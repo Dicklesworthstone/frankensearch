@@ -1378,27 +1378,20 @@ impl OpsStorage {
             for window in SummaryWindow::ALL {
                 let window_start_ms = window.bucket_start_ms(now_ms);
                 for project_key in &project_keys {
-                    let stats = compute_slo_window_stats(
-                        conn,
-                        Some(project_key),
-                        window_start_ms,
-                        now_ms,
-                    )?;
+                    let stats =
+                        compute_slo_window_stats(conn, Some(project_key), window_start_ms, now_ms)?;
                     let evaluation = evaluate_slo_window(
                         &stats,
+                        SloScope::Project,
+                        project_key,
+                        Some(project_key),
                         window_start_ms,
                         now_ms,
                         config,
                         window,
                     );
 
-                    upsert_slo_rollup_row(
-                        conn,
-                        SloScope::Project,
-                        project_key,
-                        Some(project_key),
-                        &evaluation,
-                    )?;
+                    upsert_slo_rollup_row(conn, &evaluation)?;
                     result.rollups_upserted = result.rollups_upserted.saturating_add(1);
 
                     let stale_resolved = resolve_stale_anomaly_rows(
@@ -1413,14 +1406,7 @@ impl OpsStorage {
                         .anomalies_resolved
                         .saturating_add(usize_to_u64(stale_resolved));
 
-                    let (opened, resolved) = sync_rollup_anomaly(
-                        conn,
-                        SloScope::Project,
-                        project_key,
-                        Some(project_key),
-                        &evaluation,
-                        now_ms,
-                    )?;
+                    let (opened, resolved) = sync_rollup_anomaly(conn, &evaluation, now_ms)?;
                     result.anomalies_opened =
                         result.anomalies_opened.saturating_add(usize_to_u64(opened));
                     result.anomalies_resolved = result
@@ -1430,15 +1416,17 @@ impl OpsStorage {
 
                 let fleet_scope_key = "__fleet__";
                 let fleet_stats = compute_slo_window_stats(conn, None, window_start_ms, now_ms)?;
-                let fleet_evaluation =
-                    evaluate_slo_window(&fleet_stats, window_start_ms, now_ms, config, window);
-                upsert_slo_rollup_row(
-                    conn,
+                let fleet_evaluation = evaluate_slo_window(
+                    &fleet_stats,
                     SloScope::Fleet,
                     fleet_scope_key,
                     None,
-                    &fleet_evaluation,
-                )?;
+                    window_start_ms,
+                    now_ms,
+                    config,
+                    window,
+                );
+                upsert_slo_rollup_row(conn, &fleet_evaluation)?;
                 result.rollups_upserted = result.rollups_upserted.saturating_add(1);
 
                 let stale_resolved = resolve_stale_anomaly_rows(
@@ -1453,14 +1441,7 @@ impl OpsStorage {
                     .anomalies_resolved
                     .saturating_add(usize_to_u64(stale_resolved));
 
-                let (opened, resolved) = sync_rollup_anomaly(
-                    conn,
-                    SloScope::Fleet,
-                    fleet_scope_key,
-                    None,
-                    &fleet_evaluation,
-                    now_ms,
-                )?;
+                let (opened, resolved) = sync_rollup_anomaly(conn, &fleet_evaluation, now_ms)?;
                 result.anomalies_opened =
                     result.anomalies_opened.saturating_add(usize_to_u64(opened));
                 result.anomalies_resolved = result
@@ -2324,6 +2305,607 @@ fn compute_window_event_stats(
     })
 }
 
+fn list_distinct_project_keys(conn: &Connection) -> SearchResult<Vec<String>> {
+    let rows = conn
+        .query("SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;")
+        .map_err(ops_error)?;
+    rows.iter()
+        .map(|row| {
+            row_text(row, 0, "search_events.project_key").map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn compute_slo_window_stats(
+    conn: &Connection,
+    project_key: Option<&str>,
+    window_start_ms: i64,
+    window_end_ms: i64,
+) -> SearchResult<SloWindowStats> {
+    let rows = if let Some(project_key) = project_key {
+        conn.query_with_params(
+            "SELECT phase, latency_us \
+             FROM search_events \
+             WHERE project_key = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3 \
+             ORDER BY latency_us ASC;",
+            &[
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Integer(window_start_ms),
+                SqliteValue::Integer(window_end_ms),
+            ],
+        )
+        .map_err(ops_error)?
+    } else {
+        conn.query_with_params(
+            "SELECT phase, latency_us \
+             FROM search_events \
+             WHERE ts_ms >= ?1 AND ts_ms <= ?2 \
+             ORDER BY latency_us ASC;",
+            &[
+                SqliteValue::Integer(window_start_ms),
+                SqliteValue::Integer(window_end_ms),
+            ],
+        )
+        .map_err(ops_error)?
+    };
+
+    if rows.is_empty() {
+        return Ok(SloWindowStats::default());
+    }
+
+    let mut failed_requests = 0_u64;
+    let mut latencies = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let phase = row_text(row, 0, "search_events.phase")?;
+        if phase == SearchEventPhase::Failed.as_str() {
+            failed_requests = failed_requests.saturating_add(1);
+        }
+        let latency_us = i64_to_u64_non_negative(
+            row_i64(row, 1, "search_events.latency_us")?,
+            "search_events.latency_us",
+        )?;
+        latencies.push(latency_us);
+    }
+
+    Ok(SloWindowStats {
+        total_requests: usize_to_u64(rows.len()),
+        failed_requests,
+        p95_latency_us: percentile_nearest_rank(&latencies, 95, 100),
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn evaluate_slo_window(
+    stats: &SloWindowStats,
+    scope: SloScope,
+    scope_key: &str,
+    project_key: Option<&str>,
+    window_start_ms: i64,
+    now_ms: i64,
+    config: SloMaterializationConfig,
+    window: SummaryWindow,
+) -> SloEvaluation {
+    let total_requests = stats.total_requests;
+    let failed_requests = stats.failed_requests;
+    let p95_latency_us = stats.p95_latency_us;
+
+    if total_requests < config.min_requests {
+        return SloEvaluation {
+            scope,
+            scope_key: scope_key.to_owned(),
+            project_key: project_key.map(ToOwned::to_owned),
+            window,
+            window_start_ms,
+            window_end_ms: now_ms,
+            total_requests,
+            failed_requests,
+            p95_latency_us,
+            target_p95_latency_us: config.target_p95_latency_us,
+            error_budget_ratio: config.error_budget_ratio,
+            error_rate: None,
+            error_budget_burn: None,
+            remaining_budget_ratio: None,
+            health: SloHealth::NoData,
+            reason_code: "slo.no_data.min_requests".to_owned(),
+            generated_at_ms: now_ms,
+            anomaly: None,
+        };
+    }
+
+    let error_rate = (failed_requests as f64) / (total_requests as f64);
+    let error_budget_burn = error_rate / config.error_budget_ratio;
+    let remaining_budget_ratio = (1.0 - error_budget_burn).clamp(0.0, 1.0);
+    let latency_ratio = p95_latency_us.map(|value| (value as f64) / (config.target_p95_latency_us as f64));
+
+    let burn_level = if error_budget_burn >= config.critical_burn_rate {
+        3
+    } else if error_budget_burn >= config.error_burn_rate {
+        2
+    } else if error_budget_burn >= config.warn_burn_rate {
+        1
+    } else {
+        0
+    };
+    let latency_level = if latency_ratio.unwrap_or(0.0) >= config.critical_latency_multiplier {
+        3
+    } else if latency_ratio.unwrap_or(0.0) >= config.error_latency_multiplier {
+        2
+    } else if latency_ratio.unwrap_or(0.0) >= config.warn_latency_multiplier {
+        1
+    } else {
+        0
+    };
+    let max_level = burn_level.max(latency_level);
+
+    let (health, reason_code) = match (burn_level, latency_level, max_level) {
+        (_, _, 0) => (SloHealth::Healthy, "slo.healthy"),
+        (burn, lat, level) if burn > lat => match level {
+            1 => (SloHealth::Warn, "slo.error_budget.warn"),
+            2 => (SloHealth::Error, "slo.error_budget.error"),
+            _ => (SloHealth::Critical, "slo.error_budget.critical"),
+        },
+        (burn, lat, level) if lat > burn => match level {
+            1 => (SloHealth::Warn, "slo.latency.warn"),
+            2 => (SloHealth::Error, "slo.latency.error"),
+            _ => (SloHealth::Critical, "slo.latency.critical"),
+        },
+        (_, _, level) => match level {
+            1 => (SloHealth::Warn, "slo.error_budget_and_latency.warn"),
+            2 => (SloHealth::Error, "slo.error_budget_and_latency.error"),
+            _ => (SloHealth::Critical, "slo.error_budget_and_latency.critical"),
+        },
+    };
+
+    let anomaly = if max_level == 0 {
+        None
+    } else if burn_level >= latency_level {
+        let baseline = match max_level {
+            1 => config.warn_burn_rate,
+            2 => config.error_burn_rate,
+            _ => config.critical_burn_rate,
+        };
+        Some(AnomalyCandidate {
+            metric_name: "error_budget_burn".to_owned(),
+            baseline_value: baseline,
+            observed_value: error_budget_burn,
+            deviation_ratio: if baseline == 0.0 {
+                0.0
+            } else {
+                (error_budget_burn - baseline) / baseline
+            },
+            severity: severity_for_level(max_level),
+            reason_code: reason_code.to_owned(),
+        })
+    } else {
+        let multiplier = match max_level {
+            1 => config.warn_latency_multiplier,
+            2 => config.error_latency_multiplier,
+            _ => config.critical_latency_multiplier,
+        };
+        let baseline = (config.target_p95_latency_us as f64) * multiplier;
+        let observed = p95_latency_us.map_or(0.0, |value| value as f64);
+        Some(AnomalyCandidate {
+            metric_name: "p95_latency_us".to_owned(),
+            baseline_value: baseline,
+            observed_value: observed,
+            deviation_ratio: if baseline == 0.0 {
+                0.0
+            } else {
+                (observed - baseline) / baseline
+            },
+            severity: severity_for_level(max_level),
+            reason_code: reason_code.to_owned(),
+        })
+    };
+
+    SloEvaluation {
+        scope,
+        scope_key: scope_key.to_owned(),
+        project_key: project_key.map(ToOwned::to_owned),
+        window,
+        window_start_ms,
+        window_end_ms: now_ms,
+        total_requests,
+        failed_requests,
+        p95_latency_us,
+        target_p95_latency_us: config.target_p95_latency_us,
+        error_budget_ratio: config.error_budget_ratio,
+        error_rate: Some(error_rate),
+        error_budget_burn: Some(error_budget_burn),
+        remaining_budget_ratio: Some(remaining_budget_ratio),
+        health,
+        reason_code: reason_code.to_owned(),
+        generated_at_ms: now_ms,
+        anomaly,
+    }
+}
+
+const fn severity_for_level(level: usize) -> AnomalySeverity {
+    match level {
+        1 => AnomalySeverity::Warn,
+        2 => AnomalySeverity::Error,
+        _ => AnomalySeverity::Critical,
+    }
+}
+
+fn upsert_slo_rollup_row(conn: &Connection, evaluation: &SloEvaluation) -> SearchResult<()> {
+    let rollup_id = format!(
+        "slo:{}:{}:{}:{}",
+        evaluation.scope.as_str(),
+        evaluation.scope_key,
+        evaluation.window.as_label(),
+        evaluation.window_start_ms
+    );
+    let key_params = [
+        SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+        SqliteValue::Text(evaluation.scope_key.clone()),
+        SqliteValue::Text(evaluation.window.as_label().to_owned()),
+        SqliteValue::Integer(evaluation.window_start_ms),
+    ];
+    let existing = conn
+        .query_with_params(
+            "SELECT 1 FROM slo_rollups \
+             WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 AND window_start_ms = ?4;",
+            &key_params,
+        )
+        .map_err(ops_error)?;
+
+    if existing.is_empty() {
+        conn.execute_with_params(
+            "INSERT INTO slo_rollups(\
+                rollup_id, scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+                total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+                error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+                health, reason_code, generated_at_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
+            &[
+                SqliteValue::Text(rollup_id),
+                SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+                SqliteValue::Text(evaluation.scope_key.clone()),
+                optional_text(evaluation.project_key.as_deref()),
+                SqliteValue::Text(evaluation.window.as_label().to_owned()),
+                SqliteValue::Integer(evaluation.window_start_ms),
+                SqliteValue::Integer(evaluation.window_end_ms),
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.total_requests,
+                    "slo_rollups.total_requests",
+                )?),
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.failed_requests,
+                    "slo_rollups.failed_requests",
+                )?),
+                optional_u64(evaluation.p95_latency_us, "slo_rollups.p95_latency_us")?,
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.target_p95_latency_us,
+                    "slo_rollups.target_p95_latency_us",
+                )?),
+                SqliteValue::Float(evaluation.error_budget_ratio),
+                optional_f64(evaluation.error_rate),
+                optional_f64(evaluation.error_budget_burn),
+                optional_f64(evaluation.remaining_budget_ratio),
+                SqliteValue::Text(evaluation.health.as_str().to_owned()),
+                SqliteValue::Text(evaluation.reason_code.clone()),
+                SqliteValue::Integer(evaluation.generated_at_ms),
+            ],
+        )
+        .map_err(ops_error)?;
+    } else {
+        conn.execute_with_params(
+            "UPDATE slo_rollups SET \
+                project_key = ?1, window_end_ms = ?2, total_requests = ?3, failed_requests = ?4, \
+                p95_latency_us = ?5, target_p95_latency_us = ?6, error_budget_ratio = ?7, \
+                error_rate = ?8, error_budget_burn = ?9, remaining_budget_ratio = ?10, \
+                health = ?11, reason_code = ?12, generated_at_ms = ?13 \
+             WHERE scope = ?14 AND scope_key = ?15 AND window = ?16 AND window_start_ms = ?17;",
+            &[
+                optional_text(evaluation.project_key.as_deref()),
+                SqliteValue::Integer(evaluation.window_end_ms),
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.total_requests,
+                    "slo_rollups.total_requests",
+                )?),
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.failed_requests,
+                    "slo_rollups.failed_requests",
+                )?),
+                optional_u64(evaluation.p95_latency_us, "slo_rollups.p95_latency_us")?,
+                SqliteValue::Integer(u64_to_i64(
+                    evaluation.target_p95_latency_us,
+                    "slo_rollups.target_p95_latency_us",
+                )?),
+                SqliteValue::Float(evaluation.error_budget_ratio),
+                optional_f64(evaluation.error_rate),
+                optional_f64(evaluation.error_budget_burn),
+                optional_f64(evaluation.remaining_budget_ratio),
+                SqliteValue::Text(evaluation.health.as_str().to_owned()),
+                SqliteValue::Text(evaluation.reason_code.clone()),
+                SqliteValue::Integer(evaluation.generated_at_ms),
+                SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+                SqliteValue::Text(evaluation.scope_key.clone()),
+                SqliteValue::Text(evaluation.window.as_label().to_owned()),
+                SqliteValue::Integer(evaluation.window_start_ms),
+            ],
+        )
+        .map_err(ops_error)?;
+    }
+    Ok(())
+}
+
+fn resolve_stale_anomaly_rows(
+    conn: &Connection,
+    scope: SloScope,
+    scope_key: &str,
+    window: SummaryWindow,
+    active_window_start_ms: i64,
+    now_ms: i64,
+) -> SearchResult<usize> {
+    conn.execute_with_params(
+        "UPDATE anomaly_materializations \
+         SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), updated_at_ms = ?1 \
+         WHERE scope = ?2 AND scope_key = ?3 AND window = ?4 AND state = 'open' \
+           AND window_start_ms < ?5;",
+        &[
+            SqliteValue::Integer(now_ms),
+            SqliteValue::Text(scope.as_str().to_owned()),
+            SqliteValue::Text(scope_key.to_owned()),
+            SqliteValue::Text(window.as_label().to_owned()),
+            SqliteValue::Integer(active_window_start_ms),
+        ],
+    )
+    .map_err(ops_error)
+}
+
+fn sync_rollup_anomaly(
+    conn: &Connection,
+    evaluation: &SloEvaluation,
+    now_ms: i64,
+) -> SearchResult<(usize, usize)> {
+    let anomaly_id = format!(
+        "anomaly:{}:{}:{}:{}",
+        evaluation.scope.as_str(),
+        evaluation.scope_key,
+        evaluation.window.as_label(),
+        evaluation.window_start_ms
+    );
+    let Some(candidate) = &evaluation.anomaly else {
+        let resolved = conn
+            .execute_with_params(
+                "UPDATE anomaly_materializations \
+                 SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), \
+                     updated_at_ms = ?1 \
+                 WHERE anomaly_id = ?2 AND state = 'open';",
+                &[
+                    SqliteValue::Integer(now_ms),
+                    SqliteValue::Text(anomaly_id),
+                ],
+            )
+            .map_err(ops_error)?;
+        return Ok((0, resolved));
+    };
+
+    let rows = conn
+        .query_with_params(
+            "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1;",
+            &[SqliteValue::Text(anomaly_id.clone())],
+        )
+        .map_err(ops_error)?;
+    let existing_state = rows
+        .first()
+        .map(|row| row_text(row, 0, "anomaly_materializations.state"))
+        .transpose()?;
+
+    match existing_state {
+        None => {
+            conn.execute_with_params(
+                "INSERT INTO anomaly_materializations(\
+                    anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                    metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                    reason_code, correlation_id, state, opened_at_ms, updated_at_ms, resolved_at_ms\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14, ?14, NULL);",
+                &[
+                    SqliteValue::Text(anomaly_id),
+                    SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+                    SqliteValue::Text(evaluation.scope_key.clone()),
+                    optional_text(evaluation.project_key.as_deref()),
+                    SqliteValue::Text(evaluation.window.as_label().to_owned()),
+                    SqliteValue::Integer(evaluation.window_start_ms),
+                    SqliteValue::Text(candidate.metric_name.clone()),
+                    SqliteValue::Float(candidate.baseline_value),
+                    SqliteValue::Float(candidate.observed_value),
+                    SqliteValue::Float(candidate.deviation_ratio),
+                    SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                    SqliteValue::Text(candidate.reason_code.clone()),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(now_ms),
+                ],
+            )
+            .map_err(ops_error)?;
+            Ok((1, 0))
+        }
+        Some("resolved") => {
+            conn.execute_with_params(
+                "UPDATE anomaly_materializations SET \
+                    project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
+                    deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
+                    state = 'open', opened_at_ms = ?9, updated_at_ms = ?9, resolved_at_ms = NULL \
+                 WHERE anomaly_id = ?10;",
+                &[
+                    optional_text(evaluation.project_key.as_deref()),
+                    SqliteValue::Text(candidate.metric_name.clone()),
+                    SqliteValue::Float(candidate.baseline_value),
+                    SqliteValue::Float(candidate.observed_value),
+                    SqliteValue::Float(candidate.deviation_ratio),
+                    SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                    SqliteValue::Text(candidate.reason_code.clone()),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(now_ms),
+                    SqliteValue::Text(anomaly_id),
+                ],
+            )
+            .map_err(ops_error)?;
+            Ok((1, 0))
+        }
+        Some("open") => {
+            conn.execute_with_params(
+                "UPDATE anomaly_materializations SET \
+                    project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
+                    deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
+                    updated_at_ms = ?9 \
+                 WHERE anomaly_id = ?10;",
+                &[
+                    optional_text(evaluation.project_key.as_deref()),
+                    SqliteValue::Text(candidate.metric_name.clone()),
+                    SqliteValue::Float(candidate.baseline_value),
+                    SqliteValue::Float(candidate.observed_value),
+                    SqliteValue::Float(candidate.deviation_ratio),
+                    SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                    SqliteValue::Text(candidate.reason_code.clone()),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(now_ms),
+                    SqliteValue::Text(anomaly_id),
+                ],
+            )
+            .map_err(ops_error)?;
+            Ok((0, 0))
+        }
+        Some(other) => Err(SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(format!(
+                "unexpected anomaly state value: {other}"
+            ))),
+        }),
+    }
+}
+
+fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
+    let scope = SloScope::from_db(row_text(row, 0, "slo_rollups.scope")?).ok_or_else(|| {
+        SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other("invalid slo_rollups.scope value")),
+        }
+    })?;
+    let scope_key = row_text(row, 1, "slo_rollups.scope_key")?.to_owned();
+    let project_key = row_opt_text(row, 2, "slo_rollups.project_key")?.map(ToOwned::to_owned);
+    let window = SummaryWindow::from_label(row_text(row, 3, "slo_rollups.window")?).ok_or_else(
+        || SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other("invalid slo_rollups.window value")),
+        },
+    )?;
+    let window_start_ms = row_i64(row, 4, "slo_rollups.window_start_ms")?;
+    let window_end_ms = row_i64(row, 5, "slo_rollups.window_end_ms")?;
+    let total_requests = i64_to_u64_non_negative(
+        row_i64(row, 6, "slo_rollups.total_requests")?,
+        "slo_rollups.total_requests",
+    )?;
+    let failed_requests = i64_to_u64_non_negative(
+        row_i64(row, 7, "slo_rollups.failed_requests")?,
+        "slo_rollups.failed_requests",
+    )?;
+    let p95_latency_us = row_opt_i64(row, 8, "slo_rollups.p95_latency_us")?
+        .map(|value| i64_to_u64_non_negative(value, "slo_rollups.p95_latency_us"))
+        .transpose()?;
+    let target_p95_latency_us = i64_to_u64_non_negative(
+        row_i64(row, 9, "slo_rollups.target_p95_latency_us")?,
+        "slo_rollups.target_p95_latency_us",
+    )?;
+    let error_budget_ratio = row_opt_f64(row, 10, "slo_rollups.error_budget_ratio")?
+        .ok_or_else(|| SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(
+                "slo_rollups.error_budget_ratio should not be NULL",
+            )),
+        })?;
+    let error_rate = row_opt_f64(row, 11, "slo_rollups.error_rate")?;
+    let error_budget_burn = row_opt_f64(row, 12, "slo_rollups.error_budget_burn")?;
+    let remaining_budget_ratio = row_opt_f64(row, 13, "slo_rollups.remaining_budget_ratio")?;
+    let health = SloHealth::from_db(row_text(row, 14, "slo_rollups.health")?).ok_or_else(|| {
+        SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other("invalid slo_rollups.health value")),
+        }
+    })?;
+    let reason_code = row_text(row, 15, "slo_rollups.reason_code")?.to_owned();
+    let generated_at_ms = row_i64(row, 16, "slo_rollups.generated_at_ms")?;
+
+    Ok(SloRollupSnapshot {
+        scope,
+        scope_key,
+        project_key,
+        window,
+        window_start_ms,
+        window_end_ms,
+        total_requests,
+        failed_requests,
+        p95_latency_us,
+        target_p95_latency_us,
+        error_budget_ratio,
+        error_rate,
+        error_budget_burn,
+        remaining_budget_ratio,
+        health,
+        reason_code,
+        generated_at_ms,
+    })
+}
+
+fn row_to_anomaly(row: &Row) -> SearchResult<AnomalyMaterializationSnapshot> {
+    let anomaly_id = row_text(row, 0, "anomaly_materializations.anomaly_id")?.to_owned();
+    let scope = SloScope::from_db(row_text(row, 1, "anomaly_materializations.scope")?)
+        .ok_or_else(|| SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other("invalid anomaly_materializations.scope value")),
+        })?;
+    let scope_key = row_text(row, 2, "anomaly_materializations.scope_key")?.to_owned();
+    let project_key =
+        row_opt_text(row, 3, "anomaly_materializations.project_key")?.map(ToOwned::to_owned);
+    let window = SummaryWindow::from_label(row_text(row, 4, "anomaly_materializations.window")?)
+        .ok_or_else(|| SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other("invalid anomaly_materializations.window value")),
+        })?;
+    let window_start_ms = row_i64(row, 5, "anomaly_materializations.window_start_ms")?;
+    let metric_name = row_text(row, 6, "anomaly_materializations.metric_name")?.to_owned();
+    let baseline_value = row_opt_f64(row, 7, "anomaly_materializations.baseline_value")?;
+    let observed_value = row_opt_f64(row, 8, "anomaly_materializations.observed_value")?;
+    let deviation_ratio = row_opt_f64(row, 9, "anomaly_materializations.deviation_ratio")?;
+    let severity =
+        AnomalySeverity::from_db(row_text(row, 10, "anomaly_materializations.severity")?)
+            .ok_or_else(|| SearchError::SubsystemError {
+                subsystem: "ops-storage",
+                source: Box::new(io::Error::other(
+                    "invalid anomaly_materializations.severity value",
+                )),
+            })?;
+    let reason_code = row_text(row, 11, "anomaly_materializations.reason_code")?.to_owned();
+    let correlation_id =
+        row_opt_text(row, 12, "anomaly_materializations.correlation_id")?.map(ToOwned::to_owned);
+    let state = row_text(row, 13, "anomaly_materializations.state")?.to_owned();
+    let opened_at_ms = row_i64(row, 14, "anomaly_materializations.opened_at_ms")?;
+    let updated_at_ms = row_i64(row, 15, "anomaly_materializations.updated_at_ms")?;
+    let resolved_at_ms = row_opt_i64(row, 16, "anomaly_materializations.resolved_at_ms")?;
+
+    Ok(AnomalyMaterializationSnapshot {
+        anomaly_id,
+        scope,
+        scope_key,
+        project_key,
+        window,
+        window_start_ms,
+        metric_name,
+        baseline_value,
+        observed_value,
+        deviation_ratio,
+        severity,
+        reason_code,
+        correlation_id,
+        state,
+        opened_at_ms,
+        updated_at_ms,
+        resolved_at_ms,
+    })
+}
+
 fn percentile_nearest_rank(values: &[u64], numerator: usize, denominator: usize) -> Option<u64> {
     if values.is_empty() || denominator == 0 {
         return None;
@@ -2362,6 +2944,19 @@ fn optional_f64(value: Option<f64>) -> SqliteValue {
 fn row_opt_i64(row: &Row, index: usize, field: &str) -> SearchResult<Option<i64>> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(Some(*value)),
+        Some(SqliteValue::Null) | None => Ok(None),
+        Some(other) => Err(SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(format!(
+                "unexpected type for {field}: {other:?}"
+            ))),
+        }),
+    }
+}
+
+fn row_opt_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<Option<&'a str>> {
+    match row.get(index) {
+        Some(SqliteValue::Text(value)) => Ok(Some(value.as_str())),
         Some(SqliteValue::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "ops-storage",

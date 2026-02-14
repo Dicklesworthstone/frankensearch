@@ -16,7 +16,7 @@ use crate::data_source::DataSource;
 use crate::preferences::DisplayPreferences;
 use crate::presets::{ViewPreset, ViewState};
 use crate::screens::FleetOverviewScreen;
-use crate::state::AppState;
+use crate::state::{AppState, ControlPlaneHealth};
 
 // ─── Ops App ─────────────────────────────────────────────────────────────────
 
@@ -36,6 +36,8 @@ pub struct OpsApp {
     pub preferences: DisplayPreferences,
     /// Current view state (preset + density + filters).
     pub view: ViewState,
+    /// Most severe control-plane state we already surfaced as an alert.
+    last_alerted_health: Option<ControlPlaneHealth>,
 }
 
 impl OpsApp {
@@ -71,11 +73,13 @@ impl OpsApp {
             fleet_screen_id: fleet_id,
             preferences: DisplayPreferences::new(),
             view: ViewState::default(),
+            last_alerted_health: None,
         }
     }
 
     /// Refresh state from the data source.
     pub fn refresh_data(&mut self) {
+        let previous_health = self.state.control_plane_health();
         let snapshot = self.data_source.fleet_snapshot();
         let control_plane = self.data_source.control_plane_metrics();
         self.state.update_fleet(snapshot);
@@ -89,6 +93,8 @@ impl OpsApp {
             .with_center(self.state.connection_status().to_string())
             .with_right(self.state.control_plane_health().badge());
 
+        let current_health = self.state.control_plane_health();
+        self.maybe_emit_control_plane_alert(previous_health, current_health);
         self.sync_fleet_screen_state();
     }
 
@@ -361,16 +367,131 @@ impl OpsApp {
             );
         }
     }
+
+    #[must_use]
+    const fn health_rank(health: ControlPlaneHealth) -> u8 {
+        match health {
+            ControlPlaneHealth::Healthy => 0,
+            ControlPlaneHealth::Degraded => 1,
+            ControlPlaneHealth::Critical => 2,
+        }
+    }
+
+    fn maybe_emit_control_plane_alert(
+        &mut self,
+        previous_health: ControlPlaneHealth,
+        current_health: ControlPlaneHealth,
+    ) {
+        if Self::health_rank(current_health) < Self::health_rank(previous_health) {
+            self.last_alerted_health = None;
+            return;
+        }
+        if Self::health_rank(current_health) <= Self::health_rank(previous_health) {
+            return;
+        }
+        if self.last_alerted_health == Some(current_health) {
+            return;
+        }
+
+        let title = match current_health {
+            ControlPlaneHealth::Healthy => return,
+            ControlPlaneHealth::Degraded => "Control Plane Degraded",
+            ControlPlaneHealth::Critical => "Control Plane Critical",
+        };
+        tracing::warn!(
+            target: "frankensearch.ops",
+            previous = %previous_health,
+            current = %current_health,
+            "control-plane health degraded"
+        );
+        let body = format!(
+            "health transition: {previous_health} -> {current_health}\n\n{}",
+            self.state.self_check_report()
+        );
+        self.shell
+            .overlays
+            .push(OverlayRequest::new(OverlayKind::Alert, title).with_body(body));
+        self.last_alerted_health = Some(current_health);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use frankensearch_tui::palette::PaletteState;
     use frankensearch_tui::screen::ScreenId;
 
     use super::*;
-    use crate::data_source::MockDataSource;
+    use crate::data_source::{DataSource, MockDataSource, TimeWindow};
     use crate::preferences::ContrastMode;
+    use crate::state::{
+        ControlPlaneMetrics, FleetSnapshot, InstanceAttribution, InstanceLifecycle,
+        ResourceMetrics, SearchMetrics,
+    };
+
+    struct SequencedControlPlaneSource {
+        metrics: Vec<ControlPlaneMetrics>,
+        index: AtomicUsize,
+    }
+
+    impl SequencedControlPlaneSource {
+        fn new(metrics: Vec<ControlPlaneMetrics>) -> Self {
+            assert!(!metrics.is_empty());
+            Self {
+                metrics,
+                index: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DataSource for SequencedControlPlaneSource {
+        fn fleet_snapshot(&self) -> FleetSnapshot {
+            FleetSnapshot::default()
+        }
+
+        fn search_metrics(&self, _instance_id: &str, _window: TimeWindow) -> Option<SearchMetrics> {
+            None
+        }
+
+        fn resource_metrics(&self, _instance_id: &str) -> Option<ResourceMetrics> {
+            None
+        }
+
+        fn control_plane_metrics(&self) -> ControlPlaneMetrics {
+            let idx = self.index.fetch_add(1, Ordering::Relaxed);
+            let bounded = idx.min(self.metrics.len() - 1);
+            self.metrics[bounded].clone()
+        }
+
+        fn attribution(&self, _instance_id: &str) -> Option<InstanceAttribution> {
+            None
+        }
+
+        fn lifecycle(&self, _instance_id: &str) -> Option<InstanceLifecycle> {
+            None
+        }
+    }
+
+    fn healthy_metrics() -> ControlPlaneMetrics {
+        ControlPlaneMetrics::default()
+    }
+
+    fn degraded_metrics() -> ControlPlaneMetrics {
+        ControlPlaneMetrics {
+            ingestion_lag_events: 2_500,
+            event_throughput_eps: 10.0,
+            ..ControlPlaneMetrics::default()
+        }
+    }
+
+    fn critical_metrics() -> ControlPlaneMetrics {
+        ControlPlaneMetrics {
+            ingestion_lag_events: 12_000,
+            event_throughput_eps: 10.0,
+            ..ControlPlaneMetrics::default()
+        }
+    }
 
     #[test]
     fn ops_app_creation() {
@@ -527,6 +648,89 @@ mod tests {
                 .body
                 .as_deref()
                 .is_some_and(|body| body.contains("ingestion_lag_events"))
+        );
+    }
+
+    #[test]
+    fn refresh_emits_alert_when_health_degrades() {
+        let source = SequencedControlPlaneSource::new(vec![healthy_metrics(), degraded_metrics()]);
+        let mut app = OpsApp::new(Box::new(source));
+
+        app.refresh_data();
+        assert_eq!(app.shell.overlays.depth(), 0);
+
+        app.refresh_data();
+        assert_eq!(
+            app.state.control_plane_health(),
+            ControlPlaneHealth::Degraded
+        );
+        assert_eq!(app.shell.overlays.depth(), 1);
+        let overlay = app
+            .shell
+            .overlays
+            .top()
+            .expect("degradation alert should exist");
+        assert_eq!(overlay.kind, OverlayKind::Alert);
+        assert_eq!(overlay.title, "Control Plane Degraded");
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("health transition: healthy -> degraded"))
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_duplicate_alert_when_state_stays_degraded() {
+        let source = SequencedControlPlaneSource::new(vec![
+            healthy_metrics(),
+            degraded_metrics(),
+            degraded_metrics(),
+        ]);
+        let mut app = OpsApp::new(Box::new(source));
+
+        app.refresh_data();
+        app.refresh_data();
+        assert_eq!(app.shell.overlays.depth(), 1);
+
+        app.refresh_data();
+        assert_eq!(
+            app.state.control_plane_health(),
+            ControlPlaneHealth::Degraded
+        );
+        assert_eq!(app.shell.overlays.depth(), 1);
+    }
+
+    #[test]
+    fn refresh_emits_critical_alert_when_health_worsens_again() {
+        let source = SequencedControlPlaneSource::new(vec![
+            healthy_metrics(),
+            degraded_metrics(),
+            critical_metrics(),
+        ]);
+        let mut app = OpsApp::new(Box::new(source));
+
+        app.refresh_data();
+        app.refresh_data();
+        assert_eq!(app.shell.overlays.depth(), 1);
+
+        app.refresh_data();
+        assert_eq!(
+            app.state.control_plane_health(),
+            ControlPlaneHealth::Critical
+        );
+        assert_eq!(app.shell.overlays.depth(), 2);
+        let overlay = app
+            .shell
+            .overlays
+            .top()
+            .expect("critical alert should exist");
+        assert_eq!(overlay.title, "Control Plane Critical");
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("health transition: degraded -> critical"))
         );
     }
 
