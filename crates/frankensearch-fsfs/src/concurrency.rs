@@ -623,6 +623,636 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
     ]
 }
 
+// ─── Workload Budget Scheduling ─────────────────────────────────────────────
+
+/// Workload classes competing for shared fsfs compute budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkloadClass {
+    Ingest,
+    Embed,
+    Query,
+}
+
+impl WorkloadClass {
+    const COUNT: usize = 3;
+
+    #[must_use]
+    const fn index(self) -> usize {
+        match self {
+            Self::Ingest => 0,
+            Self::Embed => 1,
+            Self::Query => 2,
+        }
+    }
+
+    #[must_use]
+    const fn all() -> [Self; Self::COUNT] {
+        [Self::Ingest, Self::Embed, Self::Query]
+    }
+}
+
+/// Scheduler mode toggle for balancing fairness vs query latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSchedulerMode {
+    FairShare,
+    LatencySensitive,
+}
+
+/// Pending demand snapshot for one scheduling cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkloadDemand {
+    pub ingest: usize,
+    pub embed: usize,
+    pub query: usize,
+}
+
+impl WorkloadDemand {
+    #[must_use]
+    const fn get(self, class: WorkloadClass) -> usize {
+        match class {
+            WorkloadClass::Ingest => self.ingest,
+            WorkloadClass::Embed => self.embed,
+            WorkloadClass::Query => self.query,
+        }
+    }
+
+    const fn set(&mut self, class: WorkloadClass, value: usize) {
+        match class {
+            WorkloadClass::Ingest => self.ingest = value,
+            WorkloadClass::Embed => self.embed = value,
+            WorkloadClass::Query => self.query = value,
+        }
+    }
+
+    #[must_use]
+    const fn total(self) -> usize {
+        self.ingest + self.embed + self.query
+    }
+
+    #[must_use]
+    const fn active_classes(self) -> usize {
+        (self.ingest > 0) as usize + (self.embed > 0) as usize + (self.query > 0) as usize
+    }
+}
+
+/// Scheduler configuration and safety bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetSchedulerPolicy {
+    /// Total slots available per scheduling cycle.
+    pub total_slots: usize,
+    /// Upper bound on admitted units per cycle.
+    pub admission_limit: usize,
+    /// Query floor when in latency-sensitive mode (percent of total slots).
+    pub latency_query_reserve_pct: u8,
+    /// Cycles a non-empty class can receive zero slots before guard activates.
+    pub starvation_guard_cycles: u8,
+}
+
+impl BudgetSchedulerPolicy {
+    #[must_use]
+    pub const fn normalized(self) -> Self {
+        let total_slots = if self.total_slots == 0 {
+            1
+        } else {
+            self.total_slots
+        };
+        let admission_limit = if self.admission_limit == 0 {
+            total_slots
+        } else {
+            self.admission_limit
+        };
+        let latency_query_reserve_pct = if self.latency_query_reserve_pct > 100 {
+            100
+        } else {
+            self.latency_query_reserve_pct
+        };
+        let starvation_guard_cycles = if self.starvation_guard_cycles == 0 {
+            1
+        } else {
+            self.starvation_guard_cycles
+        };
+        Self {
+            total_slots,
+            admission_limit,
+            latency_query_reserve_pct,
+            starvation_guard_cycles,
+        }
+    }
+}
+
+impl Default for BudgetSchedulerPolicy {
+    fn default() -> Self {
+        Self {
+            total_slots: 24,
+            admission_limit: 48,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        }
+    }
+}
+
+/// Deterministic per-cycle allocation output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadAllocation {
+    pub ingest: usize,
+    pub embed: usize,
+    pub query: usize,
+    pub mode: BudgetSchedulerMode,
+    pub admission_capped: bool,
+    pub starvation_guard_applied: bool,
+    pub reason_code: &'static str,
+}
+
+impl WorkloadAllocation {
+    #[must_use]
+    pub const fn get(self, class: WorkloadClass) -> usize {
+        match class {
+            WorkloadClass::Ingest => self.ingest,
+            WorkloadClass::Embed => self.embed,
+            WorkloadClass::Query => self.query,
+        }
+    }
+
+    const fn set(&mut self, class: WorkloadClass, value: usize) {
+        match class {
+            WorkloadClass::Ingest => self.ingest = value,
+            WorkloadClass::Embed => self.embed = value,
+            WorkloadClass::Query => self.query = value,
+        }
+    }
+
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.ingest + self.embed + self.query
+    }
+}
+
+/// Two-phase permit state for cancellation-correct admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermitState {
+    Reserved,
+    Committed,
+    Cancelled,
+}
+
+/// Reserve/commit token for one workload class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadPermit {
+    class: WorkloadClass,
+    slots: usize,
+    state: PermitState,
+}
+
+impl WorkloadPermit {
+    #[must_use]
+    pub const fn class(self) -> WorkloadClass {
+        self.class
+    }
+
+    #[must_use]
+    pub const fn slots(self) -> usize {
+        self.slots
+    }
+
+    #[must_use]
+    pub const fn state(self) -> PermitState {
+        self.state
+    }
+}
+
+/// Stateful scheduler with fairness and starvation tracking.
+#[derive(Debug, Clone)]
+pub struct WorkloadBudgetScheduler {
+    policy: BudgetSchedulerPolicy,
+    starvation_counters: [u8; WorkloadClass::COUNT],
+    rr_cursor: usize,
+    reserved: [usize; WorkloadClass::COUNT],
+    inflight: [usize; WorkloadClass::COUNT],
+}
+
+impl WorkloadBudgetScheduler {
+    /// Create a scheduler with normalized policy.
+    #[must_use]
+    pub const fn new(policy: BudgetSchedulerPolicy) -> Self {
+        Self {
+            policy: policy.normalized(),
+            starvation_counters: [0; WorkloadClass::COUNT],
+            rr_cursor: 0,
+            reserved: [0; WorkloadClass::COUNT],
+            inflight: [0; WorkloadClass::COUNT],
+        }
+    }
+
+    /// Plan one deterministic allocation cycle.
+    #[must_use]
+    pub fn plan_cycle(
+        &mut self,
+        demand: WorkloadDemand,
+        mode: BudgetSchedulerMode,
+    ) -> WorkloadAllocation {
+        let mut capped = false;
+        let mut demand = demand;
+        if demand.total() > self.policy.admission_limit {
+            demand = cap_demand(demand, self.policy.admission_limit, mode, self.rr_cursor);
+            capped = true;
+        }
+
+        let mut allocation = match mode {
+            BudgetSchedulerMode::FairShare => {
+                fair_share_allocate(demand, self.policy.total_slots, self.rr_cursor)
+            }
+            BudgetSchedulerMode::LatencySensitive => {
+                latency_sensitive_allocate(demand, self.policy.total_slots, self.policy)
+            }
+        };
+        self.bump_cursor();
+
+        let starvation_guard_applied = self.apply_starvation_guard(demand, &mut allocation);
+        self.update_starvation_counters(demand, allocation);
+
+        WorkloadAllocation {
+            ingest: allocation.ingest,
+            embed: allocation.embed,
+            query: allocation.query,
+            mode,
+            admission_capped: capped,
+            starvation_guard_applied,
+            reason_code: allocation_reason(mode, capped, starvation_guard_applied),
+        }
+    }
+
+    /// Reserve slots in two phases. Call commit/cancel explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason code when reservation cannot be admitted.
+    pub fn reserve(
+        &mut self,
+        class: WorkloadClass,
+        slots: usize,
+    ) -> Result<WorkloadPermit, &'static str> {
+        if slots == 0 {
+            return Err("scheduler.reserve.zero_slots");
+        }
+        if self.total_reserved().saturating_add(slots) > self.policy.admission_limit {
+            return Err("scheduler.reserve.admission_limited");
+        }
+        if self.total_inflight_reserved().saturating_add(slots) > self.policy.total_slots {
+            return Err("scheduler.reserve.capacity_exhausted");
+        }
+
+        self.reserved[class.index()] = self.reserved[class.index()].saturating_add(slots);
+        Ok(WorkloadPermit {
+            class,
+            slots,
+            state: PermitState::Reserved,
+        })
+    }
+
+    /// Commit a previously reserved permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason code when the permit is not in reserved state.
+    pub const fn commit_permit(&mut self, permit: &mut WorkloadPermit) -> Result<(), &'static str> {
+        if !matches!(permit.state, PermitState::Reserved) {
+            return Err("scheduler.commit.invalid_state");
+        }
+        let idx = permit.class.index();
+        self.reserved[idx] = self.reserved[idx].saturating_sub(permit.slots);
+        self.inflight[idx] = self.inflight[idx].saturating_add(permit.slots);
+        permit.state = PermitState::Committed;
+        Ok(())
+    }
+
+    /// Cancel a previously reserved permit and release capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason code when the permit is not in reserved state.
+    pub const fn cancel_permit(&mut self, permit: &mut WorkloadPermit) -> Result<(), &'static str> {
+        if !matches!(permit.state, PermitState::Reserved) {
+            return Err("scheduler.cancel.invalid_state");
+        }
+        let idx = permit.class.index();
+        self.reserved[idx] = self.reserved[idx].saturating_sub(permit.slots);
+        permit.state = PermitState::Cancelled;
+        Ok(())
+    }
+
+    /// Mark committed work complete and release inflight capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason code when completion exceeds inflight slots.
+    pub const fn complete(
+        &mut self,
+        class: WorkloadClass,
+        slots: usize,
+    ) -> Result<(), &'static str> {
+        let idx = class.index();
+        if slots > self.inflight[idx] {
+            return Err("scheduler.complete.underflow");
+        }
+        self.inflight[idx] -= slots;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> BudgetSchedulerPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn reserved_for(&self, class: WorkloadClass) -> usize {
+        self.reserved[class.index()]
+    }
+
+    #[must_use]
+    pub const fn inflight_for(&self, class: WorkloadClass) -> usize {
+        self.inflight[class.index()]
+    }
+
+    const fn bump_cursor(&mut self) {
+        self.rr_cursor = (self.rr_cursor + 1) % WorkloadClass::COUNT;
+    }
+
+    fn total_reserved(&self) -> usize {
+        self.reserved.iter().sum()
+    }
+
+    fn total_inflight_reserved(&self) -> usize {
+        self.inflight.iter().sum::<usize>() + self.total_reserved()
+    }
+
+    fn apply_starvation_guard(
+        &self,
+        demand: WorkloadDemand,
+        allocation: &mut WorkloadAllocation,
+    ) -> bool {
+        let mut applied = false;
+        for class in WorkloadClass::all() {
+            let idx = class.index();
+            if demand.get(class) == 0
+                || allocation.get(class) > 0
+                || self.starvation_counters[idx] < self.policy.starvation_guard_cycles
+            {
+                continue;
+            }
+
+            if let Some(donor) = donor_class(*allocation, class) {
+                allocation.set(class, allocation.get(class) + 1);
+                allocation.set(donor, allocation.get(donor).saturating_sub(1));
+                applied = true;
+            }
+        }
+        applied
+    }
+
+    fn update_starvation_counters(
+        &mut self,
+        demand: WorkloadDemand,
+        allocation: WorkloadAllocation,
+    ) {
+        for class in WorkloadClass::all() {
+            let idx = class.index();
+            if demand.get(class) == 0 {
+                self.starvation_counters[idx] = 0;
+            } else if allocation.get(class) == 0 {
+                self.starvation_counters[idx] = self.starvation_counters[idx].saturating_add(1);
+            } else {
+                self.starvation_counters[idx] = 0;
+            }
+        }
+    }
+}
+
+const fn allocation_reason(
+    mode: BudgetSchedulerMode,
+    admission_capped: bool,
+    starvation_guard_applied: bool,
+) -> &'static str {
+    match (mode, admission_capped, starvation_guard_applied) {
+        (BudgetSchedulerMode::FairShare, false, false) => "scheduler.plan.fair_share",
+        (BudgetSchedulerMode::FairShare, true, false) => "scheduler.plan.fair_share.capped",
+        (BudgetSchedulerMode::FairShare, false, true) => {
+            "scheduler.plan.fair_share.starvation_guard"
+        }
+        (BudgetSchedulerMode::FairShare, true, true) => {
+            "scheduler.plan.fair_share.capped_starvation_guard"
+        }
+        (BudgetSchedulerMode::LatencySensitive, false, false) => "scheduler.plan.latency_sensitive",
+        (BudgetSchedulerMode::LatencySensitive, true, false) => {
+            "scheduler.plan.latency_sensitive.capped"
+        }
+        (BudgetSchedulerMode::LatencySensitive, false, true) => {
+            "scheduler.plan.latency_sensitive.starvation_guard"
+        }
+        (BudgetSchedulerMode::LatencySensitive, true, true) => {
+            "scheduler.plan.latency_sensitive.capped_starvation_guard"
+        }
+    }
+}
+
+fn fair_share_allocate(
+    demand: WorkloadDemand,
+    total_slots: usize,
+    rr_cursor: usize,
+) -> WorkloadAllocation {
+    let active = demand.active_classes();
+    if active == 0 || total_slots == 0 {
+        return WorkloadAllocation {
+            ingest: 0,
+            embed: 0,
+            query: 0,
+            mode: BudgetSchedulerMode::FairShare,
+            admission_capped: false,
+            starvation_guard_applied: false,
+            reason_code: "scheduler.plan.fair_share",
+        };
+    }
+
+    let mut allocation = WorkloadAllocation {
+        ingest: 0,
+        embed: 0,
+        query: 0,
+        mode: BudgetSchedulerMode::FairShare,
+        admission_capped: false,
+        starvation_guard_applied: false,
+        reason_code: "scheduler.plan.fair_share",
+    };
+    let base = total_slots / active;
+    let mut remainder = total_slots % active;
+
+    let order = class_order(rr_cursor);
+    for class in order {
+        if demand.get(class) == 0 {
+            continue;
+        }
+        let mut slots = base.min(demand.get(class));
+        if remainder > 0 && slots < demand.get(class) {
+            slots += 1;
+            remainder -= 1;
+        }
+        allocation.set(class, slots);
+    }
+
+    while allocation.total() < total_slots {
+        let mut progressed = false;
+        for class in class_order(rr_cursor) {
+            if allocation.get(class) >= demand.get(class) {
+                continue;
+            }
+            allocation.set(class, allocation.get(class) + 1);
+            progressed = true;
+            if allocation.total() == total_slots {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    allocation
+}
+
+fn latency_sensitive_allocate(
+    demand: WorkloadDemand,
+    total_slots: usize,
+    policy: BudgetSchedulerPolicy,
+) -> WorkloadAllocation {
+    if total_slots == 0 || demand.total() == 0 {
+        return WorkloadAllocation {
+            ingest: 0,
+            embed: 0,
+            query: 0,
+            mode: BudgetSchedulerMode::LatencySensitive,
+            admission_capped: false,
+            starvation_guard_applied: false,
+            reason_code: "scheduler.plan.latency_sensitive",
+        };
+    }
+
+    let mut allocation = WorkloadAllocation {
+        ingest: 0,
+        embed: 0,
+        query: 0,
+        mode: BudgetSchedulerMode::LatencySensitive,
+        admission_capped: false,
+        starvation_guard_applied: false,
+        reason_code: "scheduler.plan.latency_sensitive",
+    };
+
+    let mut remaining = total_slots;
+    let query_floor =
+        (total_slots.saturating_mul(usize::from(policy.latency_query_reserve_pct))) / 100;
+    let query_reserved = demand
+        .query
+        .min(query_floor.max(usize::from(demand.query > 0)));
+    allocation.query = query_reserved;
+    remaining = remaining.saturating_sub(query_reserved);
+
+    let non_query_demand = WorkloadDemand {
+        ingest: demand.ingest,
+        embed: demand.embed,
+        query: 0,
+    };
+    let non_query_allocation = fair_share_allocate(non_query_demand, remaining, 0);
+    allocation.ingest = non_query_allocation.ingest;
+    allocation.embed = non_query_allocation.embed;
+    remaining = remaining.saturating_sub(non_query_allocation.total());
+
+    if remaining > 0 {
+        let extra_query = demand.query.saturating_sub(allocation.query).min(remaining);
+        allocation.query += extra_query;
+        remaining -= extra_query;
+    }
+
+    if remaining > 0 {
+        for class in [
+            WorkloadClass::Ingest,
+            WorkloadClass::Embed,
+            WorkloadClass::Query,
+        ] {
+            if remaining == 0 {
+                break;
+            }
+            let headroom = demand.get(class).saturating_sub(allocation.get(class));
+            if headroom == 0 {
+                continue;
+            }
+            let take = headroom.min(remaining);
+            allocation.set(class, allocation.get(class) + take);
+            remaining -= take;
+        }
+    }
+
+    allocation
+}
+
+fn cap_demand(
+    mut demand: WorkloadDemand,
+    limit: usize,
+    mode: BudgetSchedulerMode,
+    rr_cursor: usize,
+) -> WorkloadDemand {
+    while demand.total() > limit {
+        let class = match mode {
+            BudgetSchedulerMode::LatencySensitive => {
+                if demand.ingest > 0 {
+                    WorkloadClass::Ingest
+                } else if demand.embed > 0 {
+                    WorkloadClass::Embed
+                } else {
+                    WorkloadClass::Query
+                }
+            }
+            BudgetSchedulerMode::FairShare => highest_demand_class(demand, rr_cursor),
+        };
+        demand.set(class, demand.get(class).saturating_sub(1));
+    }
+    demand
+}
+
+fn highest_demand_class(demand: WorkloadDemand, rr_cursor: usize) -> WorkloadClass {
+    let mut best = WorkloadClass::Ingest;
+    let mut best_value = 0usize;
+    for class in class_order(rr_cursor) {
+        let value = demand.get(class);
+        if value > best_value {
+            best = class;
+            best_value = value;
+        }
+    }
+    best
+}
+
+fn donor_class(allocation: WorkloadAllocation, starving: WorkloadClass) -> Option<WorkloadClass> {
+    let mut donor = None;
+    let mut donor_slots = 0usize;
+    for class in WorkloadClass::all() {
+        if class == starving {
+            continue;
+        }
+        let slots = allocation.get(class);
+        if slots > donor_slots {
+            donor = Some(class);
+            donor_slots = slots;
+        }
+    }
+    donor.filter(|class| allocation.get(*class) > 0)
+}
+
+const fn class_order(rr_cursor: usize) -> [WorkloadClass; WorkloadClass::COUNT] {
+    let classes = WorkloadClass::all();
+    [
+        classes[rr_cursor % WorkloadClass::COUNT],
+        classes[(rr_cursor + 1) % WorkloadClass::COUNT],
+        classes[(rr_cursor + 2) % WorkloadClass::COUNT],
+    ]
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Get the system hostname, or "unknown" if it can't be determined.
@@ -965,6 +1595,172 @@ mod tests {
         assert_eq!(crawl.catalog, AccessMode::ReadWrite);
         assert_eq!(crawl.queue, AccessMode::ReadWrite);
         assert_eq!(crawl.fsvi, AccessMode::None);
+    }
+
+    // ── Workload Budget Scheduler ──
+
+    #[test]
+    fn fair_share_scheduler_balances_active_classes() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 9,
+            admission_limit: 64,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        });
+        let allocation = scheduler.plan_cycle(
+            WorkloadDemand {
+                ingest: 20,
+                embed: 20,
+                query: 20,
+            },
+            BudgetSchedulerMode::FairShare,
+        );
+
+        assert_eq!(allocation.total(), 9);
+        assert_eq!(allocation.ingest, 3);
+        assert_eq!(allocation.embed, 3);
+        assert_eq!(allocation.query, 3);
+        assert_eq!(allocation.reason_code, "scheduler.plan.fair_share");
+    }
+
+    #[test]
+    fn latency_sensitive_scheduler_prioritizes_query_budget() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 10,
+            admission_limit: 32,
+            latency_query_reserve_pct: 60,
+            starvation_guard_cycles: 2,
+        });
+        let allocation = scheduler.plan_cycle(
+            WorkloadDemand {
+                ingest: 10,
+                embed: 10,
+                query: 10,
+            },
+            BudgetSchedulerMode::LatencySensitive,
+        );
+
+        assert_eq!(allocation.total(), 10);
+        assert!(allocation.query >= 6);
+        assert!(allocation.query >= allocation.ingest);
+        assert!(allocation.query >= allocation.embed);
+        assert_eq!(allocation.reason_code, "scheduler.plan.latency_sensitive");
+    }
+
+    #[test]
+    fn starvation_guard_forces_minimum_progress() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 1,
+            admission_limit: 16,
+            latency_query_reserve_pct: 100,
+            starvation_guard_cycles: 1,
+        });
+
+        let first = scheduler.plan_cycle(
+            WorkloadDemand {
+                ingest: 5,
+                embed: 0,
+                query: 5,
+            },
+            BudgetSchedulerMode::LatencySensitive,
+        );
+        assert_eq!(first.query, 1);
+        assert_eq!(first.ingest, 0);
+
+        let second = scheduler.plan_cycle(
+            WorkloadDemand {
+                ingest: 5,
+                embed: 0,
+                query: 5,
+            },
+            BudgetSchedulerMode::LatencySensitive,
+        );
+        assert_eq!(second.ingest, 1);
+        assert!(second.starvation_guard_applied);
+        assert_eq!(
+            second.reason_code,
+            "scheduler.plan.latency_sensitive.starvation_guard"
+        );
+    }
+
+    #[test]
+    fn admission_cap_is_reflected_in_allocation() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 8,
+            admission_limit: 5,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        });
+        let allocation = scheduler.plan_cycle(
+            WorkloadDemand {
+                ingest: 10,
+                embed: 10,
+                query: 10,
+            },
+            BudgetSchedulerMode::FairShare,
+        );
+
+        assert_eq!(allocation.total(), 5);
+        assert!(allocation.admission_capped);
+        assert_eq!(allocation.reason_code, "scheduler.plan.fair_share.capped");
+    }
+
+    #[test]
+    fn permit_cancel_releases_reserved_capacity() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 4,
+            admission_limit: 4,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        });
+        let mut permit = scheduler
+            .reserve(WorkloadClass::Ingest, 3)
+            .expect("reservation should succeed");
+        assert_eq!(permit.state(), PermitState::Reserved);
+        assert_eq!(scheduler.reserved_for(WorkloadClass::Ingest), 3);
+
+        scheduler
+            .cancel_permit(&mut permit)
+            .expect("cancel should release reserved slots");
+        assert_eq!(permit.state(), PermitState::Cancelled);
+        assert_eq!(scheduler.reserved_for(WorkloadClass::Ingest), 0);
+    }
+
+    #[test]
+    fn permit_commit_and_complete_preserve_invariants() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 6,
+            admission_limit: 6,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        });
+        let mut permit = scheduler
+            .reserve(WorkloadClass::Query, 2)
+            .expect("query reservation should succeed");
+        scheduler
+            .commit_permit(&mut permit)
+            .expect("commit should move reservation to inflight");
+
+        assert_eq!(permit.state(), PermitState::Committed);
+        assert_eq!(scheduler.reserved_for(WorkloadClass::Query), 0);
+        assert_eq!(scheduler.inflight_for(WorkloadClass::Query), 2);
+
+        scheduler
+            .complete(WorkloadClass::Query, 2)
+            .expect("completion should release inflight slots");
+        assert_eq!(scheduler.inflight_for(WorkloadClass::Query), 0);
+    }
+
+    #[test]
+    fn reserve_enforces_bounded_admission() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 8,
+            admission_limit: 3,
+            latency_query_reserve_pct: 50,
+            starvation_guard_cycles: 2,
+        });
+        let result = scheduler.reserve(WorkloadClass::Embed, 4);
+        assert_eq!(result, Err("scheduler.reserve.admission_limited"));
     }
 
     // ── Helpers ──

@@ -258,6 +258,10 @@ impl FsfsReasonCode {
     pub const DEGRADE_CPU_CEILING_HIT: &str = "degrade.cpu.ceiling_hit";
     /// Memory ceiling was breached.
     pub const DEGRADE_MEMORY_CEILING_HIT: &str = "degrade.memory.ceiling_hit";
+    /// I/O ceiling was breached.
+    pub const DEGRADE_IO_CEILING_HIT: &str = "degrade.io.ceiling_hit";
+    /// Load average ceiling was breached.
+    pub const DEGRADE_LOAD_CEILING_HIT: &str = "degrade.load.ceiling_hit";
     /// Quality tier was disabled due to resource pressure.
     pub const DEGRADE_QUALITY_DISABLED: &str = "degrade.quality.disabled";
     /// Quality tier was re-enabled after pressure subsided.
@@ -266,6 +270,18 @@ impl FsfsReasonCode {
     pub const DEGRADE_BATCH_REDUCED: &str = "degrade.batch.reduced";
     /// Embedding batch size was restored to normal.
     pub const DEGRADE_BATCH_RESTORED: &str = "degrade.batch.restored";
+    /// State transition was held by hysteresis/anti-flap guard.
+    pub const DEGRADE_TRANSITION_HELD: &str = "degrade.transition.hysteresis_hold";
+    /// Controller recovered to a lower-pressure state.
+    pub const DEGRADE_TRANSITION_RECOVERED: &str = "degrade.transition.recovered";
+    /// Index footprint is healthy relative to configured disk budget.
+    pub const DEGRADE_DISK_WITHIN_BUDGET: &str = "degrade.disk.within_budget";
+    /// Index footprint approached disk budget threshold.
+    pub const DEGRADE_DISK_NEAR_BUDGET: &str = "degrade.disk.near_budget";
+    /// Index footprint exceeded configured disk budget.
+    pub const DEGRADE_DISK_OVER_BUDGET: &str = "degrade.disk.over_budget";
+    /// Index footprint entered critical disk-budget region.
+    pub const DEGRADE_DISK_CRITICAL: &str = "degrade.disk.critical";
 
     // ── Override ────────────────────────────────────────────────────────
 
@@ -498,10 +514,18 @@ pub const ALL_FSFS_REASON_CODES: &[&str] = &[
     FsfsReasonCode::DEGRADE_PROFILE_CHANGED,
     FsfsReasonCode::DEGRADE_CPU_CEILING_HIT,
     FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT,
+    FsfsReasonCode::DEGRADE_IO_CEILING_HIT,
+    FsfsReasonCode::DEGRADE_LOAD_CEILING_HIT,
     FsfsReasonCode::DEGRADE_QUALITY_DISABLED,
     FsfsReasonCode::DEGRADE_QUALITY_RESTORED,
     FsfsReasonCode::DEGRADE_BATCH_REDUCED,
     FsfsReasonCode::DEGRADE_BATCH_RESTORED,
+    FsfsReasonCode::DEGRADE_TRANSITION_HELD,
+    FsfsReasonCode::DEGRADE_TRANSITION_RECOVERED,
+    FsfsReasonCode::DEGRADE_DISK_WITHIN_BUDGET,
+    FsfsReasonCode::DEGRADE_DISK_NEAR_BUDGET,
+    FsfsReasonCode::DEGRADE_DISK_OVER_BUDGET,
+    FsfsReasonCode::DEGRADE_DISK_CRITICAL,
     // Override
     FsfsReasonCode::OVERRIDE_CONFIG_RELOADED,
     FsfsReasonCode::OVERRIDE_FIELD_CHANGED,
@@ -1030,8 +1054,8 @@ mod tests {
 
     #[test]
     fn reason_code_count_matches_expectations() {
-        // 10 discovery + 12 ingest + 10 query + 7 degrade + 7 override
-        // + 7 privacy + 6 durability + 7 lifecycle = 66
-        assert_eq!(ALL_FSFS_REASON_CODES.len(), 66);
+        // 10 discovery + 12 ingest + 10 query + 15 degrade + 7 override
+        // + 7 privacy + 6 durability + 7 lifecycle = 74
+        assert_eq!(ALL_FSFS_REASON_CODES.len(), 74);
     }
 }

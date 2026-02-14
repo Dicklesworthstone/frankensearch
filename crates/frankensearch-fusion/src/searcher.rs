@@ -13,7 +13,8 @@
 //!    and `fast_only` is false).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use asupersync::time::{timeout, wall_now};
@@ -23,16 +24,24 @@ use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::host_adapter::HostAdapter;
 use frankensearch_core::query_class::QueryClass;
-use frankensearch_core::traits::{Embedder, LexicalSearch, Reranker};
+use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, Reranker};
 use frankensearch_core::types::{
     EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics, SearchMode,
     SearchPhase, VectorHit,
+};
+use frankensearch_core::{
+    EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LiveSearchFrame,
+    LiveSearchStreamEmitter, RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase,
+    SearchStreamHealth, TelemetryCorrelation, TelemetryInstance,
 };
 use frankensearch_index::TwoTierIndex;
 
 use crate::blend::{blend_two_tier, compute_rank_changes, kendall_tau};
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
+
+static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Progressive two-tier search orchestrator.
 ///
@@ -61,6 +70,9 @@ pub struct TwoTierSearcher {
     quality_embedder: Option<Arc<dyn Embedder>>,
     lexical: Option<Arc<dyn LexicalSearch>>,
     reranker: Option<Arc<dyn Reranker>>,
+    host_adapter: Option<Arc<dyn HostAdapter>>,
+    runtime_metrics_collector: Arc<RuntimeMetricsCollector>,
+    live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
     canonicalizer: Box<dyn Canonicalizer>,
     config: TwoTierConfig,
 }
@@ -79,6 +91,9 @@ impl TwoTierSearcher {
             quality_embedder: None,
             lexical: None,
             reranker: None,
+            host_adapter: None,
+            runtime_metrics_collector: Arc::new(RuntimeMetricsCollector::default()),
+            live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
             canonicalizer: Box::new(DefaultCanonicalizer::default()),
             config,
         }
@@ -105,11 +120,50 @@ impl TwoTierSearcher {
         self
     }
 
+    /// Set the host adapter used to receive canonical telemetry envelopes.
+    #[must_use]
+    pub fn with_host_adapter(mut self, host_adapter: Arc<dyn HostAdapter>) -> Self {
+        self.host_adapter = Some(host_adapter);
+        self
+    }
+
+    /// Override the runtime telemetry collector used for canonical envelope assembly.
+    #[must_use]
+    pub fn with_runtime_metrics_collector(
+        mut self,
+        collector: Arc<RuntimeMetricsCollector>,
+    ) -> Self {
+        self.runtime_metrics_collector = collector;
+        self
+    }
+
+    /// Override the live-search stream emitter used for timeline/live-feed frames.
+    #[must_use]
+    pub fn with_live_search_stream_emitter(
+        mut self,
+        emitter: Arc<LiveSearchStreamEmitter>,
+    ) -> Self {
+        self.live_search_stream_emitter = emitter;
+        self
+    }
+
     /// Override the query canonicalizer.
     #[must_use]
     pub fn with_canonicalizer(mut self, canonicalizer: Box<dyn Canonicalizer>) -> Self {
         self.canonicalizer = canonicalizer;
         self
+    }
+
+    /// Snapshot live-search stream health counters.
+    #[must_use]
+    pub fn live_search_stream_health(&self) -> SearchStreamHealth {
+        self.live_search_stream_emitter.health()
+    }
+
+    /// Drain buffered live-search frames from oldest to newest.
+    #[must_use]
+    pub fn drain_live_search_stream(&self, max_items: usize) -> Vec<LiveSearchFrame> {
+        self.live_search_stream_emitter.drain(max_items)
     }
 
     /// Execute progressive search, calling `on_phase` as results become available.
@@ -173,6 +227,11 @@ impl TwoTierSearcher {
         let query_class = QueryClass::classify(semantic_query);
         metrics.query_class = Some(query_class);
         metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
+        let telemetry_root_request_id = self
+            .host_adapter
+            .as_ref()
+            .map(|_| next_telemetry_identifier("root"));
+        let mut telemetry_initial_event_id: Option<String> = None;
 
         // Phase 1: Initial (fast tier).
         let phase1_start = Instant::now();
@@ -185,6 +244,7 @@ impl TwoTierSearcher {
                 query_class,
                 &text_fn,
                 &mut metrics,
+                telemetry_root_request_id.as_deref(),
             )
             .await;
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
@@ -201,10 +261,25 @@ impl TwoTierSearcher {
         let phase1_has_fast_candidates = initial_hits
             .iter()
             .any(|result| result.fast_score.is_some());
+        let initial_latency = phase1_start.elapsed();
+
+        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+            telemetry_initial_event_id = self.emit_search_telemetry(
+                semantic_query,
+                query_class,
+                SearchEventPhase::Initial,
+                initial_hits.len(),
+                metrics.lexical_candidates,
+                metrics.semantic_candidates,
+                initial_latency,
+                root_request_id,
+                None,
+            );
+        }
 
         on_phase(SearchPhase::Initial {
             results: initial_results,
-            latency: phase1_start.elapsed(),
+            latency: initial_latency,
             metrics: PhaseMetrics {
                 embedder_id: self.fast_embedder.id().to_owned(),
                 vectors_searched: self.index.doc_count(),
@@ -226,6 +301,8 @@ impl TwoTierSearcher {
                 &initial_hits,
                 &text_fn,
                 &mut metrics,
+                telemetry_root_request_id.as_deref(),
+                telemetry_initial_event_id.clone(),
             ));
             let timeout_budget = Duration::from_millis(self.config.quality_timeout_ms);
             let timeout_start = cx
@@ -236,28 +313,55 @@ impl TwoTierSearcher {
 
             match phase2_result {
                 Err(_elapsed) => {
-                    metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+                    let phase2_latency = phase2_start.elapsed();
+                    metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                     let timeout_error = SearchError::SearchTimeout {
-                        elapsed_ms: u64::try_from(phase2_start.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
+                        elapsed_ms: u64::try_from(phase2_latency.as_millis()).unwrap_or(u64::MAX),
                         budget_ms: self.config.quality_timeout_ms,
                     };
                     metrics.skip_reason = Some(timeout_error.to_string());
                     self.export_error(&timeout_error);
+                    if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                        let _ = self.emit_search_telemetry(
+                            semantic_query,
+                            query_class,
+                            SearchEventPhase::RefinementFailed,
+                            initial_hits.len(),
+                            metrics.lexical_candidates,
+                            metrics.semantic_candidates,
+                            phase2_latency,
+                            root_request_id,
+                            telemetry_initial_event_id.clone(),
+                        );
+                    }
                     on_phase(SearchPhase::RefinementFailed {
                         initial_results: initial_hits,
                         error: timeout_error,
-                        latency: phase2_start.elapsed(),
+                        latency: phase2_latency,
                     });
                 }
                 Ok(phase2_outcome) => match phase2_outcome {
                     Ok(refined_results) => {
+                        let phase2_latency = phase2_start.elapsed();
                         let refined_count = refined_results.len();
-                        metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+                        metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
+                        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                            let _ = self.emit_search_telemetry(
+                                semantic_query,
+                                query_class,
+                                SearchEventPhase::Refined,
+                                refined_count,
+                                metrics.lexical_candidates,
+                                metrics.semantic_candidates,
+                                phase2_latency,
+                                root_request_id,
+                                telemetry_initial_event_id.clone(),
+                            );
+                        }
                         self.export_search_metrics(query_class, &metrics, refined_count, true);
                         on_phase(SearchPhase::Refined {
                             results: refined_results,
-                            latency: phase2_start.elapsed(),
+                            latency: phase2_latency,
                             metrics: PhaseMetrics {
                                 embedder_id: self
                                     .quality_embedder
@@ -275,13 +379,27 @@ impl TwoTierSearcher {
                         return Err(SearchError::Cancelled { phase, reason });
                     }
                     Err(err) => {
-                        metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+                        let phase2_latency = phase2_start.elapsed();
+                        metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         metrics.skip_reason = Some(format!("{err}"));
                         self.export_error(&err);
+                        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                            let _ = self.emit_search_telemetry(
+                                semantic_query,
+                                query_class,
+                                SearchEventPhase::RefinementFailed,
+                                initial_hits.len(),
+                                metrics.lexical_candidates,
+                                metrics.semantic_candidates,
+                                phase2_latency,
+                                root_request_id,
+                                telemetry_initial_event_id.clone(),
+                            );
+                        }
                         on_phase(SearchPhase::RefinementFailed {
                             initial_results: initial_hits,
                             error: err,
-                            latency: phase2_start.elapsed(),
+                            latency: phase2_latency,
                         });
                     }
                 },
@@ -355,7 +473,7 @@ impl TwoTierSearcher {
     }
 
     /// Run Phase 1: fast embedding + optional lexical + RRF fusion.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_phase1(
         &self,
         cx: &Cx,
@@ -365,6 +483,7 @@ impl TwoTierSearcher {
         query_class: QueryClass,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
+        root_request_id: Option<&str>,
     ) -> SearchResult<Vec<ScoredResult>> {
         let base_candidates = candidate_count(k, 0, self.config.candidate_multiplier);
 
@@ -391,7 +510,8 @@ impl TwoTierSearcher {
         // Fast embedding.
         let embed_start = Instant::now();
         let fast_embed_result = self.fast_embedder.embed(cx, semantic_query).await;
-        metrics.fast_embed_ms = embed_start.elapsed().as_secs_f64() * 1000.0;
+        let fast_embed_elapsed = embed_start.elapsed();
+        metrics.fast_embed_ms = fast_embed_elapsed.as_secs_f64() * 1000.0;
 
         // Lexical search (runs regardless of embedding success).
         let mut lexical_results = self
@@ -413,6 +533,16 @@ impl TwoTierSearcher {
                     1,
                     metrics.fast_embed_ms,
                 );
+                if let Some(root_request_id) = root_request_id {
+                    let _ = self.emit_embedding_telemetry(
+                        self.fast_embedder.as_ref(),
+                        EmbeddingStage::Fast,
+                        EmbeddingStatus::Completed,
+                        fast_embed_elapsed,
+                        root_request_id,
+                        None,
+                    );
+                }
                 // Vector search.
                 let search_start = Instant::now();
                 let fast_hits = self.index.search_fast(&query_vec, semantic_budget)?;
@@ -438,6 +568,21 @@ impl TwoTierSearcher {
                 Ok(results)
             }
             Err(embed_err) => {
+                if let Some(root_request_id) = root_request_id {
+                    let status = if matches!(&embed_err, SearchError::Cancelled { .. }) {
+                        EmbeddingStatus::Cancelled
+                    } else {
+                        EmbeddingStatus::Failed
+                    };
+                    let _ = self.emit_embedding_telemetry(
+                        self.fast_embedder.as_ref(),
+                        EmbeddingStage::Fast,
+                        status,
+                        fast_embed_elapsed,
+                        root_request_id,
+                        None,
+                    );
+                }
                 if matches!(embed_err, SearchError::Cancelled { .. }) {
                     return Err(embed_err);
                 }
@@ -457,7 +602,7 @@ impl TwoTierSearcher {
     }
 
     /// Run Phase 2: quality embedding + blend + optional rerank.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_phase2(
         &self,
         cx: &Cx,
@@ -466,6 +611,8 @@ impl TwoTierSearcher {
         initial_results: &[ScoredResult],
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
+        root_request_id: Option<&str>,
+        parent_event_id: Option<String>,
     ) -> SearchResult<Vec<ScoredResult>> {
         let quality_embedder =
             self.quality_embedder
@@ -479,16 +626,43 @@ impl TwoTierSearcher {
         let embed_start = Instant::now();
         let quality_vec = match quality_embedder.embed(cx, query).await {
             Ok(quality_vec) => {
-                metrics.quality_embed_ms = embed_start.elapsed().as_secs_f64() * 1000.0;
+                let quality_embed_elapsed = embed_start.elapsed();
+                metrics.quality_embed_ms = quality_embed_elapsed.as_secs_f64() * 1000.0;
                 self.export_embedding_metrics(
                     quality_embedder.as_ref(),
                     1,
                     metrics.quality_embed_ms,
                 );
+                if let Some(root_request_id) = root_request_id {
+                    let _ = self.emit_embedding_telemetry(
+                        quality_embedder.as_ref(),
+                        EmbeddingStage::Quality,
+                        EmbeddingStatus::Completed,
+                        quality_embed_elapsed,
+                        root_request_id,
+                        parent_event_id.clone(),
+                    );
+                }
                 quality_vec
             }
             Err(err) => {
-                metrics.quality_embed_ms = embed_start.elapsed().as_secs_f64() * 1000.0;
+                let quality_embed_elapsed = embed_start.elapsed();
+                metrics.quality_embed_ms = quality_embed_elapsed.as_secs_f64() * 1000.0;
+                if let Some(root_request_id) = root_request_id {
+                    let status = if matches!(&err, SearchError::Cancelled { .. }) {
+                        EmbeddingStatus::Cancelled
+                    } else {
+                        EmbeddingStatus::Failed
+                    };
+                    let _ = self.emit_embedding_telemetry(
+                        quality_embedder.as_ref(),
+                        EmbeddingStage::Quality,
+                        status,
+                        quality_embed_elapsed,
+                        root_request_id,
+                        parent_event_id,
+                    );
+                }
                 return Err(err);
             }
         };
@@ -693,6 +867,106 @@ impl TwoTierSearcher {
     fn should_run_quality(&self) -> bool {
         !self.config.fast_only && self.quality_embedder.is_some()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_search_telemetry(
+        &self,
+        query_text: &str,
+        query_class: QueryClass,
+        phase: SearchEventPhase,
+        result_count: usize,
+        lexical_count: usize,
+        semantic_count: usize,
+        latency: Duration,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+    ) -> Option<String> {
+        let host_adapter = self.host_adapter.as_ref()?;
+
+        let event_id = next_telemetry_identifier("evt");
+        let telemetry_instance = telemetry_instance_for_adapter(host_adapter.as_ref());
+        let telemetry_correlation = TelemetryCorrelation {
+            event_id: event_id.clone(),
+            root_request_id: root_request_id.to_owned(),
+            parent_event_id,
+        };
+
+        let envelope = self.runtime_metrics_collector.emit_search(
+            telemetry_timestamp_now(),
+            telemetry_instance,
+            telemetry_correlation,
+            SearchCollectorSample {
+                query_text: query_text.to_owned(),
+                query_class,
+                phase,
+                result_count,
+                lexical_count,
+                semantic_count,
+                latency_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+                memory_bytes: None,
+            },
+        );
+
+        if let Err(err) = self
+            .live_search_stream_emitter
+            .publish_search(envelope.clone())
+        {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "live search stream publish failed");
+        }
+
+        if let Err(err) = host_adapter.emit_telemetry(&envelope) {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+        }
+
+        Some(event_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_embedding_telemetry(
+        &self,
+        embedder: &dyn Embedder,
+        stage: EmbeddingStage,
+        status: EmbeddingStatus,
+        duration: Duration,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+    ) -> Option<String> {
+        let host_adapter = self.host_adapter.as_ref()?;
+
+        let event_id = next_telemetry_identifier("evt");
+        let telemetry_instance = telemetry_instance_for_adapter(host_adapter.as_ref());
+        let telemetry_correlation = TelemetryCorrelation {
+            event_id: event_id.clone(),
+            root_request_id: root_request_id.to_owned(),
+            parent_event_id,
+        };
+
+        let envelope = self.runtime_metrics_collector.emit_embedding(
+            telemetry_timestamp_now(),
+            telemetry_instance,
+            telemetry_correlation,
+            EmbeddingCollectorSample {
+                job_id: format!("embed-{event_id}"),
+                queue_depth: 0,
+                doc_count: 1,
+                stage,
+                embedder_id: embedder.id().to_owned(),
+                tier: embedder_tier_for_stage(stage, embedder.category()),
+                dimension: embedder.dimension(),
+                status,
+                duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            },
+        );
+
+        if let Err(err) = host_adapter.emit_telemetry(&envelope) {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+        }
+
+        Some(event_id)
+    }
 }
 
 // Implement Debug manually since trait objects don't derive Debug.
@@ -706,8 +980,51 @@ impl std::fmt::Debug for TwoTierSearcher {
             )
             .field("has_lexical", &self.lexical.is_some())
             .field("has_reranker", &self.reranker.is_some())
+            .field("has_host_adapter", &self.host_adapter.is_some())
             .field("config", &self.config)
             .finish_non_exhaustive()
+    }
+}
+
+fn next_telemetry_identifier(prefix: &str) -> String {
+    let sequence = TELEMETRY_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{sequence:020}")
+}
+
+fn telemetry_timestamp_now() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.to_string()
+}
+
+fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryInstance {
+    let identity = host_adapter.identity();
+    let host_name = std::env::var("HOSTNAME")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_owned());
+    let instance_id = identity
+        .instance_uuid
+        .unwrap_or_else(|| format!("{}-{}", identity.adapter_id, std::process::id()));
+    TelemetryInstance {
+        instance_id,
+        project_key: identity.host_project,
+        host_name,
+        pid: Some(std::process::id()),
+    }
+}
+
+const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory) -> EmbedderTier {
+    match stage {
+        EmbeddingStage::Quality => EmbedderTier::Quality,
+        EmbeddingStage::Fast | EmbeddingStage::Background => match category {
+            ModelCategory::HashEmbedder => EmbedderTier::Hash,
+            ModelCategory::StaticEmbedder => EmbedderTier::Fast,
+            ModelCategory::TransformerEmbedder => EmbedderTier::Quality,
+        },
     }
 }
 
@@ -828,6 +1145,9 @@ mod tests {
 
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
+    use frankensearch_core::{
+        AdapterIdentity, AdapterLifecycleEvent, HostAdapter, TelemetryEnvelope, TelemetryEvent,
+    };
 
     use super::*;
 
@@ -1073,6 +1393,57 @@ mod tests {
 
         fn doc_count(&self) -> usize {
             0
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingHostAdapter {
+        identity: AdapterIdentity,
+        telemetry: Mutex<Vec<TelemetryEnvelope>>,
+        lifecycle: Mutex<Vec<AdapterLifecycleEvent>>,
+    }
+
+    impl RecordingHostAdapter {
+        fn new(host_project: &str) -> Self {
+            Self {
+                identity: AdapterIdentity {
+                    adapter_id: "test-host-adapter".to_owned(),
+                    adapter_version: "1.0.0".to_owned(),
+                    host_project: host_project.to_owned(),
+                    runtime_role: Some("query".to_owned()),
+                    instance_uuid: Some("test-instance-uuid".to_owned()),
+                    telemetry_schema_version: 1,
+                    redaction_policy_version: "v1".to_owned(),
+                },
+                telemetry: Mutex::new(Vec::new()),
+                lifecycle: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn telemetry_events(&self) -> Vec<TelemetryEnvelope> {
+            self.telemetry.lock().expect("telemetry lock").clone()
+        }
+    }
+
+    impl HostAdapter for RecordingHostAdapter {
+        fn identity(&self) -> AdapterIdentity {
+            self.identity.clone()
+        }
+
+        fn emit_telemetry(&self, envelope: &TelemetryEnvelope) -> SearchResult<()> {
+            self.telemetry
+                .lock()
+                .expect("telemetry lock")
+                .push(envelope.clone());
+            Ok(())
+        }
+
+        fn on_lifecycle_event(&self, event: &AdapterLifecycleEvent) -> SearchResult<()> {
+            self.lifecycle
+                .lock()
+                .expect("lifecycle lock")
+                .push(event.clone());
+            Ok(())
         }
     }
 
@@ -1720,6 +2091,286 @@ mod tests {
                 lexical_only.fast_score.is_some_and(|score| score > 0.0_f32),
                 "lexical-only refined result should preserve positive phase-1 signal"
             );
+        });
+    }
+
+    #[test]
+    fn host_adapter_receives_initial_and_refined_search_events() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
+
+            let _ = searcher
+                .search(&cx, "test query", 5, |_| None, |_| {})
+                .await
+                .expect("search should succeed");
+
+            let events = adapter.telemetry_events();
+            let search_events: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    TelemetryEvent::Search {
+                        correlation, query, ..
+                    } => Some((correlation, query)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                search_events.len(),
+                2,
+                "expected initial + refined search telemetry"
+            );
+
+            let (initial_event_id, root_request_id) = {
+                let (correlation, query) = search_events[0];
+                assert_eq!(query.phase, SearchEventPhase::Initial);
+                (
+                    correlation.event_id.clone(),
+                    correlation.root_request_id.clone(),
+                )
+            };
+            assert!(
+                !initial_event_id.is_empty(),
+                "initial event id should be present"
+            );
+            assert!(
+                !root_request_id.is_empty(),
+                "root request id should be present"
+            );
+
+            let saw_refined_event = {
+                let (correlation, query) = search_events[1];
+                assert_eq!(query.phase, SearchEventPhase::Refined);
+                assert_eq!(correlation.root_request_id, root_request_id);
+                assert_eq!(
+                    correlation.parent_event_id.as_deref(),
+                    Some(initial_event_id.as_str())
+                );
+                true
+            };
+            assert!(saw_refined_event, "second event should be a search event");
+        });
+    }
+
+    #[test]
+    fn host_adapter_receives_refinement_failed_search_event() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+            let config = TwoTierConfig {
+                quality_timeout_ms: 0,
+                ..TwoTierConfig::default()
+            };
+
+            let searcher = TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
+
+            let _ = searcher
+                .search(&cx, "timeout query", 5, |_| None, |_| {})
+                .await
+                .expect("search should degrade on timeout without failing");
+
+            let events = adapter.telemetry_events();
+            let search_events: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    TelemetryEvent::Search { query, results, .. } => Some((query, results)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                search_events.len(),
+                2,
+                "expected initial + refinement_failed search events"
+            );
+
+            let initial_result_count = {
+                let (query, results) = search_events[0];
+                assert_eq!(query.phase, SearchEventPhase::Initial);
+                Some(results.result_count)
+            };
+            assert!(
+                initial_result_count.is_some(),
+                "first event should be a search event"
+            );
+            let initial_result_count = initial_result_count.unwrap_or_default();
+
+            let saw_refinement_failed = {
+                let (query, results) = search_events[1];
+                assert_eq!(query.phase, SearchEventPhase::RefinementFailed);
+                assert_eq!(results.result_count, initial_result_count);
+                true
+            };
+            assert!(
+                saw_refinement_failed,
+                "second event should be refinement_failed"
+            );
+        });
+    }
+
+    #[test]
+    fn host_adapter_receives_fast_and_quality_embedding_events() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
+
+            let _ = searcher
+                .search(&cx, "embed telemetry", 5, |_| None, |_| {})
+                .await
+                .expect("search should succeed");
+
+            let events = adapter.telemetry_events();
+            let mut root_request_id = String::new();
+            for event in &events {
+                if let TelemetryEvent::Search { correlation, .. } = &event.event {
+                    root_request_id = correlation.root_request_id.clone();
+                    break;
+                }
+            }
+            assert!(
+                !root_request_id.is_empty(),
+                "search events should provide root request id"
+            );
+
+            let embedding_events: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    TelemetryEvent::Embedding {
+                        correlation,
+                        job,
+                        embedder,
+                        status,
+                        ..
+                    } => Some((correlation, job, embedder, status)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                embedding_events.len(),
+                2,
+                "expected fast + quality embedding events"
+            );
+
+            let fast_event = embedding_events
+                .iter()
+                .find(|(_, job, _, _)| job.stage == EmbeddingStage::Fast);
+            assert!(fast_event.is_some(), "fast embedding event missing");
+            let (fast_correlation, fast_job, fast_embedder, fast_status) =
+                fast_event.expect("fast event should exist");
+            assert_eq!(**fast_status, EmbeddingStatus::Completed);
+            assert_eq!(fast_embedder.id, "fast");
+            assert_eq!(fast_embedder.tier, EmbedderTier::Fast);
+            assert_eq!(fast_job.doc_count, 1);
+            assert_eq!(fast_job.queue_depth, 0);
+            assert_eq!(fast_correlation.root_request_id, root_request_id);
+            assert!(!fast_job.job_id.is_empty(), "fast job id should be present");
+
+            let quality_event = embedding_events
+                .iter()
+                .find(|(_, job, _, _)| job.stage == EmbeddingStage::Quality);
+            assert!(quality_event.is_some(), "quality embedding event missing");
+            let (quality_correlation, quality_job, quality_embedder, quality_status) =
+                quality_event.expect("quality event should exist");
+            assert_eq!(**quality_status, EmbeddingStatus::Completed);
+            assert_eq!(quality_embedder.id, "quality");
+            assert_eq!(quality_embedder.tier, EmbedderTier::Quality);
+            assert_eq!(quality_job.doc_count, 1);
+            assert_eq!(quality_job.queue_depth, 0);
+            assert_eq!(quality_correlation.root_request_id, root_request_id);
+            assert!(
+                !quality_job.job_id.is_empty(),
+                "quality job id should be present"
+            );
+
+            let snapshot = searcher.runtime_metrics_collector.snapshot();
+            assert_eq!(snapshot.embedding_events_emitted, 2);
+        });
+    }
+
+    #[test]
+    fn host_adapter_receives_failed_fast_embedding_event() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_lexical(lexical)
+                .with_host_adapter(adapter.clone());
+
+            let _ = searcher
+                .search(&cx, "fallback query", 5, |_| None, |_| {})
+                .await
+                .expect("search should fall back to lexical-only results");
+
+            let events = adapter.telemetry_events();
+            let embedding_events: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    TelemetryEvent::Embedding {
+                        job,
+                        embedder,
+                        status,
+                        ..
+                    } => Some((job, embedder, status)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                embedding_events.len(),
+                1,
+                "expected one failed fast embedding event"
+            );
+
+            let (job, embedder, status) = embedding_events[0];
+            assert_eq!(job.stage, EmbeddingStage::Fast);
+            assert_eq!(embedder.id, "failing-embedder");
+            assert_eq!(embedder.tier, EmbedderTier::Hash);
+            assert_eq!(*status, EmbeddingStatus::Failed);
+
+            let snapshot = searcher.runtime_metrics_collector.snapshot();
+            assert_eq!(snapshot.embedding_events_emitted, 1);
+        });
+    }
+
+    #[test]
+    fn live_search_stream_health_reflects_emitted_search_events() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_host_adapter(adapter);
+
+            let _ = searcher
+                .search(&cx, "stream health", 5, |_| None, |_| {})
+                .await
+                .expect("search should succeed");
+
+            let health = searcher.live_search_stream_health();
+            assert_eq!(health.emitted_total, 1);
+            assert_eq!(health.buffered, 1);
+
+            let drained = searcher.drain_live_search_stream(10);
+            assert_eq!(drained.len(), 1);
+            let drained_health = searcher.live_search_stream_health();
+            assert_eq!(drained_health.buffered, 0);
         });
     }
 

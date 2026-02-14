@@ -20,6 +20,9 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::config::PressureConfig;
+use crate::evidence::FsfsReasonCode;
+
 // ─── Daemon Phase ───────────────────────────────────────────────────────────
 
 /// Lifecycle phase of the fsfs daemon.
@@ -187,6 +190,682 @@ pub struct ResourceUsage {
     /// Number of open file descriptors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_fds: Option<u32>,
+    /// Current index/storage footprint in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_bytes: Option<u64>,
+    /// Vector index footprint (FSVI/WAL) in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_index_bytes: Option<u64>,
+    /// Lexical index footprint (Tantivy) in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_index_bytes: Option<u64>,
+    /// Catalog/database footprint in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_bytes: Option<u64>,
+    /// Embedding cache footprint in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_cache_bytes: Option<u64>,
+}
+
+impl ResourceUsage {
+    /// Build a resource usage snapshot from storage-domain byte totals.
+    #[must_use]
+    pub const fn from_index_storage(storage: IndexStorageBreakdown) -> Self {
+        Self {
+            rss_bytes: None,
+            thread_count: None,
+            open_fds: None,
+            index_bytes: Some(storage.total_bytes()),
+            vector_index_bytes: Some(storage.vector_index_bytes),
+            lexical_index_bytes: Some(storage.lexical_index_bytes),
+            catalog_bytes: Some(storage.catalog_bytes),
+            embedding_cache_bytes: Some(storage.embedding_cache_bytes),
+        }
+    }
+
+    /// Effective index footprint used for budget and limit checks.
+    ///
+    /// Prefers explicit `index_bytes`, then falls back to summing domain fields.
+    #[must_use]
+    pub fn effective_index_bytes(&self) -> Option<u64> {
+        self.index_bytes.or_else(|| {
+            let mut had_component = false;
+            let mut total = 0_u64;
+            for bytes in [
+                self.vector_index_bytes,
+                self.lexical_index_bytes,
+                self.catalog_bytes,
+                self.embedding_cache_bytes,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                had_component = true;
+                total = total.saturating_add(bytes);
+            }
+            had_component.then_some(total)
+        })
+    }
+}
+
+/// Cross-domain index/storage footprint used for budget accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexStorageBreakdown {
+    /// Vector index footprint (FSVI/WAL) in bytes.
+    pub vector_index_bytes: u64,
+    /// Lexical index footprint (Tantivy) in bytes.
+    pub lexical_index_bytes: u64,
+    /// Catalog/database footprint in bytes.
+    pub catalog_bytes: u64,
+    /// Embedding cache footprint in bytes.
+    pub embedding_cache_bytes: u64,
+}
+
+impl IndexStorageBreakdown {
+    /// Total storage footprint across all index domains.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.vector_index_bytes
+            .saturating_add(self.lexical_index_bytes)
+            .saturating_add(self.catalog_bytes)
+            .saturating_add(self.embedding_cache_bytes)
+    }
+}
+
+/// Disk-budget stage derived from index footprint vs configured budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskBudgetStage {
+    Normal,
+    NearLimit,
+    OverLimit,
+    Critical,
+}
+
+/// Recommended controller action for the current disk-budget stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskBudgetAction {
+    Continue,
+    ThrottleIngest,
+    EvictLowUtility,
+    PauseWrites,
+}
+
+/// Snapshot of disk-budget state for scheduler/UX/evidence consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskBudgetSnapshot {
+    pub budget_bytes: u64,
+    pub used_bytes: u64,
+    /// Budget utilization in per-mille (1000 == 100% of budget).
+    pub usage_per_mille: u16,
+    pub stage: DiskBudgetStage,
+    pub action: DiskBudgetAction,
+    pub reason_code: &'static str,
+}
+
+/// Policy thresholds for staged disk-budget responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskBudgetPolicy {
+    /// Enter near-limit mode at this per-mille of budget.
+    pub near_limit_per_mille: u16,
+    /// Enter critical mode at this per-mille of budget.
+    pub critical_per_mille: u16,
+}
+
+impl Default for DiskBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            near_limit_per_mille: 850,
+            critical_per_mille: 1100,
+        }
+    }
+}
+
+impl DiskBudgetPolicy {
+    /// Derive a staged disk-budget response for one footprint reading.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn evaluate(&self, used_bytes: u64, budget_bytes: u64) -> DiskBudgetSnapshot {
+        debug_assert!(budget_bytes > 0, "budget_bytes must be non-zero");
+        let usage_per_mille_u64 = used_bytes
+            .saturating_mul(1000)
+            .saturating_add(budget_bytes.saturating_sub(1))
+            / budget_bytes;
+        let usage_per_mille = usage_per_mille_u64.min(u64::from(u16::MAX)) as u16;
+
+        let (stage, action, reason_code) = if usage_per_mille >= self.critical_per_mille {
+            (
+                DiskBudgetStage::Critical,
+                DiskBudgetAction::PauseWrites,
+                FsfsReasonCode::DEGRADE_DISK_CRITICAL,
+            )
+        } else if used_bytes > budget_bytes {
+            (
+                DiskBudgetStage::OverLimit,
+                DiskBudgetAction::EvictLowUtility,
+                FsfsReasonCode::DEGRADE_DISK_OVER_BUDGET,
+            )
+        } else if usage_per_mille >= self.near_limit_per_mille {
+            (
+                DiskBudgetStage::NearLimit,
+                DiskBudgetAction::ThrottleIngest,
+                FsfsReasonCode::DEGRADE_DISK_NEAR_BUDGET,
+            )
+        } else {
+            (
+                DiskBudgetStage::Normal,
+                DiskBudgetAction::Continue,
+                FsfsReasonCode::DEGRADE_DISK_WITHIN_BUDGET,
+            )
+        };
+
+        DiskBudgetSnapshot {
+            budget_bytes,
+            used_bytes,
+            usage_per_mille,
+            stage,
+            action,
+            reason_code,
+        }
+    }
+}
+
+// ─── Pressure Sensing & Control-State Model ────────────────────────────────
+
+/// Stable host-pressure control states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureState {
+    Normal,
+    Constrained,
+    Degraded,
+    Emergency,
+}
+
+impl PressureState {
+    #[must_use]
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Constrained => 1,
+            Self::Degraded => 2,
+            Self::Emergency => 3,
+        }
+    }
+}
+
+/// One pressure telemetry sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressureSignals {
+    pub cpu_pct: f64,
+    pub memory_pct: f64,
+    pub io_bytes_per_sec: f64,
+    pub load_avg_1m: f64,
+}
+
+impl PressureSignals {
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            cpu_pct: 0.0,
+            memory_pct: 0.0,
+            io_bytes_per_sec: 0.0,
+            load_avg_1m: 0.0,
+        }
+    }
+}
+
+/// Threshold bundle used to map smoothed signals into control states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressureThresholds {
+    pub constrained_cpu_pct: f64,
+    pub degraded_cpu_pct: f64,
+    pub emergency_cpu_pct: f64,
+    pub constrained_memory_pct: f64,
+    pub degraded_memory_pct: f64,
+    pub emergency_memory_pct: f64,
+    pub constrained_io_bytes_per_sec: f64,
+    pub degraded_io_bytes_per_sec: f64,
+    pub emergency_io_bytes_per_sec: f64,
+    pub constrained_load_avg_1m: f64,
+    pub degraded_load_avg_1m: f64,
+    pub emergency_load_avg_1m: f64,
+}
+
+impl PressureThresholds {
+    /// Build profile-aware thresholds from fsfs pressure config.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn from_config(config: &PressureConfig) -> Self {
+        let cpu_base = f64::from(config.cpu_ceiling_pct);
+        let io_base = config.io_ceiling_bytes_per_sec as f64;
+        let load_base = f64::from(config.load_ceiling_per_mille) / 1000.0;
+        let (memory_degraded_pct, constrained_pad, emergency_pad): (f64, f64, f64) =
+            match config.profile {
+                crate::config::PressureProfile::Strict => (75.0, 15.0, 8.0),
+                crate::config::PressureProfile::Performance => (85.0, 10.0, 10.0),
+                crate::config::PressureProfile::Degraded => (90.0, 8.0, 7.0),
+            };
+
+        Self {
+            constrained_cpu_pct: (cpu_base - 10.0).max(1.0),
+            degraded_cpu_pct: cpu_base,
+            emergency_cpu_pct: (cpu_base + 10.0).min(100.0),
+            constrained_memory_pct: (memory_degraded_pct - constrained_pad).max(1.0),
+            degraded_memory_pct: memory_degraded_pct,
+            emergency_memory_pct: (memory_degraded_pct + emergency_pad).min(99.0),
+            constrained_io_bytes_per_sec: io_base * 0.8,
+            degraded_io_bytes_per_sec: io_base,
+            emergency_io_bytes_per_sec: io_base * 1.5,
+            constrained_load_avg_1m: (load_base * 0.75).max(0.1),
+            degraded_load_avg_1m: load_base.max(0.1),
+            emergency_load_avg_1m: (load_base * 1.35).max(0.2),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressureStateUpdate {
+    pub state: PressureState,
+    pub target_state: PressureState,
+    pub transition_reason_code: Option<&'static str>,
+    pub smoothed: PressureSignals,
+    pub consecutive_observations: usize,
+}
+
+/// Anti-flap pressure-state machine with EWMA smoothing.
+#[derive(Debug, Clone)]
+pub struct PressureStateMachine {
+    state: PressureState,
+    alpha: f64,
+    anti_flap_readings: usize,
+    thresholds: PressureThresholds,
+    smoothed: Option<PressureSignals>,
+    pending_state: Option<PressureState>,
+    pending_count: usize,
+}
+
+impl PressureStateMachine {
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn from_config(config: &PressureConfig) -> Self {
+        let alpha = f64::from(config.ewma_alpha_per_mille) / 1000.0;
+        Self {
+            state: PressureState::Normal,
+            alpha,
+            anti_flap_readings: usize::from(config.anti_flap_readings.max(1)),
+            thresholds: PressureThresholds::from_config(config),
+            smoothed: None,
+            pending_state: None,
+            pending_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> PressureState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn thresholds(&self) -> &PressureThresholds {
+        &self.thresholds
+    }
+
+    #[must_use]
+    pub const fn smoothed(&self) -> Option<PressureSignals> {
+        self.smoothed
+    }
+
+    /// Ingest one sample and derive the stable control state.
+    pub fn observe(&mut self, sample: PressureSignals) -> PressureStateUpdate {
+        let smoothed = if let Some(previous) = self.smoothed {
+            PressureSignals {
+                cpu_pct: ewma(previous.cpu_pct, sample.cpu_pct, self.alpha),
+                memory_pct: ewma(previous.memory_pct, sample.memory_pct, self.alpha),
+                io_bytes_per_sec: ewma(
+                    previous.io_bytes_per_sec,
+                    sample.io_bytes_per_sec,
+                    self.alpha,
+                ),
+                load_avg_1m: ewma(previous.load_avg_1m, sample.load_avg_1m, self.alpha),
+            }
+        } else {
+            sample
+        };
+        self.smoothed = Some(smoothed);
+
+        let (target_state, target_reason_code) = self.evaluate_target(smoothed);
+        if target_state == self.state {
+            self.pending_state = None;
+            self.pending_count = 0;
+            return PressureStateUpdate {
+                state: self.state,
+                target_state,
+                transition_reason_code: None,
+                smoothed,
+                consecutive_observations: 0,
+            };
+        }
+
+        if self.pending_state == Some(target_state) {
+            self.pending_count = self.pending_count.saturating_add(1);
+        } else {
+            self.pending_state = Some(target_state);
+            self.pending_count = 1;
+        }
+
+        if self.pending_count < self.anti_flap_readings {
+            return PressureStateUpdate {
+                state: self.state,
+                target_state,
+                transition_reason_code: Some(FsfsReasonCode::DEGRADE_TRANSITION_HELD),
+                smoothed,
+                consecutive_observations: self.pending_count,
+            };
+        }
+
+        let previous = self.state;
+        self.state = target_state;
+        self.pending_state = None;
+        self.pending_count = 0;
+
+        let transition_reason_code = if target_state.severity() < previous.severity() {
+            Some(FsfsReasonCode::DEGRADE_TRANSITION_RECOVERED)
+        } else {
+            Some(target_reason_code)
+        };
+
+        PressureStateUpdate {
+            state: self.state,
+            target_state,
+            transition_reason_code,
+            smoothed,
+            consecutive_observations: self.anti_flap_readings,
+        }
+    }
+
+    #[must_use]
+    fn evaluate_target(&self, smoothed: PressureSignals) -> (PressureState, &'static str) {
+        if smoothed.cpu_pct >= self.thresholds.emergency_cpu_pct
+            || smoothed.memory_pct >= self.thresholds.emergency_memory_pct
+            || smoothed.io_bytes_per_sec >= self.thresholds.emergency_io_bytes_per_sec
+            || smoothed.load_avg_1m >= self.thresholds.emergency_load_avg_1m
+        {
+            let reason = if smoothed.cpu_pct >= self.thresholds.emergency_cpu_pct {
+                FsfsReasonCode::DEGRADE_CPU_CEILING_HIT
+            } else if smoothed.memory_pct >= self.thresholds.emergency_memory_pct {
+                FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT
+            } else if smoothed.io_bytes_per_sec >= self.thresholds.emergency_io_bytes_per_sec {
+                FsfsReasonCode::DEGRADE_IO_CEILING_HIT
+            } else {
+                FsfsReasonCode::DEGRADE_LOAD_CEILING_HIT
+            };
+            return (PressureState::Emergency, reason);
+        }
+
+        if smoothed.cpu_pct >= self.thresholds.degraded_cpu_pct
+            || smoothed.memory_pct >= self.thresholds.degraded_memory_pct
+            || smoothed.io_bytes_per_sec >= self.thresholds.degraded_io_bytes_per_sec
+            || smoothed.load_avg_1m >= self.thresholds.degraded_load_avg_1m
+        {
+            let reason = if smoothed.cpu_pct >= self.thresholds.degraded_cpu_pct {
+                FsfsReasonCode::DEGRADE_CPU_CEILING_HIT
+            } else if smoothed.memory_pct >= self.thresholds.degraded_memory_pct {
+                FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT
+            } else if smoothed.io_bytes_per_sec >= self.thresholds.degraded_io_bytes_per_sec {
+                FsfsReasonCode::DEGRADE_IO_CEILING_HIT
+            } else {
+                FsfsReasonCode::DEGRADE_LOAD_CEILING_HIT
+            };
+            return (PressureState::Degraded, reason);
+        }
+
+        if smoothed.cpu_pct >= self.thresholds.constrained_cpu_pct
+            || smoothed.memory_pct >= self.thresholds.constrained_memory_pct
+            || smoothed.io_bytes_per_sec >= self.thresholds.constrained_io_bytes_per_sec
+            || smoothed.load_avg_1m >= self.thresholds.constrained_load_avg_1m
+        {
+            let reason = if smoothed.cpu_pct >= self.thresholds.constrained_cpu_pct {
+                FsfsReasonCode::DEGRADE_CPU_CEILING_HIT
+            } else if smoothed.memory_pct >= self.thresholds.constrained_memory_pct {
+                FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT
+            } else if smoothed.io_bytes_per_sec >= self.thresholds.constrained_io_bytes_per_sec {
+                FsfsReasonCode::DEGRADE_IO_CEILING_HIT
+            } else {
+                FsfsReasonCode::DEGRADE_LOAD_CEILING_HIT
+            };
+            return (PressureState::Constrained, reason);
+        }
+
+        (
+            PressureState::Normal,
+            FsfsReasonCode::DEGRADE_TRANSITION_RECOVERED,
+        )
+    }
+}
+
+#[must_use]
+fn ewma(previous: f64, current: f64, alpha: f64) -> f64 {
+    alpha.mul_add(current, (1.0 - alpha) * previous)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpuCounters {
+    total: u64,
+    idle: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IoCounters {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawPressureCounters {
+    cpu: CpuCounters,
+    io: IoCounters,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
+    load_avg_1m: f64,
+    sampled_at_ms: u64,
+}
+
+/// Linux `/proc` pressure sampler with delta-based CPU/IO rates.
+#[derive(Debug, Clone, Default)]
+pub struct HostPressureCollector {
+    previous: Option<RawPressureCounters>,
+}
+
+impl HostPressureCollector {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { previous: None }
+    }
+
+    /// Sample host pressure metrics from `/proc`.
+    ///
+    /// Returns `None` on unsupported platforms or when proc parsing fails.
+    pub fn sample_now(&mut self, sampled_at_ms: u64) -> Option<PressureSignals> {
+        let current = read_procfs_counters(sampled_at_ms)?;
+        let sample = self.previous.map_or_else(
+            || PressureSignals {
+                cpu_pct: 0.0,
+                memory_pct: memory_pct(current.memory_total_bytes, current.memory_available_bytes),
+                io_bytes_per_sec: 0.0,
+                load_avg_1m: current.load_avg_1m,
+            },
+            |previous| build_pressure_signals(previous, current),
+        );
+        self.previous = Some(current);
+        Some(sample)
+    }
+}
+
+#[must_use]
+fn memory_pct(total_bytes: u64, available_bytes: u64) -> f64 {
+    if total_bytes == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let used = total_bytes.saturating_sub(available_bytes) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let total = total_bytes as f64;
+    (used / total) * 100.0
+}
+
+#[must_use]
+fn build_pressure_signals(
+    previous: RawPressureCounters,
+    current: RawPressureCounters,
+) -> PressureSignals {
+    let cpu_delta_total = current.cpu.total.saturating_sub(previous.cpu.total);
+    let cpu_delta_idle = current.cpu.idle.saturating_sub(previous.cpu.idle);
+    let cpu_pct = if cpu_delta_total == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let busy = cpu_delta_total.saturating_sub(cpu_delta_idle) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let total = cpu_delta_total as f64;
+        (busy / total) * 100.0
+    };
+
+    let elapsed_ms = current.sampled_at_ms.saturating_sub(previous.sampled_at_ms);
+    let io_delta = current
+        .io
+        .read_bytes
+        .saturating_add(current.io.write_bytes)
+        .saturating_sub(
+            previous
+                .io
+                .read_bytes
+                .saturating_add(previous.io.write_bytes),
+        );
+    let io_bytes_per_sec = if elapsed_ms == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let delta = io_delta as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_secs = elapsed_ms as f64 / 1000.0;
+        delta / elapsed_secs
+    };
+
+    PressureSignals {
+        cpu_pct,
+        memory_pct: memory_pct(current.memory_total_bytes, current.memory_available_bytes),
+        io_bytes_per_sec,
+        load_avg_1m: current.load_avg_1m,
+    }
+}
+
+#[must_use]
+fn read_procfs_counters(sampled_at_ms: u64) -> Option<RawPressureCounters> {
+    #[cfg(target_os = "linux")]
+    {
+        let cpu_text = std::fs::read_to_string("/proc/stat").ok()?;
+        let mem_text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let io_text = std::fs::read_to_string("/proc/self/io").ok()?;
+        let load_text = std::fs::read_to_string("/proc/loadavg").ok()?;
+
+        let cpu = parse_proc_stat_cpu_line(&cpu_text)?;
+        let (memory_total_bytes, memory_available_bytes) = parse_proc_meminfo(&mem_text)?;
+        let io = parse_proc_self_io(&io_text)?;
+        let load_avg_1m = parse_proc_loadavg(&load_text)?;
+
+        Some(RawPressureCounters {
+            cpu,
+            io,
+            memory_total_bytes,
+            memory_available_bytes,
+            load_avg_1m,
+            sampled_at_ms,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sampled_at_ms;
+        None
+    }
+}
+
+#[must_use]
+fn parse_proc_stat_cpu_line(contents: &str) -> Option<CpuCounters> {
+    let line = contents.lines().find(|line| line.starts_with("cpu "))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse::<u64>().ok())
+        .collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let total = fields.iter().copied().sum();
+    let idle = fields
+        .get(3)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(fields.get(4).copied().unwrap_or(0));
+    Some(CpuCounters { total, idle })
+}
+
+#[must_use]
+fn parse_proc_meminfo(contents: &str) -> Option<(u64, u64)> {
+    let mut total_kb = None;
+    let mut available_kb = None;
+
+    for line in contents.lines() {
+        if line.starts_with("MemTotal:") {
+            total_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        } else if line.starts_with("MemAvailable:") {
+            available_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        }
+    }
+
+    let total = total_kb?;
+    let available = available_kb?;
+    Some((total.saturating_mul(1024), available.saturating_mul(1024)))
+}
+
+#[must_use]
+fn parse_proc_self_io(contents: &str) -> Option<IoCounters> {
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+
+    for line in contents.lines() {
+        if line.starts_with("read_bytes:") {
+            read_bytes = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        } else if line.starts_with("write_bytes:") {
+            write_bytes = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        }
+    }
+
+    Some(IoCounters {
+        read_bytes: read_bytes?,
+        write_bytes: write_bytes?,
+    })
+}
+
+#[must_use]
+fn parse_proc_loadavg(contents: &str) -> Option<f64> {
+    contents
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
 }
 
 // ─── PID File Management ────────────────────────────────────────────────────
@@ -504,6 +1183,17 @@ impl ResourceLimits {
             });
         }
 
+        if self.max_index_bytes > 0
+            && let Some(index_bytes) = usage.effective_index_bytes()
+            && index_bytes > self.max_index_bytes
+        {
+            violations.push(LimitViolation {
+                resource: "index_bytes",
+                limit: self.max_index_bytes,
+                actual: index_bytes,
+            });
+        }
+
         violations
     }
 }
@@ -538,6 +1228,7 @@ pub struct LifecycleTracker {
     subsystems: std::sync::Mutex<HashMap<SubsystemId, SubsystemHealth>>,
     total_errors: AtomicU64,
     total_panics: AtomicU64,
+    resource_usage: std::sync::Mutex<ResourceUsage>,
     watchdog_config: WatchdogConfig,
     resource_limits: ResourceLimits,
 }
@@ -552,6 +1243,7 @@ impl LifecycleTracker {
             subsystems: std::sync::Mutex::new(HashMap::new()),
             total_errors: AtomicU64::new(0),
             total_panics: AtomicU64::new(0),
+            resource_usage: std::sync::Mutex::new(ResourceUsage::default()),
             watchdog_config,
             resource_limits,
         }
@@ -662,6 +1354,40 @@ impl LifecycleTracker {
         self.resource_limits.check(usage)
     }
 
+    /// Update the latest resource snapshot used by status reporting.
+    pub fn set_resource_usage(&self, usage: ResourceUsage) {
+        let mut current = lock_or_recover(&self.resource_usage);
+        *current = usage;
+    }
+
+    /// Read the latest resource snapshot.
+    #[must_use]
+    pub fn current_resource_usage(&self) -> ResourceUsage {
+        lock_or_recover(&self.resource_usage).clone()
+    }
+
+    /// Evaluate staged disk-budget control state for the current index footprint.
+    ///
+    /// Returns `None` when no index budget is configured.
+    #[must_use]
+    pub fn evaluate_index_budget(&self, index_bytes: u64) -> Option<DiskBudgetSnapshot> {
+        let budget_bytes = self.resource_limits.max_index_bytes;
+        if budget_bytes == 0 {
+            return None;
+        }
+        Some(DiskBudgetPolicy::default().evaluate(index_bytes, budget_bytes))
+    }
+
+    /// Evaluate staged disk-budget control state from an aggregated usage snapshot.
+    ///
+    /// Returns `None` when no index budget is configured or no index usage is known.
+    #[must_use]
+    pub fn evaluate_usage_budget(&self, usage: &ResourceUsage) -> Option<DiskBudgetSnapshot> {
+        usage
+            .effective_index_bytes()
+            .and_then(|index_bytes| self.evaluate_index_budget(index_bytes))
+    }
+
     /// Build a complete status snapshot.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
@@ -687,7 +1413,7 @@ impl LifecycleTracker {
             subsystems: subsystem_vec,
             total_errors: self.total_errors.load(Ordering::Relaxed),
             total_panics_recovered: self.total_panics.load(Ordering::Relaxed),
-            resources: ResourceUsage::default(),
+            resources: self.current_resource_usage(),
         }
     }
 
@@ -827,6 +1553,168 @@ mod tests {
         assert!(!HealthStatus::Stopped.is_alive());
     }
 
+    // ── Pressure Control ──
+
+    #[test]
+    fn pressure_machine_requires_hysteresis_before_escalation() {
+        let config = PressureConfig {
+            anti_flap_readings: 3,
+            cpu_ceiling_pct: 80,
+            ..PressureConfig::default()
+        };
+        let mut machine = PressureStateMachine::from_config(&config);
+
+        let hot = PressureSignals {
+            cpu_pct: 95.0,
+            memory_pct: 50.0,
+            io_bytes_per_sec: 10_000.0,
+            load_avg_1m: 0.5,
+        };
+
+        let u1 = machine.observe(hot);
+        assert_eq!(u1.state, PressureState::Normal);
+        assert_eq!(
+            u1.transition_reason_code,
+            Some(FsfsReasonCode::DEGRADE_TRANSITION_HELD)
+        );
+        let u2 = machine.observe(hot);
+        assert_eq!(u2.state, PressureState::Normal);
+        let u3 = machine.observe(hot);
+        assert_eq!(u3.state, PressureState::Emergency);
+        assert_eq!(
+            u3.transition_reason_code,
+            Some(FsfsReasonCode::DEGRADE_CPU_CEILING_HIT)
+        );
+    }
+
+    #[test]
+    fn pressure_machine_recovers_with_hysteresis() {
+        let config = PressureConfig {
+            anti_flap_readings: 2,
+            cpu_ceiling_pct: 75,
+            ewma_alpha_per_mille: 1000,
+            ..PressureConfig::default()
+        };
+        let mut machine = PressureStateMachine::from_config(&config);
+
+        let hot = PressureSignals {
+            cpu_pct: 95.0,
+            memory_pct: 92.0,
+            io_bytes_per_sec: 160_000_000.0,
+            load_avg_1m: 10.0,
+        };
+        let cool = PressureSignals {
+            cpu_pct: 5.0,
+            memory_pct: 20.0,
+            io_bytes_per_sec: 1_000.0,
+            load_avg_1m: 0.2,
+        };
+
+        let _ = machine.observe(hot);
+        let up = machine.observe(hot);
+        assert_eq!(up.state, PressureState::Emergency);
+
+        let held = machine.observe(cool);
+        assert_eq!(held.state, PressureState::Emergency);
+        assert_eq!(
+            held.transition_reason_code,
+            Some(FsfsReasonCode::DEGRADE_TRANSITION_HELD)
+        );
+
+        let recovered = machine.observe(cool);
+        assert_eq!(recovered.state, PressureState::Normal);
+        assert_eq!(
+            recovered.transition_reason_code,
+            Some(FsfsReasonCode::DEGRADE_TRANSITION_RECOVERED)
+        );
+    }
+
+    #[test]
+    fn pressure_machine_applies_ewma_smoothing() {
+        let config = PressureConfig {
+            anti_flap_readings: 1,
+            ewma_alpha_per_mille: 300,
+            ..PressureConfig::default()
+        };
+        let mut machine = PressureStateMachine::from_config(&config);
+
+        let _ = machine.observe(PressureSignals {
+            cpu_pct: 100.0,
+            memory_pct: 0.0,
+            io_bytes_per_sec: 0.0,
+            load_avg_1m: 0.0,
+        });
+        let update = machine.observe(PressureSignals {
+            cpu_pct: 0.0,
+            memory_pct: 0.0,
+            io_bytes_per_sec: 0.0,
+            load_avg_1m: 0.0,
+        });
+        assert!(
+            (update.smoothed.cpu_pct - 70.0).abs() < 0.0001,
+            "expected EWMA cpu to be 70.0, got {}",
+            update.smoothed.cpu_pct
+        );
+    }
+
+    #[test]
+    fn procfs_parsers_extract_expected_values() {
+        let cpu = parse_proc_stat_cpu_line("cpu  10 20 30 40 50 0 0 0 0 0\n").expect("cpu parse");
+        assert_eq!(cpu.total, 150);
+        assert_eq!(cpu.idle, 90);
+
+        let (mem_total, mem_available) =
+            parse_proc_meminfo("MemTotal:       16000 kB\nMemAvailable:    4000 kB\n")
+                .expect("mem parse");
+        assert_eq!(mem_total, 16_384_000);
+        assert_eq!(mem_available, 4_096_000);
+
+        let io = parse_proc_self_io("read_bytes: 123\nwrite_bytes: 456\n").expect("io parse");
+        assert_eq!(io.read_bytes, 123);
+        assert_eq!(io.write_bytes, 456);
+
+        let load = parse_proc_loadavg("1.23 0.55 0.33 1/200 12345\n").expect("load parse");
+        assert!((load - 1.23).abs() < 0.0001);
+    }
+
+    #[test]
+    fn build_pressure_signals_uses_cpu_and_io_deltas() {
+        let previous = RawPressureCounters {
+            cpu: CpuCounters {
+                total: 1_000,
+                idle: 200,
+            },
+            io: IoCounters {
+                read_bytes: 1_000,
+                write_bytes: 500,
+            },
+            memory_total_bytes: 16_000,
+            memory_available_bytes: 8_000,
+            load_avg_1m: 1.0,
+            sampled_at_ms: 1_000,
+        };
+        let current = RawPressureCounters {
+            cpu: CpuCounters {
+                total: 1_500,
+                idle: 300,
+            },
+            io: IoCounters {
+                read_bytes: 3_000,
+                write_bytes: 1_500,
+            },
+            memory_total_bytes: 16_000,
+            memory_available_bytes: 4_000,
+            load_avg_1m: 2.0,
+            sampled_at_ms: 2_000,
+        };
+
+        let sample = build_pressure_signals(previous, current);
+        assert!((sample.cpu_pct - 80.0).abs() < 0.0001);
+        assert!((sample.io_bytes_per_sec - 3_000.0).abs() < 0.0001);
+        assert!((sample.memory_pct - 75.0).abs() < 0.0001);
+        assert!((sample.load_avg_1m - 2.0).abs() < 0.0001);
+    }
+
     // ── PID File ──
 
     #[test]
@@ -937,6 +1825,8 @@ mod tests {
             rss_bytes: Some(1_000_000_000),
             thread_count: Some(100),
             open_fds: Some(5000),
+            index_bytes: Some(10_000_000_000),
+            ..ResourceUsage::default()
         };
         assert!(limits.check(&usage).is_empty());
     }
@@ -947,17 +1837,39 @@ mod tests {
             max_rss_bytes: 100_000,
             max_threads: 10,
             max_open_fds: 100,
-            max_index_bytes: 0,
+            max_index_bytes: 1_000,
         };
         let usage = ResourceUsage {
             rss_bytes: Some(200_000),
             thread_count: Some(20),
             open_fds: Some(50), // Under limit.
+            index_bytes: Some(2_000),
+            ..ResourceUsage::default()
         };
         let violations = limits.check(&usage);
-        assert_eq!(violations.len(), 2);
+        assert_eq!(violations.len(), 3);
         assert_eq!(violations[0].resource, "rss_bytes");
         assert_eq!(violations[1].resource, "threads");
+        assert_eq!(violations[2].resource, "index_bytes");
+    }
+
+    #[test]
+    fn resource_limits_use_index_breakdown_when_total_missing() {
+        let limits = ResourceLimits {
+            max_index_bytes: 1_000,
+            ..ResourceLimits::default()
+        };
+        let usage = ResourceUsage {
+            vector_index_bytes: Some(400),
+            lexical_index_bytes: Some(350),
+            catalog_bytes: Some(200),
+            embedding_cache_bytes: Some(150),
+            ..ResourceUsage::default()
+        };
+        let violations = limits.check(&usage);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].resource, "index_bytes");
+        assert_eq!(violations[0].actual, 1_100);
     }
 
     #[test]
@@ -968,6 +1880,75 @@ mod tests {
         };
         let usage = ResourceUsage::default();
         assert!(limits.check(&usage).is_empty());
+    }
+
+    #[test]
+    fn disk_budget_policy_stages_actions() {
+        let policy = DiskBudgetPolicy::default();
+
+        let normal = policy.evaluate(700, 1_000);
+        assert_eq!(normal.stage, DiskBudgetStage::Normal);
+        assert_eq!(normal.action, DiskBudgetAction::Continue);
+        assert_eq!(
+            normal.reason_code,
+            FsfsReasonCode::DEGRADE_DISK_WITHIN_BUDGET
+        );
+
+        let near = policy.evaluate(900, 1_000);
+        assert_eq!(near.stage, DiskBudgetStage::NearLimit);
+        assert_eq!(near.action, DiskBudgetAction::ThrottleIngest);
+        assert_eq!(near.reason_code, FsfsReasonCode::DEGRADE_DISK_NEAR_BUDGET);
+
+        let over = policy.evaluate(1_020, 1_000);
+        assert_eq!(over.stage, DiskBudgetStage::OverLimit);
+        assert_eq!(over.action, DiskBudgetAction::EvictLowUtility);
+        assert_eq!(over.reason_code, FsfsReasonCode::DEGRADE_DISK_OVER_BUDGET);
+
+        let critical = policy.evaluate(1_250, 1_000);
+        assert_eq!(critical.stage, DiskBudgetStage::Critical);
+        assert_eq!(critical.action, DiskBudgetAction::PauseWrites);
+        assert_eq!(critical.reason_code, FsfsReasonCode::DEGRADE_DISK_CRITICAL);
+    }
+
+    #[test]
+    fn lifecycle_tracker_evaluates_index_budget_from_limits() {
+        let limits = ResourceLimits {
+            max_index_bytes: 1_000,
+            ..ResourceLimits::default()
+        };
+        let tracker = LifecycleTracker::new(WatchdogConfig::default(), limits);
+
+        let near = tracker
+            .evaluate_index_budget(900)
+            .expect("budget should be configured");
+        assert_eq!(near.stage, DiskBudgetStage::NearLimit);
+
+        let unbounded = LifecycleTracker::new(WatchdogConfig::default(), ResourceLimits::default());
+        assert!(unbounded.evaluate_index_budget(900).is_none());
+    }
+
+    #[test]
+    fn lifecycle_tracker_evaluates_usage_budget_from_breakdown() {
+        let tracker = LifecycleTracker::new(
+            WatchdogConfig::default(),
+            ResourceLimits {
+                max_index_bytes: 1_000,
+                ..ResourceLimits::default()
+            },
+        );
+        let usage = ResourceUsage {
+            vector_index_bytes: Some(400),
+            lexical_index_bytes: Some(300),
+            catalog_bytes: Some(150),
+            embedding_cache_bytes: Some(150),
+            ..ResourceUsage::default()
+        };
+
+        let snapshot = tracker
+            .evaluate_usage_budget(&usage)
+            .expect("usage budget should be available");
+        assert_eq!(snapshot.used_bytes, 1_000);
+        assert_eq!(snapshot.stage, DiskBudgetStage::NearLimit);
     }
 
     // ── LifecycleTracker ──
@@ -1073,6 +2054,31 @@ mod tests {
         assert_eq!(status.pid, std::process::id());
         assert!(status.uptime_secs < 5);
         assert_eq!(status.subsystems.len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_tracker_status_includes_last_resource_usage() {
+        let tracker = LifecycleTracker::new(
+            WatchdogConfig::default(),
+            ResourceLimits {
+                max_index_bytes: 2_000,
+                ..ResourceLimits::default()
+            },
+        );
+        let breakdown = IndexStorageBreakdown {
+            vector_index_bytes: 500,
+            lexical_index_bytes: 600,
+            catalog_bytes: 200,
+            embedding_cache_bytes: 100,
+        };
+        tracker.set_resource_usage(ResourceUsage::from_index_storage(breakdown));
+
+        let status = tracker.status();
+        assert_eq!(status.resources.index_bytes, Some(1_400));
+        assert_eq!(status.resources.vector_index_bytes, Some(500));
+        assert_eq!(status.resources.lexical_index_bytes, Some(600));
+        assert_eq!(status.resources.catalog_bytes, Some(200));
+        assert_eq!(status.resources.embedding_cache_bytes, Some(100));
     }
 
     #[test]

@@ -493,7 +493,14 @@ impl StorageBackedJobRunner {
             let doc = self.storage.get_document(&job.doc_id)?;
             let Some(doc) = doc else {
                 let message = format!("document {} missing during process_batch", job.doc_id);
-                let _ = self.queue.fail(job.job_id, &message);
+                if let Err(fail_err) = self.queue.fail(job.job_id, &message) {
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        job_id = job.job_id,
+                        error = %fail_err,
+                        "failed to record job failure in queue"
+                    );
+                }
                 result.jobs_failed += 1;
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
@@ -695,10 +702,25 @@ impl StorageBackedJobRunner {
 
     fn handle_job_failure(&self, job: &crate::ClaimedJob, error: &SearchError) {
         let error_message = error.to_string();
-        let _ = self.queue.fail(job.job_id, &error_message);
-        let _ = self
-            .storage
-            .mark_failed(&job.doc_id, &job.embedder_id, &error_message);
+        if let Err(fail_err) = self.queue.fail(job.job_id, &error_message) {
+            tracing::warn!(
+                target: "frankensearch.storage.pipeline",
+                job_id = job.job_id,
+                error = %fail_err,
+                "failed to record job failure in queue"
+            );
+        }
+        if let Err(mark_err) =
+            self.storage
+                .mark_failed(&job.doc_id, &job.embedder_id, &error_message)
+        {
+            tracing::warn!(
+                target: "frankensearch.storage.pipeline",
+                doc_id = %job.doc_id,
+                error = %mark_err,
+                "failed to mark document as failed in storage"
+            );
+        }
     }
 
     fn record_ingest_metrics(&self, tx_result: &IngestTxResult) {

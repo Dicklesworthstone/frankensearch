@@ -4,6 +4,8 @@
 //! (`frankensearch-ops.db`) and a small connection wrapper that applies
 //! pragmas, runs migrations, and validates migration checksums.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -383,6 +385,34 @@ impl ResourceSampleRecord {
     }
 }
 
+/// Write payload for `evidence_links` with deterministic duplicate semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLinkRecord {
+    pub project_key: String,
+    pub alert_id: String,
+    pub evidence_type: String,
+    pub evidence_uri: String,
+    pub evidence_hash: Option<String>,
+    pub created_at_ms: i64,
+}
+
+impl EvidenceLinkRecord {
+    fn validate(&self) -> SearchResult<()> {
+        ensure_non_empty(&self.project_key, "project_key")?;
+        ensure_non_empty(&self.alert_id, "alert_id")?;
+        ensure_non_empty(&self.evidence_type, "evidence_type")?;
+        ensure_non_empty(&self.evidence_uri, "evidence_uri")?;
+        if self.created_at_ms < 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "created_at_ms".to_owned(),
+                value: self.created_at_ms.to_string(),
+                reason: "must be >= 0".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Supported aggregation windows for dashboard rollups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -594,7 +624,8 @@ pub struct SloMaterializationConfig {
 impl Default for SloMaterializationConfig {
     fn default() -> Self {
         Self {
-            target_p95_latency_us: 2_500,
+            // Contract default: search_latency_p95 threshold = 150ms.
+            target_p95_latency_us: 150_000,
             error_budget_ratio: 0.01,
             warn_burn_rate: 1.0,
             error_burn_rate: 2.0,
@@ -1294,6 +1325,61 @@ impl OpsStorage {
         Ok(())
     }
 
+    /// Insert an evidence link while enforcing `(alert_id, evidence_uri)` uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when inputs are invalid, a duplicate pair already exists,
+    /// or the database write fails.
+    pub fn insert_evidence_link(&self, link: &EvidenceLinkRecord) -> SearchResult<()> {
+        link.validate()?;
+        let conn = self.connection();
+
+        let duplicate_params = [
+            SqliteValue::Text(link.alert_id.clone()),
+            SqliteValue::Text(link.evidence_uri.clone()),
+        ];
+        let duplicate_rows = conn
+            .query_with_params(
+                "SELECT link_id FROM evidence_links \
+                 WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
+                &duplicate_params,
+            )
+            .map_err(ops_error)?;
+        if !duplicate_rows.is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "evidence_uri".to_owned(),
+                value: link.evidence_uri.clone(),
+                reason: format!(
+                    "duplicate evidence link pair for alert_id='{}'",
+                    link.alert_id
+                ),
+            });
+        }
+
+        let link_id = evidence_link_id(&link.alert_id, &link.evidence_uri);
+        let params = [
+            SqliteValue::Text(link_id),
+            SqliteValue::Text(link.project_key.clone()),
+            SqliteValue::Text(link.alert_id.clone()),
+            SqliteValue::Text(link.evidence_type.clone()),
+            SqliteValue::Text(link.evidence_uri.clone()),
+            link.evidence_hash
+                .clone()
+                .map_or(SqliteValue::Null, SqliteValue::Text),
+            SqliteValue::Integer(link.created_at_ms),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO evidence_links(\
+                link_id, project_key, alert_id, evidence_type, evidence_uri, \
+                evidence_hash, created_at_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+            &params,
+        )
+        .map_err(ops_error)?;
+        Ok(())
+    }
+
     /// Recompute and materialize rolling search summaries for one instance.
     ///
     /// # Errors
@@ -1537,7 +1623,14 @@ impl OpsStorage {
                         resolved_at_ms \
                  FROM anomaly_materializations \
                  WHERE scope = ?1 AND scope_key = ?2 AND state = 'open' \
-                 ORDER BY severity DESC, updated_at_ms DESC LIMIT ?3;",
+                 ORDER BY CASE severity \
+                            WHEN 'critical' THEN 4 \
+                            WHEN 'error' THEN 3 \
+                            WHEN 'warn' THEN 2 \
+                            WHEN 'info' THEN 1 \
+                            ELSE 0 \
+                          END DESC, \
+                          updated_at_ms DESC LIMIT ?3;",
                 &[
                     SqliteValue::Text(scope.as_str().to_owned()),
                     SqliteValue::Text(scope_key.to_owned()),
@@ -2142,6 +2235,14 @@ fn search_event_exists(conn: &Connection, event_id: &str) -> SearchResult<bool> 
     Ok(!existing.is_empty())
 }
 
+fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    alert_id.hash(&mut hasher);
+    '\u{1f}'.hash(&mut hasher);
+    evidence_uri.hash(&mut hasher);
+    format!("evlnk:{:016x}", hasher.finish())
+}
+
 fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<()> {
     let params = [
         SqliteValue::Text(event.event_id.clone()),
@@ -2310,9 +2411,7 @@ fn list_distinct_project_keys(conn: &Connection) -> SearchResult<Vec<String>> {
         .query("SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;")
         .map_err(ops_error)?;
     rows.iter()
-        .map(|row| {
-            row_text(row, 0, "search_events.project_key").map(ToOwned::to_owned)
-        })
+        .map(|row| row_text(row, 0, "search_events.project_key").map(ToOwned::to_owned))
         .collect()
 }
 
@@ -2374,7 +2473,11 @@ fn compute_slo_window_stats(
     })
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn evaluate_slo_window(
     stats: &SloWindowStats,
     scope: SloScope,
@@ -2413,47 +2516,42 @@ fn evaluate_slo_window(
     }
 
     let error_rate = (failed_requests as f64) / (total_requests as f64);
-    let error_budget_burn = error_rate / config.error_budget_ratio;
-    let remaining_budget_ratio = (1.0 - error_budget_burn).clamp(0.0, 1.0);
-    let latency_ratio = p95_latency_us.map(|value| (value as f64) / (config.target_p95_latency_us as f64));
+    let consumed_budget_ratio = (error_rate / config.error_budget_ratio).clamp(0.0, 1.0);
+    let error_budget_burn = consumed_budget_ratio / budget_fraction_for_window(window);
+    let remaining_budget_ratio = 1.0 - consumed_budget_ratio;
+    let latency_ratio =
+        p95_latency_us.map(|value| (value as f64) / (config.target_p95_latency_us as f64));
 
     let burn_level = if error_budget_burn >= config.critical_burn_rate {
         3
     } else if error_budget_burn >= config.error_burn_rate {
         2
-    } else if error_budget_burn >= config.warn_burn_rate {
-        1
     } else {
-        0
+        usize::from(error_budget_burn >= config.warn_burn_rate)
     };
     let latency_level = if latency_ratio.unwrap_or(0.0) >= config.critical_latency_multiplier {
         3
     } else if latency_ratio.unwrap_or(0.0) >= config.error_latency_multiplier {
         2
-    } else if latency_ratio.unwrap_or(0.0) >= config.warn_latency_multiplier {
-        1
     } else {
-        0
+        usize::from(latency_ratio.unwrap_or(0.0) >= config.warn_latency_multiplier)
     };
     let max_level = burn_level.max(latency_level);
 
     let (health, reason_code) = match (burn_level, latency_level, max_level) {
-        (_, _, 0) => (SloHealth::Healthy, "slo.healthy"),
-        (burn, lat, level) if burn > lat => match level {
-            1 => (SloHealth::Warn, "slo.error_budget.warn"),
-            2 => (SloHealth::Error, "slo.error_budget.error"),
-            _ => (SloHealth::Critical, "slo.error_budget.critical"),
-        },
-        (burn, lat, level) if lat > burn => match level {
-            1 => (SloHealth::Warn, "slo.latency.warn"),
-            2 => (SloHealth::Error, "slo.latency.error"),
-            _ => (SloHealth::Critical, "slo.latency.critical"),
-        },
-        (_, _, level) => match level {
-            1 => (SloHealth::Warn, "slo.error_budget_and_latency.warn"),
-            2 => (SloHealth::Error, "slo.error_budget_and_latency.error"),
-            _ => (SloHealth::Critical, "slo.error_budget_and_latency.critical"),
-        },
+        (_, _, 0) => (SloHealth::Healthy, "slo.search_latency_p95.healthy"),
+        (burn, lat, _) if burn > lat => (
+            level_to_health(burn_level),
+            "slo.query_failure_rate.budget_burn_high",
+        ),
+        (burn, lat, _) if lat > burn => (
+            level_to_health(latency_level),
+            "slo.search_latency_p95.threshold_exceeded",
+        ),
+        (_, _, level) => (
+            level_to_health(level),
+            "slo.search_latency_p95.budget_burn_and_latency_high",
+        ),
     };
 
     let anomaly = if max_level == 0 {
@@ -2465,7 +2563,7 @@ fn evaluate_slo_window(
             _ => config.critical_burn_rate,
         };
         Some(AnomalyCandidate {
-            metric_name: "error_budget_burn".to_owned(),
+            metric_name: "query_failure_rate".to_owned(),
             baseline_value: baseline,
             observed_value: error_budget_burn,
             deviation_ratio: if baseline == 0.0 {
@@ -2474,7 +2572,7 @@ fn evaluate_slo_window(
                 (error_budget_burn - baseline) / baseline
             },
             severity: severity_for_level(max_level),
-            reason_code: reason_code.to_owned(),
+            reason_code: "anomaly.query_failure_rate.spike".to_owned(),
         })
     } else {
         let multiplier = match max_level {
@@ -2485,7 +2583,7 @@ fn evaluate_slo_window(
         let baseline = (config.target_p95_latency_us as f64) * multiplier;
         let observed = p95_latency_us.map_or(0.0, |value| value as f64);
         Some(AnomalyCandidate {
-            metric_name: "p95_latency_us".to_owned(),
+            metric_name: "search_latency_p95".to_owned(),
             baseline_value: baseline,
             observed_value: observed,
             deviation_ratio: if baseline == 0.0 {
@@ -2494,7 +2592,7 @@ fn evaluate_slo_window(
                 (observed - baseline) / baseline
             },
             severity: severity_for_level(max_level),
-            reason_code: reason_code.to_owned(),
+            reason_code: "anomaly.search_latency_p95.spike".to_owned(),
         })
     };
 
@@ -2525,6 +2623,26 @@ const fn severity_for_level(level: usize) -> AnomalySeverity {
         1 => AnomalySeverity::Warn,
         2 => AnomalySeverity::Error,
         _ => AnomalySeverity::Critical,
+    }
+}
+
+const fn level_to_health(level: usize) -> SloHealth {
+    match level {
+        1 => SloHealth::Warn,
+        2 => SloHealth::Error,
+        _ => SloHealth::Critical,
+    }
+}
+
+const fn budget_fraction_for_window(window: SummaryWindow) -> f64 {
+    match window {
+        SummaryWindow::OneMinute => 0.005,
+        SummaryWindow::FifteenMinutes => 0.01,
+        SummaryWindow::OneHour => 0.02,
+        SummaryWindow::SixHours => 0.08,
+        SummaryWindow::TwentyFourHours => 0.2,
+        SummaryWindow::ThreeDays => 0.35,
+        SummaryWindow::OneWeek => 1.0,
     }
 }
 
@@ -2655,6 +2773,7 @@ fn resolve_stale_anomaly_rows(
     .map_err(ops_error)
 }
 
+#[allow(clippy::too_many_lines)]
 fn sync_rollup_anomaly(
     conn: &Connection,
     evaluation: &SloEvaluation,
@@ -2674,10 +2793,7 @@ fn sync_rollup_anomaly(
                  SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), \
                      updated_at_ms = ?1 \
                  WHERE anomaly_id = ?2 AND state = 'open';",
-                &[
-                    SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(anomaly_id),
-                ],
+                &[SqliteValue::Integer(now_ms), SqliteValue::Text(anomaly_id)],
             )
             .map_err(ops_error)?;
         return Ok((0, resolved));
@@ -2786,12 +2902,13 @@ fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
     })?;
     let scope_key = row_text(row, 1, "slo_rollups.scope_key")?.to_owned();
     let project_key = row_opt_text(row, 2, "slo_rollups.project_key")?.map(ToOwned::to_owned);
-    let window = SummaryWindow::from_label(row_text(row, 3, "slo_rollups.window")?).ok_or_else(
-        || SearchError::SubsystemError {
-            subsystem: "ops-storage",
-            source: Box::new(io::Error::other("invalid slo_rollups.window value")),
-        },
-    )?;
+    let window =
+        SummaryWindow::from_label(row_text(row, 3, "slo_rollups.window")?).ok_or_else(|| {
+            SearchError::SubsystemError {
+                subsystem: "ops-storage",
+                source: Box::new(io::Error::other("invalid slo_rollups.window value")),
+            }
+        })?;
     let window_start_ms = row_i64(row, 4, "slo_rollups.window_start_ms")?;
     let window_end_ms = row_i64(row, 5, "slo_rollups.window_end_ms")?;
     let total_requests = i64_to_u64_non_negative(
@@ -2809,12 +2926,14 @@ fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
         row_i64(row, 9, "slo_rollups.target_p95_latency_us")?,
         "slo_rollups.target_p95_latency_us",
     )?;
-    let error_budget_ratio = row_opt_f64(row, 10, "slo_rollups.error_budget_ratio")?
-        .ok_or_else(|| SearchError::SubsystemError {
-            subsystem: "ops-storage",
-            source: Box::new(io::Error::other(
-                "slo_rollups.error_budget_ratio should not be NULL",
-            )),
+    let error_budget_ratio =
+        row_opt_f64(row, 10, "slo_rollups.error_budget_ratio")?.ok_or_else(|| {
+            SearchError::SubsystemError {
+                subsystem: "ops-storage",
+                source: Box::new(io::Error::other(
+                    "slo_rollups.error_budget_ratio should not be NULL",
+                )),
+            }
         })?;
     let error_rate = row_opt_f64(row, 11, "slo_rollups.error_rate")?;
     let error_budget_burn = row_opt_f64(row, 12, "slo_rollups.error_budget_burn")?;
@@ -2851,18 +2970,23 @@ fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
 
 fn row_to_anomaly(row: &Row) -> SearchResult<AnomalyMaterializationSnapshot> {
     let anomaly_id = row_text(row, 0, "anomaly_materializations.anomaly_id")?.to_owned();
-    let scope = SloScope::from_db(row_text(row, 1, "anomaly_materializations.scope")?)
-        .ok_or_else(|| SearchError::SubsystemError {
+    let scope = SloScope::from_db(row_text(row, 1, "anomaly_materializations.scope")?).ok_or_else(
+        || SearchError::SubsystemError {
             subsystem: "ops-storage",
-            source: Box::new(io::Error::other("invalid anomaly_materializations.scope value")),
-        })?;
+            source: Box::new(io::Error::other(
+                "invalid anomaly_materializations.scope value",
+            )),
+        },
+    )?;
     let scope_key = row_text(row, 2, "anomaly_materializations.scope_key")?.to_owned();
     let project_key =
         row_opt_text(row, 3, "anomaly_materializations.project_key")?.map(ToOwned::to_owned);
     let window = SummaryWindow::from_label(row_text(row, 4, "anomaly_materializations.window")?)
         .ok_or_else(|| SearchError::SubsystemError {
             subsystem: "ops-storage",
-            source: Box::new(io::Error::other("invalid anomaly_materializations.window value")),
+            source: Box::new(io::Error::other(
+                "invalid anomaly_materializations.window value",
+            )),
         })?;
     let window_start_ms = row_i64(row, 5, "anomaly_materializations.window_start_ms")?;
     let metric_name = row_text(row, 6, "anomaly_materializations.metric_name")?.to_owned();
@@ -3031,9 +3155,10 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
-        OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION, OpsRetentionPolicy, OpsStorage,
-        ResourceSampleRecord, SearchEventPhase, SearchEventRecord, SummaryWindow, bootstrap,
-        current_version, ops_error,
+        EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
+        OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
+        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
+        ops_error,
     };
     use frankensearch_core::SearchError;
     use fsqlite::Connection;
@@ -3145,6 +3270,38 @@ mod tests {
         match row.get(0) {
             Some(SqliteValue::Integer(value)) => *value,
             other => panic!("unexpected row type for queue_depth: {other:?}"),
+        }
+    }
+
+    fn anomaly_state(conn: &Connection, anomaly_id: &str) -> Option<String> {
+        let rows = conn
+            .query_with_params(
+                "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1 LIMIT 1;",
+                &[SqliteValue::Text(anomaly_id.to_owned())],
+            )
+            .map_err(ops_error)
+            .expect("anomaly state query should succeed");
+        let row = rows.first()?;
+        match row.get(0) {
+            Some(SqliteValue::Text(value)) => Some(value.clone()),
+            other => panic!("unexpected row type for anomaly state: {other:?}"),
+        }
+    }
+
+    fn anomaly_resolved_at(conn: &Connection, anomaly_id: &str) -> Option<i64> {
+        let rows = conn
+            .query_with_params(
+                "SELECT resolved_at_ms FROM anomaly_materializations \
+                 WHERE anomaly_id = ?1 LIMIT 1;",
+                &[SqliteValue::Text(anomaly_id.to_owned())],
+            )
+            .map_err(ops_error)
+            .expect("anomaly resolved_at query should succeed");
+        let row = rows.first()?;
+        match row.get(0) {
+            Some(SqliteValue::Integer(value)) => Some(*value),
+            Some(SqliteValue::Null) | None => None,
+            other => panic!("unexpected row type for anomaly resolved_at: {other:?}"),
         }
     }
 
@@ -3474,6 +3631,142 @@ mod tests {
     }
 
     #[test]
+    fn materialize_slo_rollups_and_anomalies_emits_project_and_fleet_views() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let now_ms = 119_000;
+        let mut events = Vec::new();
+        for index in 0..20 {
+            let mut event = sample_search_event(
+                &format!("event-slo-{index}"),
+                now_ms - 5_000 + i64::from(index),
+            );
+            if index < 8 {
+                event.phase = SearchEventPhase::Failed;
+                event.latency_us = 260_000;
+            } else {
+                event.phase = SearchEventPhase::Initial;
+                event.latency_us = 90_000;
+            }
+            events.push(event);
+        }
+        storage
+            .ingest_search_events_batch(&events, 256)
+            .expect("slo test event ingest should succeed");
+
+        let result = storage
+            .materialize_slo_rollups_and_anomalies(
+                now_ms,
+                SloMaterializationConfig {
+                    target_p95_latency_us: 150_000,
+                    error_budget_ratio: 0.01,
+                    min_requests: 1,
+                    ..SloMaterializationConfig::default()
+                },
+            )
+            .expect("slo materialization should succeed");
+
+        assert_eq!(
+            result.rollups_upserted,
+            u64::try_from(SummaryWindow::ALL.len() * 2).expect("constant conversion should fit")
+        );
+        assert!(result.anomalies_opened >= 2);
+
+        let project_rollup = storage
+            .latest_slo_rollup(SloScope::Project, "project-a", SummaryWindow::OneMinute)
+            .expect("latest project rollup query should succeed")
+            .expect("expected project rollup");
+        assert_eq!(project_rollup.total_requests, 20);
+        assert_eq!(project_rollup.failed_requests, 8);
+        assert!(project_rollup.error_budget_burn.unwrap_or(0.0) > 50.0);
+        assert_ne!(project_rollup.health, SloHealth::Healthy);
+
+        let fleet_rollup = storage
+            .latest_slo_rollup(SloScope::Fleet, "__fleet__", SummaryWindow::OneMinute)
+            .expect("latest fleet rollup query should succeed")
+            .expect("expected fleet rollup");
+        assert_eq!(fleet_rollup.total_requests, 20);
+
+        let open_project_anomalies = storage
+            .query_open_anomalies_for_scope(SloScope::Project, "project-a", 20)
+            .expect("open anomaly query should succeed");
+        assert!(!open_project_anomalies.is_empty());
+        assert!(
+            open_project_anomalies
+                .iter()
+                .all(|row| row.reason_code.starts_with("anomaly."))
+        );
+
+        let timeline = storage
+            .query_anomaly_timeline(Some("project-a"), 20)
+            .expect("project timeline query should succeed");
+        assert!(!timeline.is_empty());
+    }
+
+    #[test]
+    fn materialize_slo_rollups_and_anomalies_resolves_when_thresholds_relax() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let now_ms = 119_000;
+        let mut events = Vec::new();
+        for index in 0..12 {
+            let mut event = sample_search_event(
+                &format!("event-slo-recover-{index}"),
+                now_ms - 4_000 + i64::from(index),
+            );
+            event.phase = SearchEventPhase::Failed;
+            event.latency_us = 300_000;
+            events.push(event);
+        }
+        storage
+            .ingest_search_events_batch(&events, 256)
+            .expect("slo recovery event ingest should succeed");
+
+        storage
+            .materialize_slo_rollups_and_anomalies(
+                now_ms,
+                SloMaterializationConfig {
+                    target_p95_latency_us: 150_000,
+                    error_budget_ratio: 0.01,
+                    min_requests: 1,
+                    ..SloMaterializationConfig::default()
+                },
+            )
+            .expect("initial anomaly materialization should succeed");
+
+        let open_before = storage
+            .query_open_anomalies_for_scope(SloScope::Project, "project-a", 50)
+            .expect("open anomalies query should succeed")
+            .len();
+        assert!(open_before > 0);
+
+        let relaxed = storage
+            .materialize_slo_rollups_and_anomalies(
+                now_ms,
+                SloMaterializationConfig {
+                    target_p95_latency_us: 1_000_000,
+                    error_budget_ratio: 1.0,
+                    warn_burn_rate: 10_000.0,
+                    error_burn_rate: 20_000.0,
+                    critical_burn_rate: 30_000.0,
+                    warn_latency_multiplier: 10.0,
+                    error_latency_multiplier: 20.0,
+                    critical_latency_multiplier: 30.0,
+                    min_requests: 1,
+                },
+            )
+            .expect("relaxed anomaly materialization should succeed");
+        assert!(relaxed.anomalies_resolved >= u64::try_from(open_before).expect("len fits u64"));
+
+        let open_after = storage
+            .query_open_anomalies_for_scope(SloScope::Project, "project-a", 50)
+            .expect("open anomalies query after recovery should succeed");
+        assert!(open_after.is_empty());
+    }
+
+    #[test]
     fn query_resource_trend_returns_ordered_points_in_window() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
         seed_project_and_instance(storage.connection());
@@ -3538,6 +3831,156 @@ mod tests {
         assert!((throughput.completed_per_sec - 10.0).abs() < 0.0001);
         assert!((throughput.failed_per_sec - 1.0).abs() < 0.0001);
         assert!((throughput.retried_per_sec - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn materialize_slo_rollups_and_anomalies_writes_project_and_fleet_views() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        seed_second_project_and_instance(storage.connection());
+
+        let now_ms = 120_500;
+        let mut events = Vec::new();
+        for idx in 0_i64..20 {
+            let mut event = sample_search_event(&format!("project-a-event-{idx}"), 120_100 + idx);
+            event.latency_us = if idx == 0 { 10_000 } else { 1_200 };
+            if idx == 0 {
+                event.phase = SearchEventPhase::Failed;
+            }
+            events.push(event);
+        }
+        for idx in 0_i64..10 {
+            let mut event = sample_search_event(&format!("project-b-event-{idx}"), 120_200 + idx);
+            event.project_key = "project-b".to_owned();
+            event.instance_id = "instance-b".to_owned();
+            event.latency_us = 900;
+            events.push(event);
+        }
+
+        storage
+            .ingest_search_events_batch(&events, 512)
+            .expect("event ingest should succeed");
+        let materialized = storage
+            .materialize_slo_rollups_and_anomalies(now_ms, SloMaterializationConfig::default())
+            .expect("SLO/anomaly materialization should succeed");
+
+        assert_eq!(
+            materialized.rollups_upserted,
+            u64::try_from(SummaryWindow::ALL.len() * 3).expect("len fits in u64")
+        );
+        assert!(materialized.anomalies_opened >= 2);
+
+        let project_rollup = storage
+            .latest_slo_rollup(SloScope::Project, "project-a", SummaryWindow::OneMinute)
+            .expect("project rollup query should succeed")
+            .expect("project rollup should exist");
+        assert_eq!(project_rollup.health, SloHealth::Critical);
+        assert!(project_rollup.error_budget_burn.expect("burn should exist") >= 4.0);
+        assert_eq!(project_rollup.total_requests, 20);
+
+        let fleet_rollup = storage
+            .latest_slo_rollup(SloScope::Fleet, "__fleet__", SummaryWindow::OneMinute)
+            .expect("fleet rollup query should succeed")
+            .expect("fleet rollup should exist");
+        assert!(matches!(
+            fleet_rollup.health,
+            SloHealth::Error | SloHealth::Critical
+        ));
+        assert_eq!(fleet_rollup.total_requests, 30);
+
+        let project_rollups = storage
+            .query_slo_rollups_for_scope(SloScope::Project, "project-a", 64)
+            .expect("project rollup list query should succeed");
+        let mut project_windows = project_rollups
+            .iter()
+            .map(|row| row.window.as_label().to_owned())
+            .collect::<Vec<_>>();
+        project_windows.sort_unstable();
+        let mut expected_windows = SummaryWindow::ALL
+            .iter()
+            .map(|window| window.as_label().to_owned())
+            .collect::<Vec<_>>();
+        expected_windows.sort_unstable();
+        assert_eq!(project_windows, expected_windows);
+
+        let fleet_rollups = storage
+            .query_slo_rollups_for_scope(SloScope::Fleet, "__fleet__", 64)
+            .expect("fleet rollup list query should succeed");
+        let mut fleet_windows = fleet_rollups
+            .iter()
+            .map(|row| row.window.as_label().to_owned())
+            .collect::<Vec<_>>();
+        fleet_windows.sort_unstable();
+        assert_eq!(fleet_windows, expected_windows);
+
+        let open_anomalies = storage
+            .query_open_anomalies_for_scope(SloScope::Project, "project-a", 10)
+            .expect("open anomaly query should succeed");
+        assert!(!open_anomalies.is_empty(), "expected open anomaly rows");
+        let top = &open_anomalies[0];
+        assert!(top.baseline_value.is_some());
+        assert!(top.observed_value.is_some());
+        assert!(top.deviation_ratio.is_some());
+        assert!(top.reason_code.starts_with("anomaly."));
+    }
+
+    #[test]
+    fn materialize_slo_rollups_resolves_previous_window_anomalies() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let first_now_ms = 120_500;
+        let mut first_window_events = Vec::new();
+        for idx in 0_i64..16 {
+            let mut event = sample_search_event(&format!("window1-event-{idx}"), 120_100 + idx);
+            event.latency_us = if idx == 0 { 8_000 } else { 1_300 };
+            if idx == 0 {
+                event.phase = SearchEventPhase::Failed;
+            }
+            first_window_events.push(event);
+        }
+        storage
+            .ingest_search_events_batch(&first_window_events, 256)
+            .expect("first window ingest should succeed");
+        storage
+            .materialize_slo_rollups_and_anomalies(
+                first_now_ms,
+                SloMaterializationConfig::default(),
+            )
+            .expect("first materialization should succeed");
+
+        let first_window_start = SummaryWindow::OneMinute.bucket_start_ms(first_now_ms);
+        let anomaly_id = format!("anomaly:project:project-a:1m:{first_window_start}");
+        assert_eq!(
+            anomaly_state(storage.connection(), &anomaly_id).as_deref(),
+            Some("open")
+        );
+
+        let second_now_ms = 180_500;
+        let mut second_window_events = Vec::new();
+        for idx in 0_i64..20 {
+            let mut event = sample_search_event(&format!("window2-event-{idx}"), 180_100 + idx);
+            event.latency_us = 900;
+            second_window_events.push(event);
+        }
+        storage
+            .ingest_search_events_batch(&second_window_events, 256)
+            .expect("second window ingest should succeed");
+        storage
+            .materialize_slo_rollups_and_anomalies(
+                second_now_ms,
+                SloMaterializationConfig::default(),
+            )
+            .expect("second materialization should succeed");
+
+        assert_eq!(
+            anomaly_state(storage.connection(), &anomaly_id).as_deref(),
+            Some("resolved")
+        );
+        assert!(
+            anomaly_resolved_at(storage.connection(), &anomaly_id).is_some(),
+            "resolved anomalies should carry resolved_at_ms"
+        );
     }
 
     #[test]
@@ -3844,7 +4287,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FrankenSQLite does not yet enforce CHECK constraints"]
+    #[ignore = "FrankenSQLite does not yet enforce CHECK constraints on direct SQL writes"]
     fn search_summaries_window_check_rejects_invalid_values() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
@@ -3907,59 +4350,43 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FrankenSQLite does not yet enforce UNIQUE constraints on non-PK columns"]
     fn evidence_links_unique_constraint_prevents_duplicate_alert_uri_pairs() {
-        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
-        bootstrap(&conn).expect("bootstrap should succeed");
-        seed_project_and_instance(&conn);
-        conn.execute(
-            "INSERT INTO alerts_timeline(\
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO alerts_timeline(\
                 alert_id, project_key, instance_id, category, severity, reason_code, summary, \
                 state, opened_at_ms, updated_at_ms\
              ) VALUES (\
                 'alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
                 'spike', 'open', 1, 1\
              );",
-        )
-        .expect("alert row should insert");
+            )
+            .expect("alert row should insert");
 
-        let first = [
-            SqliteValue::Text("link-1".to_owned()),
-            SqliteValue::Text("project-a".to_owned()),
-            SqliteValue::Text("alert-1".to_owned()),
-            SqliteValue::Text("jsonl".to_owned()),
-            SqliteValue::Text("file:///tmp/evidence.jsonl".to_owned()),
-            SqliteValue::Text("hash-1".to_owned()),
-            SqliteValue::Integer(1),
-        ];
-        conn.execute_with_params(
-            "INSERT INTO evidence_links(\
-                link_id, project_key, alert_id, evidence_type, evidence_uri, \
-                evidence_hash, created_at_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-            &first,
-        )
-        .expect("first evidence link should insert");
+        let first = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "alert-1".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///tmp/evidence.jsonl".to_owned(),
+            evidence_hash: Some("hash-1".to_owned()),
+            created_at_ms: 1,
+        };
+        storage
+            .insert_evidence_link(&first)
+            .expect("first evidence link should insert");
 
-        let duplicate_pair = [
-            SqliteValue::Text("link-2".to_owned()),
-            SqliteValue::Text("project-a".to_owned()),
-            SqliteValue::Text("alert-1".to_owned()),
-            SqliteValue::Text("jsonl".to_owned()),
-            SqliteValue::Text("file:///tmp/evidence.jsonl".to_owned()),
-            SqliteValue::Text("hash-2".to_owned()),
-            SqliteValue::Integer(2),
-        ];
-        let duplicate_result = conn.execute_with_params(
-            "INSERT INTO evidence_links(\
-                link_id, project_key, alert_id, evidence_type, evidence_uri, \
-                evidence_hash, created_at_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-            &duplicate_pair,
-        );
+        let duplicate_pair = EvidenceLinkRecord {
+            evidence_hash: Some("hash-2".to_owned()),
+            created_at_ms: 2,
+            ..first
+        };
+        let duplicate_result = storage.insert_evidence_link(&duplicate_pair);
         assert!(
             duplicate_result.is_err(),
-            "duplicate alert/evidence_uri pair should violate UNIQUE constraint"
+            "duplicate alert/evidence_uri pair should be rejected by insert_evidence_link"
         );
     }
 }

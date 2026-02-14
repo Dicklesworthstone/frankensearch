@@ -16,12 +16,17 @@ path = "src/main.rs"
 [dependencies]
 frankensearch-core = { workspace = true }
 asupersync = { workspace = true }
+fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toon-rust = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }
 signal-hook = "0.3"
+sysinfo = { workspace = true }
+notify = "7.0"
 
 [dev-dependencies]
 asupersync = { workspace = true }

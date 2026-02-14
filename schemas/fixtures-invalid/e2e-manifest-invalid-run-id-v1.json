@@ -13,7 +13,7 @@
     "clock_mode": "simulated",
     "tie_break_policy": "doc_id_lexical",
     "artifacts": [
-      { "file": "structured_events.jsonl", "checksum": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" }
+      { "file": "structured_events.jsonl", "checksum": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", "line_count": 10 }
     ],
     "duration_ms": 100,
     "exit_status": "pass"

@@ -54,6 +54,7 @@ pub use state::{
     ProjectAttributionResolver, ProjectLifecycleTracker,
 };
 pub use storage::{
-    OPS_SCHEMA_VERSION, OpsStorage, OpsStorageConfig, bootstrap as bootstrap_ops_storage,
-    current_version as current_ops_schema_version,
+    AnomalyMaterializationSnapshot, OPS_SCHEMA_VERSION, OpsStorage, OpsStorageConfig, SloHealth,
+    SloMaterializationConfig, SloMaterializationResult, SloRollupSnapshot, SloScope,
+    bootstrap as bootstrap_ops_storage, current_version as current_ops_schema_version,
 };

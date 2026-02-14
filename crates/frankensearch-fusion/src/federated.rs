@@ -471,6 +471,7 @@ fn into_ranked_hits(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -571,6 +572,52 @@ mod tests {
         }
     }
 
+    struct FailingEmbedder {
+        id: &'static str,
+        dimension: usize,
+    }
+
+    impl FailingEmbedder {
+        const fn new(id: &'static str, dimension: usize) -> Self {
+            Self { id, dimension }
+        }
+    }
+
+    impl Embedder for FailingEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                Err(SearchError::EmbeddingFailed {
+                    model: self.id.to_owned(),
+                    source: Box::new(io::Error::other("simulated embed failure")),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     fn build_index(records: &[(&str, &[f32])]) -> Arc<TwoTierIndex> {
         let dir = std::env::temp_dir().join(format!(
             "frankensearch-federated-test-{}-{}",
@@ -606,6 +653,17 @@ mod tests {
         let dimension = records.first().map_or(1, |(_, vector)| vector.len());
         let index = build_index(records);
         let embedder: Arc<dyn Embedder> = Arc::new(PendingEmbedder::new("stub-pending", dimension));
+        Arc::new(TwoTierSearcher::new(
+            index,
+            embedder,
+            TwoTierConfig::default(),
+        ))
+    }
+
+    fn build_failing_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+        let dimension = records.first().map_or(1, |(_, vector)| vector.len());
+        let index = build_index(records);
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder::new("stub-failing", dimension));
         Arc::new(TwoTierSearcher::new(
             index,
             embedder,
@@ -659,6 +717,37 @@ mod tests {
 
             assert_eq!(results_a[0].result.doc_id, "shared");
             assert_eq!(results_b[0].result.doc_id, "b-only");
+        });
+    }
+
+    #[test]
+    fn weighted_score_normalizes_disparate_shard_scales() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let large_scale =
+                build_searcher(&[("large-top", &[100.0, 0.0]), ("large-low", &[50.0, 0.0])]);
+            let small_scale =
+                build_searcher(&[("small-top", &[1.0, 0.0]), ("small-low", &[0.5, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    fusion_method: FederatedFusion::WeightedScore {
+                        normalization: NormalizationMethod::MinMax,
+                    },
+                    ..FederatedConfig::default()
+                })
+                .add_index("large", large_scale, 1.0)
+                .add_index("small", small_scale, 1.0);
+
+            let results = federated.search(&cx, "query", 4, |_| None).await.unwrap();
+            let top_ids: std::collections::BTreeSet<_> = results
+                .iter()
+                .take(2)
+                .map(|hit| hit.result.doc_id.as_str())
+                .collect();
+
+            assert!(top_ids.contains("large-top"));
+            assert!(top_ids.contains("small-top"));
+            assert!(!top_ids.contains("large-low"));
         });
     }
 
@@ -741,6 +830,182 @@ mod tests {
                 }
             ));
         });
+    }
+
+    #[test]
+    fn failed_shard_does_not_abort_when_min_indices_met() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let healthy = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
+            let failing = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    min_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("healthy", healthy, 1.0)
+                .add_index("failing", failing, 1.0);
+
+            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].result.doc_id, "doc-healthy");
+            assert_eq!(results[0].appeared_in, vec!["healthy".to_owned()]);
+        });
+    }
+
+    #[test]
+    fn filtered_shard_can_yield_zero_hits_without_failing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let full = build_searcher(&[("doc-full", &[1.0, 0.0])]);
+            let filtered = build_searcher(&[("doc-filtered", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    min_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("full", full, 1.0)
+                .add_index("filtered", filtered, 1.0);
+
+            let results = federated
+                .search(&cx, "query -dropme", 10, |doc_id| {
+                    if doc_id == "doc-filtered" {
+                        Some("dropme".to_owned())
+                    } else {
+                        Some("keep".to_owned())
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].result.doc_id, "doc-full");
+            assert_eq!(results[0].appeared_in, vec!["full".to_owned()]);
+        });
+    }
+
+    #[test]
+    fn comb_mnz_tracks_all_source_indices_for_duplicate_doc() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index_a = build_searcher(&[("shared", &[1.0, 0.0]), ("a-only", &[1.0, 0.0])]);
+            let index_b = build_searcher(&[("shared", &[1.0, 0.0]), ("b-only", &[1.0, 0.0])]);
+            let index_c = build_searcher(&[("shared", &[1.0, 0.0]), ("c-only", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    fusion_method: FederatedFusion::CombMnz {
+                        normalization: NormalizationMethod::MinMax,
+                    },
+                    ..FederatedConfig::default()
+                })
+                .add_index("a", index_a, 1.0)
+                .add_index("b", index_b, 1.0)
+                .add_index("c", index_c, 1.0);
+
+            let results = federated.search(&cx, "query", 5, |_| None).await.unwrap();
+            let shared = results
+                .iter()
+                .find(|hit| hit.result.doc_id == "shared")
+                .expect("shared should be present");
+            assert_eq!(shared.appeared_in, vec!["a", "b", "c"]);
+            assert_eq!(results[0].result.doc_id, "shared");
+        });
+    }
+
+    #[test]
+    fn max_indices_limits_scatter_fanout() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let first = build_searcher(&[("doc-first", &[1.0, 0.0])]);
+            let second = build_searcher(&[("doc-second", &[1.0, 0.0])]);
+            let third = build_searcher(&[("doc-third", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    max_indices: 2,
+                    fusion_method: FederatedFusion::WeightedScore {
+                        normalization: NormalizationMethod::MinMax,
+                    },
+                    ..FederatedConfig::default()
+                })
+                .add_index("first", first, 1.0)
+                .add_index("second", second, 1.0)
+                .add_index("third", third, 1.0);
+
+            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let ids: std::collections::BTreeSet<_> = results
+                .iter()
+                .map(|hit| hit.result.doc_id.as_str())
+                .collect();
+
+            assert!(ids.contains("doc-first"));
+            assert!(ids.contains("doc-second"));
+            assert!(!ids.contains("doc-third"));
+        });
+    }
+
+    #[test]
+    fn empty_query_returns_empty_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
+            let results = federated.search(&cx, "", 10, |_| None).await.unwrap();
+            assert!(results.is_empty());
+        });
+    }
+
+    #[test]
+    fn zero_limit_returns_empty_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
+            let results = federated.search(&cx, "query", 0, |_| None).await.unwrap();
+            assert!(results.is_empty());
+        });
+    }
+
+    #[test]
+    fn no_indices_returns_empty_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let federated = FederatedSearcher::new();
+            assert!(federated.is_empty());
+            assert_eq!(federated.len(), 0);
+            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            assert!(results.is_empty());
+        });
+    }
+
+    #[test]
+    fn federated_fusion_default_is_rrf() {
+        let fusion = super::FederatedFusion::default();
+        assert!(
+            matches!(fusion, super::FederatedFusion::Rrf { k } if (k - 60.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn federated_config_defaults() {
+        let config = FederatedConfig::default();
+        assert_eq!(config.per_index_timeout_ms, 500);
+        assert_eq!(config.min_indices, 1);
+        assert_eq!(config.candidate_pool_factor, 3);
+        assert_eq!(config.max_indices, usize::MAX);
+    }
+
+    #[test]
+    fn rank_contribution_decreases_with_rank() {
+        let c0 = super::rank_contribution(60.0, 0);
+        let c1 = super::rank_contribution(60.0, 1);
+        let c10 = super::rank_contribution(60.0, 10);
+        assert!(c0 > c1);
+        assert!(c1 > c10);
+        assert!(c0 > 0.0);
+    }
+
+    #[test]
+    fn rank_contribution_large_rank() {
+        // Should not panic even with very large rank values
+        let c = super::rank_contribution(60.0, usize::MAX);
+        assert!(c >= 0.0);
+        assert!(c.is_finite());
     }
 
     #[test]

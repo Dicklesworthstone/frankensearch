@@ -98,8 +98,9 @@ pub use generation::{
     validate_manifest,
 };
 pub use host_adapter::{
-    AdapterIdentity, AdapterLifecycleEvent, ConformanceConfig, ConformanceHarness,
-    ConformanceReport, ConformanceViolation, DEFAULT_REDACTION_FORBIDDEN_PATTERNS, HostAdapter,
+    AdapterIdentity, AdapterLifecycleEvent, AdapterSink, CanonicalHostProject, ConformanceConfig,
+    ConformanceHarness, ConformanceReport, ConformanceViolation,
+    DEFAULT_REDACTION_FORBIDDEN_PATTERNS, ForwardingHostAdapter, HostAdapter, NoopAdapterSink,
 };
 pub use observability_lint::{
     LintFinding, LintReport, LintRuleId, LintSeverity, lint_component_coverage, lint_record,

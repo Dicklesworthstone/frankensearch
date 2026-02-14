@@ -159,4 +159,17 @@ mod tests {
         let expanded = expand_cli_config_path(Path::new("/tmp/fsfs.toml"), Path::new("/home/alex"));
         assert_eq!(expanded, PathBuf::from("/tmp/fsfs.toml"));
     }
+
+    #[test]
+    fn expand_cli_config_path_bare_tilde() {
+        let expanded = expand_cli_config_path(Path::new("~"), Path::new("/home/alex"));
+        assert_eq!(expanded, PathBuf::from("/home/alex"));
+    }
+
+    #[test]
+    fn expand_cli_config_path_keeps_relative_paths() {
+        let expanded =
+            expand_cli_config_path(Path::new("relative/config.toml"), Path::new("/home/alex"));
+        assert_eq!(expanded, PathBuf::from("relative/config.toml"));
+    }
 }

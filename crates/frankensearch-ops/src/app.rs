@@ -4,18 +4,21 @@
 //! data source, and drives the event loop. Product binaries create an
 //! `OpsApp` and call `run()`.
 
+use frankensearch_tui::Screen;
 use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{Action, ActionCategory};
 use frankensearch_tui::screen::ScreenId;
 use frankensearch_tui::shell::{AppShell, ShellConfig};
 use frankensearch_tui::theme::Theme;
-use frankensearch_tui::Screen;
 use ratatui::Frame;
 
 use crate::data_source::DataSource;
 use crate::preferences::DisplayPreferences;
 use crate::presets::{ViewPreset, ViewState};
-use crate::screens::FleetOverviewScreen;
+use crate::screens::{
+    ActionTimelineScreen, FleetOverviewScreen, IndexResourceScreen, LiveSearchStreamScreen,
+    ProjectDetailScreen,
+};
 use crate::state::{AppState, ControlPlaneHealth};
 
 // ─── Ops App ─────────────────────────────────────────────────────────────────
@@ -32,6 +35,14 @@ pub struct OpsApp {
     data_source: Box<dyn DataSource>,
     /// Registered fleet screen id.
     fleet_screen_id: ScreenId,
+    /// Registered project detail screen id.
+    project_screen_id: ScreenId,
+    /// Registered live stream screen id.
+    live_stream_screen_id: ScreenId,
+    /// Registered timeline screen id.
+    timeline_screen_id: ScreenId,
+    /// Registered index/resource monitoring screen id.
+    index_screen_id: ScreenId,
     /// Accessibility and display preferences.
     pub preferences: DisplayPreferences,
     /// Current view state (preset + density + filters).
@@ -58,10 +69,28 @@ impl OpsApp {
             shell.palette.register(action);
         }
 
-        // Create and register the fleet screen.
-        let fleet_screen = FleetOverviewScreen::new();
+        // Create and register screens.
+        let project_screen = ProjectDetailScreen::new();
+        let project_id = project_screen.id().clone();
+
+        let mut fleet_screen = FleetOverviewScreen::new();
+        fleet_screen.set_project_screen_id(project_id.clone());
         let fleet_id = fleet_screen.id().clone();
+
+        let live_stream_screen = LiveSearchStreamScreen::new();
+        let live_stream_id = live_stream_screen.id().clone();
+
+        let timeline_screen = ActionTimelineScreen::new();
+        let timeline_id = timeline_screen.id().clone();
+
+        let index_screen = IndexResourceScreen::new();
+        let index_id = index_screen.id().clone();
+
         shell.registry.register(Box::new(fleet_screen));
+        shell.registry.register(Box::new(project_screen));
+        shell.registry.register(Box::new(live_stream_screen));
+        shell.registry.register(Box::new(timeline_screen));
+        shell.registry.register(Box::new(index_screen));
 
         // Set initial active screen.
         shell.navigate_to(&fleet_id);
@@ -71,6 +100,10 @@ impl OpsApp {
             state: AppState::new(),
             data_source,
             fleet_screen_id: fleet_id,
+            project_screen_id: project_id,
+            live_stream_screen_id: live_stream_id,
+            timeline_screen_id: timeline_id,
+            index_screen_id: index_id,
             preferences: DisplayPreferences::new(),
             view: ViewState::default(),
             last_alerted_health: None,
@@ -95,12 +128,14 @@ impl OpsApp {
 
         let current_health = self.state.control_plane_health();
         self.maybe_emit_control_plane_alert(previous_health, current_health);
-        self.sync_fleet_screen_state();
+        self.sync_screen_states();
     }
 
     /// Process an input event. Returns `true` if the app should quit.
     pub fn handle_input(&mut self, event: &frankensearch_tui::InputEvent) -> bool {
+        let previous_screen = self.shell.active_screen.clone();
         let quit = self.shell.handle_input(event);
+        self.sync_project_filter_from_screen_transition(previous_screen.as_ref(), event);
 
         // Handle palette action confirmations.
         if let Some(action_id) = self.shell.last_palette_action().map(str::to_string) {
@@ -128,15 +163,25 @@ impl OpsApp {
     fn dispatch_palette_action(&mut self, action_id: &str) {
         match action_id {
             "nav.fleet" => {
-                let id = frankensearch_tui::screen::ScreenId::new("ops.fleet");
+                if self.view.preset == ViewPreset::ProjectDeepDive {
+                    self.view.apply_preset(ViewPreset::FleetTriage);
+                } else {
+                    self.view.clear_project_filter();
+                }
+                let id = self.fleet_screen_id.clone();
+                self.shell.navigate_to(&id);
+                self.sync_screen_states();
+            }
+            "nav.project" | "view.project_deep_dive" => {
+                self.open_project_detail_for_selected_project();
+            }
+            "nav.search" => {
+                let id = self.live_stream_screen_id.clone();
                 self.shell.navigate_to(&id);
             }
-            "nav.search" | "nav.index" => {
-                tracing::warn!(
-                    target: "frankensearch.ops",
-                    action_id,
-                    "palette navigation action is not implemented yet"
-                );
+            "nav.index" => {
+                let id = self.index_screen_id.clone();
+                self.shell.navigate_to(&id);
             }
             "debug.refresh" => {
                 self.refresh_data();
@@ -177,34 +222,33 @@ impl OpsApp {
             }
             "view.density" => {
                 self.view.cycle_density();
-                self.sync_fleet_screen_state();
+                self.sync_screen_states();
             }
             "view.fleet_triage" => {
                 self.view.apply_preset(ViewPreset::FleetTriage);
-                self.sync_fleet_screen_state();
-            }
-            "view.project_deep_dive" => {
-                self.view.apply_preset(ViewPreset::ProjectDeepDive);
-                self.sync_fleet_screen_state();
+                self.view.clear_project_filter();
+                let id = self.fleet_screen_id.clone();
+                self.shell.navigate_to(&id);
+                self.sync_screen_states();
             }
             "view.incident_mode" => {
                 self.view.apply_preset(ViewPreset::IncidentMode);
                 if self.view.preset.prefer_high_contrast() {
                     self.preferences.contrast = crate::preferences::ContrastMode::High;
                 }
-                self.sync_fleet_screen_state();
+                self.sync_screen_states();
             }
             "view.low_noise" => {
                 self.view.apply_preset(ViewPreset::LowNoise);
-                self.sync_fleet_screen_state();
+                self.sync_screen_states();
             }
             "view.hide_healthy" => {
                 self.view.toggle_hide_healthy();
-                self.sync_fleet_screen_state();
+                self.sync_screen_states();
             }
             "view.unhealthy_first" => {
                 self.view.toggle_unhealthy_first();
-                self.sync_fleet_screen_state();
+                self.sync_screen_states();
             }
             _ => {
                 tracing::warn!(
@@ -231,8 +275,27 @@ impl OpsApp {
             .and_then(|screen| screen.as_any().downcast_ref::<FleetOverviewScreen>())
     }
 
+    /// Get a reference to the project detail screen (for testing/inspection).
+    #[must_use]
+    pub fn project_screen(&self) -> Option<&ProjectDetailScreen> {
+        self.shell
+            .registry
+            .get(&self.project_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<ProjectDetailScreen>())
+    }
+
+    /// Get a reference to the index/resource screen (for testing/inspection).
+    #[must_use]
+    pub fn index_screen(&self) -> Option<&IndexResourceScreen> {
+        self.shell
+            .registry
+            .get(&self.index_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<IndexResourceScreen>())
+    }
+
     /// Get a list of all registered palette actions (for help screen).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn palette_actions() -> Vec<Action> {
         vec![
             Action::new(
@@ -241,6 +304,12 @@ impl OpsApp {
                 ActionCategory::Navigation,
             )
             .with_shortcut("1"),
+            Action::new(
+                "nav.project",
+                "Go to Project Detail",
+                ActionCategory::Navigation,
+            )
+            .with_shortcut("4"),
             Action::new(
                 "nav.search",
                 "Go to Search Stream",
@@ -354,7 +423,84 @@ impl OpsApp {
             .and_then(|screen| screen.as_any_mut().downcast_mut::<FleetOverviewScreen>())
     }
 
-    fn sync_fleet_screen_state(&mut self) {
+    fn project_screen_mut(&mut self) -> Option<&mut ProjectDetailScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.project_screen_id)
+            .and_then(|screen| screen.as_any_mut().downcast_mut::<ProjectDetailScreen>())
+    }
+
+    fn live_stream_screen_mut(&mut self) -> Option<&mut LiveSearchStreamScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.live_stream_screen_id)
+            .and_then(|screen| screen.as_any_mut().downcast_mut::<LiveSearchStreamScreen>())
+    }
+
+    fn timeline_screen_mut(&mut self) -> Option<&mut ActionTimelineScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.timeline_screen_id)
+            .and_then(|screen| screen.as_any_mut().downcast_mut::<ActionTimelineScreen>())
+    }
+
+    fn index_screen_mut(&mut self) -> Option<&mut IndexResourceScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.index_screen_id)
+            .and_then(|screen| screen.as_any_mut().downcast_mut::<IndexResourceScreen>())
+    }
+
+    fn selected_project_from_fleet(&self) -> Option<String> {
+        self.fleet_screen()
+            .and_then(FleetOverviewScreen::selected_project)
+            .map(ToOwned::to_owned)
+    }
+
+    fn open_project_detail_for_selected_project(&mut self) {
+        self.view.apply_preset(ViewPreset::ProjectDeepDive);
+        if let Some(project) = self.selected_project_from_fleet() {
+            self.view.set_project_filter(project);
+        }
+        let id = self.project_screen_id.clone();
+        self.shell.navigate_to(&id);
+        self.sync_screen_states();
+    }
+
+    fn sync_project_filter_from_screen_transition(
+        &mut self,
+        previous_screen: Option<&ScreenId>,
+        event: &frankensearch_tui::InputEvent,
+    ) {
+        let current_screen = self.shell.active_screen.clone();
+        let moved_fleet_to_project = previous_screen == Some(&self.fleet_screen_id)
+            && current_screen.as_ref() == Some(&self.project_screen_id);
+        if moved_fleet_to_project
+            && matches!(
+                event,
+                frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Enter, _)
+            )
+        {
+            self.view.apply_preset(ViewPreset::ProjectDeepDive);
+            if let Some(project) = self.selected_project_from_fleet() {
+                self.view.set_project_filter(project);
+            }
+            self.sync_screen_states();
+        }
+
+        let moved_project_to_fleet = previous_screen == Some(&self.project_screen_id)
+            && current_screen.as_ref() == Some(&self.fleet_screen_id);
+        if moved_project_to_fleet {
+            if self.view.preset == ViewPreset::ProjectDeepDive {
+                self.view.apply_preset(ViewPreset::FleetTriage);
+            } else {
+                self.view.clear_project_filter();
+            }
+            self.sync_screen_states();
+        }
+    }
+
+    fn sync_screen_states(&mut self) {
         let state_snapshot = self.state.clone();
         let view_snapshot = self.view.clone();
         if let Some(screen) = self.fleet_screen_mut() {
@@ -364,6 +510,42 @@ impl OpsApp {
                 target: "frankensearch.ops",
                 screen_id = %self.fleet_screen_id,
                 "fleet screen missing or wrong type; skipping screen state refresh"
+            );
+        }
+        if let Some(screen) = self.project_screen_mut() {
+            screen.update_state(&state_snapshot, &view_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.project_screen_id,
+                "project detail screen missing or wrong type; skipping screen state refresh"
+            );
+        }
+        if let Some(screen) = self.live_stream_screen_mut() {
+            screen.update_state(&state_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.live_stream_screen_id,
+                "live stream screen missing or wrong type; skipping screen state refresh"
+            );
+        }
+        if let Some(screen) = self.timeline_screen_mut() {
+            screen.update_state(&state_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.timeline_screen_id,
+                "timeline screen missing or wrong type; skipping screen state refresh"
+            );
+        }
+        if let Some(screen) = self.index_screen_mut() {
+            screen.update_state(&state_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.index_screen_id,
+                "index/resource screen missing or wrong type; skipping screen state refresh"
             );
         }
     }
@@ -533,6 +715,7 @@ mod tests {
         let actions = OpsApp::palette_actions();
         assert!(!actions.is_empty());
         assert!(actions.iter().any(|a| a.id == "nav.fleet"));
+        assert!(actions.iter().any(|a| a.id == "nav.project"));
     }
 
     #[test]
@@ -550,6 +733,20 @@ mod tests {
         let app = OpsApp::new(Box::new(MockDataSource::sample()));
         let fleet = app.fleet_screen().expect("fleet screen should exist");
         assert_eq!(fleet.id(), &ScreenId::new("ops.fleet"));
+    }
+
+    #[test]
+    fn project_screen_accessible() {
+        let app = OpsApp::new(Box::new(MockDataSource::sample()));
+        let project = app.project_screen().expect("project screen should exist");
+        assert_eq!(project.id(), &ScreenId::new("ops.project"));
+    }
+
+    #[test]
+    fn index_screen_accessible() {
+        let app = OpsApp::new(Box::new(MockDataSource::sample()));
+        let index = app.index_screen().expect("index screen should exist");
+        assert_eq!(index.id(), &ScreenId::new("ops.index"));
     }
 
     #[test]
@@ -616,6 +813,55 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_fleet_opens_project_detail_with_project_filter() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.shell.overlays.dismiss();
+
+        let enter = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&enter);
+        assert!(!quit);
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
+        assert_eq!(app.view.project_filter.as_deref(), Some("cass"));
+        assert_eq!(app.view.preset, crate::presets::ViewPreset::ProjectDeepDive);
+    }
+
+    #[test]
+    fn esc_from_project_detail_returns_to_fleet_and_clears_project_filter() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.shell.overlays.dismiss();
+        app.handle_input(&frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
+        assert_eq!(app.view.project_filter.as_deref(), Some("cass"));
+
+        let esc = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&esc);
+        assert!(!quit);
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.fleet")));
+        assert!(app.view.project_filter.is_none());
+        assert_eq!(app.view.preset, crate::presets::ViewPreset::FleetTriage);
+    }
+
+    #[test]
+    fn nav_project_action_opens_selected_project_detail() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.dispatch_palette_action("nav.project");
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
+        assert_eq!(app.view.project_filter.as_deref(), Some("cass"));
+    }
+
+    #[test]
     fn dispatch_contrast_toggle() {
         let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
         assert_eq!(app.preferences.contrast, ContrastMode::Normal);
@@ -643,10 +889,12 @@ mod tests {
         let overlay = app.shell.overlays.top().expect("overlay should be visible");
         assert_eq!(overlay.kind, OverlayKind::Alert);
         assert_eq!(overlay.title, "Control Plane Self-Check");
-        assert!(overlay
-            .body
-            .as_deref()
-            .is_some_and(|body| body.contains("ingestion_lag_events")));
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("ingestion_lag_events"))
+        );
     }
 
     #[test]
@@ -670,10 +918,12 @@ mod tests {
             .expect("degradation alert should exist");
         assert_eq!(overlay.kind, OverlayKind::Alert);
         assert_eq!(overlay.title, "Control Plane Degraded");
-        assert!(overlay
-            .body
-            .as_deref()
-            .is_some_and(|body| body.contains("health transition: healthy -> degraded")));
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("health transition: healthy -> degraded"))
+        );
     }
 
     #[test]
@@ -722,10 +972,12 @@ mod tests {
             .top()
             .expect("critical alert should exist");
         assert_eq!(overlay.title, "Control Plane Critical");
-        assert!(overlay
-            .body
-            .as_deref()
-            .is_some_and(|body| body.contains("health transition: degraded -> critical")));
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("health transition: degraded -> critical"))
+        );
     }
 
     #[test]

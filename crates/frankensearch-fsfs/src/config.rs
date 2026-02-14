@@ -16,6 +16,18 @@ const PRECEDENCE: [ConfigSource; 4] = [
     ConfigSource::Defaults,
 ];
 
+/// Versioned profile contract revision for pressure-profile policy resolution.
+pub const PRESSURE_PROFILE_VERSION: u16 = 1;
+
+/// Deterministic precedence chain for profile-managed fields.
+pub const PROFILE_PRECEDENCE_CHAIN: [&str; 5] = [
+    "hard_safety_guards",
+    "cli_override",
+    "env_override",
+    "config_override",
+    "profile_default",
+];
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TextSelectionMode {
@@ -41,6 +53,111 @@ impl FromStr for PressureProfile {
             "strict" => Ok(Self::Strict),
             "performance" => Ok(Self::Performance),
             "degraded" => Ok(Self::Degraded),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileSchedulerMode {
+    FairShare,
+    LatencySensitive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureProfileField {
+    SchedulerMode,
+    MaxEmbedConcurrency,
+    MaxIndexConcurrency,
+    QualityEnabled,
+    AllowBackgroundIndexing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileOverrideSource {
+    Cli,
+    Env,
+    Config,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileOverridePolicy {
+    pub overridable_fields: Vec<PressureProfileField>,
+    pub locked_fields: Vec<PressureProfileField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileEffectiveSettings {
+    pub scheduler_mode: ProfileSchedulerMode,
+    pub max_embed_concurrency: u8,
+    pub max_index_concurrency: u8,
+    pub quality_enabled: bool,
+    pub allow_background_indexing: bool,
+    pub pressure_enter_threshold_per_mille: u16,
+    pub pressure_exit_threshold_per_mille: u16,
+    pub override_policy: PressureProfileOverridePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileOverrideDecision {
+    pub field: PressureProfileField,
+    pub source: ProfileOverrideSource,
+    pub requested_value: String,
+    pub applied: bool,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileSafetyClamp {
+    pub field: PressureProfileField,
+    pub clamped_to: String,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileResolutionDiagnostics {
+    pub event: String,
+    pub precedence_chain: Vec<String>,
+    pub reason_code: String,
+    pub effective_profile_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PressureProfileResolution {
+    pub selected_profile: PressureProfile,
+    pub overrides: Vec<PressureProfileOverrideDecision>,
+    pub effective: PressureProfileEffectiveSettings,
+    pub safety_clamps: Vec<PressureProfileSafetyClamp>,
+    pub conflict_detected: bool,
+    pub diagnostics: PressureProfileResolutionDiagnostics,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationOverrideMode {
+    #[default]
+    Auto,
+    ForceFull,
+    ForceEmbedDeferred,
+    ForceLexicalOnly,
+    ForceMetadataOnly,
+    ForcePaused,
+}
+
+impl FromStr for DegradationOverrideMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "full" | "force_full" => Ok(Self::ForceFull),
+            "embed_deferred" | "force_embed_deferred" => Ok(Self::ForceEmbedDeferred),
+            "lexical_only" | "force_lexical_only" => Ok(Self::ForceLexicalOnly),
+            "metadata_only" | "force_metadata_only" => Ok(Self::ForceMetadataOnly),
+            "paused" | "force_paused" => Ok(Self::ForcePaused),
             _ => Err(()),
         }
     }
@@ -123,6 +240,115 @@ const REASON_DISCOVERY_FILE_INCLUDED: &str = "discovery.file.included";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded_pattern";
 const REASON_DISCOVERY_FILE_TOO_LARGE: &str = "discovery.file.too_large";
 const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
+
+const STRICT_OVERRIDABLE_FIELDS: &[PressureProfileField] = &[
+    PressureProfileField::SchedulerMode,
+    PressureProfileField::MaxIndexConcurrency,
+];
+const STRICT_LOCKED_FIELDS: &[PressureProfileField] = &[
+    PressureProfileField::QualityEnabled,
+    PressureProfileField::AllowBackgroundIndexing,
+    PressureProfileField::MaxEmbedConcurrency,
+];
+const PERFORMANCE_OVERRIDABLE_FIELDS: &[PressureProfileField] = &[
+    PressureProfileField::SchedulerMode,
+    PressureProfileField::MaxEmbedConcurrency,
+    PressureProfileField::MaxIndexConcurrency,
+    PressureProfileField::AllowBackgroundIndexing,
+];
+const PERFORMANCE_LOCKED_FIELDS: &[PressureProfileField] = &[PressureProfileField::QualityEnabled];
+const DEGRADED_LOCKED_FIELDS: &[PressureProfileField] = &[
+    PressureProfileField::SchedulerMode,
+    PressureProfileField::MaxEmbedConcurrency,
+    PressureProfileField::MaxIndexConcurrency,
+    PressureProfileField::QualityEnabled,
+    PressureProfileField::AllowBackgroundIndexing,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureProfileContract {
+    scheduler_mode: ProfileSchedulerMode,
+    max_embed_concurrency: u8,
+    max_index_concurrency: u8,
+    quality_enabled: bool,
+    allow_background_indexing: bool,
+    pressure_enter_threshold_per_mille: u16,
+    pressure_exit_threshold_per_mille: u16,
+    overridable_fields: &'static [PressureProfileField],
+    locked_fields: &'static [PressureProfileField],
+}
+
+impl PressureProfileContract {
+    #[must_use]
+    fn to_effective_settings(self) -> PressureProfileEffectiveSettings {
+        PressureProfileEffectiveSettings {
+            scheduler_mode: self.scheduler_mode,
+            max_embed_concurrency: self.max_embed_concurrency,
+            max_index_concurrency: self.max_index_concurrency,
+            quality_enabled: self.quality_enabled,
+            allow_background_indexing: self.allow_background_indexing,
+            pressure_enter_threshold_per_mille: self.pressure_enter_threshold_per_mille,
+            pressure_exit_threshold_per_mille: self.pressure_exit_threshold_per_mille,
+            override_policy: PressureProfileOverridePolicy {
+                overridable_fields: self.overridable_fields.to_vec(),
+                locked_fields: self.locked_fields.to_vec(),
+            },
+        }
+    }
+
+    #[must_use]
+    fn is_locked_field(self, field: PressureProfileField) -> bool {
+        let mut idx = 0;
+        while idx < self.locked_fields.len() {
+            if self.locked_fields[idx] == field {
+                return true;
+            }
+            idx += 1;
+        }
+        false
+    }
+}
+
+impl PressureProfile {
+    #[must_use]
+    const fn contract(self) -> PressureProfileContract {
+        match self {
+            Self::Strict => PressureProfileContract {
+                scheduler_mode: ProfileSchedulerMode::FairShare,
+                max_embed_concurrency: 2,
+                max_index_concurrency: 2,
+                quality_enabled: false,
+                allow_background_indexing: false,
+                pressure_enter_threshold_per_mille: 350,
+                pressure_exit_threshold_per_mille: 200,
+                overridable_fields: STRICT_OVERRIDABLE_FIELDS,
+                locked_fields: STRICT_LOCKED_FIELDS,
+            },
+            Self::Performance => PressureProfileContract {
+                scheduler_mode: ProfileSchedulerMode::LatencySensitive,
+                max_embed_concurrency: 6,
+                max_index_concurrency: 8,
+                quality_enabled: true,
+                allow_background_indexing: true,
+                pressure_enter_threshold_per_mille: 650,
+                pressure_exit_threshold_per_mille: 450,
+                overridable_fields: PERFORMANCE_OVERRIDABLE_FIELDS,
+                locked_fields: PERFORMANCE_LOCKED_FIELDS,
+            },
+            Self::Degraded => PressureProfileContract {
+                scheduler_mode: ProfileSchedulerMode::FairShare,
+                max_embed_concurrency: 1,
+                max_index_concurrency: 1,
+                quality_enabled: false,
+                allow_background_indexing: false,
+                pressure_enter_threshold_per_mille: 150,
+                pressure_exit_threshold_per_mille: 100,
+                overridable_fields: &[],
+                locked_fields: DEGRADED_LOCKED_FIELDS,
+            },
+        }
+    }
+}
 
 /// Ingestion class assigned by discovery policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -630,6 +856,14 @@ pub struct PressureConfig {
     pub profile: PressureProfile,
     pub cpu_ceiling_pct: u8,
     pub memory_ceiling_mb: usize,
+    pub sample_interval_ms: u64,
+    pub ewma_alpha_per_mille: u16,
+    pub anti_flap_readings: u8,
+    pub io_ceiling_bytes_per_sec: u64,
+    pub load_ceiling_per_mille: u16,
+    pub degradation_override: DegradationOverrideMode,
+    pub hard_pause_requested: bool,
+    pub quality_circuit_open: bool,
 }
 
 impl Default for PressureConfig {
@@ -638,6 +872,14 @@ impl Default for PressureConfig {
             profile: PressureProfile::Performance,
             cpu_ceiling_pct: 80,
             memory_ceiling_mb: 2048,
+            sample_interval_ms: 2_000,
+            ewma_alpha_per_mille: 300,
+            anti_flap_readings: 3,
+            io_ceiling_bytes_per_sec: 100 * 1024 * 1024,
+            load_ceiling_per_mille: 3_000,
+            degradation_override: DegradationOverrideMode::Auto,
+            hard_pause_requested: false,
+            quality_circuit_open: false,
         }
     }
 }
@@ -741,6 +983,14 @@ struct PressureConfigPatch {
     profile: Option<PressureProfile>,
     cpu_ceiling_pct: Option<u8>,
     memory_ceiling_mb: Option<usize>,
+    sample_interval_ms: Option<u64>,
+    ewma_alpha_per_mille: Option<u16>,
+    anti_flap_readings: Option<u8>,
+    io_ceiling_bytes_per_sec: Option<u64>,
+    load_ceiling_per_mille: Option<u16>,
+    degradation_override: Option<DegradationOverrideMode>,
+    hard_pause_requested: Option<bool>,
+    quality_circuit_open: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -808,6 +1058,7 @@ pub struct ConfigLoadResult {
     pub config_file_used: Option<PathBuf>,
     pub cli_flags_used: Vec<String>,
     pub env_keys_used: Vec<String>,
+    pub pressure_profile_resolution: PressureProfileResolution,
     pub warnings: Vec<ConfigWarning>,
     pub path_expansions: Vec<PathExpansion>,
 }
@@ -815,11 +1066,32 @@ pub struct ConfigLoadResult {
 impl ConfigLoadResult {
     #[must_use]
     pub fn to_loaded_event(&self) -> ConfigLoadedEvent {
-        let reason_codes = self
+        let mut reason_codes: Vec<String> = self
             .warnings
             .iter()
             .map(|warning| warning.reason_code.clone())
             .collect();
+        reason_codes.push(
+            self.pressure_profile_resolution
+                .diagnostics
+                .reason_code
+                .clone(),
+        );
+        reason_codes.extend(
+            self.pressure_profile_resolution
+                .overrides
+                .iter()
+                .filter(|decision| !decision.applied)
+                .map(|decision| decision.reason_code.clone()),
+        );
+        reason_codes.extend(
+            self.pressure_profile_resolution
+                .safety_clamps
+                .iter()
+                .map(|clamp| clamp.reason_code.clone()),
+        );
+        reason_codes.sort_unstable();
+        reason_codes.dedup();
 
         ConfigLoadedEvent {
             event: "config_loaded".into(),
@@ -827,6 +1099,7 @@ impl ConfigLoadResult {
             config_file_used: self.config_file_used.clone(),
             cli_flags_used: self.cli_flags_used.clone(),
             env_keys_used: self.env_keys_used.clone(),
+            pressure_profile_resolution: self.pressure_profile_resolution.clone(),
             resolved_values: self.config.clone(),
             warnings: self.warnings.clone(),
             reason_codes,
@@ -841,6 +1114,7 @@ pub struct ConfigLoadedEvent {
     pub config_file_used: Option<PathBuf>,
     pub cli_flags_used: Vec<String>,
     pub env_keys_used: Vec<String>,
+    pub pressure_profile_resolution: PressureProfileResolution,
     pub resolved_values: FsfsConfig,
     pub warnings: Vec<ConfigWarning>,
     pub reason_codes: Vec<String>,
@@ -852,8 +1126,12 @@ pub struct CliOverrides {
     pub exclude_patterns: Option<Vec<String>>,
     pub limit: Option<usize>,
     pub fast_only: Option<bool>,
+    pub allow_background_indexing: Option<bool>,
     pub explain: Option<bool>,
     pub profile: Option<PressureProfile>,
+    pub degradation_override: Option<DegradationOverrideMode>,
+    pub hard_pause_requested: Option<bool>,
+    pub quality_circuit_open: Option<bool>,
     pub theme: Option<TuiTheme>,
     pub config_path: Option<PathBuf>,
 }
@@ -874,11 +1152,23 @@ impl CliOverrides {
         if self.fast_only.is_some() {
             flags.push("--fast-only".into());
         }
+        if self.allow_background_indexing.is_some() {
+            flags.push("--watch-mode".into());
+        }
         if self.explain.is_some() {
             flags.push("--explain".into());
         }
         if self.profile.is_some() {
             flags.push("--profile".into());
+        }
+        if self.degradation_override.is_some() {
+            flags.push("--degradation-override".into());
+        }
+        if self.hard_pause_requested.is_some() {
+            flags.push("--hard-pause".into());
+        }
+        if self.quality_circuit_open.is_some() {
+            flags.push("--quality-circuit-open".into());
         }
         if self.theme.is_some() {
             flags.push("--theme".into());
@@ -971,6 +1261,7 @@ where
 {
     let mut config = FsfsConfig::default();
     let mut warnings = Vec::new();
+    let mut file_profile_overrides = ProfileSourceOverrides::default();
 
     if let Some(config_toml) = config_toml {
         warnings.extend(collect_unknown_key_warnings(config_toml)?);
@@ -980,20 +1271,30 @@ where
                 value: "<toml>".into(),
                 reason: error.to_string(),
             })?;
+        file_profile_overrides = profile_overrides_from_file_patch(&patch);
         apply_patch(&mut config, patch);
     }
 
-    let env_keys_used = apply_env_overrides(&mut config, env)?;
-    apply_cli_overrides(&mut config, cli);
+    let env_report = apply_env_overrides(&mut config, env)?;
+    let cli_profile_overrides = apply_cli_overrides(&mut config, cli);
     let path_expansions = expand_tilde_paths(&mut config, home_dir);
     validate_config(&config, &mut warnings)?;
+
+    let pressure_profile_resolution = resolve_pressure_profile(
+        &mut config,
+        file_profile_overrides,
+        env_report.profile_overrides,
+        cli_profile_overrides,
+        &mut warnings,
+    );
 
     Ok(ConfigLoadResult {
         config,
         source_precedence: PRECEDENCE,
         config_file_used: config_file_path.map(Path::to_path_buf),
         cli_flags_used: cli.used_flags(),
-        env_keys_used,
+        env_keys_used: env_report.keys_used,
+        pressure_profile_resolution,
         warnings,
         path_expansions,
     })
@@ -1006,9 +1307,251 @@ pub fn emit_config_loaded(event: &ConfigLoadedEvent) {
         config_file_used = ?event.config_file_used,
         cli_flags_used = ?event.cli_flags_used,
         env_keys_used = ?event.env_keys_used,
+        pressure_profile = ?event.pressure_profile_resolution.selected_profile,
+        profile_conflict = event.pressure_profile_resolution.conflict_detected,
+        profile_reason_code = %event.pressure_profile_resolution.diagnostics.reason_code,
+        profile_version = event.pressure_profile_resolution.diagnostics.effective_profile_version,
         reason_codes = ?event.reason_codes,
         "fsfs configuration loaded"
     );
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProfileSourceOverrides {
+    quality_enabled: Option<bool>,
+    allow_background_indexing: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EnvOverrideReport {
+    keys_used: Vec<String>,
+    profile_overrides: ProfileSourceOverrides,
+}
+
+#[must_use]
+fn profile_overrides_from_file_patch(patch: &FsfsConfigPatch) -> ProfileSourceOverrides {
+    ProfileSourceOverrides {
+        quality_enabled: patch
+            .search
+            .as_ref()
+            .and_then(|search| search.fast_only.map(|fast_only| !fast_only)),
+        allow_background_indexing: patch
+            .indexing
+            .as_ref()
+            .and_then(|indexing| indexing.watch_mode),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_pressure_profile(
+    config: &mut FsfsConfig,
+    file_overrides: ProfileSourceOverrides,
+    env_overrides: ProfileSourceOverrides,
+    cli_overrides: ProfileSourceOverrides,
+    warnings: &mut Vec<ConfigWarning>,
+) -> PressureProfileResolution {
+    let contract = config.pressure.profile.contract();
+    let mut effective = contract.to_effective_settings();
+    let mut overrides = Vec::new();
+    let mut safety_clamps = Vec::new();
+    let mut conflict_detected = false;
+
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::QualityEnabled,
+        ProfileOverrideSource::Config,
+        file_overrides.quality_enabled,
+        &mut effective.quality_enabled,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::QualityEnabled,
+        ProfileOverrideSource::Env,
+        env_overrides.quality_enabled,
+        &mut effective.quality_enabled,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::QualityEnabled,
+        ProfileOverrideSource::Cli,
+        cli_overrides.quality_enabled,
+        &mut effective.quality_enabled,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::AllowBackgroundIndexing,
+        ProfileOverrideSource::Config,
+        file_overrides.allow_background_indexing,
+        &mut effective.allow_background_indexing,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::AllowBackgroundIndexing,
+        ProfileOverrideSource::Env,
+        env_overrides.allow_background_indexing,
+        &mut effective.allow_background_indexing,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+    apply_profile_bool_override(
+        config.pressure.profile,
+        PressureProfileField::AllowBackgroundIndexing,
+        ProfileOverrideSource::Cli,
+        cli_overrides.allow_background_indexing,
+        &mut effective.allow_background_indexing,
+        contract,
+        &mut overrides,
+        &mut conflict_detected,
+        warnings,
+    );
+
+    if config.pressure.hard_pause_requested {
+        if effective.quality_enabled {
+            effective.quality_enabled = false;
+            safety_clamps.push(PressureProfileSafetyClamp {
+                field: PressureProfileField::QualityEnabled,
+                clamped_to: "false".into(),
+                reason_code: "safety.clamp.hard_pause.quality_enabled".into(),
+            });
+        }
+        if effective.allow_background_indexing {
+            effective.allow_background_indexing = false;
+            safety_clamps.push(PressureProfileSafetyClamp {
+                field: PressureProfileField::AllowBackgroundIndexing,
+                clamped_to: "false".into(),
+                reason_code: "safety.clamp.hard_pause.allow_background_indexing".into(),
+            });
+        }
+    }
+
+    config.search.fast_only = !effective.quality_enabled;
+    config.indexing.watch_mode = effective.allow_background_indexing;
+
+    let diagnostics_reason_code = if conflict_detected {
+        "profile.resolution.conflict"
+    } else {
+        "profile.resolution.ok"
+    };
+
+    PressureProfileResolution {
+        selected_profile: config.pressure.profile,
+        overrides,
+        effective,
+        safety_clamps,
+        conflict_detected,
+        diagnostics: PressureProfileResolutionDiagnostics {
+            event: "profile_resolution_completed".into(),
+            precedence_chain: PROFILE_PRECEDENCE_CHAIN
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            reason_code: diagnostics_reason_code.into(),
+            effective_profile_version: PRESSURE_PROFILE_VERSION,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_profile_bool_override(
+    profile: PressureProfile,
+    field: PressureProfileField,
+    source: ProfileOverrideSource,
+    requested: Option<bool>,
+    effective_value: &mut bool,
+    contract: PressureProfileContract,
+    overrides: &mut Vec<PressureProfileOverrideDecision>,
+    conflict_detected: &mut bool,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let Some(requested) = requested else {
+        return;
+    };
+
+    let locked = contract.is_locked_field(field);
+    if locked {
+        overrides.push(PressureProfileOverrideDecision {
+            field,
+            source,
+            requested_value: requested.to_string(),
+            applied: false,
+            reason_code: "override.rejected.locked_field".into(),
+        });
+        if requested != *effective_value {
+            *conflict_detected = true;
+            warnings.push(ConfigWarning {
+                reason_code: "override.rejected.locked_field".into(),
+                field: profile_field_path(field).into(),
+                source: config_source_for_override(source),
+                message: format!(
+                    "profile {:?} locks {}; requested {} from {:?} rejected",
+                    profile,
+                    profile_field_path(field),
+                    requested,
+                    source
+                ),
+            });
+        }
+        return;
+    }
+
+    *effective_value = requested;
+    overrides.push(PressureProfileOverrideDecision {
+        field,
+        source,
+        requested_value: requested.to_string(),
+        applied: true,
+        reason_code: format!("override.applied.{}_field", override_source_label(source)),
+    });
+}
+
+#[must_use]
+const fn override_source_label(source: ProfileOverrideSource) -> &'static str {
+    match source {
+        ProfileOverrideSource::Cli => "cli",
+        ProfileOverrideSource::Env => "env",
+        ProfileOverrideSource::Config => "config",
+    }
+}
+
+#[must_use]
+const fn config_source_for_override(source: ProfileOverrideSource) -> ConfigSource {
+    match source {
+        ProfileOverrideSource::Cli => ConfigSource::Cli,
+        ProfileOverrideSource::Env => ConfigSource::Env,
+        ProfileOverrideSource::Config => ConfigSource::File,
+    }
+}
+
+#[must_use]
+const fn profile_field_path(field: PressureProfileField) -> &'static str {
+    match field {
+        PressureProfileField::SchedulerMode => "pressure.profile.scheduler_mode",
+        PressureProfileField::MaxEmbedConcurrency => "pressure.profile.max_embed_concurrency",
+        PressureProfileField::MaxIndexConcurrency => "pressure.profile.max_index_concurrency",
+        PressureProfileField::QualityEnabled => "pressure.profile.quality_enabled",
+        PressureProfileField::AllowBackgroundIndexing => {
+            "pressure.profile.allow_background_indexing"
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1092,6 +1635,30 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(memory_ceiling_mb) = pressure.memory_ceiling_mb {
             config.pressure.memory_ceiling_mb = memory_ceiling_mb;
         }
+        if let Some(sample_interval_ms) = pressure.sample_interval_ms {
+            config.pressure.sample_interval_ms = sample_interval_ms;
+        }
+        if let Some(ewma_alpha_per_mille) = pressure.ewma_alpha_per_mille {
+            config.pressure.ewma_alpha_per_mille = ewma_alpha_per_mille;
+        }
+        if let Some(anti_flap_readings) = pressure.anti_flap_readings {
+            config.pressure.anti_flap_readings = anti_flap_readings;
+        }
+        if let Some(io_ceiling_bytes_per_sec) = pressure.io_ceiling_bytes_per_sec {
+            config.pressure.io_ceiling_bytes_per_sec = io_ceiling_bytes_per_sec;
+        }
+        if let Some(load_ceiling_per_mille) = pressure.load_ceiling_per_mille {
+            config.pressure.load_ceiling_per_mille = load_ceiling_per_mille;
+        }
+        if let Some(degradation_override) = pressure.degradation_override {
+            config.pressure.degradation_override = degradation_override;
+        }
+        if let Some(hard_pause_requested) = pressure.hard_pause_requested {
+            config.pressure.hard_pause_requested = hard_pause_requested;
+        }
+        if let Some(quality_circuit_open) = pressure.quality_circuit_open {
+            config.pressure.quality_circuit_open = quality_circuit_open;
+        }
     }
 
     if let Some(tui) = patch.tui {
@@ -1134,8 +1701,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
 fn apply_env_overrides(
     config: &mut FsfsConfig,
     env: &HashMap<String, String, impl BuildHasher>,
-) -> SearchResult<Vec<String>> {
+) -> SearchResult<EnvOverrideReport> {
     let mut keys_used = Vec::new();
+    let mut profile_overrides = ProfileSourceOverrides::default();
 
     if let Some(value) = env.get("FSFS_DISCOVERY_ROOTS") {
         config.discovery.roots = parse_csv(value, "discovery.roots")?;
@@ -1153,8 +1721,17 @@ fn apply_env_overrides(
     }
 
     if let Some(value) = env.get("FSFS_SEARCH_FAST_ONLY") {
-        config.search.fast_only = parse_bool(value, "search.fast_only")?;
+        let fast_only = parse_bool(value, "search.fast_only")?;
+        config.search.fast_only = fast_only;
+        profile_overrides.quality_enabled = Some(!fast_only);
         keys_used.push("FSFS_SEARCH_FAST_ONLY".into());
+    }
+
+    if let Some(value) = env.get("FSFS_INDEXING_WATCH_MODE") {
+        let watch_mode = parse_bool(value, "indexing.watch_mode")?;
+        config.indexing.watch_mode = watch_mode;
+        profile_overrides.allow_background_indexing = Some(watch_mode);
+        keys_used.push("FSFS_INDEXING_WATCH_MODE".into());
     }
 
     if let Some(value) = env.get("FSFS_SEARCH_EXPLAIN") {
@@ -1170,6 +1747,54 @@ fn apply_env_overrides(
                 reason: "expected strict|performance|degraded".into(),
             })?;
         keys_used.push("FSFS_PRESSURE_PROFILE".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_SAMPLE_INTERVAL_MS") {
+        config.pressure.sample_interval_ms = parse_u64(value, "pressure.sample_interval_ms")?;
+        keys_used.push("FSFS_PRESSURE_SAMPLE_INTERVAL_MS".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_EWMA_ALPHA_PER_MILLE") {
+        config.pressure.ewma_alpha_per_mille = parse_u16(value, "pressure.ewma_alpha_per_mille")?;
+        keys_used.push("FSFS_PRESSURE_EWMA_ALPHA_PER_MILLE".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_ANTI_FLAP_READINGS") {
+        config.pressure.anti_flap_readings = parse_u8(value, "pressure.anti_flap_readings")?;
+        keys_used.push("FSFS_PRESSURE_ANTI_FLAP_READINGS".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_IO_CEILING_BYTES_PER_SEC") {
+        config.pressure.io_ceiling_bytes_per_sec =
+            parse_u64(value, "pressure.io_ceiling_bytes_per_sec")?;
+        keys_used.push("FSFS_PRESSURE_IO_CEILING_BYTES_PER_SEC".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_LOAD_CEILING_PER_MILLE") {
+        config.pressure.load_ceiling_per_mille =
+            parse_u16(value, "pressure.load_ceiling_per_mille")?;
+        keys_used.push("FSFS_PRESSURE_LOAD_CEILING_PER_MILLE".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_DEGRADATION_OVERRIDE") {
+        config.pressure.degradation_override =
+            DegradationOverrideMode::from_str(value).map_err(|()| SearchError::InvalidConfig {
+                field: "pressure.degradation_override".into(),
+                value: value.clone(),
+                reason: "expected auto|full|embed_deferred|lexical_only|metadata_only|paused"
+                    .into(),
+            })?;
+        keys_used.push("FSFS_PRESSURE_DEGRADATION_OVERRIDE".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_HARD_PAUSE_REQUESTED") {
+        config.pressure.hard_pause_requested = parse_bool(value, "pressure.hard_pause_requested")?;
+        keys_used.push("FSFS_PRESSURE_HARD_PAUSE_REQUESTED".into());
+    }
+
+    if let Some(value) = env.get("FSFS_PRESSURE_QUALITY_CIRCUIT_OPEN") {
+        config.pressure.quality_circuit_open = parse_bool(value, "pressure.quality_circuit_open")?;
+        keys_used.push("FSFS_PRESSURE_QUALITY_CIRCUIT_OPEN".into());
     }
 
     if let Some(value) = env.get("FSFS_TUI_THEME") {
@@ -1192,10 +1817,13 @@ fn apply_env_overrides(
         keys_used.push("FSFS_STORAGE_DB_PATH".into());
     }
 
-    Ok(keys_used)
+    Ok(EnvOverrideReport {
+        keys_used,
+        profile_overrides,
+    })
 }
 
-fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) {
+fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSourceOverrides {
     if let Some(roots) = &cli.roots {
         config.discovery.roots.clone_from(roots);
     }
@@ -1215,6 +1843,10 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) {
         config.search.fast_only = fast_only;
     }
 
+    if let Some(allow_background_indexing) = cli.allow_background_indexing {
+        config.indexing.watch_mode = allow_background_indexing;
+    }
+
     if let Some(explain) = cli.explain {
         config.search.explain = explain;
     }
@@ -1223,11 +1855,29 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) {
         config.pressure.profile = profile;
     }
 
+    if let Some(degradation_override) = cli.degradation_override {
+        config.pressure.degradation_override = degradation_override;
+    }
+
+    if let Some(hard_pause_requested) = cli.hard_pause_requested {
+        config.pressure.hard_pause_requested = hard_pause_requested;
+    }
+
+    if let Some(quality_circuit_open) = cli.quality_circuit_open {
+        config.pressure.quality_circuit_open = quality_circuit_open;
+    }
+
     if let Some(theme) = cli.theme {
         config.tui.theme = theme;
     }
+
+    ProfileSourceOverrides {
+        quality_enabled: cli.fast_only.map(|fast_only| !fast_only),
+        allow_background_indexing: cli.allow_background_indexing,
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWarning>> {
     let value: toml::Value =
         toml::from_str(config_toml).map_err(|error| SearchError::InvalidConfig {
@@ -1304,9 +1954,21 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
             ]
             .into_iter()
             .collect(),
-            "pressure" => ["profile", "cpu_ceiling_pct", "memory_ceiling_mb"]
-                .into_iter()
-                .collect(),
+            "pressure" => [
+                "profile",
+                "cpu_ceiling_pct",
+                "memory_ceiling_mb",
+                "sample_interval_ms",
+                "ewma_alpha_per_mille",
+                "anti_flap_readings",
+                "io_ceiling_bytes_per_sec",
+                "load_ceiling_per_mille",
+                "degradation_override",
+                "hard_pause_requested",
+                "quality_circuit_open",
+            ]
+            .into_iter()
+            .collect(),
             "tui" => ["theme", "frame_budget_ms", "show_explanations", "density"]
                 .into_iter()
                 .collect(),
@@ -1386,6 +2048,7 @@ fn expand_tilde(value: &str, home_dir: &Path) -> Option<String> {
         .map(|rest| home_dir.join(rest).to_string_lossy().into_owned())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> SearchResult<()> {
     if !(1_usize..=1024_usize).contains(&config.discovery.max_file_size_mb) {
         return Err(SearchError::InvalidConfig {
@@ -1456,6 +2119,46 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "pressure.memory_ceiling_mb".into(),
             value: config.pressure.memory_ceiling_mb.to_string(),
             reason: "must be >= 128".into(),
+        });
+    }
+
+    if config.pressure.sample_interval_ms < 100 {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.sample_interval_ms".into(),
+            value: config.pressure.sample_interval_ms.to_string(),
+            reason: "must be >= 100".into(),
+        });
+    }
+
+    if !(1_u16..=1000_u16).contains(&config.pressure.ewma_alpha_per_mille) {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.ewma_alpha_per_mille".into(),
+            value: config.pressure.ewma_alpha_per_mille.to_string(),
+            reason: "must be between 1 and 1000".into(),
+        });
+    }
+
+    if !(1_u8..=32_u8).contains(&config.pressure.anti_flap_readings) {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.anti_flap_readings".into(),
+            value: config.pressure.anti_flap_readings.to_string(),
+            reason: "must be between 1 and 32".into(),
+        });
+    }
+
+    if config.pressure.io_ceiling_bytes_per_sec == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.io_ceiling_bytes_per_sec".into(),
+            value: config.pressure.io_ceiling_bytes_per_sec.to_string(),
+            reason: "must be > 0".into(),
+        });
+    }
+
+    if config.pressure.load_ceiling_per_mille < 100 {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.load_ceiling_per_mille".into(),
+            value: config.pressure.load_ceiling_per_mille.to_string(),
+            reason: "must be >= 100".into(),
         });
     }
 
@@ -1534,6 +2237,34 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
             value: value.into(),
             reason: "expected unsigned integer".into(),
         })
+}
+
+fn parse_u64(value: &str, field: &str) -> SearchResult<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "expected unsigned integer".into(),
+        })
+}
+
+fn parse_u16(value: &str, field: &str) -> SearchResult<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|_| SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "expected unsigned integer".into(),
+        })
+}
+
+fn parse_u8(value: &str, field: &str) -> SearchResult<u8> {
+    value.parse::<u8>().map_err(|_| SearchError::InvalidConfig {
+        field: field.into(),
+        value: value.into(),
+        reason: "expected unsigned integer".into(),
+    })
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -1652,6 +2383,7 @@ mod tests {
 
     use super::{
         CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, IngestionClass,
+        PRESSURE_PROFILE_VERSION, PressureProfileField, ProfileOverrideSource,
         default_config_file_path, load_from_sources, load_from_str,
     };
 
@@ -1698,6 +2430,87 @@ mod tests {
                 .contains(&"FSFS_SEARCH_DEFAULT_LIMIT".to_string())
         );
         assert!(result.cli_flags_used.contains(&"--limit".to_string()));
+    }
+
+    #[test]
+    fn profile_resolution_rejects_locked_quality_override() {
+        let file = "\
+[pressure]\nprofile = \"performance\"\n\
+[search]\nfast_only = true\n";
+
+        let result = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load config");
+
+        assert!(!result.config.search.fast_only);
+        assert!(result.pressure_profile_resolution.conflict_detected);
+        assert_eq!(
+            result
+                .pressure_profile_resolution
+                .diagnostics
+                .effective_profile_version,
+            PRESSURE_PROFILE_VERSION
+        );
+        assert!(
+            result
+                .pressure_profile_resolution
+                .overrides
+                .iter()
+                .any(|decision| {
+                    decision.field == PressureProfileField::QualityEnabled
+                        && decision.source == ProfileOverrideSource::Config
+                        && !decision.applied
+                        && decision.reason_code == "override.rejected.locked_field"
+                })
+        );
+    }
+
+    #[test]
+    fn profile_resolution_uses_cli_env_file_precedence_for_overridable_fields() {
+        let file = "\
+[pressure]\nprofile = \"performance\"\n\
+[indexing]\nwatch_mode = false\n";
+        let env = HashMap::from([("FSFS_INDEXING_WATCH_MODE".into(), "true".into())]);
+        let cli = CliOverrides {
+            allow_background_indexing: Some(false),
+            ..CliOverrides::default()
+        };
+
+        let result = load_from_str(Some(file), None, &env, &cli, home()).expect("load config");
+
+        assert!(!result.config.indexing.watch_mode);
+        assert_eq!(
+            result
+                .pressure_profile_resolution
+                .overrides
+                .iter()
+                .filter(|decision| {
+                    decision.field == PressureProfileField::AllowBackgroundIndexing
+                        && decision.applied
+                })
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn hard_pause_clamps_profile_managed_capabilities() {
+        let cli = CliOverrides {
+            profile: Some(super::PressureProfile::Performance),
+            hard_pause_requested: Some(true),
+            allow_background_indexing: Some(true),
+            ..CliOverrides::default()
+        };
+
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home()).expect("load");
+        assert!(result.config.search.fast_only);
+        assert!(!result.config.indexing.watch_mode);
+        assert_eq!(result.pressure_profile_resolution.safety_clamps.len(), 2);
     }
 
     #[test]
@@ -1821,6 +2634,26 @@ mod tests {
             "[pressure]\nmemory_ceiling_mb = 64\n",
             "pressure.memory_ceiling_mb",
         );
+        assert_invalid_field(
+            "[pressure]\nsample_interval_ms = 99\n",
+            "pressure.sample_interval_ms",
+        );
+        assert_invalid_field(
+            "[pressure]\newma_alpha_per_mille = 0\n",
+            "pressure.ewma_alpha_per_mille",
+        );
+        assert_invalid_field(
+            "[pressure]\nanti_flap_readings = 0\n",
+            "pressure.anti_flap_readings",
+        );
+        assert_invalid_field(
+            "[pressure]\nio_ceiling_bytes_per_sec = 0\n",
+            "pressure.io_ceiling_bytes_per_sec",
+        );
+        assert_invalid_field(
+            "[pressure]\nload_ceiling_per_mille = 99\n",
+            "pressure.load_ceiling_per_mille",
+        );
         assert_invalid_field("[tui]\nframe_budget_ms = 7\n", "tui.frame_budget_ms");
         assert_invalid_field(
             "[storage]\nevidence_retention_days = 0\n",
@@ -1927,6 +2760,60 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|code| code == "discovery.file.too_large")
+        );
+    }
+
+    #[test]
+    fn discovery_policy_metadata_fallback_at_threshold() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/tester/.cache/snapshot.lockstate"), 2_048);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.utility_score, 20);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Include);
+        assert_eq!(decision.ingestion_class, IngestionClass::MetadataOnly);
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.file.included")
+        );
+    }
+
+    #[test]
+    fn discovery_policy_allowlist_unknown_extension_falls_back_to_skip() {
+        let file = "\
+[discovery]\ntext_selection_mode = \"allowlist\"\n";
+        let config = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("config")
+        .config;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/tester/docs/snapshot.unknown"), 1_024);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert!(decision.utility_score < 20);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.file.excluded_pattern")
         );
     }
 

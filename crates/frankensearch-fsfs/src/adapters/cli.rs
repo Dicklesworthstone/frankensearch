@@ -33,6 +33,8 @@ pub enum OutputFormat {
     Csv,
     /// Newline-delimited JSON (streaming).
     Jsonl,
+    /// TOON (Token-Oriented Object Notation) machine output.
+    Toon,
 }
 
 impl FromStr for OutputFormat {
@@ -44,6 +46,7 @@ impl FromStr for OutputFormat {
             "json" => Ok(Self::Json),
             "csv" => Ok(Self::Csv),
             "jsonl" => Ok(Self::Jsonl),
+            "toon" => Ok(Self::Toon),
             _ => Err(()),
         }
     }
@@ -56,6 +59,7 @@ impl std::fmt::Display for OutputFormat {
             Self::Json => write!(f, "json"),
             Self::Csv => write!(f, "csv"),
             Self::Jsonl => write!(f, "jsonl"),
+            Self::Toon => write!(f, "toon"),
         }
     }
 }
@@ -240,7 +244,7 @@ where
                     OutputFormat::from_str(value).map_err(|()| SearchError::InvalidConfig {
                         field: "cli.format".into(),
                         value: value.into(),
-                        reason: "expected table|json|csv|jsonl".into(),
+                        reason: "expected table|json|csv|jsonl|toon".into(),
                     })?;
                 idx += 2;
             }
@@ -250,6 +254,14 @@ where
             }
             "--no-fast-only" => {
                 input.overrides.fast_only = Some(false);
+                idx += 1;
+            }
+            "--watch-mode" => {
+                input.overrides.allow_background_indexing = Some(true);
+                idx += 1;
+            }
+            "--no-watch-mode" => {
+                input.overrides.allow_background_indexing = Some(false);
                 idx += 1;
             }
             "--explain" | "-e" => {
@@ -314,7 +326,38 @@ where
         }
     }
 
+    normalize_stream_settings(&mut input)?;
+
     Ok(input)
+}
+
+fn normalize_stream_settings(input: &mut CliInput) -> SearchResult<()> {
+    if !input.stream {
+        return Ok(());
+    }
+
+    // Streaming defaults to NDJSON unless explicitly set to TOON.
+    if input.format == OutputFormat::Table {
+        input.format = OutputFormat::Jsonl;
+    }
+
+    if input.command != CliCommand::Search {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.stream.command".into(),
+            value: format!("{:?}", input.command).to_lowercase(),
+            reason: "stream mode is only supported for the search command".into(),
+        });
+    }
+
+    if !matches!(input.format, OutputFormat::Jsonl | OutputFormat::Toon) {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.stream.format".into(),
+            value: input.format.to_string(),
+            reason: "stream mode requires --format jsonl or --format toon".into(),
+        });
+    }
+
+    Ok(())
 }
 
 fn extract_command(tokens: &[String]) -> SearchResult<(CliCommand, usize, CommandSource)> {
@@ -441,6 +484,8 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-f"
             | "--fast-only"
             | "--no-fast-only"
+            | "--watch-mode"
+            | "--no-watch-mode"
             | "--explain"
             | "-e"
             | "--stream"
@@ -469,6 +514,7 @@ mod tests {
             "--limit",
             "25",
             "--fast-only",
+            "--watch-mode",
             "--explain",
             "--profile",
             "degraded",
@@ -481,6 +527,7 @@ mod tests {
         assert_eq!(input.query.as_deref(), Some("hello world"));
         assert_eq!(input.overrides.limit, Some(25));
         assert_eq!(input.overrides.fast_only, Some(true));
+        assert_eq!(input.overrides.allow_background_indexing, Some(true));
         assert_eq!(input.overrides.explain, Some(true));
         assert_eq!(
             input.overrides.roots.expect("roots"),
@@ -541,6 +588,9 @@ mod tests {
     fn parse_output_format() {
         let input = parse_cli_args(["status", "--format", "json"]).unwrap();
         assert_eq!(input.format, OutputFormat::Json);
+
+        let toon = parse_cli_args(["status", "--format", "toon"]).unwrap();
+        assert_eq!(toon.format, OutputFormat::Toon);
     }
 
     #[test]
@@ -555,6 +605,39 @@ mod tests {
     fn parse_stream_flag() {
         let input = parse_cli_args(["search", "test", "--stream"]).unwrap();
         assert!(input.stream);
+        assert_eq!(input.format, OutputFormat::Jsonl);
+    }
+
+    #[test]
+    fn parse_stream_accepts_toon_format() {
+        let input = parse_cli_args(["search", "test", "--stream", "--format", "toon"]).unwrap();
+        assert!(input.stream);
+        assert_eq!(input.format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn parse_stream_rejects_non_search_command() {
+        let err = parse_cli_args(["status", "--stream"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("stream mode is only supported for the search command")
+        );
+    }
+
+    #[test]
+    fn parse_stream_rejects_non_stream_format() {
+        let err = parse_cli_args(["search", "test", "--stream", "--format", "json"])
+            .expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("stream mode requires --format jsonl or --format toon")
+        );
+    }
+
+    #[test]
+    fn parse_watch_mode_override_flags() {
+        let input = parse_cli_args(["status", "--no-watch-mode"]).unwrap();
+        assert_eq!(input.overrides.allow_background_indexing, Some(false));
     }
 
     #[test]
@@ -655,7 +738,7 @@ mod tests {
     fn invalid_format_returns_error() {
         let err = parse_cli_args(["status", "--format", "xml"]).expect_err("must fail");
         let msg = err.to_string();
-        assert!(msg.contains("expected table|json|csv|jsonl"));
+        assert!(msg.contains("expected table|json|csv|jsonl|toon"));
     }
 
     #[test]
@@ -707,11 +790,12 @@ mod tests {
         assert_eq!(OutputFormat::Json.to_string(), "json");
         assert_eq!(OutputFormat::Csv.to_string(), "csv");
         assert_eq!(OutputFormat::Jsonl.to_string(), "jsonl");
+        assert_eq!(OutputFormat::Toon.to_string(), "toon");
     }
 
     #[test]
     fn output_format_roundtrip() {
-        for fmt_str in ["table", "json", "csv", "jsonl"] {
+        for fmt_str in ["table", "json", "csv", "jsonl", "toon"] {
             let fmt = OutputFormat::from_str(fmt_str).unwrap();
             assert_eq!(fmt.to_string(), fmt_str);
         }

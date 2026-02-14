@@ -35,4 +35,29 @@ mod tests {
         assert_eq!(settings.density, Density::Compact);
         assert!(!settings.show_explanations);
     }
+
+    #[test]
+    fn default_config_produces_default_settings() {
+        let config = FsfsConfig::default();
+        let settings = TuiAdapterSettings::from(&config);
+        assert_eq!(settings.theme, config.tui.theme);
+        assert_eq!(settings.density, config.tui.density);
+        assert_eq!(settings.show_explanations, config.tui.show_explanations);
+    }
+
+    #[test]
+    fn settings_clone_is_independent() {
+        let config = FsfsConfig::default();
+        let settings = TuiAdapterSettings::from(&config);
+        let cloned = settings.clone();
+        assert_eq!(settings, cloned);
+    }
+
+    #[test]
+    fn settings_debug_format() {
+        let config = FsfsConfig::default();
+        let settings = TuiAdapterSettings::from(&config);
+        let debug = format!("{settings:?}");
+        assert!(debug.contains("TuiAdapterSettings"));
+    }
 }

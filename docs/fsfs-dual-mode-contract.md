@@ -49,8 +49,26 @@ The following capabilities MUST be semantically identical in CLI and TUI.
 ### 4. Explainability Semantics
 
 - Explanation payload meaning MUST be identical (same component names and interpretation).
+- Explanation payload exports MUST conform to `schemas/fsfs-explanation-payload-v1.schema.json`
+  and `docs/fsfs-explanation-payload-contract.md`.
 - Rank movement semantics MUST be identical (`promoted`, `demoted`, `stable` with same thresholds).
 - Decision/fallback reasons MUST be emitted from the same canonical reason-code set.
+
+### 5. Trace Query + Replay Semantics
+
+- Trace query/filter semantics MUST be identical in CLI and TUI:
+  - same selector fields (`trace_id`, `root_request_id`, `project_key`, `instance_id`)
+  - same event-type vocabulary (`decision|alert|degradation|transition|replay_marker`)
+  - same frame-range behavior (`since_frame_seq`/`until_frame_seq`, inclusive)
+  - same ordering vocabulary (`oldest_first|newest_first`)
+  - same hard limits (bounded `limit`, same failure behavior)
+- Replay-by-trace-id semantics MUST be identical:
+  - same source resolution rules (`manifest_path`/`artifact_root`)
+  - same partial replay window behavior (`start_frame_seq`/`end_frame_seq`)
+  - same strictness behavior for unknown reason codes
+- Validation failures MUST map to the same canonical reason-code set in both modes:
+  - `trace.query.*`
+  - `trace.replay.*`
 
 ## Intentional Divergence Policy (Allowed Differences)
 
@@ -137,6 +155,7 @@ Downstream implementation beads MUST prove:
 3. **Version tests**: payloads include required version fields and respect compatibility policy.
 4. **Recovery tests**: representative failures surface correct canonical reason codes and guidance.
 5. **Discoverability tests**: help/palette paths cover all primary command surfaces.
+6. **Matrix alignment**: module-level unit coverage stays synced with `docs/fsfs-unit-test-matrix.md` (`bd-2hz.10.1`), including reason-code and structured-log assertions for ER/C/D lanes.
 
 ## Required Logging/Artifact Fields
 
@@ -161,4 +180,3 @@ This contract is authoritative input for:
 - `bd-2hz.7.1`
 - `bd-2hz.10.1`
 - `bd-2hz.13`
-

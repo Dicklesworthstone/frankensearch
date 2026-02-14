@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,57 @@ pub struct AdapterIdentity {
     pub telemetry_schema_version: u8,
     /// Redaction policy version enforced by this adapter.
     pub redaction_policy_version: String,
+}
+
+/// Canonical host projects with first-class adapter support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalHostProject {
+    CodingAgentSessionSearch,
+    Xf,
+    McpAgentMailRust,
+    Frankenterm,
+}
+
+impl CanonicalHostProject {
+    /// Deterministic host iteration order used by tests and harnesses.
+    pub const ALL: [Self; 4] = [
+        Self::CodingAgentSessionSearch,
+        Self::Xf,
+        Self::McpAgentMailRust,
+        Self::Frankenterm,
+    ];
+
+    /// Canonical host project key.
+    #[must_use]
+    pub const fn host_project_key(self) -> &'static str {
+        match self {
+            Self::CodingAgentSessionSearch => "coding_agent_session_search",
+            Self::Xf => "xf",
+            Self::McpAgentMailRust => "mcp_agent_mail_rust",
+            Self::Frankenterm => "frankenterm",
+        }
+    }
+
+    /// Stable adapter identifier for this host.
+    #[must_use]
+    pub const fn adapter_id(self) -> &'static str {
+        match self {
+            Self::CodingAgentSessionSearch => "cass-host-adapter",
+            Self::Xf => "xf-host-adapter",
+            Self::McpAgentMailRust => "mcp-agent-mail-host-adapter",
+            Self::Frankenterm => "frankenterm-host-adapter",
+        }
+    }
+
+    /// Default runtime role label for this host adapter.
+    #[must_use]
+    pub const fn default_runtime_role(self) -> &'static str {
+        match self {
+            Self::McpAgentMailRust => "control-plane",
+            Self::CodingAgentSessionSearch | Self::Xf | Self::Frankenterm => "query",
+        }
+    }
 }
 
 /// Canonical host-project attribution result.
@@ -197,6 +249,164 @@ pub trait HostAdapter: fmt::Debug + Send + Sync {
     ///
     /// Returns `SearchError` when lifecycle processing fails.
     fn on_lifecycle_event(&self, event: &AdapterLifecycleEvent) -> SearchResult<()>;
+}
+
+/// Non-blocking sink abstraction used by concrete host adapters.
+pub trait AdapterSink: Send + Sync {
+    /// Emit a canonical telemetry envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` when sink delivery fails.
+    fn emit(&self, envelope: &TelemetryEnvelope) -> SearchResult<()>;
+
+    /// Process one lifecycle event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` when lifecycle handling fails.
+    fn on_lifecycle_event(&self, event: &AdapterLifecycleEvent) -> SearchResult<()>;
+}
+
+/// No-op sink used by default when callers only need conformance-safe identities.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopAdapterSink;
+
+impl AdapterSink for NoopAdapterSink {
+    fn emit(&self, _: &TelemetryEnvelope) -> SearchResult<()> {
+        Ok(())
+    }
+
+    fn on_lifecycle_event(&self, _: &AdapterLifecycleEvent) -> SearchResult<()> {
+        Ok(())
+    }
+}
+
+/// Reusable host adapter implementation that forwards to an injected sink.
+///
+/// This gives host projects one deterministic adapter path:
+/// - canonical identity handshake
+/// - non-blocking sink forwarding
+/// - shared conformance harness compatibility
+pub struct ForwardingHostAdapter {
+    identity: AdapterIdentity,
+    sink: Arc<dyn AdapterSink>,
+}
+
+impl fmt::Debug for ForwardingHostAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForwardingHostAdapter")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ForwardingHostAdapter {
+    /// Construct an adapter with an explicit identity and no-op sink.
+    #[must_use]
+    pub fn new(identity: AdapterIdentity) -> Self {
+        Self {
+            identity,
+            sink: Arc::new(NoopAdapterSink),
+        }
+    }
+
+    /// Construct a canonical host adapter profile with shared defaults.
+    #[must_use]
+    pub fn for_host(
+        host: CanonicalHostProject,
+        adapter_version: impl Into<String>,
+        runtime_role: Option<String>,
+        instance_uuid: Option<String>,
+    ) -> Self {
+        let runtime_role = runtime_role.or_else(|| Some(host.default_runtime_role().to_owned()));
+        Self::new(AdapterIdentity {
+            adapter_id: host.adapter_id().to_owned(),
+            adapter_version: adapter_version.into(),
+            host_project: host.host_project_key().to_owned(),
+            runtime_role,
+            instance_uuid,
+            telemetry_schema_version: TELEMETRY_SCHEMA_VERSION,
+            redaction_policy_version: "v1".to_owned(),
+        })
+    }
+
+    /// Canonical profile for `coding_agent_session_search` (cass).
+    #[must_use]
+    pub fn for_cass(adapter_version: impl Into<String>, instance_uuid: Option<String>) -> Self {
+        Self::for_host(
+            CanonicalHostProject::CodingAgentSessionSearch,
+            adapter_version,
+            None,
+            instance_uuid,
+        )
+    }
+
+    /// Canonical profile for `xf`.
+    #[must_use]
+    pub fn for_xf(adapter_version: impl Into<String>, instance_uuid: Option<String>) -> Self {
+        Self::for_host(
+            CanonicalHostProject::Xf,
+            adapter_version,
+            None,
+            instance_uuid,
+        )
+    }
+
+    /// Canonical profile for `mcp_agent_mail_rust`.
+    #[must_use]
+    pub fn for_mcp_agent_mail(
+        adapter_version: impl Into<String>,
+        instance_uuid: Option<String>,
+    ) -> Self {
+        Self::for_host(
+            CanonicalHostProject::McpAgentMailRust,
+            adapter_version,
+            None,
+            instance_uuid,
+        )
+    }
+
+    /// Canonical profile for `frankenterm`.
+    #[must_use]
+    pub fn for_frankenterm(
+        adapter_version: impl Into<String>,
+        instance_uuid: Option<String>,
+    ) -> Self {
+        Self::for_host(
+            CanonicalHostProject::Frankenterm,
+            adapter_version,
+            None,
+            instance_uuid,
+        )
+    }
+
+    /// Replace the sink implementation used for forwarding.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Arc<dyn AdapterSink>) -> Self {
+        self.sink = sink;
+        self
+    }
+
+    /// Borrow this adapter's identity.
+    #[must_use]
+    pub const fn identity_ref(&self) -> &AdapterIdentity {
+        &self.identity
+    }
+}
+
+impl HostAdapter for ForwardingHostAdapter {
+    fn identity(&self) -> AdapterIdentity {
+        self.identity.clone()
+    }
+
+    fn emit_telemetry(&self, envelope: &TelemetryEnvelope) -> SearchResult<()> {
+        self.sink.emit(envelope)
+    }
+
+    fn on_lifecycle_event(&self, event: &AdapterLifecycleEvent) -> SearchResult<()> {
+        self.sink.on_lifecycle_event(event)
+    }
 }
 
 /// One machine-readable conformance violation.
@@ -836,6 +1046,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        emitted: Arc<Mutex<Vec<TelemetryEnvelope>>>,
+        lifecycle: Arc<Mutex<Vec<AdapterLifecycleEvent>>>,
+    }
+
+    impl AdapterSink for RecordingSink {
+        fn emit(&self, envelope: &TelemetryEnvelope) -> SearchResult<()> {
+            self.emitted.lock().unwrap().push(envelope.clone());
+            Ok(())
+        }
+
+        fn on_lifecycle_event(&self, event: &AdapterLifecycleEvent) -> SearchResult<()> {
+            self.lifecycle.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
     fn default_identity() -> AdapterIdentity {
         AdapterIdentity {
             adapter_id: "sample-host-adapter".to_owned(),
@@ -874,6 +1102,104 @@ mod tests {
         assert_eq!(report.emitted_events, fixtures.len());
         assert!(report.lifecycle_hooks_checked >= 2);
         assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn canonical_host_profiles_emit_expected_identity_handshake() {
+        let cases = [
+            (
+                CanonicalHostProject::CodingAgentSessionSearch,
+                "cass-host-adapter",
+                "coding_agent_session_search",
+            ),
+            (CanonicalHostProject::Xf, "xf-host-adapter", "xf"),
+            (
+                CanonicalHostProject::McpAgentMailRust,
+                "mcp-agent-mail-host-adapter",
+                "mcp_agent_mail_rust",
+            ),
+            (
+                CanonicalHostProject::Frankenterm,
+                "frankenterm-host-adapter",
+                "frankenterm",
+            ),
+        ];
+
+        for (host, expected_adapter_id, expected_project) in cases {
+            let adapter = ForwardingHostAdapter::for_host(
+                host,
+                "1.2.3",
+                None,
+                Some("instance-xyz".to_owned()),
+            );
+            let identity = adapter.identity();
+            assert_eq!(identity.adapter_id, expected_adapter_id);
+            assert_eq!(identity.host_project, expected_project);
+            assert_eq!(identity.adapter_version, "1.2.3");
+            assert_eq!(identity.telemetry_schema_version, TELEMETRY_SCHEMA_VERSION);
+            assert_eq!(identity.redaction_policy_version, "v1");
+            assert_eq!(
+                identity.runtime_role.as_deref(),
+                Some(host.default_runtime_role())
+            );
+        }
+    }
+
+    #[test]
+    fn forwarding_host_adapter_routes_events_to_sink() {
+        let sink = Arc::new(RecordingSink::default());
+        let sink_trait: Arc<dyn AdapterSink> = sink.clone();
+        let adapter = ForwardingHostAdapter::for_cass("0.9.0", None).with_sink(sink_trait);
+
+        let fixture = load_fixture("telemetry-search-v1.json");
+        adapter.emit_telemetry(&fixture).unwrap();
+        adapter
+            .on_lifecycle_event(&AdapterLifecycleEvent::SessionStart {
+                ts: "now".to_owned(),
+            })
+            .unwrap();
+
+        {
+            let emitted = sink.emitted.lock().unwrap();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(emitted[0], fixture);
+            drop(emitted);
+        }
+
+        {
+            let lifecycle = sink.lifecycle.lock().unwrap();
+            assert_eq!(lifecycle.len(), 1);
+            assert!(matches!(
+                lifecycle[0],
+                AdapterLifecycleEvent::SessionStart { .. }
+            ));
+            drop(lifecycle);
+        }
+    }
+
+    #[test]
+    fn forwarding_host_adapter_conformance_passes_for_all_canonical_hosts() {
+        let harness = ConformanceHarness::default();
+        let fixtures = vec![
+            load_fixture("telemetry-search-v1.json"),
+            load_fixture("telemetry-embedding-v1.json"),
+            load_fixture("telemetry-index-v1.json"),
+            load_fixture("telemetry-resource-v1.json"),
+            load_fixture("telemetry-lifecycle-v1.json"),
+        ];
+
+        for host in CanonicalHostProject::ALL {
+            let adapter = ForwardingHostAdapter::for_host(host, "2.0.0", None, None);
+            let report = harness.run(&adapter, &fixtures);
+            assert!(
+                report.passed,
+                "host {:?} failed conformance: {:?}",
+                host, report.violations
+            );
+            assert_eq!(report.fixtures_checked, fixtures.len());
+            assert_eq!(report.emitted_events, fixtures.len());
+            assert!(report.lifecycle_hooks_checked >= 2);
+        }
     }
 
     #[test]

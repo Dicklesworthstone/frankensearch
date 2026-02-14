@@ -283,3 +283,78 @@ jsonschema -i schemas/fixtures-invalid/ops-telemetry-storage-invalid-missing-ind
 Expected behavior:
 - valid fixture: passes
 - invalid fixture: fails because `indexes` is required
+
+## Appendix: fsfs Catalog and Changelog Schema (bd-2hz.3.2)
+`frankensearch-storage` schema version `6` now includes a dedicated fsfs incremental-indexing catalog with crash-safe changelog replay primitives.
+
+### fsfs catalog tables
+```sql
+CREATE TABLE fsfs_catalog (
+    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    path_hash TEXT NOT NULL,
+    doc_id TEXT REFERENCES documents(doc_id) ON DELETE SET NULL,
+    inode INTEGER,
+    device_id INTEGER,
+    byte_len INTEGER NOT NULL DEFAULT 0,
+    modified_at_ms INTEGER,
+    discovered_at_ms INTEGER NOT NULL,
+    last_seen_at_ms INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    ingestion_class TEXT NOT NULL CHECK (
+      ingestion_class IN ('full_semantic_lexical', 'lexical_only', 'metadata_only', 'skip')
+    ),
+    utility_score INTEGER NOT NULL,
+    pipeline_status TEXT NOT NULL CHECK (
+      pipeline_status IN ('new', 'queued', 'processing', 'indexed', 'failed', 'skipped', 'deleted')
+    ),
+    status_reason_code TEXT,
+    deleted_at_ms INTEGER,
+    metadata_json TEXT
+);
+
+CREATE TABLE fsfs_changelog (
+    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES fsfs_catalog(file_id) ON DELETE CASCADE,
+    change_kind TEXT NOT NULL CHECK (
+      change_kind IN ('discovered', 'content_changed', 'ingestion_class_changed', 'status_changed', 'deleted', 'replayed')
+    ),
+    from_revision INTEGER,
+    to_revision INTEGER,
+    from_status TEXT,
+    to_status TEXT,
+    reason_code TEXT NOT NULL,
+    replay_applied INTEGER NOT NULL DEFAULT 0 CHECK (replay_applied IN (0, 1)),
+    idempotency_key TEXT,
+    payload_json TEXT,
+    event_ts_ms INTEGER NOT NULL,
+    UNIQUE(idempotency_key)
+);
+
+CREATE TABLE fsfs_replay_cursor (
+    cursor_name TEXT PRIMARY KEY,
+    last_sequence_id INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+```
+
+### fsfs lookup and cleanup indexes
+```sql
+CREATE INDEX idx_fsfs_catalog_pipeline_status
+  ON fsfs_catalog(pipeline_status, last_seen_at_ms DESC);
+CREATE INDEX idx_fsfs_catalog_revision
+  ON fsfs_catalog(revision DESC);
+CREATE INDEX idx_fsfs_catalog_cleanup
+  ON fsfs_catalog(deleted_at_ms)
+  WHERE deleted_at_ms IS NOT NULL;
+CREATE INDEX idx_fsfs_changelog_file_seq
+  ON fsfs_changelog(file_id, sequence_id DESC);
+CREATE INDEX idx_fsfs_changelog_unapplied
+  ON fsfs_changelog(replay_applied, sequence_id)
+  WHERE replay_applied = 0;
+```
+
+### replay semantics
+- Writers append immutable rows to `fsfs_changelog` and advance `fsfs_catalog.revision`.
+- Consumers replay ordered rows where `replay_applied = 0`, then atomically set `replay_applied = 1`.
+- `fsfs_replay_cursor` stores durable high-water marks for named replayers to resume after crashes.
