@@ -57,6 +57,8 @@ pub struct Storage {
     metrics: StorageMetrics,
 }
 
+static FILE_BOOTSTRAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Storage")
@@ -79,6 +81,19 @@ impl Storage {
             "opening storage connection"
         );
 
+        let file_bootstrap_guard = if config.db_path.as_os_str() == ":memory:" {
+            None
+        } else {
+            Some(
+                FILE_BOOTSTRAP_LOCK
+                    .lock()
+                    .map_err(|_| SearchError::SubsystemError {
+                        subsystem: "storage",
+                        source: Box::new(std::io::Error::other("file bootstrap lock poisoned")),
+                    })?,
+            )
+        };
+
         let path = config.db_path.to_string_lossy().to_string();
         let conn = Connection::open(path).map_err(map_storage_error)?;
 
@@ -92,6 +107,7 @@ impl Storage {
         storage.apply_pragmas()?;
         schema::bootstrap(storage.connection())?;
         storage.metrics.record_schema_bootstrap();
+        drop(file_bootstrap_guard);
 
         if let Ok(version) = schema::current_version(storage.connection()) {
             tracing::debug!(
