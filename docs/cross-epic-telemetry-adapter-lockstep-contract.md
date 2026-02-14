@@ -91,6 +91,84 @@ Replay command mapping:
 5. Require zero hard violations in `ContractSanityReport::diagnostics()` before full rollout.
 6. Archive diagnostic artifacts for release sign-off.
 
+## Host Integration Guide (Adapter SDK + Conformance)
+
+This guide is the required host-onboarding path for known and future projects.
+
+### Step 1: Define adapter identity
+
+Every host adapter MUST declare:
+
+- `adapter_id`
+- `adapter_version`
+- `host_project`
+- `telemetry_schema_version`
+- `redaction_policy_version`
+
+These fields are mandatory inputs to conformance and rollout gates.
+
+### Step 2: Implement telemetry envelope mapping
+
+Map host-native telemetry into canonical envelope fields:
+
+- lifecycle and state transitions
+- decision/alert/degradation/transition/replay-marker events
+- deterministic reason codes
+- replay command handles
+
+Do not emit host-specific ad hoc payloads without a canonical mapping.
+
+### Step 3: Run conformance harness (required)
+
+Run these checks before any rollout:
+
+```bash
+cargo test -p frankensearch-core contract_sanity::tests -- --nocapture
+cargo test -p frankensearch-core host_adapter::tests -- --nocapture
+```
+
+If running under load or CI offload policy, execute heavy cargo commands via:
+
+```bash
+rch exec -- cargo test -p frankensearch-core contract_sanity::tests -- --nocapture
+rch exec -- cargo test -p frankensearch-core host_adapter::tests -- --nocapture
+```
+
+### Step 4: Execute rollout verification
+
+1. Shadow host traffic with adapter enabled.
+2. Validate compatibility status is `Exact` or `Compatible`.
+3. Confirm zero hard failures (`Deprecated`, `TooNew`, redaction mismatch).
+4. Promote canary only after deterministic replay checks pass.
+
+### Step 5: Define rollback pin
+
+Before default rollout, document:
+
+- previous adapter version pin,
+- previous core version pin (if needed),
+- deterministic rollback command sequence,
+- owner/on-call escalation target.
+
+### Known host integration map
+
+| Host project | Integration expectation | Minimum verification |
+|---|---|---|
+| `cass` (`/dp/coding_agent_session_search`) | Preserve agent-facing search telemetry semantics and replay handles. | Contract sanity + adapter conformance + shadow verification evidence. |
+| `xf` (`/dp/xf`) | Preserve high-volume search stream fidelity and reason-code stability. | Contract sanity + adapter conformance + canary error/latency gate pass. |
+| `mcp_agent_mail_rust` (`/dp/mcp_agent_mail_rust`) | Preserve thread/message retrieval telemetry correctness for agent workflows. | Contract sanity + adapter conformance + deterministic replay validation. |
+| `frankenterm` (`/dp/frankenterm`) | Preserve interactive session telemetry and degradation transitions. | Contract sanity + adapter conformance + interactive canary verification. |
+
+### Future host template
+
+For any new host:
+
+1. Register adapter identity and version policy.
+2. Provide fixture-backed conformance examples for core event categories.
+3. Run contract + adapter test commands.
+4. Publish rollout and rollback plan with explicit reason-code ownership.
+5. Add host entry to this guide before full rollout.
+
 ## Sign-Off Checklist
 
 - [ ] No `Deprecated` or `TooNew` adapters in the latest contract report.

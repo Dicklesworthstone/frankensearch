@@ -301,23 +301,32 @@ impl MountTable {
     /// applying any user overrides.
     #[must_use]
     pub fn new(entries: Vec<MountEntry>, overrides: &HashMap<String, MountOverride>) -> Self {
+        let mut effective_entries = Vec::with_capacity(entries.len());
         let mut policies = HashMap::with_capacity(entries.len());
 
-        for entry in &entries {
-            let base = MountPolicy::for_category(entry.category);
+        for mut entry in entries {
             let mount_path_str = entry.mount_point.to_string_lossy();
+            let override_entry = overrides.get(mount_path_str.as_ref());
 
-            // Check for a matching override (exact path match).
-            let policy = if let Some(ovr) = overrides.get(mount_path_str.as_ref()) {
+            if let Some(category) = override_entry.and_then(|ovr| ovr.category) {
+                entry.category = category;
+            }
+
+            let base = MountPolicy::for_category(entry.category);
+            let policy = if let Some(ovr) = override_entry {
                 ovr.apply(base)
             } else {
                 base
             };
 
             policies.insert(entry.mount_point.clone(), policy);
+            effective_entries.push(entry);
         }
 
-        Self { entries, policies }
+        Self {
+            entries: effective_entries,
+            policies,
+        }
     }
 
     /// Look up the mount entry and policy for a given file path.
@@ -839,6 +848,39 @@ user@host:/home /mnt/sshfs fuse.sshfs rw,nosuid,nodev 0 0
         let table = MountTable::new(entries, &overrides);
         let policy = table.policy_for(Path::new("/mnt/nfs")).unwrap();
         assert!(!policy.enabled);
+    }
+
+    #[test]
+    fn mount_table_category_override_updates_lookup_category_and_policy_defaults() {
+        let entries = vec![MountEntry {
+            device: "/dev/sda1".into(),
+            mount_point: PathBuf::from("/"),
+            fstype: "ext4".into(),
+            category: FsCategory::Local,
+            options: "rw".into(),
+        }];
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "/".to_owned(),
+            MountOverride {
+                category: Some(FsCategory::Nfs),
+                ..MountOverride::default()
+            },
+        );
+
+        let table = MountTable::new(entries, &overrides);
+        let (entry, policy) = table.lookup(Path::new("/tmp/file.txt")).unwrap();
+        assert_eq!(
+            entry.category,
+            FsCategory::Nfs,
+            "mount category override should affect lookup results"
+        );
+        assert_eq!(
+            policy.change_detection,
+            ChangeDetectionStrategy::Poll,
+            "effective category should influence default mount policy"
+        );
     }
 
     #[test]

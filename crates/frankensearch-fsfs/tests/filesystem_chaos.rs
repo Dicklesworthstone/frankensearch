@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -13,8 +13,8 @@ use frankensearch_fsfs::{
     CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED, CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
     CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY, CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
     CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenario,
-    build_cli_e2e_filesystem_chaos_bundles, default_cli_e2e_filesystem_chaos_scenarios,
-    replay_command_for_scenario,
+    MountTable, build_cli_e2e_filesystem_chaos_bundles,
+    default_cli_e2e_filesystem_chaos_scenarios, read_system_mounts, replay_command_for_scenario,
 };
 use serde::Deserialize;
 
@@ -116,14 +116,20 @@ fn load_manifest(index_root: &Path) -> Vec<IndexManifestEntry> {
     serde_json::from_str(&raw).expect("parse lexical manifest")
 }
 
+fn resolve_mount_point(path: &Path) -> Option<PathBuf> {
+    let table = MountTable::new(read_system_mounts(), &HashMap::new());
+    table.lookup(path).map(|(entry, _policy)| entry.mount_point.clone())
+}
+
 fn write_mount_boundary_config(root: &Path, mount_point: &Path) -> PathBuf {
     let config_path = root.join("chaos_mount_boundary.toml");
+    let effective_mount_point = resolve_mount_point(mount_point).unwrap_or_else(|| PathBuf::from("/"));
     let config = format!(
         "[discovery]
 skip_network_mounts = true
 mount_overrides = [{{ mount_point = \"{}\", category = \"nfs\" }}]
 ",
-        mount_point.display()
+        effective_mount_point.display()
     );
     fs::write(&config_path, config).expect("write mount boundary config");
     config_path
@@ -265,8 +271,10 @@ fn assert_bundle_matches_reason(scenario_id: &str, expected_reason: &str) {
 fn assert_binary_chaos_result(
     scenario_id: &str,
     expected_reason: &str,
+    min_skipped: usize,
     expect_zero_indexed: bool,
-    expect_skipped: bool,
+    expected_manifest_reason: Option<&str>,
+    expect_manifest_empty: bool,
 ) {
     let result = run_binary_filesystem_chaos_scenario(scenario_id);
 
@@ -279,9 +287,9 @@ fn assert_binary_chaos_result(
         "expected discovered files for scenario {scenario_id}, got sentinel={:?}",
         result.sentinel
     );
-    if expect_skipped {
+    if min_skipped > 0 {
         assert!(
-            result.sentinel.skipped >= 1,
+            result.sentinel.skipped >= min_skipped,
             "expected skipped files for scenario {scenario_id}, got sentinel={:?}",
             result.sentinel
         );
@@ -300,15 +308,47 @@ fn assert_binary_chaos_result(
         );
     }
 
+    let manifest_reason_codes: Vec<&str> = result
+        .lexical_manifest
+        .iter()
+        .map(|entry| entry.reason_code.as_str())
+        .collect();
     assert!(
-        result
-            .lexical_manifest
+        manifest_reason_codes
             .iter()
-            .all(|entry| entry.reason_code.starts_with("index.plan.")),
-        "manifest reason codes must remain canonical index plan codes"
+            .all(|code| code.starts_with("index.plan.")),
+        "manifest reason codes must remain canonical index plan codes, got {:?}",
+        manifest_reason_codes
     );
+    if expect_manifest_empty {
+        assert!(
+            result.lexical_manifest.is_empty(),
+            "expected empty manifest for {scenario_id}, got {:?}",
+            manifest_reason_codes
+        );
+    }
+    if let Some(expected_reason_code) = expected_manifest_reason {
+        assert!(
+            !result.lexical_manifest.is_empty(),
+            "expected non-empty manifest for {scenario_id}"
+        );
+        assert!(
+            manifest_reason_codes
+                .iter()
+                .all(|code| *code == expected_reason_code),
+            "expected manifest reason code {expected_reason_code} for {scenario_id}, got {:?}",
+            manifest_reason_codes
+        );
+    }
     assert_eq!(result.bundle.scenario.id, scenario_id);
     assert_eq!(result.bundle.scenario.expected_reason_code, expected_reason);
+    assert!(result.bundle.events.iter().any(|event| {
+        event
+            .body
+            .reason_code
+            .as_deref()
+            .is_some_and(|code| code == expected_reason)
+    }));
     assert!(
         result
             .bundle
@@ -366,8 +406,10 @@ fn scenario_cli_chaos_permission_denied_binary_run() {
     assert_binary_chaos_result(
         "cli-chaos-permission-denied",
         CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
+        1,
         false,
-        true,
+        Some("index.plan.full_semantic_lexical"),
+        false,
     );
 }
 
@@ -376,7 +418,9 @@ fn scenario_cli_chaos_symlink_loop_binary_run() {
     assert_binary_chaos_result(
         "cli-chaos-symlink-loop",
         CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP,
+        0,
         false,
+        Some("index.plan.full_semantic_lexical"),
         false,
     );
 }
@@ -386,7 +430,9 @@ fn scenario_cli_chaos_mount_boundary_binary_run() {
     assert_binary_chaos_result(
         "cli-chaos-mount-boundary",
         CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY,
+        1,
         true,
+        None,
         true,
     );
 }
@@ -396,8 +442,10 @@ fn scenario_cli_chaos_giant_log_skip_binary_run() {
     assert_binary_chaos_result(
         "cli-chaos-giant-log-skip",
         CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
+        1,
         false,
-        true,
+        Some("index.plan.full_semantic_lexical"),
+        false,
     );
 }
 
@@ -406,8 +454,10 @@ fn scenario_cli_chaos_binary_blob_skip_binary_run() {
     assert_binary_chaos_result(
         "cli-chaos-binary-blob-skip",
         CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED,
+        1,
         false,
-        true,
+        Some("index.plan.full_semantic_lexical"),
+        false,
     );
 }
 

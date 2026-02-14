@@ -7,6 +7,8 @@ on:
       - main
     tags:
       - "v*"
+  schedule:
+    - cron: "23 3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -64,6 +66,18 @@ jobs:
           shared-key: workspace-${{ matrix.os }}-nightly
           cache-targets: true
 
+      - name: Resolve validation profile
+        id: validation_profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="premerge"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            profile="nightly"
+          fi
+          echo "profile=${profile}" >> "${GITHUB_OUTPUT}"
+          echo "validation_profile=${profile}" >> "${GITHUB_ENV}"
+
       - name: cargo check
         run: cargo check --workspace --all-targets
 
@@ -75,6 +89,10 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: Nightly full validation (all features)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        run: cargo test --workspace --all-features -- --nocapture
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
@@ -126,7 +144,66 @@ jobs:
           }
           EOF
 
-      - name: Validate e2e index + retention policy payloads
+      - name: Emit quality gate matrix + rollout checklist artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+
+          cat > ci_artifacts/quality_gate_matrix.json <<EOF
+          {
+            "schema": "quality-gate-matrix-v1",
+            "validation_profile": "${validation_profile}",
+            "suites": [
+              {"id":"unit","required":true,"lane":"cargo test --workspace"},
+              {"id":"integration","required":true,"lane":"cargo test --workspace"},
+              {"id":"snapshot","required":true,"status":"pending","bead":"bd-2yu.8.3"},
+              {"id":"e2e","required":true,"lane":"cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture"},
+              {"id":"perf","required":true,"status":"pending","bead":"bd-2yu.8.4"},
+              {"id":"fault","required":true,"status":"pending","bead":"bd-2yu.8.4"},
+              {"id":"soak","required":true,"status":"pending","bead":"bd-2yu.8.5"},
+              {"id":"contract_schema","required":true,"lane":"python3 -m jsonschema --instance schemas/fixtures/e2e-*.json schemas/e2e-artifact-v1.schema.json"}
+            ],
+            "profiles": {
+              "premerge": {
+                "description": "Fast gate for PR/push",
+                "required_lanes": ["cargo check","cargo clippy","cargo fmt --check","cargo test --workspace","fsfs_cli_e2e_contract","schema_validation"]
+              },
+              "nightly": {
+                "description": "Full validation sweep",
+                "required_lanes": ["premerge","cargo test --workspace --all-features -- --nocapture"]
+              }
+            }
+          }
+          EOF
+
+          cat > ci_artifacts/rollout_host_checklist.json <<'EOF'
+          {
+            "schema": "host-rollout-checklist-v1",
+            "hosts": [
+              "coding_agent_session_search",
+              "xf",
+              "mcp_agent_mail_rust",
+              "frankenterm"
+            ],
+            "phases": ["shadow","canary","default"],
+            "post_rollout_health_checks": [
+              "slo_error_budget_within_threshold",
+              "latency_budget_within_threshold",
+              "degraded_reason_code_rate_within_threshold",
+              "deterministic_replay_passed"
+            ],
+            "rollback_triggers": [
+              "fatal_incident_open",
+              "contract_breaking_output_regression",
+              "persistent_latency_or_error_budget_breach",
+              "replay_reproducible_failure_unresolved"
+            ]
+          }
+          EOF
+
+      - name: Validate CI artifact payloads
         if: always() && matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
@@ -145,6 +222,20 @@ jobs:
             .success_retention_days >= 1 and
             .failure_retention_days >= .success_retention_days
           ' ci_artifacts/e2e_retention_policy.json >/dev/null
+
+          jq -e '
+            .schema == "quality-gate-matrix-v1" and
+            (.validation_profile == "premerge" or .validation_profile == "nightly") and
+            (.suites | length >= 8)
+          ' ci_artifacts/quality_gate_matrix.json >/dev/null
+
+          jq -e '
+            .schema == "host-rollout-checklist-v1" and
+            (.hosts | length == 4) and
+            (.phases == ["shadow","canary","default"]) and
+            (.post_rollout_health_checks | length >= 4) and
+            (.rollback_triggers | length >= 4)
+          ' ci_artifacts/rollout_host_checklist.json >/dev/null
 
       - name: Upload e2e artifact index (success retention)
         if: matrix.os == 'ubuntu-latest' && success()
@@ -178,6 +269,7 @@ jobs:
             echo "- Operator docs entrypoint: [Ops TUI IA playbook link](${OPS_URL})"
             echo "- Replay source of truth: \`replay_command.txt\` from the failing artifact bundle."
             echo "- Machine index artifact: \`e2e-contract-index-failure-${{ github.run_id }}\` (retention: 30 days)."
+            echo "- Quality gate metadata artifacts: \`quality_gate_matrix.json\`, \`rollout_host_checklist.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
   release-build:

@@ -320,6 +320,10 @@ E2e-specific reason codes use the `e2e.*` namespace:
 | `e2e.replay.seed_mismatch` | Replay seed did not match manifest |
 | `e2e.diff.tolerance_exceeded` | Snapshot diff exceeded tolerance |
 | `e2e.diff.field_missing` | Expected field absent in current run |
+| `e2e.perf.gate.missing_inputs` | Performance gate skipped due to missing baseline/current metrics |
+| `e2e.perf.gate.inconclusive_confidence` | Performance gate could not reach confidence target |
+| `e2e.perf.gate.flake_suspected` | High variance triggered flake mitigation path |
+| `e2e.perf.gate.regression_detected` | Statistical gate detected latency/memory regression |
 
 ## Suite-to-Schema Migration Matrix (bd-2hz.10.11.2)
 
@@ -337,6 +341,8 @@ Status legend:
 | fsfs TUI replay suite (`bd-2hz.10.5`) | `pending` | Deluxe TUI e2e lane | Must emit canonical bundle with `terminal_transcript.txt` + snapshot assets on failures | Add adapter hooks for TUI snapshot diff outputs into `artifacts_index.json`. |
 | fsfs chaos suite (`bd-2hz.10.7`) | `pending` | Filesystem-chaos e2e lane | Must emit canonical bundle plus reproducible replay command | Add reason-code taxonomy mapping for permission/symlink/mount/binary-blob failures. |
 | fsfs privacy/redaction suite (`bd-2hz.10.9`) | `pending` | Privacy leak-detection e2e lane | Must emit canonical bundle with structured redaction evidence in `structured_events.jsonl` | Add deterministic redaction outcome fields + replay-safe scrubbed transcript pathing. |
+| Upgrade/migration compatibility suite (`bd-2hz.11.6`) | `pending` | Upgrade matrix + migration soak verification lane | Must emit canonical bundle with migration matrix report, quality-regression report, and replay command | Add adapters for version-path metadata (`N-2->N`, `N-1->N`, rollback) and stable migration failure reason codes. |
+| Performance regression gate suite (`bd-2hz.9.6`) | `in_progress` | CI quality lane + benchmark comparison artifacts | Must emit policy/result artifacts (`perf_regression_gate_policy.json`, `perf_regression_gate_result.json`) and replay command | Promote to adopted after benchmark harness inputs are wired for all required lanes. |
 | Ops PTY + snapshot suite (`bd-2yu.8.3`) | `pending` | Ops/control-plane PTY snapshot lane | Must emit canonical bundle with `terminal_transcript.txt`, snapshot diffs, and artifact checksums | Add PTY snapshot metadata adapter and enforce transcript-on-failure requirement. |
 
 ### Canonical Field Mapping Rules

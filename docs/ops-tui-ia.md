@@ -191,6 +191,125 @@ Operator triage for failing unified v1 artifact bundles is standardized in:
 
 CI failure outputs in `.github/workflows/ci.yml` also publish this same runbook link so operators can pivot from failed jobs directly into the replay workflow.
 
+## Operator Runbook (Production Use)
+
+This runbook is the day-1/day-2 operational baseline for the control-plane TUI.
+
+### A) Startup and Verification Checklist (Shift Start)
+
+1. Confirm fsfs/control-plane health input is available:
+   - `fsfs status --no-watch-mode --format json`
+2. Open the TUI and verify primary navigation surfaces:
+   - `1` Fleet Overview
+   - `2` Project Detail
+   - `7` Alerts + Timeline
+   - `?` Help overlay renders with keybindings
+3. Confirm stream health on one active project:
+   - open `live_search_stream` (`3`),
+   - verify state is `connected` or expected `degraded` with explicit reason.
+4. Confirm trend windows are populated:
+   - open `resource_trends` (`5`) and `historical_analytics` (`6`),
+   - verify at least one non-empty historical window (`15m` or greater).
+5. Confirm explainability path:
+   - open `explainability_cockpit` (`8`) from a live query drilldown.
+
+### B) Fast Incident Triage Workflow (5-10 minutes)
+
+1. Detect:
+   - start at `fleet_overview` (`1`) and identify impacted project(s).
+2. Scope:
+   - jump to `project_dashboard` (`2`) and compare latency/health cards.
+3. Correlate:
+   - inspect `alerts_timeline` (`7`) for first failure timestamp and reason codes.
+4. Deep dive:
+   - inspect `historical_analytics` (`6`) for percentile/regression windows.
+   - pivot into `explainability_cockpit` (`8`) for query/ranking evidence.
+5. Classify severity:
+   - `Fatal`: hard outage/data unavailability.
+   - `Degraded`: partial service with constrained quality/throughput.
+   - `Transient`: short-lived recoverable blip.
+6. Act:
+   - apply operator action via palette (`Ctrl+K`) only if guardrails allow,
+   - record reason code + action in incident thread.
+
+### C) Deterministic Replay Procedure
+
+Use this when triaging CI or production-captured artifact bundles.
+
+1. Download artifacts:
+
+```bash
+gh run download <run-id> --dir /tmp/frankensearch-ci
+```
+
+2. Inspect manifest and key fields:
+
+```bash
+cd <bundle_dir>
+jq '.body | {suite, exit_status, determinism_tier, seed, duration_ms}' manifest.json
+```
+
+3. Replay exactly from bundled command:
+
+```bash
+bash replay_command.txt
+```
+
+4. Record:
+   - `run_id`, `suite`, top `reason_code`, replay result (`reproduced`/`not_reproduced`), next owner.
+
+### D) Rollout Verification Checklist
+
+Before promoting a rollout phase (`shadow -> canary -> default`), verify:
+
+1. No unresolved fatal diagnostics in alerts timeline.
+2. Latency/error-budget gates remain within declared phase envelope.
+3. Degraded/fallback reason-code rate is under declared threshold.
+4. Replay command for latest verification artifact succeeds.
+5. Rollback path has been dry-run in the current release window.
+
+### D.1) Host Rollout Matrix (Required)
+
+Apply the same phase sequence for each priority host:
+
+| Host | Shadow gate | Canary gate | Default gate |
+|---|---|---|---|
+| `coding_agent_session_search` | Query/result parity on representative automation corpus | Error/latency budget stable for canary cohort | 24h stable operation + replay validation pass |
+| `xf` | High-volume query stream parity and reason-code stability | Canary SLO + degradation-rate thresholds met | Stable production window + no unresolved P0/P1 incidents |
+| `mcp_agent_mail_rust` | Thread/message retrieval contract parity in shadow mode | Agent workflow contract checks pass in canary | Full rollout only after deterministic replay checks pass |
+| `frankenterm` | Interactive workflow parity (latency + explainability surfaces) | Canary interactive latency and error budget within thresholds | Default only after rollback drill is validated |
+
+### D.2) Post-Rollout Health Checks (Required)
+
+After each host reaches `default`, verify:
+
+1. SLO/error-budget metrics stay within target.
+2. `p95/p99` latency remains within rollout envelope.
+3. Fallback/degradation reason-code rates stay within threshold.
+4. Deterministic replay of sampled incidents succeeds.
+
+Rollback triggers:
+
+1. Fatal incident attributable to rollout delta.
+2. Contract-breaking output regression.
+3. Persistent latency/error-budget breach beyond allowed window.
+4. Reproducible failure remains unresolved after defined mitigation window.
+
+### E) Rollback Procedure (Operator-Facing)
+
+If rollout gate fails:
+
+1. Freeze progression for affected host/project.
+2. Re-pin to last known good deployment path.
+3. Re-verify startup, stream connectivity, and project dashboard health.
+4. Re-run deterministic replay on failing artifact pack.
+5. Publish rollback summary with:
+   - trigger reason code,
+   - rollback version/path,
+   - verification evidence links.
+
+Rollback is complete only when the project returns to known-good telemetry and all blocking alerts are resolved or downgraded with explicit rationale.
+
 ## Downstream Implementation Boundaries
 
 This spec is now authoritative for:
