@@ -10,6 +10,8 @@ description = "Operations control-plane TUI for frankensearch fleet monitoring"
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
+fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
 
 # Terminal UI rendering
 ratatui = "0.30"
