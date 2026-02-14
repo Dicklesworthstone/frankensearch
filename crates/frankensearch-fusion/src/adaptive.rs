@@ -1103,8 +1103,7 @@ mod tests {
         let precision_prior: f64 = 1.0 / 100.0;
         let precision_obs: f64 = 1.0 / 225.0;
         let precision_post = precision_prior + precision_obs;
-        let expected_mu =
-            precision_prior.mul_add(60.0, precision_obs * 80.0) / precision_post;
+        let expected_mu = precision_prior.mul_add(60.0, precision_obs * 80.0) / precision_post;
         let expected_sigma_sq = 1.0 / precision_post;
 
         kp.update(80.0);
@@ -1128,14 +1127,20 @@ mod tests {
         let af = AdaptiveFusion::new(test_config());
 
         let ev1 = af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
-        assert!(ev1.blend_posterior.0 > 7.0, "alpha should increase after success");
+        assert!(
+            ev1.blend_posterior.0 > 7.0,
+            "alpha should increase after success"
+        );
         assert!(
             (ev1.blend_posterior.1 - 3.0).abs() < f64::EPSILON,
             "beta should stay at prior for success"
         );
 
         let ev2 = af.update_k(QueryClass::NaturalLanguage, 80.0, SignalSource::NdcgEval);
-        assert!(ev2.k_posterior.0 > 60.0, "K mu should shift toward observed 80");
+        assert!(
+            ev2.k_posterior.0 > 60.0,
+            "K mu should shift toward observed 80"
+        );
         assert!(
             ev2.k_posterior.1 < 100.0,
             "K sigma_sq should decrease after observation"
@@ -1158,8 +1163,7 @@ mod tests {
 
         let snap = af.snapshot();
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
-        let restored: AdaptiveSnapshot =
-            serde_json::from_str(&json).expect("deserialize snapshot");
+        let restored: AdaptiveSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
 
         // Verify per-class data survived the roundtrip.
         assert_eq!(restored.per_class.len(), snap.per_class.len());
@@ -1206,11 +1210,11 @@ mod tests {
             assert!(blend.is_finite(), "blend for {qc:?} must be finite");
             assert!(k.is_finite(), "K for {qc:?} must be finite");
             assert!(
-                blend >= 0.1 && blend <= 0.95,
+                (0.1..=0.95).contains(&blend),
                 "blend for {qc:?} out of safety bounds: {blend}"
             );
             assert!(
-                k >= 1.0 && k <= 200.0,
+                (1.0..=200.0).contains(&k),
                 "K for {qc:?} out of safety bounds: {k}"
             );
         }

@@ -16,8 +16,11 @@ pub mod cache;
 pub mod calibration;
 pub mod circuit_breaker;
 pub mod conformal;
+pub mod federated;
 pub mod feedback;
 pub mod incremental;
+pub mod interaction_lanes;
+pub mod interaction_oracles;
 pub mod mmr;
 pub mod normalize;
 pub mod ope;
@@ -46,8 +49,20 @@ pub use conformal::{
     AdaptiveConformalState, AdaptiveConformalUpdate, ConformalSearchCalibration,
     MondrianConformalCalibration,
 };
+pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
 pub use incremental::{IncrementalConfig, IncrementalSearcher, SearchPlan, SearchStrategy};
+pub use interaction_lanes::{
+    CalibratorChoice, CorpusSlice, ExpectedPhase, FeatureToggles, FixtureQuery, InteractionLane,
+    QuerySlice, RiskLevel, derive_query_seed, fixture_queries, lane_by_id, lane_catalog, lane_ids,
+    lanes_at_risk, queries_for_lane,
+};
+pub use interaction_oracles::{
+    InvariantCategory, InvariantGroup, LaneOracleMapping, LaneOracleTemplate, LaneTestReport,
+    OracleDescriptor, OracleOutcome, OracleRequirements, OracleVerdict, RequiredFeature,
+    all_oracles, compute_lane_oracle_mappings, lane_oracle_templates, oracle_applicable,
+    oracle_template_for_lane, oracles_for_lane,
+};
 pub use mmr::{MmrConfig, mmr_rerank};
 pub use normalize::{
     NormalizationMethod, min_max_normalize, normalize_in_place, normalize_scores,

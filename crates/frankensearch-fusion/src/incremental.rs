@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn should_refine_above_threshold() {
         let s = default_searcher();
-        assert!(s.should_refine(Duration::from_millis(1000)));
+        assert!(s.should_refine(Duration::from_secs(1)));
     }
 
     // ── Reset clears state ──────────────────────────────────────────

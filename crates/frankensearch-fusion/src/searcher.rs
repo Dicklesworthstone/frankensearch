@@ -13,11 +13,13 @@
 //!    and `fast_only` is false).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::time::{timeout, wall_now};
 use tracing::instrument;
 
+use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -122,8 +124,10 @@ impl TwoTierSearcher {
     /// * `cx` — Capability context for cancellation.
     /// * `query` — The search query string.
     /// * `k` — Maximum number of results per phase.
-    /// * `text_fn` — Retrieves document text by `doc_id` for reranking.
-    ///   Pass `|_| None` when reranking is not needed.
+    /// * `text_fn` — Retrieves document text by `doc_id` for reranking and
+    ///   exclusion-query filtering.
+    ///   Pass `|_| None` only when reranking is not needed and the query does
+    ///   not contain exclusions (`-term`, `NOT "phrase"`).
     /// * `on_phase` — Callback invoked once per search phase.
     ///
     /// # Errors
@@ -132,6 +136,7 @@ impl TwoTierSearcher {
     /// Returns `SearchError::EmbeddingFailed` if fast embedding fails and no
     /// lexical backend is available as fallback.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
+    #[allow(clippy::too_many_lines)]
     pub async fn search(
         &self,
         cx: &Cx,
@@ -148,14 +153,39 @@ impl TwoTierSearcher {
 
         // Canonicalize query.
         let canon_query = self.canonicalizer.canonicalize_query(query);
-        let query_class = QueryClass::classify(&canon_query);
+        if canon_query.trim().is_empty() {
+            return Ok(metrics);
+        }
+        let parsed_query = ParsedQuery::parse(&canon_query);
+        let semantic_query = if parsed_query.is_positive_empty() {
+            canon_query.as_str()
+        } else {
+            parsed_query.positive.as_str()
+        };
+
+        tracing::debug!(
+            included_terms = parsed_query.positive.split_whitespace().count(),
+            excluded_terms = parsed_query.negation_count(),
+            has_negations = parsed_query.has_negations(),
+            "query_parsed"
+        );
+
+        let query_class = QueryClass::classify(semantic_query);
         metrics.query_class = Some(query_class);
         metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
 
         // Phase 1: Initial (fast tier).
         let phase1_start = Instant::now();
         let initial = self
-            .run_phase1(cx, &canon_query, k, query_class, &mut metrics)
+            .run_phase1(
+                cx,
+                semantic_query,
+                &parsed_query,
+                k,
+                query_class,
+                &text_fn,
+                &mut metrics,
+            )
             .await;
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -168,6 +198,9 @@ impl TwoTierSearcher {
         };
 
         let initial_hits = initial_results.clone();
+        let phase1_has_fast_candidates = initial_hits
+            .iter()
+            .any(|result| result.fast_score.is_some());
 
         on_phase(SearchPhase::Initial {
             results: initial_results,
@@ -182,47 +215,79 @@ impl TwoTierSearcher {
         self.export_search_metrics(query_class, &metrics, initial_hits.len(), false);
 
         // Phase 2: Quality refinement (optional).
-        if self.should_run_quality() {
+        if self.should_run_quality() && phase1_has_fast_candidates {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
 
-            match self
-                .run_phase2(cx, &canon_query, k, &initial_hits, &text_fn, &mut metrics)
-                .await
-            {
-                Ok(refined_results) => {
+            let phase2_future = Box::pin(self.run_phase2(
+                cx,
+                semantic_query,
+                k,
+                &initial_hits,
+                &text_fn,
+                &mut metrics,
+            ));
+            let timeout_budget = Duration::from_millis(self.config.quality_timeout_ms);
+            let timeout_start = cx
+                .timer_driver()
+                .as_ref()
+                .map_or_else(wall_now, asupersync::time::TimerDriverHandle::now);
+            let phase2_result = timeout(timeout_start, timeout_budget, phase2_future).await;
+
+            match phase2_result {
+                Err(_elapsed) => {
                     metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
-                    self.export_search_metrics(query_class, &metrics, refined_results.len(), true);
-                    on_phase(SearchPhase::Refined {
-                        results: refined_results,
-                        latency: phase2_start.elapsed(),
-                        metrics: PhaseMetrics {
-                            embedder_id: self
-                                .quality_embedder
-                                .as_ref()
-                                .map_or("none", |e| e.id())
-                                .to_owned(),
-                            vectors_searched: self.index.doc_count(),
-                            lexical_candidates: metrics.lexical_candidates,
-                            fused_count: k,
-                        },
-                        rank_changes: metrics.rank_changes.clone(),
-                    });
-                }
-                Err(SearchError::Cancelled { phase, reason }) => {
-                    return Err(SearchError::Cancelled { phase, reason });
-                }
-                Err(err) => {
-                    metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
-                    metrics.skip_reason = Some(format!("{err}"));
-                    self.export_error(&err);
+                    let timeout_error = SearchError::SearchTimeout {
+                        elapsed_ms: u64::try_from(phase2_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        budget_ms: self.config.quality_timeout_ms,
+                    };
+                    metrics.skip_reason = Some(timeout_error.to_string());
+                    self.export_error(&timeout_error);
                     on_phase(SearchPhase::RefinementFailed {
                         initial_results: initial_hits,
-                        error: err,
+                        error: timeout_error,
                         latency: phase2_start.elapsed(),
                     });
                 }
+                Ok(phase2_outcome) => match phase2_outcome {
+                    Ok(refined_results) => {
+                        let refined_count = refined_results.len();
+                        metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+                        self.export_search_metrics(query_class, &metrics, refined_count, true);
+                        on_phase(SearchPhase::Refined {
+                            results: refined_results,
+                            latency: phase2_start.elapsed(),
+                            metrics: PhaseMetrics {
+                                embedder_id: self
+                                    .quality_embedder
+                                    .as_ref()
+                                    .map_or("none", |e| e.id())
+                                    .to_owned(),
+                                vectors_searched: self.index.doc_count(),
+                                lexical_candidates: metrics.lexical_candidates,
+                                fused_count: refined_count,
+                            },
+                            rank_changes: metrics.rank_changes.clone(),
+                        });
+                    }
+                    Err(SearchError::Cancelled { phase, reason }) => {
+                        return Err(SearchError::Cancelled { phase, reason });
+                    }
+                    Err(err) => {
+                        metrics.phase2_total_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+                        metrics.skip_reason = Some(format!("{err}"));
+                        self.export_error(&err);
+                        on_phase(SearchPhase::RefinementFailed {
+                            initial_results: initial_hits,
+                            error: err,
+                            latency: phase2_start.elapsed(),
+                        });
+                    }
+                },
             }
+        } else if self.should_run_quality() {
+            metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
         } else if self.config.fast_only {
             metrics.skip_reason = Some("fast_only".to_owned());
         } else {
@@ -236,6 +301,10 @@ impl TwoTierSearcher {
     ///
     /// Returns the refined results if Phase 2 succeeds, otherwise the initial results.
     ///
+    /// This method cannot evaluate exclusion clauses because it does not accept
+    /// a document text provider. Use [`search_collect_with_text`](Self::search_collect_with_text)
+    /// or [`search`](Self::search) when querying with exclusions.
+    ///
     /// # Errors
     ///
     /// Same as [`search`](Self::search).
@@ -245,33 +314,56 @@ impl TwoTierSearcher {
         query: &str,
         k: usize,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
+        let canon_query = self.canonicalizer.canonicalize_query(query);
+        if ParsedQuery::parse(&canon_query).has_negations() {
+            return Err(SearchError::QueryParseError {
+                query: query.to_owned(),
+                detail: "search_collect requires a text provider for exclusion syntax; use search_collect_with_text() or search()".to_owned(),
+            });
+        }
+
+        self.search_collect_with_text(cx, query, k, |_| None).await
+    }
+
+    /// Convenience method that collects all phases while using `text_fn` for
+    /// reranking and exclusion filtering.
+    ///
+    /// Returns the refined results if Phase 2 succeeds, otherwise the initial results.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`search`](Self::search).
+    pub async fn search_collect_with_text(
+        &self,
+        cx: &Cx,
+        query: &str,
+        k: usize,
+        text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
+    ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
         let mut best_results = Vec::new();
         let metrics = self
-            .search(
-                cx,
-                query,
-                k,
-                |_| None,
-                |phase| match phase {
-                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
-                        best_results = results;
-                    }
-                    SearchPhase::RefinementFailed { .. } => {
-                        // Keep the initial results already stored in best_results.
-                    }
-                },
-            )
+            .search(cx, query, k, text_fn, |phase| match phase {
+                SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                    best_results = results;
+                }
+                SearchPhase::RefinementFailed { .. } => {
+                    // Keep the initial results already stored in best_results.
+                }
+            })
             .await?;
         Ok((best_results, metrics))
     }
 
     /// Run Phase 1: fast embedding + optional lexical + RRF fusion.
+    #[allow(clippy::too_many_arguments)]
     async fn run_phase1(
         &self,
         cx: &Cx,
-        query: &str,
+        semantic_query: &str,
+        parsed_query: &ParsedQuery,
         k: usize,
         query_class: QueryClass,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
     ) -> SearchResult<Vec<ScoredResult>> {
         let base_candidates = candidate_count(k, 0, self.config.candidate_multiplier);
@@ -298,11 +390,21 @@ impl TwoTierSearcher {
 
         // Fast embedding.
         let embed_start = Instant::now();
-        let fast_embed_result = self.fast_embedder.embed(cx, query).await;
+        let fast_embed_result = self.fast_embedder.embed(cx, semantic_query).await;
         metrics.fast_embed_ms = embed_start.elapsed().as_secs_f64() * 1000.0;
 
         // Lexical search (runs regardless of embedding success).
-        let lexical_results = self.run_lexical(cx, query, lexical_budget, metrics).await;
+        let mut lexical_results = self
+            .run_lexical(cx, semantic_query, lexical_budget, metrics)
+            .await?;
+        if parsed_query.has_negations() {
+            lexical_results = lexical_results.map(|results| {
+                let filtered =
+                    filter_scored_results_by_negations(results, parsed_query, text_fn, "lexical");
+                metrics.lexical_candidates = filtered.len();
+                filtered
+            });
+        }
 
         match fast_embed_result {
             Ok(query_vec) => {
@@ -314,6 +416,11 @@ impl TwoTierSearcher {
                 // Vector search.
                 let search_start = Instant::now();
                 let fast_hits = self.index.search_fast(&query_vec, semantic_budget)?;
+                let fast_hits = if parsed_query.has_negations() {
+                    filter_vector_hits_by_negations(fast_hits, parsed_query, text_fn, "semantic")
+                } else {
+                    fast_hits
+                };
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
 
@@ -331,6 +438,9 @@ impl TwoTierSearcher {
                 Ok(results)
             }
             Err(embed_err) => {
+                if matches!(embed_err, SearchError::Cancelled { .. }) {
+                    return Err(embed_err);
+                }
                 // Graceful degradation: use lexical-only results if available.
                 if let Some(ref lexical) = lexical_results {
                     self.export_error(&embed_err);
@@ -391,6 +501,7 @@ impl TwoTierSearcher {
             .map(|(i, r)| VectorHit {
                 #[allow(clippy::cast_possible_truncation)]
                 index: i as u32,
+                // Preserve phase-1 fusion signal for lexical-only candidates.
                 score: r.fast_score.unwrap_or(r.score),
                 doc_id: r.doc_id.clone(),
             })
@@ -399,7 +510,7 @@ impl TwoTierSearcher {
         // Look up indices in the fast index for quality scoring.
         let fast_indices: Vec<usize> = fast_hits
             .iter()
-            .filter_map(|h| self.index.doc_ids().iter().position(|id| *id == h.doc_id))
+            .filter_map(|h| self.index.fast_index_for_doc_id(&h.doc_id))
             .collect();
 
         let quality_scores = self
@@ -497,20 +608,25 @@ impl TwoTierSearcher {
         query: &str,
         candidates: usize,
         metrics: &mut TwoTierMetrics,
-    ) -> Option<Vec<ScoredResult>> {
-        let lexical = self.lexical.as_ref()?;
+    ) -> SearchResult<Option<Vec<ScoredResult>>> {
+        let Some(lexical) = self.lexical.as_ref() else {
+            return Ok(None);
+        };
         let start = Instant::now();
         match lexical.search(cx, query, candidates).await {
             Ok(results) => {
                 metrics.lexical_search_ms = start.elapsed().as_secs_f64() * 1000.0;
                 metrics.lexical_candidates = results.len();
-                Some(results)
+                Ok(Some(results))
             }
             Err(err) => {
+                metrics.lexical_search_ms = start.elapsed().as_secs_f64() * 1000.0;
+                if matches!(err, SearchError::Cancelled { .. }) {
+                    return Err(err);
+                }
                 self.export_error(&err);
                 tracing::warn!(error = %err, "lexical search failed, continuing without");
-                metrics.lexical_search_ms = start.elapsed().as_secs_f64() * 1000.0;
-                None
+                Ok(None)
             }
         }
     }
@@ -641,6 +757,65 @@ fn vector_hits_to_scored_results(hits: &[VectorHit], k: usize) -> Vec<ScoredResu
         .collect()
 }
 
+fn filter_scored_results_by_negations(
+    results: Vec<ScoredResult>,
+    parsed_query: &ParsedQuery,
+    text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    source: &'static str,
+) -> Vec<ScoredResult> {
+    results
+        .into_iter()
+        .filter(|result| !should_exclude_document(&result.doc_id, parsed_query, text_fn, source))
+        .collect()
+}
+
+fn filter_vector_hits_by_negations(
+    hits: Vec<VectorHit>,
+    parsed_query: &ParsedQuery,
+    text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    source: &'static str,
+) -> Vec<VectorHit> {
+    hits.into_iter()
+        .filter(|hit| !should_exclude_document(&hit.doc_id, parsed_query, text_fn, source))
+        .collect()
+}
+
+fn should_exclude_document(
+    doc_id: &str,
+    parsed_query: &ParsedQuery,
+    text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    source: &'static str,
+) -> bool {
+    let Some(text) = text_fn(doc_id) else {
+        return false;
+    };
+    let Some(matched_clause) = find_negative_match(&text, parsed_query) else {
+        return false;
+    };
+    tracing::debug!(
+        %doc_id,
+        matched_exclusion_term = %matched_clause,
+        source,
+        "doc_excluded"
+    );
+    true
+}
+
+fn find_negative_match(text: &str, parsed_query: &ParsedQuery) -> Option<String> {
+    let lower_text = text.to_lowercase();
+    for term in &parsed_query.negative_terms {
+        if !term.is_empty() && lower_text.contains(&term.to_lowercase()) {
+            return Some(term.clone());
+        }
+    }
+    for phrase in &parsed_query.negative_phrases {
+        if !phrase.is_empty() && lower_text.contains(&phrase.to_lowercase()) {
+            return Some(phrase.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unnecessary_literal_bound,
@@ -737,6 +912,76 @@ mod tests {
         }
     }
 
+    struct CancelledEmbedder;
+
+    impl Embedder for CancelledEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async {
+                Err(SearchError::Cancelled {
+                    phase: "embed".to_owned(),
+                    reason: "test cancellation".to_owned(),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &str {
+            "cancelled-embedder"
+        }
+
+        fn model_name(&self) -> &str {
+            "cancelled-embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    struct PendingEmbedder {
+        id: &'static str,
+        dimension: usize,
+    }
+
+    impl PendingEmbedder {
+        const fn new(id: &'static str, dimension: usize) -> Self {
+            Self { id, dimension }
+        }
+    }
+
+    impl Embedder for PendingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     // ─── Stub Lexical Search ────────────────────────────────────────────
 
     struct StubLexical;
@@ -786,6 +1031,48 @@ mod tests {
 
         fn doc_count(&self) -> usize {
             3
+        }
+    }
+
+    struct CancelledLexical;
+
+    impl LexicalSearch for CancelledLexical {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            _limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async {
+                Err(SearchError::Cancelled {
+                    phase: "lexical_search".to_owned(),
+                    reason: "test cancellation".to_owned(),
+                })
+            })
+        }
+
+        fn index_document<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _doc: &'a frankensearch_core::types::IndexableDocument,
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn index_documents<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _docs: &'a [frankensearch_core::types::IndexableDocument],
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn doc_count(&self) -> usize {
+            0
         }
     }
 
@@ -889,6 +1176,30 @@ mod tests {
     }
 
     #[test]
+    fn search_whitespace_query_returns_no_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            let mut phases = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "   \t\n  ",
+                    10,
+                    |_| None,
+                    |p| phases.push(format!("{p:?}")),
+                )
+                .await
+                .unwrap();
+
+            assert!(phases.is_empty());
+            assert!(metrics.phase1_total_ms.abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
     fn search_fast_only_yields_initial_phase() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -962,6 +1273,43 @@ mod tests {
     }
 
     #[test]
+    fn refined_phase_metrics_report_actual_fused_count() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4); // 10 docs in fixture index
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality);
+
+            let mut refined_fused_count = None;
+            let mut refined_result_len = None;
+            searcher
+                .search(
+                    &cx,
+                    "test query",
+                    20, // ask for more than available docs to exercise truncation
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Refined {
+                            metrics, results, ..
+                        } = phase
+                        {
+                            refined_fused_count = Some(metrics.fused_count);
+                            refined_result_len = Some(results.len());
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert_eq!(
+                refined_fused_count, refined_result_len,
+                "refined phase should report fused_count equal to emitted result length"
+            );
+        });
+    }
+
+    #[test]
     fn fast_only_config_skips_quality() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -983,6 +1331,52 @@ mod tests {
 
             assert_eq!(phase_count, 1, "fast_only should skip quality phase");
             assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+        });
+    }
+
+    #[test]
+    fn quality_timeout_emits_refinement_failed_with_timeout_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
+            let config = TwoTierConfig {
+                quality_timeout_ms: 0,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast, config).with_quality_embedder(quality);
+
+            let mut saw_initial = false;
+            let mut saw_timeout = false;
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "timeout me",
+                    5,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { .. } => saw_initial = true,
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            saw_timeout = matches!(error, SearchError::SearchTimeout { .. });
+                        }
+                        SearchPhase::Refined { .. } => {}
+                    },
+                )
+                .await
+                .expect("search should return metrics even when refinement times out");
+
+            assert!(saw_initial, "phase 1 should still run");
+            assert!(
+                saw_timeout,
+                "phase 2 timeout should degrade to RefinementFailed with SearchTimeout"
+            );
+            assert!(
+                metrics
+                    .skip_reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.contains("Search timed out")),
+                "timeout should be recorded in skip reason"
+            );
         });
     }
 
@@ -1020,6 +1414,57 @@ mod tests {
     }
 
     #[test]
+    fn fast_embed_failure_with_quality_configured_skips_refinement() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+            let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("quality", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_lexical(lexical);
+
+            let mut phase_count = 0;
+            let mut saw_initial = false;
+            let mut saw_refined = false;
+            let mut saw_refinement_failed = false;
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "test",
+                    5,
+                    |_| None,
+                    |phase| {
+                        phase_count += 1;
+                        match phase {
+                            SearchPhase::Initial { .. } => saw_initial = true,
+                            SearchPhase::Refined { .. } => saw_refined = true,
+                            SearchPhase::RefinementFailed { .. } => saw_refinement_failed = true,
+                        }
+                    },
+                )
+                .await
+                .expect("search should degrade gracefully");
+
+            assert_eq!(phase_count, 1);
+            assert!(saw_initial, "initial lexical fallback should be emitted");
+            assert!(
+                !saw_refined,
+                "quality phase must be skipped without fast candidates"
+            );
+            assert!(
+                !saw_refinement_failed,
+                "skipping refinement should not emit refinement failure"
+            );
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("no_fast_phase_candidates")
+            );
+        });
+    }
+
+    #[test]
     fn fast_embed_failure_without_lexical_returns_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -1037,6 +1482,42 @@ mod tests {
     }
 
     #[test]
+    fn fast_embed_cancellation_propagates_even_with_lexical() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder: Arc<dyn Embedder> = Arc::new(CancelledEmbedder);
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
+                .with_lexical(lexical);
+
+            let err = searcher
+                .search(&cx, "test", 5, |_| None, |_| {})
+                .await
+                .expect_err("cancelled embed should propagate");
+
+            assert!(matches!(err, SearchError::Cancelled { .. }));
+        });
+    }
+
+    #[test]
+    fn lexical_cancellation_propagates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(CancelledLexical);
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
+                .with_lexical(lexical);
+
+            let err = searcher
+                .search(&cx, "test", 5, |_| None, |_| {})
+                .await
+                .expect_err("cancelled lexical search should propagate");
+
+            assert!(matches!(err, SearchError::Cancelled { .. }));
+        });
+    }
+
+    #[test]
     fn search_collect_returns_best_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -1048,6 +1529,197 @@ mod tests {
 
             assert!(!results.is_empty());
             assert!(metrics.phase1_total_ms > 0.0);
+        });
+    }
+
+    #[test]
+    fn search_collect_rejects_negations_without_text_provider() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let err = searcher
+                .search_collect(&cx, "ownership -unsafe", 5)
+                .await
+                .expect_err("search_collect should reject exclusion queries without text provider");
+
+            assert!(matches!(err, SearchError::QueryParseError { .. }));
+            if let SearchError::QueryParseError { detail, .. } = err {
+                assert!(detail.contains("text provider"));
+            }
+        });
+    }
+
+    #[test]
+    fn search_collect_with_text_applies_negations() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let (results, _) = searcher
+                .search_collect_with_text(&cx, "ownership -unsafe", 10, |doc_id| {
+                    let text = if doc_id == "doc-0" {
+                        "unsafe ownership example"
+                    } else {
+                        "safe ownership example"
+                    };
+                    Some(text.to_owned())
+                })
+                .await
+                .expect("search should succeed");
+
+            assert!(!results.is_empty());
+            assert!(!results.iter().any(|r| r.doc_id == "doc-0"));
+        });
+    }
+
+    #[test]
+    fn exclusion_filters_semantic_results_case_insensitive() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let mut initial_results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "ownership -RuSt",
+                    10,
+                    |doc_id| {
+                        let text = match doc_id {
+                            "doc-0" => "Rust ownership and borrowing",
+                            "doc-1" => "RUST lifetimes and traits",
+                            _ => "safe memory patterns",
+                        };
+                        Some(text.to_owned())
+                    },
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert_eq!(initial_results.len(), 8);
+            assert!(!initial_results.iter().any(|r| r.doc_id == "doc-0"));
+            assert!(!initial_results.iter().any(|r| r.doc_id == "doc-1"));
+        });
+    }
+
+    #[test]
+    fn exclusion_filters_lexical_and_semantic_candidates_before_fusion() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher =
+                TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
+
+            let mut initial_results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    r#"query -unsafe NOT "danger zone""#,
+                    10,
+                    |doc_id| {
+                        let text = match doc_id {
+                            "doc-0" => "unsafe pointer dance",
+                            "doc-1" => "all checks passed",
+                            "lex-doc-0" => "contains danger zone marker",
+                            "lex-doc-1" => "safe lexical candidate",
+                            "lex-doc-2" => "UNSAFE lexical candidate",
+                            _ => "safe semantic content",
+                        };
+                        Some(text.to_owned())
+                    },
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(!initial_results.iter().any(|r| r.doc_id == "doc-0"));
+            assert!(!initial_results.iter().any(|r| r.doc_id == "lex-doc-0"));
+            assert!(!initial_results.iter().any(|r| r.doc_id == "lex-doc-2"));
+            assert!(initial_results.iter().any(|r| r.doc_id == "lex-doc-1"));
+        });
+    }
+
+    #[test]
+    fn exclusion_can_eliminate_all_results_without_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let mut initial_results = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "-unsafe",
+                    10,
+                    |_doc_id| Some("unsafe across all docs".to_owned()),
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(initial_results.is_empty());
+            assert!(metrics.phase1_total_ms > 0.0);
+        });
+    }
+
+    #[test]
+    fn refined_phase_preserves_fast_signal_for_lexical_only_candidates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_lexical(lexical);
+
+            let mut refined_results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    12,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Refined { results, .. } = phase {
+                            refined_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(
+                !refined_results.is_empty(),
+                "refined phase should produce results"
+            );
+            let lexical_only = refined_results
+                .iter()
+                .find(|result| result.doc_id.starts_with("lex-doc-"))
+                .expect("at least one lexical-only candidate should survive top-k");
+            assert!(
+                lexical_only.fast_score.is_some_and(|score| score > 0.0_f32),
+                "lexical-only refined result should preserve positive phase-1 signal"
+            );
         });
     }
 
