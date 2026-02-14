@@ -483,6 +483,80 @@ mod tests {
     }
 
     #[test]
+    fn model_candidates_include_default_paths_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidates = model_candidates(
+            temp.path(),
+            "all-MiniLM-L6-v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        );
+
+        assert!(candidates.len() >= 4);
+        assert_eq!(candidates[0], temp.path().to_path_buf());
+        assert_eq!(candidates[1], temp.path().join("all-MiniLM-L6-v2"));
+        assert_eq!(
+            candidates[2],
+            temp.path().join("models").join("all-MiniLM-L6-v2")
+        );
+        assert_eq!(
+            candidates[3],
+            temp.path()
+                .join("frankensearch/models")
+                .join("all-MiniLM-L6-v2")
+        );
+    }
+
+    #[test]
+    fn availability_detects_legacy_model_onnx_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        touch_model_files(
+            temp.path(),
+            "all-MiniLM-L6-v2",
+            &[
+                MODEL_ONNX_LEGACY,
+                TOKENIZER_JSON,
+                CONFIG_JSON,
+                SPECIAL_TOKENS_JSON,
+                TOKENIZER_CONFIG_JSON,
+            ],
+        );
+
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry
+                .available()
+                .iter()
+                .map(|entry| entry.id)
+                .any(|id| id == "minilm-384")
+        );
+    }
+
+    #[test]
+    fn availability_detects_huggingface_snapshot_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        touch_model_files(
+            temp.path(),
+            "huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/abc123",
+            &[
+                MODEL_ONNX_SUBDIR,
+                TOKENIZER_JSON,
+                CONFIG_JSON,
+                SPECIAL_TOKENS_JSON,
+                TOKENIZER_CONFIG_JSON,
+            ],
+        );
+
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry
+                .available()
+                .iter()
+                .map(|entry| entry.id)
+                .any(|id| id == "minilm-384")
+        );
+    }
+
+    #[test]
     fn best_available_prefers_quality_model() {
         let temp = tempfile::tempdir().unwrap();
         touch_model_files(

@@ -917,6 +917,49 @@ mod tests {
     }
 
     #[test]
+    fn valid_manifest_json_round_trips_expected_fields() {
+        let manifest = ModelManifest::from_json_str(
+            r#"{
+                "id":"test-model",
+                "repo":"acme/test-model",
+                "revision":"0123456789abcdef0123456789abcdef01234567",
+                "files":[
+                    {
+                        "name":"model.bin",
+                        "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size":42
+                    }
+                ],
+                "license":"MIT"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.id, "test-model");
+        assert_eq!(manifest.repo, "acme/test-model");
+        assert_eq!(manifest.total_size_bytes(), 42);
+        assert!(manifest.has_verified_checksums());
+        assert!(manifest.has_pinned_revision());
+        assert!(manifest.is_production_ready());
+    }
+
+    #[test]
+    fn missing_required_manifest_field_surfaces_field_name() {
+        let err = ModelManifest::from_json_str(
+            r#"{
+                "id":"test-model",
+                "repo":"acme/test-model",
+                "revision":"0123456789abcdef0123456789abcdef01234567",
+                "files":[]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        assert!(err.to_string().contains("license"));
+    }
+
+    #[test]
     fn verify_file_sha256_success_wrong_hash_and_truncated() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("model.bin");
@@ -933,6 +976,46 @@ mod tests {
 
         let err = verify_file_sha256(&path, &expected_hash, expected_size + 1).unwrap_err();
         assert!(matches!(err, SearchError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_file_sha256_rejects_placeholder_invalid_hash_and_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_path = temp.path().join("missing.bin");
+
+        let err =
+            verify_file_sha256(&missing_path, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, 1).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+
+        let err = verify_file_sha256(&missing_path, "NOT-A-HASH", 1).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+
+        let valid_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = verify_file_sha256(&missing_path, valid_hash, 1).unwrap_err();
+        assert!(matches!(err, SearchError::ModelNotFound { .. }));
+    }
+
+    #[test]
+    fn catalog_validate_reports_invalid_nested_manifest() {
+        let catalog = ModelManifestCatalog::from_json_str(
+            r#"{
+                "models":[
+                    {
+                        "id":"bad-model",
+                        "repo":"acme/bad-model",
+                        "revision":"0123456789abcdef0123456789abcdef01234567",
+                        "files":[
+                            {"name":"model.bin","sha256":"bad-hash","size":10}
+                        ],
+                        "license":"MIT"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
     }
 
     #[test]
@@ -1081,5 +1164,569 @@ mod tests {
         let consent = resolve_download_consent_with_env(None, None, Some(false), Some(true));
         assert_eq!(consent.source, Some(ConsentSource::Interactive));
         assert!(!consent.granted);
+    }
+
+    // ── bd-3un.51: Additional coverage ───────────────────────────────
+
+    #[test]
+    fn valid_manifest_parses_all_fields() {
+        let json = r#"{
+            "id": "test-model",
+            "repo": "owner/test-model",
+            "revision": "abc123def456",
+            "files": [
+                {"name": "model.onnx", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1024},
+                {"name": "tokenizer.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 512}
+            ],
+            "license": "Apache-2.0"
+        }"#;
+        let manifest = ModelManifest::from_json_str(json).unwrap();
+        assert_eq!(manifest.id, "test-model");
+        assert_eq!(manifest.repo, "owner/test-model");
+        assert_eq!(manifest.revision, "abc123def456");
+        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(manifest.files[0].name, "model.onnx");
+        assert_eq!(manifest.files[1].size, 512);
+        assert_eq!(manifest.license, "Apache-2.0");
+    }
+
+    #[test]
+    fn missing_id_field_returns_clear_error() {
+        let json = r#"{"id": "", "repo": "r", "revision": "v", "files": [], "license": "MIT"}"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn missing_repo_field_returns_clear_error() {
+        let json = r#"{"id": "m", "repo": " ", "revision": "v", "files": [], "license": "MIT"}"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn missing_revision_field_returns_clear_error() {
+        let json = r#"{"id": "m", "repo": "r", "revision": "", "files": [], "license": "MIT"}"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn missing_license_field_returns_clear_error() {
+        let json = r#"{"id": "m", "repo": "r", "revision": "v", "files": [], "license": ""}"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn invalid_sha256_format_rejected() {
+        let json = r#"{
+            "id": "m", "repo": "r", "revision": "v", "license": "MIT",
+            "files": [{"name": "f.bin", "sha256": "not-a-valid-hash", "size": 1}]
+        }"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("SHA256 hex"));
+    }
+
+    #[test]
+    fn file_with_zero_size_and_non_placeholder_hash_rejected() {
+        let json = r#"{
+            "id": "m", "repo": "r", "revision": "v", "license": "MIT",
+            "files": [{"name": "f.bin", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 0}]
+        }"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
+    }
+
+    #[test]
+    fn empty_file_name_rejected() {
+        let json = r#"{
+            "id": "m", "repo": "r", "revision": "v", "license": "MIT",
+            "files": [{"name": "", "sha256": "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD", "size": 0}]
+        }"#;
+        let err = ModelManifest::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn verify_missing_file_returns_model_not_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("does_not_exist.bin");
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = verify_file_sha256(&path, hash, 100).unwrap_err();
+        assert!(matches!(err, SearchError::ModelNotFound { .. }));
+    }
+
+    #[test]
+    fn verify_placeholder_checksum_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.bin");
+        write_temp_file(&path, b"data");
+        let err = verify_file_sha256(&path, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, 4).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        assert!(err.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn verify_zero_expected_size_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.bin");
+        write_temp_file(&path, b"data");
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = verify_file_sha256(&path, hash, 0).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn to_pretty_json_roundtrip() {
+        let manifest = ModelManifest::potion_128m();
+        let json = manifest.to_pretty_json().unwrap();
+        let restored = ModelManifest::from_json_str(&json).unwrap();
+        assert_eq!(restored.id, manifest.id);
+        assert_eq!(restored.files.len(), manifest.files.len());
+    }
+
+    #[test]
+    fn builtin_manifests_validate() {
+        ModelManifest::minilm_v2().validate().unwrap();
+        ModelManifest::potion_128m().validate().unwrap();
+    }
+
+    #[test]
+    fn builtin_manifests_not_production_ready() {
+        assert!(!ModelManifest::minilm_v2().is_production_ready());
+        assert!(!ModelManifest::potion_128m().is_production_ready());
+    }
+
+    #[test]
+    fn has_pinned_revision_rejects_floating_aliases() {
+        for alias in &[
+            "main",
+            "master",
+            "latest",
+            "HEAD",
+            PLACEHOLDER_PINNED_REVISION,
+        ] {
+            let m = ModelManifest {
+                revision: alias.to_string(),
+                ..ModelManifest::potion_128m()
+            };
+            assert!(
+                !m.has_pinned_revision(),
+                "'{alias}' should not be considered pinned"
+            );
+        }
+    }
+
+    #[test]
+    fn has_pinned_revision_accepts_commit_sha() {
+        let m = ModelManifest {
+            revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            ..ModelManifest::potion_128m()
+        };
+        assert!(m.has_pinned_revision());
+    }
+
+    #[test]
+    fn total_size_bytes_sums_all_files() {
+        let m = ModelManifest {
+            files: vec![
+                ModelFile {
+                    name: "a".to_owned(),
+                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                    size: 100,
+                },
+                ModelFile {
+                    name: "b".to_owned(),
+                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                    size: 200,
+                },
+            ],
+            ..ModelManifest::potion_128m()
+        };
+        assert_eq!(m.total_size_bytes(), 300);
+    }
+
+    #[test]
+    fn model_state_serde_roundtrip() {
+        let states = vec![
+            ModelState::NotInstalled,
+            ModelState::NeedsConsent,
+            ModelState::Downloading {
+                progress_pct: 50,
+                bytes_downloaded: 1000,
+                total_bytes: 2000,
+            },
+            ModelState::Verifying,
+            ModelState::Ready,
+            ModelState::Disabled {
+                reason: "out of disk".to_owned(),
+            },
+            ModelState::VerificationFailed {
+                reason: "hash mismatch".to_owned(),
+            },
+            ModelState::UpdateAvailable {
+                current_revision: "old".to_owned(),
+                latest_revision: "new".to_owned(),
+            },
+            ModelState::Cancelled,
+        ];
+        for state in &states {
+            let json = serde_json::to_string(state).unwrap();
+            let decoded: ModelState = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, state);
+        }
+    }
+
+    #[test]
+    fn consent_source_serde_roundtrip() {
+        for source in &[
+            ConsentSource::Programmatic,
+            ConsentSource::Environment,
+            ConsentSource::Interactive,
+            ConsentSource::ConfigFile,
+        ] {
+            let json = serde_json::to_string(source).unwrap();
+            let decoded: ConsentSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, source);
+        }
+    }
+
+    #[test]
+    fn lifecycle_needs_consent_when_not_granted() {
+        let manifest = ModelManifest::potion_128m();
+        let lifecycle = ModelLifecycle::new(manifest, DownloadConsent::denied(None));
+        assert_eq!(lifecycle.state(), &ModelState::NeedsConsent);
+    }
+
+    #[test]
+    fn lifecycle_begin_download_without_consent_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(manifest, DownloadConsent::denied(None));
+        let err = lifecycle.begin_download(100).unwrap_err();
+        assert!(matches!(err, SearchError::EmbedderUnavailable { .. }));
+    }
+
+    #[test]
+    fn lifecycle_begin_download_zero_bytes_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+        let err = lifecycle.begin_download(0).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn lifecycle_approve_consent_transitions() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(manifest, DownloadConsent::denied(None));
+        assert_eq!(lifecycle.state(), &ModelState::NeedsConsent);
+
+        lifecycle.approve_consent(ConsentSource::Interactive);
+        assert_eq!(lifecycle.state(), &ModelState::NotInstalled);
+    }
+
+    #[test]
+    fn lifecycle_disable_and_update() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+
+        lifecycle.disable("maintenance");
+        assert!(matches!(lifecycle.state(), ModelState::Disabled { .. }));
+
+        lifecycle.mark_update_available("v1", "v2");
+        assert!(matches!(
+            lifecycle.state(),
+            ModelState::UpdateAvailable { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_recovery_from_non_cancelled_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+        let err = lifecycle.recover_after_cancel().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn lifecycle_begin_verification_from_not_downloading_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+        let err = lifecycle.begin_verification().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn lifecycle_update_progress_from_not_downloading_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+        let err = lifecycle.update_download_progress(50).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn detect_update_state_same_revision_returns_none() {
+        let m = ModelManifest {
+            revision: "abc123".to_owned(),
+            ..ModelManifest::potion_128m()
+        };
+        assert!(m.detect_update_state("abc123").is_none());
+    }
+
+    #[test]
+    fn detect_update_state_different_revision_returns_update() {
+        let m = ModelManifest {
+            revision: "new_rev".to_owned(),
+            ..ModelManifest::potion_128m()
+        };
+        let state = m.detect_update_state("old_rev").unwrap();
+        assert!(matches!(state, ModelState::UpdateAvailable { .. }));
+    }
+
+    #[test]
+    fn detect_update_state_unpinned_returns_none() {
+        let manifest = ModelManifest::potion_128m();
+        assert!(manifest.detect_update_state("anything").is_none());
+    }
+
+    #[test]
+    fn resolve_consent_config_file_path() {
+        let consent = resolve_download_consent_with_env(None, None, None, Some(true));
+        assert_eq!(consent.source, Some(ConsentSource::ConfigFile));
+        assert!(consent.granted);
+    }
+
+    #[test]
+    fn resolve_consent_no_source_denies() {
+        let consent = resolve_download_consent_with_env(None, None, None, None);
+        assert!(!consent.granted);
+        assert!(consent.source.is_none());
+    }
+
+    #[test]
+    fn resolve_consent_env_values() {
+        for (val, expected) in &[
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            let consent = resolve_download_consent_with_env(None, Some(val), None, None);
+            assert_eq!(consent.granted, *expected, "env={val}");
+        }
+    }
+
+    #[test]
+    fn resolve_consent_invalid_env_skipped() {
+        let consent = resolve_download_consent_with_env(None, Some("maybe"), Some(true), None);
+        assert_eq!(consent.source, Some(ConsentSource::Interactive));
+        assert!(consent.granted);
+    }
+
+    #[test]
+    fn model_file_placeholder_detection() {
+        let file = ModelFile {
+            name: "f.bin".to_owned(),
+            sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+            size: 0,
+        };
+        assert!(file.uses_placeholder_checksum());
+        assert!(!file.has_verified_checksum());
+    }
+
+    #[test]
+    fn model_file_verified_checksum_detection() {
+        let file = ModelFile {
+            name: "f.bin".to_owned(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            size: 42,
+        };
+        assert!(!file.uses_placeholder_checksum());
+        assert!(file.has_verified_checksum());
+    }
+
+    #[test]
+    fn promote_verified_installation_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let dest = temp.path().join("final");
+        fs::create_dir_all(&staged).unwrap();
+
+        let data = b"model data";
+        write_temp_file(&staged.join("model.bin"), data);
+        let hash = to_hex_lowercase(&Sha256::digest(data));
+        let size = u64::try_from(data.len()).unwrap();
+
+        let manifest = ModelManifest {
+            id: "test".to_owned(),
+            repo: "owner/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: hash,
+                size,
+            }],
+            license: "MIT".to_owned(),
+        };
+
+        let backup = manifest
+            .promote_verified_installation(&staged, &dest)
+            .unwrap();
+        assert!(backup.is_none());
+        assert!(dest.join("model.bin").exists());
+    }
+
+    #[test]
+    fn promote_verified_creates_backup_of_existing() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let dest = temp.path().join("final");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        write_temp_file(&dest.join("old.bin"), b"old");
+
+        let data = b"new model";
+        write_temp_file(&staged.join("model.bin"), data);
+        let hash = to_hex_lowercase(&Sha256::digest(data));
+        let size = u64::try_from(data.len()).unwrap();
+
+        let manifest = ModelManifest {
+            id: "test".to_owned(),
+            repo: "owner/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: hash,
+                size,
+            }],
+            license: "MIT".to_owned(),
+        };
+
+        let backup = manifest
+            .promote_verified_installation(&staged, &dest)
+            .unwrap();
+        assert!(backup.is_some());
+        assert!(dest.join("model.bin").exists());
+    }
+
+    #[test]
+    fn manifest_catalog_with_multiple_models() {
+        let json = r#"{"models": [
+            {"id": "m1", "repo": "r1", "revision": "v1", "files": [], "license": "MIT"},
+            {"id": "m2", "repo": "r2", "revision": "v2", "files": [], "license": "Apache-2.0"}
+        ]}"#;
+        let catalog = ModelManifestCatalog::from_json_str(json).unwrap();
+        assert_eq!(catalog.models.len(), 2);
+        catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_catalog_invalid_model_fails_validation() {
+        let json = r#"{"models": [
+            {"id": "", "repo": "r", "revision": "v", "files": [], "license": "MIT"}
+        ]}"#;
+        let catalog = ModelManifestCatalog::from_json_str(json).unwrap();
+        let err = catalog.validate().unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn is_valid_sha256_hex_checks() {
+        assert!(is_valid_sha256_hex(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(!is_valid_sha256_hex("short"));
+        // Uppercase rejected.
+        assert!(!is_valid_sha256_hex(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+        // Invalid hex chars rejected.
+        assert!(!is_valid_sha256_hex(
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+        ));
+    }
+
+    #[test]
+    fn download_consent_constructors() {
+        let granted = DownloadConsent::granted(ConsentSource::Programmatic);
+        assert!(granted.granted);
+        assert_eq!(granted.source, Some(ConsentSource::Programmatic));
+
+        let denied = DownloadConsent::denied(Some(ConsentSource::Environment));
+        assert!(!denied.granted);
+        assert_eq!(denied.source, Some(ConsentSource::Environment));
+
+        let denied_none = DownloadConsent::denied(None);
+        assert!(!denied_none.granted);
+        assert!(denied_none.source.is_none());
+    }
+
+    #[test]
+    fn lifecycle_can_restart_after_verification_failure() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+
+        lifecycle.begin_download(100).unwrap();
+        lifecycle.fail_verification("bad hash");
+        assert!(matches!(
+            lifecycle.state(),
+            ModelState::VerificationFailed { .. }
+        ));
+
+        lifecycle.begin_download(100).unwrap();
+        assert!(matches!(lifecycle.state(), ModelState::Downloading { .. }));
+    }
+
+    #[test]
+    fn lifecycle_double_begin_download_from_ready_fails() {
+        let manifest = ModelManifest::potion_128m();
+        let mut lifecycle = ModelLifecycle::new(
+            manifest,
+            DownloadConsent::granted(ConsentSource::Programmatic),
+        );
+
+        lifecycle.begin_download(100).unwrap();
+        lifecycle.begin_verification().unwrap();
+        lifecycle.mark_ready();
+
+        let err = lifecycle.begin_download(200).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn truncate_for_error_short_passthrough() {
+        let short = "hello world";
+        assert_eq!(truncate_for_error(short), "hello world");
+    }
+
+    #[test]
+    fn truncate_for_error_long_truncated() {
+        let long = "x".repeat(200);
+        let result = truncate_for_error(&long);
+        assert!(result.ends_with("..."));
+        assert!(result.len() < 200);
     }
 }

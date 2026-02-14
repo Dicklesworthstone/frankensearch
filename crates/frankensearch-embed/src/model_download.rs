@@ -6,16 +6,25 @@
 //! Gated behind the `download` feature flag to keep the core crate network-free.
 
 use std::fmt;
+use std::future::poll_fn;
+use std::io::ErrorKind;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use asupersync::bytes::Buf;
+use asupersync::http::body::{Body, Frame};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, RedirectPolicy};
+use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, Method, RedirectPolicy};
 use frankensearch_core::error::{SearchError, SearchResult};
 
 use crate::model_manifest::{ModelFile, ModelLifecycle, ModelManifest};
+
+static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -127,8 +136,9 @@ impl ModelDownloader {
 
     /// Download all files for a model manifest into a staging directory.
     ///
-    /// The staging directory is created as `{dest_dir}/.download/` and files
-    /// are placed there during download. After all files are verified, the
+    /// A unique staging directory is created under `{dest_dir}` for each call
+    /// (for example, `.download-<pid>-<counter>`), and files are placed there
+    /// during download. After all files are verified, the
     /// caller should use [`ModelManifest::promote_verified_installation`] to
     /// atomically install the model.
     ///
@@ -142,11 +152,32 @@ impl ModelDownloader {
         lifecycle: &mut ModelLifecycle,
         on_progress: impl Fn(&DownloadProgress) + Send + Sync,
     ) -> SearchResult<PathBuf> {
-        let staging_dir = dest_dir.join(".download");
-        std::fs::create_dir_all(&staging_dir).map_err(SearchError::from)?;
-
         let total_bytes = manifest.total_size_bytes();
         lifecycle.begin_download(total_bytes.max(1))?;
+
+        if !manifest.is_production_ready() {
+            let reason = format!(
+                "manifest for '{}' must be production-ready (pinned revision + verified checksums) before download",
+                manifest.id
+            );
+            lifecycle.fail_verification(reason.clone());
+            return Err(SearchError::InvalidConfig {
+                field: "manifest".to_owned(),
+                value: manifest.id.clone(),
+                reason,
+            });
+        }
+
+        let staging_dir = match create_unique_staging_dir(dest_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                lifecycle.fail_verification(format!(
+                    "failed to create staging directory for '{}': {err}",
+                    manifest.id
+                ));
+                return Err(err);
+            }
+        };
 
         let files_total = manifest.files.len();
         let mut cumulative_bytes: u64 = 0;
@@ -156,8 +187,14 @@ impl ModelDownloader {
             let file_dest = staging_dir.join(&file.name);
 
             // Create parent directories for nested paths (e.g., "onnx/model.onnx").
-            if let Some(parent) = file_dest.parent() {
-                std::fs::create_dir_all(parent).map_err(SearchError::from)?;
+            if let Some(parent) = file_dest.parent()
+                && let Err(err) = std::fs::create_dir_all(parent).map_err(SearchError::from)
+            {
+                lifecycle.fail_verification(format!(
+                    "failed to create parent directory for '{}': {err}",
+                    file.name
+                ));
+                return Err(err);
             }
 
             info!(
@@ -167,15 +204,28 @@ impl ModelDownloader {
                 "downloading model file"
             );
 
-            self.download_file_with_retry(&url, &file_dest, file, idx, files_total, &on_progress)
-                .await?;
+            if let Err(err) = self
+                .download_file_with_retry(&url, &file_dest, file, idx, files_total, &on_progress)
+                .await
+            {
+                lifecycle.fail_verification(format!("download failed for '{}': {err}", file.name));
+                return Err(err);
+            }
 
             cumulative_bytes = cumulative_bytes.saturating_add(file.size);
-            lifecycle.update_download_progress(cumulative_bytes)?;
+            if let Err(err) = lifecycle.update_download_progress(cumulative_bytes) {
+                lifecycle.fail_verification(format!("failed to update download progress: {err}"));
+                return Err(err);
+            }
         }
 
         // Verify all files.
-        lifecycle.begin_verification()?;
+        if let Err(err) = lifecycle.begin_verification() {
+            lifecycle.fail_verification(format!(
+                "failed to transition model lifecycle into verification: {err}"
+            ));
+            return Err(err);
+        }
         info!(model = %manifest.id, "verifying downloaded files");
         match manifest.verify_dir(&staging_dir) {
             Ok(()) => {
@@ -211,7 +261,7 @@ impl ModelDownloader {
                     delay_ms = delay.as_millis(),
                     "retrying download after failure"
                 );
-                std::thread::sleep(delay);
+                asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
             }
 
             match self
@@ -238,7 +288,7 @@ impl ModelDownloader {
     }
 
     /// Download a single file (one attempt).
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     async fn download_single_file(
         &self,
         url: &str,
@@ -261,76 +311,129 @@ impl ModelDownloader {
             eta_seconds: None,
         });
 
-        // Download into memory using the high-level HTTP client.
-        let response = self
+        // Stream directly into a temp file to keep memory bounded.
+        let mut response = self
             .client
-            .get(url)
+            .request_streaming(Method::Get, url, Vec::new(), Vec::new())
             .await
             .map_err(|e| client_error_to_search(e, url))?;
 
         // Check HTTP status.
-        if response.status < 200 || response.status >= 300 {
+        if response.head.status < 200 || response.head.status >= 300 {
             return Err(SearchError::ModelLoadFailed {
                 path: dest.to_path_buf(),
-                source: format!("HTTP {} {} for {url}", response.status, response.reason).into(),
+                source: format!(
+                    "HTTP {} {} for {url}",
+                    response.head.status, response.head.reason
+                )
+                .into(),
             });
         }
 
-        let body = &response.body;
+        let tmp_path = dest.with_extension("tmp");
+        let mut tmp_guard = TempFileGuard::new(tmp_path.clone());
+        let mut tmp_file = std::fs::File::create(&tmp_path).map_err(SearchError::from)?;
+
+        let total_bytes = if file.size > 0 {
+            Some(file.size)
+        } else {
+            response_content_length(&response.head.headers)
+        };
+        let mut hasher = Sha256::new();
+        let mut bytes_downloaded: u64 = 0;
+
+        while let Some(frame) = poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await {
+            let frame = frame.map_err(|e| SearchError::ModelLoadFailed {
+                path: dest.to_path_buf(),
+                source: format!("stream read failed for {url}: {e}").into(),
+            })?;
+            if let Frame::Data(mut chunk) = frame {
+                while chunk.has_remaining() {
+                    let bytes = chunk.chunk();
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    tmp_file.write_all(bytes).map_err(SearchError::from)?;
+                    hasher.update(bytes);
+                    bytes_downloaded = bytes_downloaded
+                        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                    chunk.advance(bytes.len());
+                }
+
+                let elapsed = start.elapsed();
+                let speed = if elapsed.as_secs_f64() > 0.0 {
+                    bytes_downloaded as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let eta_seconds = total_bytes.and_then(|total| {
+                    if speed <= f64::EPSILON || bytes_downloaded >= total {
+                        None
+                    } else {
+                        Some((total.saturating_sub(bytes_downloaded)) as f64 / speed)
+                    }
+                });
+                on_progress(&DownloadProgress {
+                    file_name: file.name.clone(),
+                    bytes_downloaded,
+                    total_bytes,
+                    files_completed: file_idx,
+                    files_total,
+                    speed_bytes_per_sec: speed,
+                    eta_seconds,
+                });
+            }
+        }
+
+        if file.size > 0 && bytes_downloaded != file.size {
+            return Err(SearchError::HashMismatch {
+                path: dest.to_path_buf(),
+                expected: format!("size={}", file.size),
+                actual: format!("size={bytes_downloaded}"),
+            });
+        }
+
+        // Verify SHA-256 only when the manifest provides a concrete checksum.
+        if file.has_verified_checksum() {
+            let actual_hash = sha256_digest_hex(hasher.finalize().as_slice());
+            if actual_hash != file.sha256 {
+                return Err(SearchError::HashMismatch {
+                    path: dest.to_path_buf(),
+                    expected: format!("sha256={},size={}", file.sha256, file.size),
+                    actual: format!("sha256={actual_hash},size={bytes_downloaded}"),
+                });
+            }
+        }
+
+        tmp_file.flush().map_err(SearchError::from)?;
+        tmp_file.sync_all().map_err(SearchError::from)?;
+        drop(tmp_file);
+        std::fs::rename(&tmp_path, dest).map_err(SearchError::from)?;
+        tmp_guard.disarm();
+
         let elapsed = start.elapsed();
         let speed = if elapsed.as_secs_f64() > 0.0 {
-            body.len() as f64 / elapsed.as_secs_f64()
+            bytes_downloaded as f64 / elapsed.as_secs_f64()
         } else {
             0.0
         };
-
-        // Report completion.
         on_progress(&DownloadProgress {
             file_name: file.name.clone(),
-            bytes_downloaded: body.len() as u64,
-            total_bytes: Some(body.len() as u64),
+            bytes_downloaded,
+            total_bytes: if file.size > 0 {
+                Some(file.size)
+            } else {
+                total_bytes
+            },
             files_completed: file_idx,
             files_total,
             speed_bytes_per_sec: speed,
             eta_seconds: Some(0.0),
         });
 
-        debug!(
-            file = %file.name,
-            bytes = body.len(),
-            elapsed_ms = elapsed.as_millis(),
-            speed_mbps = format_args!("{:.1}", speed / 1_048_576.0),
-            "file downloaded"
-        );
-
-        // Verify SHA-256 in memory before writing (if checksum is not placeholder).
-        if file.has_verified_checksum() {
-            let actual_hash = sha256_hex(body);
-            if actual_hash != file.sha256 {
-                return Err(SearchError::HashMismatch {
-                    path: dest.to_path_buf(),
-                    expected: format!("sha256={},size={}", file.sha256, file.size),
-                    actual: format!("sha256={actual_hash},size={}", body.len()),
-                });
-            }
-
-            if body.len() as u64 != file.size {
-                return Err(SearchError::HashMismatch {
-                    path: dest.to_path_buf(),
-                    expected: format!("size={}", file.size),
-                    actual: format!("size={}", body.len()),
-                });
-            }
-        }
-
-        // Write atomically: write to .tmp then rename.
-        let tmp_path = dest.with_extension("tmp");
-        std::fs::write(&tmp_path, body).map_err(SearchError::from)?;
-        std::fs::rename(&tmp_path, dest).map_err(SearchError::from)?;
-
         info!(
             file = %file.name,
-            bytes = body.len(),
+            bytes = bytes_downloaded,
             elapsed_ms = elapsed.as_millis(),
             "file saved"
         );
@@ -346,15 +449,70 @@ fn huggingface_url(repo: &str, revision: &str, file_name: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/{revision}/{file_name}")
 }
 
-/// Compute lowercase hex SHA-256 of a byte slice.
-fn sha256_hex(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
+fn create_unique_staging_dir(dest_dir: &Path) -> SearchResult<PathBuf> {
+    std::fs::create_dir_all(dest_dir).map_err(SearchError::from)?;
+
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let counter = STAGING_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = dest_dir.join(format!(".download-{pid}-{counter:016x}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(SearchError::from(err)),
+        }
+    }
+
+    Err(SearchError::ModelLoadFailed {
+        path: dest_dir.to_path_buf(),
+        source: "failed to allocate unique staging directory".into(),
+    })
+}
+
+fn response_content_length(headers: &[(String, String)]) -> Option<u64> {
+    headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn sha256_digest_hex(data: &[u8]) -> String {
     let mut out = String::with_capacity(64);
-    for byte in &hash {
+    for byte in data {
         use std::fmt::Write;
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+/// Compute lowercase hex SHA-256 of a byte slice.
+#[cfg(test)]
+fn sha256_hex(data: &[u8]) -> String {
+    sha256_digest_hex(Sha256::digest(data).as_slice())
+}
+
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Format bytes as a human-readable string.
@@ -388,6 +546,94 @@ fn client_error_to_search(error: ClientError, url: &str) -> SearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use asupersync::test_utils::run_test_with_cx;
+
+    #[derive(Debug, Clone)]
+    struct TestHttpResponse {
+        status: u16,
+        reason: &'static str,
+        body: Vec<u8>,
+    }
+
+    fn spawn_test_http_server(
+        responses: Vec<TestHttpResponse>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_for_thread = Arc::clone(&served);
+        let queue_for_thread = Arc::clone(&queue);
+
+        let handle = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                if read_http_headers(&mut stream).is_err() {
+                    break;
+                }
+
+                let response = {
+                    let mut guard = queue_for_thread.lock().unwrap();
+                    guard.pop_front()
+                };
+                let Some(response) = response else {
+                    break;
+                };
+
+                served_for_thread.fetch_add(1, Ordering::SeqCst);
+                if write_http_response(&mut stream, &response).is_err() {
+                    break;
+                }
+                let _ = stream.shutdown(Shutdown::Both);
+                if queue_for_thread.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+        });
+
+        (format!("http://{addr}"), served, handle)
+    }
+
+    fn read_http_headers(stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut buf = [0_u8; 1024];
+        let mut request = Vec::new();
+        loop {
+            let read = stream.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if request.len() > 64 * 1024 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_http_response(
+        stream: &mut TcpStream,
+        response: &TestHttpResponse,
+    ) -> std::io::Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            response.reason,
+            response.body.len()
+        )?;
+        stream.write_all(&response.body)?;
+        stream.flush()?;
+        Ok(())
+    }
 
     #[test]
     fn huggingface_url_format() {
@@ -470,5 +716,264 @@ mod tests {
             "https://example.com",
         );
         assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
+    }
+
+    #[test]
+    fn download_single_file_success_writes_file_and_reports_progress() {
+        let body = b"hello-model".to_vec();
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(&body),
+            size: u64::try_from(body.len()).unwrap(),
+        };
+
+        let (base_url, served, handle) = spawn_test_http_server(vec![TestHttpResponse {
+            status: 200,
+            reason: "OK",
+            body: body.clone(),
+        }]);
+        let url = format!("{base_url}/model.onnx");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let progress = Arc::new(Mutex::new(Vec::<DownloadProgress>::new()));
+        let progress_for_cb = Arc::clone(&progress);
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            downloader
+                .download_single_file(&url, &dest_for_task, &file, 0, 1, &|p| {
+                    progress_for_cb.lock().unwrap().push(p.clone());
+                })
+                .await
+                .unwrap();
+        });
+
+        handle.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(dest).unwrap(), body);
+
+        let events = progress.lock().unwrap();
+        assert!(events.len() >= 2);
+        assert_eq!(events[0].bytes_downloaded, 0);
+        assert_eq!(events[0].file_name, "model.onnx");
+        let last = events.last().unwrap();
+        let expected_size = u64::try_from(body.len()).unwrap();
+        assert_eq!(last.bytes_downloaded, expected_size);
+        assert_eq!(last.total_bytes, Some(expected_size));
+        drop(events);
+    }
+
+    #[test]
+    fn download_file_with_retry_succeeds_after_transient_http_error() {
+        let body = b"retry-success".to_vec();
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(&body),
+            size: u64::try_from(body.len()).unwrap(),
+        };
+
+        let (base_url, served, handle) = spawn_test_http_server(vec![
+            TestHttpResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: b"server error".to_vec(),
+            },
+            TestHttpResponse {
+                status: 200,
+                reason: "OK",
+                body: body.clone(),
+            },
+        ]);
+        let url = format!("{base_url}/model.onnx");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 1,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            downloader
+                .download_file_with_retry(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap();
+        });
+
+        handle.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(dest).unwrap(), body);
+    }
+
+    #[test]
+    fn download_file_with_retry_returns_error_after_max_attempts() {
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            size: 4,
+        };
+
+        let (base_url, served, handle) = spawn_test_http_server(vec![
+            TestHttpResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: b"error".to_vec(),
+            },
+            TestHttpResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: b"error".to_vec(),
+            },
+        ]);
+        let url = format!("{base_url}/model.onnx");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 1,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            let err = downloader
+                .download_file_with_retry(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
+            assert!(err.to_string().contains("HTTP 500"));
+        });
+
+        handle.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn download_single_file_hash_mismatch_does_not_write_destination() {
+        let expected = b"expected-content".to_vec();
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(&expected),
+            size: u64::try_from(expected.len()).unwrap(),
+        };
+
+        let (base_url, served, handle) = spawn_test_http_server(vec![TestHttpResponse {
+            status: 200,
+            reason: "OK",
+            body: b"different-content".to_vec(),
+        }]);
+        let url = format!("{base_url}/model.onnx");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            let err = downloader
+                .download_single_file(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SearchError::HashMismatch { .. }));
+        });
+
+        handle.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn download_model_failure_transitions_lifecycle_to_verification_failed() {
+        let manifest = ModelManifest {
+            id: "test-model".to_owned(),
+            repo: "owner/repo".to_owned(),
+            revision: "deadbeef".to_owned(),
+            files: vec![ModelFile {
+                // Invalid URL path segment (space) forces an immediate client error.
+                name: "bad file.bin".to_owned(),
+                sha256: "0".repeat(64),
+                size: 1,
+            }],
+            license: "Apache-2.0".to_owned(),
+        };
+        let consent = crate::model_manifest::DownloadConsent::granted(
+            crate::model_manifest::ConsentSource::Environment,
+        );
+        let mut lifecycle = ModelLifecycle::new(manifest.clone(), consent);
+        let dest = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            let err = downloader
+                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
+            assert!(matches!(
+                lifecycle.state(),
+                crate::model_manifest::ModelState::VerificationFailed { .. }
+            ));
+            assert!(lifecycle.begin_download(1).is_ok());
+        });
+    }
+
+    #[test]
+    fn create_unique_staging_dir_returns_distinct_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = create_unique_staging_dir(temp.path()).expect("first staging dir");
+        let second = create_unique_staging_dir(temp.path()).expect("second staging dir");
+
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+    }
+
+    #[test]
+    fn download_model_rejects_non_production_ready_manifest() {
+        let manifest = ModelManifest::minilm_v2();
+        let consent = crate::model_manifest::DownloadConsent::granted(
+            crate::model_manifest::ConsentSource::Environment,
+        );
+        let mut lifecycle = ModelLifecycle::new(manifest.clone(), consent);
+        let dest = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            let err = downloader
+                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SearchError::InvalidConfig { .. }));
+            assert!(err.to_string().contains("production-ready"));
+            assert!(matches!(
+                lifecycle.state(),
+                crate::model_manifest::ModelState::VerificationFailed { .. }
+            ));
+        });
     }
 }

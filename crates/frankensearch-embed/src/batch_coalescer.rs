@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -300,6 +300,15 @@ impl BatchCoalescer {
     /// Create a new batch coalescer with the given configuration.
     #[must_use]
     pub fn new(config: CoalescerConfig) -> Self {
+        let mut config = config;
+        if config.max_batch_size == 0 {
+            warn!(
+                target: "frankensearch.coalescer",
+                "invalid max_batch_size=0; clamping to 1"
+            );
+            config.max_batch_size = 1;
+        }
+
         Self {
             state: Mutex::new(CoalescerState {
                 pending: VecDeque::with_capacity(config.max_batch_size),
@@ -667,6 +676,22 @@ mod tests {
         assert!(!decoded.use_priority_lanes);
     }
 
+    #[test]
+    fn zero_max_batch_size_is_clamped_to_one() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig {
+            max_batch_size: 0,
+            max_wait_ms: 50,
+            min_batch_size: 1,
+            use_priority_lanes: true,
+        });
+        assert_eq!(coalescer.config().max_batch_size, 1);
+
+        let _rx = coalescer.submit("hello".into(), Priority::Background);
+        let batch = coalescer.try_form_batch().expect("batch formed");
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+    }
+
     // ── Priority serde ───────────────────────────────────────────────
 
     #[test]
@@ -1017,7 +1042,7 @@ mod tests {
         assert_eq!(batch.len(), 4);
 
         // Generate distinct result vectors matching batch size
-        let results: Vec<Vec<f32>> = (0..4).map(|i| vec![i as f32]).collect();
+        let results = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]];
         batch.deliver(Ok(results));
 
         // Each caller gets exactly one result (thread ordering is
@@ -1098,11 +1123,11 @@ mod tests {
             use_priority_lanes: false,
         });
 
-        let _rx1 = coalescer.submit("text a".into(), Priority::Background);
+        let rx1 = coalescer.submit("text a".into(), Priority::Background);
         let rx2 = coalescer.submit("text b".into(), Priority::Background);
 
         // Drop rx1's receiver (it goes out of scope)
-        drop(_rx1);
+        drop(rx1);
 
         let batch = coalescer.try_form_batch().unwrap();
         // Should not panic even though rx1 is dropped
@@ -1153,7 +1178,7 @@ mod tests {
     #[test]
     fn avg_batch_size_computation() {
         let m = CoalescerMetrics::default();
-        assert_eq!(m.avg_batch_size(), 0.0);
+        assert!(m.avg_batch_size().abs() < f64::EPSILON);
 
         m.total_batches.store(2, Ordering::Relaxed);
         m.total_texts_batched.store(10, Ordering::Relaxed);
@@ -1333,12 +1358,7 @@ mod tests {
         while total_dispatched < total {
             let batch = coalescer.try_form_batch();
             if let Some(b) = batch {
-                assert!(
-                    b.len() <= max,
-                    "batch size {} exceeds max {}",
-                    b.len(),
-                    max
-                );
+                assert!(b.len() <= max, "batch size {} exceeds max {}", b.len(), max);
                 total_dispatched += b.len();
                 let results: Vec<Vec<f32>> = (0..b.len()).map(|_| vec![0.0]).collect();
                 b.deliver(Ok(results));
@@ -1381,8 +1401,10 @@ mod tests {
         }
 
         // All 5 callers should have received their results.
-        for (i, rx) in receivers.into_iter().enumerate() {
-            let result = rx.recv().unwrap_or_else(|_| panic!("caller {i} should receive result"));
+        for (i, rx) in receivers.iter().enumerate() {
+            let result = rx
+                .recv()
+                .unwrap_or_else(|_| panic!("caller {i} should receive result"));
             assert!(result.is_ok(), "caller {i} result should be Ok");
             assert_eq!(result.unwrap(), vec![1.0]);
         }
