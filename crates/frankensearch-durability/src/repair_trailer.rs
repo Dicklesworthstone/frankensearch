@@ -115,6 +115,11 @@ pub fn deserialize_repair_trailer(
             "repair trailer symbol_size must be greater than zero",
         ));
     }
+    if header.k_source == 0 && header.source_len > 0 {
+        return Err(trailer_corruption(
+            "repair trailer k_source must be greater than zero for non-empty payloads",
+        ));
+    }
 
     let mut cursor = FIXED_HEADER_BYTES;
     let mut symbols = Vec::new();
@@ -372,6 +377,84 @@ mod tests {
             err.to_string().contains("symbol_size"),
             "error should mention symbol_size: {err}"
         );
+    }
+
+    #[test]
+    fn empty_symbols_roundtrip() {
+        let header = RepairTrailerHeader {
+            symbol_size: 256,
+            k_source: 1,
+            source_len: 100,
+            source_crc32: 42,
+            repair_symbol_count: 0,
+        };
+        let symbols: Vec<RepairSymbol> = Vec::new();
+        let encoded = serialize_repair_trailer(&header, &symbols).expect("serialize empty");
+        let (decoded_header, decoded_symbols) =
+            deserialize_repair_trailer(&encoded).expect("deserialize empty");
+        assert_eq!(decoded_header, header);
+        assert!(decoded_symbols.is_empty());
+    }
+
+    #[test]
+    fn zero_k_source_with_nonzero_source_len_is_rejected() {
+        let header = RepairTrailerHeader {
+            symbol_size: 256,
+            k_source: 0,
+            source_len: 16,
+            source_crc32: 7,
+            repair_symbol_count: 1,
+        };
+        let symbols = vec![RepairSymbol {
+            esi: 1,
+            data: vec![0; 256],
+        }];
+        let encoded = serialize_repair_trailer(&header, &symbols).expect("serialize");
+        let err = deserialize_repair_trailer(&encoded).expect_err("must fail");
+        assert!(
+            err.to_string().contains("k_source"),
+            "error should mention k_source: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_k_source_with_zero_source_len_is_accepted() {
+        let header = RepairTrailerHeader {
+            symbol_size: 256,
+            k_source: 0,
+            source_len: 0,
+            source_crc32: crc32fast::hash(&[]),
+            repair_symbol_count: 0,
+        };
+        let symbols: Vec<RepairSymbol> = Vec::new();
+        let encoded = serialize_repair_trailer(&header, &symbols).expect("serialize");
+        let (decoded_header, decoded_symbols) =
+            deserialize_repair_trailer(&encoded).expect("deserialize");
+        assert_eq!(decoded_header, header);
+        assert!(decoded_symbols.is_empty());
+    }
+
+    #[test]
+    fn large_symbol_data_roundtrips() {
+        let header = RepairTrailerHeader {
+            symbol_size: 4096,
+            k_source: 1,
+            source_len: 4096,
+            source_crc32: 0xDEAD_BEEF,
+            repair_symbol_count: 1,
+        };
+        let large_data = vec![0xAB_u8; 4096];
+        let symbols = vec![RepairSymbol {
+            esi: 1_000_000,
+            data: large_data.clone(),
+        }];
+        let encoded = serialize_repair_trailer(&header, &symbols).expect("serialize");
+        let (decoded_header, decoded_symbols) =
+            deserialize_repair_trailer(&encoded).expect("deserialize");
+        assert_eq!(decoded_header, header);
+        assert_eq!(decoded_symbols.len(), 1);
+        assert_eq!(decoded_symbols[0].esi, 1_000_000);
+        assert_eq!(decoded_symbols[0].data, large_data);
     }
 
     #[test]

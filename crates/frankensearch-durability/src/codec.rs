@@ -1138,6 +1138,95 @@ mod tests {
     }
 
     #[test]
+    fn validate_repair_data_rejects_zero_k_source() {
+        let facade = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig::default(),
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+
+        let repair_data = RepairData {
+            repair_symbols: vec![(10, vec![7_u8; 4096])],
+            k_source: 0,
+            symbol_size: 4096,
+            source_hash: [0_u8; 8],
+        };
+
+        let err = facade
+            .verify(b"anything", &repair_data)
+            .expect_err("must reject k_source=0");
+        assert!(matches!(
+            err,
+            frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "repair_data.k_source"
+        ));
+    }
+
+    #[test]
+    fn validate_repair_data_rejects_zero_symbol_size() {
+        let facade = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig::default(),
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+
+        let repair_data = RepairData {
+            repair_symbols: vec![(10, vec![7_u8; 4096])],
+            k_source: 1,
+            symbol_size: 0,
+            source_hash: [0_u8; 8],
+        };
+
+        let err = facade
+            .verify(b"anything", &repair_data)
+            .expect_err("must reject symbol_size=0");
+        assert!(matches!(
+            err,
+            frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "repair_data.symbol_size"
+        ));
+    }
+
+    #[test]
+    fn codec_facade_rejects_invalid_config() {
+        let result = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig {
+                symbol_size: 1000, // not a power of two
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn singular_matrix_failure_is_recoverable() {
+        assert_eq!(
+            classify_decode_failure(
+                fsqlite_core::raptorq_integration::DecodeFailureReason::SingularMatrix
+            ),
+            DecodeFailureClass::Recoverable
+        );
+    }
+
+    #[test]
+    fn cancelled_failure_is_recoverable() {
+        assert_eq!(
+            classify_decode_failure(
+                fsqlite_core::raptorq_integration::DecodeFailureReason::Cancelled
+            ),
+            DecodeFailureClass::Recoverable
+        );
+    }
+
+    #[test]
     fn verify_intact_data_returns_intact() {
         let facade = CodecFacade::new(
             Arc::new(MockCodec {

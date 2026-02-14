@@ -963,7 +963,18 @@ impl FileProtector {
 
         let log_path = log_dir.join("repair-events.jsonl");
 
-        if let Ok(json) = serde_json::to_string(&event) {
+        let json = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to serialize repair event to JSON"
+                );
+                return;
+            }
+        };
+        {
             // Rotate if needed.
             if matches!(
                 should_rotate(&log_path, self.pipeline_config.max_repair_log_entries),

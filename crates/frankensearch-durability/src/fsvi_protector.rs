@@ -129,7 +129,13 @@ impl FsviProtector {
             // fsync the parent directory
             if let Some(parent) = sidecar_path.parent() {
                 if let Ok(dir) = fs::File::open(parent) {
-                    let _ = dir.sync_all();
+                    if let Err(sync_err) = dir.sync_all() {
+                        warn!(
+                            dir = %parent.display(),
+                            error = %sync_err,
+                            "directory fsync failed after atomic sidecar replace"
+                        );
+                    }
                 }
             }
         }

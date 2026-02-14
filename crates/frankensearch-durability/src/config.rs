@@ -90,11 +90,11 @@ impl DurabilityConfig {
                 reason: "must be greater than zero".to_owned(),
             });
         }
-        if self.repair_overhead < 1.0 {
+        if !self.repair_overhead.is_finite() || self.repair_overhead < 1.0 {
             return Err(SearchError::InvalidConfig {
                 field: "repair_overhead".to_owned(),
                 value: self.repair_overhead.to_string(),
-                reason: "must be at least 1.0".to_owned(),
+                reason: "must be finite and at least 1.0".to_owned(),
             });
         }
         if self.max_repair_symbols < MIN_MAX_REPAIR_SYMBOLS {
@@ -200,5 +200,68 @@ mod tests {
         assert_eq!(config.expected_repair_symbols(20), 5);
         assert_eq!(config.expected_repair_symbols(100_000), 10_000);
         assert_eq!(config.minimum_decode_symbols(100), 102);
+    }
+
+    #[test]
+    fn nan_repair_overhead_is_rejected() {
+        let config = DurabilityConfig {
+            repair_overhead: f64::NAN,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn infinity_repair_overhead_is_rejected() {
+        let config = DurabilityConfig {
+            repair_overhead: f64::INFINITY,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn neg_infinity_repair_overhead_is_rejected() {
+        let config = DurabilityConfig {
+            repair_overhead: f64::NEG_INFINITY,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_checkpoint_interval_is_rejected() {
+        let config = DurabilityConfig {
+            checkpoint_interval: 0,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_max_block_size_is_rejected() {
+        let config = DurabilityConfig {
+            max_block_size: 0,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn minimum_decode_symbols_saturates_on_overflow() {
+        let config = DurabilityConfig::default();
+        let result = config.minimum_decode_symbols(u32::MAX);
+        // Should saturate to u32::MAX, not wrap around.
+        assert_eq!(result, u32::MAX);
+    }
+
+    #[test]
+    fn repair_overhead_exactly_one_yields_zero_percent() {
+        let config = DurabilityConfig {
+            repair_overhead: 1.0,
+            ..DurabilityConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.repair_overhead_percent(), 0);
     }
 }

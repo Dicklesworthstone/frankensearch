@@ -210,6 +210,76 @@ mod tests {
     use super::{DecodeOutcomeClass, DurabilityMetrics};
 
     #[test]
+    fn new_metrics_are_zeroed() {
+        let metrics = DurabilityMetrics::new();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.encoded_bytes_total, 0);
+        assert_eq!(snapshot.source_symbols_total, 0);
+        assert_eq!(snapshot.repair_symbols_total, 0);
+        assert_eq!(snapshot.decoded_bytes_total, 0);
+        assert_eq!(snapshot.decode_symbols_used_total, 0);
+        assert_eq!(snapshot.decode_symbols_received_total, 0);
+        assert_eq!(snapshot.decode_k_required_total, 0);
+        assert_eq!(snapshot.encode_ops, 0);
+        assert_eq!(snapshot.decode_ops, 0);
+        assert_eq!(snapshot.decode_failures, 0);
+        assert_eq!(snapshot.decode_failures_recoverable, 0);
+        assert_eq!(snapshot.decode_failures_unrecoverable, 0);
+        assert_eq!(snapshot.encode_latency_us_total, 0);
+        assert_eq!(snapshot.decode_latency_us_total, 0);
+        assert_eq!(snapshot.repair_attempts, 0);
+        assert_eq!(snapshot.repair_successes, 0);
+        assert_eq!(snapshot.repair_failures, 0);
+    }
+
+    #[test]
+    fn default_equals_new() {
+        let from_new = DurabilityMetrics::new().snapshot();
+        let from_default = DurabilityMetrics::default().snapshot();
+        assert_eq!(from_new, from_default);
+    }
+
+    #[test]
+    fn repair_counters_are_independent() {
+        let metrics = DurabilityMetrics::default();
+        metrics.record_repair_attempt();
+        metrics.record_repair_attempt();
+        metrics.record_repair_success();
+        metrics.record_repair_failure();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.repair_attempts, 2);
+        assert_eq!(snapshot.repair_successes, 1);
+        assert_eq!(snapshot.repair_failures, 1);
+    }
+
+    #[test]
+    fn multiple_encodes_accumulate() {
+        let metrics = DurabilityMetrics::default();
+        metrics.record_encode(100, 4, 2, 50);
+        metrics.record_encode(200, 8, 4, 100);
+        metrics.record_encode(300, 12, 6, 150);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.encode_ops, 3);
+        assert_eq!(snapshot.encoded_bytes_total, 600);
+        assert_eq!(snapshot.source_symbols_total, 24);
+        assert_eq!(snapshot.repair_symbols_total, 12);
+        assert_eq!(snapshot.encode_latency_us_total, 300);
+    }
+
+    #[test]
+    fn decode_success_and_failure_ops_both_increment_decode_ops() {
+        let metrics = DurabilityMetrics::default();
+        metrics.record_decode_success(100, 5, 6, 5, 10);
+        metrics.record_decode_failure(DecodeOutcomeClass::Recoverable, 3, 5, 20);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.decode_ops, 2);
+        assert_eq!(snapshot.decode_latency_us_total, 30);
+    }
+
+    #[test]
     fn snapshot_reflects_recorded_events() {
         let metrics = DurabilityMetrics::default();
         metrics.record_encode(100, 4, 5, 11);
