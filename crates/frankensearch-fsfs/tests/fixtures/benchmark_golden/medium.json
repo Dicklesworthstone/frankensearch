@@ -14,11 +14,18 @@
     "query_cases": 1200,
     "tui_interactions": 1400
   },
-  "baseline_p95_ms": {
-    "crawl": 410,
-    "index": 980,
-    "query": 58,
-    "tui_frame": 17
+  "baseline_metrics": {
+    "indexing_throughput_docs_per_second": 95,
+    "search_latency_ms": {
+      "p50": 31,
+      "p95": 58,
+      "p99": 104
+    },
+    "fast_tier_latency_ms": 11,
+    "quality_tier_latency_ms": 156,
+    "indexing_peak_memory_mb": 910,
+    "searching_peak_memory_mb": 540,
+    "index_size_bytes_per_document": 2360
   },
   "notes": [
     "Large machine-wide corpus profile",

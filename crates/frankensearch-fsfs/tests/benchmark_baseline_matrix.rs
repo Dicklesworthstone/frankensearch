@@ -11,6 +11,8 @@ const GOLDEN_SCHEMA_VERSION: &str = "fsfs-benchmark-golden-v1";
 const ARTIFACT_SCHEMA_VERSION: &str = "fsfs-benchmark-artifact-v1";
 const MATRIX_VERSION: &str = "fsfs-benchmark-matrix-v1";
 const GOLDEN_PROFILES: [&str; 3] = ["tiny", "small", "medium"];
+const MAX_ALLOWED_REGRESSION_PCT: u16 = 20;
+const REGRESSION_SCALE: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,12 +23,18 @@ enum BenchmarkPath {
     Tui,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ComparatorMetric {
-    P95LatencyMs,
-    ThroughputPerSecond,
-    FrameBudgetMs,
+    IndexingThroughputDocsPerSecond,
+    SearchLatencyP50Ms,
+    SearchLatencyP95Ms,
+    SearchLatencyP99Ms,
+    FastTierLatencyMs,
+    QualityTierLatencyMs,
+    IndexingPeakMemoryMb,
+    SearchingPeakMemoryMb,
+    IndexSizeBytesPerDocument,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,7 +42,7 @@ struct ComparatorDefinition {
     path: BenchmarkPath,
     metric: ComparatorMetric,
     baseline_key: String,
-    max_regression_pct: f32,
+    max_regression_pct: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,11 +78,21 @@ struct WorkloadStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct BaselineP95Ms {
-    crawl: u64,
-    index: u64,
-    query: u64,
-    tui_frame: u64,
+struct SearchLatencyPercentilesMs {
+    p50: u64,
+    p95: u64,
+    p99: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BaselineMetrics {
+    indexing_throughput_docs_per_second: u64,
+    search_latency_ms: SearchLatencyPercentilesMs,
+    fast_tier_latency_ms: u64,
+    quality_tier_latency_ms: u64,
+    indexing_peak_memory_mb: u64,
+    searching_peak_memory_mb: u64,
+    index_size_bytes_per_document: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,7 +102,7 @@ struct GoldenDataset {
     profile: String,
     corpus: CorpusStats,
     workload: WorkloadStats,
-    baseline_p95_ms: BaselineP95Ms,
+    baseline_metrics: BaselineMetrics,
     notes: Vec<String>,
 }
 
@@ -98,6 +116,21 @@ struct BenchmarkArtifactManifest {
     comparator_count: usize,
     sample_count: usize,
     replay_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BenchmarkObservation {
+    metric: ComparatorMetric,
+    measured_value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegressionViolation {
+    metric: ComparatorMetric,
+    baseline: u64,
+    measured: u64,
+    regression_pct_x100: u64,
+    threshold_pct_x100: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,28 +177,58 @@ fn build_baseline_matrix(dataset_profile: &str) -> BenchmarkMatrix {
         ],
         comparators: vec![
             ComparatorDefinition {
-                path: BenchmarkPath::Crawl,
-                metric: ComparatorMetric::P95LatencyMs,
-                baseline_key: "baseline_p95_ms.crawl".to_owned(),
-                max_regression_pct: 20.0,
-            },
-            ComparatorDefinition {
                 path: BenchmarkPath::Index,
-                metric: ComparatorMetric::ThroughputPerSecond,
-                baseline_key: "workload.index_documents".to_owned(),
-                max_regression_pct: 15.0,
+                metric: ComparatorMetric::IndexingThroughputDocsPerSecond,
+                baseline_key: "baseline_metrics.indexing_throughput_docs_per_second".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
             },
             ComparatorDefinition {
                 path: BenchmarkPath::Query,
-                metric: ComparatorMetric::P95LatencyMs,
-                baseline_key: "baseline_p95_ms.query".to_owned(),
-                max_regression_pct: 10.0,
+                metric: ComparatorMetric::SearchLatencyP50Ms,
+                baseline_key: "baseline_metrics.search_latency_ms.p50".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
             },
             ComparatorDefinition {
-                path: BenchmarkPath::Tui,
-                metric: ComparatorMetric::FrameBudgetMs,
-                baseline_key: "baseline_p95_ms.tui_frame".to_owned(),
-                max_regression_pct: 5.0,
+                path: BenchmarkPath::Query,
+                metric: ComparatorMetric::SearchLatencyP95Ms,
+                baseline_key: "baseline_metrics.search_latency_ms.p95".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Query,
+                metric: ComparatorMetric::SearchLatencyP99Ms,
+                baseline_key: "baseline_metrics.search_latency_ms.p99".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Query,
+                metric: ComparatorMetric::FastTierLatencyMs,
+                baseline_key: "baseline_metrics.fast_tier_latency_ms".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Query,
+                metric: ComparatorMetric::QualityTierLatencyMs,
+                baseline_key: "baseline_metrics.quality_tier_latency_ms".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Index,
+                metric: ComparatorMetric::IndexingPeakMemoryMb,
+                baseline_key: "baseline_metrics.indexing_peak_memory_mb".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Query,
+                metric: ComparatorMetric::SearchingPeakMemoryMb,
+                baseline_key: "baseline_metrics.searching_peak_memory_mb".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
+            },
+            ComparatorDefinition {
+                path: BenchmarkPath::Index,
+                metric: ComparatorMetric::IndexSizeBytesPerDocument,
+                baseline_key: "baseline_metrics.index_size_bytes_per_document".to_owned(),
+                max_regression_pct: MAX_ALLOWED_REGRESSION_PCT,
             },
         ],
     }
@@ -175,6 +238,68 @@ fn load_golden_dataset(profile: &str) -> GoldenDataset {
     let path = fixture_dir().join(format!("{profile}.json"));
     let raw = fs::read_to_string(&path).expect("read golden dataset fixture");
     serde_json::from_str::<GoldenDataset>(&raw).expect("parse golden dataset fixture")
+}
+
+fn baseline_value(dataset: &GoldenDataset, metric: ComparatorMetric) -> u64 {
+    match metric {
+        ComparatorMetric::IndexingThroughputDocsPerSecond => {
+            dataset.baseline_metrics.indexing_throughput_docs_per_second
+        }
+        ComparatorMetric::SearchLatencyP50Ms => dataset.baseline_metrics.search_latency_ms.p50,
+        ComparatorMetric::SearchLatencyP95Ms => dataset.baseline_metrics.search_latency_ms.p95,
+        ComparatorMetric::SearchLatencyP99Ms => dataset.baseline_metrics.search_latency_ms.p99,
+        ComparatorMetric::FastTierLatencyMs => dataset.baseline_metrics.fast_tier_latency_ms,
+        ComparatorMetric::QualityTierLatencyMs => dataset.baseline_metrics.quality_tier_latency_ms,
+        ComparatorMetric::IndexingPeakMemoryMb => dataset.baseline_metrics.indexing_peak_memory_mb,
+        ComparatorMetric::SearchingPeakMemoryMb => dataset.baseline_metrics.searching_peak_memory_mb,
+        ComparatorMetric::IndexSizeBytesPerDocument => {
+            dataset.baseline_metrics.index_size_bytes_per_document
+        }
+    }
+}
+
+fn regression_pct_x100(metric: ComparatorMetric, baseline: u64, measured: u64) -> u64 {
+    if baseline == 0 {
+        return 0;
+    }
+
+    let regression_numerator = match metric {
+        ComparatorMetric::IndexingThroughputDocsPerSecond => baseline.saturating_sub(measured),
+        _ => measured.saturating_sub(baseline),
+    };
+
+    regression_numerator
+        .saturating_mul(100)
+        .saturating_mul(REGRESSION_SCALE)
+        / baseline
+}
+
+fn evaluate_regressions(
+    matrix: &BenchmarkMatrix,
+    dataset: &GoldenDataset,
+    observations: &[BenchmarkObservation],
+) -> Vec<RegressionViolation> {
+    matrix
+        .comparators
+        .iter()
+        .filter_map(|comparator| {
+            let observation = observations
+                .iter()
+                .find(|candidate| candidate.metric == comparator.metric)?;
+            let baseline = baseline_value(dataset, comparator.metric);
+            let regression_pct_x100 =
+                regression_pct_x100(comparator.metric, baseline, observation.measured_value);
+            let threshold_pct_x100 = u64::from(comparator.max_regression_pct) * REGRESSION_SCALE;
+
+            (regression_pct_x100 > threshold_pct_x100).then_some(RegressionViolation {
+                metric: comparator.metric,
+                baseline,
+                measured: observation.measured_value,
+                regression_pct_x100,
+                threshold_pct_x100,
+            })
+        })
+        .collect()
 }
 
 fn sha256_hex_for_file(path: &Path) -> String {
@@ -192,11 +317,25 @@ fn sha256_hex_for_file(path: &Path) -> String {
 }
 
 fn sample_payload(case: &BenchmarkCase, dataset: &GoldenDataset) -> serde_json::Value {
-    let comparator_value = match case.path {
-        BenchmarkPath::Crawl => dataset.baseline_p95_ms.crawl,
-        BenchmarkPath::Index => dataset.baseline_p95_ms.index,
-        BenchmarkPath::Query => dataset.baseline_p95_ms.query,
-        BenchmarkPath::Tui => dataset.baseline_p95_ms.tui_frame,
+    let baseline_snapshot = match case.path {
+        BenchmarkPath::Crawl => serde_json::json!({
+            "crawl_events": dataset.workload.crawl_events,
+        }),
+        BenchmarkPath::Index => serde_json::json!({
+            "indexing_throughput_docs_per_second": dataset.baseline_metrics.indexing_throughput_docs_per_second,
+            "indexing_peak_memory_mb": dataset.baseline_metrics.indexing_peak_memory_mb,
+            "index_size_bytes_per_document": dataset.baseline_metrics.index_size_bytes_per_document,
+        }),
+        BenchmarkPath::Query => serde_json::json!({
+            "search_latency_ms": dataset.baseline_metrics.search_latency_ms,
+            "fast_tier_latency_ms": dataset.baseline_metrics.fast_tier_latency_ms,
+            "quality_tier_latency_ms": dataset.baseline_metrics.quality_tier_latency_ms,
+            "searching_peak_memory_mb": dataset.baseline_metrics.searching_peak_memory_mb,
+        }),
+        BenchmarkPath::Tui => serde_json::json!({
+            "tui_interactions": dataset.workload.tui_interactions,
+            "searching_peak_memory_mb": dataset.baseline_metrics.searching_peak_memory_mb,
+        }),
     };
 
     serde_json::json!({
@@ -204,7 +343,7 @@ fn sample_payload(case: &BenchmarkCase, dataset: &GoldenDataset) -> serde_json::
         "dataset_profile": case.dataset_profile,
         "warmup_iterations": case.warmup_iterations,
         "measured_iterations": case.measured_iterations,
-        "comparator_value": comparator_value,
+        "baseline_snapshot": baseline_snapshot,
     })
 }
 
@@ -268,7 +407,7 @@ fn benchmark_matrix_covers_crawl_index_query_tui_paths() {
     assert_eq!(matrix.schema_version, ARTIFACT_SCHEMA_VERSION);
     assert_eq!(matrix.matrix_version, MATRIX_VERSION);
     assert_eq!(matrix.cases.len(), 4);
-    assert_eq!(matrix.comparators.len(), 4);
+    assert_eq!(matrix.comparators.len(), 9);
 
     let expected = BTreeSet::from([
         BenchmarkPath::Crawl,
@@ -280,19 +419,89 @@ fn benchmark_matrix_covers_crawl_index_query_tui_paths() {
 }
 
 #[test]
+fn benchmark_matrix_declares_required_regression_metrics() {
+    let matrix = build_baseline_matrix("small");
+    let actual_metrics: BTreeSet<_> = matrix
+        .comparators
+        .iter()
+        .map(|comparator| comparator.metric)
+        .collect();
+    let expected_metrics = BTreeSet::from([
+        ComparatorMetric::IndexingThroughputDocsPerSecond,
+        ComparatorMetric::SearchLatencyP50Ms,
+        ComparatorMetric::SearchLatencyP95Ms,
+        ComparatorMetric::SearchLatencyP99Ms,
+        ComparatorMetric::FastTierLatencyMs,
+        ComparatorMetric::QualityTierLatencyMs,
+        ComparatorMetric::IndexingPeakMemoryMb,
+        ComparatorMetric::SearchingPeakMemoryMb,
+        ComparatorMetric::IndexSizeBytesPerDocument,
+    ]);
+
+    assert_eq!(actual_metrics, expected_metrics);
+    assert!(matrix
+        .comparators
+        .iter()
+        .all(|comparator| comparator.max_regression_pct == MAX_ALLOWED_REGRESSION_PCT));
+}
+
+#[test]
+fn regression_detector_enforces_twenty_percent_budget() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let observations = vec![
+        BenchmarkObservation {
+            metric: ComparatorMetric::IndexingThroughputDocsPerSecond,
+            measured_value: 280,
+        },
+        BenchmarkObservation {
+            metric: ComparatorMetric::SearchLatencyP95Ms,
+            measured_value: 31,
+        },
+        BenchmarkObservation {
+            metric: ComparatorMetric::SearchingPeakMemoryMb,
+            measured_value: 330,
+        },
+    ];
+
+    let regressions = evaluate_regressions(&matrix, &dataset, &observations);
+    let regressed_metrics: BTreeSet<_> = regressions
+        .iter()
+        .map(|violation| violation.metric)
+        .collect();
+
+    assert_eq!(regressions.len(), 2);
+    assert_eq!(
+        regressed_metrics,
+        BTreeSet::from([
+            ComparatorMetric::IndexingThroughputDocsPerSecond,
+            ComparatorMetric::SearchingPeakMemoryMb,
+        ])
+    );
+
+    let throughput = regressions
+        .iter()
+        .find(|violation| {
+            violation.metric == ComparatorMetric::IndexingThroughputDocsPerSecond
+        })
+        .expect("throughput regression is present");
+    assert!(throughput.regression_pct_x100 > throughput.threshold_pct_x100);
+}
+
+#[test]
 fn golden_datasets_are_versioned_and_reproducible() {
     let expected_hashes = [
         (
             "tiny",
-            "e99b242723daa36cbae9512b725abd8965cdf85390a161eb5dfcc54e91595638",
+            "b66af1741fa5c4400c3aaabbcef2b74624f4348e0e02b9ca0d452a56b38ec267",
         ),
         (
             "small",
-            "6f87f4fc3779f67ff6d595fe8733a4c9ee8541f224724ac788d08b9416bef759",
+            "7456c946763118d90ad7749d615b50bb00f478dff443d389b25e993e4c2adc95",
         ),
         (
             "medium",
-            "34926c4b04cca3f9c3eed8c7c483a81c9cebaff93b48b28c3eab6ab0096ac27d",
+            "d5aa0568cd849a377a8980c4206bc5d6b63b0b3aa3b8af6d8b37f4278dea8d64",
         ),
     ];
 
@@ -307,6 +516,25 @@ fn golden_datasets_are_versioned_and_reproducible() {
         assert_eq!(dataset.dataset_version, "2026-02-14");
         assert_eq!(dataset.profile, profile);
         assert_eq!(digest, expected_hash);
+
+        assert!(dataset.baseline_metrics.indexing_throughput_docs_per_second > 0);
+        assert!(dataset.baseline_metrics.fast_tier_latency_ms > 0);
+        assert!(dataset.baseline_metrics.quality_tier_latency_ms > 0);
+        assert!(dataset.baseline_metrics.indexing_peak_memory_mb > 0);
+        assert!(dataset.baseline_metrics.searching_peak_memory_mb > 0);
+        assert!(dataset.baseline_metrics.index_size_bytes_per_document > 0);
+        assert!(
+            dataset.baseline_metrics.search_latency_ms.p50
+                <= dataset.baseline_metrics.search_latency_ms.p95
+        );
+        assert!(
+            dataset.baseline_metrics.search_latency_ms.p95
+                <= dataset.baseline_metrics.search_latency_ms.p99
+        );
+        assert!(
+            dataset.baseline_metrics.fast_tier_latency_ms
+                <= dataset.baseline_metrics.quality_tier_latency_ms
+        );
     }
 
     assert_eq!(GOLDEN_PROFILES.len(), 3);
@@ -332,7 +560,7 @@ fn artifact_capture_supports_later_statistical_comparison() {
     assert_eq!(manifest.matrix_version, MATRIX_VERSION);
     assert_eq!(manifest.dataset_profile, "small");
     assert_eq!(manifest.dataset_version, "2026-02-14");
-    assert_eq!(manifest.comparator_count, 4);
+    assert_eq!(manifest.comparator_count, 9);
     assert_eq!(manifest.sample_count, 4);
     assert!(
         manifest

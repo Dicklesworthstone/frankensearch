@@ -14,11 +14,18 @@
     "query_cases": 420,
     "tui_interactions": 640
   },
-  "baseline_p95_ms": {
-    "crawl": 75,
-    "index": 135,
-    "query": 26,
-    "tui_frame": 14
+  "baseline_metrics": {
+    "indexing_throughput_docs_per_second": 400,
+    "search_latency_ms": {
+      "p50": 12,
+      "p95": 26,
+      "p99": 44
+    },
+    "fast_tier_latency_ms": 7,
+    "quality_tier_latency_ms": 128,
+    "indexing_peak_memory_mb": 380,
+    "searching_peak_memory_mb": 250,
+    "index_size_bytes_per_document": 2080
   },
   "notes": [
     "Mid-size mono-repo profile",

@@ -6612,4 +6612,220 @@ mod tests {
         let found = loaded.entries.iter().any(|e| e.version == "0.99.0");
         assert!(found);
     }
+
+    // ─── Additional Auto-Update Edge Case Tests (bd-2w7x.46) ──────────
+
+    #[test]
+    fn semver_parse_single_digit_components() {
+        let v = super::SemVer::parse("1.2.3").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
+    }
+
+    #[test]
+    fn semver_parse_large_components() {
+        let v = super::SemVer::parse("100.200.300").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (100, 200, 300));
+    }
+
+    #[test]
+    fn semver_comparison_major_trumps_minor() {
+        let v200 = super::SemVer::parse("2.0.0").unwrap();
+        let v1_99_99 = super::SemVer::parse("1.99.99").unwrap();
+        assert!(v200.is_newer_than(v1_99_99));
+    }
+
+    #[test]
+    fn semver_comparison_minor_trumps_patch() {
+        let v0_2_0 = super::SemVer::parse("0.2.0").unwrap();
+        let v0_1_99 = super::SemVer::parse("0.1.99").unwrap();
+        assert!(v0_2_0.is_newer_than(v0_1_99));
+    }
+
+    #[test]
+    fn semver_prerelease_stripped_for_comparison() {
+        // Pre-release suffix stripped: v0.3.0-rc1 parses as 0.3.0.
+        let rc = super::SemVer::parse("v0.3.0-rc1").unwrap();
+        let release = super::SemVer::parse("0.3.0").unwrap();
+        // Same triple means neither is newer.
+        assert!(!rc.is_newer_than(release));
+        assert!(!release.is_newer_than(rc));
+    }
+
+    #[test]
+    fn version_cache_with_custom_ttl() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: super::epoch_now(),
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            latest_version: "v0.1.0".into(),
+            release_url: String::new(),
+            ttl_seconds: 1, // 1-second TTL
+        };
+        // Should be valid immediately.
+        assert!(super::is_cache_valid(&cache));
+
+        // With a very old checked_at, should be expired.
+        let expired_cache = super::VersionCheckCache {
+            checked_at_epoch: super::epoch_now() - 2,
+            ttl_seconds: 1,
+            ..cache.clone()
+        };
+        assert!(!super::is_cache_valid(&expired_cache));
+    }
+
+    #[test]
+    fn prune_backups_noop_when_under_limit() {
+        let dir = std::env::temp_dir().join("fsfs_test_prune_noop");
+        let _ = fs::create_dir_all(&dir);
+
+        let mut manifest = super::RollbackManifest {
+            entries: vec![super::BackupEntry {
+                version: "0.1.0".into(),
+                backed_up_at_epoch: 100,
+                original_path: "/bin/fsfs".into(),
+                binary_filename: "fsfs-0.1.0".into(),
+                sha256: String::new(),
+            }],
+        };
+
+        super::prune_backups(&mut manifest, &dir);
+        assert_eq!(manifest.entries.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_backups_deletes_oldest_files() {
+        let dir = std::env::temp_dir().join("fsfs_test_prune_deletes");
+        let _ = fs::create_dir_all(&dir);
+
+        // Create 4 backup files + entries. After pruning, oldest should be gone.
+        let mut manifest = super::RollbackManifest {
+            entries: (0..4)
+                .map(|i| {
+                    let filename = format!("fsfs-prune-test-{i}");
+                    fs::write(dir.join(&filename), b"binary").unwrap();
+                    super::BackupEntry {
+                        version: format!("0.{i}.0"),
+                        backed_up_at_epoch: (i + 1) as u64 * 1000,
+                        original_path: "/bin/fsfs".into(),
+                        binary_filename: filename,
+                        sha256: String::new(),
+                    }
+                })
+                .collect(),
+        };
+
+        super::prune_backups(&mut manifest, &dir);
+        assert_eq!(manifest.entries.len(), super::MAX_BACKUP_VERSIONS);
+        // The oldest entry (epoch=1000, version 0.0.0) should have been pruned.
+        assert!(
+            manifest.entries.iter().all(|e| e.version != "0.0.0"),
+            "oldest entry should have been pruned"
+        );
+        // Its file should also be deleted.
+        assert!(!dir.join("fsfs-prune-test-0").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_backup_produces_valid_entry() {
+        // Create a fake binary to back up.
+        let dir = std::env::temp_dir().join("fsfs_test_create_backup");
+        let _ = fs::create_dir_all(&dir);
+        let fake_binary = dir.join("fsfs");
+        fs::write(&fake_binary, b"#!/bin/sh\necho fsfs test").unwrap();
+
+        let entry = super::create_backup(&fake_binary).unwrap();
+        assert_eq!(entry.version, env!("CARGO_PKG_VERSION"));
+        assert!(!entry.binary_filename.is_empty());
+        assert!(!entry.sha256.is_empty());
+
+        // Verify the backup file exists in the backup directory.
+        if let Some(bdir) = super::backup_dir() {
+            assert!(bdir.join(&entry.binary_filename).exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_backup_deduplicates_same_version() {
+        let dir = std::env::temp_dir().join("fsfs_test_backup_dedup");
+        let _ = fs::create_dir_all(&dir);
+        let fake_binary = dir.join("fsfs");
+        fs::write(&fake_binary, b"#!/bin/sh\necho test1").unwrap();
+
+        // Create first backup.
+        let _ = super::create_backup(&fake_binary);
+        // Create second backup of same version.
+        let _ = super::create_backup(&fake_binary);
+
+        // Manifest should have only one entry for the current version.
+        let manifest = super::read_rollback_manifest();
+        let count = manifest
+            .entries
+            .iter()
+            .filter(|e| e.version == env!("CARGO_PKG_VERSION"))
+            .count();
+        assert_eq!(count, 1, "should deduplicate same-version backups");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_payload_check_only_does_not_apply() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            check_only: true,
+            applied: false,
+            channel: "stable".into(),
+            release_url: Some("https://example.com".into()),
+            notes: vec![],
+        };
+        assert!(payload.update_available);
+        assert!(!payload.applied);
+        assert!(payload.check_only);
+    }
+
+    #[test]
+    fn update_payload_no_update_available() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.1.0".into(),
+            update_available: false,
+            check_only: false,
+            applied: false,
+            channel: "stable".into(),
+            release_url: None,
+            notes: vec!["up to date".into()],
+        };
+        assert!(!payload.update_available);
+        assert!(!payload.applied);
+    }
+
+    #[test]
+    fn release_urls_contain_expected_patterns() {
+        let asset = super::release_asset_url("v1.0.0", "aarch64-apple-darwin");
+        assert!(asset.contains("v1.0.0"));
+        assert!(asset.contains("aarch64-apple-darwin"));
+        assert!(asset.contains(".tar.xz"));
+        assert!(asset.contains("github.com"));
+
+        let checksum = super::release_checksum_url("v1.0.0", "aarch64-apple-darwin");
+        assert!(checksum.ends_with(".sha256"));
+    }
+
+    #[test]
+    fn detect_target_triple_has_arch_and_os() {
+        let triple = super::detect_target_triple();
+        // Should contain an architecture component.
+        assert!(
+            triple.contains("x86_64") || triple.contains("aarch64") || triple.contains("arm"),
+            "triple should contain architecture: {triple}"
+        );
+        // Should contain an OS component.
+        assert!(
+            triple.contains("linux") || triple.contains("darwin") || triple.contains("windows"),
+            "triple should contain OS: {triple}"
+        );
+    }
 }

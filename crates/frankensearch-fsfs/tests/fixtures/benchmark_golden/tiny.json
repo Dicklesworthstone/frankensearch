@@ -14,11 +14,18 @@
     "query_cases": 160,
     "tui_interactions": 220
   },
-  "baseline_p95_ms": {
-    "crawl": 18,
-    "index": 42,
-    "query": 14,
-    "tui_frame": 11
+  "baseline_metrics": {
+    "indexing_throughput_docs_per_second": 1800,
+    "search_latency_ms": {
+      "p50": 6,
+      "p95": 14,
+      "p99": 21
+    },
+    "fast_tier_latency_ms": 5,
+    "quality_tier_latency_ms": 96,
+    "indexing_peak_memory_mb": 120,
+    "searching_peak_memory_mb": 95,
+    "index_size_bytes_per_document": 1820
   },
   "notes": [
     "Single developer laptop profile",
