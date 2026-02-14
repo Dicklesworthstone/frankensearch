@@ -420,9 +420,11 @@ impl StorageBackedJobRunner {
         tracing::info!(
             target: "frankensearch.storage.pipeline",
             stage = "ingest",
+            event = "document_ingested",
             doc_id = %request.doc_id,
             correlation_id = %correlation_id,
             action = %ingest_action_name(&tx_result.action),
+            content_hash = %content_hash_hex,
             fast_job_enqueued = tx_result.fast_job_enqueued,
             quality_job_enqueued = tx_result.quality_job_enqueued,
             "document ingest completed"
@@ -487,6 +489,7 @@ impl StorageBackedJobRunner {
 
         let embed_start = Instant::now();
         for job in &claimed {
+            let job_started = Instant::now();
             let doc = self.storage.get_document(&job.doc_id)?;
             let Some(doc) = doc else {
                 let message = format!("document {} missing during process_batch", job.doc_id);
@@ -586,10 +589,13 @@ impl StorageBackedJobRunner {
             tracing::info!(
                 target: "frankensearch.storage.pipeline",
                 stage = "complete",
+                event = "job_completed",
                 worker_id,
                 correlation_id = %correlation_id,
+                job_id = job.job_id,
                 doc_id = %job.doc_id,
                 embedder_id = %job.embedder_id,
+                duration_ms = duration_as_u64(job_started.elapsed().as_millis()),
                 "embedding job completed"
             );
         }
@@ -613,6 +619,16 @@ impl StorageBackedJobRunner {
         self.metrics
             .total_reclaimed
             .fetch_add(usize_to_u64(reclaimed), Ordering::Relaxed);
+        if reclaimed > 0 {
+            tracing::warn!(
+                target: "frankensearch.storage.pipeline",
+                stage = "startup",
+                event = "crash_recovery",
+                worker_id,
+                recovered_job_count = reclaimed,
+                "reclaimed stale embedding jobs on worker startup"
+            );
+        }
 
         let mut report = WorkerReport {
             reclaimed_on_startup: reclaimed,
@@ -929,8 +945,9 @@ fn duration_as_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::io::Write;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
@@ -1025,6 +1042,43 @@ mod tests {
             runner = runner.with_quality_embedder(quality_embedder);
         }
         runner
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_logs<R>(run: impl FnOnce() -> R) -> (R, String) {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || TestLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let logs = {
+            let guard = buffer.lock().expect("log buffer lock poisoned");
+            String::from_utf8_lossy(&guard).into_owned()
+        };
+        (result, logs)
     }
 
     #[test]
@@ -1284,6 +1338,156 @@ mod tests {
         let stored =
             extract_correlation_id(doc.metadata.as_ref()).expect("correlation id should exist");
         assert_eq!(stored, "corr-123");
+    }
+
+    #[test]
+    fn ingest_returns_queue_full_when_backpressured() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig {
+                backpressure_threshold: 0,
+                ..JobQueueConfig::default()
+            },
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let _ = runner
+            .ingest(IngestRequest::new("doc-first", "first"))
+            .expect("first ingest should seed pending queue");
+        let error = runner
+            .ingest(IngestRequest::new("doc-second", "second"))
+            .expect_err("second ingest should trip queue backpressure");
+
+        match error {
+            SearchError::QueueFull { pending, capacity } => {
+                assert!(pending >= 1, "expected non-zero pending jobs");
+                assert_eq!(capacity, 0);
+            }
+            other => panic!("expected QueueFull error, received {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingest_emits_document_ingested_log_with_content_hash() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let text = "observability-ready payload";
+        let expected_hash = ContentHasher::hash_hex(text);
+        let ((), logs) = with_captured_logs(move || {
+            let result = runner
+                .ingest(IngestRequest::new("doc-log", text))
+                .expect("ingest should succeed");
+            assert_eq!(result.action, IngestAction::New);
+        });
+
+        assert!(logs.contains("document_ingested"), "logs: {logs}");
+        assert!(logs.contains("doc_id=doc-log"), "logs: {logs}");
+        assert!(logs.contains("action=new"), "logs: {logs}");
+        assert!(logs.contains("content_hash="), "logs: {logs}");
+        assert!(logs.contains(expected_hash.as_str()), "logs: {logs}");
+    }
+
+    #[test]
+    fn process_batch_emits_job_completed_log_with_duration_ms() {
+        let ((), logs) = with_captured_logs(|| {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+                let runner = make_runner(
+                    JobQueueConfig::default(),
+                    PipelineConfig::default(),
+                    fast,
+                    None,
+                    sink,
+                );
+
+                let _ = runner
+                    .ingest(IngestRequest::new("doc-job-log", "job completion logging"))
+                    .expect("ingest should succeed");
+                let processed = runner
+                    .process_batch(&cx, "worker-log")
+                    .await
+                    .expect("process_batch should succeed");
+                assert_eq!(processed.jobs_completed, 1);
+            });
+        });
+
+        assert!(logs.contains("job_completed"), "logs: {logs}");
+        assert!(logs.contains("embedder_id=fast-tier"), "logs: {logs}");
+        assert!(logs.contains("job_id="), "logs: {logs}");
+        assert!(logs.contains("duration_ms="), "logs: {logs}");
+    }
+
+    #[test]
+    fn run_worker_emits_crash_recovery_warn_with_recovered_job_count() {
+        let ((), logs) = with_captured_logs(|| {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+                let runner = make_runner(
+                    JobQueueConfig {
+                        visibility_timeout_ms: 5,
+                        stale_job_threshold_ms: 5,
+                        ..JobQueueConfig::default()
+                    },
+                    PipelineConfig {
+                        process_batch_size: 1,
+                        worker_idle_sleep_ms: 1,
+                        worker_max_idle_cycles: Some(1),
+                        ..PipelineConfig::default()
+                    },
+                    fast,
+                    None,
+                    Arc::clone(&sink),
+                );
+
+                let _ = runner
+                    .ingest(IngestRequest::new("doc-recover", "recover me"))
+                    .expect("ingest should succeed");
+                let claimed = runner
+                    .queue
+                    .claim_batch("worker-pre", 1)
+                    .expect("claim should succeed");
+                let stale_started = unix_timestamp_ms()
+                    .expect("timestamp should resolve")
+                    .saturating_sub(10_000);
+                let params = [
+                    SqliteValue::Integer(stale_started),
+                    SqliteValue::Integer(claimed[0].job_id),
+                ];
+                runner
+                    .storage
+                    .connection()
+                    .execute_with_params(
+                        "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
+                        &params,
+                    )
+                    .expect("stale timestamp update should succeed");
+
+                let shutdown = AtomicBool::new(false);
+                let report = runner
+                    .run_worker(&cx, "worker-recover", &shutdown)
+                    .await
+                    .expect("run_worker should succeed");
+                assert_eq!(report.reclaimed_on_startup, 1);
+            });
+        });
+
+        assert!(logs.contains("crash_recovery"), "logs: {logs}");
+        assert!(logs.contains("worker-recover"), "logs: {logs}");
+        assert!(logs.contains("recovered_job_count=1"), "logs: {logs}");
     }
 
     #[test]

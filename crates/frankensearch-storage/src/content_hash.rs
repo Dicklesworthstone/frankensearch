@@ -689,6 +689,58 @@ mod tests {
     }
 
     #[test]
+    fn content_hasher_hex_is_64_chars() {
+        let hex = ContentHasher::hash_hex("anything");
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex output should contain only hex digits"
+        );
+    }
+
+    #[test]
+    fn content_hasher_empty_string() {
+        let hash = ContentHasher::hash("");
+        let hex = ContentHasher::hash_hex("");
+        assert_eq!(hex.len(), 64);
+        // Empty string always produces the same well-known SHA-256 hash.
+        assert_eq!(
+            hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(ContentHasher::matches(&hash, &hash));
+    }
+
+    #[test]
+    fn check_dedup_rejects_empty_doc_id() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let hash = ContentHasher::hash("some content");
+        let err = storage
+            .check_dedup("", &hash, "fast-tier")
+            .expect_err("empty doc_id should be rejected");
+        assert!(err.to_string().contains("doc_id"));
+    }
+
+    #[test]
+    fn check_dedup_rejects_empty_embedder_id() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let hash = ContentHasher::hash("some content");
+        let err = storage
+            .check_dedup("doc-1", &hash, "")
+            .expect_err("empty embedder_id should be rejected");
+        assert!(err.to_string().contains("embedder_id"));
+    }
+
+    #[test]
+    fn check_dedup_batch_empty_returns_empty() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let decisions = storage
+            .check_dedup_batch(&[], "fast-tier")
+            .expect("empty batch should succeed");
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
     fn check_dedup_batch_rejects_duplicate_doc_ids() {
         let storage = Storage::open_in_memory().expect("storage should open");
         let duplicate = hash_with(3);

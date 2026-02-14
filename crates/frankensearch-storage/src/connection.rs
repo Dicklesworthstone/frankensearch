@@ -176,7 +176,13 @@ impl Storage {
         match outcome {
             Ok(Ok(value)) => {
                 self.conn.execute("COMMIT;").map_err(|commit_err| {
-                    let _ = self.conn.execute("ROLLBACK;");
+                    if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
+                        tracing::warn!(
+                            target: "frankensearch.storage",
+                            error = %rollback_err,
+                            "rollback failed after commit error"
+                        );
+                    }
                     map_storage_error(commit_err)
                 })?;
                 self.metrics.record_commit();
@@ -184,7 +190,13 @@ impl Storage {
                 Ok(value)
             }
             Ok(Err(err)) => {
-                let _ = self.conn.execute("ROLLBACK;");
+                if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
+                    tracing::warn!(
+                        target: "frankensearch.storage",
+                        error = %rollback_err,
+                        "rollback failed after closure error"
+                    );
+                }
                 self.metrics.record_rollback();
                 tracing::debug!(
                     target: "frankensearch.storage",
@@ -194,7 +206,13 @@ impl Storage {
                 Err(err)
             }
             Err(payload) => {
-                let _ = self.conn.execute("ROLLBACK;");
+                if let Err(rollback_err) = self.conn.execute("ROLLBACK;") {
+                    tracing::error!(
+                        target: "frankensearch.storage",
+                        error = %rollback_err,
+                        "critical: rollback failed during panic recovery"
+                    );
+                }
                 self.metrics.record_rollback();
                 tracing::error!(
                     target: "frankensearch.storage",
@@ -746,6 +764,95 @@ mod tests {
             1,
             "reopened reader should observe committed write from writer transaction"
         );
+    }
+
+    #[test]
+    fn storage_config_serde_roundtrip() {
+        let config = StorageConfig {
+            db_path: PathBuf::from("/tmp/test.db"),
+            wal_mode: false,
+            busy_timeout_ms: 10_000,
+            raptorq_repair_symbols: 4,
+            cache_size_pages: 500,
+            concurrent_transactions: false,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let deserialized: StorageConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn storage_config_in_memory_path() {
+        let config = StorageConfig::in_memory();
+        assert_eq!(config.db_path, PathBuf::from(":memory:"));
+        assert!(config.wal_mode);
+        assert!(config.concurrent_transactions);
+    }
+
+    #[test]
+    fn storage_config_begin_sql_concurrent_vs_standard() {
+        let concurrent = StorageConfig {
+            concurrent_transactions: true,
+            ..StorageConfig::default()
+        };
+        assert_eq!(concurrent.begin_sql(), "BEGIN CONCURRENT;");
+
+        let standard = StorageConfig {
+            concurrent_transactions: false,
+            ..StorageConfig::default()
+        };
+        assert_eq!(standard.begin_sql(), "BEGIN;");
+    }
+
+    #[test]
+    fn immediate_transaction_commits_successfully() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+
+        storage
+            .immediate_transaction(|conn| {
+                insert_document_minimal(conn, "doc-immediate")?;
+                Ok(())
+            })
+            .expect("immediate transaction should commit");
+
+        assert_eq!(
+            count_documents(storage.connection()).expect("count after immediate tx"),
+            1
+        );
+
+        let metrics = storage.metrics_snapshot();
+        assert_eq!(metrics.tx_commits, 1);
+    }
+
+    #[test]
+    fn immediate_transaction_rolls_back_on_error() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+
+        let result: SearchResult<()> = storage.immediate_transaction(|conn| {
+            insert_document_minimal(conn, "doc-immediate-rollback")?;
+            Err(SearchError::InvalidConfig {
+                field: "test".to_owned(),
+                value: "forced".to_owned(),
+                reason: "force rollback".to_owned(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            count_documents(storage.connection()).expect("count after rollback"),
+            0
+        );
+
+        let metrics = storage.metrics_snapshot();
+        assert_eq!(metrics.tx_rollbacks, 1);
+    }
+
+    #[test]
+    fn storage_debug_format() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let debug = format!("{storage:?}");
+        assert!(debug.contains("Storage"));
+        assert!(debug.contains(":memory:"));
     }
 
     #[test]

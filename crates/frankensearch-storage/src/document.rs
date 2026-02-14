@@ -789,7 +789,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{DocumentRecord, EmbeddingStatus, count_documents, list_document_ids};
-    use crate::connection::Storage;
+    use crate::connection::{Storage, StorageConfig};
 
     fn hash_with(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -1060,5 +1060,254 @@ mod tests {
             Some(EmbeddingStatus::Embedded)
         );
         assert_eq!(EmbeddingStatus::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let result = storage
+            .get_document("does-not-exist")
+            .expect("get should succeed even for missing doc");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn content_preview_round_trips_correctly() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let long_preview = "A".repeat(400);
+        let mut doc = DocumentRecord::new(
+            "doc-preview",
+            long_preview.clone(),
+            hash_with(10),
+            2048,
+            1_739_500_000,
+            1_739_500_000,
+        );
+        doc.source_path = Some("/test/preview.txt".to_owned());
+
+        storage
+            .upsert_document(&doc)
+            .expect("upsert should succeed");
+
+        let fetched = storage
+            .get_document("doc-preview")
+            .expect("get should succeed")
+            .expect("document should exist");
+        assert_eq!(fetched.content_preview, long_preview);
+        assert_eq!(fetched.content_length, 2048);
+    }
+
+    #[test]
+    fn metadata_json_round_trips_correctly() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let metadata = serde_json::json!({
+            "tags": ["rust", "search"],
+            "priority": 1,
+            "nested": {"key": "value"},
+            "flag": true
+        });
+
+        let mut doc = DocumentRecord::new(
+            "doc-meta",
+            "metadata test",
+            hash_with(20),
+            64,
+            1_739_500_100,
+            1_739_500_100,
+        );
+        doc.metadata = Some(metadata.clone());
+
+        storage
+            .upsert_document(&doc)
+            .expect("upsert should succeed");
+
+        let fetched = storage
+            .get_document("doc-meta")
+            .expect("get should succeed")
+            .expect("document should exist");
+        assert_eq!(fetched.metadata, Some(metadata));
+    }
+
+    #[test]
+    fn unicode_doc_id_works_correctly() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let unicode_ids = [
+            "\u{1F980}crab-doc",
+            "\u{00E9}l\u{00E8}ve",
+            "\u{4E16}\u{754C}",
+            "path/with\u{2003}em-space",
+        ];
+
+        for id in &unicode_ids {
+            let doc = DocumentRecord::new(
+                *id,
+                "unicode test content",
+                hash_with(42),
+                32,
+                1_739_500_200,
+                1_739_500_200,
+            );
+            storage
+                .upsert_document(&doc)
+                .unwrap_or_else(|e| panic!("upsert for {id:?} should succeed: {e}"));
+
+            let fetched = storage
+                .get_document(id)
+                .unwrap_or_else(|e| panic!("get for {id:?} should succeed: {e}"))
+                .unwrap_or_else(|| panic!("document {id:?} should exist"));
+            assert_eq!(fetched.doc_id, *id);
+        }
+
+        assert_eq!(
+            count_documents(storage.connection()).expect("count should succeed"),
+            i64::try_from(unicode_ids.len()).expect("len fits i64")
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_returns_false() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let deleted = storage
+            .delete_document("ghost-doc")
+            .expect("delete of missing doc should not error");
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn multi_tier_embedding_status_tracked_independently() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = sample_document("doc-multi", 5);
+        storage
+            .upsert_document(&doc)
+            .expect("insert should succeed");
+
+        storage
+            .mark_embedded("doc-multi", "fast-tier")
+            .expect("fast-tier mark_embedded should succeed");
+        storage
+            .mark_failed("doc-multi", "quality-tier", "onnx timeout")
+            .expect("quality-tier mark_failed should succeed");
+
+        let fast_counts = storage
+            .count_by_status("fast-tier")
+            .expect("fast-tier status counts should succeed");
+        assert_eq!(fast_counts.embedded, 1);
+        assert_eq!(fast_counts.pending, 0);
+
+        let quality_counts = storage
+            .count_by_status("quality-tier")
+            .expect("quality-tier status counts should succeed");
+        assert_eq!(quality_counts.failed, 1);
+        assert_eq!(quality_counts.pending, 0);
+    }
+
+    #[test]
+    fn mark_failed_succeeds_on_repeated_calls() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = sample_document("doc-retry", 6);
+        storage
+            .upsert_document(&doc)
+            .expect("insert should succeed");
+
+        for i in 0..3 {
+            storage
+                .mark_failed("doc-retry", "fast-tier", &format!("attempt {i}"))
+                .expect("mark_failed should succeed on each call");
+        }
+
+        let counts = storage
+            .count_by_status("fast-tier")
+            .expect("status counts should succeed");
+        assert_eq!(counts.pending, 0, "no pending after mark_failed");
+        assert!(counts.failed > 0, "failed count should be positive");
+        assert_eq!(counts.embedded, 0, "no embedded after mark_failed");
+    }
+
+    #[test]
+    fn reopened_database_persists_all_data() {
+        let dir = tempfile::tempdir().expect("tempdir creation should succeed");
+        let db_path = dir.path().join("test.db");
+
+        {
+            let storage = Storage::open(StorageConfig {
+                db_path: db_path.clone(),
+                ..StorageConfig::default()
+            })
+            .expect("initial open should succeed");
+            storage
+                .upsert_document(&sample_document("persisted-1", 1))
+                .expect("insert should succeed");
+            storage
+                .upsert_document(&sample_document("persisted-2", 2))
+                .expect("insert should succeed");
+            storage
+                .mark_embedded("persisted-1", "fast-tier")
+                .expect("mark_embedded should succeed");
+        }
+
+        {
+            let storage = Storage::open(StorageConfig {
+                db_path,
+                ..StorageConfig::default()
+            })
+            .expect("reopen should succeed");
+            let doc1 = storage
+                .get_document("persisted-1")
+                .expect("get should succeed")
+                .expect("persisted-1 should survive reopen");
+            assert_eq!(doc1.doc_id, "persisted-1");
+
+            let doc2 = storage
+                .get_document("persisted-2")
+                .expect("get should succeed")
+                .expect("persisted-2 should survive reopen");
+            assert_eq!(doc2.doc_id, "persisted-2");
+
+            let counts = storage
+                .count_by_status("fast-tier")
+                .expect("status counts should succeed");
+            assert_eq!(counts.embedded, 1);
+            assert_eq!(counts.pending, 1);
+
+            assert_eq!(
+                count_documents(storage.connection()).expect("count should succeed"),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_batch_empty_is_noop() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let result = storage
+            .upsert_batch(&[])
+            .expect("empty batch should succeed");
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn metadata_none_round_trips_as_none() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = DocumentRecord::new(
+            "doc-no-meta",
+            "no metadata",
+            hash_with(30),
+            16,
+            1_739_500_300,
+            1_739_500_300,
+        );
+
+        storage
+            .upsert_document(&doc)
+            .expect("upsert should succeed");
+
+        let fetched = storage
+            .get_document("doc-no-meta")
+            .expect("get should succeed")
+            .expect("document should exist");
+        assert!(fetched.metadata.is_none());
+        assert!(fetched.source_path.is_none());
     }
 }

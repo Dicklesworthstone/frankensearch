@@ -275,7 +275,13 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
     match result {
         Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(storage_error),
         Err(error) => {
-            let _ = conn.execute("ROLLBACK;");
+            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+                tracing::warn!(
+                    target: "frankensearch.storage",
+                    error = %rollback_err,
+                    "rollback failed after schema bootstrap error"
+                );
+            }
             Err(error)
         }
     }
@@ -477,6 +483,25 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("legacy schema version 1 is unsupported"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_future_schema_versions() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+            .expect("schema_version should be creatable");
+        let future_version = SCHEMA_VERSION + 100;
+        let params = [SqliteValue::Integer(future_version)];
+        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
+            .expect("future version marker should insert");
+
+        let error = bootstrap(&conn).expect_err("future schemas should be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("newer than supported"),
             "unexpected error message: {message}"
         );
     }

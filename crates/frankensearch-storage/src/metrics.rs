@@ -45,3 +45,62 @@ impl StorageMetrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StorageMetrics;
+
+    #[test]
+    fn default_metrics_are_zeroed() {
+        let metrics = StorageMetrics::default();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.opens, 0);
+        assert_eq!(snapshot.schema_bootstraps, 0);
+        assert_eq!(snapshot.tx_commits, 0);
+        assert_eq!(snapshot.tx_rollbacks, 0);
+    }
+
+    #[test]
+    fn counters_accumulate_independently() {
+        let metrics = StorageMetrics::default();
+        metrics.record_open();
+        metrics.record_open();
+        metrics.record_schema_bootstrap();
+        metrics.record_commit();
+        metrics.record_commit();
+        metrics.record_commit();
+        metrics.record_rollback();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.opens, 2);
+        assert_eq!(snapshot.schema_bootstraps, 1);
+        assert_eq!(snapshot.tx_commits, 3);
+        assert_eq!(snapshot.tx_rollbacks, 1);
+    }
+
+    #[test]
+    fn snapshot_is_point_in_time() {
+        let metrics = StorageMetrics::default();
+        metrics.record_open();
+        let snap1 = metrics.snapshot();
+
+        metrics.record_open();
+        let snap2 = metrics.snapshot();
+
+        assert_eq!(snap1.opens, 1);
+        assert_eq!(snap2.opens, 2);
+    }
+
+    #[test]
+    fn snapshot_serde_roundtrip() {
+        let metrics = StorageMetrics::default();
+        metrics.record_open();
+        metrics.record_commit();
+        let snapshot = metrics.snapshot();
+
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let deserialized: super::StorageMetricsSnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(snapshot, deserialized);
+    }
+}
