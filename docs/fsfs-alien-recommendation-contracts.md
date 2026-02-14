@@ -46,6 +46,42 @@ Focus:
 - quality/latency balancing under constrained resources
 - stable tie-break and regression-safe rollout criteria
 
+## Crawl/Ingest Optimization Track (`bd-2hz.9.3`)
+
+Prioritized hotspot candidates and target gains:
+
+1. `ingest.catalog.batch_upsert`
+   - stage: `catalog_mutation`
+   - target: p50 -16%, p95 -24%, throughput +20%
+2. `crawl.classification.policy_batching`
+   - stage: `classification`
+   - target: p50 -10%, p95 -16%, throughput +12%
+3. `ingest.queue.lane_budget_admission`
+   - stage: `queue_admission`
+   - target: p50 -9%, p95 -14%, throughput +11%
+4. `crawl.discovery.path_metadata_cache`
+   - stage: `discovery_walk`
+   - target: p50 -8%, p95 -13%, throughput +10%
+5. `ingest.embed_gate.early_skip`
+   - stage: `embedding_gate`
+   - target: p50 -7%, p95 -11%, throughput +9%
+
+Isomorphism proof checklist requirements (per lever):
+
+- baseline comparator explicitly names incumbent behavior (discovery/classification/catalog/queue/embed gate)
+- replay command: `fsfs profile replay --lane ingest --lever-id <id> --compare baseline`
+- invariants include:
+  - deterministic scope/classification outcomes
+  - monotonic catalog/changelog sequencing
+  - bounded queue semantics and stable backpressure reason codes
+  - explainability-preserving ingest/degrade reason codes
+
+Rollback guardrails (per optimization class):
+
+- rollback command: `fsfs profile rollback --lever-id <id> --restore baseline`
+- abort triggers include class-specific reason codes (scope regressions, idempotency violations, queue starvation/unbounded growth, embed/degrade policy regressions)
+- required recovery reason code: `opt.rollback.completed`
+
 ## Contract Semantics
 
 - `ev_score` is numeric expected value (impact-confidence-reuse-effort normalization)

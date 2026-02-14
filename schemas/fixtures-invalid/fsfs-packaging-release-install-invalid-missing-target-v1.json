@@ -1,0 +1,92 @@
+{
+  "kind": "fsfs_packaging_release_install_contract",
+  "schema_version": 1,
+  "release_matrix": [
+    {
+      "target_triple": "x86_64-unknown-linux-musl",
+      "os_family": "linux",
+      "build_tool": "zigbuild",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs"
+    },
+    {
+      "target_triple": "aarch64-unknown-linux-musl",
+      "os_family": "linux",
+      "build_tool": "zigbuild",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs"
+    },
+    {
+      "target_triple": "x86_64-apple-darwin",
+      "os_family": "macos",
+      "build_tool": "cargo",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs"
+    }
+  ],
+  "artifact_naming": {
+    "archive_template": "fsfs-{tag}-{target}.tar.xz",
+    "checksum_suffix": ".sha256",
+    "metadata_suffix": ".metadata.json",
+    "signature_suffix": ".sig",
+    "certificate_suffix": ".pem"
+  },
+  "integrity_policy": {
+    "checksum_algorithm": "sha256",
+    "checksum_required": true,
+    "signature_strategy": "optional_cosign_blob",
+    "installer_verify_modes": [
+      "always_checksum",
+      "explicit_signature_with_verify_flag"
+    ],
+    "transparency_log_required": false
+  },
+  "install_policy": {
+    "default_entrypoint": "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh | bash -s -- --easy-mode",
+    "developer_entrypoint": "cargo +nightly install --path crates/frankensearch-fsfs",
+    "preflight_checks": [
+      "platform_support",
+      "disk_space",
+      "write_permission",
+      "network_reachability",
+      "existing_install_detection"
+    ],
+    "required_flags": [
+      "--version",
+      "--dest",
+      "--verify",
+      "--checksum",
+      "--easy-mode"
+    ],
+    "non_root_default": true,
+    "upgrade_entrypoint": "install.sh --version <tag> --verify"
+  },
+  "upgrade_policy": {
+    "version_resolution_order": [
+      "pinned",
+      "latest"
+    ],
+    "supported_upgrade_paths": [
+      "fresh_install",
+      "n-1_to_n",
+      "n-2_to_n"
+    ],
+    "rollback_behavior": {
+      "on_verification_failure": "abort_without_replacing_binary",
+      "on_post_install_failure": "restore_previous_binary_if_present",
+      "downgrade_support": "best_effort_with_clear_error"
+    }
+  },
+  "ci_jobs": {
+    "release_build_job": "release-build",
+    "release_publish_job": "release-publish",
+    "crates_publish_job": "publish-crates"
+  },
+  "reason_codes": [
+    "release.build.missing_target",
+    "release.package.checksum_failed",
+    "install.preflight.disk_space_low",
+    "install.verify.signature_missing",
+    "upgrade.apply.unsupported_path"
+  ]
+}

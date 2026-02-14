@@ -69,7 +69,7 @@ use crate::model_manifest::{
     feature = "download",
     any(feature = "model2vec", feature = "fastembed")
 ))]
-use crate::model_registry::ensure_model_storage_layout;
+use crate::model_registry::ensure_model_storage_layout_checked;
 #[cfg(feature = "model2vec")]
 use crate::model2vec_embedder::{
     Model2VecEmbedder, find_model_dir_with_hf_id as find_model2vec_model_dir,
@@ -856,14 +856,14 @@ fn maybe_lazy_quality_embedder(
     feature = "download",
     any(feature = "model2vec", feature = "fastembed")
 ))]
-fn install_destination_dir(model_root: Option<&Path>, model_name: &str) -> PathBuf {
+fn install_destination_dir(model_root: Option<&Path>, model_name: &str) -> SearchResult<PathBuf> {
     if let Some(root) = model_root {
         if root.ends_with(model_name) {
-            return root.to_path_buf();
+            return Ok(root.to_path_buf());
         }
-        return root.join(model_name);
+        return Ok(root.join(model_name));
     }
-    ensure_model_storage_layout().join(model_name)
+    Ok(ensure_model_storage_layout_checked()?.join(model_name))
 }
 
 #[cfg(all(
@@ -983,7 +983,7 @@ impl LazyModel2VecEmbedder {
         }
 
         let manifest = ModelManifest::potion_128m();
-        let destination = install_destination_dir(self.model_root.as_deref(), POTION_MODEL_NAME);
+        let destination = install_destination_dir(self.model_root.as_deref(), POTION_MODEL_NAME)?;
         download_and_install_manifest(cx, &manifest, &destination, self.policy).await?;
         Model2VecEmbedder::load_with_name(&destination, POTION_MODEL_NAME)
             .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
@@ -1080,7 +1080,7 @@ impl LazyFastEmbedEmbedder {
         }
 
         let manifest = ModelManifest::minilm_v2();
-        let destination = install_destination_dir(self.model_root.as_deref(), MINILM_MODEL_NAME);
+        let destination = install_destination_dir(self.model_root.as_deref(), MINILM_MODEL_NAME)?;
         download_and_install_manifest(cx, &manifest, &destination, self.policy).await?;
         FastEmbedEmbedder::load_with_name(&destination, MINILM_MODEL_NAME)
             .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
@@ -1507,7 +1507,7 @@ fn candidate_directories(
     let mut seen = BTreeSet::new();
     paths
         .into_iter()
-        .filter(|path| seen.insert(path.display().to_string()))
+        .filter(|path| seen.insert(path.clone()))
         .collect()
 }
 

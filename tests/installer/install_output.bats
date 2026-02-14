@@ -35,3 +35,17 @@ setup() {
   [ "$status" -eq 2 ]
   [[ "$output" == *"Unknown argument: --definitely-not-valid"* ]]
 }
+
+@test "install.sh --demo respects NO_COLOR without ANSI escapes" {
+  run env NO_COLOR=1 bash "$REPO_ROOT/install.sh" --demo --no-gum
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Installation Summary"* ]]
+  [[ "$output" != *$'\033'* ]]
+}
+
+@test "install.sh --demo degrades cleanly when piped (no ANSI escapes)" {
+  run bash -c "bash \"$REPO_ROOT/install.sh\" --demo --no-gum | cat"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Installation Summary"* ]]
+  [[ "$output" != *$'\033'* ]]
+}

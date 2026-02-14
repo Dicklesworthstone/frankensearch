@@ -90,6 +90,9 @@ pub struct ActionTimelineScreen {
     reason_filter_index: usize,
     host_filter_index: usize,
     severity_filter: SeverityFilter,
+    project_screen_id: ScreenId,
+    live_stream_screen_id: ScreenId,
+    analytics_screen_id: ScreenId,
 }
 
 impl ActionTimelineScreen {
@@ -104,13 +107,33 @@ impl ActionTimelineScreen {
             reason_filter_index: 0,
             host_filter_index: 0,
             severity_filter: SeverityFilter::All,
+            project_screen_id: ScreenId::new("ops.project"),
+            live_stream_screen_id: ScreenId::new("ops.live_stream"),
+            analytics_screen_id: ScreenId::new("ops.analytics"),
         }
+    }
+
+    /// Update the project-detail drilldown destination.
+    pub fn set_project_screen_id(&mut self, id: ScreenId) {
+        self.project_screen_id = id;
+    }
+
+    /// Update the live-stream drilldown destination.
+    pub fn set_live_stream_screen_id(&mut self, id: ScreenId) {
+        self.live_stream_screen_id = id;
+    }
+
+    /// Update the historical-analytics drilldown destination.
+    pub fn set_analytics_screen_id(&mut self, id: ScreenId) {
+        self.analytics_screen_id = id;
     }
 
     /// Update timeline data from shared app state.
     pub fn update_state(&mut self, state: &AppState) {
         let focused = self.selected_event_key();
+        let (project_filter, reason_filter, host_filter) = self.selected_filter_values();
         self.state = state.clone();
+        self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_event(focused);
     }
@@ -148,10 +171,15 @@ impl ActionTimelineScreen {
             .into_iter()
             .filter(|event| {
                 project_filter.is_none_or(|project| {
-                    self.project_for_instance(&event.instance_id)
-                        .is_some_and(|instance_project| {
-                            instance_project.eq_ignore_ascii_case(project)
-                        })
+                    if project.eq_ignore_ascii_case("unknown") {
+                        self.project_for_instance(&event.instance_id).is_none_or(
+                            |instance_project| instance_project.eq_ignore_ascii_case("unknown"),
+                        )
+                    } else {
+                        self.project_for_instance(&event.instance_id).is_some_and(
+                            |instance_project| instance_project.eq_ignore_ascii_case(project),
+                        )
+                    }
                 })
             })
             .filter(|event| self.severity_filter.allows(Self::event_severity(event)))
@@ -200,13 +228,18 @@ impl ActionTimelineScreen {
 
     fn project_filters(&self) -> Vec<String> {
         let mut values = vec!["all".to_owned()];
-        let projects: BTreeSet<_> = self
+        let mut projects: BTreeSet<_> = self
             .state
             .fleet()
             .instances
             .iter()
             .map(|instance| instance.project.clone())
             .collect();
+        projects.extend(self.state.fleet().lifecycle_events.iter().map(|event| {
+            self.project_for_instance(&event.instance_id)
+                .unwrap_or("unknown")
+                .to_owned()
+        }));
         values.extend(projects);
         values
     }
@@ -235,6 +268,45 @@ impl ActionTimelineScreen {
             .collect();
         values.extend(hosts);
         values
+    }
+
+    fn selected_filter_values(&self) -> (String, String, String) {
+        let project = self
+            .project_filters()
+            .get(self.project_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        let reason = self
+            .reason_filters()
+            .get(self.reason_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        let host = self
+            .host_filters()
+            .get(self.host_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        (project, reason, host)
+    }
+
+    fn restore_filter_indices(&mut self, project: &str, reason: &str, host: &str) {
+        let project_filters = self.project_filters();
+        self.project_filter_index = project_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(project))
+            .unwrap_or(0);
+
+        let reason_filters = self.reason_filters();
+        self.reason_filter_index = reason_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(reason))
+            .unwrap_or(0);
+
+        let host_filters = self.host_filters();
+        self.host_filter_index = host_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(host))
+            .unwrap_or(0);
     }
 
     fn clamp_filter_indices(&mut self) {
@@ -413,7 +485,7 @@ impl ActionTimelineScreen {
             .cloned()
             .unwrap_or_else(|| "all".to_owned());
         format!(
-            "filters: project={project}, severity={}, reason={reason}, host={host} | keys: p/s/r/h/x",
+            "filters: project={project}, severity={}, reason={reason}, host={host} | keys: p/s/r/h/x g/l/a",
             self.severity_filter.label()
         )
     }
@@ -456,6 +528,13 @@ impl ActionTimelineScreen {
             );
         }
         "focus: none".to_owned()
+    }
+
+    pub fn selected_project(&self) -> Option<String> {
+        self.filtered_events()
+            .get(self.selected_row)
+            .and_then(|event| self.project_for_instance(&event.instance_id))
+            .map(std::borrow::ToOwned::to_owned)
     }
 
     #[cfg(test)]
@@ -570,6 +649,24 @@ impl Screen for ActionTimelineScreen {
                 }
                 crossterm::event::KeyCode::Char('x') => {
                     self.reset_filters();
+                    return ScreenAction::Consumed;
+                }
+                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Enter => {
+                    if self.selected_project().is_some() {
+                        return ScreenAction::Navigate(self.project_screen_id.clone());
+                    }
+                    return ScreenAction::Consumed;
+                }
+                crossterm::event::KeyCode::Char('l') => {
+                    if self.event_count() > 0 {
+                        return ScreenAction::Navigate(self.live_stream_screen_id.clone());
+                    }
+                    return ScreenAction::Consumed;
+                }
+                crossterm::event::KeyCode::Char('a') => {
+                    if self.event_count() > 0 {
+                        return ScreenAction::Navigate(self.analytics_screen_id.clone());
+                    }
                     return ScreenAction::Consumed;
                 }
                 _ => {}
@@ -801,5 +898,253 @@ mod tests {
         assert!(focus.contains("reason="));
         assert!(stream.contains("stream: health="));
         assert!(stream.contains("lag="));
+    }
+
+    #[test]
+    fn timeline_drilldown_keys_navigate_to_targets() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.set_project_screen_id(ScreenId::new("ops.project.custom"));
+        screen.set_live_stream_screen_id(ScreenId::new("ops.stream.custom"));
+        screen.set_analytics_screen_id(ScreenId::new("ops.analytics.custom"));
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let project = InputEvent::Key(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&project, &ctx),
+            ScreenAction::Navigate(ScreenId::new("ops.project.custom"))
+        );
+
+        let project_enter = InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&project_enter, &ctx),
+            ScreenAction::Navigate(ScreenId::new("ops.project.custom"))
+        );
+
+        let stream = InputEvent::Key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&stream, &ctx),
+            ScreenAction::Navigate(ScreenId::new("ops.stream.custom"))
+        );
+
+        let analytics = InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&analytics, &ctx),
+            ScreenAction::Navigate(ScreenId::new("ops.analytics.custom"))
+        );
+    }
+
+    #[test]
+    fn timeline_drilldown_keys_are_consumed_when_no_rows_exist() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&AppState::new());
+        let ctx = screen_context();
+
+        let project = InputEvent::Key(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&project, &ctx), ScreenAction::Consumed);
+
+        let project_enter = InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&project_enter, &ctx),
+            ScreenAction::Consumed
+        );
+
+        let stream = InputEvent::Key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&stream, &ctx), ScreenAction::Consumed);
+
+        let analytics = InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&analytics, &ctx),
+            ScreenAction::Consumed
+        );
+    }
+
+    #[test]
+    fn timeline_update_state_preserves_filter_value_when_new_option_is_inserted() {
+        let mut screen = ActionTimelineScreen::new();
+        let mut state = sample_state();
+        screen.update_state(&state);
+
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "proj-b")
+            .expect("project filter should exist");
+
+        state.update_fleet(crate::state::FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "host-a:inst-a".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(10),
+                    healthy: true,
+                    doc_count: 10,
+                    pending_jobs: 0,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-b:inst-b".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(11),
+                    healthy: false,
+                    doc_count: 20,
+                    pending_jobs: 2,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-a:inst-c".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(12),
+                    healthy: false,
+                    doc_count: 30,
+                    pending_jobs: 4,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-z:inst-z".to_owned(),
+                    project: "proj-aa".to_owned(),
+                    pid: Some(13),
+                    healthy: true,
+                    doc_count: 8,
+                    pending_jobs: 0,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:inst-a".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.heartbeat".to_owned(),
+                    at_ms: 1_000_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:inst-b".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 970_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+                LifecycleEvent {
+                    instance_id: "host-a:inst-c".to_owned(),
+                    from: LifecycleState::Recovering,
+                    to: LifecycleState::Stopped,
+                    reason_code: "lifecycle.discovery.stop".to_owned(),
+                    at_ms: 100_000,
+                    attribution_confidence_score: 60,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-z:inst-z".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.heartbeat".to_owned(),
+                    at_ms: 950_000,
+                    attribution_confidence_score: 88,
+                    attribution_collision: false,
+                },
+            ],
+            ..crate::state::FleetSnapshot::default()
+        });
+
+        screen.update_state(&state);
+
+        let selected_project = screen
+            .project_filters()
+            .get(screen.project_filter_index)
+            .cloned();
+        assert_eq!(selected_project.as_deref(), Some("proj-b"));
+    }
+
+    #[test]
+    fn timeline_project_filter_supports_unknown_orphan_events() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.lifecycle_events.push(LifecycleEvent {
+            instance_id: "orphan-host:missing-inst".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Stale,
+            reason_code: "lifecycle.instance.orphan".to_owned(),
+            at_ms: 1_200_000,
+            attribution_confidence_score: 40,
+            attribution_collision: false,
+        });
+        state.update_fleet(fleet);
+
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&state);
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "unknown")
+            .expect("unknown project filter should exist");
+
+        let orphan_events = screen.filtered_events();
+        assert_eq!(orphan_events.len(), 1);
+        assert_eq!(orphan_events[0].instance_id, "orphan-host:missing-inst");
+    }
+
+    #[test]
+    fn timeline_unknown_filter_includes_real_unknown_project_instances() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.instances.push(crate::state::InstanceInfo {
+            id: "host-u:unknown-1".to_owned(),
+            project: "unknown".to_owned(),
+            pid: Some(77),
+            healthy: true,
+            doc_count: 11,
+            pending_jobs: 0,
+        });
+        fleet.lifecycle_events.push(LifecycleEvent {
+            instance_id: "host-u:unknown-1".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "lifecycle.discovery.heartbeat".to_owned(),
+            at_ms: 1_300_000,
+            attribution_confidence_score: 95,
+            attribution_collision: false,
+        });
+        state.update_fleet(fleet);
+
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&state);
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "unknown")
+            .expect("unknown project filter should exist");
+
+        let events = screen.filtered_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.instance_id == "host-u:unknown-1"),
+            "unknown filter should include events for real projects named unknown"
+        );
     }
 }

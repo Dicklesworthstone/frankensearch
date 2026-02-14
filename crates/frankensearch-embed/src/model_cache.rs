@@ -8,25 +8,22 @@
 //! 4. `~/Library/Application Support/frankensearch/models/` — macOS (when XDG unset)
 //! 5. `~/.local/share/frankensearch/models/` — POSIX fallback
 //!
-//! Within the cache root, each model gets a versioned subdirectory:
+//! Within the cache root, each model gets a base directory. Versioned
+//! subdirectories are also provisioned for forward-compatible migrations:
 //!
 //! ```text
 //! <root>/
 //!   potion-base-128M/
+//!   all-MiniLM-L6-v2/
+//!     onnx/model.onnx
+//!     tokenizer.json
+//!     config.json
+//!     manifest.json
+//!   potion-base-128M/
 //!     v1/
 //!       model.safetensors
 //!       tokenizer.json
-//!       manifest.json
-//!   all-MiniLM-L6-v2/
-//!     v1/
-//!       onnx/model.onnx
-//!       tokenizer.json
 //!       config.json
-//!       manifest.json
-//!   ms-marco-MiniLM-L-6-v2/
-//!     v1/
-//!       onnx/model.onnx
-//!       tokenizer.json
 //!       manifest.json
 //! ```
 
@@ -168,7 +165,7 @@ pub struct ModelDirEntry {
     pub name: String,
     /// Version tag.
     pub version: String,
-    /// Full path to the versioned directory.
+    /// Full path to the model base directory.
     pub path: PathBuf,
 }
 
@@ -181,7 +178,7 @@ impl ModelCacheLayout {
             .map(|m| ModelDirEntry {
                 name: m.dir_name.to_string(),
                 version: m.version.to_string(),
-                path: root.join(m.dir_name).join(m.version),
+                path: root.join(m.dir_name),
             })
             .collect();
         Self { root, model_dirs }
@@ -193,13 +190,22 @@ impl ModelCacheLayout {
         Self::for_root(resolve_cache_root())
     }
 
-    /// Get the versioned path for a model by directory name.
+    /// Get the base path for a model by directory name.
     #[must_use]
     pub fn model_path(&self, dir_name: &str) -> Option<&Path> {
         self.model_dirs
             .iter()
             .find(|e| e.name == dir_name)
             .map(|e| e.path.as_path())
+    }
+
+    /// Get the versioned path for a model by directory name.
+    #[must_use]
+    pub fn versioned_model_path(&self, dir_name: &str) -> Option<PathBuf> {
+        self.model_dirs
+            .iter()
+            .find(|e| e.name == dir_name)
+            .map(|e| e.path.join(&e.version))
     }
 
     /// Get the model's parent directory (without the version suffix).
@@ -227,6 +233,7 @@ pub fn ensure_cache_layout(layout: &ModelCacheLayout) -> SearchResult<()> {
 
     for entry in &layout.model_dirs {
         std::fs::create_dir_all(&entry.path)?;
+        std::fs::create_dir_all(entry.path.join(&entry.version))?;
     }
 
     Ok(())
@@ -266,9 +273,15 @@ pub fn is_model_installed(model_versioned_dir: &Path, required_files: &[&str]) -
     if !model_versioned_dir.is_dir() {
         return false;
     }
-    required_files
+    let all_present_in = |dir: &Path| required_files.iter().all(|f| dir.join(f).is_file());
+    if all_present_in(model_versioned_dir) {
+        return true;
+    }
+    let version_fallbacks = ["v1", "v2"];
+    version_fallbacks
         .iter()
-        .all(|f| model_versioned_dir.join(f).is_file())
+        .map(|version| model_versioned_dir.join(version))
+        .any(|candidate| candidate.is_dir() && all_present_in(&candidate))
 }
 
 // ─── Environment Abstraction (for testing) ─────────────────────────────────
@@ -357,16 +370,20 @@ mod tests {
             .find(|e| e.name == "potion-base-128M")
             .expect("potion entry");
         assert_eq!(potion.version, "v1");
-        assert_eq!(
-            potion.path,
-            PathBuf::from("/test/models/potion-base-128M/v1")
-        );
+        assert_eq!(potion.path, PathBuf::from("/test/models/potion-base-128M"));
     }
 
     #[test]
-    fn layout_model_path_returns_versioned_path() {
+    fn layout_model_path_returns_base_path() {
         let layout = ModelCacheLayout::for_root(PathBuf::from("/m"));
         let path = layout.model_path("all-MiniLM-L6-v2").unwrap();
+        assert_eq!(path, Path::new("/m/all-MiniLM-L6-v2"));
+    }
+
+    #[test]
+    fn layout_versioned_model_path_returns_versioned_path() {
+        let layout = ModelCacheLayout::for_root(PathBuf::from("/m"));
+        let path = layout.versioned_model_path("all-MiniLM-L6-v2").unwrap();
         assert_eq!(path, Path::new("/m/all-MiniLM-L6-v2/v1"));
     }
 
@@ -389,7 +406,7 @@ mod tests {
         let path = model_file_path(&layout, "all-MiniLM-L6-v2", "onnx/model.onnx");
         assert_eq!(
             path,
-            Some(PathBuf::from("/cache/all-MiniLM-L6-v2/v1/onnx/model.onnx"))
+            Some(PathBuf::from("/cache/all-MiniLM-L6-v2/onnx/model.onnx"))
         );
     }
 
@@ -411,6 +428,11 @@ mod tests {
                 entry.path.is_dir(),
                 "expected dir: {}",
                 entry.path.display()
+            );
+            assert!(
+                entry.path.join(&entry.version).is_dir(),
+                "expected version dir: {}",
+                entry.path.join(&entry.version).display()
             );
         }
     }
@@ -439,7 +461,22 @@ mod tests {
         // Verify all model dirs were created.
         for entry in &layout.model_dirs {
             assert!(entry.path.is_dir());
+            assert!(entry.path.join(&entry.version).is_dir());
         }
+    }
+
+    #[test]
+    fn is_model_installed_accepts_base_dir_with_version_subdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_base = temp.path().join("model");
+        let versioned = model_base.join("v1");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::write(versioned.join("tokenizer.json"), b"stub").unwrap();
+        std::fs::write(versioned.join("model.onnx"), b"stub").unwrap();
+        assert!(is_model_installed(
+            &model_base,
+            &["tokenizer.json", "model.onnx"]
+        ));
     }
 
     #[test]

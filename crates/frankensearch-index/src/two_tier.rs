@@ -468,10 +468,29 @@ fn maybe_load_or_build_ann(
         return None;
     }
 
+    let ann_config = HnswConfig {
+        m: config.hnsw_m,
+        ef_construction: config.hnsw_ef_construction,
+        ef_search: config.hnsw_ef_search,
+        max_layer: HNSW_DEFAULT_MAX_LAYER,
+    };
+
     if ann_path.exists() {
         match HnswIndex::load(ann_path) {
             Ok(ann) => match ann.matches_vector_index(vector_index) {
-                Ok(true) => return Some(ann),
+                Ok(true) => {
+                    let loaded_config = ann.config();
+                    if loaded_config == ann_config {
+                        return Some(ann);
+                    }
+                    warn!(
+                        tier,
+                        ann_path = %ann_path.display(),
+                        ?loaded_config,
+                        ?ann_config,
+                        "ANN sidecar config differs from requested config; rebuilding"
+                    );
+                }
                 Ok(false) => {
                     warn!(
                         tier,
@@ -499,12 +518,6 @@ fn maybe_load_or_build_ann(
         }
     }
 
-    let ann_config = HnswConfig {
-        m: config.hnsw_m,
-        ef_construction: config.hnsw_ef_construction,
-        ef_search: config.hnsw_ef_search,
-        max_layer: HNSW_DEFAULT_MAX_LAYER,
-    };
     let ann = match HnswIndex::build_from_vector_index(vector_index, ann_config) {
         Ok(ann) => ann,
         Err(error) => {
@@ -746,5 +759,56 @@ mod tests {
         let index = TwoTierIndex::open(&dir, config).expect("open");
         assert!(!index.has_fast_ann());
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_sidecar_rebuilds_when_config_changes() {
+        let dir = temp_index_dir("ann-rebuild-config");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        let initial = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_m: 8,
+            hnsw_ef_construction: 64,
+            hnsw_ef_search: 16,
+            ..TwoTierConfig::default()
+        };
+        let first_open = TwoTierIndex::open(&dir, initial).expect("open with initial ann config");
+        assert!(first_open.has_fast_ann());
+
+        let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
+        let before = HnswIndex::load(&ann_path).expect("load initial ann sidecar");
+        let before_config = before.config();
+        assert_eq!(before_config.m, 8);
+        assert_eq!(before_config.ef_construction, 64);
+        assert_eq!(before_config.ef_search, 16);
+
+        let updated = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_m: 24,
+            hnsw_ef_construction: 96,
+            hnsw_ef_search: 48,
+            ..TwoTierConfig::default()
+        };
+        let second_open = TwoTierIndex::open(&dir, updated).expect("open with updated ann config");
+        assert!(second_open.has_fast_ann());
+
+        let after = HnswIndex::load(&ann_path).expect("load rebuilt ann sidecar");
+        let after_config = after.config();
+        assert_eq!(after_config.m, 24);
+        assert_eq!(after_config.ef_construction, 96);
+        assert_eq!(after_config.ef_search, 48);
     }
 }

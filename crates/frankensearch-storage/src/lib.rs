@@ -13,6 +13,7 @@ pub mod content_hash;
 pub mod document;
 #[cfg(feature = "fts5")]
 pub mod fts5_adapter;
+pub mod history;
 pub mod index_metadata;
 pub mod job_queue;
 pub mod metrics;
@@ -32,6 +33,11 @@ pub use document::{
 #[cfg(feature = "fts5")]
 pub use fts5_adapter::{
     Fts5AdapterConfig, Fts5ContentMode, Fts5Hit, Fts5LexicalSearch, Fts5TokenizerChoice,
+};
+pub use history::{
+    Bookmark, SearchHistoryEntry, add_bookmark, count_bookmarks, count_search_history,
+    is_bookmarked, list_bookmarks, list_search_history, record_search, remove_bookmark,
+    remove_bookmark_by_doc, search_history_prefix, truncate_search_history,
 };
 pub use index_metadata::{
     BuildTrigger, IndexBuildRecord, IndexMetadata, RecordBuildParams, StalenessCheck,

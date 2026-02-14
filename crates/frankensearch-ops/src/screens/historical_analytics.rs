@@ -168,8 +168,10 @@ impl HistoricalAnalyticsScreen {
     /// Update state from the shared app snapshot.
     pub fn update_state(&mut self, state: &AppState) {
         let focused = self.selected_evidence_key();
+        let (project_filter, reason_filter, host_filter) = self.selected_filter_values();
         self.state = state.clone();
         self.rebuild_derived_rows();
+        self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_row(focused);
     }
@@ -177,19 +179,28 @@ impl HistoricalAnalyticsScreen {
     /// Selected project from the evidence table.
     #[must_use]
     pub fn selected_project(&self) -> Option<String> {
-        self.selected_snapshot_payload()
-            .map(|payload| payload.project)
+        let rows = self.filtered_evidence_rows();
+        let row = rows.get(self.selected_row)?;
+        self.project_lookup.get(&row.instance_id).cloned()
     }
 
+    fn selected_replay_target_for_rows(&self, rows: &[EvidenceRow]) -> Option<ReplayTarget> {
+        self.selected_snapshot_payload_for_rows(rows)
+            .map(|payload| ReplayTarget {
+                project: payload.project,
+                instance_id: payload.instance_id,
+                replay_handle: payload.replay_handle,
+            })
+    }
+
+    #[cfg(test)]
     #[must_use]
     fn selected_replay_target(&self) -> Option<ReplayTarget> {
-        self.selected_snapshot_payload().map(|payload| ReplayTarget {
-            project: payload.project,
-            instance_id: payload.instance_id,
-            replay_handle: payload.replay_handle,
-        })
+        let rows = self.filtered_evidence_rows();
+        self.selected_replay_target_for_rows(&rows)
     }
 
+    #[cfg(test)]
     #[must_use]
     fn selected_snapshot_payload(&self) -> Option<SnapshotExportPayload> {
         let rows = self.filtered_evidence_rows();
@@ -321,6 +332,45 @@ impl HistoricalAnalyticsScreen {
             .collect();
         values.extend(hosts);
         values
+    }
+
+    fn selected_filter_values(&self) -> (String, String, String) {
+        let project = self
+            .project_filters()
+            .get(self.project_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        let reason = self
+            .reason_filters()
+            .get(self.reason_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        let host = self
+            .host_filters()
+            .get(self.host_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
+        (project, reason, host)
+    }
+
+    fn restore_filter_indices(&mut self, project: &str, reason: &str, host: &str) {
+        let project_filters = self.project_filters();
+        self.project_filter_index = project_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(project))
+            .unwrap_or(0);
+
+        let reason_filters = self.reason_filters();
+        self.reason_filter_index = reason_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(reason))
+            .unwrap_or(0);
+
+        let host_filters = self.host_filters();
+        self.host_filter_index = host_filters
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(host))
+            .unwrap_or(0);
     }
 
     fn selected_evidence_key(&self) -> Option<(u64, String, String)> {
@@ -578,7 +628,10 @@ impl HistoricalAnalyticsScreen {
         "snapshot: no evidence row selected".to_owned()
     }
 
-    fn selected_snapshot_payload_for_rows(&self, rows: &[EvidenceRow]) -> Option<SnapshotExportPayload> {
+    fn selected_snapshot_payload_for_rows(
+        &self,
+        rows: &[EvidenceRow],
+    ) -> Option<SnapshotExportPayload> {
         let row = rows.get(self.selected_row)?;
         Some(SnapshotExportPayload {
             mode: SnapshotExportMode::from_compact(self.compact_export),
@@ -588,8 +641,31 @@ impl HistoricalAnalyticsScreen {
             ts_ms: row.ts_ms,
             reason_code: row.reason_code.clone(),
             confidence: row.confidence,
-            replay_handle: row.replay_handle.clone(),
+            replay_handle: Self::normalize_replay_handle(row),
         })
+    }
+
+    fn normalize_replay_handle(row: &EvidenceRow) -> String {
+        let trimmed = row.replay_handle.trim();
+        if trimmed.is_empty() {
+            return Self::fallback_replay_handle(row);
+        }
+        if trimmed.starts_with("replay:") || trimmed.starts_with("file:") || trimmed.contains("://")
+        {
+            return trimmed.to_owned();
+        }
+
+        format!(
+            "replay://legacy/{}/{}/{}/{}/{}",
+            row.project, row.host, row.instance_id, row.ts_ms, trimmed
+        )
+    }
+
+    fn fallback_replay_handle(row: &EvidenceRow) -> String {
+        format!(
+            "replay://{}/{}/{}/{}",
+            row.project, row.host, row.instance_id, row.ts_ms
+        )
     }
 
     fn filter_summary(&self) -> String {
@@ -710,7 +786,7 @@ impl Screen for HistoricalAnalyticsScreen {
     fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
         let evidence = self.filtered_evidence_rows();
         let correlation = self.correlation_rows_for_rows(&evidence);
-        let replay_summary = self.selected_replay_target().map_or_else(
+        let replay_summary = self.selected_replay_target_for_rows(&evidence).map_or_else(
             || "selected_replay: none".to_owned(),
             |target| {
                 format!(
@@ -1177,6 +1253,242 @@ mod tests {
         screen.update_state(&AppState::new());
         assert!(screen.selected_snapshot_payload().is_none());
         assert!(screen.selected_replay_target().is_none());
-        assert_eq!(screen.export_snapshot_line(), "snapshot: no evidence row selected");
+        assert_eq!(
+            screen.export_snapshot_line(),
+            "snapshot: no evidence row selected"
+        );
+    }
+
+    #[test]
+    fn selected_snapshot_payload_normalizes_missing_replay_handle() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.evidence_rows[0].replay_handle.clear();
+
+        let payload = screen
+            .selected_snapshot_payload()
+            .expect("payload should still exist with fallback replay handle");
+        assert!(payload.replay_handle.starts_with("replay://"));
+        assert!(payload.replay_handle.contains(&payload.project));
+        assert!(payload.replay_handle.contains(&payload.instance_id));
+    }
+
+    #[test]
+    fn selected_snapshot_payload_normalizes_legacy_replay_handle() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.evidence_rows[0].replay_handle = "legacy-handle".to_owned();
+
+        let payload = screen
+            .selected_snapshot_payload()
+            .expect("payload should exist with normalized legacy replay handle");
+        assert!(payload.replay_handle.starts_with("replay://legacy/"));
+        assert!(payload.replay_handle.contains(&payload.host));
+        assert!(payload.replay_handle.ends_with("/legacy-handle"));
+    }
+
+    #[test]
+    fn selected_snapshot_payload_preserves_existing_uri_scheme() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.evidence_rows[0].replay_handle = "artifact://bundle/segment/42".to_owned();
+
+        let payload = screen
+            .selected_snapshot_payload()
+            .expect("payload should preserve existing uri-schemed replay handle");
+        assert_eq!(payload.replay_handle, "artifact://bundle/segment/42");
+    }
+
+    #[test]
+    fn selected_project_ignores_unknown_sentinel_rows() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.lifecycle_events.push(LifecycleEvent {
+            instance_id: "orphan-host:missing-inst".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Stale,
+            reason_code: "lifecycle.instance.orphan".to_owned(),
+            at_ms: 12_500,
+            attribution_confidence_score: 40,
+            attribution_collision: false,
+        });
+        state.update_fleet(fleet);
+
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&state);
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "unknown")
+            .expect("unknown project filter should exist");
+
+        assert_eq!(
+            screen.selected_project(),
+            None,
+            "unknown sentinel should not be forwarded as a project drilldown target"
+        );
+    }
+
+    #[test]
+    fn selected_project_allows_real_unknown_project_name() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.instances.push(InstanceInfo {
+            id: "host-u:unknown-1".to_owned(),
+            project: "unknown".to_owned(),
+            pid: Some(99),
+            healthy: true,
+            doc_count: 12,
+            pending_jobs: 0,
+        });
+        fleet.lifecycle_events.insert(
+            0,
+            LifecycleEvent {
+                instance_id: "host-u:unknown-1".to_owned(),
+                from: LifecycleState::Started,
+                to: LifecycleState::Healthy,
+                reason_code: "lifecycle.discovery.ready".to_owned(),
+                at_ms: 13_000,
+                attribution_confidence_score: 96,
+                attribution_collision: false,
+            },
+        );
+        state.update_fleet(fleet);
+
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&state);
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "unknown")
+            .expect("unknown project filter should exist");
+
+        assert_eq!(
+            screen.selected_project().as_deref(),
+            Some("unknown"),
+            "real project names should not be dropped as sentinel values"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_update_state_preserves_filter_value_when_new_option_is_inserted() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot {
+            instances: vec![
+                InstanceInfo {
+                    id: "host-a:alpha-1".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(11),
+                    healthy: true,
+                    doc_count: 140,
+                    pending_jobs: 1,
+                },
+                InstanceInfo {
+                    id: "host-b:beta-1".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(12),
+                    healthy: false,
+                    doc_count: 90,
+                    pending_jobs: 4,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:alpha-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 12_000,
+                    attribution_confidence_score: 95,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:beta-1".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 10_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+        screen.update_state(&state);
+
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "proj-b")
+            .expect("project filter should exist");
+
+        state.update_fleet(FleetSnapshot {
+            instances: vec![
+                InstanceInfo {
+                    id: "host-a:alpha-1".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(11),
+                    healthy: true,
+                    doc_count: 140,
+                    pending_jobs: 1,
+                },
+                InstanceInfo {
+                    id: "host-b:beta-1".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(12),
+                    healthy: false,
+                    doc_count: 90,
+                    pending_jobs: 4,
+                },
+                InstanceInfo {
+                    id: "host-z:zeta-1".to_owned(),
+                    project: "proj-aa".to_owned(),
+                    pid: Some(13),
+                    healthy: true,
+                    doc_count: 20,
+                    pending_jobs: 0,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:alpha-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 12_000,
+                    attribution_confidence_score: 95,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:beta-1".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 10_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+                LifecycleEvent {
+                    instance_id: "host-z:zeta-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 9_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+
+        screen.update_state(&state);
+
+        let selected_project = screen
+            .project_filters()
+            .get(screen.project_filter_index)
+            .cloned();
+        assert_eq!(selected_project.as_deref(), Some("proj-b"));
     }
 }

@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 
 use frankensearch_fsfs::{
-    ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE,
-    LeverSnapshot, OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol,
-    OpportunityCandidate, OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind,
-    ProfileWorkflow,
+    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, ITERATION_REASON_ACCEPTED,
+    ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE, LeverSnapshot,
+    OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol, OpportunityCandidate,
+    OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind, ProfileWorkflow,
+    crawl_ingest_optimization_track,
 };
 
 #[test]
@@ -66,6 +67,42 @@ fn opportunity_matrix_emits_deterministic_ranking_table() {
     assert_eq!(ranked[2].rank, 3);
     assert!(ranked[0].ice_score_per_mille >= ranked[1].ice_score_per_mille);
     assert!(ranked[1].ice_score_per_mille >= ranked[2].ice_score_per_mille);
+}
+
+#[test]
+fn crawl_ingest_track_is_ranked_and_guarded() {
+    let track = crawl_ingest_optimization_track();
+    assert_eq!(track.schema_version, CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION);
+    assert_eq!(track.hotspots.len(), 5);
+    assert_eq!(track.hotspots[0].rank, 1);
+    assert!(
+        track.hotspots[0].expected_p95_gain_pct >= track.hotspots[0].expected_p50_gain_pct,
+        "top hotspot p95 gain should be >= p50 gain"
+    );
+
+    let hotspot_ids: BTreeSet<&str> = track
+        .hotspots
+        .iter()
+        .map(|hotspot| hotspot.lever_id.as_str())
+        .collect();
+
+    assert_eq!(track.proof_checklist.len(), hotspot_ids.len());
+    assert_eq!(track.rollback_guardrails.len(), hotspot_ids.len());
+
+    for proof in &track.proof_checklist {
+        assert!(hotspot_ids.contains(proof.lever_id.as_str()));
+        assert!(!proof.required_invariants.is_empty());
+        assert!(proof.replay_command.contains("--lane ingest"));
+    }
+
+    for guardrail in &track.rollback_guardrails {
+        assert!(hotspot_ids.contains(guardrail.lever_id.as_str()));
+        assert!(
+            guardrail.rollback_command.contains("fsfs profile rollback"),
+            "rollback command must be explicit"
+        );
+        assert!(!guardrail.abort_reason_codes.is_empty());
+    }
 }
 
 #[test]

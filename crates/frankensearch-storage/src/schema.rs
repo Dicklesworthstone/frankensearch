@@ -4,7 +4,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 struct Migration {
     version: i64,
@@ -101,6 +101,26 @@ const LATEST_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON embedding_jobs(status, priority DESC, submitted_at ASC) WHERE status = 'pending';",
     "CREATE INDEX IF NOT EXISTS idx_jobs_processing ON embedding_jobs(status, started_at) WHERE status = 'processing';",
     "CREATE INDEX IF NOT EXISTS idx_build_history_index ON index_build_history(index_name, built_at DESC);",
+    "CREATE TABLE IF NOT EXISTS search_history (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        query TEXT NOT NULL,\
+        query_class TEXT,\
+        result_count INTEGER,\
+        phase1_latency_ms INTEGER,\
+        phase2_latency_ms INTEGER,\
+        top_results_json TEXT,\
+        searched_at INTEGER NOT NULL\
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_history_query ON search_history(query);",
+    "CREATE INDEX IF NOT EXISTS idx_history_ts ON search_history(searched_at DESC);",
+    "CREATE TABLE IF NOT EXISTS bookmarks (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        doc_id TEXT NOT NULL,\
+        query TEXT,\
+        note TEXT,\
+        created_at INTEGER NOT NULL\
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_bookmarks_doc_query ON bookmarks(doc_id, query);",
 ];
 
 const MIGRATIONS: &[Migration] = &[
@@ -265,6 +285,31 @@ const MIGRATIONS: &[Migration] = &[
                 variance REAL\
             );",
             "CREATE INDEX IF NOT EXISTS idx_build_history_index ON index_build_history(index_name, built_at DESC);",
+        ],
+    },
+    Migration {
+        version: 6,
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS search_history (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                query TEXT NOT NULL,\
+                query_class TEXT,\
+                result_count INTEGER,\
+                phase1_latency_ms INTEGER,\
+                phase2_latency_ms INTEGER,\
+                top_results_json TEXT,\
+                searched_at INTEGER NOT NULL\
+            );",
+            "CREATE INDEX IF NOT EXISTS idx_history_query ON search_history(query);",
+            "CREATE INDEX IF NOT EXISTS idx_history_ts ON search_history(searched_at DESC);",
+            "CREATE TABLE IF NOT EXISTS bookmarks (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                doc_id TEXT NOT NULL,\
+                query TEXT,\
+                note TEXT,\
+                created_at INTEGER NOT NULL\
+            );",
+            "CREATE INDEX IF NOT EXISTS idx_bookmarks_doc_query ON bookmarks(doc_id, query);",
         ],
     },
 ];
@@ -487,8 +532,8 @@ mod tests {
             SCHEMA_VERSION
         );
         assert!(
-            index_exists(&conn, "idx_build_history_index"),
-            "migration should create latest build history index"
+            index_exists(&conn, "idx_history_query"),
+            "migration should create search history index"
         );
     }
 

@@ -8,11 +8,12 @@
 use std::collections::BTreeMap;
 
 use frankensearch_core::{
-    ArtifactEntry, ClockMode, Correlation, DeterminismTier, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
-    E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
-    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity,
-    EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
-    Suite, validate_event_envelope, validate_manifest_envelope,
+    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
+    E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody,
+    ModelVersion, Platform, ReplayBody, ReplayEventType, Suite, build_artifact_entries,
+    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,16 @@ pub const CLI_E2E_REASON_SCENARIO_START: &str = "e2e.cli.scenario_start";
 pub const CLI_E2E_REASON_SCENARIO_PASS: &str = "e2e.cli.scenario_pass";
 /// Stable reason code for degraded scenario assertions.
 pub const CLI_E2E_REASON_SCENARIO_DEGRADE: &str = "e2e.cli.degrade_path";
+/// Stable reason code for permission-denied chaos assertions.
+pub const CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED: &str = "e2e.fs_permission.denied";
+/// Stable reason code for symlink-loop chaos assertions.
+pub const CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP: &str = "e2e.fs_symlink.loop";
+/// Stable reason code for mount-boundary chaos assertions.
+pub const CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY: &str = "e2e.fs_mount.boundary";
+/// Stable reason code for giant-log chaos assertions.
+pub const CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED: &str = "e2e.fs_skip.giant_log";
+/// Stable reason code for binary-blob chaos assertions.
+pub const CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED: &str = "e2e.fs_skip.binary_blob";
 
 /// CLI scenario category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -185,7 +196,7 @@ impl CliE2eArtifactBundle {
                 platform: config.platform.clone(),
                 clock_mode: ClockMode::Simulated,
                 tie_break_policy: "doc_id_lexical".to_owned(),
-                artifacts: artifact_entries(&replay_command, events.len()),
+                artifacts: artifact_entries(&replay_command, &events),
                 duration_ms: 250,
                 exit_status,
             },
@@ -286,35 +297,149 @@ pub fn build_default_cli_e2e_bundles(config: &CliE2eRunConfig) -> Vec<CliE2eArti
     default_cli_e2e_scenarios()
         .into_iter()
         .map(|scenario| {
-            let exit_status = if scenario.kind == CliE2eScenarioKind::Degrade {
-                ExitStatus::Fail
-            } else {
-                ExitStatus::Pass
-            };
+            let exit_status = scenario_exit_status(&scenario);
             CliE2eArtifactBundle::build(config, &scenario, exit_status)
         })
         .collect()
 }
 
-fn artifact_entries(replay_command: &str, event_count: usize) -> Vec<ArtifactEntry> {
-    let checksum = |file: &str| format!("sha256:{:0>64}", file.len() + replay_command.len());
+/// Deterministic filesystem-chaos scenario catalog for CLI mode E2E.
+///
+/// These scenarios encode expected reason-code behavior for filesystem edge
+/// cases (permissions, symlink loops, mount boundaries, and high-cost skips).
+#[must_use]
+pub fn default_cli_e2e_filesystem_chaos_scenarios() -> Vec<CliE2eScenario> {
     vec![
-        ArtifactEntry {
-            file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
-            checksum: checksum(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL),
-            line_count: Some(event_count as u64),
+        CliE2eScenario {
+            id: "cli-chaos-permission-denied".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![
+                "index".to_owned(),
+                "--roots".to_owned(),
+                "/tmp/fsfs-chaos/permission-denied".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED.to_owned(),
+            summary: "Handle unreadable directories with deterministic reason codes".to_owned(),
         },
-        ArtifactEntry {
-            file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
-            checksum: checksum(E2E_ARTIFACT_ARTIFACTS_INDEX_JSON),
-            line_count: None,
+        CliE2eScenario {
+            id: "cli-chaos-symlink-loop".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![
+                "index".to_owned(),
+                "--roots".to_owned(),
+                "/tmp/fsfs-chaos/symlink-loop".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP.to_owned(),
+            summary: "Detect symlink loops without non-deterministic traversal".to_owned(),
         },
-        ArtifactEntry {
-            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT.to_owned(),
-            checksum: checksum(E2E_ARTIFACT_REPLAY_COMMAND_TXT),
-            line_count: None,
+        CliE2eScenario {
+            id: "cli-chaos-mount-boundary".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![
+                "index".to_owned(),
+                "--roots".to_owned(),
+                "/tmp/fsfs-chaos/mount-boundary".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY.to_owned(),
+            summary: "Respect configured mount boundaries during discovery".to_owned(),
+        },
+        CliE2eScenario {
+            id: "cli-chaos-giant-log-skip".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![
+                "index".to_owned(),
+                "--roots".to_owned(),
+                "/tmp/fsfs-chaos/giant-logs".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED.to_owned(),
+            summary: "Skip giant log artifacts with explicit degradation reason".to_owned(),
+        },
+        CliE2eScenario {
+            id: "cli-chaos-binary-blob-skip".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![
+                "index".to_owned(),
+                "--roots".to_owned(),
+                "/tmp/fsfs-chaos/binary-blobs".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED.to_owned(),
+            summary: "Skip binary blobs with deterministic policy evidence".to_owned(),
         },
     ]
+}
+
+/// Build bundles for the filesystem-chaos scenario catalog.
+#[must_use]
+pub fn build_cli_e2e_filesystem_chaos_bundles(
+    config: &CliE2eRunConfig,
+) -> Vec<CliE2eArtifactBundle> {
+    default_cli_e2e_filesystem_chaos_scenarios()
+        .into_iter()
+        .map(|scenario| {
+            let exit_status = scenario_exit_status(&scenario);
+            CliE2eArtifactBundle::build(config, &scenario, exit_status)
+        })
+        .collect()
+}
+
+#[must_use]
+const fn scenario_exit_status(scenario: &CliE2eScenario) -> ExitStatus {
+    if scenario.expected_exit_code == 0 {
+        ExitStatus::Pass
+    } else {
+        ExitStatus::Fail
+    }
+}
+
+fn artifact_entries(replay_command: &str, events: &[E2eEnvelope<EventBody>]) -> Vec<ArtifactEntry> {
+    let structured_events_jsonl = render_events_jsonl(events);
+    #[allow(clippy::cast_possible_truncation)]
+    let line_count = u64::try_from(events.len()).expect("event count must fit in u64");
+    let mut entries = build_artifact_entries([
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            bytes: structured_events_jsonl.as_bytes(),
+            line_count: Some(line_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+            bytes: replay_command.as_bytes(),
+            line_count: None,
+        },
+    ])
+    .expect("cli e2e manifest artifacts must satisfy contract");
+    let artifacts_index_json =
+        render_artifacts_index(&entries).expect("artifacts index payload must render");
+    entries.push(ArtifactEntry {
+        file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+        checksum: sha256_checksum(artifacts_index_json.as_bytes()),
+        line_count: None,
+    });
+    entries.sort_by(|left, right| left.file.cmp(&right.file));
+    entries
+}
+
+fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
+    events
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("event envelope serialization must work"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn scenario_event_bodies(scenario: &CliE2eScenario, exit_status: ExitStatus) -> Vec<EventBody> {
@@ -327,11 +452,7 @@ fn scenario_event_bodies(scenario: &CliE2eScenario, exit_status: ExitStatus) -> 
     } else {
         E2eOutcome::Fail
     };
-    let assertion_reason = if scenario.kind == CliE2eScenarioKind::Degrade {
-        CLI_E2E_REASON_SCENARIO_DEGRADE
-    } else {
-        CLI_E2E_REASON_SCENARIO_PASS
-    };
+    let assertion_reason = scenario.expected_reason_code.as_str();
 
     vec![
         EventBody {
@@ -411,17 +532,33 @@ const fn empty_correlation() -> Correlation {
 /// Deterministic replay command for a single scenario.
 #[must_use]
 pub fn replay_command_for_scenario(scenario: &CliE2eScenario) -> String {
+    let test_target = if scenario.id.starts_with("cli-chaos-") {
+        "filesystem_chaos"
+    } else {
+        "cli_e2e_contract"
+    };
     format!(
-        "cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture --exact scenario_{}",
+        "cargo test -p frankensearch-fsfs --test {test_target} -- --nocapture --exact scenario_{}",
         scenario.id.replace('-', "_")
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use frankensearch_core::{
+        ArtifactEntry, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+        E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, render_artifacts_index, sha256_checksum,
+    };
+
     use super::{
-        CLI_E2E_SCHEMA_VERSION, CliE2eRunConfig, CliE2eScenarioKind, ExitStatus,
-        build_default_cli_e2e_bundles, default_cli_e2e_scenarios,
+        CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED, CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
+        CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY, CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
+        CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP, CLI_E2E_SCHEMA_VERSION, CliE2eRunConfig,
+        CliE2eScenarioKind, ExitStatus, build_cli_e2e_filesystem_chaos_bundles,
+        build_default_cli_e2e_bundles, default_cli_e2e_filesystem_chaos_scenarios,
+        default_cli_e2e_scenarios,
     };
 
     #[test]
@@ -453,13 +590,13 @@ mod tests {
     }
 
     #[test]
-    fn degraded_scenario_produces_failed_manifest_with_required_artifacts() {
+    fn degraded_scenario_produces_passed_manifest_with_required_artifacts() {
         let config = CliE2eRunConfig::default();
         let degrade = default_cli_e2e_scenarios()
             .into_iter()
             .find(|scenario| scenario.kind == CliE2eScenarioKind::Degrade)
             .expect("degrade scenario");
-        let bundle = super::CliE2eArtifactBundle::build(&config, &degrade, ExitStatus::Fail);
+        let bundle = super::CliE2eArtifactBundle::build(&config, &degrade, ExitStatus::Pass);
         let artifact_files: Vec<&str> = bundle
             .manifest
             .body
@@ -476,5 +613,115 @@ mod tests {
                 .replay_command
                 .contains("--exact scenario_cli_degrade_path")
         );
+    }
+
+    #[test]
+    fn manifest_artifact_checksums_match_serialized_payloads() {
+        let config = CliE2eRunConfig::default();
+        let degrade = default_cli_e2e_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.kind == CliE2eScenarioKind::Degrade)
+            .expect("degrade scenario");
+        let bundle = super::CliE2eArtifactBundle::build(&config, &degrade, ExitStatus::Pass);
+        let artifact_checksums: BTreeMap<&str, &str> = bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.file.as_str(), artifact.checksum.as_str()))
+            .collect();
+
+        let events_jsonl = super::render_events_jsonl(&bundle.events);
+        let expected_events_checksum = sha256_checksum(events_jsonl.as_bytes());
+        assert_eq!(
+            artifact_checksums
+                .get(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL)
+                .copied(),
+            Some(expected_events_checksum.as_str())
+        );
+
+        let expected_replay_checksum = sha256_checksum(bundle.replay_command.as_bytes());
+        assert_eq!(
+            artifact_checksums
+                .get(E2E_ARTIFACT_REPLAY_COMMAND_TXT)
+                .copied(),
+            Some(expected_replay_checksum.as_str())
+        );
+
+        let mut index_inputs: Vec<ArtifactEntry> = bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.file != E2E_ARTIFACT_ARTIFACTS_INDEX_JSON)
+            .cloned()
+            .collect();
+        index_inputs.sort_by(|left, right| left.file.cmp(&right.file));
+        let artifacts_index_json =
+            render_artifacts_index(&index_inputs).expect("render artifacts index payload");
+        let expected_index_checksum = sha256_checksum(artifacts_index_json.as_bytes());
+        assert_eq!(
+            artifact_checksums
+                .get(E2E_ARTIFACT_ARTIFACTS_INDEX_JSON)
+                .copied(),
+            Some(expected_index_checksum.as_str())
+        );
+    }
+
+    #[test]
+    fn filesystem_chaos_catalog_covers_reason_taxonomy() {
+        let scenarios = default_cli_e2e_filesystem_chaos_scenarios();
+        let ids: Vec<&str> = scenarios
+            .iter()
+            .map(|scenario| scenario.id.as_str())
+            .collect();
+        let reasons: Vec<&str> = scenarios
+            .iter()
+            .map(|scenario| scenario.expected_reason_code.as_str())
+            .collect();
+
+        assert_eq!(scenarios.len(), 5);
+        assert!(ids.contains(&"cli-chaos-permission-denied"));
+        assert!(ids.contains(&"cli-chaos-symlink-loop"));
+        assert!(ids.contains(&"cli-chaos-mount-boundary"));
+        assert!(ids.contains(&"cli-chaos-giant-log-skip"));
+        assert!(ids.contains(&"cli-chaos-binary-blob-skip"));
+        assert!(reasons.contains(&CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED));
+        assert!(reasons.contains(&CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP));
+        assert!(reasons.contains(&CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY));
+        assert!(reasons.contains(&CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED));
+        assert!(reasons.contains(&CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED));
+    }
+
+    #[test]
+    fn filesystem_chaos_bundles_validate_and_target_filesystem_harness() {
+        let bundles = build_cli_e2e_filesystem_chaos_bundles(&CliE2eRunConfig::default());
+        assert_eq!(bundles.len(), 5);
+        for bundle in bundles {
+            bundle
+                .validate()
+                .expect("chaos bundle must satisfy e2e artifact validators");
+            assert!(bundle.replay_command.contains("--test filesystem_chaos"));
+            let outcomes = bundle
+                .events
+                .iter()
+                .filter_map(|event| event.body.outcome)
+                .collect::<Vec<_>>();
+            assert!(
+                !outcomes.is_empty(),
+                "chaos bundles must include outcome-bearing assertion events"
+            );
+            assert!(
+                outcomes.iter().all(|outcome| *outcome == E2eOutcome::Pass),
+                "filesystem chaos bundles should report pass outcomes when expected_exit_code is zero"
+            );
+            assert!(bundle.events.iter().any(|event| {
+                event
+                    .body
+                    .reason_code
+                    .as_deref()
+                    .is_some_and(|code| code == bundle.scenario.expected_reason_code)
+            }));
+        }
     }
 }

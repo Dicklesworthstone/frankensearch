@@ -1,0 +1,49 @@
+{
+  "kind": "fsfs_upgrade_plan",
+  "schema_version": 1,
+  "from_version": "v0.3.2",
+  "to_version": "v0.4.0",
+  "selected_channel": "curl_installer",
+  "steps": [
+    {
+      "stage": "preflight",
+      "action": "Validate platform support and writable destination.",
+      "on_failure_reason_code": "install.preflight.disk_space_low"
+    },
+    {
+      "stage": "fetch",
+      "action": "Download release archive, checksum file, and optional signature bundle.",
+      "on_failure_reason_code": "release.publish.asset_upload_failed"
+    },
+    {
+      "stage": "verify",
+      "action": "Verify archive checksum and optional signature when --verify is enabled.",
+      "on_failure_reason_code": "release.package.checksum_failed"
+    },
+    {
+      "stage": "install",
+      "action": "Replace binary atomically and retain previous binary for rollback.",
+      "on_failure_reason_code": "upgrade.apply.rollback_triggered"
+    },
+    {
+      "stage": "post_install",
+      "action": "Run fsfs version self-check and optional status probe.",
+      "on_failure_reason_code": "upgrade.apply.unsupported_path"
+    }
+  ],
+  "rollback": {
+    "trigger_reason_codes": [
+      "release.package.checksum_failed",
+      "upgrade.apply.rollback_triggered"
+    ],
+    "procedure": "Restore previous fsfs binary, keep downloaded artifacts for triage, emit deterministic reason code.",
+    "user_message": "Upgrade aborted; previous fsfs binary restored."
+  },
+  "telemetry_fields": [
+    "package_version",
+    "install_stage",
+    "migration_hook",
+    "rollback_status",
+    "reason_code"
+  ]
+}

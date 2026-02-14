@@ -4,6 +4,7 @@
 //! (`frankensearch-ops.db`) and a small connection wrapper that applies
 //! pragmas, runs migrations, and validates migration checksums.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1163,9 +1164,12 @@ impl OpsStorage {
             }
 
             let mut to_insert: Vec<&SearchEventRecord> = Vec::with_capacity(ordered_events.len());
+            let mut seen_event_ids: BTreeSet<&str> = BTreeSet::new();
             let mut deduplicated = 0_usize;
             for event in ordered_events {
-                if search_event_exists(conn, &event.event_id)? {
+                if !seen_event_ids.insert(event.event_id.as_str())
+                    || search_event_exists(conn, &event.event_id)?
+                {
                     deduplicated = deduplicated.saturating_add(1);
                 } else {
                     to_insert.push(event);
@@ -3617,6 +3621,35 @@ mod tests {
             .map(|(event_id, _)| event_id.as_str())
             .collect();
         assert_eq!(ordered_ids, vec!["event-dedup-a", "event-dedup-b"]);
+    }
+
+    #[test]
+    fn ingest_search_events_batch_deduplicates_duplicates_within_single_batch() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let event_a = sample_search_event("event-single-batch-dup-a", 11);
+        let event_b = sample_search_event("event-single-batch-dup-b", 12);
+        let duplicate_event_a = sample_search_event("event-single-batch-dup-a", 13);
+
+        let result = storage
+            .ingest_search_events_batch(&[event_a, event_b, duplicate_event_a], 64)
+            .expect("batch with internal duplicates should still succeed");
+
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.deduplicated, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(search_event_count(storage.connection()), 2);
+
+        let ordered = search_event_order(storage.connection());
+        let ordered_ids: Vec<&str> = ordered
+            .iter()
+            .map(|(event_id, _)| event_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            vec!["event-single-batch-dup-a", "event-single-batch-dup-b"]
+        );
     }
 
     #[test]

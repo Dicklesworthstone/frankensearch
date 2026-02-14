@@ -173,7 +173,7 @@ impl OpsApp {
     /// Consumers should render via this method (instead of calling
     /// `self.shell.render(...)` directly) so palette/help/alert overlays
     /// are painted on top of the active screen.
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
         self.shell.render(frame);
         let area = frame.area();
         if let Some(request) = self.shell.overlays.top() {
@@ -543,6 +543,14 @@ impl OpsApp {
             .and_then(HistoricalAnalyticsScreen::selected_project)
     }
 
+    fn selected_project_from_timeline(&self) -> Option<String> {
+        self.shell
+            .registry
+            .get(&self.timeline_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<ActionTimelineScreen>())
+            .and_then(ActionTimelineScreen::selected_project)
+    }
+
     fn open_project_detail_for_selected_project(&mut self) {
         self.view.apply_preset(ViewPreset::ProjectDeepDive);
         if let Some(project) = self.selected_project_from_fleet() {
@@ -605,6 +613,24 @@ impl OpsApp {
         {
             self.view.apply_preset(ViewPreset::ProjectDeepDive);
             if let Some(project) = self.selected_project_from_analytics() {
+                self.view.set_project_filter(project);
+            }
+            self.sync_screen_states();
+        }
+
+        let moved_timeline_to_project = previous_screen == Some(&self.timeline_screen_id)
+            && current_screen.as_ref() == Some(&self.project_screen_id);
+        if moved_timeline_to_project
+            && matches!(
+                event,
+                frankensearch_tui::InputEvent::Key(
+                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
+                    _
+                )
+            )
+        {
+            self.view.apply_preset(ViewPreset::ProjectDeepDive);
+            if let Some(project) = self.selected_project_from_timeline() {
                 self.view.set_project_filter(project);
             }
             self.sync_screen_states();
@@ -1090,6 +1116,36 @@ mod tests {
             app.shell.active_screen,
             Some(ScreenId::new("ops.analytics"))
         );
+
+        let goto_project = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_project);
+        assert!(!quit);
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
+        assert!(app.view.project_filter.is_some());
+        assert_eq!(app.view.preset, crate::presets::ViewPreset::ProjectDeepDive);
+    }
+
+    #[test]
+    fn g_from_timeline_opens_project_detail_with_project_context() {
+        let discovered = vec![DiscoveredInstance {
+            instance_id: "host-a:cass-003".to_string(),
+            project_key_hint: Some("cass".to_string()),
+            host_name: Some("cass-host".to_string()),
+            pid: Some(4444),
+            version: Some("0.1.0".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["instance:host-a:cass-003".to_string()],
+        }];
+        let mut app = OpsApp::new(Box::new(MockDataSource::from_discovery(&discovered)));
+        app.refresh_data();
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
 
         let goto_project = frankensearch_tui::InputEvent::Key(
             crossterm::event::KeyCode::Char('g'),

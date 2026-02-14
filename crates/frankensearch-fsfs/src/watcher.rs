@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 use crate::config::{
     DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, FsfsConfig, IngestionClass,
 };
-use crate::mount_info::FsCategory;
+use crate::mount_info::{FsCategory, MountTable, read_system_mounts};
 use crate::pressure::PressureState;
 
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
@@ -505,6 +505,7 @@ struct WorkerContext {
 fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
     let mut watcher = build_notify_watcher(event_tx)?;
+    let mount_table = build_mount_table(&context.discovery);
 
     let mut watched_dirs = 0_usize;
     for root in &context.roots {
@@ -534,12 +535,24 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
         );
 
         match event_rx.recv_timeout(WATCHER_POLL_INTERVAL) {
-            Ok(event) => process_notify_result(event, policy, &context.stats, &mut pending),
+            Ok(event) => process_notify_result(
+                event,
+                policy,
+                &context.stats,
+                &mut pending,
+                Some(&mount_table),
+            ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         while let Ok(event) = event_rx.try_recv() {
-            process_notify_result(event, policy, &context.stats, &mut pending);
+            process_notify_result(
+                event,
+                policy,
+                &context.stats,
+                &mut pending,
+                Some(&mount_table),
+            );
         }
 
         if !policy.watching_enabled {
@@ -567,7 +580,9 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             }
             Err(error) => {
                 context.stats.add_error();
+                let retried = requeue_failed_ready_events(&mut pending, ready);
                 warn!(error = %error, "watcher failed to apply ingest batch");
+                debug!(retried, "watcher requeued failed batch for retry");
             }
         }
     }
@@ -575,15 +590,27 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     Ok(())
 }
 
+fn requeue_failed_ready_events(pending: &mut PendingEvents, ready: Vec<WatchEvent>) -> usize {
+    let retry_observed_at_ms = now_millis();
+    let mut count = 0_usize;
+    for mut event in ready {
+        event.observed_at_ms = retry_observed_at_ms;
+        let _ = pending.push(event);
+        count = count.saturating_add(1);
+    }
+    count
+}
+
 fn process_notify_result(
     event: notify::Result<Event>,
     policy: WatcherExecutionPolicy,
     stats: &WatcherStatsInner,
     pending: &mut PendingEvents,
+    mount_table: Option<&MountTable>,
 ) {
     match event {
         Ok(event) => {
-            let mapped_events = map_notify_event(event);
+            let mapped_events = map_notify_event_with_mount_table(event, mount_table);
             if mapped_events.is_empty() {
                 return;
             }
@@ -665,11 +692,19 @@ fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option
     })
 }
 
+#[cfg(test)]
 fn map_notify_event(event: Event) -> Vec<WatchEvent> {
+    map_notify_event_with_mount_table(event, None)
+}
+
+fn map_notify_event_with_mount_table(
+    event: Event,
+    mount_table: Option<&MountTable>,
+) -> Vec<WatchEvent> {
     let Event { kind, paths, .. } = event;
     let observed_at_ms = now_millis();
     if let EventKind::Modify(ModifyKind::Name(mode)) = kind {
-        return map_rename_notify_event(paths, mode, observed_at_ms);
+        return map_rename_notify_event(paths, mode, observed_at_ms, mount_table);
     }
 
     let Some(kind) = map_notify_kind(kind) else {
@@ -678,7 +713,7 @@ fn map_notify_event(event: Event) -> Vec<WatchEvent> {
 
     paths
         .into_iter()
-        .map(|path| build_watch_event(path, kind, observed_at_ms))
+        .map(|path| build_watch_event(path, kind, observed_at_ms, mount_table))
         .collect()
 }
 
@@ -695,6 +730,7 @@ fn map_rename_notify_event(
     paths: Vec<PathBuf>,
     mode: RenameMode,
     observed_at_ms: u64,
+    mount_table: Option<&MountTable>,
 ) -> Vec<WatchEvent> {
     match mode {
         RenameMode::Both => {
@@ -704,6 +740,7 @@ fn map_rename_notify_event(
                     from.clone(),
                     WatchEventKind::Deleted,
                     observed_at_ms,
+                    mount_table,
                 ));
             }
             // Use get(1) — not last() — to reliably pick the destination
@@ -713,17 +750,22 @@ fn map_rename_notify_event(
                     to.clone(),
                     WatchEventKind::Created,
                     observed_at_ms,
+                    mount_table,
                 ));
             }
             events
         }
         RenameMode::From => paths
             .into_iter()
-            .map(|path| build_watch_event(path, WatchEventKind::Deleted, observed_at_ms))
+            .map(|path| {
+                build_watch_event(path, WatchEventKind::Deleted, observed_at_ms, mount_table)
+            })
             .collect(),
         RenameMode::To => paths
             .into_iter()
-            .map(|path| build_watch_event(path, WatchEventKind::Created, observed_at_ms))
+            .map(|path| {
+                build_watch_event(path, WatchEventKind::Created, observed_at_ms, mount_table)
+            })
             .collect(),
         RenameMode::Any | RenameMode::Other => paths
             .into_iter()
@@ -733,13 +775,19 @@ fn map_rename_notify_event(
                 } else {
                     WatchEventKind::Deleted
                 };
-                build_watch_event(path, kind, observed_at_ms)
+                build_watch_event(path, kind, observed_at_ms, mount_table)
             })
             .collect(),
     }
 }
 
-fn build_watch_event(path: PathBuf, kind: WatchEventKind, observed_at_ms: u64) -> WatchEvent {
+fn build_watch_event(
+    path: PathBuf,
+    kind: WatchEventKind,
+    observed_at_ms: u64,
+    mount_table: Option<&MountTable>,
+) -> WatchEvent {
+    let mount_category = lookup_mount_category(mount_table, &path);
     let metadata = if matches!(kind, WatchEventKind::Deleted) {
         None
     } else {
@@ -756,8 +804,17 @@ fn build_watch_event(path: PathBuf, kind: WatchEventKind, observed_at_ms: u64) -
         observed_at_ms,
         byte_len,
         is_symlink,
-        mount_category: None,
+        mount_category,
     }
+}
+
+fn build_mount_table(discovery: &DiscoveryConfig) -> MountTable {
+    let overrides = discovery.mount_override_map();
+    MountTable::new(read_system_mounts(), &overrides)
+}
+
+fn lookup_mount_category(mount_table: Option<&MountTable>, path: &Path) -> Option<FsCategory> {
+    mount_table.and_then(|table| table.lookup(path).map(|(entry, _)| entry.category))
 }
 
 fn build_notify_watcher(
@@ -783,8 +840,9 @@ fn collect_snapshot_from_roots(
     discovery: &DiscoveryConfig,
 ) -> SearchResult<FileSnapshot> {
     let mut snapshot = FileSnapshot::new();
+    let mount_table = build_mount_table(discovery);
     for root in roots {
-        collect_snapshot_for_root(root, discovery, &mut snapshot)?;
+        collect_snapshot_for_root(root, discovery, Some(&mount_table), &mut snapshot)?;
     }
     Ok(snapshot)
 }
@@ -792,9 +850,15 @@ fn collect_snapshot_from_roots(
 fn collect_snapshot_for_root(
     root: &Path,
     discovery: &DiscoveryConfig,
+    mount_table: Option<&MountTable>,
     snapshot: &mut FileSnapshot,
 ) -> SearchResult<()> {
     if !root.exists() {
+        return Ok(());
+    }
+
+    let root_decision = discovery.evaluate_root(root, lookup_mount_category(mount_table, root));
+    if matches!(root_decision.scope, DiscoveryScopeDecision::Exclude) {
         return Ok(());
     }
 
@@ -821,7 +885,10 @@ fn collect_snapshot_for_root(
             };
 
             if file_type.is_dir() {
-                let directory_candidate = DiscoveryCandidate::new(&path, 0);
+                let mut directory_candidate = DiscoveryCandidate::new(&path, 0);
+                if let Some(category) = lookup_mount_category(mount_table, &path) {
+                    directory_candidate = directory_candidate.with_mount_category(category);
+                }
                 let directory_decision = discovery.evaluate_candidate(&directory_candidate);
                 if matches!(directory_decision.scope, DiscoveryScopeDecision::Exclude) {
                     continue;
@@ -840,8 +907,11 @@ fn collect_snapshot_for_root(
                 Err(error) => return Err(error.into()),
             };
 
-            let candidate =
+            let mut candidate =
                 DiscoveryCandidate::new(&path, metadata.len()).with_symlink(file_type.is_symlink());
+            if let Some(category) = lookup_mount_category(mount_table, &path) {
+                candidate = candidate.with_mount_category(category);
+            }
             let decision = discovery.evaluate_candidate(&candidate);
             if matches!(decision.scope, DiscoveryScopeDecision::Exclude)
                 || !decision.ingestion_class.is_indexed()
@@ -958,19 +1028,23 @@ mod tests {
         DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
         PendingEvents, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestOp,
         WatchIngestPipeline, WatcherExecutionPolicy, normalize_file_key, now_millis,
+        requeue_failed_ready_events,
     };
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::SearchResult;
-    use notify::event::{ModifyKind, RenameMode};
+    use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
+    use std::collections::HashMap;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    use crate::mount_info::{FsCategory, MountTable};
 
     #[derive(Default)]
     struct RecordingPipeline {
@@ -1061,6 +1135,27 @@ mod tests {
         assert_eq!(outcome.reindexed, 0);
         assert_eq!(outcome.skipped, 1);
         assert!(pipeline.all_ops().is_empty());
+    }
+
+    #[test]
+    fn notify_event_mount_category_lookup_uses_mount_table() {
+        let mount_table = MountTable::new(
+            vec![crate::mount_info::MountEntry {
+                device: "server:/share".to_owned(),
+                mount_point: PathBuf::from("/mnt/nfs"),
+                fstype: "nfs".to_owned(),
+                category: FsCategory::Nfs,
+                options: "rw".to_owned(),
+            }],
+            &HashMap::new(),
+        );
+
+        let event = Event::new(EventKind::Create(CreateKind::Any))
+            .add_path(PathBuf::from("/mnt/nfs/project/src/lib.rs"));
+
+        let mapped = super::map_notify_event_with_mount_table(event, Some(&mount_table));
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].mount_category, Some(FsCategory::Nfs));
     }
 
     #[test]
@@ -1193,6 +1288,35 @@ mod tests {
     }
 
     #[test]
+    fn collect_snapshot_skips_network_root_when_category_is_network() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        fs::write(src_dir.join("lib.rs"), "fn main() {}\n").expect("write source");
+
+        let discovery = DiscoveryConfig {
+            skip_network_mounts: true,
+            ..DiscoveryConfig::default()
+        };
+        let mount_table = MountTable::new(
+            vec![crate::mount_info::MountEntry {
+                device: "server:/share".to_owned(),
+                mount_point: root.clone(),
+                fstype: "nfs".to_owned(),
+                category: FsCategory::Nfs,
+                options: "rw".to_owned(),
+            }],
+            &HashMap::new(),
+        );
+
+        let mut snapshot = FileSnapshot::new();
+        super::collect_snapshot_for_root(&root, &discovery, Some(&mount_table), &mut snapshot)
+            .expect("collect snapshot");
+        assert!(snapshot.is_empty(), "network root should be excluded");
+    }
+
+    #[test]
     fn deleted_event_emits_delete_ingest_operation() {
         let pipeline = Arc::new(RecordingPipeline::default());
         let watcher = FsWatcher::new(
@@ -1290,7 +1414,9 @@ mod tests {
 
         let pipeline = Arc::new(RecordingPipeline::default());
         let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
-        let outcome = watcher.process_events_now(&mapped).expect("process rename mapping");
+        let outcome = watcher
+            .process_events_now(&mapped)
+            .expect("process rename mapping");
         assert_eq!(outcome.accepted, 2);
         assert_eq!(outcome.reindexed, 2);
         assert_eq!(outcome.skipped, 0);
@@ -1321,7 +1447,11 @@ mod tests {
             .add_path(PathBuf::from("/tmp/repo/src/only.rs"));
 
         let mapped = super::map_notify_event(event);
-        assert_eq!(mapped.len(), 1, "single-path Both should produce delete only");
+        assert_eq!(
+            mapped.len(),
+            1,
+            "single-path Both should produce delete only"
+        );
         assert_eq!(mapped[0].kind, WatchEventKind::Deleted);
         assert_eq!(mapped[0].path, PathBuf::from("/tmp/repo/src/only.rs"));
     }
@@ -1332,8 +1462,8 @@ mod tests {
         let file = temp.path().join("exists.rs");
         fs::write(&file, "fn main() {}\n").expect("write");
 
-        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
-            .add_path(file.clone());
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any))).add_path(file.clone());
 
         let mapped = super::map_notify_event(event);
         assert_eq!(mapped.len(), 1);
@@ -1362,11 +1492,36 @@ mod tests {
         pending.push(WatchEvent::created(new_path, 100, Some(42)));
 
         let ready = pending.drain_ready(700, 500, 10);
-        assert_eq!(ready.len(), 2, "both rename events should drain independently");
+        assert_eq!(
+            ready.len(),
+            2,
+            "both rename events should drain independently"
+        );
 
         let kinds: Vec<_> = ready.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&WatchEventKind::Deleted));
         assert!(kinds.contains(&WatchEventKind::Created));
+    }
+
+    #[test]
+    fn failed_ready_batch_is_requeued_with_fresh_timestamp() {
+        let mut pending = PendingEvents::default();
+        let ready = vec![
+            WatchEvent::modified("/tmp/repo/src/a.rs", 100, Some(10)),
+            WatchEvent::modified("/tmp/repo/src/b.rs", 110, Some(20)),
+        ];
+
+        let requeued = requeue_failed_ready_events(&mut pending, ready);
+        assert_eq!(requeued, 2);
+
+        let immediately_ready = pending.drain_ready(now_millis(), 500, 10);
+        assert!(
+            immediately_ready.is_empty(),
+            "failed events should be delayed by debounce when requeued"
+        );
+
+        let eventually_ready = pending.drain_ready(now_millis().saturating_add(600), 500, 10);
+        assert_eq!(eventually_ready.len(), 2);
     }
 
     #[test]

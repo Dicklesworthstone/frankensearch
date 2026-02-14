@@ -456,6 +456,8 @@ pub struct DiscoveryConfig {
 pub struct MountPolicyEntry {
     /// Mount point path (e.g., "/mnt/nfs").
     pub mount_point: String,
+    /// Optional category override for deterministic policy simulation.
+    pub category: Option<crate::mount_info::FsCategory>,
     /// Whether to enable or disable this mount.
     pub enabled: Option<bool>,
     /// Override change detection strategy.
@@ -473,7 +475,7 @@ impl MountPolicyEntry {
     #[must_use]
     pub const fn to_mount_override(&self) -> crate::mount_info::MountOverride {
         crate::mount_info::MountOverride {
-            category: None,
+            category: self.category,
             change_detection: self.change_detection,
             stat_timeout_ms: self.stat_timeout_ms,
             max_concurrent_io: self.max_concurrent_io,

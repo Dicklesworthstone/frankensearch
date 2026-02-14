@@ -117,6 +117,10 @@ Common environment variables:
 For full contracts and knobs:
 - `docs/fsfs-config-contract.md`
 - `docs/fsfs-dual-mode-contract.md`
+- `docs/fsfs-packaging-release-install-contract.md`
+- `docs/fsfs-packaging-release-install-contract.md#host-migration-playbooks-priority-projects`
+- `docs/fsfs-packaging-release-install-contract.md#staged-rollout-and-deterministic-fallback-protocol`
+- `docs/fsfs-packaging-release-install-contract.md#upgrade-and-migration-compatibility-verification-strategy`
 - `docs/architecture/`
 
 ## How It Works

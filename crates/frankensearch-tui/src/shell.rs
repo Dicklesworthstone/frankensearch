@@ -5,14 +5,16 @@
 //! input events to the active screen.
 
 use std::cell::Cell;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use serde::{Deserialize, Serialize};
 
+use crate::frame::{CachedLayout, CachedTabState};
 use crate::input::{InputEvent, KeyAction, Keymap};
 use crate::overlay::OverlayManager;
 use crate::palette::{CommandPalette, PaletteState};
@@ -111,6 +113,10 @@ pub struct AppShell {
     last_palette_action: Option<String>,
     /// Terminal area captured from the most recent render pass.
     last_render_area: Cell<Rect>,
+    /// Cached layout to avoid recomputing splits every frame.
+    cached_layout: CachedLayout,
+    /// Cached tab titles and selected index.
+    cached_tabs: CachedTabState,
 }
 
 impl AppShell {
@@ -128,6 +134,8 @@ impl AppShell {
             should_quit: false,
             last_palette_action: None,
             last_render_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            cached_layout: CachedLayout::new(),
+            cached_tabs: CachedTabState::new(),
         }
     }
 
@@ -146,6 +154,8 @@ impl AppShell {
             if let Some(screen) = self.registry.get_mut(id) {
                 screen.on_focus();
             }
+            // Invalidate tab cache since the active screen changed.
+            self.cached_tabs.invalidate();
         }
     }
 
@@ -340,54 +350,90 @@ impl AppShell {
     }
 
     /// Render the shell chrome and active screen.
+    ///
+    /// Uses cached layout and tab state to avoid redundant allocations
+    /// when the terminal dimensions and screen configuration haven't changed.
     #[allow(clippy::too_many_lines)]
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         self.last_render_area.set(area);
         let ctx = self.screen_context(area);
 
-        // Layout: optional breadcrumbs + content + optional status bar.
-        let mut constraints = Vec::new();
-        if self.config.show_breadcrumbs && self.registry.len() > 1 {
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Min(1));
-        if self.config.show_status_bar {
-            constraints.push(Constraint::Length(1));
-        }
+        // Cached layout avoids recomputing splits when area hasn't changed.
+        // Copy the Rect values directly (Rect is Copy, 8 bytes) instead of
+        // allocating a Vec clone every frame.
+        let show_bc = self.config.show_breadcrumbs;
+        let show_sb = self.config.show_status_bar;
+        let num_screens = self.registry.len();
+        let layout_chunks = self
+            .cached_layout
+            .get_or_compute(area, show_bc, show_sb, num_screens);
+        let bc_area = if show_bc && num_screens > 1 {
+            Some(layout_chunks[0])
+        } else {
+            None
+        };
+        let content_idx = usize::from(bc_area.is_some());
+        let content_area = layout_chunks[content_idx];
+        let status_area = if show_sb {
+            Some(layout_chunks[content_idx + 1])
+        } else {
+            None
+        };
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
+        // Breadcrumbs / tabs (using cached titles and selected index).
+        if let Some(bc_rect) = bc_area {
+            let screen_ids = self.registry.screen_ids();
+            let mut id_hasher = DefaultHasher::new();
+            let mut title_hasher = DefaultHasher::new();
+            for id in screen_ids {
+                id.0.hash(&mut id_hasher);
+                id.0.hash(&mut title_hasher);
+                if let Some(screen) = self.registry.get(id) {
+                    screen.title().hash(&mut title_hasher);
+                }
+            }
+            let screen_ids_hash = id_hasher.finish();
+            let title_signature = title_hasher.finish();
+            let active_str = self.active_screen.as_ref().map(|id| id.0.as_str());
 
-        let mut chunk_idx = 0;
+            if !self
+                .cached_tabs
+                .is_valid(screen_ids_hash, title_signature, active_str)
+            {
+                let titles: Vec<String> = screen_ids
+                    .iter()
+                    .map(|id| {
+                        self.registry
+                            .get(id)
+                            .map_or_else(|| id.0.clone(), |s| s.title().to_string())
+                    })
+                    .collect();
 
-        // Breadcrumbs / tabs.
-        if self.config.show_breadcrumbs && self.registry.len() > 1 {
-            let titles: Vec<Line<'_>> = self
-                .registry
-                .screen_ids()
+                let selected = self
+                    .active_screen
+                    .as_ref()
+                    .and_then(|active| screen_ids.iter().position(|id| id == active))
+                    .unwrap_or(0);
+
+                self.cached_tabs.update(
+                    titles,
+                    selected,
+                    screen_ids_hash,
+                    title_signature,
+                    active_str,
+                );
+            }
+
+            let tab_titles: Vec<Line<'_>> = self
+                .cached_tabs
+                .titles
                 .iter()
-                .map(|id| {
-                    let title = self.registry.get(id).map_or(id.0.as_str(), |s| s.title());
-                    Line::from(title.to_string())
-                })
+                .map(|t| Line::from(t.as_str()))
                 .collect();
 
-            let selected = self
-                .active_screen
-                .as_ref()
-                .and_then(|active| {
-                    self.registry
-                        .screen_ids()
-                        .iter()
-                        .position(|id| id == active)
-                })
-                .unwrap_or(0);
-
-            let tabs = Tabs::new(titles)
-                .select(selected)
+            let tabs = Tabs::new(tab_titles)
+                .select(self.cached_tabs.selected)
                 .highlight_style(
                     Style::default()
                         .fg(self.config.theme.highlight_fg.to_ratatui())
@@ -400,14 +446,10 @@ impl AppShell {
                         .bg(self.config.theme.bg.to_ratatui()),
                 );
 
-            frame.render_widget(tabs, chunks[chunk_idx]);
-            chunk_idx += 1;
+            frame.render_widget(tabs, bc_rect);
         }
 
         // Main content area.
-        let content_area = chunks[chunk_idx];
-        chunk_idx += 1;
-
         if let Some(screen_id) = &self.active_screen {
             if let Some(screen) = self.registry.get(screen_id) {
                 screen.render(frame, &ctx);
@@ -427,8 +469,7 @@ impl AppShell {
         }
 
         // Status bar.
-        if self.config.show_status_bar {
-            let status_area = chunks[chunk_idx];
+        if let Some(sb_rect) = status_area {
             let status_text = if self.status_line.center.is_empty() {
                 format!(" {} ", self.config.title)
             } else {
@@ -455,7 +496,7 @@ impl AppShell {
             let status = Paragraph::new(Line::from(status_spans))
                 .style(Style::default().bg(self.config.theme.status_bar_bg.to_ratatui()));
 
-            frame.render_widget(status, status_area);
+            frame.render_widget(status, sb_rect);
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::{E2eOutcome, ExitStatus};
@@ -222,6 +223,36 @@ fn parse_json_stdout(label: &str, output: &Output) -> Value {
     })
 }
 
+fn command_exists(program: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {program} >/dev/null 2>&1"))
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn pipe_stdout_into(program: &str, args: &[&str], stdout: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {program}: {error}"));
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(stdout)
+            .unwrap_or_else(|error| panic!("write stdin for {program}: {error}"));
+    } else {
+        panic!("missing stdin pipe for {program}");
+    }
+
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("wait for {program}: {error}"))
+}
+
 fn extract_hit_paths(search_envelope: &Value) -> Vec<String> {
     search_envelope
         .pointer("/data/hits")
@@ -251,6 +282,110 @@ fn recall_at_5(hit_paths: &[String], expected_docs: &[String]) -> f64 {
     let matched_f64 = f64::from(u32::try_from(matched).unwrap_or(u32::MAX));
     let expected_f64 = f64::from(u32::try_from(expected_docs.len()).unwrap_or(u32::MAX));
     matched_f64 / expected_f64
+}
+
+fn create_small_index_fixture() -> (tempfile::TempDir, E2eCommandContext, String) {
+    let temp = tempfile::tempdir().expect("create temporary test workspace");
+    let corpus_root = temp.path().join("tiny-corpus");
+    let index_root = temp.path().join("tiny-index");
+    fs::create_dir_all(&corpus_root).expect("create tiny corpus root");
+    fs::write(
+        corpus_root.join("retry.md"),
+        "retry backoff strategy with jitter and exponential delay",
+    )
+    .expect("write retry fixture");
+    fs::write(
+        corpus_root.join("cache.md"),
+        "cache invalidation guide and cache key stability checks",
+    )
+    .expect("write cache fixture");
+
+    let command_context = E2eCommandContext::new(temp.path());
+    let corpus_root_arg = corpus_root.display().to_string();
+    let index_root_arg = index_root.display().to_string();
+    let index_output = command_context.run(
+        temp.path(),
+        &[
+            "index",
+            &corpus_root_arg,
+            "--index-dir",
+            &index_root_arg,
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_command_success("tiny fixture index", &index_output);
+
+    (temp, command_context, index_root_arg)
+}
+
+#[test]
+fn search_json_output_can_be_consumed_by_jq() {
+    if !command_exists("jq") {
+        eprintln!("jq not available; skipping jq integration assertion");
+        return;
+    }
+
+    let (temp, command_context, index_root_arg) = create_small_index_fixture();
+    let search_output = command_context.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff strategy",
+            "--index-dir",
+            &index_root_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+            "--format",
+            "json",
+        ],
+    );
+    assert_command_success("search json", &search_output);
+
+    let jq_output = pipe_stdout_into("jq", &["-e", ".ok == true"], &search_output.stdout);
+    assert_command_success("jq parse", &jq_output);
+}
+
+#[test]
+fn search_csv_output_can_be_consumed_by_csv_parser() {
+    let (temp, command_context, index_root_arg) = create_small_index_fixture();
+    let search_output = command_context.run(
+        temp.path(),
+        &[
+            "search",
+            "cache invalidation",
+            "--index-dir",
+            &index_root_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+            "--format",
+            "csv",
+        ],
+    );
+    assert_command_success("search csv", &search_output);
+    assert!(
+        !search_output.stdout.is_empty(),
+        "search csv output must not be empty"
+    );
+
+    if command_exists("csvtool") {
+        let csvtool_output = pipe_stdout_into("csvtool", &["col", "1", "-"], &search_output.stdout);
+        assert_command_success("csvtool parse", &csvtool_output);
+        return;
+    }
+
+    let python_output = pipe_stdout_into(
+        "python3",
+        &[
+            "-c",
+            "import csv,sys; rows=list(csv.reader(sys.stdin)); assert rows and rows[0], 'empty csv'",
+        ],
+        &search_output.stdout,
+    );
+    assert_command_success("python csv parse fallback", &python_output);
 }
 
 #[test]

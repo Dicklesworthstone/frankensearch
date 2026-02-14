@@ -4,7 +4,7 @@
 //! and validation edge cases that span multiple manifest components.
 
 use frankensearch_embed::{
-    ModelFile, ModelManifest, ModelManifestCatalog, ModelTier, MANIFEST_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION, ModelFile, ModelManifest, ModelManifestCatalog, ModelTier,
     PLACEHOLDER_VERIFY_AFTER_DOWNLOAD,
 };
 

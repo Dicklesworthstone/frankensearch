@@ -92,6 +92,7 @@ parse_args() {
 
 configure_output_mode() {
   local is_tty=false
+  local no_color_requested=false
   if [[ -t 1 ]]; then
     is_tty=true
   fi
@@ -104,6 +105,7 @@ configure_output_mode() {
   esac
 
   if [[ -n "${NO_COLOR:-}" ]]; then
+    no_color_requested=true
     USE_COLOR=false
   elif [[ "$is_tty" == true ]]; then
     USE_COLOR=true
@@ -133,7 +135,7 @@ configure_output_mode() {
     SYMBOL_ERR="✗"
   fi
 
-  if [[ "$NO_GUM" == false && "$is_tty" == true ]] && command -v gum >/dev/null 2>&1; then
+  if [[ "$NO_GUM" == false && "$is_tty" == true && "$no_color_requested" == false ]] && command -v gum >/dev/null 2>&1; then
     HAS_GUM=true
   else
     HAS_GUM=false
@@ -309,7 +311,11 @@ demo_mode() {
   info "preflight checks started"
   run_with_spinner "simulating model download" sleep 1
   ok "binary install complete"
-  warn "gum not found; using fallback renderer"
+  if [[ "$HAS_GUM" == true ]]; then
+    info "gum renderer active"
+  else
+    warn "gum not found; using fallback renderer"
+  fi
   err "sample failure output"
   final_summary \
     "$INSTALL_LOCATION" \

@@ -45,6 +45,19 @@ use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
+    if base_candidates == 0 || multiplier <= 0.0 {
+        return 0;
+    }
+    let scaled = (base_candidates as f32 * multiplier).ceil() as usize;
+    scaled.max(1)
+}
+
 /// Progressive two-tier search orchestrator.
 ///
 /// Coordinates fast-tier embedding, optional lexical search, RRF fusion,
@@ -490,20 +503,10 @@ impl TwoTierSearcher {
         let base_candidates = candidate_count(k, 0, self.config.candidate_multiplier);
 
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
         let semantic_budget =
-            (base_candidates as f32 * query_class.semantic_budget_multiplier()) as usize;
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
+            scaled_budget(base_candidates, query_class.semantic_budget_multiplier());
         let lexical_budget =
-            (base_candidates as f32 * query_class.lexical_budget_multiplier()) as usize;
+            scaled_budget(base_candidates, query_class.lexical_budget_multiplier());
 
         let rrf_config = RrfConfig {
             k: self.config.rrf_k,
@@ -1183,6 +1186,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn scaled_budget_clamps_positive_budget_to_at_least_one() {
+        assert_eq!(scaled_budget(1, 0.5), 1);
+        assert_eq!(scaled_budget(1, 0.25), 1);
+        assert_eq!(scaled_budget(2, 0.5), 1);
+        assert_eq!(scaled_budget(0, 0.5), 0);
+        assert_eq!(scaled_budget(4, 0.0), 0);
+    }
 
     // ─── Stub Embedder ──────────────────────────────────────────────────
 

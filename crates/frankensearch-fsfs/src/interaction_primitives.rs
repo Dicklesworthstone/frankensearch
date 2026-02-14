@@ -971,9 +971,25 @@ impl VirtualizedListState {
     /// Ensure the selected item is visible by adjusting `scroll_offset`.
     #[allow(clippy::missing_const_for_fn)]
     pub fn ensure_visible(&mut self) {
-        if self.viewport_height == 0 {
+        if self.total_items == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
             return;
         }
+
+        self.selected = self.selected.min(self.total_items - 1);
+
+        if self.viewport_height == 0 {
+            self.scroll_offset = self.scroll_offset.min(self.selected);
+            return;
+        }
+
+        // Clamp stale scroll offsets after list shrink so the viewport can still fill.
+        let max_scroll_offset = self.total_items.saturating_sub(self.viewport_height);
+        if self.scroll_offset > max_scroll_offset {
+            self.scroll_offset = max_scroll_offset;
+        }
+
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
         } else if self.selected >= self.scroll_offset + self.viewport_height {
@@ -1088,6 +1104,14 @@ pub enum SearchInteractionEvent {
     QuerySubmitted(String),
     OpenSelected { doc_id: String, source_path: String },
     JumpToSource { doc_id: String, source_path: String },
+}
+
+/// Deterministic outcome of applying a palette action ID to search state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchInteractionDispatch {
+    UnknownAction,
+    AppliedNoEvent,
+    AppliedWithEvent(SearchInteractionEvent),
 }
 
 /// Stateful contract for the fsfs interactive search screen.
@@ -1246,6 +1270,19 @@ impl SearchInteractionState {
             _ => {}
         }
         None
+    }
+
+    /// Resolve and apply one palette action ID.
+    #[must_use]
+    pub fn apply_palette_action_id(&mut self, action_id: &str) -> SearchInteractionDispatch {
+        let Some(action) = ScreenAction::from_palette_action_id(action_id) else {
+            return SearchInteractionDispatch::UnknownAction;
+        };
+
+        self.apply_action(&action)
+            .map_or(SearchInteractionDispatch::AppliedNoEvent, |event| {
+                SearchInteractionDispatch::AppliedWithEvent(event)
+            })
     }
 
     fn submit_current_query(&mut self) -> Option<SearchInteractionEvent> {
@@ -2505,6 +2542,33 @@ mod tests {
         assert_eq!(
             state.selected_result().map(|row| row.doc_id.as_str()),
             Some("doc-2")
+        );
+    }
+
+    #[test]
+    fn search_interaction_palette_dispatch_routes_known_actions() {
+        let mut state = SearchInteractionState::new(2);
+        state.apply_incremental_query("interactive search");
+
+        let submit = state.apply_palette_action_id("search.submit_query");
+        assert_eq!(
+            submit,
+            SearchInteractionDispatch::AppliedWithEvent(SearchInteractionEvent::QuerySubmitted(
+                "interactive search".to_owned(),
+            ))
+        );
+
+        let toggle = state.apply_palette_action_id("search.toggle_explain");
+        assert_eq!(toggle, SearchInteractionDispatch::AppliedNoEvent);
+        assert!(state.detail_panel_visible);
+    }
+
+    #[test]
+    fn search_interaction_palette_dispatch_marks_unknown_actions() {
+        let mut state = SearchInteractionState::new(2);
+        assert_eq!(
+            state.apply_palette_action_id("search.not_real"),
+            SearchInteractionDispatch::UnknownAction
         );
     }
 

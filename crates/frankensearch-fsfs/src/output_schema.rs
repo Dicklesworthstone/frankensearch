@@ -904,122 +904,164 @@ pub fn validate_envelope<T>(
     mode: CompatibilityMode,
 ) -> ValidationResult {
     let mut violations = Vec::new();
-
-    // 1. Schema version
-    match mode {
-        CompatibilityMode::Strict => {
-            if envelope.v != OUTPUT_SCHEMA_VERSION {
-                violations.push(ValidationViolation {
-                    field: "v".into(),
-                    code: "output.schema_version.mismatch".into(),
-                    message: format!(
-                        "expected schema version {OUTPUT_SCHEMA_VERSION}, found {}",
-                        envelope.v
-                    ),
-                });
-            }
-        }
-        CompatibilityMode::Lenient => {
-            if envelope.v < OUTPUT_SCHEMA_MIN_SUPPORTED {
-                violations.push(ValidationViolation {
-                    field: "v".into(),
-                    code: "output.schema_version.too_old".into(),
-                    message: format!(
-                        "schema version {} is below minimum supported {OUTPUT_SCHEMA_MIN_SUPPORTED}",
-                        envelope.v
-                    ),
-                });
-            }
-        }
-    }
-
-    // 2. Timestamp
-    if envelope.ts.is_empty() {
-        violations.push(ValidationViolation {
-            field: "ts".into(),
-            code: "output.timestamp.empty".into(),
-            message: "timestamp must be non-empty RFC 3339 UTC".into(),
-        });
-    }
-
-    // 3. ok == true invariants
-    if envelope.ok {
-        if envelope.data.is_none() {
-            violations.push(ValidationViolation {
-                field: "data".into(),
-                code: "output.data.missing_on_success".into(),
-                message: "data must be present when ok == true".into(),
-            });
-        }
-        if envelope.error.is_some() {
-            violations.push(ValidationViolation {
-                field: "error".into(),
-                code: "output.error.present_on_success".into(),
-                message: "error must be absent when ok == true".into(),
-            });
-        }
-    }
-
-    // 4. ok == false invariants
-    if !envelope.ok {
-        if envelope.error.is_none() {
-            violations.push(ValidationViolation {
-                field: "error".into(),
-                code: "output.error.missing_on_failure".into(),
-                message: "error must be present when ok == false".into(),
-            });
-        }
-        if envelope.data.is_some() {
-            violations.push(ValidationViolation {
-                field: "data".into(),
-                code: "output.data.present_on_failure".into(),
-                message: "data must be absent when ok == false".into(),
-            });
-        }
-    }
-
-    // 5. Error code validation
-    if let Some(error) = &envelope.error
-        && !ALL_OUTPUT_ERROR_CODES.contains(&error.code.as_str())
-    {
-        violations.push(ValidationViolation {
-            field: "error.code".into(),
-            code: "output.error_code.unrecognized".into(),
-            message: format!("unrecognized error code: {}", error.code),
-        });
-    }
-
-    // 6. Meta fields
-    if envelope.meta.command.is_empty() {
-        violations.push(ValidationViolation {
-            field: "meta.command".into(),
-            code: "output.meta.command_empty".into(),
-            message: "meta.command must be non-empty".into(),
-        });
-    }
-    if envelope.meta.format.is_empty() {
-        violations.push(ValidationViolation {
-            field: "meta.format".into(),
-            code: "output.meta.format_empty".into(),
-            message: "meta.format must be non-empty".into(),
-        });
-    } else if matches!(mode, CompatibilityMode::Strict)
-        && !KNOWN_OUTPUT_FORMATS.contains(&envelope.meta.format.as_str())
-    {
-        violations.push(ValidationViolation {
-            field: "meta.format".into(),
-            code: "output.meta.format_unrecognized".into(),
-            message: format!(
-                "meta.format must be one of: {}",
-                KNOWN_OUTPUT_FORMATS.join(", ")
-            ),
-        });
-    }
+    validate_schema_version(envelope, mode, &mut violations);
+    validate_timestamp(envelope, &mut violations);
+    validate_envelope_shape(envelope, &mut violations);
+    validate_error_code(envelope, &mut violations);
+    validate_meta_fields(envelope, mode, &mut violations);
 
     ValidationResult {
         valid: violations.is_empty(),
         violations,
     }
+}
+
+fn validate_schema_version<T>(
+    envelope: &OutputEnvelope<T>,
+    mode: CompatibilityMode,
+    violations: &mut Vec<ValidationViolation>,
+) {
+    match mode {
+        CompatibilityMode::Strict => {
+            if envelope.v != OUTPUT_SCHEMA_VERSION {
+                push_violation(
+                    violations,
+                    "v",
+                    "output.schema_version.mismatch",
+                    format!(
+                        "expected schema version {OUTPUT_SCHEMA_VERSION}, found {}",
+                        envelope.v
+                    ),
+                );
+            }
+        }
+        CompatibilityMode::Lenient => {
+            if envelope.v < OUTPUT_SCHEMA_MIN_SUPPORTED {
+                push_violation(
+                    violations,
+                    "v",
+                    "output.schema_version.too_old",
+                    format!(
+                        "schema version {} is below minimum supported {OUTPUT_SCHEMA_MIN_SUPPORTED}",
+                        envelope.v
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn validate_timestamp<T>(envelope: &OutputEnvelope<T>, violations: &mut Vec<ValidationViolation>) {
+    if envelope.ts.is_empty() {
+        push_violation(
+            violations,
+            "ts",
+            "output.timestamp.empty",
+            "timestamp must be non-empty RFC 3339 UTC",
+        );
+    }
+}
+
+fn validate_envelope_shape<T>(
+    envelope: &OutputEnvelope<T>,
+    violations: &mut Vec<ValidationViolation>,
+) {
+    if envelope.ok {
+        if envelope.data.is_none() {
+            push_violation(
+                violations,
+                "data",
+                "output.data.missing_on_success",
+                "data must be present when ok == true",
+            );
+        }
+        if envelope.error.is_some() {
+            push_violation(
+                violations,
+                "error",
+                "output.error.present_on_success",
+                "error must be absent when ok == true",
+            );
+        }
+    } else {
+        if envelope.error.is_none() {
+            push_violation(
+                violations,
+                "error",
+                "output.error.missing_on_failure",
+                "error must be present when ok == false",
+            );
+        }
+        if envelope.data.is_some() {
+            push_violation(
+                violations,
+                "data",
+                "output.data.present_on_failure",
+                "data must be absent when ok == false",
+            );
+        }
+    }
+}
+
+fn validate_error_code<T>(envelope: &OutputEnvelope<T>, violations: &mut Vec<ValidationViolation>) {
+    if let Some(error) = &envelope.error
+        && !ALL_OUTPUT_ERROR_CODES.contains(&error.code.as_str())
+    {
+        push_violation(
+            violations,
+            "error.code",
+            "output.error_code.unrecognized",
+            format!("unrecognized error code: {}", error.code),
+        );
+    }
+}
+
+fn validate_meta_fields<T>(
+    envelope: &OutputEnvelope<T>,
+    mode: CompatibilityMode,
+    violations: &mut Vec<ValidationViolation>,
+) {
+    if envelope.meta.command.is_empty() {
+        push_violation(
+            violations,
+            "meta.command",
+            "output.meta.command_empty",
+            "meta.command must be non-empty",
+        );
+    }
+    if envelope.meta.format.is_empty() {
+        push_violation(
+            violations,
+            "meta.format",
+            "output.meta.format_empty",
+            "meta.format must be non-empty",
+        );
+    } else if matches!(mode, CompatibilityMode::Strict)
+        && !KNOWN_OUTPUT_FORMATS.contains(&envelope.meta.format.as_str())
+    {
+        push_violation(
+            violations,
+            "meta.format",
+            "output.meta.format_unrecognized",
+            format!(
+                "meta.format must be one of: {}",
+                KNOWN_OUTPUT_FORMATS.join(", ")
+            ),
+        );
+    }
+}
+
+fn push_violation(
+    violations: &mut Vec<ValidationViolation>,
+    field: &str,
+    code: &str,
+    message: impl Into<String>,
+) {
+    violations.push(ValidationViolation {
+        field: field.to_owned(),
+        code: code.to_owned(),
+        message: message.into(),
+    });
 }
 
 /// Check whether a schema version is compatible under the given mode.

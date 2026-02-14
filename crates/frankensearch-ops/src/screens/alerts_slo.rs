@@ -173,9 +173,10 @@ impl AlertsSloScreen {
     /// Selected project in the filtered alert table.
     #[must_use]
     pub fn selected_project(&self) -> Option<String> {
-        self.filtered_alerts()
-            .get(self.selected_row)
-            .map(|row| row.project.clone())
+        let filtered = self.filtered_alerts();
+        let row = filtered.get(self.selected_row)?;
+        self.project_for_instance(&row.instance_id)
+            .map(std::borrow::ToOwned::to_owned)
     }
 
     fn all_alerts(&self) -> Vec<AlertRow> {
@@ -1137,6 +1138,70 @@ mod tests {
         let mut screen = AlertsSloScreen::new();
         screen.update_state(&sample_state());
         assert_eq!(screen.selected_project().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn selected_project_ignores_unknown_sentinel_rows() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.lifecycle_events.insert(
+            0,
+            LifecycleEvent {
+                instance_id: "orphan-host:missing-inst".to_owned(),
+                from: LifecycleState::Started,
+                to: LifecycleState::Stopped,
+                reason_code: "lifecycle.instance.orphan".to_owned(),
+                at_ms: 12_500,
+                attribution_confidence_score: 40,
+                attribution_collision: false,
+            },
+        );
+        state.update_fleet(fleet);
+
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&state);
+
+        assert_eq!(
+            screen.selected_project(),
+            None,
+            "unknown sentinel should not be forwarded as a project drilldown target"
+        );
+    }
+
+    #[test]
+    fn selected_project_allows_real_unknown_project_name() {
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        fleet.instances.push(InstanceInfo {
+            id: "host-u:unknown-1".to_owned(),
+            project: "unknown".to_owned(),
+            pid: Some(99),
+            healthy: true,
+            doc_count: 12,
+            pending_jobs: 0,
+        });
+        fleet.lifecycle_events.insert(
+            0,
+            LifecycleEvent {
+                instance_id: "host-u:unknown-1".to_owned(),
+                from: LifecycleState::Started,
+                to: LifecycleState::Stopped,
+                reason_code: "lifecycle.discovery.ready".to_owned(),
+                at_ms: 13_000,
+                attribution_confidence_score: 96,
+                attribution_collision: false,
+            },
+        );
+        state.update_fleet(fleet);
+
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&state);
+
+        assert_eq!(
+            screen.selected_project().as_deref(),
+            Some("unknown"),
+            "real project names should not be dropped as sentinel values"
+        );
     }
 
     #[test]

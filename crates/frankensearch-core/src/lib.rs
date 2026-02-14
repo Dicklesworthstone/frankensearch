@@ -104,6 +104,11 @@ pub use host_adapter::{
     ConformanceHarness, ConformanceReport, ConformanceViolation,
     DEFAULT_REDACTION_FORBIDDEN_PATTERNS, ForwardingHostAdapter, HostAdapter, NoopAdapterSink,
 };
+pub use metrics_eval::{
+    BootstrapCi, BootstrapComparison, QualityComparison, QualityMetric, QualityMetricComparison,
+    QualityMetricSamples, bootstrap_ci, bootstrap_compare, map_at_k, mrr, ndcg_at_k,
+    quality_comparison, recall_at_k,
+};
 pub use observability_lint::{
     LintFinding, LintReport, LintRuleId, LintSeverity, lint_component_coverage, lint_record,
     lint_stream,

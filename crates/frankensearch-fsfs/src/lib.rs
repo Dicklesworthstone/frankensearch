@@ -62,9 +62,13 @@ pub use catalog::{
     current_catalog_schema_version,
 };
 pub use cli_e2e::{
-    CLI_E2E_REASON_SCENARIO_DEGRADE, CLI_E2E_REASON_SCENARIO_PASS, CLI_E2E_REASON_SCENARIO_START,
-    CLI_E2E_SCHEMA_VERSION, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenario,
-    CliE2eScenarioKind, build_default_cli_e2e_bundles, default_cli_e2e_scenarios,
+    CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED, CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
+    CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY, CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
+    CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP, CLI_E2E_REASON_SCENARIO_DEGRADE,
+    CLI_E2E_REASON_SCENARIO_PASS, CLI_E2E_REASON_SCENARIO_START, CLI_E2E_SCHEMA_VERSION,
+    CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenario, CliE2eScenarioKind,
+    build_cli_e2e_filesystem_chaos_bundles, build_default_cli_e2e_bundles,
+    default_cli_e2e_filesystem_chaos_scenarios, default_cli_e2e_scenarios,
     replay_command_for_scenario,
 };
 pub use concurrency::{
@@ -141,11 +145,13 @@ pub use pressure_sensing::{
     PressureThresholds as SensingThresholds, SmoothedReadings, ThresholdPair,
 };
 pub use profiling::{
-    ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE,
-    IterationValidation, LeverSnapshot, OPPORTUNITY_MATRIX_SCHEMA_VERSION,
-    OneLeverIterationProtocol, OpportunityCandidate, OpportunityMatrix,
-    PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileArtifact, ProfileKind, ProfileStep, ProfileWorkflow,
-    RankedOpportunity,
+    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CrawlIngestHotspot, CrawlIngestOptimizationTrack,
+    CrawlIngestStage, ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE,
+    ITERATION_REASON_NO_CHANGE, IsomorphismProofChecklistItem, IterationValidation, LeverSnapshot,
+    OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol, OpportunityCandidate,
+    OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileArtifact, ProfileKind,
+    ProfileStep, ProfileWorkflow, RankedOpportunity, RollbackGuardrail,
+    crawl_ingest_opportunity_matrix, crawl_ingest_optimization_track,
 };
 pub use query_execution::{
     CancellationAction, CancellationDirective, CancellationPoint, DegradationOverride,

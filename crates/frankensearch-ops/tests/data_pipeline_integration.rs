@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_ops::storage::SummaryWindow;
 use frankensearch_ops::{
-    OpsStorage, SimulatedProject, SimulationRun, SloMaterializationConfig,
-    SloMaterializationResult, SloScope, TelemetrySimulator, TelemetrySimulatorConfig,
-    WorkloadProfile,
+    OpsStorage, OpsStorageConfig, SimulatedProject, SimulationBatch, SimulationRun,
+    SloMaterializationConfig, SloMaterializationResult, SloScope, TelemetrySimulator,
+    TelemetrySimulatorConfig, WorkloadProfile,
 };
 
 fn pipeline_config(seed: u64) -> TelemetrySimulatorConfig {
@@ -42,8 +43,16 @@ fn apply_pipeline(
     run: &SimulationRun,
     backpressure_threshold: usize,
 ) -> SearchResult<SloMaterializationResult> {
+    apply_pipeline_batches(storage, &run.batches, backpressure_threshold)
+}
+
+fn apply_pipeline_batches(
+    storage: &OpsStorage,
+    batches: &[SimulationBatch],
+    backpressure_threshold: usize,
+) -> SearchResult<SloMaterializationResult> {
     let mut last_result = SloMaterializationResult::default();
-    for batch in &run.batches {
+    for batch in batches {
         let records: Vec<_> = batch
             .search_events
             .iter()
@@ -73,6 +82,14 @@ fn apply_pipeline(
             .materialize_slo_rollups_and_anomalies(now_ms, SloMaterializationConfig::default())?;
     }
     Ok(last_result)
+}
+
+fn temp_ops_db_path(test_name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock should be >= unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("frankensearch-ops-{test_name}-{nanos}.sqlite3"))
 }
 
 #[test]
@@ -223,4 +240,191 @@ fn pipeline_recovers_after_backpressure_rejection() {
         "expected backpressure counter to record initial rejection"
     );
     assert!(metrics.total_inserted > 0);
+}
+
+#[test]
+fn pipeline_performance_entrypoint_enforces_deterministic_budgets() {
+    let config = TelemetrySimulatorConfig {
+        seed: 777,
+        tick_interval_ms: 750,
+        ticks: 14,
+        projects: vec![
+            SimulatedProject {
+                project_key: "xf".to_owned(),
+                host_name: "xf-load".to_owned(),
+                instance_count: 3,
+                workload: WorkloadProfile::Burst,
+            },
+            SimulatedProject {
+                project_key: "mail".to_owned(),
+                host_name: "mail-load".to_owned(),
+                instance_count: 2,
+                workload: WorkloadProfile::EmbeddingWave,
+            },
+        ],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let simulator = TelemetrySimulator::new(config).expect("config should validate");
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+
+    let report = simulator
+        .run_performance_entrypoint(&storage, 16_384)
+        .expect("performance replay should succeed");
+
+    assert!(
+        report.events_ingested >= 300,
+        "expected sustained load volume, got {} events",
+        report.events_ingested
+    );
+    assert!(
+        report.events_per_second >= 50.0,
+        "expected deterministic throughput floor, got {} events/sec",
+        report.events_per_second
+    );
+    assert!(
+        (80_000..=300_000).contains(&report.p95_event_latency_us),
+        "p95 should stay within deterministic simulator load budget, got {}us",
+        report.p95_event_latency_us
+    );
+    assert!(
+        report.avg_write_latency_us < 200_000.0,
+        "avg write latency budget exceeded: {}us",
+        report.avg_write_latency_us
+    );
+    assert_eq!(report.backpressured_batches, 0);
+}
+
+#[test]
+fn pipeline_embedding_wave_surfaces_backlog_and_resource_pressure() {
+    let config = TelemetrySimulatorConfig {
+        seed: 4242,
+        ticks: 10,
+        projects: vec![SimulatedProject {
+            project_key: "mail".to_owned(),
+            host_name: "mail-sat".to_owned(),
+            instance_count: 2,
+            workload: WorkloadProfile::EmbeddingWave,
+        }],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let simulator = TelemetrySimulator::new(config).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+
+    let _ = apply_pipeline(&storage, &run, 8_192).expect("pipeline should succeed");
+    let now_ms = i64::try_from(
+        run.batches
+            .last()
+            .expect("run should include at least one batch")
+            .now_ms,
+    )
+    .expect("timestamp should fit into i64");
+
+    for (project_key, instance_id) in run.instance_pairs() {
+        let trend = storage
+            .query_resource_trend(
+                &project_key,
+                &instance_id,
+                SummaryWindow::OneHour,
+                now_ms,
+                256,
+            )
+            .expect("resource trend query should succeed");
+        assert!(!trend.is_empty());
+
+        let max_queue_depth = trend
+            .iter()
+            .filter_map(|point| point.queue_depth)
+            .max()
+            .unwrap_or_default();
+        let max_rss_bytes = trend
+            .iter()
+            .filter_map(|point| point.rss_bytes)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            max_queue_depth >= 90,
+            "expected backlog pressure for {project_key}/{instance_id}, got {max_queue_depth}"
+        );
+        assert!(
+            max_rss_bytes >= (150 * 1024 * 1024),
+            "expected saturated RSS for {project_key}/{instance_id}, got {max_rss_bytes}"
+        );
+
+        let one_minute = storage
+            .latest_search_summary(&project_key, &instance_id, SummaryWindow::OneMinute)
+            .expect("search summary query should succeed")
+            .expect("expected one-minute summary to exist");
+        let p95_latency_us = one_minute
+            .p95_latency_us
+            .expect("expected p95 latency in one-minute summary");
+        assert!(
+            p95_latency_us >= 8_000,
+            "embedding wave should carry elevated p95 latency, got {p95_latency_us}us"
+        );
+    }
+}
+
+#[test]
+fn pipeline_recovers_after_restart_with_telemetry_gap() {
+    let config = TelemetrySimulatorConfig {
+        seed: 9090,
+        ticks: 12,
+        projects: vec![SimulatedProject {
+            project_key: "frankenterm".to_owned(),
+            host_name: "term-restart".to_owned(),
+            instance_count: 2,
+            workload: WorkloadProfile::Restarting,
+        }],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let simulator = TelemetrySimulator::new(config).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    assert!(
+        run.batches.len() >= 6,
+        "expected enough batches for split replay"
+    );
+
+    let split = run.batches.len() / 2;
+    let early = &run.batches[..split];
+    let late = &run.batches[split + 1..];
+    let storage_path = temp_ops_db_path("restart-gap");
+    let storage_config = OpsStorageConfig {
+        db_path: storage_path,
+        busy_timeout_ms: 25,
+        ..OpsStorageConfig::default()
+    };
+
+    let storage_before_restart =
+        OpsStorage::open(storage_config.clone()).expect("storage before restart should open");
+    let _ = apply_pipeline_batches(&storage_before_restart, early, 8_192)
+        .expect("initial replay should succeed");
+    drop(storage_before_restart);
+
+    let storage_after_restart =
+        OpsStorage::open(storage_config).expect("storage after restart should open");
+    let _ = apply_pipeline_batches(&storage_after_restart, late, 8_192)
+        .expect("replay after telemetry gap should succeed");
+
+    let metrics = storage_after_restart.ingestion_metrics();
+    assert!(metrics.total_inserted > 0);
+    assert_eq!(metrics.total_failed_records, 0);
+
+    for (project_key, instance_id) in run.instance_pairs() {
+        let summary = storage_after_restart
+            .latest_search_summary(&project_key, &instance_id, SummaryWindow::OneMinute)
+            .expect("summary query should succeed");
+        assert!(
+            summary.is_some(),
+            "expected summaries to remain materialized for {project_key}/{instance_id}"
+        );
+    }
+
+    let fleet_rollups = storage_after_restart
+        .query_slo_rollups_for_scope(SloScope::Fleet, "__fleet__", 16)
+        .expect("fleet rollup query should succeed");
+    assert!(
+        !fleet_rollups.is_empty(),
+        "expected fleet rollups after restart + telemetry gap replay"
+    );
 }

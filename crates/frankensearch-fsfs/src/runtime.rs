@@ -36,6 +36,7 @@ use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
 };
+use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload};
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -259,6 +260,106 @@ impl LiveIngestPipeline {
         }
     }
 
+    fn resolve_paths(&self, file_key: &str) -> (PathBuf, String) {
+        let abs_path = if Path::new(file_key).is_absolute() {
+            PathBuf::from(file_key)
+        } else {
+            self.target_root.join(file_key)
+        };
+        let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
+        (abs_path, rel_key)
+    }
+
+    fn soft_delete_vector(&self, rel_key: &str) {
+        let mut vi = self
+            .vector_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = vi.soft_delete(rel_key).ok();
+    }
+
+    fn prune_indexes(&self, rel_key: &str) -> frankensearch_core::SearchResult<()> {
+        self.lexical_index.delete_document(rel_key)?;
+        self.soft_delete_vector(rel_key);
+        Ok(())
+    }
+
+    async fn apply_upsert_op(
+        &self,
+        cx: &Cx,
+        file_key: &str,
+        ingestion_class: IngestionClass,
+    ) -> frankensearch_core::SearchResult<bool> {
+        let (abs_path, rel_key) = self.resolve_paths(file_key);
+
+        if matches!(
+            ingestion_class,
+            IngestionClass::MetadataOnly | IngestionClass::Skip
+        ) {
+            self.prune_indexes(&rel_key)?;
+            return Ok(true);
+        }
+
+        let bytes = match fs::read(&abs_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.prune_indexes(&rel_key)?;
+                return Ok(true);
+            }
+            Err(error) if is_ignorable_index_walk_error(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        if is_probably_binary(&bytes) {
+            self.prune_indexes(&rel_key)?;
+            return Ok(true);
+        }
+
+        let raw_text = String::from_utf8_lossy(&bytes);
+        let canonical = self.canonicalizer.canonicalize(&raw_text);
+        if canonical.trim().is_empty() {
+            self.prune_indexes(&rel_key)?;
+            return Ok(true);
+        }
+
+        let file_name = abs_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        let doc = IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
+        self.lexical_index.index_document(cx, &doc).await?;
+
+        if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
+            match self.embedder.embed(cx, &canonical).await {
+                Ok(embedding) => {
+                    let mut vi = self
+                        .vector_index
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = vi.soft_delete(&rel_key).ok();
+                    vi.append(&rel_key, &embedding)?;
+                }
+                Err(error) => {
+                    warn!(
+                        file_key = %rel_key,
+                        error = %error,
+                        "watcher ingest: embedding failed; lexical-only for this file"
+                    );
+                }
+            }
+        } else {
+            self.soft_delete_vector(&rel_key);
+        }
+
+        Ok(true)
+    }
+
+    fn apply_delete_op(&self, file_key: &str) -> frankensearch_core::SearchResult<()> {
+        let (_abs_path, rel_key) = self.resolve_paths(file_key);
+        self.prune_indexes(&rel_key)
+    }
+
     async fn apply_batch_inner(
         &self,
         cx: &Cx,
@@ -268,89 +369,17 @@ impl LiveIngestPipeline {
 
         for op in batch {
             match op {
-                WatchIngestOp::Upsert { file_key, .. } => {
-                    let abs_path = if Path::new(file_key).is_absolute() {
-                        PathBuf::from(file_key)
-                    } else {
-                        self.target_root.join(file_key)
-                    };
-                    let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
-
-                    let bytes = match fs::read(&abs_path) {
-                        Ok(bytes) => bytes,
-                        Err(error) if error.kind() == ErrorKind::NotFound => {
-                            self.lexical_index.delete_document(&rel_key)?;
-                            {
-                                let mut vi = self
-                                    .vector_index
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let _ = vi.soft_delete(&rel_key).ok();
-                            }
-                            count = count.saturating_add(1);
-                            continue;
-                        }
-                        Err(error) if is_ignorable_index_walk_error(&error) => continue,
-                        Err(error) => return Err(error.into()),
-                    };
-
-                    if is_probably_binary(&bytes) {
-                        continue;
+                WatchIngestOp::Upsert {
+                    file_key,
+                    ingestion_class,
+                    ..
+                } => {
+                    if self.apply_upsert_op(cx, file_key, *ingestion_class).await? {
+                        count = count.saturating_add(1);
                     }
-
-                    let raw_text = String::from_utf8_lossy(&bytes);
-                    let canonical = self.canonicalizer.canonicalize(&raw_text);
-                    if canonical.trim().is_empty() {
-                        continue;
-                    }
-
-                    let file_name = abs_path
-                        .file_name()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    let doc = IndexableDocument::new(rel_key.clone(), canonical.clone())
-                        .with_title(file_name);
-
-                    self.lexical_index.index_document(cx, &doc).await?;
-
-                    match self.embedder.embed(cx, &canonical).await {
-                        Ok(embedding) => {
-                            let mut vi = self
-                                .vector_index
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let _ = vi.soft_delete(&rel_key).ok();
-                            vi.append(&rel_key, &embedding)?;
-                        }
-                        Err(error) => {
-                            warn!(
-                                file_key = %rel_key,
-                                error = %error,
-                                "watcher ingest: embedding failed; lexical-only for this file"
-                            );
-                        }
-                    }
-
-                    count = count.saturating_add(1);
                 }
                 WatchIngestOp::Delete { file_key, .. } => {
-                    let abs_path = if Path::new(file_key).is_absolute() {
-                        PathBuf::from(file_key)
-                    } else {
-                        self.target_root.join(file_key)
-                    };
-                    let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
-
-                    self.lexical_index.delete_document(&rel_key)?;
-                    {
-                        let mut vi = self
-                            .vector_index
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let _ = vi.soft_delete(&rel_key).ok();
-                    }
-
+                    self.apply_delete_op(file_key)?;
                     count = count.saturating_add(1);
                 }
             }
@@ -2338,14 +2367,6 @@ impl FsfsRuntime {
     }
 
     async fn run_search_command(&self, cx: &Cx) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "search command does not support csv output".to_owned(),
-            });
-        }
-
         if self.cli_input.filter.is_some() {
             warn!(
                 filter = ?self.cli_input.filter,
@@ -2406,7 +2427,10 @@ impl FsfsRuntime {
         let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
         let mut stdout = std::io::stdout();
         emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
-        if self.cli_input.format != OutputFormat::Jsonl {
+        if !matches!(
+            self.cli_input.format,
+            OutputFormat::Jsonl | OutputFormat::Csv
+        ) {
             stdout
                 .write_all(b"\n")
                 .map_err(|source| SearchError::SubsystemError {
@@ -3980,6 +4004,8 @@ impl FsfsRuntime {
     ) -> SearchResult<IndexDiscoveryStats> {
         let mut discovered_files = 0_usize;
         let mut skipped_files = 0_usize;
+        let mount_overrides = self.config.discovery.mount_override_map();
+        let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
         let mut walker = WalkBuilder::new(target_root);
         walker.follow_links(self.config.discovery.follow_symlinks);
@@ -4009,13 +4035,17 @@ impl FsfsRuntime {
                 }
             };
 
+            let path_is_symlink = entry.path_is_symlink();
             let Some(file_type) = entry.file_type() else {
+                if path_is_symlink && !self.config.discovery.follow_symlinks {
+                    skipped_files = skipped_files.saturating_add(1);
+                }
                 continue;
             };
             if file_type.is_dir() {
                 continue;
             }
-            if !file_type.is_file() && !entry.path_is_symlink() {
+            if !file_type.is_file() && !path_is_symlink {
                 continue;
             }
 
@@ -4024,7 +4054,7 @@ impl FsfsRuntime {
                 skipped_files = skipped_files.saturating_add(1);
                 continue;
             }
-            if entry.path_is_symlink() && !self.config.discovery.follow_symlinks {
+            if path_is_symlink && !self.config.discovery.follow_symlinks {
                 skipped_files = skipped_files.saturating_add(1);
                 continue;
             }
@@ -4036,8 +4066,11 @@ impl FsfsRuntime {
             };
 
             discovered_files = discovered_files.saturating_add(1);
-            let candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
-                .with_symlink(entry.path_is_symlink());
+            let mut candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
+                .with_symlink(path_is_symlink);
+            if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
+                candidate = candidate.with_mount_category(mount_entry.category);
+            }
             let decision = self.config.discovery.evaluate_candidate(&candidate);
             if !matches!(decision.scope, DiscoveryScopeDecision::Include)
                 || !decision.ingestion_class.is_indexed()
@@ -5516,6 +5549,227 @@ mod tests {
                 .await
                 .expect("lexical search after delete");
             assert!(hits.is_empty(), "stale lexical doc should be removed");
+        });
+    }
+
+    #[test]
+    fn live_ingest_upsert_binary_file_deletes_stale_document() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(target_root.join("src")).expect("target root");
+            let binary_path = target_root.join("src/blob.bin");
+            fs::write(&binary_path, [0_u8, 42, 7, 9]).expect("write binary fixture");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer
+                .write_record("src/blob.bin", &vec![0.0_f32; 256])
+                .expect("seed vector record");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let stale_doc = IndexableDocument::new(
+                "src/blob.bin".to_owned(),
+                "stale lexical content".to_owned(),
+            );
+            lexical_index
+                .index_document(&cx, &stale_doc)
+                .await
+                .expect("seed lexical doc");
+            lexical_index
+                .commit(&cx)
+                .await
+                .expect("commit seed lexical doc");
+
+            let pipeline = LiveIngestPipeline::new(
+                target_root.clone(),
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let applied = pipeline
+                .apply_batch(&[WatchIngestOp::Upsert {
+                    file_key: binary_path.display().to_string(),
+                    revision: 42,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                }])
+                .expect("binary upsert should prune stale entries");
+
+            assert_eq!(applied, 1);
+
+            let hits = pipeline
+                .lexical_index
+                .search(&cx, "stale", 5)
+                .await
+                .expect("lexical search after binary prune");
+            assert!(hits.is_empty(), "stale lexical doc should be removed");
+
+            let query = vec![0.0_f32; 256];
+            let vector_hits = {
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                vi.search_top_k(&query, 5, None).expect("vector search")
+            };
+            assert!(
+                vector_hits.iter().all(|hit| hit.doc_id != "src/blob.bin"),
+                "stale vector entry should be removed when file becomes binary"
+            );
+        });
+    }
+
+    #[test]
+    fn live_ingest_upsert_lexical_only_reindexes_lexical_and_prunes_vector() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(target_root.join("src")).expect("target root");
+            let file_path = target_root.join("src/lexical_only.md");
+            fs::write(
+                &file_path,
+                "fresh lexical content without semantic embedding",
+            )
+            .expect("write lexical fixture");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer
+                .write_record("src/lexical_only.md", &vec![0.1_f32; 256])
+                .expect("seed vector record");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let pipeline = LiveIngestPipeline::new(
+                target_root.clone(),
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let applied = pipeline
+                .apply_batch(&[WatchIngestOp::Upsert {
+                    file_key: file_path.display().to_string(),
+                    revision: 7,
+                    ingestion_class: IngestionClass::LexicalOnly,
+                }])
+                .expect("lexical-only upsert should succeed");
+
+            assert_eq!(applied, 1);
+            let lexical_hits = pipeline
+                .lexical_index
+                .search(&cx, "lexical", 5)
+                .await
+                .expect("search lexical index");
+            assert!(
+                lexical_hits
+                    .iter()
+                    .any(|hit| hit.doc_id == "src/lexical_only.md"),
+                "lexical-only ingest should still index lexical content"
+            );
+
+            let query = vec![0.0_f32; 256];
+            let vector_hits = {
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                vi.search_top_k(&query, 5, None).expect("vector search")
+            };
+            assert!(
+                vector_hits
+                    .iter()
+                    .all(|hit| hit.doc_id != "src/lexical_only.md"),
+                "lexical-only ingest should remove stale semantic vectors"
+            );
+        });
+    }
+
+    #[test]
+    fn live_ingest_upsert_metadata_only_prunes_lexical_and_vector_entries() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(target_root.join("src")).expect("target root");
+            let file_path = target_root.join("src/meta.json");
+            fs::write(&file_path, "{\"meta\":true}\n").expect("write metadata fixture");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer
+                .write_record("src/meta.json", &vec![0.2_f32; 256])
+                .expect("seed vector record");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let stale_doc = IndexableDocument::new(
+                "src/meta.json".to_owned(),
+                "stale lexical metadata content".to_owned(),
+            );
+            lexical_index
+                .index_document(&cx, &stale_doc)
+                .await
+                .expect("seed lexical doc");
+            lexical_index
+                .commit(&cx)
+                .await
+                .expect("commit lexical seed");
+
+            let pipeline = LiveIngestPipeline::new(
+                target_root.clone(),
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let applied = pipeline
+                .apply_batch(&[WatchIngestOp::Upsert {
+                    file_key: file_path.display().to_string(),
+                    revision: 8,
+                    ingestion_class: IngestionClass::MetadataOnly,
+                }])
+                .expect("metadata-only upsert should prune stale index entries");
+
+            assert_eq!(applied, 1);
+            let lexical_hits = pipeline
+                .lexical_index
+                .search(&cx, "metadata", 5)
+                .await
+                .expect("search lexical index");
+            assert!(
+                lexical_hits.iter().all(|hit| hit.doc_id != "src/meta.json"),
+                "metadata-only ingest should remove lexical entries"
+            );
+
+            let query = vec![0.0_f32; 256];
+            let vector_hits = {
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                vi.search_top_k(&query, 5, None).expect("vector search")
+            };
+            assert!(
+                vector_hits.iter().all(|hit| hit.doc_id != "src/meta.json"),
+                "metadata-only ingest should remove vector entries"
+            );
         });
     }
 

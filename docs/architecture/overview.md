@@ -221,8 +221,41 @@ Then inspect:
 
 - `docs/fsfs-config-contract.md`
 - `docs/fsfs-dual-mode-contract.md`
+- `docs/fsfs-packaging-release-install-contract.md` (including host migration playbooks)
+- `docs/fsfs-packaging-release-install-contract.md#upgrade-and-migration-compatibility-verification-strategy`
+- `docs/ops-tui-ia.md#operator-runbook-production-use`
 - `AGENTS.md`
 
-## 9) Scope Notes
+## 9) Ops Control-Plane Data Flow + Contract Surface
+
+The ops control-plane stack is intentionally contract-driven so host integrations and operator workflows stay deterministic.
+
+```text
+host app adapter
+  -> telemetry envelope (schema + redaction policy)
+  -> ingestion/store (FrankenSQLite raw + summarized windows)
+  -> alert/slo/anomaly evaluators
+  -> ops query API
+  -> TUI screens (fleet/project/stream/history/explainability)
+```
+
+Key semantics:
+
+- SLO and anomaly state MUST use one shared taxonomy across all hosts.
+- Error severity and recovery guidance are contract-defined, not ad hoc.
+- Replay artifacts and reason codes are required for incident triage.
+
+Core contract references:
+
+| Contract | What it defines |
+|---|---|
+| `docs/control-plane-interface.md` | API surface and data model for fleet/project/stream queries |
+| `docs/slo-anomaly-contract.md` | SLO budgets, anomaly lifecycle, and reason fields |
+| `docs/control-plane-error-contract.md` | Severity classes, recovery guidance, and UI escalation |
+| `docs/observability-contract.md` | Event taxonomy (`decision/alert/degradation/transition/replay_marker`) |
+| `docs/evidence-jsonl-contract.md` | Replay-safe evidence schema + redaction policy |
+| `docs/cross-epic-telemetry-adapter-lockstep-contract.md` | Host adapter lockstep/versioning/conformance requirements |
+
+## 10) Scope Notes
 
 This document is intentionally a high-signal architecture map, not a full API reference. Detailed behavior, config invariants, and integration rules live in crate-level docs and the contracts under `docs/`.

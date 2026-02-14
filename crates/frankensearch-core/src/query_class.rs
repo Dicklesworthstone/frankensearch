@@ -64,8 +64,8 @@ impl QueryClass {
 
     /// Heuristic check for identifier-like queries.
     fn looks_like_identifier(s: &str) -> bool {
-        // Contains path separators
-        if s.contains('/') || s.contains('\\') {
+        // Path separators are identifier-like for single-token queries.
+        if !s.chars().any(char::is_whitespace) && (s.contains('/') || s.contains('\\')) {
             return true;
         }
 
@@ -159,6 +159,22 @@ mod tests {
         assert_eq!(
             QueryClass::classify("path/to/file.txt"),
             QueryClass::Identifier
+        );
+    }
+
+    #[test]
+    fn classify_slash_natural_language_as_natural_language() {
+        assert_eq!(
+            QueryClass::classify("how should we handle HTTP status 404/500 errors"),
+            QueryClass::NaturalLanguage
+        );
+    }
+
+    #[test]
+    fn classify_short_query_with_slash_as_short_keyword() {
+        assert_eq!(
+            QueryClass::classify("http 404/500"),
+            QueryClass::ShortKeyword
         );
     }
 

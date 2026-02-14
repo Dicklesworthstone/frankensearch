@@ -183,6 +183,7 @@ impl FederatedSearcher {
     /// # Errors
     ///
     /// Returns `SearchError::Cancelled` when cancellation is requested via `cx`.
+    /// Returns the first shard error when no shard completes successfully.
     /// Returns `SearchError::FederatedInsufficientResponses` when fewer than
     /// `min_indices` shards complete successfully.
     pub async fn search<F>(
@@ -227,6 +228,7 @@ impl FederatedSearcher {
         Ok(fused)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn collect_shard_results<F>(
         &self,
         cx: &Cx,
@@ -277,6 +279,7 @@ impl FederatedSearcher {
             .collect();
 
         let mut shard_results = Vec::new();
+        let mut first_shard_error: Option<SearchError> = None;
         while !pending.is_empty() {
             let ready_batch = poll_fn(|task_cx| {
                 let mut ready = Vec::new();
@@ -317,6 +320,9 @@ impl FederatedSearcher {
                             error = %error,
                             "federated shard search failed; continuing with remaining indices"
                         );
+                        if first_shard_error.is_none() {
+                            first_shard_error = Some(error);
+                        }
                     }
                     ShardCompletion::TimedOut { index } => {
                         warn!(
@@ -327,6 +333,16 @@ impl FederatedSearcher {
                     }
                 }
             }
+
+            if self.config.min_indices > 0 && shard_results.len() >= self.config.min_indices {
+                break;
+            }
+        }
+
+        if shard_results.is_empty()
+            && let Some(error) = first_shard_error
+        {
+            return Err(error);
         }
 
         Ok(shard_results)
@@ -868,6 +884,29 @@ mod tests {
     }
 
     #[test]
+    fn underlying_error_is_preserved_when_all_shards_fail() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let first = build_failing_searcher(&[("doc-first", &[1.0, 0.0])]);
+            let second = build_failing_searcher(&[("doc-second", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    min_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("first", first, 1.0)
+                .add_index("second", second, 1.0);
+
+            let error = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .expect_err("all shard failures should preserve an underlying error");
+
+            assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
+        });
+    }
+
+    #[test]
     fn filtered_shard_can_yield_zero_hits_without_failing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let full = build_searcher(&[("doc-full", &[1.0, 0.0])]);
@@ -1064,6 +1103,37 @@ mod tests {
             assert!(
                 elapsed < Duration::from_millis(130),
                 "scatter-gather should bound latency near one timeout budget; elapsed={elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn scatter_gather_returns_early_when_min_indices_is_satisfied() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let timeout_ms = 200_u64;
+            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    per_index_timeout_ms: timeout_ms,
+                    min_indices: 1,
+                    ..FederatedConfig::default()
+                })
+                .add_index("pending", pending, 1.0)
+                .add_index("fast", fast, 1.0);
+
+            let start = Instant::now();
+            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(
+                results.iter().any(|hit| hit.result.doc_id == "doc-fast"),
+                "fast shard result should be returned"
+            );
+            assert!(
+                elapsed < Duration::from_millis(120),
+                "search should return once min_indices is satisfied without waiting for timeout; elapsed={elapsed:?}"
             );
         });
     }

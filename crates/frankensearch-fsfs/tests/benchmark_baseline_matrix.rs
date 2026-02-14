@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use frankensearch_core::metrics_eval::{BootstrapComparison, bootstrap_compare};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -13,6 +14,16 @@ const MATRIX_VERSION: &str = "fsfs-benchmark-matrix-v1";
 const GOLDEN_PROFILES: [&str; 3] = ["tiny", "small", "medium"];
 const MAX_ALLOWED_REGRESSION_PCT: u16 = 20;
 const REGRESSION_SCALE: u64 = 100;
+
+/// Default bootstrap parameters for statistical regression detection.
+const BOOTSTRAP_CONFIDENCE: f64 = 0.95;
+const BOOTSTRAP_RESAMPLES: usize = 2000;
+const BOOTSTRAP_SEED: u64 = 0xBE0C_5EED;
+
+#[inline]
+fn metric_u64_to_f64(value: u64) -> f64 {
+    f64::from(u32::try_from(value).expect("benchmark fixture values must fit in u32"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +142,28 @@ struct RegressionViolation {
     measured: u64,
     regression_pct_x100: u64,
     threshold_pct_x100: u64,
+}
+
+/// Per-iteration sample set for a single metric, enabling bootstrap comparison.
+///
+/// When `iterations` contains multiple measurements from repeated benchmark runs,
+/// `bootstrap_compare` can determine whether the difference from the baseline
+/// distribution is statistically significant rather than relying on a fixed threshold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BenchmarkSampleSet {
+    metric: ComparatorMetric,
+    /// Per-iteration measured values (e.g., latency per query run).
+    iterations: Vec<f64>,
+}
+
+/// Result of a statistical regression check using bootstrap paired comparison.
+#[derive(Debug, Clone)]
+struct StatisticalRegressionResult {
+    metric: ComparatorMetric,
+    comparison: BootstrapComparison,
+    /// True when the difference is both statistically significant AND
+    /// in the regression direction (worse performance).
+    is_regression: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +332,57 @@ fn evaluate_regressions(
                 measured: observation.measured_value,
                 regression_pct_x100,
                 threshold_pct_x100,
+            })
+        })
+        .collect()
+}
+
+/// Evaluate regressions using bootstrap paired comparison.
+///
+/// For each metric in `sample_sets`, constructs a synthetic baseline distribution
+/// from the golden dataset value (repeated to match sample count) and compares
+/// against the measured iterations using `bootstrap_compare`.
+///
+/// A regression is flagged when the difference is both statistically significant
+/// (p < alpha) AND in the regression direction:
+/// - For throughput metrics: measured < baseline (lower is worse)
+/// - For latency/memory metrics: measured > baseline (higher is worse)
+fn evaluate_regressions_statistical(
+    dataset: &GoldenDataset,
+    sample_sets: &[BenchmarkSampleSet],
+) -> Vec<StatisticalRegressionResult> {
+    sample_sets
+        .iter()
+        .filter_map(|sample_set| {
+            if sample_set.iterations.is_empty() {
+                return None;
+            }
+            let baseline_scalar = baseline_value(dataset, sample_set.metric);
+            let n = sample_set.iterations.len();
+            let baseline_samples: Vec<f64> = vec![metric_u64_to_f64(baseline_scalar); n];
+
+            let comparison = bootstrap_compare(
+                &sample_set.iterations,
+                &baseline_samples,
+                BOOTSTRAP_CONFIDENCE,
+                BOOTSTRAP_RESAMPLES,
+                BOOTSTRAP_SEED,
+            )?;
+
+            // Determine regression direction:
+            // - Throughput: regression when measured < baseline (mean_diff < 0)
+            // - Latency/memory/size: regression when measured > baseline (mean_diff > 0)
+            let is_regression_direction = match sample_set.metric {
+                ComparatorMetric::IndexingThroughputDocsPerSecond => comparison.mean_diff < 0.0,
+                _ => comparison.mean_diff > 0.0,
+            };
+
+            let is_regression = comparison.significant && is_regression_direction;
+
+            Some(StatisticalRegressionResult {
+                metric: sample_set.metric,
+                comparison,
+                is_regression,
             })
         })
         .collect()
@@ -573,4 +657,185 @@ fn artifact_capture_supports_later_statistical_comparison() {
     let sample_lines = fs::read_to_string(&bundle.samples_path).expect("read samples");
     let non_empty_count = sample_lines.lines().filter(|line| !line.is_empty()).count();
     assert_eq!(non_empty_count, 4);
+}
+
+// ── Bootstrap statistical regression detection (bd-2hz.9.8) ───────
+
+#[test]
+fn statistical_regression_detects_significant_latency_increase() {
+    let dataset = load_golden_dataset("small");
+    // Baseline p95 is 25ms. Simulate measured iterations significantly higher.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![35.0, 38.0, 32.0, 36.0, 34.0, 37.0, 33.0, 35.0, 39.0, 36.0],
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert!(
+        result.is_regression,
+        "significant latency increase should be flagged as regression"
+    );
+    assert!(
+        result.comparison.significant,
+        "difference should be statistically significant"
+    );
+    assert!(
+        result.comparison.mean_diff > 0.0,
+        "measured latency should be higher than baseline"
+    );
+}
+
+#[test]
+fn statistical_regression_not_flagged_for_stable_throughput() {
+    let dataset = load_golden_dataset("small");
+    // Baseline throughput is 350 docs/s. Simulate stable measurements.
+    let base = metric_u64_to_f64(dataset.baseline_metrics.indexing_throughput_docs_per_second);
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::IndexingThroughputDocsPerSecond,
+        iterations: vec![
+            base,
+            base + 5.0,
+            base - 3.0,
+            base + 2.0,
+            base - 1.0,
+            base + 4.0,
+            base - 2.0,
+            base + 1.0,
+        ],
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].is_regression,
+        "stable throughput near baseline should not be flagged as regression"
+    );
+}
+
+#[test]
+fn statistical_regression_detects_throughput_drop() {
+    let dataset = load_golden_dataset("small");
+    // Baseline throughput is 350 docs/s. Simulate a significant drop.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::IndexingThroughputDocsPerSecond,
+        iterations: vec![200.0, 210.0, 195.0, 205.0, 198.0, 208.0, 202.0, 190.0],
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert!(
+        result.is_regression,
+        "significant throughput drop should be flagged as regression"
+    );
+    assert!(
+        result.comparison.mean_diff < 0.0,
+        "measured throughput should be lower than baseline (negative diff)"
+    );
+}
+
+#[test]
+fn statistical_regression_skips_empty_sample_sets() {
+    let dataset = load_golden_dataset("small");
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP50Ms,
+        iterations: Vec::new(),
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert!(
+        results.is_empty(),
+        "empty sample set should produce no results"
+    );
+}
+
+#[test]
+fn statistical_regression_handles_multiple_metrics_independently() {
+    let dataset = load_golden_dataset("small");
+    let mem_base = metric_u64_to_f64(dataset.baseline_metrics.searching_peak_memory_mb);
+    let sample_sets = vec![
+        // Latency regressed: measured >> baseline
+        BenchmarkSampleSet {
+            metric: ComparatorMetric::SearchLatencyP99Ms,
+            iterations: vec![80.0, 85.0, 78.0, 82.0, 84.0, 79.0, 83.0, 81.0],
+        },
+        // Memory stable: measured ≈ baseline
+        BenchmarkSampleSet {
+            metric: ComparatorMetric::SearchingPeakMemoryMb,
+            iterations: vec![
+                mem_base,
+                mem_base + 1.0,
+                mem_base - 1.0,
+                mem_base + 2.0,
+                mem_base - 2.0,
+                mem_base,
+                mem_base + 1.0,
+                mem_base - 1.0,
+            ],
+        },
+    ];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 2);
+
+    let latency = results
+        .iter()
+        .find(|r| r.metric == ComparatorMetric::SearchLatencyP99Ms)
+        .expect("p99 latency result should be present");
+    assert!(latency.is_regression, "p99 latency should show regression");
+
+    let memory = results
+        .iter()
+        .find(|r| r.metric == ComparatorMetric::SearchingPeakMemoryMb)
+        .expect("memory result should be present");
+    assert!(
+        !memory.is_regression,
+        "stable memory should not show regression"
+    );
+}
+
+#[test]
+fn statistical_regression_result_contains_bootstrap_ci_bounds() {
+    let dataset = load_golden_dataset("small");
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::FastTierLatencyMs,
+        iterations: vec![2.0, 2.1, 1.9, 2.0, 2.2, 1.8, 2.1, 2.0],
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    // CI bounds should be well-formed
+    assert!(
+        result.comparison.ci_lower <= result.comparison.ci_upper,
+        "CI lower should be <= CI upper"
+    );
+    assert!(
+        (result.comparison.confidence - BOOTSTRAP_CONFIDENCE).abs() < f64::EPSILON,
+        "confidence should match configured value"
+    );
+    assert_eq!(result.comparison.n_resamples, BOOTSTRAP_RESAMPLES);
+    assert!(
+        result.comparison.p_value > 0.0,
+        "p-value should be positive (plus-one correction)"
+    );
+    assert!(
+        result.comparison.p_value <= 1.0,
+        "p-value should not exceed 1.0"
+    );
+}
+
+#[test]
+fn sample_set_serde_roundtrip() {
+    let sample_set = BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![25.0, 26.0, 24.5, 25.5, 27.0],
+    };
+
+    let json = serde_json::to_string(&sample_set).expect("serialize sample set");
+    let back: BenchmarkSampleSet = serde_json::from_str(&json).expect("deserialize sample set");
+    assert_eq!(sample_set, back);
 }

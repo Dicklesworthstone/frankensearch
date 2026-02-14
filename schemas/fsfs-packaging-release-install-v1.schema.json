@@ -1,0 +1,595 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-packaging-release-install-v1.schema.json",
+  "title": "fsfs Packaging, Release, and Install Contract v1",
+  "description": "Schema for packaging/release/install contract definitions, release manifests, and upgrade plans.",
+  "oneOf": [
+    { "$ref": "#/$defs/contractDefinition" },
+    { "$ref": "#/$defs/releaseManifest" },
+    { "$ref": "#/$defs/upgradePlan" }
+  ],
+  "$defs": {
+    "targetTriple": {
+      "type": "string",
+      "enum": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ]
+    },
+    "buildTool": {
+      "type": "string",
+      "enum": [
+        "cargo",
+        "zigbuild"
+      ]
+    },
+    "archiveFormat": {
+      "type": "string",
+      "enum": ["tar.xz"]
+    },
+    "osFamily": {
+      "type": "string",
+      "enum": ["linux", "macos"]
+    },
+    "channel": {
+      "type": "string",
+      "enum": [
+        "github_release",
+        "curl_installer",
+        "cargo_crates_io"
+      ]
+    },
+    "semverTag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^(release|install|upgrade)\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)+$"
+    },
+    "matrixEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_triple",
+        "os_family",
+        "build_tool",
+        "archive_format",
+        "binary_name"
+      ],
+      "properties": {
+        "target_triple": { "$ref": "#/$defs/targetTriple" },
+        "os_family": { "$ref": "#/$defs/osFamily" },
+        "build_tool": { "$ref": "#/$defs/buildTool" },
+        "archive_format": { "$ref": "#/$defs/archiveFormat" },
+        "binary_name": { "type": "string", "const": "fsfs" }
+      }
+    },
+    "artifactDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_triple",
+        "archive_path",
+        "checksum",
+        "metadata_path",
+        "build_tool"
+      ],
+      "properties": {
+        "target_triple": { "$ref": "#/$defs/targetTriple" },
+        "archive_path": {
+          "type": "string",
+          "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz$"
+        },
+        "checksum": { "$ref": "#/$defs/sha256Digest" },
+        "metadata_path": {
+          "type": "string",
+          "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.metadata\\.json$"
+        },
+        "build_tool": { "$ref": "#/$defs/buildTool" },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "signature_path",
+            "certificate_path"
+          ],
+          "properties": {
+            "signature_path": {
+              "type": "string",
+              "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz\\.sig$"
+            },
+            "certificate_path": {
+              "type": "string",
+              "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz\\.pem$"
+            }
+          }
+        }
+      }
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "release_matrix",
+        "artifact_naming",
+        "integrity_policy",
+        "install_policy",
+        "upgrade_policy",
+        "ci_jobs",
+        "reason_codes"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_packaging_release_install_contract"
+        },
+        "schema_version": { "type": "integer", "const": 1 },
+        "release_matrix": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/matrixEntry" }
+        },
+        "artifact_naming": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "archive_template",
+            "checksum_suffix",
+            "metadata_suffix",
+            "signature_suffix",
+            "certificate_suffix"
+          ],
+          "properties": {
+            "archive_template": {
+              "type": "string",
+              "const": "fsfs-{tag}-{target}.tar.xz"
+            },
+            "checksum_suffix": { "type": "string", "const": ".sha256" },
+            "metadata_suffix": { "type": "string", "const": ".metadata.json" },
+            "signature_suffix": { "type": "string", "const": ".sig" },
+            "certificate_suffix": { "type": "string", "const": ".pem" }
+          }
+        },
+        "integrity_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checksum_algorithm",
+            "checksum_required",
+            "signature_strategy",
+            "installer_verify_modes",
+            "transparency_log_required"
+          ],
+          "properties": {
+            "checksum_algorithm": { "type": "string", "const": "sha256" },
+            "checksum_required": { "type": "boolean", "const": true },
+            "signature_strategy": {
+              "type": "string",
+              "enum": [
+                "optional_cosign_blob",
+                "required_cosign_blob"
+              ]
+            },
+            "installer_verify_modes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "always_checksum",
+                  "explicit_signature_with_verify_flag"
+                ]
+              }
+            },
+            "transparency_log_required": { "type": "boolean" }
+          }
+        },
+        "install_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "default_entrypoint",
+            "developer_entrypoint",
+            "preflight_checks",
+            "required_flags",
+            "non_root_default",
+            "upgrade_entrypoint"
+          ],
+          "properties": {
+            "default_entrypoint": { "type": "string", "minLength": 1 },
+            "developer_entrypoint": { "type": "string", "minLength": 1 },
+            "preflight_checks": {
+              "type": "array",
+              "minItems": 4,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "platform_support",
+                  "disk_space",
+                  "write_permission",
+                  "network_reachability",
+                  "existing_install_detection"
+                ]
+              }
+            },
+            "required_flags": {
+              "type": "array",
+              "minItems": 5,
+              "uniqueItems": true,
+              "items": { "type": "string" }
+            },
+            "non_root_default": { "type": "boolean", "const": true },
+            "upgrade_entrypoint": { "type": "string", "minLength": 1 }
+          },
+          "allOf": [
+            { "properties": { "required_flags": { "contains": { "const": "--version" } } } },
+            { "properties": { "required_flags": { "contains": { "const": "--dest" } } } },
+            { "properties": { "required_flags": { "contains": { "const": "--verify" } } } },
+            { "properties": { "required_flags": { "contains": { "const": "--checksum" } } } },
+            { "properties": { "required_flags": { "contains": { "const": "--easy-mode" } } } }
+          ]
+        },
+        "upgrade_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version_resolution_order",
+            "supported_upgrade_paths",
+            "rollback_behavior"
+          ],
+          "properties": {
+            "version_resolution_order": {
+              "type": "array",
+              "prefixItems": [
+                { "const": "pinned" },
+                { "const": "latest" }
+              ],
+              "items": { "type": "string" },
+              "minItems": 2
+            },
+            "supported_upgrade_paths": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "fresh_install",
+                  "n-1_to_n",
+                  "n-2_to_n"
+                ]
+              }
+            },
+            "rollback_behavior": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "on_verification_failure",
+                "on_post_install_failure",
+                "downgrade_support"
+              ],
+              "properties": {
+                "on_verification_failure": {
+                  "type": "string",
+                  "enum": [
+                    "abort_without_replacing_binary",
+                    "abort_and_restore_previous_binary"
+                  ]
+                },
+                "on_post_install_failure": {
+                  "type": "string",
+                  "enum": [
+                    "restore_previous_binary_if_present",
+                    "emit_error_and_require_manual_recovery"
+                  ]
+                },
+                "downgrade_support": {
+                  "type": "string",
+                  "enum": [
+                    "best_effort_with_clear_error",
+                    "unsupported"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "ci_jobs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "release_build_job",
+            "release_publish_job",
+            "crates_publish_job"
+          ],
+          "properties": {
+            "release_build_job": { "type": "string", "const": "release-build" },
+            "release_publish_job": { "type": "string", "const": "release-publish" },
+            "crates_publish_job": { "type": "string", "const": "publish-crates" }
+          }
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/reasonCode" }
+        }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "x86_64-unknown-linux-musl"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "aarch64-unknown-linux-musl"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "x86_64-apple-darwin"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "aarch64-apple-darwin"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "releaseManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "tag",
+        "generated_at",
+        "install_script_url",
+        "distribution_channels",
+        "artifacts",
+        "verification_summary"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_release_manifest"
+        },
+        "schema_version": { "type": "integer", "const": 1 },
+        "tag": { "$ref": "#/$defs/semverTag" },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "install_script_url": { "type": "string", "format": "uri" },
+        "distribution_channels": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/channel" }
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 4,
+          "items": { "$ref": "#/$defs/artifactDescriptor" }
+        },
+        "verification_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checksum_verified",
+            "signatures_present",
+            "transparency_log_checked"
+          ],
+          "properties": {
+            "checksum_verified": { "type": "boolean", "const": true },
+            "signatures_present": { "type": "boolean" },
+            "transparency_log_checked": { "type": "boolean" }
+          }
+        },
+        "compatibility_notes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "artifacts": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "x86_64-unknown-linux-musl"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "artifacts": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "aarch64-unknown-linux-musl"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "artifacts": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "x86_64-apple-darwin"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "artifacts": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "target_triple": {
+                    "const": "aarch64-apple-darwin"
+                  }
+                },
+                "required": ["target_triple"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "upgradeStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "action",
+        "on_failure_reason_code"
+      ],
+      "properties": {
+        "stage": {
+          "type": "string",
+          "enum": [
+            "preflight",
+            "fetch",
+            "verify",
+            "install",
+            "post_install"
+          ]
+        },
+        "action": { "type": "string", "minLength": 1 },
+        "on_failure_reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "upgradePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "from_version",
+        "to_version",
+        "selected_channel",
+        "steps",
+        "rollback",
+        "telemetry_fields"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_upgrade_plan"
+        },
+        "schema_version": { "type": "integer", "const": 1 },
+        "from_version": { "$ref": "#/$defs/semverTag" },
+        "to_version": { "$ref": "#/$defs/semverTag" },
+        "selected_channel": { "$ref": "#/$defs/channel" },
+        "steps": {
+          "type": "array",
+          "minItems": 4,
+          "items": { "$ref": "#/$defs/upgradeStep" }
+        },
+        "rollback": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "trigger_reason_codes",
+            "procedure",
+            "user_message"
+          ],
+          "properties": {
+            "trigger_reason_codes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/reasonCode" }
+            },
+            "procedure": { "type": "string", "minLength": 1 },
+            "user_message": { "type": "string", "minLength": 1 }
+          }
+        },
+        "telemetry_fields": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "package_version",
+              "install_stage",
+              "migration_hook",
+              "rollback_status",
+              "reason_code"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

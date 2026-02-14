@@ -146,6 +146,52 @@ Both modes MUST provide:
 - If lexical or semantic source is missing, both modes MUST degrade with explicit source-loss reason code.
 - Degraded behavior MUST preserve deterministic ordering guarantees.
 
+## Operator Triage Playbooks (CLI + TUI)
+
+These playbooks are normative for incident response so both modes remain operationally equivalent.
+
+### Playbook 1: Quality refinement unavailable
+
+- Symptoms:
+  - CLI: initial results present but refinement absent/failed.
+  - TUI: phase upgrade panel indicates refinement failure.
+- Diagnose:
+  - confirm both surfaces classify outcome as degraded-but-valid,
+  - compare canonical reason code and root-cause category (`model` or `resource`),
+  - verify fallback still preserves ranking determinism for fast-phase set.
+- Recovery:
+  - restore quality-tier availability (model path, timeout budget, pressure limits),
+  - rerun same query and verify phase transition parity,
+  - keep fallback enabled until parity checks pass.
+- Exit criteria: both modes return equivalent `Initial` + `Refined` semantics for equal inputs.
+
+### Playbook 2: Source-loss degradation (lexical or semantic lane missing)
+
+- Symptoms:
+  - one retrieval source is unavailable while search still returns partial results.
+- Diagnose:
+  - validate that both modes emit the same canonical source-loss reason code,
+  - verify ordered subset consistency for equal `limit/offset` inputs,
+  - confirm explain payloads remain schema-valid and mode-consistent.
+- Recovery:
+  - restore missing lane (index health, embedder availability, config source),
+  - rerun parity query set and compare ranked outputs between modes,
+  - keep divergence confined to presentation-only surfaces.
+- Exit criteria: no semantic divergence remains after lane recovery.
+
+### Playbook 3: Recovery guidance mismatch between CLI and TUI
+
+- Symptoms:
+  - CLI and TUI show different remediation steps for the same failure.
+- Diagnose:
+  - compare root-cause category, reason code, and suggested action text source,
+  - verify both modes point to the same replay/diagnostic handle where available.
+- Recovery:
+  - normalize guidance templates to shared canonical mappings,
+  - add/refresh parity tests in conformance lanes (`recovery` + `discoverability` checks),
+  - verify mode-specific wording does not alter semantic guidance.
+- Exit criteria: mode outputs differ only by presentation, not remediation semantics.
+
 ## Conformance Checklist (Implementation Gate)
 
 Downstream implementation beads MUST prove:

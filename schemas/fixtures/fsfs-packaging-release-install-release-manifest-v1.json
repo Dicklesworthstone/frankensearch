@@ -1,0 +1,67 @@
+{
+  "kind": "fsfs_release_manifest",
+  "schema_version": 1,
+  "tag": "v0.4.0",
+  "generated_at": "2026-02-14T22:00:00Z",
+  "install_script_url": "https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh",
+  "distribution_channels": [
+    "github_release",
+    "curl_installer",
+    "cargo_crates_io"
+  ],
+  "artifacts": [
+    {
+      "target_triple": "x86_64-unknown-linux-musl",
+      "archive_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.tar.xz",
+      "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "metadata_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.metadata.json",
+      "build_tool": "zigbuild",
+      "signature": {
+        "signature_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.tar.xz.sig",
+        "certificate_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.tar.xz.pem"
+      }
+    },
+    {
+      "target_triple": "aarch64-unknown-linux-musl",
+      "archive_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.tar.xz",
+      "checksum": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "metadata_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.metadata.json",
+      "build_tool": "zigbuild",
+      "signature": {
+        "signature_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.tar.xz.sig",
+        "certificate_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.tar.xz.pem"
+      }
+    },
+    {
+      "target_triple": "x86_64-apple-darwin",
+      "archive_path": "fsfs-v0.4.0-x86_64-apple-darwin.tar.xz",
+      "checksum": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "metadata_path": "fsfs-v0.4.0-x86_64-apple-darwin.metadata.json",
+      "build_tool": "cargo",
+      "signature": {
+        "signature_path": "fsfs-v0.4.0-x86_64-apple-darwin.tar.xz.sig",
+        "certificate_path": "fsfs-v0.4.0-x86_64-apple-darwin.tar.xz.pem"
+      }
+    },
+    {
+      "target_triple": "aarch64-apple-darwin",
+      "archive_path": "fsfs-v0.4.0-aarch64-apple-darwin.tar.xz",
+      "checksum": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "metadata_path": "fsfs-v0.4.0-aarch64-apple-darwin.metadata.json",
+      "build_tool": "cargo",
+      "signature": {
+        "signature_path": "fsfs-v0.4.0-aarch64-apple-darwin.tar.xz.sig",
+        "certificate_path": "fsfs-v0.4.0-aarch64-apple-darwin.tar.xz.pem"
+      }
+    }
+  ],
+  "verification_summary": {
+    "checksum_verified": true,
+    "signatures_present": true,
+    "transparency_log_checked": false
+  },
+  "compatibility_notes": [
+    "Installer verifies checksums before replacement.",
+    "Signature verification is opt-in via --verify."
+  ]
+}

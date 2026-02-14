@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use frankensearch_core::SearchError;
 use frankensearch_fsfs::{
-    ALL_OUTPUT_ERROR_CODES, ALL_OUTPUT_WARNING_CODES, CompatibilityMode, CompactEnvelope,
-    CompactSearchResponse, ENVELOPE_FIELDS, FieldPresence, OUTPUT_SCHEMA_MIN_SUPPORTED,
+    ALL_OUTPUT_ERROR_CODES, ALL_OUTPUT_WARNING_CODES, CompactEnvelope, CompactSearchResponse,
+    CompatibilityMode, ENVELOPE_FIELDS, FieldPresence, OUTPUT_SCHEMA_MIN_SUPPORTED,
     OUTPUT_SCHEMA_VERSION, OutputEnvelope, OutputError, OutputErrorCode, OutputMeta, OutputWarning,
     OutputWarningCode, ResultIdRegistry, STREAM_PROTOCOL_VERSION, STREAM_SCHEMA_VERSION,
     StreamTerminalStatus, builtin_templates, decode_envelope_toon, encode_envelope_toon,
@@ -453,14 +453,22 @@ fn toon_encoding_is_deterministic() {
 fn valid_success_envelope_passes_strict_validation() {
     let env = sample_success_envelope();
     let result = validate_envelope(&env, CompatibilityMode::Strict);
-    assert!(result.valid, "validation violations: {:?}", result.violations);
+    assert!(
+        result.valid,
+        "validation violations: {:?}",
+        result.violations
+    );
 }
 
 #[test]
 fn valid_error_envelope_passes_strict_validation() {
     let env = sample_error_envelope();
     let result = validate_envelope(&env, CompatibilityMode::Strict);
-    assert!(result.valid, "validation violations: {:?}", result.violations);
+    assert!(
+        result.valid,
+        "validation violations: {:?}",
+        result.violations
+    );
 }
 
 #[test]
@@ -696,10 +704,7 @@ fn registry_preserves_state_across_batches() {
 #[test]
 fn registry_resolve_returns_correct_entry() {
     let mut registry = ResultIdRegistry::new();
-    let docs = vec![
-        ("alpha.rs".to_string(), 0.9),
-        ("beta.rs".to_string(), 0.8),
-    ];
+    let docs = vec![("alpha.rs".to_string(), 0.9), ("beta.rs".to_string(), 0.8)];
     registry.register_batch(&docs);
 
     let entry = registry.resolve("R0").expect("R0 should exist");

@@ -61,7 +61,10 @@ pub use evidence::{
     EvidenceRedaction, EvidenceSeverity, EvidenceSink, EvidenceTrace, EvidenceWriteError,
     NoopWriter, RedactionTransform, VecWriter,
 };
-pub use frame::{FrameBudget, FrameMetrics, JankCallback};
+pub use frame::{
+    CachedLayout, CachedTabState, FrameBudget, FrameMetrics, FramePipelineMetrics,
+    FramePipelineTimer, JankCallback,
+};
 pub use input::{InputEvent, KeyAction, KeyBinding, Keymap};
 pub use interaction::{
     CardLayoutRule, CardRole, DeterministicCheckpoint, DeterministicStateBoundary,

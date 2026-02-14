@@ -7,6 +7,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use frankensearch_core::error::{SearchError, SearchResult};
+use tracing::warn;
+
 /// Bakeoff eligibility cutoff (strictly later than this date).
 pub const BAKEOFF_CUTOFF_DATE: &str = "2025-11-01";
 
@@ -325,10 +328,28 @@ pub(crate) fn model_storage_root() -> PathBuf {
     PathBuf::from("models")
 }
 
-pub(crate) fn ensure_model_storage_layout() -> PathBuf {
+pub(crate) fn ensure_model_storage_layout_checked() -> SearchResult<PathBuf> {
     let root = model_storage_root();
-    let _ = ensure_model_layout_dirs(&root);
-    root
+    ensure_model_layout_dirs(&root).map_err(|source| SearchError::ModelLoadFailed {
+        path: root.clone(),
+        source: Box::new(source),
+    })?;
+    Ok(root)
+}
+
+pub(crate) fn ensure_model_storage_layout() -> PathBuf {
+    match ensure_model_storage_layout_checked() {
+        Ok(root) => root,
+        Err(error) => {
+            let root = model_storage_root();
+            warn!(
+                root = %root.display(),
+                error = %error,
+                "failed to ensure model storage layout; continuing with unresolved root"
+            );
+            root
+        }
+    }
 }
 
 fn ensure_model_layout_dirs(root: &Path) -> std::io::Result<()> {

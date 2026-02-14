@@ -91,6 +91,47 @@ Profile-resolution diagnostics MUST include:
 - `reason_code`
 - `effective_profile_version`
 
+## Scenario Playbooks (Pressure + Recovery)
+
+### Playbook 1: Rapid pressure escalation into degraded states
+
+- Symptoms: frequent transitions toward `EmbedDeferred`, `LexicalOnly`, `MetadataOnly`, or `Paused`.
+- Diagnose:
+  - inspect transition reason codes: `degrade.transition.escalated`, `degrade.transition.calibration_fallback`,
+  - inspect profile diagnostics: `profile.resolution.ok` or `profile.resolution.conflict`,
+  - verify whether safety clamps were applied (`safety.clamp.hard_pause.quality_enabled`, `safety.clamp.hard_pause.allow_background_indexing`).
+- Recovery:
+  - reduce load and confirm profile-appropriate ceilings (`cpu`, `memory`, `io`, `load`),
+  - clear accidental hard-pause inputs if present,
+  - prefer profile changes over ad-hoc override churn.
+- Exit criteria: transitions stabilize with repeated `degrade.state.stable` under expected workload.
+
+### Playbook 2: Recovery appears stuck after host pressure drops
+
+- Symptoms: system remains in degraded mode despite healthy host metrics.
+- Diagnose:
+  - verify recovery-gate telemetry: `degrade.transition.recovery_pending`,
+  - verify eventual recovery emission: `degrade.transition.recovered`,
+  - check anti-flap/readiness controls (`consecutive_healthy_required`) and override mode.
+- Recovery:
+  - keep pressure in healthy band long enough to satisfy recovery gate,
+  - remove manual holds/forced overrides that pin degraded mode,
+  - avoid forcing direct jumps that violate stepwise recovery policy.
+- Exit criteria: deterministic stepwise recovery and stable non-degraded operation.
+
+### Playbook 3: Operator override rejected or silently ineffective
+
+- Symptoms: requested profile override does not apply.
+- Diagnose:
+  - inspect `overrides[]` entries (`applied=false`) and `override.rejected.locked_field`,
+  - inspect `precedence_chain` to ensure request source is actually winning,
+  - inspect conflict signal (`conflict_detected=true`).
+- Recovery:
+  - move change to an allowed field for the selected profile,
+  - if lock is intentional, switch profile first, then reapply override,
+  - document manual intervention in incident notes.
+- Exit criteria: override outcomes are explicit and reproducible with matching reason codes.
+
 ## Degraded-Mode UX and Override Control Contract
 
 When runtime enters any non-`normal` query mode, the UI layer MUST provide:

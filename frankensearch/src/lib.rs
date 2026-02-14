@@ -250,6 +250,13 @@ pub use frankensearch_core::fingerprint::{
     DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint, SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,
 };
 
+// IR evaluation metrics
+pub use frankensearch_core::metrics_eval::{
+    BootstrapCi, BootstrapComparison, QualityComparison, QualityMetric, QualityMetricComparison,
+    QualityMetricSamples, bootstrap_ci, bootstrap_compare, map_at_k, mrr, ndcg_at_k,
+    quality_comparison, recall_at_k,
+};
+
 // Utility functions
 pub use frankensearch_core::traits::{cosine_similarity, l2_normalize, truncate_embedding};
 

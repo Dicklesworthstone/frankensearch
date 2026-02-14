@@ -40,7 +40,7 @@ const SUBSYSTEM: &str = "fsfs_format_emitter";
 /// | `Toon` | TOON encoding via `toon-rust` |
 /// | `Jsonl` | Compact single-line JSON (no trailing newline added by serializer) |
 /// | `Table` | Human-readable key/value table |
-/// | `Csv` | Not yet implemented for envelopes (returns error) |
+/// | `Csv` | RFC4180-compatible rows for search payloads, generic payloads, and envelope errors |
 ///
 /// # Errors
 ///
@@ -59,11 +59,7 @@ where
         OutputFormat::Toon => emit_toon(envelope, writer),
         OutputFormat::Jsonl => emit_jsonl(envelope, writer),
         OutputFormat::Table => emit_table(envelope, writer),
-        OutputFormat::Csv => Err(SearchError::InvalidConfig {
-            field: "format".into(),
-            value: "csv".into(),
-            reason: "CSV format is not supported for envelope output; use json or toon".into(),
-        }),
+        OutputFormat::Csv => emit_csv(envelope, writer),
     }
 }
 
@@ -266,6 +262,157 @@ fn emit_table<T: Serialize, W: Write>(
     }
 
     Ok(())
+}
+
+fn emit_csv<T: Serialize, W: Write>(
+    envelope: &OutputEnvelope<T>,
+    writer: &mut W,
+) -> SearchResult<()> {
+    if envelope.ok {
+        let data = envelope
+            .data
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "format".into(),
+                value: "csv".into(),
+                reason: "csv success output requires a payload".into(),
+            })?;
+        let payload_json =
+            serde_json::to_string(data).map_err(|source| SearchError::SubsystemError {
+                subsystem: SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to project data for csv display: {source}"
+                ))),
+            })?;
+
+        if envelope.meta.command.eq_ignore_ascii_case("search")
+            && let Ok(search_payload) = serde_json::from_str::<SearchPayload>(&payload_json)
+        {
+            return write_search_payload_csv(&search_payload, writer);
+        }
+
+        return write_generic_payload_csv(&payload_json, writer);
+    }
+
+    write_csv_row(
+        writer,
+        &[
+            "ok".to_owned(),
+            "error_code".to_owned(),
+            "error_message".to_owned(),
+            "error_field".to_owned(),
+            "error_suggestion".to_owned(),
+            "error_context".to_owned(),
+        ],
+    )?;
+
+    if let Some(error) = &envelope.error {
+        write_csv_row(
+            writer,
+            &[
+                "false".to_owned(),
+                error.code.clone(),
+                error.message.clone(),
+                error.field.clone().unwrap_or_default(),
+                error.suggestion.clone().unwrap_or_default(),
+                error.context.clone().unwrap_or_default(),
+            ],
+        )
+    } else {
+        write_csv_row(
+            writer,
+            &[
+                "false".to_owned(),
+                "unknown_error".to_owned(),
+                "envelope marked as error but no error payload provided".to_owned(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        )
+    }
+}
+
+fn write_generic_payload_csv<W: Write>(payload_json: &str, writer: &mut W) -> SearchResult<()> {
+    write_csv_row(writer, &["data_json".to_owned()])?;
+    write_csv_row(writer, &[payload_json.to_owned()])
+}
+
+fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -> SearchResult<()> {
+    write_csv_row(
+        writer,
+        &[
+            "query".to_owned(),
+            "phase".to_owned(),
+            "total_candidates".to_owned(),
+            "returned_hits".to_owned(),
+            "rank".to_owned(),
+            "path".to_owned(),
+            "score".to_owned(),
+            "in_both_sources".to_owned(),
+            "lexical_rank".to_owned(),
+            "semantic_rank".to_owned(),
+            "snippet".to_owned(),
+        ],
+    )?;
+
+    for hit in &payload.hits {
+        let lexical_rank = hit
+            .lexical_rank
+            .map(|rank| rank.saturating_add(1).to_string())
+            .unwrap_or_default();
+        let semantic_rank = hit
+            .semantic_rank
+            .map(|rank| rank.saturating_add(1).to_string())
+            .unwrap_or_default();
+        write_csv_row(
+            writer,
+            &[
+                payload.query.clone(),
+                payload.phase.to_string(),
+                payload.total_candidates.to_string(),
+                payload.returned_hits.to_string(),
+                hit.rank.to_string(),
+                hit.path.clone(),
+                format!("{:.6}", hit.score),
+                hit.in_both_sources.to_string(),
+                lexical_rank,
+                semantic_rank,
+                hit.snippet.clone().unwrap_or_default(),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_csv_row<W: Write>(writer: &mut W, fields: &[String]) -> SearchResult<()> {
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",").map_err(write_err)?;
+        }
+        write_csv_field(writer, field)?;
+    }
+    writer.write_all(b"\n").map_err(write_err)
+}
+
+fn write_csv_field<W: Write>(writer: &mut W, field: &str) -> SearchResult<()> {
+    let needs_quotes = field.contains(',') || field.contains('\n') || field.contains('\r');
+    if !needs_quotes && !field.contains('"') {
+        return writer.write_all(field.as_bytes()).map_err(write_err);
+    }
+
+    writer.write_all(b"\"").map_err(write_err)?;
+    for ch in field.chars() {
+        if ch == '"' {
+            writer.write_all(b"\"\"").map_err(write_err)?;
+        } else {
+            let mut utf8 = [0_u8; 4];
+            let encoded = ch.encode_utf8(&mut utf8);
+            writer.write_all(encoded.as_bytes()).map_err(write_err)?;
+        }
+    }
+    writer.write_all(b"\"").map_err(write_err)
 }
 
 fn render_search_table(payload: &SearchPayload, duration_ms: Option<u64>) -> String {
@@ -846,13 +993,77 @@ mod tests {
         assert!(output.contains("(42ms)"));
     }
 
-    // ─── CSV unsupported ────────────────────────────────────────────────
+    // ─── CSV emission ────────────────────────────────────────────────────
 
     #[test]
-    fn emit_csv_returns_error() {
+    fn emit_csv_search_payload_renders_header_and_rows() {
+        let payload = SearchPayload::new(
+            "auth middleware",
+            SearchOutputPhase::Refined,
+            3,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/auth.rs:42".to_owned(),
+                    score: 0.9234,
+                    snippet: Some("middleware validates bearer tokens".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(1),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "docs/auth guide.md".to_owned(),
+                    score: 0.811,
+                    snippet: Some("quoted \"token\" snippet, with comma".to_owned()),
+                    lexical_rank: None,
+                    semantic_rank: Some(2),
+                    in_both_sources: false,
+                },
+            ],
+        );
+        let env = OutputEnvelope::success(payload, sample_meta("csv"), sample_ts());
+        let output = emit_envelope_string(&env, OutputFormat::Csv).expect("csv output");
+        let mut lines = output.lines();
+        assert_eq!(
+            lines.next().unwrap_or_default(),
+            "query,phase,total_candidates,returned_hits,rank,path,score,in_both_sources,lexical_rank,semantic_rank,snippet"
+        );
+        assert!(
+            lines.next().unwrap_or_default().contains("auth middleware,refined,3,2,1,src/auth.rs:42,0.923400,true,1,2,middleware validates bearer tokens")
+        );
+        assert!(lines.next().unwrap_or_default().contains(
+            "docs/auth guide.md,0.811000,false,,3,\"quoted \"\"token\"\" snippet, with comma\""
+        ));
+    }
+
+    #[test]
+    fn emit_csv_error_outputs_error_row() {
+        let err = OutputError::new(OutputErrorCode::MODEL_NOT_FOUND, "model missing", 78)
+            .with_field("model")
+            .with_suggestion("fsfs download-models --model all-MiniLM-L6-v2");
+        let env: OutputEnvelope<()> = OutputEnvelope::error(err, sample_meta("csv"), sample_ts());
+        let output = emit_envelope_string(&env, OutputFormat::Csv).expect("csv error output");
+        let mut lines = output.lines();
+        assert_eq!(
+            lines.next().unwrap_or_default(),
+            "ok,error_code,error_message,error_field,error_suggestion,error_context"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap_or_default()
+                .contains("false,model_not_found,model missing,model,fsfs download-models --model all-MiniLM-L6-v2,")
+        );
+    }
+
+    #[test]
+    fn emit_csv_non_search_success_payload_outputs_json_cell() {
         let env = OutputEnvelope::success("ok", sample_meta("csv"), sample_ts());
-        let err = emit_envelope_string(&env, OutputFormat::Csv).unwrap_err();
-        assert!(err.to_string().contains("CSV format is not supported"));
+        let output = emit_envelope_string(&env, OutputFormat::Csv).expect("csv output");
+        let mut lines = output.lines();
+        assert_eq!(lines.next().unwrap_or_default(), "data_json");
+        assert_eq!(lines.next().unwrap_or_default(), "\"\"\"ok\"\"\"");
     }
 
     // ─── JSON/TOON Parity ───────────────────────────────────────────────

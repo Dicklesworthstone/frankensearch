@@ -9,6 +9,8 @@ use frankensearch_tui::{
 
 use crate::config::{Density, FsfsConfig, TuiTheme};
 
+const REPLAY_TRACE_ACTION_ID: &str = "diag.replay_trace";
+
 /// TUI-facing settings derived from resolved fsfs config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiAdapterSettings {
@@ -305,6 +307,25 @@ impl Default for TuiKeymapModel {
                     "search.submit_query",
                     TuiKeyBindingScope::Global,
                 ),
+                TuiKeyBindingSpec::new("Up", "search.select_up", TuiKeyBindingScope::Global),
+                TuiKeyBindingSpec::new("Down", "search.select_down", TuiKeyBindingScope::Global),
+                TuiKeyBindingSpec::new("PageUp", "search.page_up", TuiKeyBindingScope::Global),
+                TuiKeyBindingSpec::new("PageDown", "search.page_down", TuiKeyBindingScope::Global),
+                TuiKeyBindingSpec::new(
+                    "Ctrl+E",
+                    "search.toggle_explain",
+                    TuiKeyBindingScope::Global,
+                ),
+                TuiKeyBindingSpec::new(
+                    "Ctrl+O",
+                    "search.open_selected",
+                    TuiKeyBindingScope::Global,
+                ),
+                TuiKeyBindingSpec::new(
+                    "Ctrl+J",
+                    "search.jump_to_source",
+                    TuiKeyBindingScope::Global,
+                ),
                 TuiKeyBindingSpec::new("Enter", "palette.confirm", TuiKeyBindingScope::Palette),
                 TuiKeyBindingSpec::new("Up", "palette.up", TuiKeyBindingScope::Palette),
                 TuiKeyBindingSpec::new("Down", "palette.down", TuiKeyBindingScope::Palette),
@@ -477,21 +498,21 @@ impl TuiPaletteModel {
                 "Toggle Inline Explainability",
                 "Show or hide inline score/provenance details for selected result",
                 TuiPaletteCategory::Search,
-                None,
+                Some("Ctrl+E"),
             ),
             TuiPaletteActionSpec::named(
                 "search.open_selected",
                 "Open Selected Result",
                 "Open the currently selected result in the local editor/viewer",
                 TuiPaletteCategory::Search,
-                None,
+                Some("Ctrl+O"),
             ),
             TuiPaletteActionSpec::named(
                 "search.jump_to_source",
                 "Jump To Source",
                 "Jump directly to the selected result's file/source location",
                 TuiPaletteCategory::Search,
-                None,
+                Some("Ctrl+J"),
             ),
         ]
     }
@@ -595,7 +616,7 @@ impl TuiPaletteModel {
                 None,
             ),
             TuiPaletteActionSpec::named(
-                "diag.replay_trace",
+                REPLAY_TRACE_ACTION_ID,
                 "Replay Last Trace",
                 "Replay last failing scenario using repro manifest metadata",
                 TuiPaletteCategory::Diagnostics,
@@ -832,7 +853,7 @@ impl TuiPaletteIntentModel {
             "explain.toggle_panel" => TuiPaletteIntent::ToggleExplainabilityPanel,
             "config.reload" => TuiPaletteIntent::ReloadConfiguration,
             "ops.open_timeline" => TuiPaletteIntent::OpenOpsTimeline,
-            "diag.replay_trace" => TuiPaletteIntent::ReplayDiagnostics,
+            REPLAY_TRACE_ACTION_ID => TuiPaletteIntent::ReplayDiagnostics,
             _ => TuiPaletteIntent::Unknown,
         }
     }
@@ -1061,6 +1082,20 @@ impl TuiLatencyBudgetHook {
                 metric_key: "tui.search.virtualized_render_ms".to_owned(),
             },
             Self {
+                id: "search.navigation.intent_to_state".to_owned(),
+                boundary: TuiLatencyBoundary::IntentToState,
+                screen: Some(FsfsScreen::Search),
+                budget_ms: 6,
+                metric_key: "tui.search.navigation_intent_to_state_ms".to_owned(),
+            },
+            Self {
+                id: "search.inline_explain.state_to_frame".to_owned(),
+                boundary: TuiLatencyBoundary::StateToFrame,
+                screen: Some(FsfsScreen::Search),
+                budget_ms: 8,
+                metric_key: "tui.search.inline_explain_render_ms".to_owned(),
+            },
+            Self {
                 id: "timeline.stream_update".to_owned(),
                 boundary: TuiLatencyBoundary::IntentToState,
                 screen: Some(FsfsScreen::OpsTimeline),
@@ -1205,7 +1240,7 @@ impl FsfsShowcasePortingSpec {
                         ),
                         PaletteIntentRoute::new(
                             PaletteIntent::ReplayTrace,
-                            "diag.replay_trace",
+                            REPLAY_TRACE_ACTION_ID,
                             Some(InteractionSurfaceKind::Explainability),
                             true,
                         ),
@@ -1483,11 +1518,12 @@ mod tests {
 
     use super::{
         ContextRetentionPolicy, FsfsCardPrimitive, FsfsScreen, FsfsTuiShellModel,
-        TuiAdapterSettings, TuiKeyBindingScope, TuiLatencyBudgetHook, TuiModelValidationError,
-        TuiNavigationModel, TuiPaletteActionSpec, TuiPaletteCategory, TuiPaletteIntent,
-        TuiStateSerializationPoint,
+        REPLAY_TRACE_ACTION_ID, TuiAdapterSettings, TuiKeyBindingScope, TuiLatencyBoundary,
+        TuiLatencyBudgetHook, TuiModelValidationError, TuiNavigationModel, TuiPaletteActionSpec,
+        TuiPaletteCategory, TuiPaletteIntent, TuiStateSerializationPoint,
     };
     use crate::config::{Density, FsfsConfig, TuiTheme};
+    use crate::repro::{ReplayClientSurface, ReplayEntrypoint};
 
     #[test]
     fn converts_from_resolved_config() {
@@ -1676,6 +1712,51 @@ mod tests {
     }
 
     #[test]
+    fn keymap_includes_search_navigation_chords() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Up"
+                && binding.action_id == "search.select_up"
+        }));
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Down"
+                && binding.action_id == "search.select_down"
+        }));
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "PageUp"
+                && binding.action_id == "search.page_up"
+        }));
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "PageDown"
+                && binding.action_id == "search.page_down"
+        }));
+    }
+
+    #[test]
+    fn keymap_includes_search_drilldown_chords() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Ctrl+E"
+                && binding.action_id == "search.toggle_explain"
+        }));
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Ctrl+O"
+                && binding.action_id == "search.open_selected"
+        }));
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Ctrl+J"
+                && binding.action_id == "search.jump_to_source"
+        }));
+    }
+
+    #[test]
     fn palette_intents_cover_all_palette_actions() {
         let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
         assert_eq!(
@@ -1698,6 +1779,37 @@ mod tests {
             .expect("default serialization points should be valid");
         TuiLatencyBudgetHook::validate(&shell.latency_budget_hooks)
             .expect("default latency hooks should be valid");
+    }
+
+    #[test]
+    fn latency_hooks_include_search_navigation_and_inline_explain_metrics() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+
+        let navigation_hook = shell
+            .latency_budget_hooks
+            .iter()
+            .find(|hook| hook.id == "search.navigation.intent_to_state")
+            .expect("search navigation latency hook must exist");
+        assert_eq!(navigation_hook.boundary, TuiLatencyBoundary::IntentToState);
+        assert_eq!(navigation_hook.screen, Some(FsfsScreen::Search));
+        assert_eq!(navigation_hook.budget_ms, 6);
+        assert_eq!(
+            navigation_hook.metric_key,
+            "tui.search.navigation_intent_to_state_ms"
+        );
+
+        let explain_hook = shell
+            .latency_budget_hooks
+            .iter()
+            .find(|hook| hook.id == "search.inline_explain.state_to_frame")
+            .expect("search inline explain latency hook must exist");
+        assert_eq!(explain_hook.boundary, TuiLatencyBoundary::StateToFrame);
+        assert_eq!(explain_hook.screen, Some(FsfsScreen::Search));
+        assert_eq!(explain_hook.budget_ms, 8);
+        assert_eq!(
+            explain_hook.metric_key,
+            "tui.search.inline_explain_render_ms"
+        );
     }
 
     #[test]
@@ -1795,12 +1907,39 @@ mod tests {
     }
 
     #[test]
+    fn replay_entrypoint_action_id_matches_tui_palette_contract() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let entrypoint = ReplayEntrypoint {
+            trace_id: "trace-1".to_owned(),
+            client_surface: ReplayClientSurface::Tui,
+            manifest_path: Some("manifest.json".to_owned()),
+            artifact_root: None,
+            start_frame_seq: None,
+            end_frame_seq: None,
+            strict_reason_codes: false,
+        };
+        let action_id = entrypoint.tui_action_id();
+
+        assert_eq!(action_id, REPLAY_TRACE_ACTION_ID);
+        assert!(
+            shell
+                .palette
+                .actions
+                .iter()
+                .any(|action| action.id == action_id)
+        );
+        assert!(shell.palette_intents.intents.iter().any(|intent| {
+            intent.action_id == action_id && intent.intent == TuiPaletteIntent::ReplayDiagnostics
+        }));
+    }
+
+    #[test]
     fn showcase_mapping_validation_rejects_missing_required_action() {
         let mut shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
         shell
             .palette
             .actions
-            .retain(|action| action.id != "diag.replay_trace");
+            .retain(|action| action.id != REPLAY_TRACE_ACTION_ID);
 
         let spec = shell.showcase_porting_spec();
         let err = spec
@@ -1809,7 +1948,7 @@ mod tests {
         assert!(matches!(
             err,
             TuiModelValidationError::ShowcaseMappingMissingAction(id)
-                if id == "diag.replay_trace"
+                if id == REPLAY_TRACE_ACTION_ID
         ));
     }
 }

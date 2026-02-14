@@ -828,7 +828,7 @@ impl ReplayEntrypoint {
     /// Canonical TUI action ID for replay requests.
     #[must_use]
     pub const fn tui_action_id(&self) -> &'static str {
-        "ops.replay_trace"
+        "diag.replay_trace"
     }
 }
 
@@ -965,6 +965,7 @@ pub const fn files_for_tier(tier: RetentionTier) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interaction_primitives::ScreenAction;
 
     // ─── CaptureReason ──────────────────────────────────────────────────
 
@@ -1484,7 +1485,11 @@ mod tests {
             end_frame_seq: None,
             strict_reason_codes: false,
         };
-        assert_eq!(entrypoint.tui_action_id(), "ops.replay_trace");
+        assert_eq!(entrypoint.tui_action_id(), "diag.replay_trace");
+        assert_eq!(
+            ScreenAction::from_palette_action_id(entrypoint.tui_action_id()),
+            Some(ScreenAction::ReplayTrace)
+        );
     }
 
     // ─── Environment Snapshot ───────────────────────────────────────────
