@@ -5,6 +5,7 @@
 //! [`ScreenRegistry`]. The app shell uses the registry to navigate
 //! between screens while preserving context.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -86,6 +87,12 @@ pub trait Screen: Send {
     fn semantic_role(&self) -> &'static str {
         "region"
     }
+
+    /// Downcast support for product crates that need concrete screen state.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable downcast support for product crates that need concrete screen state.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Action returned by a screen's input handler.
@@ -222,6 +229,14 @@ mod tests {
 
         fn handle_input(&mut self, _event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
             ScreenAction::Ignored
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
         }
     }
 

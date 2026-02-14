@@ -108,18 +108,18 @@ impl Theme {
     pub const fn dark() -> Self {
         Self {
             preset: ThemePreset::Dark,
-            bg: SerColor::new(0x1a, 0x1b, 0x26),      // dark navy
-            fg: SerColor::new(0xc0, 0xca, 0xf5),      // soft white-blue
+            bg: SerColor::new(0x1a, 0x1b, 0x26), // dark navy
+            fg: SerColor::new(0xc0, 0xca, 0xf5), // soft white-blue
             status_bar_bg: SerColor::new(0x24, 0x28, 0x3b), // slightly lighter
             status_bar_fg: SerColor::new(0x7a, 0xa2, 0xf7), // bright blue
-            highlight_bg: SerColor::new(0x33, 0x46, 0x7c),  // muted blue
-            highlight_fg: SerColor::new(0xff, 0xff, 0xff),   // white
-            border: SerColor::new(0x3b, 0x40, 0x61),        // dark border
-            muted: SerColor::new(0x56, 0x5f, 0x89),         // gray
-            error: SerColor::new(0xf7, 0x76, 0x8e),         // red
-            warning: SerColor::new(0xe0, 0xaf, 0x68),        // orange
-            success: SerColor::new(0x9e, 0xce, 0x6a),        // green
-            info: SerColor::new(0x7d, 0xcf, 0xff),           // cyan
+            highlight_bg: SerColor::new(0x33, 0x46, 0x7c), // muted blue
+            highlight_fg: SerColor::new(0xff, 0xff, 0xff), // white
+            border: SerColor::new(0x3b, 0x40, 0x61), // dark border
+            muted: SerColor::new(0x56, 0x5f, 0x89), // gray
+            error: SerColor::new(0xf7, 0x76, 0x8e), // red
+            warning: SerColor::new(0xe0, 0xaf, 0x68), // orange
+            success: SerColor::new(0x9e, 0xce, 0x6a), // green
+            info: SerColor::new(0x7d, 0xcf, 0xff), // cyan
         }
     }
 
@@ -154,18 +154,42 @@ impl Theme {
 }
 
 impl ColorScheme for Theme {
-    fn bg(&self) -> Color { self.bg.to_ratatui() }
-    fn fg(&self) -> Color { self.fg.to_ratatui() }
-    fn status_bar_bg(&self) -> Color { self.status_bar_bg.to_ratatui() }
-    fn status_bar_fg(&self) -> Color { self.status_bar_fg.to_ratatui() }
-    fn highlight_bg(&self) -> Color { self.highlight_bg.to_ratatui() }
-    fn highlight_fg(&self) -> Color { self.highlight_fg.to_ratatui() }
-    fn border(&self) -> Color { self.border.to_ratatui() }
-    fn muted(&self) -> Color { self.muted.to_ratatui() }
-    fn error(&self) -> Color { self.error.to_ratatui() }
-    fn warning(&self) -> Color { self.warning.to_ratatui() }
-    fn success(&self) -> Color { self.success.to_ratatui() }
-    fn info(&self) -> Color { self.info.to_ratatui() }
+    fn bg(&self) -> Color {
+        self.bg.to_ratatui()
+    }
+    fn fg(&self) -> Color {
+        self.fg.to_ratatui()
+    }
+    fn status_bar_bg(&self) -> Color {
+        self.status_bar_bg.to_ratatui()
+    }
+    fn status_bar_fg(&self) -> Color {
+        self.status_bar_fg.to_ratatui()
+    }
+    fn highlight_bg(&self) -> Color {
+        self.highlight_bg.to_ratatui()
+    }
+    fn highlight_fg(&self) -> Color {
+        self.highlight_fg.to_ratatui()
+    }
+    fn border(&self) -> Color {
+        self.border.to_ratatui()
+    }
+    fn muted(&self) -> Color {
+        self.muted.to_ratatui()
+    }
+    fn error(&self) -> Color {
+        self.error.to_ratatui()
+    }
+    fn warning(&self) -> Color {
+        self.warning.to_ratatui()
+    }
+    fn success(&self) -> Color {
+        self.success.to_ratatui()
+    }
+    fn info(&self) -> Color {
+        self.info.to_ratatui()
+    }
 }
 
 #[cfg(test)]

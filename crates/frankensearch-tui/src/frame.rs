@@ -6,6 +6,7 @@
 //! diagnostics and telemetry.
 
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 // ─── Jank Callback ──────────────────────────────────────────────────────────
 
@@ -115,14 +116,20 @@ impl FrameBudget {
     }
 
     /// Mark the end of a frame. Returns metrics for the completed frame.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `begin_frame` was not called first.
     pub fn end_frame(&mut self) -> FrameMetrics {
-        let start = self
-            .frame_start
-            .expect("end_frame called without begin_frame");
+        let Some(start) = self.frame_start.take() else {
+            warn!(
+                target: "frankensearch.tui.frame",
+                "end_frame called without begin_frame; returning empty metrics"
+            );
+            return FrameMetrics {
+                frame_number: self.frame_number,
+                render_duration: Duration::ZERO,
+                budget: self.target,
+                is_jank: false,
+                timestamp: Instant::now(),
+            };
+        };
         let render_duration = start.elapsed();
         let is_jank = render_duration > self.target;
 
@@ -146,7 +153,6 @@ impl FrameBudget {
             }
         }
 
-        self.frame_start = None;
         metrics
     }
 
@@ -218,6 +224,18 @@ mod tests {
     }
 
     #[test]
+    fn end_frame_without_begin_is_safe_noop() {
+        let mut budget = FrameBudget::new(Duration::from_millis(16));
+        let metrics = budget.end_frame();
+
+        assert_eq!(metrics.render_duration, Duration::ZERO);
+        assert!(!metrics.is_jank);
+        assert_eq!(metrics.frame_number, 0);
+        assert_eq!(budget.total_frames(), 0);
+        assert_eq!(budget.jank_count(), 0);
+    }
+
+    #[test]
     fn frame_metrics_overshoot() {
         let metrics = FrameMetrics {
             frame_number: 1,
@@ -257,13 +275,13 @@ mod tests {
     #[test]
     fn jank_rate_zero_frames() {
         let budget = FrameBudget::new(Duration::from_millis(16));
-        assert_eq!(budget.jank_rate(), 0.0);
+        assert!(budget.jank_rate().abs() < f64::EPSILON);
     }
 
     #[test]
     fn jank_callback_fires() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let fired = Arc::new(AtomicBool::new(false));
         let fired_clone = Arc::clone(&fired);
@@ -278,12 +296,5 @@ mod tests {
         let _metrics = budget.end_frame();
 
         assert!(fired.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    #[should_panic(expected = "end_frame called without begin_frame")]
-    fn end_frame_without_begin_panics() {
-        let mut budget = FrameBudget::new(Duration::from_millis(16));
-        budget.end_frame();
     }
 }

@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use serde::{Deserialize, Serialize};
 
 use crate::input::InputEvent;
@@ -43,14 +43,14 @@ pub struct InputRecord {
 pub enum RecordedEvent {
     /// A key press.
     Key {
-        /// Key code as a string representation.
+        /// Key code in stable replay encoding.
         key: String,
         /// Modifier bits.
         modifiers: u8,
     },
     /// A mouse event.
     Mouse {
-        /// Mouse event kind description.
+        /// Mouse kind in stable replay encoding.
         kind: String,
         /// Column position.
         col: u16,
@@ -71,7 +71,7 @@ impl RecordedEvent {
     #[must_use]
     pub fn from_key(key: KeyCode, modifiers: KeyModifiers) -> Self {
         Self::Key {
-            key: format!("{key:?}"),
+            key: encode_key_code(key),
             modifiers: modifiers.bits(),
         }
     }
@@ -80,7 +80,7 @@ impl RecordedEvent {
     #[must_use]
     pub fn from_mouse(kind: MouseEventKind, col: u16, row: u16) -> Self {
         Self::Mouse {
-            kind: format!("{kind:?}"),
+            kind: encode_mouse_event(kind),
             col,
             row,
         }
@@ -90,6 +90,23 @@ impl RecordedEvent {
     #[must_use]
     pub const fn from_resize(width: u16, height: u16) -> Self {
         Self::Resize { width, height }
+    }
+
+    /// Convert a recorded event back into a runtime input event.
+    #[must_use]
+    pub fn to_input_event(&self) -> Option<InputEvent> {
+        match self {
+            Self::Key { key, modifiers } => {
+                let key = decode_key_code(key)?;
+                let mods = KeyModifiers::from_bits(*modifiers)?;
+                Some(InputEvent::Key(key, mods))
+            }
+            Self::Mouse { kind, col, row } => {
+                let kind = decode_mouse_event(kind)?;
+                Some(InputEvent::Mouse(kind, *col, *row))
+            }
+            Self::Resize { width, height } => Some(InputEvent::Resize(*width, *height)),
+        }
     }
 }
 
@@ -135,15 +152,11 @@ impl ReplayRecorder {
             return;
         }
 
-        let offset = self
-            .start
-            .map_or(Duration::ZERO, |s| s.elapsed());
+        let offset = self.start.map_or(Duration::ZERO, |s| s.elapsed());
 
         let recorded = match event {
             InputEvent::Key(key, mods) => RecordedEvent::from_key(*key, *mods),
-            InputEvent::Mouse(kind, col, row) => {
-                RecordedEvent::from_mouse(*kind, *col, *row)
-            }
+            InputEvent::Mouse(kind, col, row) => RecordedEvent::from_mouse(*kind, *col, *row),
             InputEvent::Resize(w, h) => RecordedEvent::from_resize(*w, *h),
             InputEvent::Action(_) => return, // Don't record resolved actions.
         };
@@ -270,6 +283,20 @@ impl ReplayPlayer {
         Some(record)
     }
 
+    /// Advance playback and decode the next replayable input event.
+    ///
+    /// Returns the event timestamp offset plus decoded input. Records that
+    /// cannot be decoded are skipped.
+    #[must_use]
+    pub fn advance_input(&mut self) -> Option<(Duration, InputEvent)> {
+        while let Some(record) = self.advance().cloned() {
+            if let Some(event) = record.event.to_input_event() {
+                return Some((record.offset, event));
+            }
+        }
+        None
+    }
+
     /// Current playback position.
     #[must_use]
     pub const fn position(&self) -> usize {
@@ -302,6 +329,128 @@ impl ReplayPlayer {
             return 1.0;
         }
         self.position as f64 / self.records.len() as f64
+    }
+}
+
+fn encode_key_code(key: KeyCode) -> String {
+    match key {
+        KeyCode::Backspace => "backspace".to_owned(),
+        KeyCode::Enter => "enter".to_owned(),
+        KeyCode::Left => "left".to_owned(),
+        KeyCode::Right => "right".to_owned(),
+        KeyCode::Up => "up".to_owned(),
+        KeyCode::Down => "down".to_owned(),
+        KeyCode::Home => "home".to_owned(),
+        KeyCode::End => "end".to_owned(),
+        KeyCode::PageUp => "page_up".to_owned(),
+        KeyCode::PageDown => "page_down".to_owned(),
+        KeyCode::Tab => "tab".to_owned(),
+        KeyCode::BackTab => "back_tab".to_owned(),
+        KeyCode::Delete => "delete".to_owned(),
+        KeyCode::Insert => "insert".to_owned(),
+        KeyCode::Null => "null".to_owned(),
+        KeyCode::Esc => "esc".to_owned(),
+        KeyCode::CapsLock => "caps_lock".to_owned(),
+        KeyCode::ScrollLock => "scroll_lock".to_owned(),
+        KeyCode::NumLock => "num_lock".to_owned(),
+        KeyCode::PrintScreen => "print_screen".to_owned(),
+        KeyCode::Pause => "pause".to_owned(),
+        KeyCode::Menu => "menu".to_owned(),
+        KeyCode::KeypadBegin => "keypad_begin".to_owned(),
+        KeyCode::F(n) => format!("f:{n}"),
+        KeyCode::Char(ch) => format!("char:{}", u32::from(ch)),
+        other => format!("debug:{other:?}"),
+    }
+}
+
+fn decode_key_code(encoded: &str) -> Option<KeyCode> {
+    if let Some(num) = encoded.strip_prefix("f:") {
+        return num.parse::<u8>().ok().map(KeyCode::F);
+    }
+    if let Some(ch) = encoded
+        .strip_prefix("char:")
+        .and_then(|value| value.parse::<u32>().ok())
+        .and_then(char::from_u32)
+    {
+        return Some(KeyCode::Char(ch));
+    }
+
+    Some(match encoded {
+        "backspace" | "Backspace" => KeyCode::Backspace,
+        "enter" | "Enter" => KeyCode::Enter,
+        "left" | "Left" => KeyCode::Left,
+        "right" | "Right" => KeyCode::Right,
+        "up" | "Up" => KeyCode::Up,
+        "down" | "Down" => KeyCode::Down,
+        "home" | "Home" => KeyCode::Home,
+        "end" | "End" => KeyCode::End,
+        "page_up" | "PageUp" => KeyCode::PageUp,
+        "page_down" | "PageDown" => KeyCode::PageDown,
+        "tab" | "Tab" => KeyCode::Tab,
+        "back_tab" | "BackTab" => KeyCode::BackTab,
+        "delete" | "Delete" => KeyCode::Delete,
+        "insert" | "Insert" => KeyCode::Insert,
+        "null" | "Null" => KeyCode::Null,
+        "esc" | "Esc" => KeyCode::Esc,
+        "caps_lock" => KeyCode::CapsLock,
+        "scroll_lock" => KeyCode::ScrollLock,
+        "num_lock" => KeyCode::NumLock,
+        "print_screen" => KeyCode::PrintScreen,
+        "pause" => KeyCode::Pause,
+        "menu" => KeyCode::Menu,
+        "keypad_begin" => KeyCode::KeypadBegin,
+        _ => return None,
+    })
+}
+
+fn encode_mouse_event(kind: MouseEventKind) -> String {
+    match kind {
+        MouseEventKind::Down(button) => format!("down:{}", encode_mouse_button(button)),
+        MouseEventKind::Up(button) => format!("up:{}", encode_mouse_button(button)),
+        MouseEventKind::Drag(button) => format!("drag:{}", encode_mouse_button(button)),
+        MouseEventKind::Moved => "moved".to_owned(),
+        MouseEventKind::ScrollDown => "scroll_down".to_owned(),
+        MouseEventKind::ScrollUp => "scroll_up".to_owned(),
+        MouseEventKind::ScrollLeft => "scroll_left".to_owned(),
+        MouseEventKind::ScrollRight => "scroll_right".to_owned(),
+    }
+}
+
+fn decode_mouse_event(encoded: &str) -> Option<MouseEventKind> {
+    if let Some(button) = encoded.strip_prefix("down:").and_then(decode_mouse_button) {
+        return Some(MouseEventKind::Down(button));
+    }
+    if let Some(button) = encoded.strip_prefix("up:").and_then(decode_mouse_button) {
+        return Some(MouseEventKind::Up(button));
+    }
+    if let Some(button) = encoded.strip_prefix("drag:").and_then(decode_mouse_button) {
+        return Some(MouseEventKind::Drag(button));
+    }
+
+    Some(match encoded {
+        "moved" | "Moved" => MouseEventKind::Moved,
+        "scroll_down" | "ScrollDown" => MouseEventKind::ScrollDown,
+        "scroll_up" | "ScrollUp" => MouseEventKind::ScrollUp,
+        "scroll_left" | "ScrollLeft" => MouseEventKind::ScrollLeft,
+        "scroll_right" | "ScrollRight" => MouseEventKind::ScrollRight,
+        _ => return None,
+    })
+}
+
+const fn encode_mouse_button(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+    }
+}
+
+fn decode_mouse_button(encoded: &str) -> Option<MouseButton> {
+    match encoded {
+        "left" | "Left" => Some(MouseButton::Left),
+        "right" | "Right" => Some(MouseButton::Right),
+        "middle" | "Middle" => Some(MouseButton::Middle),
+        _ => None,
     }
 }
 
@@ -457,10 +606,9 @@ mod tests {
         let event = RecordedEvent::from_key(KeyCode::Enter, KeyModifiers::SHIFT);
         let json = serde_json::to_string(&event).unwrap();
         let decoded: RecordedEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RecordedEvent::Key { .. }));
         if let RecordedEvent::Key { modifiers, .. } = decoded {
             assert_eq!(modifiers, KeyModifiers::SHIFT.bits());
-        } else {
-            panic!("Expected Key variant");
         }
     }
 
@@ -473,12 +621,42 @@ mod tests {
         );
         let json = serde_json::to_string(&event).unwrap();
         let decoded: RecordedEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RecordedEvent::Mouse { .. }));
         if let RecordedEvent::Mouse { col, row, .. } = decoded {
             assert_eq!(col, 10);
             assert_eq!(row, 20);
-        } else {
-            panic!("Expected Mouse variant");
         }
+    }
+
+    #[test]
+    fn recorded_event_to_input_event_roundtrip() {
+        let key = RecordedEvent::from_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            key.to_input_event(),
+            Some(InputEvent::Key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        );
+
+        let mouse = RecordedEvent::from_mouse(MouseEventKind::ScrollDown, 4, 8);
+        assert_eq!(
+            mouse.to_input_event(),
+            Some(InputEvent::Mouse(MouseEventKind::ScrollDown, 4, 8))
+        );
+
+        let resize = RecordedEvent::from_resize(120, 40);
+        assert_eq!(resize.to_input_event(), Some(InputEvent::Resize(120, 40)));
+    }
+
+    #[test]
+    fn player_advance_input_decodes_recorded_events() {
+        let mut player = ReplayPlayer::new(vec![InputRecord {
+            offset: Duration::from_millis(7),
+            event: RecordedEvent::from_key(KeyCode::Enter, KeyModifiers::NONE),
+        }]);
+        player.play();
+
+        let (offset, event) = player.advance_input().expect("decoded event");
+        assert_eq!(offset, Duration::from_millis(7));
+        assert_eq!(event, InputEvent::Key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     #[test]

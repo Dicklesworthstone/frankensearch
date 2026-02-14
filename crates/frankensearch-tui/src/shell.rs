@@ -4,11 +4,13 @@
 //! screens, renders the chrome (status bar, breadcrumbs), and dispatches
 //! input events to the active screen.
 
+use std::cell::Cell;
+
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
-use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::input::{InputEvent, KeyAction, Keymap};
@@ -107,6 +109,8 @@ pub struct AppShell {
     pub should_quit: bool,
     /// Last confirmed palette action ID (reset each `handle_input` call).
     last_palette_action: Option<String>,
+    /// Terminal area captured from the most recent render pass.
+    last_render_area: Cell<Rect>,
 }
 
 impl AppShell {
@@ -123,6 +127,7 @@ impl AppShell {
             status_line: StatusLine::new(),
             should_quit: false,
             last_palette_action: None,
+            last_render_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -180,15 +185,29 @@ impl AppShell {
     ///
     /// Returns the confirmed palette action ID if the user selected a command.
     /// Callers should check `last_palette_action()` after calling this.
+    #[allow(clippy::too_many_lines)]
     pub fn handle_input(&mut self, event: &InputEvent) -> bool {
         self.last_palette_action = None;
+
+        if let InputEvent::Resize(width, height) = event {
+            self.last_render_area.set(Rect::new(0, 0, *width, *height));
+        }
+
+        if self.last_render_area.get().width == 0 || self.last_render_area.get().height == 0 {
+            if let Ok((width, height)) = crossterm::terminal::size() {
+                self.last_render_area.set(Rect::new(0, 0, width, height));
+            } else {
+                // Fallback keeps context sane in non-interactive test harnesses.
+                self.last_render_area.set(Rect::new(0, 0, 80, 24));
+            }
+        }
 
         // If the command palette is open, route input there first.
         if self.palette.state() == &PaletteState::Open {
             if let InputEvent::Key(key, mods) = event {
                 if let Some(action) = self.keymap.resolve(*key, *mods) {
                     match action {
-                        KeyAction::Dismiss => {
+                        KeyAction::TogglePalette | KeyAction::Dismiss => {
                             self.palette.close();
                             return false;
                         }
@@ -212,7 +231,12 @@ impl AppShell {
                 }
                 // Handle text input for palette search.
                 match key {
-                    crossterm::event::KeyCode::Char(ch) if *mods == crossterm::event::KeyModifiers::NONE => {
+                    crossterm::event::KeyCode::Char(ch)
+                        if !mods.intersects(
+                            crossterm::event::KeyModifiers::CONTROL
+                                | crossterm::event::KeyModifiers::ALT,
+                        ) =>
+                    {
                         self.palette.push_char(*ch);
                         return false;
                     }
@@ -256,14 +280,17 @@ impl AppShell {
                         return false;
                     }
                     KeyAction::ToggleHelp => {
-                        if self.overlays.top().is_some_and(|o| o.kind == crate::overlay::OverlayKind::Help) {
+                        if self
+                            .overlays
+                            .top()
+                            .is_some_and(|o| o.kind == crate::overlay::OverlayKind::Help)
+                        {
                             self.overlays.dismiss();
                         } else {
-                            self.overlays
-                                .push(crate::overlay::OverlayRequest::new(
-                                    crate::overlay::OverlayKind::Help,
-                                    "Keyboard Shortcuts",
-                                ));
+                            self.overlays.push(crate::overlay::OverlayRequest::new(
+                                crate::overlay::OverlayKind::Help,
+                                "Keyboard Shortcuts",
+                            ));
                         }
                         return false;
                     }
@@ -279,8 +306,7 @@ impl AppShell {
         // Forward to active screen.
         if let Some(screen_id) = &self.active_screen {
             let screen_id = screen_id.clone();
-            let area = Rect::new(0, 0, 80, 24); // Default for context.
-            let ctx = self.screen_context(area);
+            let ctx = self.screen_context(self.last_render_area.get());
             if let Some(screen) = self.registry.get_mut(&screen_id) {
                 match screen.handle_input(event, &ctx) {
                     ScreenAction::Quit => {
@@ -291,11 +317,10 @@ impl AppShell {
                         self.navigate_to(&target);
                     }
                     ScreenAction::OpenOverlay(name) => {
-                        self.overlays
-                            .push(crate::overlay::OverlayRequest::new(
-                                crate::overlay::OverlayKind::Custom(name.clone()),
-                                name,
-                            ));
+                        self.overlays.push(crate::overlay::OverlayRequest::new(
+                            crate::overlay::OverlayKind::Custom(name.clone()),
+                            name,
+                        ));
                     }
                     ScreenAction::Consumed | ScreenAction::Ignored => {}
                 }
@@ -318,6 +343,7 @@ impl AppShell {
     #[allow(clippy::too_many_lines)]
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        self.last_render_area.set(area);
         let ctx = self.screen_context(area);
 
         // Layout: optional breadcrumbs + content + optional status bar.
@@ -344,10 +370,7 @@ impl AppShell {
                 .screen_ids()
                 .iter()
                 .map(|id| {
-                    let title = self
-                        .registry
-                        .get(id)
-                        .map_or(id.0.as_str(), |s| s.title());
+                    let title = self.registry.get(id).map_or(id.0.as_str(), |s| s.title());
                     Line::from(title.to_string())
                 })
                 .collect();
@@ -393,16 +416,13 @@ impl AppShell {
             // No screen active — render placeholder.
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(
-                    Style::default().fg(self.config.theme.border.to_ratatui()),
-                )
+                .border_style(Style::default().fg(self.config.theme.border.to_ratatui()))
                 .style(
                     Style::default()
                         .bg(self.config.theme.bg.to_ratatui())
                         .fg(self.config.theme.fg.to_ratatui()),
                 );
-            let placeholder =
-                Paragraph::new("No screens registered").block(block);
+            let placeholder = Paragraph::new("No screens registered").block(block);
             frame.render_widget(placeholder, content_area);
         }
 
@@ -412,17 +432,13 @@ impl AppShell {
             let status_text = if self.status_line.center.is_empty() {
                 format!(" {} ", self.config.title)
             } else {
-                format!(
-                    " {} │ {} ",
-                    self.config.title, self.status_line.center
-                )
+                format!(" {} │ {} ", self.config.title, self.status_line.center)
             };
 
             let status_spans = vec![
                 Span::styled(
                     &self.status_line.left,
-                    Style::default()
-                        .fg(self.config.theme.status_bar_fg.to_ratatui()),
+                    Style::default().fg(self.config.theme.status_bar_fg.to_ratatui()),
                 ),
                 Span::styled(
                     status_text,
@@ -432,15 +448,12 @@ impl AppShell {
                 ),
                 Span::styled(
                     &self.status_line.right,
-                    Style::default()
-                        .fg(self.config.theme.status_bar_fg.to_ratatui()),
+                    Style::default().fg(self.config.theme.status_bar_fg.to_ratatui()),
                 ),
             ];
 
-            let status = Paragraph::new(Line::from(status_spans)).style(
-                Style::default()
-                    .bg(self.config.theme.status_bar_bg.to_ratatui()),
-            );
+            let status = Paragraph::new(Line::from(status_spans))
+                .style(Style::default().bg(self.config.theme.status_bar_bg.to_ratatui()));
 
             frame.render_widget(status, status_area);
         }
@@ -449,6 +462,13 @@ impl AppShell {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
+
+    use ratatui::Frame;
+
+    use crate::screen::{Screen, ScreenAction};
+
     use super::*;
 
     #[test]
@@ -496,5 +516,130 @@ mod tests {
         let quit = shell.handle_input(&event);
         assert!(quit);
         assert!(shell.should_quit);
+    }
+
+    struct CaptureContextScreen {
+        id: ScreenId,
+        captured: Arc<Mutex<Option<(u16, u16)>>>,
+    }
+
+    impl CaptureContextScreen {
+        fn new(id: &str, captured: Arc<Mutex<Option<(u16, u16)>>>) -> Self {
+            Self {
+                id: ScreenId::new(id),
+                captured,
+            }
+        }
+    }
+
+    impl Screen for CaptureContextScreen {
+        fn id(&self) -> &ScreenId {
+            &self.id
+        }
+
+        fn title(&self) -> &'static str {
+            "capture"
+        }
+
+        fn render(&self, _frame: &mut Frame<'_>, _ctx: &ScreenContext) {}
+
+        fn handle_input(&mut self, _event: &InputEvent, ctx: &ScreenContext) -> ScreenAction {
+            *self.captured.lock().expect("capture lock") =
+                Some((ctx.terminal_width, ctx.terminal_height));
+            ScreenAction::Consumed
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn handle_input_uses_last_render_area_for_context() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let captured = Arc::new(Mutex::new(None));
+        let screen_id = ScreenId::new("capture");
+        shell.registry.register(Box::new(CaptureContextScreen::new(
+            "capture",
+            captured.clone(),
+        )));
+        shell.navigate_to(&screen_id);
+
+        shell.last_render_area.set(Rect::new(0, 0, 132, 47));
+        let event = InputEvent::Key(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&event);
+
+        let seen = captured
+            .lock()
+            .expect("capture lock")
+            .expect("context captured");
+        assert_eq!(seen, (132, 47));
+    }
+
+    #[test]
+    fn palette_toggle_shortcut_closes_palette_when_open() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let toggle = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+
+        let _ = shell.handle_input(&toggle);
+        assert_eq!(shell.palette.state(), &PaletteState::Open);
+
+        let _ = shell.handle_input(&toggle);
+        assert_eq!(shell.palette.state(), &PaletteState::Closed);
+    }
+
+    #[test]
+    fn palette_accepts_shift_modified_characters() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+
+        let shifted = InputEvent::Key(
+            crossterm::event::KeyCode::Char('A'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let _ = shell.handle_input(&shifted);
+
+        assert_eq!(shell.palette.query(), "A");
+    }
+
+    #[test]
+    fn resize_event_refreshes_context_dimensions() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let captured = Arc::new(Mutex::new(None));
+        let screen_id = ScreenId::new("capture");
+        shell.registry.register(Box::new(CaptureContextScreen::new(
+            "capture",
+            captured.clone(),
+        )));
+        shell.navigate_to(&screen_id);
+
+        let resize = InputEvent::Resize(111, 37);
+        let _ = shell.handle_input(&resize);
+
+        let key = InputEvent::Key(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&key);
+
+        let seen = captured
+            .lock()
+            .expect("capture lock")
+            .expect("context captured");
+        assert_eq!(seen, (111, 37));
     }
 }

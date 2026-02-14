@@ -56,11 +56,7 @@ pub struct Action {
 impl Action {
     /// Create a new action.
     #[must_use]
-    pub fn new(
-        id: impl Into<String>,
-        label: impl Into<String>,
-        category: ActionCategory,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, category: ActionCategory) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
@@ -373,9 +369,6 @@ mod tests {
     #[test]
     fn action_category_display() {
         assert_eq!(ActionCategory::Navigation.to_string(), "Navigation");
-        assert_eq!(
-            ActionCategory::Custom("Foo".to_string()).to_string(),
-            "Foo"
-        );
+        assert_eq!(ActionCategory::Custom("Foo".to_string()).to_string(), "Foo");
     }
 }

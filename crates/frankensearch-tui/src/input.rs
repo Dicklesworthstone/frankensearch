@@ -106,14 +106,8 @@ impl Keymap {
         let mut bindings = HashMap::new();
 
         // Quit
-        bindings.insert(
-            (KeyCode::Char('q'), KeyModifiers::NONE),
-            KeyAction::Quit,
-        );
-        bindings.insert(
-            (KeyCode::Char('c'), KeyModifiers::CONTROL),
-            KeyAction::Quit,
-        );
+        bindings.insert((KeyCode::Char('q'), KeyModifiers::NONE), KeyAction::Quit);
+        bindings.insert((KeyCode::Char('c'), KeyModifiers::CONTROL), KeyAction::Quit);
 
         // Command palette
         bindings.insert(
@@ -126,10 +120,7 @@ impl Keymap {
         );
 
         // Navigation
-        bindings.insert(
-            (KeyCode::Tab, KeyModifiers::NONE),
-            KeyAction::NextScreen,
-        );
+        bindings.insert((KeyCode::Tab, KeyModifiers::NONE), KeyAction::NextScreen);
         bindings.insert(
             (KeyCode::BackTab, KeyModifiers::SHIFT),
             KeyAction::PrevScreen,
@@ -140,82 +131,31 @@ impl Keymap {
             (KeyCode::Char('?'), KeyModifiers::NONE),
             KeyAction::ToggleHelp,
         );
-        bindings.insert(
-            (KeyCode::F(1), KeyModifiers::NONE),
-            KeyAction::ToggleHelp,
-        );
+        bindings.insert((KeyCode::F(1), KeyModifiers::NONE), KeyAction::ToggleHelp);
 
         // Dismiss
-        bindings.insert(
-            (KeyCode::Esc, KeyModifiers::NONE),
-            KeyAction::Dismiss,
-        );
+        bindings.insert((KeyCode::Esc, KeyModifiers::NONE), KeyAction::Dismiss);
 
         // Movement
-        bindings.insert(
-            (KeyCode::Up, KeyModifiers::NONE),
-            KeyAction::Up,
-        );
-        bindings.insert(
-            (KeyCode::Down, KeyModifiers::NONE),
-            KeyAction::Down,
-        );
-        bindings.insert(
-            (KeyCode::Left, KeyModifiers::NONE),
-            KeyAction::Left,
-        );
-        bindings.insert(
-            (KeyCode::Right, KeyModifiers::NONE),
-            KeyAction::Right,
-        );
-        bindings.insert(
-            (KeyCode::Char('k'), KeyModifiers::NONE),
-            KeyAction::Up,
-        );
-        bindings.insert(
-            (KeyCode::Char('j'), KeyModifiers::NONE),
-            KeyAction::Down,
-        );
-        bindings.insert(
-            (KeyCode::Char('h'), KeyModifiers::NONE),
-            KeyAction::Left,
-        );
-        bindings.insert(
-            (KeyCode::Char('l'), KeyModifiers::NONE),
-            KeyAction::Right,
-        );
+        bindings.insert((KeyCode::Up, KeyModifiers::NONE), KeyAction::Up);
+        bindings.insert((KeyCode::Down, KeyModifiers::NONE), KeyAction::Down);
+        bindings.insert((KeyCode::Left, KeyModifiers::NONE), KeyAction::Left);
+        bindings.insert((KeyCode::Right, KeyModifiers::NONE), KeyAction::Right);
+        bindings.insert((KeyCode::Char('k'), KeyModifiers::NONE), KeyAction::Up);
+        bindings.insert((KeyCode::Char('j'), KeyModifiers::NONE), KeyAction::Down);
+        bindings.insert((KeyCode::Char('h'), KeyModifiers::NONE), KeyAction::Left);
+        bindings.insert((KeyCode::Char('l'), KeyModifiers::NONE), KeyAction::Right);
 
         // Page navigation
-        bindings.insert(
-            (KeyCode::PageUp, KeyModifiers::NONE),
-            KeyAction::PageUp,
-        );
-        bindings.insert(
-            (KeyCode::PageDown, KeyModifiers::NONE),
-            KeyAction::PageDown,
-        );
-        bindings.insert(
-            (KeyCode::Home, KeyModifiers::NONE),
-            KeyAction::Home,
-        );
-        bindings.insert(
-            (KeyCode::End, KeyModifiers::NONE),
-            KeyAction::End,
-        );
+        bindings.insert((KeyCode::PageUp, KeyModifiers::NONE), KeyAction::PageUp);
+        bindings.insert((KeyCode::PageDown, KeyModifiers::NONE), KeyAction::PageDown);
+        bindings.insert((KeyCode::Home, KeyModifiers::NONE), KeyAction::Home);
+        bindings.insert((KeyCode::End, KeyModifiers::NONE), KeyAction::End);
 
         // Interaction
-        bindings.insert(
-            (KeyCode::Enter, KeyModifiers::NONE),
-            KeyAction::Confirm,
-        );
-        bindings.insert(
-            (KeyCode::Backspace, KeyModifiers::NONE),
-            KeyAction::Delete,
-        );
-        bindings.insert(
-            (KeyCode::Char('y'), KeyModifiers::CONTROL),
-            KeyAction::Copy,
-        );
+        bindings.insert((KeyCode::Enter, KeyModifiers::NONE), KeyAction::Confirm);
+        bindings.insert((KeyCode::Backspace, KeyModifiers::NONE), KeyAction::Delete);
+        bindings.insert((KeyCode::Char('y'), KeyModifiers::CONTROL), KeyAction::Copy);
 
         Self { bindings }
     }
@@ -305,7 +245,11 @@ mod tests {
     #[test]
     fn resolve_unknown_returns_none() {
         let keymap = Keymap::default_bindings();
-        assert!(keymap.resolve(KeyCode::Char('z'), KeyModifiers::NONE).is_none());
+        assert!(
+            keymap
+                .resolve(KeyCode::Char('z'), KeyModifiers::NONE)
+                .is_none()
+        );
     }
 
     #[test]
@@ -323,9 +267,17 @@ mod tests {
     #[test]
     fn unbind_removes_binding() {
         let mut keymap = Keymap::default_bindings();
-        assert!(keymap.resolve(KeyCode::Char('q'), KeyModifiers::NONE).is_some());
+        assert!(
+            keymap
+                .resolve(KeyCode::Char('q'), KeyModifiers::NONE)
+                .is_some()
+        );
         keymap.unbind(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(keymap.resolve(KeyCode::Char('q'), KeyModifiers::NONE).is_none());
+        assert!(
+            keymap
+                .resolve(KeyCode::Char('q'), KeyModifiers::NONE)
+                .is_none()
+        );
     }
 
     #[test]

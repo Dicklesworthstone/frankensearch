@@ -21,7 +21,10 @@
 //! │  ├─ overlay: Help, alerts, confirmation dialogs │
 //! │  ├─ accessibility: Focus, semantic annotations  │
 //! │  ├─ frame: Budget enforcement, jank detection   │
-//! │  └─ replay: Input recording, deterministic play │
+//! │  ├─ replay: Input recording, deterministic play │
+//! │  ├─ determinism: Clock trait, seeds, replay ctx  │
+//! │  ├─ evidence: JSONL evidence hooks + redaction   │
+//! │  └─ terminal: Mode detection, reconnect handler │
 //! ├─────────────────────────────────────────────────┤
 //! │  ratatui + crossterm                            │
 //! └─────────────────────────────────────────────────┘
@@ -36,6 +39,8 @@
 #![forbid(unsafe_code)]
 
 pub mod accessibility;
+pub mod determinism;
+pub mod evidence;
 pub mod frame;
 pub mod input;
 pub mod overlay;
@@ -43,11 +48,18 @@ pub mod palette;
 pub mod replay;
 pub mod screen;
 pub mod shell;
+pub mod terminal;
 pub mod theme;
 
 // ─── Re-exports ─────────────────────────────────────────────────────────────
 
 pub use accessibility::{FocusDirection, FocusManager, SemanticRole};
+pub use determinism::{Clock, DeterministicSeed, ReplayMetadata, ReplayMode, TickClock, WallClock};
+pub use evidence::{
+    EvidenceEnvelope, EvidenceEvent, EvidenceEventType, EvidencePayload, EvidenceReason,
+    EvidenceRedaction, EvidenceSeverity, EvidenceSink, EvidenceTrace, EvidenceWriteError,
+    NoopWriter, RedactionTransform, VecWriter,
+};
 pub use frame::{FrameBudget, FrameMetrics, JankCallback};
 pub use input::{InputEvent, KeyAction, KeyBinding, Keymap};
 pub use overlay::{OverlayKind, OverlayManager, OverlayRequest};
@@ -55,4 +67,5 @@ pub use palette::{Action, ActionCategory, CommandPalette, PaletteState};
 pub use replay::{InputRecord, ReplayPlayer, ReplayRecorder, ReplayState};
 pub use screen::{Screen, ScreenContext, ScreenId, ScreenRegistry};
 pub use shell::{AppShell, ShellConfig, StatusLine};
+pub use terminal::{TerminalEvent, TerminalMode, TerminalState};
 pub use theme::{ColorScheme, Theme, ThemePreset};
