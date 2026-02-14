@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use asupersync::time::{timeout, wall_now};
 use tracing::instrument;
+use unicode_normalization::UnicodeNormalization;
 
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
@@ -562,7 +563,7 @@ impl TwoTierSearcher {
                     || vector_hits_to_scored_results(&fast_hits, k),
                     |lexical| {
                         let fused = rrf_fuse(lexical, &fast_hits, k, 0, &rrf_config);
-                        fused_hits_to_scored_results(&fused)
+                        fused_hits_to_scored_results(&fused, lexical)
                     },
                 );
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
@@ -677,8 +678,9 @@ impl TwoTierSearcher {
             .map(|(i, r)| VectorHit {
                 #[allow(clippy::cast_possible_truncation)]
                 index: i as u32,
-                // Preserve phase-1 fusion signal for lexical-only candidates.
-                score: r.fast_score.unwrap_or(r.score),
+                // Keep missing semantic-fast source at 0.0 so blending semantics
+                // remain consistent with blend_two_tier contract.
+                score: r.fast_score.unwrap_or(0.0_f32),
                 doc_id: r.doc_id.clone(),
             })
             .collect();
@@ -1045,7 +1047,18 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
 /// Convert `FusedHit` results to `ScoredResult`.
 fn fused_hits_to_scored_results(
     fused: &[frankensearch_core::types::FusedHit],
+    lexical_results: &[ScoredResult],
 ) -> Vec<ScoredResult> {
+    let lexical_metadata_by_doc: HashMap<&str, serde_json::Value> = lexical_results
+        .iter()
+        .filter_map(|result| {
+            result
+                .metadata
+                .as_ref()
+                .map(|metadata| (result.doc_id.as_str(), metadata.clone()))
+        })
+        .collect();
+
     fused
         .iter()
         .map(|fh| {
@@ -1065,7 +1078,7 @@ fn fused_hits_to_scored_results(
                 quality_score: None,
                 lexical_score: fh.lexical_score,
                 rerank_score: None,
-                metadata: None,
+                metadata: lexical_metadata_by_doc.get(fh.doc_id.as_str()).cloned(),
             }
         })
         .collect()
@@ -1133,18 +1146,24 @@ fn should_exclude_document(
 }
 
 fn find_negative_match(text: &str, parsed_query: &ParsedQuery) -> Option<String> {
-    let lower_text = text.to_lowercase();
+    let normalized_text = normalize_for_negation_match(text);
     for term in &parsed_query.negative_terms {
-        if !term.is_empty() && lower_text.contains(&term.to_lowercase()) {
+        let normalized_term = normalize_for_negation_match(term);
+        if !normalized_term.is_empty() && normalized_text.contains(&normalized_term) {
             return Some(term.clone());
         }
     }
     for phrase in &parsed_query.negative_phrases {
-        if !phrase.is_empty() && lower_text.contains(&phrase.to_lowercase()) {
+        let normalized_phrase = normalize_for_negation_match(phrase);
+        if !normalized_phrase.is_empty() && normalized_text.contains(&normalized_phrase) {
             return Some(phrase.clone());
         }
     }
     None
+}
+
+fn normalize_for_negation_match(value: &str) -> String {
+    value.nfc().collect::<String>().to_lowercase()
 }
 
 #[cfg(test)]
@@ -2209,7 +2228,15 @@ mod tests {
     }
 
     #[test]
-    fn refined_phase_preserves_fast_signal_for_lexical_only_candidates() {
+    fn exclusion_matching_normalizes_unicode_forms() {
+        let parsed = ParsedQuery::parse("rust -café");
+        let decomposed_text = "safe docs with caf\u{0065}\u{0301} references";
+        let matched = find_negative_match(decomposed_text, &parsed);
+        assert_eq!(matched, Some("café".to_owned()));
+    }
+
+    #[test]
+    fn refined_phase_uses_zero_fast_score_for_lexical_only_candidates() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
@@ -2244,8 +2271,10 @@ mod tests {
                 .find(|result| result.doc_id.starts_with("lex-doc-"))
                 .expect("at least one lexical-only candidate should survive top-k");
             assert!(
-                lexical_only.fast_score.is_some_and(|score| score > 0.0_f32),
-                "lexical-only refined result should preserve positive phase-1 signal"
+                lexical_only
+                    .fast_score
+                    .is_some_and(|score| score == 0.0_f32),
+                "lexical-only refined result should keep missing fast-source score at 0.0"
             );
             assert_eq!(
                 lexical_only.source,
@@ -2259,6 +2288,66 @@ mod tests {
                 "lexical-only refined result should preserve lexical score for diagnostics"
             );
         });
+    }
+
+    #[test]
+    fn fused_hits_to_scored_results_preserves_lexical_metadata() {
+        let fused = vec![
+            frankensearch_core::types::FusedHit {
+                doc_id: "lex-doc-1".to_owned(),
+                rrf_score: 1.5,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                lexical_score: Some(3.0),
+                semantic_score: None,
+                in_both_sources: false,
+            },
+            frankensearch_core::types::FusedHit {
+                doc_id: "sem-doc-1".to_owned(),
+                rrf_score: 1.0,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                lexical_score: None,
+                semantic_score: Some(0.8),
+                in_both_sources: false,
+            },
+        ];
+        let lexical_results = vec![ScoredResult {
+            doc_id: "lex-doc-1".to_owned(),
+            score: 3.0,
+            source: ScoreSource::Lexical,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(3.0),
+            rerank_score: None,
+            metadata: Some(serde_json::json!({
+                "title": "Lexical doc",
+                "section": "api",
+            })),
+        }];
+
+        let scored = fused_hits_to_scored_results(&fused, &lexical_results);
+        let lexical = scored
+            .iter()
+            .find(|result| result.doc_id == "lex-doc-1")
+            .expect("lexical fused result must exist");
+        assert_eq!(
+            lexical.metadata,
+            Some(serde_json::json!({
+                "title": "Lexical doc",
+                "section": "api",
+            })),
+            "lexical metadata should be preserved through fused conversion"
+        );
+
+        let semantic = scored
+            .iter()
+            .find(|result| result.doc_id == "sem-doc-1")
+            .expect("semantic fused result must exist");
+        assert!(
+            semantic.metadata.is_none(),
+            "semantic-only fused result should not synthesize metadata"
+        );
     }
 
     #[test]

@@ -298,12 +298,13 @@ impl RefreshWorker {
     /// individual documents are handled via retry (requeue) and do not
     /// cause the cycle to fail.
     pub async fn run_cycle(&self, cx: &Cx) -> SearchResult<usize> {
-        // Drain up to max_docs_per_cycle from the queue.
+        // Drain at most `max_docs_per_cycle` jobs from the queue.
         let mut all_jobs = Vec::new();
         let batch_limit = self.config.max_docs_per_cycle;
 
         while all_jobs.len() < batch_limit {
-            let batch = self.queue.drain_batch();
+            let remaining = batch_limit - all_jobs.len();
+            let batch = self.queue.drain_batch_up_to(remaining);
             if batch.is_empty() {
                 break;
             }
@@ -791,6 +792,28 @@ mod tests {
             let snap = worker.metrics().snapshot();
             assert_eq!(snap.docs_embedded, 3);
             assert_eq!(snap.index_rebuilds, 2);
+        });
+    }
+
+    #[test]
+    fn run_cycle_respects_max_docs_per_cycle() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("limit");
+            let queue = make_queue(100);
+            for i in 0..5 {
+                submit(&queue, &format!("doc-{i}"), "Payload");
+            }
+
+            let cache = make_cache(&dir, 256);
+            let config = RefreshWorkerConfig::new(&dir)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_max_docs_per_cycle(3);
+            let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let worker = RefreshWorker::new(config, queue.clone(), fast, cache.clone());
+
+            let count = worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(queue.pending_count(), 2);
         });
     }
 

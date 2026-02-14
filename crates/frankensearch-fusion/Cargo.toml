@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tracing-test = "0.2"

@@ -318,17 +318,13 @@ impl EmbeddingQueue {
         Ok(JobOutcome::Succeeded)
     }
 
-    /// Drain up to `batch_size` jobs from the queue.
-    ///
-    /// Returns an empty vec if no jobs are pending.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    #[must_use]
-    pub fn drain_batch(&self) -> Vec<EmbeddingJob> {
+    fn drain_with_limit(&self, limit: usize) -> Vec<EmbeddingJob> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         let mut state = self.state.lock().expect("queue lock poisoned");
-        let count = state.jobs.len().min(self.config.batch_size);
+        let count = state.jobs.len().min(limit);
         let mut batch = Vec::with_capacity(count);
 
         for _ in 0..count {
@@ -349,6 +345,27 @@ impl EmbeddingQueue {
         }
 
         batch
+    }
+
+    /// Drain up to `batch_size` jobs from the queue.
+    ///
+    /// Returns an empty vec if no jobs are pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn drain_batch(&self) -> Vec<EmbeddingJob> {
+        self.drain_with_limit(self.config.batch_size)
+    }
+
+    /// Drain at most `limit` jobs from the queue.
+    ///
+    /// Useful for consumers that want to cap how many documents they
+    /// process without re-enqueuing already fetched work.
+    #[must_use]
+    pub fn drain_batch_up_to(&self, limit: usize) -> Vec<EmbeddingJob> {
+        self.drain_with_limit(limit)
     }
 
     /// Re-enqueue a failed job for retry (increments retry count).
