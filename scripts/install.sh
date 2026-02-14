@@ -1167,7 +1167,33 @@ resolve_version() {
 }
 
 artifact_name() {
-  printf '%s-%s.tar.gz' "${DEFAULT_BINARY_NAME}" "${TARGET_TRIPLE}"
+  printf '%s-%s.tar.xz' "${DEFAULT_BINARY_NAME}" "${TARGET_TRIPLE}"
+}
+
+checksum_file_name() {
+  printf '%s.sha256' "$(artifact_name)"
+}
+
+checksum_url() {
+  local repo_slug="${FRANKENSEARCH_REPO:-${DEFAULT_REPO_SLUG}}"
+  local checksum_file
+  checksum_file="$(checksum_file_name)"
+
+  if [[ "${RESOLVED_VERSION}" == "latest" ]]; then
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "${repo_slug}" "${checksum_file}"
+  else
+    printf 'https://github.com/%s/releases/download/%s/%s\n' "${repo_slug}" "${RESOLVED_VERSION}" "${checksum_file}"
+  fi
+}
+
+checksums_txt_url() {
+  local repo_slug="${FRANKENSEARCH_REPO:-${DEFAULT_REPO_SLUG}}"
+
+  if [[ "${RESOLVED_VERSION}" == "latest" ]]; then
+    printf 'https://github.com/%s/releases/latest/download/checksums.txt\n' "${repo_slug}"
+  else
+    printf 'https://github.com/%s/releases/download/%s/checksums.txt\n' "${repo_slug}" "${RESOLVED_VERSION}"
+  fi
 }
 
 artifact_url() {
@@ -1191,6 +1217,243 @@ run_preflight_checks() {
   check_existing_installation
 }
 
+# ---------------------------------------------------------------------------
+# Binary download, verification, extraction, and installation
+# ---------------------------------------------------------------------------
+
+http_download() {
+  local url="$1"
+  local output="$2"
+
+  if has_cmd curl; then
+    curl --fail --silent --show-error --location --max-time 120 \
+      --retry 3 --retry-delay 2 \
+      -o "${output}" "${url}"
+  elif has_cmd wget; then
+    wget --quiet --tries=3 --timeout=120 \
+      -O "${output}" "${url}"
+  else
+    die "Need curl or wget for downloads"
+  fi
+}
+
+download_artifact() {
+  local url
+  url="$(artifact_url)"
+  local artifact_file
+  artifact_file="${TEMP_DIR}/$(artifact_name)"
+
+  info "Downloading binary archive from ${url}"
+  if ! http_download "${url}" "${artifact_file}"; then
+    return 1
+  fi
+
+  if [[ ! -f "${artifact_file}" || ! -s "${artifact_file}" ]]; then
+    err "Downloaded artifact is missing or empty"
+    return 1
+  fi
+
+  local size_bytes
+  size_bytes="$(wc -c < "${artifact_file}" | tr -d ' ')"
+  ok "Downloaded archive (${size_bytes} bytes)"
+}
+
+resolve_expected_checksum() {
+  # If caller provided --checksum, use that directly.
+  if [[ -n "${CHECKSUM}" ]]; then
+    printf '%s' "${CHECKSUM}"
+    return 0
+  fi
+
+  local artifact
+  artifact="$(artifact_name)"
+  local checksum_file
+  checksum_file="${TEMP_DIR}/$(checksum_file_name)"
+
+  # Try per-artifact .sha256 file first.
+  local per_artifact_url
+  per_artifact_url="$(checksum_url)"
+  info "Downloading checksum from ${per_artifact_url}"
+  if http_download "${per_artifact_url}" "${checksum_file}" 2>/dev/null; then
+    if [[ -f "${checksum_file}" && -s "${checksum_file}" ]]; then
+      # Format: "<hex>  <filename>" or just "<hex>"
+      local hash
+      hash="$(awk '{print $1}' "${checksum_file}" | head -n 1 | tr -d '[:space:]')"
+      if [[ "${hash}" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+        printf '%s' "${hash}"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback: try checksums.txt (all artifacts in one file).
+  local checksums_txt="${TEMP_DIR}/checksums.txt"
+  local checksums_url
+  checksums_url="$(checksums_txt_url)"
+  info "Per-artifact checksum not found; trying checksums.txt from ${checksums_url}"
+  if http_download "${checksums_url}" "${checksums_txt}" 2>/dev/null; then
+    if [[ -f "${checksums_txt}" && -s "${checksums_txt}" ]]; then
+      # Format: "<hex>  <filename>" per line
+      local hash
+      hash="$(grep -F "${artifact}" "${checksums_txt}" | awk '{print $1}' | head -n 1 | tr -d '[:space:]')"
+      if [[ "${hash}" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+        printf '%s' "${hash}"
+        return 0
+      fi
+    fi
+  fi
+
+  # No checksum source available.
+  return 1
+}
+
+compute_sha256() {
+  local file="$1"
+
+  if has_cmd sha256sum; then
+    sha256sum "${file}" | awk '{print $1}'
+  elif has_cmd shasum; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+  elif has_cmd openssl; then
+    openssl dgst -sha256 -hex "${file}" | awk '{print $NF}'
+  else
+    die "No SHA-256 tool found (need sha256sum, shasum, or openssl)"
+  fi
+}
+
+verify_artifact_checksum() {
+  local artifact_file
+  artifact_file="${TEMP_DIR}/$(artifact_name)"
+
+  local expected_hash=""
+  if expected_hash="$(resolve_expected_checksum)"; then
+    info "Verifying SHA-256 checksum..."
+    local actual_hash
+    actual_hash="$(compute_sha256 "${artifact_file}")"
+
+    # Normalize to lowercase for comparison.
+    expected_hash="$(printf '%s' "${expected_hash}" | tr '[:upper:]' '[:lower:]')"
+    actual_hash="$(printf '%s' "${actual_hash}" | tr '[:upper:]' '[:lower:]')"
+
+    if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+      err "SHA-256 checksum mismatch!"
+      err "  Expected: ${expected_hash}"
+      err "  Actual:   ${actual_hash}"
+      die "Artifact verification failed. The download may be corrupted or tampered with."
+    fi
+
+    ok "SHA-256 checksum verified: ${actual_hash}"
+  else
+    if [[ "${VERIFY}" == true ]]; then
+      die "Checksum verification was requested (--verify) but no checksum is available. Provide one with --checksum or ensure the release includes .sha256 files."
+    fi
+    warn "No checksum available for verification. Skipping integrity check."
+    warn "Use --checksum <sha256> to provide one, or --verify to require it."
+  fi
+}
+
+extract_archive() {
+  local artifact_file
+  artifact_file="${TEMP_DIR}/$(artifact_name)"
+  local extract_dir="${TEMP_DIR}/extract"
+  mkdir -p "${extract_dir}"
+
+  info "Extracting archive..."
+
+  # Detect format by extension and available tools.
+  local artifact_basename
+  artifact_basename="$(basename "${artifact_file}")"
+
+  case "${artifact_basename}" in
+    *.tar.xz)
+      if has_cmd xz; then
+        tar -xJf "${artifact_file}" -C "${extract_dir}" || die "Failed to extract .tar.xz archive (tar + xz)"
+      elif has_cmd unxz; then
+        unxz --keep --stdout "${artifact_file}" | tar -xf - -C "${extract_dir}" || die "Failed to extract .tar.xz archive (unxz + tar)"
+      else
+        die "Cannot extract .tar.xz archive: need xz or unxz. Install xz-utils (apt) or xz (brew)."
+      fi
+      ;;
+    *.tar.gz|*.tgz)
+      tar -xzf "${artifact_file}" -C "${extract_dir}" || die "Failed to extract .tar.gz archive"
+      ;;
+    *.zip)
+      if has_cmd unzip; then
+        unzip -q "${artifact_file}" -d "${extract_dir}" || die "Failed to extract .zip archive"
+      else
+        die "Cannot extract .zip archive: need unzip"
+      fi
+      ;;
+    *)
+      die "Unknown archive format: ${artifact_basename}"
+      ;;
+  esac
+
+  # Locate the binary inside the extracted tree.
+  local binary_path=""
+
+  # Direct in extract dir.
+  if [[ -f "${extract_dir}/${DEFAULT_BINARY_NAME}" ]]; then
+    binary_path="${extract_dir}/${DEFAULT_BINARY_NAME}"
+  else
+    # Search one level deep (archives often have a top-level directory).
+    binary_path="$(find "${extract_dir}" -maxdepth 2 -name "${DEFAULT_BINARY_NAME}" -type f | head -n 1)"
+  fi
+
+  if [[ -z "${binary_path}" || ! -f "${binary_path}" ]]; then
+    die "Could not find '${DEFAULT_BINARY_NAME}' binary inside the extracted archive"
+  fi
+
+  # Stage the binary for installation.
+  cp "${binary_path}" "${TEMP_DIR}/${DEFAULT_BINARY_NAME}" || die "Failed to stage binary"
+  ok "Extracted binary: ${DEFAULT_BINARY_NAME}"
+}
+
+install_binary() {
+  local staged_binary="${TEMP_DIR}/${DEFAULT_BINARY_NAME}"
+  local target_binary="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
+
+  if [[ ! -f "${staged_binary}" ]]; then
+    die "Staged binary not found at ${staged_binary}"
+  fi
+
+  # Ensure destination directory exists.
+  mkdir -p "${DEST_DIR}" || die "Failed to create destination directory ${DEST_DIR}"
+
+  # Install with executable permissions.
+  # Use full path to avoid shell aliases (e.g., install -> apt install).
+  if [[ -x /usr/bin/install ]]; then
+    /usr/bin/install -m 0755 "${staged_binary}" "${target_binary}" || die "Failed to install binary to ${target_binary}"
+  else
+    cp "${staged_binary}" "${target_binary}" || die "Failed to copy binary to ${target_binary}"
+    chmod 0755 "${target_binary}" || die "Failed to set permissions on ${target_binary}"
+  fi
+
+  # Verify the installed binary is executable.
+  if [[ ! -x "${target_binary}" ]]; then
+    die "Installed binary is not executable: ${target_binary}"
+  fi
+
+  ok "Installed ${DEFAULT_BINARY_NAME} to ${target_binary}"
+}
+
+verify_installation() {
+  local target_binary="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
+
+  info "Verifying installation..."
+
+  local version_output=""
+  version_output="$("${target_binary}" --version 2>&1 || true)"
+
+  if [[ -z "${version_output}" ]]; then
+    warn "Binary at ${target_binary} did not produce --version output."
+    warn "The binary may require shared libraries not present on this system."
+    return 1
+  fi
+
+  ok "Binary verification passed: ${version_output}"
+}
+
 print_plan() {
   local url
   url="$(artifact_url)"
@@ -1210,24 +1473,35 @@ print_plan() {
   printf '  Configure shell  : %s\n' "$([[ "${NO_CONFIGURE}" == true ]] && echo "false" || echo "true")"
 }
 
-run_install_scaffold() {
-  info "Installer scaffold preflight is complete."
-  info "Execution stages are placeholders for release download/build and installation."
-
+run_install() {
   if [[ "${FROM_SOURCE}" == true ]]; then
-    info "FROM_SOURCE=true: source build pipeline will run in a follow-up bead."
-  else
-    info "Binary release mode selected."
+    info "FROM_SOURCE=true: building from source (see bd-2w7x.19)."
+    die "Build-from-source is not yet implemented. Remove --from-source to download a prebuilt binary."
   fi
 
-  if [[ "${VERIFY}" == true ]]; then
-    if [[ -n "${CHECKSUM}" ]]; then
-      info "Checksum verification enabled with caller-provided digest."
-    else
-      warn "--verify provided without --checksum; installer will require release-manifest checksums in follow-up bead."
-    fi
+  # Stage 1: Download the binary archive.
+  if ! download_artifact; then
+    err "Binary download failed."
+    info "You can try building from source with: ${SCRIPT_NAME} --from-source"
+    die "Download failed for $(artifact_url)"
   fi
 
+  # Stage 2: Verify the checksum.
+  verify_artifact_checksum
+
+  # Stage 3: Extract the archive.
+  extract_archive
+
+  # Stage 4: Install the binary.
+  install_binary
+
+  # Stage 5: Verify the binary runs.
+  if ! verify_installation; then
+    warn "Binary verification failed but installation completed."
+    warn "You may need to install runtime dependencies (e.g., ONNX Runtime)."
+  fi
+
+  # Post-install configuration stages.
   maybe_configure_shell_path
   maybe_install_shell_completion
 
@@ -1237,7 +1511,8 @@ run_install_scaffold() {
   maybe_run_initial_model_download
   maybe_run_post_install_doctor
 
-  ok "Scaffold completed successfully."
+  ok "Installation completed successfully."
+  info "Run '${DEFAULT_BINARY_NAME} --help' to get started."
 }
 
 main() {
@@ -1256,7 +1531,7 @@ main() {
   run_preflight_checks
   resolve_version
   print_plan
-  run_install_scaffold
+  run_install
 }
 
 main "$@"

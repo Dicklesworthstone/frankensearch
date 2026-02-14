@@ -370,6 +370,137 @@ When older suites emit legacy names, adapters must normalize before validation:
 - No open gap/adaptor notes remain for required artifact files.
 - CI enforcement lane (`bd-2hz.10.11.7`) validates canonical naming and required failure artifacts uniformly.
 
+## Replay And Triage Playbook
+
+Issue: `bd-2hz.10.11.8`
+
+This playbook is the single operator workflow for triaging failing E2E runs from `core`, `fsfs`, and `ops`.
+It assumes only the canonical v1 bundle contract from this document and does not branch by suite until escalation.
+
+### Entry Points
+
+- CI failure output links to this section from `.github/workflows/ci.yml` (`quality` job).
+- Operator docs entry point: `docs/ops-tui-ia.md#e2e-failure-triage-playbook-link`.
+
+### Unified Workflow (Core / fsfs / Ops)
+
+1. Download the failing run artifacts from GitHub Actions:
+
+```bash
+gh run download <run-id> --dir /tmp/frankensearch-ci
+find /tmp/frankensearch-ci -name manifest.json -print
+```
+
+2. Select one run directory (`<bundle_dir>`) and inspect the manifest:
+
+```bash
+cd <bundle_dir>
+jq '.body | {suite, exit_status, determinism_tier, seed, duration_ms}' manifest.json
+jq -r '.body.artifacts[].file' manifest.json | sort
+```
+
+3. Verify required contract files are present:
+- Always required: `manifest.json`, `structured_events.jsonl`.
+- If `exit_status` is `fail` or `error`: `artifacts_index.json`, `replay_command.txt`.
+- If `suite` is `ops` and `exit_status` is `fail` or `error`: `terminal_transcript.txt`.
+
+4. Verify checksums before replay:
+
+```bash
+jq -r '.body.artifacts[] | [.file, .checksum] | @tsv' manifest.json \
+| while IFS=$'\t' read -r file expected; do
+  algo="${expected%%:*}"
+  want="${expected#*:}"
+  if [[ ! -f "${file}" ]]; then
+    echo "MISSING ${file}"
+    continue
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "${file}" | awk '{print $1}')"
+  else
+    got="$(shasum -a 256 "${file}" | awk '{print $1}')"
+  fi
+  [[ "${algo}" == "sha256" && "${got}" == "${want}" ]] \
+    && echo "OK ${file}" \
+    || echo "MISMATCH ${file} expected=${expected} got=sha256:${got}"
+done
+```
+
+5. Extract top failure signals from `structured_events.jsonl`:
+
+```bash
+jq -r 'select(.schema == "e2e-event-v1") | [.body.severity, (.body.reason_code // "none"), .body.type, (.body.context // "")] | @tsv' structured_events.jsonl
+```
+
+6. Replay using the bundled source-of-truth command:
+
+```bash
+cat replay_command.txt
+bash replay_command.txt
+```
+
+7. Record triage output in the bead thread using this minimum payload:
+- `run_id`, `suite`, `exit_status`
+- top `reason_code` values
+- replay result (`reproduced` / `not_reproduced`)
+- artifact path or CI URL
+- next owner/escalation target
+
+### Common Failure Classes And Escalation Paths
+
+| Failure Class | Typical Signal | First Action | Escalation Path |
+|---|---|---|---|
+| Contract/schema violation | Missing required artifact files, checksum mismatch, schema rejection | Re-run `jsonschema` checks and verify manifest `artifacts[]` coverage | Post in `bd-2hz.10.11` thread and notify owning suite adapter bead (`core`/`fsfs`/`ops`) |
+| Determinism/replay mismatch | `e2e.replay.seed_mismatch`, replay output differs from bundle expectation | Re-run `bash replay_command.txt`; compare seed/config hash from manifest | Escalate to suite owner plus deterministic/runtime owners for clock/seed drift |
+| Ranking/oracle regression | `e2e.oracle.ordering_violated`, `e2e.oracle.duplicates_found`, `e2e.oracle.phase_mismatch` | Reproduce with replay command, capture failing query/lane IDs from events | Escalate to search/relevance owner lane (`core` + `fsfs` query pipeline) |
+| Ops transcript/snapshot incident | `suite=ops` failure with transcript/snapshot discrepancy | Validate `terminal_transcript.txt` is present and aligned with event timeline | Escalate to ops/control-plane owner lane and attach transcript excerpt + reason codes |
+
+### Suite-Specific Replay Examples
+
+- Core contract lane (example):
+  - `cargo test -p frankensearch-core -- --nocapture`
+- fsfs CLI contract lane (example):
+  - `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+- ops/control-plane lane:
+  - Use the exact command from `replay_command.txt`; ops replay must preserve transcript evidence when failing.
+
+## CI Retention And Index Policy (bd-2hz.10.11.7)
+
+The `quality` job in `.github/workflows/ci.yml` enforces the unified artifact contract with hard-fail checks and emits machine-queryable index outputs.
+
+### Hard-Fail CI Gates
+
+- `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+  - validates fsfs bundle shape and replay/diagnostic artifacts through shared validators.
+- JSON Schema fixture enforcement:
+  - every `schemas/fixtures/e2e-*.json` must validate against `schemas/e2e-artifact-v1.schema.json`
+  - every `schemas/fixtures-invalid/e2e-*.json` must fail validation
+
+Any violation fails CI and emits replay/triage links in the job summary.
+
+### Machine-Queryable Index Outputs
+
+CI emits these files under `ci_artifacts/`:
+
+- `e2e_artifact_index.ndjson`
+  - one JSON record per suite (`core`, `fsfs`, `ops`) with schema tag, current adoption status, source surface, and required failure artifacts.
+- `e2e_retention_policy.json`
+  - policy envelope with retention windows and index filename contract.
+
+Quick query examples:
+
+```bash
+jq -s '.[] | {suite, status, required_failure_artifacts}' ci_artifacts/e2e_artifact_index.ndjson
+jq '.success_retention_days, .failure_retention_days' ci_artifacts/e2e_retention_policy.json
+```
+
+### Retention Policy
+
+- Success-path CI artifact index bundles: `7` days retention
+- Failure-path CI artifact index bundles: `30` days retention
+
+Failure retention is intentionally longer to preserve triage evidence and replay handles.
+
 ## Validation Artifacts
 
 - Schema: `schemas/e2e-artifact-v1.schema.json`

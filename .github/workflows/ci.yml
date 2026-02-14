@@ -80,17 +80,123 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
 
+      - name: Validate unified e2e artifact schema fixtures
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for fixture in schemas/fixtures/e2e-*.json; do
+            python3 -m jsonschema --instance "${fixture}" schemas/e2e-artifact-v1.schema.json
+          done
+
+          for fixture in schemas/fixtures-invalid/e2e-*.json; do
+            if python3 -m jsonschema --instance "${fixture}" schemas/e2e-artifact-v1.schema.json; then
+              echo "unexpected schema pass: ${fixture}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Emit machine-queryable e2e artifact index
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+
+          cat > ci_artifacts/e2e_artifact_index.ndjson <<'EOF'
+          {"suite":"core","schema":"e2e-manifest-v1","status":"adopted","source":"crates/frankensearch-core/src/e2e_artifact.rs","required_failure_artifacts":["artifacts_index.json","replay_command.txt"],"requires_terminal_transcript_on_failure":false}
+          {"suite":"fsfs","schema":"e2e-manifest-v1","status":"in_progress","source":"crates/frankensearch-fsfs/src/cli_e2e.rs","required_failure_artifacts":["artifacts_index.json","replay_command.txt"],"requires_terminal_transcript_on_failure":false}
+          {"suite":"ops","schema":"e2e-manifest-v1","status":"pending","source":"crates/frankensearch-ops","required_failure_artifacts":["artifacts_index.json","replay_command.txt","terminal_transcript.txt"],"requires_terminal_transcript_on_failure":true}
+          EOF
+
+          cat > ci_artifacts/e2e_retention_policy.json <<'EOF'
+          {
+            "schema": "e2e-artifact-retention-policy-v1",
+            "index_file": "e2e_artifact_index.ndjson",
+            "success_retention_days": 7,
+            "failure_retention_days": 30
+          }
+          EOF
+
+      - name: Validate e2e index + retention policy payloads
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e -s '
+            length == 3 and
+            (map(.suite) | sort == ["core","fsfs","ops"]) and
+            all(.[]; .schema == "e2e-manifest-v1") and
+            all(.[]; (.required_failure_artifacts | index("artifacts_index.json")) != null) and
+            all(.[]; (.required_failure_artifacts | index("replay_command.txt")) != null)
+          ' ci_artifacts/e2e_artifact_index.ndjson >/dev/null
+
+          jq -e '
+            .schema == "e2e-artifact-retention-policy-v1" and
+            .index_file == "e2e_artifact_index.ndjson" and
+            .success_retention_days >= 1 and
+            .failure_retention_days >= .success_retention_days
+          ' ci_artifacts/e2e_retention_policy.json >/dev/null
+
+      - name: Upload e2e artifact index (success retention)
+        if: matrix.os == 'ubuntu-latest' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-contract-index-success-${{ github.run_id }}
+          path: ci_artifacts/*
+          retention-days: 7
+
+      - name: Upload e2e artifact index (failure retention)
+        if: matrix.os == 'ubuntu-latest' && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-contract-index-failure-${{ github.run_id }}
+          path: ci_artifacts/*
+          retention-days: 30
+
+      - name: Publish replay/triage runbook links on failure
+        if: failure() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUNBOOK_URL: https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/e2e-artifact-contract.md#replay-and-triage-playbook
+          OPS_URL: https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/ops-tui-ia.md#e2e-failure-triage-playbook-link
+        run: |
+          set -euo pipefail
+          echo "::notice title=Replay/Triage Playbook::${RUNBOOK_URL}"
+          {
+            echo "### Failure replay and triage"
+            echo ""
+            echo "- Unified v1 bundle playbook: [Replay and Triage Playbook](${RUNBOOK_URL})"
+            echo "- Operator docs entrypoint: [Ops TUI IA playbook link](${OPS_URL})"
+            echo "- Replay source of truth: \`replay_command.txt\` from the failing artifact bundle."
+            echo "- Machine index artifact: \`e2e-contract-index-failure-${{ github.run_id }}\` (retention: 30 days)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   release-build:
-    name: Release build (${{ matrix.os }})
+    name: Release build (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
     needs: quality
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build_tool: zigbuild
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build_tool: zigbuild
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            build_tool: cargo
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            build_tool: cargo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -126,35 +232,95 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.os }}-nightly
+          shared-key: release-${{ matrix.target }}-nightly
           cache-targets: true
 
+      - name: Setup Zig (Linux cross-musl builds)
+        if: matrix.build_tool == 'zigbuild'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.12.0
+
+      - name: Install cargo-zigbuild (Linux cross-musl builds)
+        if: matrix.build_tool == 'zigbuild'
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build fsfs release binary
-        run: cargo build -p frankensearch-fsfs --release
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
+            cargo zigbuild -p frankensearch-fsfs --release --target "${target}"
+          else
+            cargo build -p frankensearch-fsfs --release --target "${target}"
+          fi
 
       - name: Package archive + checksum
         shell: bash
         env:
           TAG_NAME: ${{ github.ref_name }}
+          TARGET_TRIPLE: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          os_name="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
-          arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
-          archive_base="fsfs-${TAG_NAME}-${os_name}-${arch_name}"
+          binary_path="target/${TARGET_TRIPLE}/release/fsfs"
+          if [[ ! -x "${binary_path}" ]]; then
+            echo "Expected binary not found: ${binary_path}" >&2
+            exit 1
+          fi
+
+          if command -v llvm-strip >/dev/null 2>&1; then
+            llvm-strip "${binary_path}" || true
+          elif command -v strip >/dev/null 2>&1; then
+            strip "${binary_path}" || true
+          fi
+
+          archive_base="fsfs-${TAG_NAME}-${TARGET_TRIPLE}"
           mkdir -p dist
-          cp target/release/fsfs dist/fsfs
+          cp "${binary_path}" dist/fsfs
           tar -C dist -cJf "dist/${archive_base}.tar.xz" fsfs
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
           else
             shasum -a 256 "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
           fi
+
+          build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          rustc_version="$(rustc -V)"
+          cat > "dist/${archive_base}.metadata.json" <<EOF
+          {
+            "tag": "${TAG_NAME}",
+            "target": "${TARGET_TRIPLE}",
+            "binary": "fsfs",
+            "build_timestamp_utc": "${build_timestamp}",
+            "rustc": "${rustc_version}"
+          }
+          EOF
           rm -f dist/fsfs
+
+      - name: Install cosign (optional signing)
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Sign release archive (optional)
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.xz; do
+            cosign sign-blob --yes \
+              --output-signature "${archive}.sig" \
+              --output-certificate "${archive}.pem" \
+              "${archive}" || true
+          done
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.os }}
+          name: release-${{ matrix.target }}
           path: dist/*
 
   release-publish:
@@ -173,4 +339,55 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.tar.xz*
+          files: dist/**/*
+
+  publish-crates:
+    name: Publish crates.io package
+    if: startsWith(github.ref, 'refs/tags/v') && vars.ENABLE_CRATES_PUBLISH == 'true'
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies under /dp
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo chown -R "$USER":"$(id -gn)" /dp
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin main
+              git -C "${dest_path}" checkout main
+              git -C "${dest_path}" pull --ff-only origin main
+            else
+              git clone --depth 1 "${repo_url}" "${dest_path}"
+            fi
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+
+      - name: Publish frankensearch-fsfs crate
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required when ENABLE_CRATES_PUBLISH=true" >&2
+            exit 1
+          fi
+          cargo publish -p frankensearch-fsfs --locked --token "${CARGO_REGISTRY_TOKEN}"

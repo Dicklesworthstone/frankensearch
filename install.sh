@@ -5,8 +5,6 @@ set -euo pipefail
 # Installer output primitives for fsfs rollout tasks.
 # This script currently focuses on presentation helpers and summary rendering.
 
-SCRIPT_NAME="$(basename "$0")"
-
 QUIET=false
 NO_GUM=false
 DEMO=false
@@ -26,7 +24,6 @@ ANSI_GREEN=""
 ANSI_YELLOW=""
 ANSI_RED=""
 ANSI_BOLD=""
-ANSI_DIM=""
 
 SYMBOL_INFO="->"
 SYMBOL_OK="[ok]"
@@ -127,7 +124,6 @@ configure_output_mode() {
     ANSI_YELLOW=$'\033[33m'
     ANSI_RED=$'\033[31m'
     ANSI_BOLD=$'\033[1m'
-    ANSI_DIM=$'\033[2m'
   fi
 
   if [[ "$USE_UNICODE" == true ]]; then
@@ -237,7 +233,7 @@ run_with_spinner() {
     return $?
   fi
 
-  local frames='|/-\'
+  local frames="|/-\\"
   local i=0
   "$@" &
   local pid=$!

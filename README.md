@@ -23,8 +23,8 @@ Installer goals:
 
 ```bash
 cargo +nightly install --path crates/frankensearch-fsfs
-fsfs --version
-fsfs --help
+fsfs version
+fsfs status --no-watch-mode --format json
 ```
 
 ## Quick Start (60 Seconds)

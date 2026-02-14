@@ -183,6 +183,14 @@ Artifacts required for CI/replay:
 2. structured JSONL logs for navigation/palette/reconnect
 3. snapshot captures for each required screen + overlay stack states
 
+## E2E Failure Triage Playbook Link
+
+Operator triage for failing unified v1 artifact bundles is standardized in:
+
+- `docs/e2e-artifact-contract.md#replay-and-triage-playbook`
+
+CI failure outputs in `.github/workflows/ci.yml` also publish this same runbook link so operators can pivot from failed jobs directly into the replay workflow.
+
 ## Downstream Implementation Boundaries
 
 This spec is now authoritative for:
