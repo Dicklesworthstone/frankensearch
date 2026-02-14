@@ -367,10 +367,10 @@ impl TantivyIndex {
     fn parse_query_lenient(&self, query: &str) -> Box<dyn tantivy::query::Query> {
         let parser = self.query_parser();
         let (parsed, errors) = parser.parse_query_lenient(query);
-        if !errors.is_empty() {
+        if let Some(first_error) = errors.first() {
             debug!(
                 error_count = errors.len(),
-                first_error = %errors[0],
+                first_error = %first_error,
                 "lenient query parse produced warnings"
             );
         }
@@ -455,13 +455,20 @@ impl TantivyIndex {
             })?;
 
         // Build snippet generator for the content field.
-        let snippet_gen =
-            tantivy::snippet::SnippetGenerator::create(&searcher, &*parsed, self.fields.content)
-                .ok()
-                .map(|mut sg| {
-                    sg.set_max_num_chars(snippet_config.max_chars);
-                    sg
-                });
+        let snippet_gen = match tantivy::snippet::SnippetGenerator::create(
+            &searcher,
+            &*parsed,
+            self.fields.content,
+        ) {
+            Ok(mut sg) => {
+                sg.set_max_num_chars(snippet_config.max_chars);
+                Some(sg)
+            }
+            Err(e) => {
+                debug!(error = %e, "failed to create snippet generator, snippets will be absent");
+                None
+            }
+        };
 
         debug!(
             hits = top_docs.len(),
@@ -482,13 +489,22 @@ impl TantivyIndex {
             let doc_id = doc
                 .get_first(self.fields.id)
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .unwrap_or_else(|| {
+                    debug!("tantivy document missing id field, using empty doc_id");
+                    ""
+                })
                 .to_owned();
 
             let metadata = doc
                 .get_first(self.fields.metadata_json)
                 .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str(s).ok());
+                .and_then(|s| match serde_json::from_str(s) {
+                    Ok(val) => Some(val),
+                    Err(e) => {
+                        debug!(doc_id = %doc_id, error = %e, "failed to deserialize metadata JSON");
+                        None
+                    }
+                });
 
             // Generate snippet from the document.
             let snippet = snippet_gen.as_ref().and_then(|sg| {
@@ -557,13 +573,22 @@ impl LexicalSearch for TantivyIndex {
                 let doc_id = doc
                     .get_first(self.fields.id)
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
+                    .unwrap_or_else(|| {
+                        debug!("tantivy document missing id field, using empty doc_id");
+                        ""
+                    })
                     .to_owned();
 
                 let metadata = doc
                     .get_first(self.fields.metadata_json)
                     .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(s).ok());
+                    .and_then(|s| match serde_json::from_str(s) {
+                        Ok(val) => Some(val),
+                        Err(e) => {
+                            debug!(doc_id = %doc_id, error = %e, "failed to deserialize metadata JSON");
+                            None
+                        }
+                    });
 
                 results.push(ScoredResult {
                     doc_id,

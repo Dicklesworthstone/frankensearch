@@ -214,10 +214,18 @@ impl FlashRankReranker {
         let batch_size = pairs.len();
         let seq_len = pairs.iter().map(|p| p.input_ids.len()).max().unwrap_or(0);
 
+        let flat_len =
+            batch_size
+                .checked_mul(seq_len)
+                .ok_or_else(|| SearchError::RerankFailed {
+                    model: model_name.to_owned(),
+                    source: format!("tensor size overflow: {batch_size} * {seq_len}").into(),
+                })?;
+
         // Pad all sequences to the same length and flatten into contiguous arrays
-        let mut flat_input_ids = vec![0_i64; batch_size * seq_len];
-        let mut flat_attention_mask = vec![0_i64; batch_size * seq_len];
-        let mut flat_token_type_ids = vec![0_i64; batch_size * seq_len];
+        let mut flat_input_ids = vec![0_i64; flat_len];
+        let mut flat_attention_mask = vec![0_i64; flat_len];
+        let mut flat_token_type_ids = vec![0_i64; flat_len];
 
         for (i, pair) in pairs.iter().enumerate() {
             let offset = i * seq_len;

@@ -699,7 +699,13 @@ impl VectorIndexWriter {
         // fsync parent directory for durability
         if let Some(parent) = Path::new(&self.path).parent() {
             if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
+                if let Err(sync_err) = dir.sync_all() {
+                    tracing::warn!(
+                        dir = %parent.display(),
+                        error = %sync_err,
+                        "directory fsync failed after FSVI index write"
+                    );
+                }
             }
         }
 
