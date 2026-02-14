@@ -2703,10 +2703,12 @@ mod tests {
         assert!(enabled.contains(&ScreenAction::ForceOverrideMetadataOnly));
         assert!(enabled.contains(&ScreenAction::ForceOverridePaused));
         assert!(!enabled.contains(&ScreenAction::ForceOverrideLexicalOnly));
-        assert!(snapshot
-            .controls
-            .iter()
-            .any(|control| control.reason_code == "cockpit.control.override.force_paused"));
+        assert!(
+            snapshot
+                .controls
+                .iter()
+                .any(|control| control.reason_code == "cockpit.control.override.force_paused")
+        );
 
         let banner = pressure.banner();
         assert_eq!(banner.text, "Degraded mode active");

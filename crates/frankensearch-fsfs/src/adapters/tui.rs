@@ -1608,18 +1608,26 @@ mod tests {
             .find(|contract| contract.screen == FsfsScreen::Indexing)
             .expect("indexing contract should exist");
 
-        assert!(indexing_contract
-            .cards
-            .contains(&FsfsCardPrimitive::IndexingBacklogChart));
-        assert!(indexing_contract
-            .cards
-            .contains(&FsfsCardPrimitive::IndexingThroughputChart));
-        assert!(indexing_contract
-            .cards
-            .contains(&FsfsCardPrimitive::IndexingControlPanel));
-        assert!(indexing_contract
-            .cards
-            .contains(&FsfsCardPrimitive::DegradationBannerStrip));
+        assert!(
+            indexing_contract
+                .cards
+                .contains(&FsfsCardPrimitive::IndexingBacklogChart)
+        );
+        assert!(
+            indexing_contract
+                .cards
+                .contains(&FsfsCardPrimitive::IndexingThroughputChart)
+        );
+        assert!(
+            indexing_contract
+                .cards
+                .contains(&FsfsCardPrimitive::IndexingControlPanel)
+        );
+        assert!(
+            indexing_contract
+                .cards
+                .contains(&FsfsCardPrimitive::DegradationBannerStrip)
+        );
     }
 
     #[test]
@@ -1674,11 +1682,13 @@ mod tests {
             shell.palette_intents.intents.len(),
             shell.palette.actions.len()
         );
-        assert!(shell
-            .palette_intents
-            .intents
-            .iter()
-            .all(|intent| intent.intent != TuiPaletteIntent::Unknown));
+        assert!(
+            shell
+                .palette_intents
+                .intents
+                .iter()
+                .all(|intent| intent.intent != TuiPaletteIntent::Unknown)
+        );
     }
 
     #[test]

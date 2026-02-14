@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 frankensearch-core = { workspace = true }
-frankensearch-embed = { workspace = true, features = ["hash", "model2vec", "download"] }
+frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "model2vec", "download"] }
 frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true }
 frankensearch-tui = { workspace = true }

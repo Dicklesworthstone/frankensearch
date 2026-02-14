@@ -25,7 +25,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates
 frankensearch-core = { path = "crates/frankensearch-core" }
-frankensearch-embed = { path = "crates/frankensearch-embed" }
+frankensearch-embed = { path = "crates/frankensearch-embed", default-features = false }
 frankensearch-index = { path = "crates/frankensearch-index" }
 frankensearch-lexical = { path = "crates/frankensearch-lexical" }
 frankensearch-fusion = { path = "crates/frankensearch-fusion" }

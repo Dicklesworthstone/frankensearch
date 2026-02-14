@@ -251,6 +251,10 @@ fn toon_unquoted_token_roundtrips_as_same_string(token: &str) -> bool {
 ///
 /// Error codes are drawn from [`OutputErrorCode`] constants and map 1:1
 /// from [`SearchError`] variants.
+///
+/// The optional `suggestion` and `context` fields follow the three-part
+/// error message pattern: (1) what happened (`message`), (2) why it
+/// matters (`context`), (3) what to do about it (`suggestion`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputError {
     /// Machine-stable error code (`snake_case`, never changes within a major version).
@@ -262,6 +266,12 @@ pub struct OutputError {
     pub field: Option<String>,
     /// Suggested CLI exit code.
     pub exit_code: i32,
+    /// Actionable suggestion for how to fix the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    /// Additional context explaining why the error matters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl OutputError {
@@ -273,6 +283,8 @@ impl OutputError {
             message: message.into(),
             field: None,
             exit_code,
+            suggestion: None,
+            context: None,
         }
     }
 
@@ -280,6 +292,20 @@ impl OutputError {
     #[must_use]
     pub fn with_field(mut self, field: impl Into<String>) -> Self {
         self.field = Some(field.into());
+        self
+    }
+
+    /// Attach an actionable fix suggestion.
+    #[must_use]
+    pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = Some(suggestion.into());
+        self
+    }
+
+    /// Attach explanatory context about why this error matters.
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
         self
     }
 }
@@ -638,7 +664,7 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
 }
 
 /// Convert a [`SearchError`] into a structured
-/// [`OutputError`].
+/// [`OutputError`] with actionable suggestion and context.
 #[must_use]
 pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
     use frankensearch_core::SearchError;
@@ -657,6 +683,135 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
         message,
         field,
         exit_code: exit,
+        suggestion: suggestion_for_error(err),
+        context: context_for_error(err),
+    }
+}
+
+/// Return an actionable fix suggestion for a [`SearchError`].
+///
+/// Each suggestion tells the user exactly what command to run or
+/// environment variable to set in order to resolve the error.
+#[must_use]
+fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
+    use frankensearch_core::SearchError;
+
+    match err {
+        SearchError::EmbedderUnavailable { model, .. } => Some(format!(
+            "Run: fsfs download-models --model {model}\n\
+             Or set FRANKENSEARCH_MODEL_DIR to a directory containing pre-downloaded models.\n\
+             For offline use: set FRANKENSEARCH_OFFLINE=1 to use hash-only fallback."
+        )),
+        SearchError::ModelNotFound { name } => Some(format!(
+            "Run: fsfs download-models --model {name}\n\
+             Or manually download the model and set FRANKENSEARCH_MODEL_DIR.\n\
+             Check cache: fsfs doctor --check-models"
+        )),
+        SearchError::ModelLoadFailed { path, .. } => Some(format!(
+            "The model file at {} may be corrupted.\n\
+             Try: fsfs download-models --force --model <name>\n\
+             Or run: fsfs doctor --fix",
+            path.display()
+        )),
+        SearchError::IndexNotFound { path } => Some(format!(
+            "Run: fsfs index <directory>\n\
+             Expected index at: {}",
+            path.display()
+        )),
+        SearchError::IndexCorrupted { path, .. } => Some(format!(
+            "Run: fsfs index --force <directory>\n\
+             This will rebuild the index at: {}",
+            path.display()
+        )),
+        SearchError::IndexVersionMismatch { expected, found } => Some(format!(
+            "The index was built with format v{found} but this version of fsfs expects v{expected}.\n\
+             Run: fsfs index --force <directory> to rebuild."
+        )),
+        SearchError::DimensionMismatch { expected, found } => Some(format!(
+            "The index was built with {expected}-dim embeddings but the current embedder produces {found}-dim vectors.\n\
+             Run: fsfs index --force <directory> to rebuild with the current embedder."
+        )),
+        SearchError::InvalidConfig { field, reason, .. } => Some(format!(
+            "Check the '{field}' setting in your configuration.\n\
+             {reason}\n\
+             Config files: fsfs.toml (project) or ~/.config/fsfs/config.toml (user)"
+        )),
+        SearchError::Io(_) => Some(
+            "Check file permissions and available disk space.\n\
+             Models require ~200MB, search indices vary by corpus size."
+                .to_owned(),
+        ),
+        SearchError::SearchTimeout {
+            budget_ms, ..
+        } => Some(format!(
+            "Increase the timeout: fsfs search --timeout {}\n\
+             Or reduce result count: fsfs search --limit 5",
+            budget_ms.saturating_mul(2)
+        )),
+        SearchError::HashMismatch { path, .. } => Some(format!(
+            "The file at {} may be corrupted or tampered with.\n\
+             Re-download: fsfs download-models --force",
+            path.display()
+        )),
+        SearchError::QueueFull { capacity, .. } => Some(format!(
+            "The embedding queue is at capacity ({capacity}).\n\
+             Wait for current jobs to complete or increase queue capacity in config."
+        )),
+        SearchError::DurabilityDisabled => Some(
+            "Enable the 'durability' feature: cargo install frankensearch-fsfs --features durability"
+                .to_owned(),
+        ),
+        SearchError::RerankerUnavailable { .. } => Some(
+            "Enable the 'rerank' feature: cargo install frankensearch-fsfs --features rerank\n\
+             Or use --no-rerank to skip reranking."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// Return explanatory context about why a [`SearchError`] matters.
+#[must_use]
+fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
+    use frankensearch_core::SearchError;
+
+    match err {
+        SearchError::EmbedderUnavailable { .. } => Some(
+            "Without an embedding model, semantic search is unavailable. \
+             Lexical (keyword) search via BM25 may still work if a Tantivy index exists."
+                .to_owned(),
+        ),
+        SearchError::ModelNotFound { .. } => Some(
+            "Search models are downloaded on first use (~200MB total). \
+             In offline environments, pre-populate the cache with fsfs download-models."
+                .to_owned(),
+        ),
+        SearchError::ModelLoadFailed { .. } => Some(
+            "A corrupted model file can produce wrong results or crash the ONNX runtime. \
+             Re-downloading ensures integrity."
+                .to_owned(),
+        ),
+        SearchError::IndexNotFound { .. } => Some(
+            "No search index exists yet. You need to index a directory of files \
+             before you can search."
+                .to_owned(),
+        ),
+        SearchError::IndexCorrupted { .. } => Some(
+            "A corrupted index will produce incorrect or missing results. \
+             Rebuilding with --force creates a fresh index from source files."
+                .to_owned(),
+        ),
+        SearchError::DimensionMismatch { .. } => Some(
+            "The index was built with a different embedder than the one currently configured. \
+             Rebuild the index to match the active embedder."
+                .to_owned(),
+        ),
+        SearchError::HashMismatch { .. } => Some(
+            "File integrity verification failed. This can happen after network errors \
+             during download or disk corruption."
+                .to_owned(),
+        ),
+        _ => None,
     }
 }
 

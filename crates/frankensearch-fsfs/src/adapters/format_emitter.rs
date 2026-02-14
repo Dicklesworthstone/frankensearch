@@ -227,6 +227,12 @@ fn emit_table<T: Serialize, W: Write>(
         if let Some(field) = &error.field {
             write!(writer, " (field: {field})").map_err(write_err)?;
         }
+        if let Some(context) = &error.context {
+            write!(writer, "\n\n  {context}").map_err(write_err)?;
+        }
+        if let Some(suggestion) = &error.suggestion {
+            write!(writer, "\n\n  Fix: {suggestion}").map_err(write_err)?;
+        }
     }
 
     for warning in &envelope.warnings {

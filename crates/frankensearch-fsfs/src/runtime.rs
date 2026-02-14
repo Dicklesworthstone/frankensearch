@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -1172,7 +1171,8 @@ impl FsfsRuntime {
         })
     }
 
-    fn run_one_shot_index_scaffold(&self, command: CliCommand) -> SearchResult<()> {
+    async fn run_one_shot_index_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
+        let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root);
 
@@ -1189,23 +1189,52 @@ impl FsfsRuntime {
         }
 
         let mut candidates = Vec::new();
-        let stats = self.collect_index_candidates(&target_root, &mut candidates)?;
+        let discovery_start = Instant::now();
+        let stats = self.collect_index_candidates(&target_root, &index_root, &mut candidates)?;
+        let discovery_elapsed_ms = discovery_start.elapsed().as_millis();
+        info!(
+            target_root = %target_root.display(),
+            discovered_files = stats.discovered_files,
+            skipped_files = stats.skipped_files,
+            candidate_files = candidates.len(),
+            elapsed_ms = discovery_elapsed_ms,
+            "fsfs file discovery completed"
+        );
+        println!(
+            "Discovered {} file(s) under {} ({} skipped by policy)",
+            stats.discovered_files,
+            target_root.display(),
+            stats.skipped_files
+        );
 
         let canonicalizer = DefaultCanonicalizer::default();
+        let canonicalize_start = Instant::now();
         let mut manifests = Vec::new();
+        let mut documents = Vec::new();
+        let mut semantic_doc_count = 0_usize;
+        let mut content_skipped_files = 0_usize;
         for candidate in candidates {
             let bytes = match fs::read(&candidate.file_path) {
                 Ok(bytes) => bytes,
-                Err(error) if is_ignorable_index_walk_error(&error) => continue,
+                Err(error) if is_ignorable_index_walk_error(&error) => {
+                    content_skipped_files = content_skipped_files.saturating_add(1);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
+            if is_probably_binary(&bytes) {
+                content_skipped_files = content_skipped_files.saturating_add(1);
+                continue;
+            }
             let raw_text = String::from_utf8_lossy(&bytes);
             let canonical = canonicalizer.canonicalize(&raw_text);
             if canonical.trim().is_empty() {
+                content_skipped_files = content_skipped_files.saturating_add(1);
                 continue;
             }
 
             let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
+            let ingestion_class = format!("{:?}", candidate.ingestion_class).to_ascii_lowercase();
             let reason_code = match candidate.ingestion_class {
                 IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
                 IngestionClass::LexicalOnly => "index.plan.lexical_only",
@@ -1215,25 +1244,92 @@ impl FsfsRuntime {
             .to_owned();
 
             manifests.push(IndexManifestEntry {
-                file_key: candidate.file_key,
+                file_key: candidate.file_key.clone(),
                 revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
-                ingestion_class: format!("{:?}", candidate.ingestion_class).to_ascii_lowercase(),
+                ingestion_class: ingestion_class.clone(),
                 canonical_bytes,
                 reason_code,
             });
+
+            let file_name = candidate
+                .file_path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default()
+                .to_owned();
+            let doc = IndexableDocument::new(candidate.file_key, canonical)
+                .with_title(file_name)
+                .with_metadata("source_path", candidate.file_path.display().to_string())
+                .with_metadata("ingestion_class", ingestion_class)
+                .with_metadata("source_modified_ms", candidate.modified_ms.to_string());
+            if matches!(
+                candidate.ingestion_class,
+                IngestionClass::FullSemanticLexical
+            ) {
+                semantic_doc_count = semantic_doc_count.saturating_add(1);
+            }
+            documents.push((candidate.ingestion_class, doc));
         }
+        let canonicalize_elapsed_ms = canonicalize_start.elapsed().as_millis();
+        info!(
+            indexed_candidates = documents.len(),
+            semantic_candidates = semantic_doc_count,
+            skipped_after_read = content_skipped_files,
+            elapsed_ms = canonicalize_elapsed_ms,
+            "fsfs canonicalization stage completed"
+        );
 
         manifests.sort_by(|left, right| left.file_key.cmp(&right.file_key));
 
         let source_hash_hex = index_source_hash_hex(&manifests);
-        let indexed_files = manifests.len();
-        let skipped_files = stats
-            .discovered_files
-            .saturating_sub(indexed_files)
-            .saturating_add(stats.skipped_files);
+        let indexed_files = documents.len();
+        let skipped_files = stats.discovered_files.saturating_sub(indexed_files);
         let total_canonical_bytes = manifests.iter().fold(0_u64, |acc, entry| {
             acc.saturating_add(entry.canonical_bytes)
         });
+
+        fs::create_dir_all(index_root.join("vector"))?;
+        fs::create_dir_all(index_root.join("cache"))?;
+
+        let lexical_docs = documents
+            .iter()
+            .filter(|(class, _)| {
+                !matches!(class, IngestionClass::MetadataOnly | IngestionClass::Skip)
+            })
+            .map(|(_, doc)| doc.clone())
+            .collect::<Vec<_>>();
+        let lexical_start = Instant::now();
+        let lexical_index = TantivyIndex::create(&index_root.join("lexical"))?;
+        lexical_index.index_documents(cx, &lexical_docs).await?;
+        lexical_index.commit(cx).await?;
+        let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
+
+        let embed_start = Instant::now();
+        let embedder = self.resolve_fast_embedder()?;
+        let semantic_docs = documents
+            .iter()
+            .filter(|(class, _)| matches!(class, IngestionClass::FullSemanticLexical))
+            .map(|(_, doc)| doc)
+            .collect::<Vec<_>>();
+        let semantic_texts = semantic_docs
+            .iter()
+            .map(|doc| doc.content.as_str())
+            .collect::<Vec<_>>();
+        let semantic_embeddings = if semantic_texts.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed_batch(cx, &semantic_texts).await?
+        };
+        let embed_elapsed_ms = embed_start.elapsed().as_millis();
+
+        let vector_start = Instant::now();
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        let mut writer = VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())?;
+        for (doc, embedding) in semantic_docs.iter().zip(semantic_embeddings.into_iter()) {
+            writer.write_record(&doc.id, &embedding)?;
+        }
+        writer.finish()?;
+        let vector_elapsed_ms = vector_start.elapsed().as_millis();
 
         self.write_index_artifacts(&index_root, &manifests)?;
         let sentinel = IndexSentinel {
@@ -1250,6 +1346,14 @@ impl FsfsRuntime {
         };
         self.write_index_sentinel(&index_root, &sentinel)?;
 
+        let storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
+            vector_index_roots: vec![index_root.join("vector")],
+            lexical_index_roots: vec![index_root.join("lexical")],
+            catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
+            embedding_cache_roots: vec![index_root.join("cache")],
+        })?;
+        let elapsed_ms = total_start.elapsed().as_millis();
+
         info!(
             command = ?command,
             target_root = %target_root.display(),
@@ -1258,16 +1362,27 @@ impl FsfsRuntime {
             indexed_files,
             skipped_files,
             total_canonical_bytes,
+            lexical_docs = lexical_docs.len(),
+            semantic_docs = semantic_doc_count,
+            embedder = embedder.id(),
+            discovery_elapsed_ms,
+            canonicalize_elapsed_ms,
+            lexical_elapsed_ms,
+            embedding_elapsed_ms = embed_elapsed_ms,
+            vector_elapsed_ms,
+            total_elapsed_ms = elapsed_ms,
             source_hash = sentinel.source_hash_hex,
-            "fsfs index scaffold completed"
+            "fsfs index pipeline completed"
         );
 
         println!(
-            "Indexed {} file(s) (discovered {}, skipped {}) into {}",
+            "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
             indexed_files,
             stats.discovered_files,
             skipped_files,
-            index_root.display()
+            index_root.display(),
+            elapsed_ms,
+            storage_usage.total_bytes()
         );
 
         Ok(())
@@ -1313,88 +1428,99 @@ impl FsfsRuntime {
         }
     }
 
+    fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
+        let configured_root = PathBuf::from(&self.config.indexing.model_dir);
+        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
+            .or_else(|_| EmbedderStack::auto_detect())?;
+        Ok(stack.fast_arc())
+    }
+
     fn collect_index_candidates(
         &self,
         target_root: &Path,
+        index_root: &Path,
         output: &mut Vec<IndexCandidate>,
     ) -> SearchResult<IndexDiscoveryStats> {
-        let mut stack = vec![target_root.to_path_buf()];
-        let mut visited_dirs = HashSet::new();
         let mut discovered_files = 0_usize;
         let mut skipped_files = 0_usize;
 
-        while let Some(path) = stack.pop() {
-            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !visited_dirs.insert(canonical) {
+        let mut walker = WalkBuilder::new(target_root);
+        walker.follow_links(self.config.discovery.follow_symlinks);
+        walker.git_ignore(true);
+        walker.git_global(true);
+        walker.git_exclude(true);
+        walker.hidden(false);
+        walker.standard_filters(true);
+
+        for entry in walker.build() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if let Some(io_error) = error.io_error() {
+                        if is_ignorable_index_walk_error(io_error) {
+                            continue;
+                        }
+                        return Err(
+                            std::io::Error::new(io_error.kind(), io_error.to_string()).into()
+                        );
+                    }
+                    return Err(SearchError::InvalidConfig {
+                        field: "discovery.walk".to_owned(),
+                        value: target_root.display().to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+            };
+
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                continue;
+            }
+            if !file_type.is_file() && !entry.path_is_symlink() {
                 continue;
             }
 
-            let entries = match fs::read_dir(&path) {
-                Ok(entries) => entries,
+            let entry_path = entry.path().to_path_buf();
+            if entry_path.starts_with(index_root) {
+                skipped_files = skipped_files.saturating_add(1);
+                continue;
+            }
+            if entry.path_is_symlink() && !self.config.discovery.follow_symlinks {
+                skipped_files = skipped_files.saturating_add(1);
+                continue;
+            }
+
+            let metadata = match fs::metadata(&entry_path) {
+                Ok(metadata) => metadata,
                 Err(error) if is_ignorable_index_walk_error(&error) => continue,
                 Err(error) => return Err(error.into()),
             };
 
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) if is_ignorable_index_walk_error(&error) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                let entry_path = entry.path();
-                let file_type = match entry.file_type() {
-                    Ok(file_type) => file_type,
-                    Err(error) if is_ignorable_index_walk_error(&error) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-
-                if file_type.is_dir() {
-                    if file_type.is_symlink() && !self.config.discovery.follow_symlinks {
-                        continue;
-                    }
-                    let candidate = DiscoveryCandidate::new(&entry_path, 0)
-                        .with_symlink(file_type.is_symlink());
-                    let decision = self.config.discovery.evaluate_candidate(&candidate);
-                    if matches!(decision.scope, DiscoveryScopeDecision::Include) {
-                        stack.push(entry_path);
-                    }
-                    continue;
-                }
-
-                if !file_type.is_file() && !file_type.is_symlink() {
-                    continue;
-                }
-
-                let metadata = match fs::metadata(&entry_path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if is_ignorable_index_walk_error(&error) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-
-                discovered_files = discovered_files.saturating_add(1);
-                let candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
-                    .with_symlink(file_type.is_symlink());
-                let decision = self.config.discovery.evaluate_candidate(&candidate);
-                if !matches!(decision.scope, DiscoveryScopeDecision::Include)
-                    || !decision.ingestion_class.is_indexed()
-                {
-                    skipped_files = skipped_files.saturating_add(1);
-                    continue;
-                }
-
-                let modified_ms = metadata
-                    .modified()
-                    .ok()
-                    .map(system_time_to_ms)
-                    .unwrap_or_default();
-
-                output.push(IndexCandidate {
-                    file_path: entry_path.clone(),
-                    file_key: normalize_file_key_for_index(&entry_path),
-                    modified_ms,
-                    ingestion_class: decision.ingestion_class,
-                });
+            discovered_files = discovered_files.saturating_add(1);
+            let candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
+                .with_symlink(entry.path_is_symlink());
+            let decision = self.config.discovery.evaluate_candidate(&candidate);
+            if !matches!(decision.scope, DiscoveryScopeDecision::Include)
+                || !decision.ingestion_class.is_indexed()
+            {
+                skipped_files = skipped_files.saturating_add(1);
+                continue;
             }
+
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .map(system_time_to_ms)
+                .unwrap_or_default();
+
+            output.push(IndexCandidate {
+                file_path: entry_path.clone(),
+                file_key: normalize_file_key_for_index(&entry_path, target_root),
+                modified_ms,
+                ingestion_class: decision.ingestion_class,
+            });
         }
 
         Ok(IndexDiscoveryStats {
@@ -1409,10 +1535,6 @@ impl FsfsRuntime {
         index_root: &Path,
         manifests: &[IndexManifestEntry],
     ) -> SearchResult<()> {
-        fs::create_dir_all(index_root.join("vector"))?;
-        fs::create_dir_all(index_root.join("lexical"))?;
-        fs::create_dir_all(index_root.join("cache"))?;
-
         let vector_manifest = serde_json::to_string_pretty(manifests).map_err(|error| {
             SearchError::SubsystemError {
                 subsystem: "index.vector_manifest",
@@ -1430,11 +1552,6 @@ impl FsfsRuntime {
         fs::write(
             index_root.join(FSFS_LEXICAL_MANIFEST_FILE),
             lexical_manifest,
-        )?;
-
-        fs::write(
-            index_root.join(FSFS_VECTOR_INDEX_FILE),
-            b"FSVI-STUB\nscaffold index artifact\n",
         )?;
 
         Ok(())
@@ -2032,8 +2149,11 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
-fn normalize_file_key_for_index(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+fn normalize_file_key_for_index(path: &Path, target_root: &Path) -> String {
+    path.strip_prefix(target_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn index_source_hash_hex(manifests: &[IndexManifestEntry]) -> String {
@@ -2045,6 +2165,26 @@ fn index_source_hash_hex(manifests: &[IndexManifestEntry]) -> String {
         entry.ingestion_class.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
+}
+
+fn is_probably_binary(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    if data.contains(&0) {
+        return true;
+    }
+
+    let control_count = data
+        .iter()
+        .filter(|byte| {
+            matches!(
+                **byte,
+                0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F
+            )
+        })
+        .count();
+    control_count.saturating_mul(5) > data.len()
 }
 
 fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
