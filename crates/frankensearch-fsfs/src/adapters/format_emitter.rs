@@ -10,14 +10,17 @@
 //! envelope as TOON and decoding it back yields the same `serde_json::Value`
 //! as direct JSON serialization. This is verified by [`verify_json_toon_parity`].
 
+use std::env;
 use std::fmt::Write as _;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
 use super::cli::OutputFormat;
-use crate::output_schema::{OutputEnvelope, OutputMeta, SearchPayload, encode_envelope_toon};
+use crate::output_schema::{
+    OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload, encode_envelope_toon,
+};
 use crate::stream_protocol::{
     StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_ndjson,
     encode_stream_frame_toon,
@@ -222,7 +225,12 @@ fn emit_table<T: Serialize, W: Write>(
                 })?;
 
             if let Ok(search_payload) = serde_json::from_value::<SearchPayload>(value.clone()) {
-                write!(writer, "{}", render_search_table(&search_payload)).map_err(write_err)?;
+                write!(
+                    writer,
+                    "{}",
+                    render_search_table(&search_payload, envelope.meta.duration_ms)
+                )
+                .map_err(write_err)?;
                 return Ok(());
             }
 
@@ -260,32 +268,204 @@ fn emit_table<T: Serialize, W: Write>(
     Ok(())
 }
 
-fn render_search_table(payload: &SearchPayload) -> String {
+fn render_search_table(payload: &SearchPayload, duration_ms: Option<u64>) -> String {
+    let color_enabled = should_use_ansi_color();
+    let width = detect_terminal_width();
+    render_search_table_with_options(payload, duration_ms, color_enabled, width)
+}
+
+/// Render search results as a table while honoring the CLI `--no-color` flag.
+#[must_use]
+pub(crate) fn render_search_table_for_cli(
+    payload: &SearchPayload,
+    duration_ms: Option<u64>,
+    no_color: bool,
+) -> String {
+    let color_enabled = !no_color && should_use_ansi_color();
+    let width = detect_terminal_width();
+    render_search_table_with_options(payload, duration_ms, color_enabled, width)
+}
+
+fn render_search_table_with_options(
+    payload: &SearchPayload,
+    duration_ms: Option<u64>,
+    color_enabled: bool,
+    width: usize,
+) -> String {
     let mut out = String::new();
+    let query_terms = collect_query_terms(&payload.query);
+    let total_ms = duration_ms.unwrap_or(0);
+    let fast_ms = total_ms;
+    let quality_ms = 0_u64;
+    let snippet_width = width.saturating_sub(34).max(32);
     let phase = payload.phase.to_string().to_ascii_uppercase();
+    let phase_label = paint(&phase, "1;34", color_enabled);
     let _ = writeln!(
         out,
-        "PHASE {phase}: {} hit(s) for \"{}\"",
+        "PHASE {phase_label}: {} hit(s) for \"{}\"",
         payload.returned_hits, payload.query
     );
 
     if payload.is_empty() {
-        let _ = writeln!(out, "No results found.");
+        let _ = writeln!(
+            out,
+            "No results for \"{}\". Try broadening your search or checking the index with fsfs status.",
+            payload.query
+        );
+        let _ = writeln!(
+            out,
+            "{} results in {total_ms}ms (fast: {fast_ms}ms, quality: {quality_ms}ms)",
+            payload.returned_hits
+        );
         return out;
     }
 
     for hit in &payload.hits {
-        let _ = write!(out, "{:>3}. {}  score={:.3}", hit.rank, hit.path, hit.score);
+        let (path_text, line_number) = split_path_and_line_number(&hit.path);
+        let path = paint(path_text, "1;36", color_enabled);
+        let line_segment = line_number
+            .map(|line| format!(":{}", paint(line, "32", color_enabled)))
+            .unwrap_or_default();
+        let score = paint(
+            &format!("{:.3}", hit.score),
+            score_color_code(hit.score),
+            color_enabled,
+        );
+        let source_badge = source_badge(hit, color_enabled);
+
+        let _ = write!(
+            out,
+            "{:>3}. {}{}  score={}  {}",
+            hit.rank, path, line_segment, score, source_badge
+        );
+
         if let (Some(lexical_rank), Some(semantic_rank)) = (hit.lexical_rank, hit.semantic_rank) {
             let _ = write!(out, " [L{} S{}]", lexical_rank + 1, semantic_rank + 1);
         }
         let _ = writeln!(out);
         if let Some(snippet) = hit.snippet.as_deref() {
-            let _ = writeln!(out, "     {snippet}");
+            let clipped = truncate_for_width(snippet.trim(), snippet_width);
+            let highlighted = highlight_query_terms(&clipped, &query_terms, color_enabled);
+            let _ = writeln!(out, "     {highlighted}");
         }
     }
 
+    let _ = writeln!(
+        out,
+        "{} results in {total_ms}ms (fast: {fast_ms}ms, quality: {quality_ms}ms)",
+        payload.returned_hits
+    );
     out
+}
+
+fn should_use_ansi_color() -> bool {
+    if env_var_disables_color() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
+fn env_var_disables_color() -> bool {
+    env::var("FRANKENSEARCH_NO_COLOR")
+        .ok()
+        .is_some_and(|value| truthy_env(&value))
+        || env::var("NO_COLOR")
+            .ok()
+            .is_some_and(|value| truthy_env(&value))
+}
+
+fn truthy_env(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    !matches!(trimmed, "0" | "false" | "FALSE" | "False")
+}
+
+fn detect_terminal_width() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 40)
+        .unwrap_or(100)
+}
+
+fn score_color_code(score: f64) -> &'static str {
+    if score >= 0.8 {
+        "32"
+    } else if score >= 0.5 {
+        "33"
+    } else {
+        "31"
+    }
+}
+
+fn paint(text: &str, style: &str, color_enabled: bool) -> String {
+    if color_enabled {
+        format!("\u{1b}[{style}m{text}\u{1b}[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn split_path_and_line_number(path: &str) -> (&str, Option<&str>) {
+    if let Some((left, right)) = path.rsplit_once(':')
+        && !right.is_empty()
+        && right.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return (left, Some(right));
+    }
+    (path, None)
+}
+
+fn source_badge(hit: &SearchHitPayload, color_enabled: bool) -> String {
+    if hit.in_both_sources {
+        return paint("[both]", "1;32", color_enabled);
+    }
+    if hit.lexical_rank.is_some() {
+        return paint("[lexical]", "33", color_enabled);
+    }
+    if hit.semantic_rank.is_some() {
+        return paint("[semantic]", "36", color_enabled);
+    }
+    paint("[unknown]", "90", color_enabled)
+}
+
+fn truncate_for_width(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+fn collect_query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn highlight_query_terms(text: &str, query_terms: &[String], color_enabled: bool) -> String {
+    if query_terms.is_empty() {
+        return text.to_owned();
+    }
+
+    text.split_whitespace()
+        .map(|token| {
+            let token_lower = token.to_ascii_lowercase();
+            if query_terms
+                .iter()
+                .any(|term| token_lower.contains(term.as_str()))
+            {
+                paint(token, "1;33", color_enabled)
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn write_err(source: io::Error) -> SearchError {
@@ -569,7 +749,48 @@ mod tests {
         assert!(output.contains("PHASE INITIAL"));
         assert!(output.contains("1. src/auth.rs"));
         assert!(output.contains("score=0.923"));
+        assert!(output.contains("[both]"));
+        assert!(output.contains("[lexical]"));
         assert!(output.contains("fn authenticate(token: &str) -> bool"));
+        assert!(output.contains("2 results in 0ms (fast: 0ms, quality: 0ms)"));
+    }
+
+    #[test]
+    fn render_search_table_empty_results_shows_guidance() {
+        let payload = SearchPayload::new("auth middleware", SearchOutputPhase::Initial, 0, vec![]);
+        let output = render_search_table_with_options(&payload, Some(19), false, 80);
+        assert!(output.contains("No results for \"auth middleware\"."));
+        assert!(output.contains("checking the index with fsfs status"));
+        assert!(output.contains("0 results in 19ms (fast: 19ms, quality: 0ms)"));
+    }
+
+    #[test]
+    fn render_search_table_uses_ansi_when_color_enabled() {
+        let payload = SearchPayload::new(
+            "auth",
+            SearchOutputPhase::Refined,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/auth.rs:45".to_owned(),
+                score: 0.91,
+                snippet: Some("auth middleware validates bearer token".to_owned()),
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                in_both_sources: true,
+            }],
+        );
+        let output = render_search_table_with_options(&payload, Some(42), true, 80);
+        assert!(output.contains("\u{1b}["));
+        assert!(output.contains("1 results in 42ms (fast: 42ms, quality: 0ms)"));
+    }
+
+    #[test]
+    fn env_var_disables_color_treats_empty_as_true() {
+        assert!(truthy_env(""));
+        assert!(!truthy_env("0"));
+        assert!(!truthy_env("false"));
+        assert!(truthy_env("1"));
     }
 
     #[test]
@@ -774,5 +995,223 @@ mod tests {
             expected_value, line_mode_value,
             "JSON and JSONL decoded values must match"
         );
+    }
+
+    // ─── render_search_table_for_cli ────────────────────────────────────
+
+    fn sample_search_payload() -> SearchPayload {
+        SearchPayload::new(
+            "how does auth work",
+            SearchOutputPhase::Refined,
+            3,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/auth/middleware.rs:45".to_owned(),
+                    score: 0.923,
+                    snippet: Some("JWT validation middleware checks Bearer token".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(1),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "src/auth/login.rs:12".to_owned(),
+                    score: 0.811,
+                    snippet: Some("Login handler with bcrypt password hashing".to_owned()),
+                    lexical_rank: Some(2),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                },
+                SearchHitPayload {
+                    rank: 3,
+                    path: "docs/auth.md".to_owned(),
+                    score: 0.421,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(3),
+                    in_both_sources: false,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn render_search_table_for_cli_no_color_strips_ansi() {
+        let payload = sample_search_payload();
+        let output = render_search_table_for_cli(&payload, Some(42), true);
+        assert!(
+            !output.contains("\u{1b}["),
+            "no_color=true must strip all ANSI escapes: {output}"
+        );
+        assert!(output.contains("REFINED"));
+        assert!(output.contains("src/auth/middleware.rs"));
+        assert!(output.contains("0.923"));
+        assert!(output.contains("3 results in 42ms"));
+    }
+
+    #[test]
+    fn render_search_table_for_cli_includes_source_badges() {
+        let payload = sample_search_payload();
+        let output = render_search_table_for_cli(&payload, Some(10), true);
+        assert!(output.contains("[both]"), "hit in both sources: {output}");
+        assert!(output.contains("[lexical]"), "lexical-only hit: {output}");
+        assert!(output.contains("[semantic]"), "semantic-only hit: {output}");
+    }
+
+    #[test]
+    fn render_search_table_for_cli_shows_score_gradient() {
+        let payload = SearchPayload::new(
+            "test scores",
+            SearchOutputPhase::Initial,
+            3,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "high.rs".to_owned(),
+                    score: 0.923,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "medium.rs".to_owned(),
+                    score: 0.65,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(0),
+                    in_both_sources: false,
+                },
+                SearchHitPayload {
+                    rank: 3,
+                    path: "low.rs".to_owned(),
+                    score: 0.32,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(1),
+                    in_both_sources: false,
+                },
+            ],
+        );
+        let output = render_search_table_with_options(&payload, Some(5), true, 100);
+        // High score (>= 0.8) gets green (code 32)
+        assert!(
+            output.contains("\u{1b}[32m0.923"),
+            "high score should be green: {output}"
+        );
+        // Medium score (>= 0.5 but < 0.8) gets yellow (code 33)
+        assert!(
+            output.contains("\u{1b}[33m0.650"),
+            "medium score should be yellow: {output}"
+        );
+        // Low score (< 0.5) gets red (code 31)
+        assert!(
+            output.contains("\u{1b}[31m0.320"),
+            "low score should be red: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_for_cli_highlights_query_terms_in_snippet() {
+        let payload = SearchPayload::new(
+            "bearer token",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/auth.rs".to_owned(),
+                score: 0.9,
+                snippet: Some("validates bearer token from header".to_owned()),
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                in_both_sources: true,
+            }],
+        );
+        let output = render_search_table_with_options(&payload, Some(5), true, 100);
+        // Query terms "bearer" and "token" should be highlighted with bold yellow
+        assert!(
+            output.contains("\u{1b}[1;33mbearer\u{1b}[0m"),
+            "query term 'bearer' should be highlighted: {output}"
+        );
+        assert!(
+            output.contains("\u{1b}[1;33mtoken\u{1b}[0m"),
+            "query term 'token' should be highlighted: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_for_cli_splits_path_and_line_number() {
+        let payload = SearchPayload::new(
+            "test",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs:42".to_owned(),
+                score: 0.75,
+                snippet: None,
+                lexical_rank: Some(0),
+                semantic_rank: None,
+                in_both_sources: false,
+            }],
+        );
+        let output = render_search_table_with_options(&payload, Some(1), true, 100);
+        // Line number should be separated with green coloring
+        assert!(
+            output.contains("\u{1b}[32m42\u{1b}[0m"),
+            "line number should be green: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_for_cli_empty_shows_guidance() {
+        let payload = SearchPayload::new("obscure query", SearchOutputPhase::Initial, 0, vec![]);
+        let output = render_search_table_for_cli(&payload, Some(3), true);
+        assert!(output.contains("No results for \"obscure query\"."));
+        assert!(output.contains("fsfs status"));
+        assert!(output.contains("0 results in 3ms"));
+    }
+
+    #[test]
+    fn render_search_table_for_cli_truncates_long_snippets() {
+        let long_snippet = "a".repeat(200);
+        let payload = SearchPayload::new(
+            "test",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/long.rs".to_owned(),
+                score: 0.8,
+                snippet: Some(long_snippet),
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                in_both_sources: false,
+            }],
+        );
+        // Narrow width to force truncation (width 60 means snippet_width = max(60-34, 32) = 32)
+        let output = render_search_table_with_options(&payload, Some(1), false, 60);
+        assert!(
+            output.contains('…'),
+            "long snippet should be truncated with ellipsis: {output}"
+        );
+    }
+
+    #[test]
+    fn render_search_table_for_cli_phase_labels_correct() {
+        for (phase, expected) in [
+            (SearchOutputPhase::Initial, "INITIAL"),
+            (SearchOutputPhase::Refined, "REFINED"),
+            (SearchOutputPhase::RefinementFailed, "REFINEMENT_FAILED"),
+        ] {
+            let payload = SearchPayload::new("q", phase, 0, vec![]);
+            let output = render_search_table_for_cli(&payload, Some(1), true);
+            assert!(
+                output.contains(expected),
+                "phase {expected} not found in: {output}"
+            );
+        }
     }
 }

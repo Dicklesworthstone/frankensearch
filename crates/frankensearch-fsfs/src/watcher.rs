@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, warn};
 
@@ -636,6 +637,13 @@ fn process_event_batch(
 }
 
 fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option<WatchIngestOp> {
+    let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
+    let file_key = normalize_file_key(&event.path);
+
+    if matches!(event.kind, WatchEventKind::Deleted) {
+        return Some(WatchIngestOp::Delete { file_key, revision });
+    }
+
     let byte_len = event.byte_len.unwrap_or(0);
     let mut candidate =
         DiscoveryCandidate::new(&event.path, byte_len).with_symlink(event.is_symlink);
@@ -650,47 +658,27 @@ fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option
         return None;
     }
 
-    let revision = i64::try_from(event.observed_at_ms).unwrap_or(i64::MAX);
-    let file_key = normalize_file_key(&event.path);
-    match event.kind {
-        WatchEventKind::Deleted => Some(WatchIngestOp::Delete { file_key, revision }),
-        WatchEventKind::Created | WatchEventKind::Modified => Some(WatchIngestOp::Upsert {
-            file_key,
-            revision,
-            ingestion_class: decision.ingestion_class,
-        }),
-    }
+    Some(WatchIngestOp::Upsert {
+        file_key,
+        revision,
+        ingestion_class: decision.ingestion_class,
+    })
 }
 
 fn map_notify_event(event: Event) -> Vec<WatchEvent> {
     let Event { kind, paths, .. } = event;
+    let observed_at_ms = now_millis();
+    if let EventKind::Modify(ModifyKind::Name(mode)) = kind {
+        return map_rename_notify_event(paths, mode, observed_at_ms);
+    }
+
     let Some(kind) = map_notify_kind(kind) else {
         return Vec::new();
     };
 
-    let observed_at_ms = now_millis();
     paths
         .into_iter()
-        .map(|path| {
-            let metadata = if matches!(kind, WatchEventKind::Deleted) {
-                None
-            } else {
-                fs::symlink_metadata(&path).ok()
-            };
-            let byte_len = metadata.as_ref().map(std::fs::Metadata::len);
-            let is_symlink = metadata
-                .as_ref()
-                .is_some_and(|meta| meta.file_type().is_symlink());
-
-            WatchEvent {
-                path,
-                kind,
-                observed_at_ms,
-                byte_len,
-                is_symlink,
-                mount_category: None,
-            }
-        })
+        .map(|path| build_watch_event(path, kind, observed_at_ms))
         .collect()
 }
 
@@ -700,6 +688,75 @@ const fn map_notify_kind(kind: EventKind) -> Option<WatchEventKind> {
         EventKind::Modify(_) => Some(WatchEventKind::Modified),
         EventKind::Remove(_) => Some(WatchEventKind::Deleted),
         _ => None,
+    }
+}
+
+fn map_rename_notify_event(
+    paths: Vec<PathBuf>,
+    mode: RenameMode,
+    observed_at_ms: u64,
+) -> Vec<WatchEvent> {
+    match mode {
+        RenameMode::Both => {
+            let mut events = Vec::with_capacity(2);
+            if let Some(from) = paths.first() {
+                events.push(build_watch_event(
+                    from.clone(),
+                    WatchEventKind::Deleted,
+                    observed_at_ms,
+                ));
+            }
+            // Use get(1) — not last() — to reliably pick the destination
+            // path even if the event carries more than two entries.
+            if let Some(to) = paths.get(1) {
+                events.push(build_watch_event(
+                    to.clone(),
+                    WatchEventKind::Created,
+                    observed_at_ms,
+                ));
+            }
+            events
+        }
+        RenameMode::From => paths
+            .into_iter()
+            .map(|path| build_watch_event(path, WatchEventKind::Deleted, observed_at_ms))
+            .collect(),
+        RenameMode::To => paths
+            .into_iter()
+            .map(|path| build_watch_event(path, WatchEventKind::Created, observed_at_ms))
+            .collect(),
+        RenameMode::Any | RenameMode::Other => paths
+            .into_iter()
+            .map(|path| {
+                let kind = if fs::symlink_metadata(&path).is_ok() {
+                    WatchEventKind::Created
+                } else {
+                    WatchEventKind::Deleted
+                };
+                build_watch_event(path, kind, observed_at_ms)
+            })
+            .collect(),
+    }
+}
+
+fn build_watch_event(path: PathBuf, kind: WatchEventKind, observed_at_ms: u64) -> WatchEvent {
+    let metadata = if matches!(kind, WatchEventKind::Deleted) {
+        None
+    } else {
+        fs::symlink_metadata(&path).ok()
+    };
+    let byte_len = metadata.as_ref().map(std::fs::Metadata::len);
+    let is_symlink = metadata
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_symlink());
+
+    WatchEvent {
+        path,
+        kind,
+        observed_at_ms,
+        byte_len,
+        is_symlink,
+        mount_category: None,
     }
 }
 
@@ -900,12 +957,14 @@ mod tests {
     use super::{
         DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
         PendingEvents, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestOp,
-        WatchIngestPipeline, WatcherExecutionPolicy, now_millis,
+        WatchIngestPipeline, WatcherExecutionPolicy, normalize_file_key, now_millis,
     };
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::SearchResult;
+    use notify::event::{ModifyKind, RenameMode};
+    use notify::{Event, EventKind};
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -1153,6 +1212,161 @@ mod tests {
         let ops = pipeline.all_ops();
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+    }
+
+    #[test]
+    fn deleted_event_for_excluded_path_still_emits_delete_operation() {
+        let pipeline = Arc::new(RecordingPipeline::default());
+        let watcher = FsWatcher::new(
+            vec![PathBuf::from("/tmp/repo")],
+            DiscoveryConfig::default(),
+            pipeline.clone(),
+        );
+
+        let event = WatchEvent::deleted("/tmp/repo/node_modules/pkg/index.js", 7_777);
+        let outcome = watcher
+            .process_events_now(&[event])
+            .expect("delete for excluded path");
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.reindexed, 1);
+        assert_eq!(outcome.skipped, 0);
+
+        let ops = pipeline.all_ops();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], WatchIngestOp::Delete { .. }));
+    }
+
+    #[test]
+    fn rename_notify_event_maps_to_delete_then_create() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/tmp/repo/src/old.rs"))
+            .add_path(PathBuf::from("/tmp/repo/src/new.rs"));
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].kind, WatchEventKind::Deleted);
+        assert_eq!(mapped[0].path, PathBuf::from("/tmp/repo/src/old.rs"));
+        assert_eq!(mapped[1].kind, WatchEventKind::Created);
+        assert_eq!(mapped[1].path, PathBuf::from("/tmp/repo/src/new.rs"));
+    }
+
+    #[test]
+    fn rename_notify_event_from_maps_to_delete() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(PathBuf::from("/tmp/repo/src/old.rs"));
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].kind, WatchEventKind::Deleted);
+        assert_eq!(mapped[0].path, PathBuf::from("/tmp/repo/src/old.rs"));
+    }
+
+    #[test]
+    fn rename_notify_event_to_maps_to_create() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path(PathBuf::from("/tmp/repo/src/new.rs"));
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].kind, WatchEventKind::Created);
+        assert_eq!(mapped[0].path, PathBuf::from("/tmp/repo/src/new.rs"));
+    }
+
+    #[test]
+    fn rename_notify_event_preserves_delete_then_upsert_ingest_mapping() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+
+        let old_path = src_dir.join("old.rs");
+        let new_path = src_dir.join("new.rs");
+        fs::write(&new_path, "fn renamed_symbol() {}\n").expect("write new path");
+
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old_path.clone())
+            .add_path(new_path.clone());
+        let mapped = super::map_notify_event(event);
+
+        let pipeline = Arc::new(RecordingPipeline::default());
+        let watcher = FsWatcher::new(vec![root], DiscoveryConfig::default(), pipeline.clone());
+        let outcome = watcher.process_events_now(&mapped).expect("process rename mapping");
+        assert_eq!(outcome.accepted, 2);
+        assert_eq!(outcome.reindexed, 2);
+        assert_eq!(outcome.skipped, 0);
+
+        let ops = pipeline.all_ops();
+        assert_eq!(ops.len(), 2);
+        assert!(
+            matches!(
+                &ops[0],
+                WatchIngestOp::Delete { file_key, .. }
+                    if file_key == &normalize_file_key(&old_path)
+            ),
+            "rename old path should map to delete op"
+        );
+        assert!(
+            matches!(
+                &ops[1],
+                WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&new_path)
+            ),
+            "rename new path should map to upsert op"
+        );
+    }
+
+    #[test]
+    fn rename_both_single_path_emits_only_delete() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/tmp/repo/src/only.rs"));
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 1, "single-path Both should produce delete only");
+        assert_eq!(mapped[0].kind, WatchEventKind::Deleted);
+        assert_eq!(mapped[0].path, PathBuf::from("/tmp/repo/src/only.rs"));
+    }
+
+    #[test]
+    fn rename_any_existing_file_maps_to_created() {
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("exists.rs");
+        fs::write(&file, "fn main() {}\n").expect("write");
+
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+            .add_path(file.clone());
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].kind, WatchEventKind::Created);
+        assert_eq!(mapped[0].path, file);
+    }
+
+    #[test]
+    fn rename_any_missing_file_maps_to_deleted() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+            .add_path(PathBuf::from("/tmp/nonexistent_rename_target_98765.rs"));
+
+        let mapped = super::map_notify_event(event);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].kind, WatchEventKind::Deleted);
+    }
+
+    #[test]
+    fn rename_events_survive_debounce_independently() {
+        let mut pending = PendingEvents::default();
+        let old_path = PathBuf::from("/tmp/repo/src/old.rs");
+        let new_path = PathBuf::from("/tmp/repo/src/new.rs");
+
+        // Simulate rename: delete old, create new — distinct paths, no coalescing.
+        pending.push(WatchEvent::deleted(old_path, 100));
+        pending.push(WatchEvent::created(new_path, 100, Some(42)));
+
+        let ready = pending.drain_ready(700, 500, 10);
+        assert_eq!(ready.len(), 2, "both rename events should drain independently");
+
+        let kinds: Vec<_> = ready.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&WatchEventKind::Deleted));
+        assert!(kinds.contains(&WatchEventKind::Created));
     }
 
     #[test]

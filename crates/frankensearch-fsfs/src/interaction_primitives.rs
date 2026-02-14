@@ -1011,6 +1011,18 @@ impl VirtualizedListState {
         }
     }
 
+    /// Select an explicit row index and clamp to bounds.
+    pub fn select_index(&mut self, index: usize) {
+        if self.total_items == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+
+        self.selected = index.min(self.total_items - 1);
+        self.ensure_visible();
+    }
+
     /// Page down (move by viewport height).
     pub fn page_down(&mut self) {
         if self.total_items == 0 {
@@ -1125,8 +1137,19 @@ impl SearchInteractionState {
 
     /// Replace result rows and synchronize virtualization bounds.
     pub fn set_results(&mut self, results: Vec<SearchResultEntry>) {
+        let selected_doc_id = self.selected_result().map(|entry| entry.doc_id.clone());
         self.results = results;
         self.list.set_total_items(self.results.len());
+
+        if let Some(selected_doc_id) = selected_doc_id {
+            if let Some(selected_index) = self
+                .results
+                .iter()
+                .position(|entry| entry.doc_id == selected_doc_id)
+            {
+                self.list.select_index(selected_index);
+            }
+        }
     }
 
     /// Current visible window as `[start, end)` over `results`.
@@ -2309,6 +2332,29 @@ mod tests {
         assert_eq!(list.selected, 0);
     }
 
+    #[test]
+    fn virtualized_list_select_index_clamps_and_keeps_visible() {
+        let mut list = VirtualizedListState {
+            total_items: 8,
+            selected: 0,
+            scroll_offset: 0,
+            viewport_height: 3,
+        };
+
+        list.select_index(5);
+        assert_eq!(list.selected, 5);
+        assert_eq!(list.scroll_offset, 3);
+
+        list.select_index(999);
+        assert_eq!(list.selected, 7);
+        assert_eq!(list.scroll_offset, 5);
+
+        list.set_total_items(0);
+        list.select_index(4);
+        assert_eq!(list.selected, 0);
+        assert_eq!(list.scroll_offset, 0);
+    }
+
     // -- SearchInteractionState --
 
     #[test]
@@ -2402,6 +2448,63 @@ mod tests {
         assert_eq!(
             state.selected_result().map(|row| row.doc_id.as_str()),
             Some("doc-3")
+        );
+    }
+
+    #[test]
+    fn search_interaction_set_results_preserves_selected_doc_on_reorder() {
+        let mut state = SearchInteractionState::new(2);
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/one.rs", "one"),
+            SearchResultEntry::new("doc-2", "src/two.rs", "two"),
+            SearchResultEntry::new("doc-3", "src/three.rs", "three"),
+            SearchResultEntry::new("doc-4", "src/four.rs", "four"),
+        ]);
+
+        state.apply_action(&ScreenAction::PageDown);
+        assert_eq!(
+            state.selected_result().map(|row| row.doc_id.as_str()),
+            Some("doc-3")
+        );
+
+        state.set_results(vec![
+            SearchResultEntry::new("doc-3", "src/three.rs", "three"),
+            SearchResultEntry::new("doc-4", "src/four.rs", "four"),
+            SearchResultEntry::new("doc-1", "src/one.rs", "one"),
+            SearchResultEntry::new("doc-2", "src/two.rs", "two"),
+        ]);
+
+        assert_eq!(state.list.selected, 0);
+        assert_eq!(state.visible_window(), (0, 2));
+        assert_eq!(
+            state.selected_result().map(|row| row.doc_id.as_str()),
+            Some("doc-3")
+        );
+    }
+
+    #[test]
+    fn search_interaction_set_results_clamps_when_selected_doc_is_removed() {
+        let mut state = SearchInteractionState::new(2);
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/one.rs", "one"),
+            SearchResultEntry::new("doc-2", "src/two.rs", "two"),
+            SearchResultEntry::new("doc-3", "src/three.rs", "three"),
+            SearchResultEntry::new("doc-4", "src/four.rs", "four"),
+        ]);
+
+        state.apply_action(&ScreenAction::PageDown);
+        assert_eq!(state.list.selected, 2);
+
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/one.rs", "one"),
+            SearchResultEntry::new("doc-2", "src/two.rs", "two"),
+        ]);
+
+        assert_eq!(state.list.selected, 1);
+        assert_eq!(state.visible_window(), (0, 2));
+        assert_eq!(
+            state.selected_result().map(|row| row.doc_id.as_str()),
+            Some("doc-2")
         );
     }
 

@@ -14,7 +14,7 @@ use frankensearch_fsfs::{
     detect_auto_mode, emit_config_loaded, emit_envelope, exit_code, init_subscriber,
     is_cache_valid, load_from_layered_sources, load_from_sources, load_from_str,
     maybe_print_update_notice, meta_for_format, parse_cli_args, read_version_cache,
-    spawn_version_cache_refresh,
+    resolve_output_format, spawn_version_cache_refresh,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -138,6 +138,11 @@ fn main() -> SearchResult<()> {
 
     let mut runtime_cli_input = cli_input;
     runtime_cli_input.command = command;
+    runtime_cli_input.format = resolve_output_format(
+        runtime_cli_input.format,
+        runtime_cli_input.format_explicit,
+        is_tty,
+    );
     if command == CliCommand::Config {
         return run_config_command(
             &loaded,
@@ -201,13 +206,12 @@ fn main() -> SearchResult<()> {
     let updates_disabled = env_map
         .get("FRANKENSEARCH_CHECK_UPDATES")
         .or_else(|| env_map.get("FSFS_CHECK_UPDATES"))
-        .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"));
+        .is_some_and(|v| {
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no")
+        });
 
-    if !updates_disabled
-        && !cli_quiet
-        && command != CliCommand::Update
-    {
-        maybe_print_update_notice(false);
+    if !updates_disabled && !cli_quiet && command != CliCommand::Update {
+        let _ = maybe_print_update_notice(false);
         // If cache is expired or missing, refresh in background.
         let needs_refresh = read_version_cache()
             .as_ref()

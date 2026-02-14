@@ -36,7 +36,7 @@ pub mod watcher;
 
 pub use adapters::cli::{
     CliCommand, CliInput, CommandSource, CompletionShell, ConfigAction, OutputFormat,
-    detect_auto_mode, exit_code, parse_cli_args,
+    detect_auto_mode, exit_code, parse_cli_args, resolve_output_format,
 };
 pub use adapters::format_emitter::{
     emit_envelope, emit_envelope_string, emit_stream_frame, emit_stream_frame_string,

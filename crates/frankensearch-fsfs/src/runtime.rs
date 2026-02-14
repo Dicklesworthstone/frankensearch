@@ -52,7 +52,7 @@ use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
     terminal_event_completed, terminal_event_from_error,
 };
-use crate::watcher::{FsWatcher, NoopWatchIngestPipeline};
+use crate::watcher::{FsWatcher, WatchIngestOp, WatchIngestPipeline};
 
 /// Supported fsfs interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +214,159 @@ struct IndexSentinel {
     skipped_files: usize,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+}
+
+/// Live ingest pipeline that re-indexes changed files detected by the watcher.
+///
+/// Reads file content, canonicalizes, embeds, and updates both the lexical
+/// (Tantivy) and semantic (FSVI) indexes incrementally.
+struct LiveIngestPipeline {
+    target_root: PathBuf,
+    lexical_index: TantivyIndex,
+    vector_index: std::sync::Mutex<VectorIndex>,
+    embedder: Arc<dyn Embedder>,
+    canonicalizer: DefaultCanonicalizer,
+}
+
+impl WatchIngestPipeline for LiveIngestPipeline {
+    fn apply_batch(&self, batch: &[WatchIngestOp]) -> frankensearch_core::SearchResult<usize> {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "watcher.ingest",
+                source: Box::new(std::io::Error::other(format!(
+                    "failed to create ingest runtime: {error}"
+                ))),
+            })?;
+        let cx = Cx::for_request();
+        rt.block_on(self.apply_batch_inner(&cx, batch))
+    }
+}
+
+impl LiveIngestPipeline {
+    fn new(
+        target_root: PathBuf,
+        lexical_index: TantivyIndex,
+        vector_index: VectorIndex,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
+        Self {
+            target_root,
+            lexical_index,
+            vector_index: std::sync::Mutex::new(vector_index),
+            embedder,
+            canonicalizer: DefaultCanonicalizer::default(),
+        }
+    }
+
+    async fn apply_batch_inner(
+        &self,
+        cx: &Cx,
+        batch: &[WatchIngestOp],
+    ) -> frankensearch_core::SearchResult<usize> {
+        let mut count = 0_usize;
+
+        for op in batch {
+            match op {
+                WatchIngestOp::Upsert { file_key, .. } => {
+                    let abs_path = if Path::new(file_key).is_absolute() {
+                        PathBuf::from(file_key)
+                    } else {
+                        self.target_root.join(file_key)
+                    };
+                    let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
+
+                    let bytes = match fs::read(&abs_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == ErrorKind::NotFound => {
+                            self.lexical_index.delete_document(&rel_key)?;
+                            {
+                                let mut vi = self
+                                    .vector_index
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let _ = vi.soft_delete(&rel_key).ok();
+                            }
+                            count = count.saturating_add(1);
+                            continue;
+                        }
+                        Err(error) if is_ignorable_index_walk_error(&error) => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+
+                    if is_probably_binary(&bytes) {
+                        continue;
+                    }
+
+                    let raw_text = String::from_utf8_lossy(&bytes);
+                    let canonical = self.canonicalizer.canonicalize(&raw_text);
+                    if canonical.trim().is_empty() {
+                        continue;
+                    }
+
+                    let file_name = abs_path
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let doc = IndexableDocument::new(rel_key.clone(), canonical.clone())
+                        .with_title(file_name);
+
+                    self.lexical_index.index_document(cx, &doc).await?;
+
+                    match self.embedder.embed(cx, &canonical).await {
+                        Ok(embedding) => {
+                            let mut vi = self
+                                .vector_index
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = vi.soft_delete(&rel_key).ok();
+                            vi.append(&rel_key, &embedding)?;
+                        }
+                        Err(error) => {
+                            warn!(
+                                file_key = %rel_key,
+                                error = %error,
+                                "watcher ingest: embedding failed; lexical-only for this file"
+                            );
+                        }
+                    }
+
+                    count = count.saturating_add(1);
+                }
+                WatchIngestOp::Delete { file_key, .. } => {
+                    let abs_path = if Path::new(file_key).is_absolute() {
+                        PathBuf::from(file_key)
+                    } else {
+                        self.target_root.join(file_key)
+                    };
+                    let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
+
+                    self.lexical_index.delete_document(&rel_key)?;
+                    {
+                        let mut vi = self
+                            .vector_index
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let _ = vi.soft_delete(&rel_key).ok();
+                    }
+
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+
+        if count > 0 {
+            self.lexical_index.commit(cx).await?;
+            info!(
+                batch_size = batch.len(),
+                reindexed = count,
+                "watcher ingest batch committed"
+            );
+        }
+
+        Ok(count)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -407,9 +560,7 @@ const GITHUB_REPO: &str = "frankensearch";
 /// Fetch the latest release tag from GitHub Releases via `curl`.
 /// Returns `(tag_name, html_url)` on success.
 fn fetch_latest_release_tag() -> SearchResult<(String, String)> {
-    let url = format!(
-        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
 
     let output = std::process::Command::new("curl")
         .args([
@@ -564,16 +715,18 @@ pub struct VersionCheckCache {
     pub ttl_seconds: u64,
 }
 
-fn default_ttl() -> u64 {
+const fn default_ttl() -> u64 {
     VERSION_CACHE_TTL_SECS
 }
 
 /// Resolve the path to the version-check cache file.
+#[must_use]
 pub fn version_cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("frankensearch").join("version_check.json"))
 }
 
 /// Read the version cache from disk. Returns `None` if missing or unreadable.
+#[must_use]
 pub fn read_version_cache() -> Option<VersionCheckCache> {
     let path = version_cache_path()?;
     let content = fs::read_to_string(&path).ok()?;
@@ -581,6 +734,10 @@ pub fn read_version_cache() -> Option<VersionCheckCache> {
 }
 
 /// Write the version cache to disk.
+///
+/// # Errors
+///
+/// Returns `SearchError` if the cache directory or file cannot be written.
 pub fn write_version_cache(cache: &VersionCheckCache) -> SearchResult<()> {
     let path = version_cache_path().ok_or_else(|| SearchError::InvalidConfig {
         field: "version_cache.path".into(),
@@ -612,6 +769,7 @@ fn epoch_now() -> u64 {
 }
 
 /// Check if the cache is still valid (not expired and matches current version).
+#[must_use]
 pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
     let elapsed = epoch_now().saturating_sub(cache.checked_at_epoch);
     elapsed < cache.ttl_seconds && cache.current_version == env!("CARGO_PKG_VERSION")
@@ -619,6 +777,10 @@ pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
 
 /// Refresh the version cache by querying GitHub. Writes the result to disk.
 /// Returns the refreshed cache on success.
+///
+/// # Errors
+///
+/// Returns `SearchError` if the GitHub API call or cache write fails.
 pub fn refresh_version_cache() -> SearchResult<VersionCheckCache> {
     let (tag, html_url) = fetch_latest_release_tag()?;
     let cache = VersionCheckCache {
@@ -638,6 +800,7 @@ pub fn refresh_version_cache() -> SearchResult<VersionCheckCache> {
 /// silently does nothing (the background refresh will populate it for next time).
 ///
 /// Returns `true` if a notice was printed.
+#[must_use]
 pub fn maybe_print_update_notice(quiet: bool) -> bool {
     if quiet {
         return false;
@@ -657,9 +820,7 @@ pub fn maybe_print_update_notice(quiet: bool) -> bool {
     if !latest.is_newer_than(current) {
         return false;
     }
-    eprintln!(
-        "Update available: v{current} \u{2192} v{latest} (run `fsfs update`)"
-    );
+    eprintln!("Update available: v{current} \u{2192} v{latest} (run `fsfs update`)");
     true
 }
 
@@ -696,16 +857,19 @@ pub struct RollbackManifest {
 }
 
 /// Resolve the backup directory path.
+#[must_use]
 pub fn backup_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("frankensearch").join("backups"))
 }
 
 /// Resolve the rollback manifest path.
+#[must_use]
 pub fn rollback_manifest_path() -> Option<PathBuf> {
     backup_dir().map(|d| d.join("rollback-manifest.json"))
 }
 
 /// Read the rollback manifest from disk.
+#[must_use]
 pub fn read_rollback_manifest() -> RollbackManifest {
     let Some(path) = rollback_manifest_path() else {
         return RollbackManifest::default();
@@ -717,6 +881,10 @@ pub fn read_rollback_manifest() -> RollbackManifest {
 }
 
 /// Write the rollback manifest to disk.
+///
+/// # Errors
+///
+/// Returns `SearchError` if the manifest directory or file cannot be written.
 pub fn write_rollback_manifest(manifest: &RollbackManifest) -> SearchResult<()> {
     let path = rollback_manifest_path().ok_or_else(|| SearchError::InvalidConfig {
         field: "backup.manifest_path".into(),
@@ -744,6 +912,10 @@ pub fn write_rollback_manifest(manifest: &RollbackManifest) -> SearchResult<()> 
 ///
 /// Returns the backup entry on success. On failure (e.g. disk full), returns
 /// an error but the caller may choose to proceed without backup.
+///
+/// # Errors
+///
+/// Returns `SearchError` if the backup directory or file operations fail.
 pub fn create_backup(current_exe: &Path) -> SearchResult<BackupEntry> {
     let dir = backup_dir().ok_or_else(|| SearchError::InvalidConfig {
         field: "backup.dir".into(),
@@ -807,6 +979,10 @@ fn prune_backups(manifest: &mut RollbackManifest, backup_directory: &Path) {
 }
 
 /// Restore a backup. If `target_version` is `None`, restores the most recent backup.
+///
+/// # Errors
+///
+/// Returns `SearchError` if no backups exist or the restore operation fails.
 pub fn restore_backup(target_version: Option<&str>) -> SearchResult<BackupEntry> {
     let dir = backup_dir().ok_or_else(|| SearchError::InvalidConfig {
         field: "backup.dir".into(),
@@ -843,11 +1019,14 @@ pub fn restore_backup(target_version: Option<&str>) -> SearchResult<BackupEntry>
             })?
     } else {
         // Most recent backup (already sorted newest-first by prune).
-        manifest.entries.first().ok_or_else(|| SearchError::InvalidConfig {
-            field: "backup.entries".into(),
-            value: String::new(),
-            reason: "no backups available".into(),
-        })?
+        manifest
+            .entries
+            .first()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "backup.entries".into(),
+                value: String::new(),
+                reason: "no backups available".into(),
+            })?
     };
 
     let backup_path = dir.join(&entry.binary_filename);
@@ -892,6 +1071,7 @@ pub fn restore_backup(target_version: Option<&str>) -> SearchResult<BackupEntry>
 }
 
 /// List available backups for display.
+#[must_use]
 pub fn list_backups() -> Vec<BackupEntry> {
     read_rollback_manifest().entries
 }
@@ -1675,10 +1855,7 @@ impl FsfsRuntime {
         match verify {
             Ok(out) if out.status.success() => {
                 let version_out = String::from_utf8_lossy(&out.stdout);
-                notes.push(format!(
-                    "verified new binary: {}",
-                    version_out.trim()
-                ));
+                notes.push(format!("verified new binary: {}", version_out.trim()));
                 // Remove transient backup on success.
                 let _ = fs::remove_file(&transient_backup);
             }
@@ -2214,6 +2391,16 @@ impl FsfsRuntime {
             elapsed_ms,
             "fsfs search command completed"
         );
+
+        if self.cli_input.format == OutputFormat::Table {
+            let table = crate::adapters::format_emitter::render_search_table_for_cli(
+                &payload,
+                Some(elapsed_ms),
+                self.cli_input.no_color,
+            );
+            print!("{table}");
+            return Ok(());
+        }
 
         let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
         let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
@@ -3758,6 +3945,33 @@ impl FsfsRuntime {
         Ok(stack.fast_arc())
     }
 
+    /// Build a live ingest pipeline for the watcher by opening existing indexes.
+    fn build_live_ingest_pipeline(&self) -> SearchResult<LiveIngestPipeline> {
+        let target_root = self.resolve_target_root()?;
+        let index_root = self.resolve_index_root(&target_root)?;
+
+        let lexical_path = index_root.join("lexical");
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        let lexical_index = TantivyIndex::create(&lexical_path)?;
+        let vector_index = VectorIndex::open(&vector_path)?;
+        let embedder = self.resolve_fast_embedder()?;
+
+        info!(
+            target_root = %target_root.display(),
+            index_root = %index_root.display(),
+            embedder = embedder.id(),
+            "live ingest pipeline initialized for watch mode"
+        );
+
+        Ok(LiveIngestPipeline::new(
+            target_root,
+            lexical_index,
+            vector_index,
+            embedder,
+        ))
+    }
+
     fn collect_index_candidates(
         &self,
         target_root: &Path,
@@ -3952,30 +4166,52 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         self.run_cli(cx).await?;
 
-        if self.config.indexing.watch_mode {
-            let watcher = FsWatcher::from_config(&self.config, Arc::new(NoopWatchIngestPipeline));
-            watcher.start(cx).await?;
-            let policy = watcher.execution_policy();
-            let storage_paths = self.default_index_storage_paths();
-            let lifecycle_tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
-            info!(
-                watch_roots = watcher.roots().len(),
-                debounce_ms = policy.debounce_ms,
-                batch_size = policy.batch_size,
-                disk_budget_bytes = lifecycle_tracker.resource_limits().max_index_bytes,
-                "fsfs watch mode enabled; watcher started"
+        let watch_enabled_for_command = self.config.indexing.watch_mode
+            && matches!(
+                self.cli_input.command,
+                CliCommand::Index | CliCommand::Watch
             );
 
-            let reason = self
-                .await_shutdown(
-                    cx,
-                    shutdown,
-                    Some(&watcher),
-                    Some((&lifecycle_tracker, &storage_paths)),
-                )
-                .await;
-            watcher.stop().await;
-            self.finalize_shutdown(cx, reason).await?;
+        if watch_enabled_for_command {
+            match self.build_live_ingest_pipeline() {
+                Ok(pipeline) => {
+                    let target_root = self.resolve_target_root()?;
+                    let watcher = FsWatcher::new(
+                        vec![target_root],
+                        self.config.discovery.clone(),
+                        Arc::new(pipeline),
+                    );
+                    watcher.start(cx).await?;
+                    let policy = watcher.execution_policy();
+                    let storage_paths = self.default_index_storage_paths();
+                    let lifecycle_tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
+                    info!(
+                        watch_roots = watcher.roots().len(),
+                        debounce_ms = policy.debounce_ms,
+                        batch_size = policy.batch_size,
+                        disk_budget_bytes = lifecycle_tracker.resource_limits().max_index_bytes,
+                        "fsfs watch mode enabled; watcher started"
+                    );
+
+                    let reason = self
+                        .await_shutdown(
+                            cx,
+                            shutdown,
+                            Some(&watcher),
+                            Some((&lifecycle_tracker, &storage_paths)),
+                        )
+                        .await;
+                    watcher.stop().await;
+                    self.finalize_shutdown(cx, reason).await?;
+                }
+                Err(ref error) if matches!(error, SearchError::IndexNotFound { .. }) => {
+                    warn!(
+                        error = %error,
+                        "watch mode skipped: no existing index found; run 'fsfs index' first"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(())
@@ -4767,12 +5003,13 @@ mod tests {
     use std::time::Duration;
 
     use asupersync::test_utils::run_test_with_cx;
-    use frankensearch_core::LexicalSearch;
+    use frankensearch_core::{IndexableDocument, LexicalSearch};
+    use frankensearch_embed::HashEmbedder;
     use frankensearch_index::VectorIndex;
     use frankensearch_lexical::TantivyIndex;
 
     use super::{
-        EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode,
+        EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
         VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
         degradation_controller_config_for_profile,
     };
@@ -4793,6 +5030,7 @@ mod tests {
         StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
         decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
+    use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
 
     #[test]
     fn runtime_modes_are_callable() {
@@ -5192,14 +5430,24 @@ mod tests {
     #[test]
     fn watch_mode_waits_for_shutdown_and_exits() {
         run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            fs::write(project.join("src/lib.rs"), "watch me\n").expect("seed file");
+
             let mut config = FsfsConfig::default();
             config.indexing.watch_mode = true;
-            let runtime = FsfsRuntime::new(config);
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(project.clone()),
+                watch: true,
+                ..CliInput::default()
+            });
             let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
 
             let trigger: Arc<ShutdownCoordinator> = Arc::clone(&coordinator);
             let worker = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(30));
+                thread::sleep(Duration::from_millis(120));
                 trigger.request_shutdown(ShutdownReason::UserRequest);
             });
 
@@ -5209,6 +5457,65 @@ mod tests {
                 .expect("watch mode with shutdown");
 
             worker.join().expect("shutdown trigger thread join");
+        });
+    }
+
+    #[test]
+    fn live_ingest_upsert_missing_file_deletes_stale_document() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(&target_root).expect("target root");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer
+                .write_record("src/ghost.rs", &vec![0.0_f32; 256])
+                .expect("seed vector record");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let stale_doc = IndexableDocument::new(
+                "src/ghost.rs".to_owned(),
+                "stale lexical content".to_owned(),
+            );
+            lexical_index
+                .index_document(&cx, &stale_doc)
+                .await
+                .expect("seed lexical doc");
+            lexical_index
+                .commit(&cx)
+                .await
+                .expect("commit seed lexical doc");
+
+            let pipeline = LiveIngestPipeline::new(
+                target_root.clone(),
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let missing_path = target_root.join("src/ghost.rs");
+            let applied = pipeline
+                .apply_batch(&[WatchIngestOp::Upsert {
+                    file_key: missing_path.display().to_string(),
+                    revision: 42,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                }])
+                .expect("upsert missing file should be treated as delete");
+
+            assert_eq!(applied, 1);
+            let hits = pipeline
+                .lexical_index
+                .search(&cx, "stale", 5)
+                .await
+                .expect("lexical search after delete");
+            assert!(hits.is_empty(), "stale lexical doc should be removed");
         });
     }
 
@@ -6529,10 +6836,10 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
 
         let mut manifest = super::RollbackManifest {
-            entries: (0..5)
+            entries: (0u64..5)
                 .map(|i| super::BackupEntry {
                     version: format!("0.{i}.0"),
-                    backed_up_at_epoch: i as u64 * 100,
+                    backed_up_at_epoch: i * 100,
                     original_path: "/bin/fsfs".into(),
                     binary_filename: format!("fsfs-0.{i}.0"),
                     sha256: String::new(),
@@ -6667,7 +6974,7 @@ mod tests {
         let expired_cache = super::VersionCheckCache {
             checked_at_epoch: super::epoch_now() - 2,
             ttl_seconds: 1,
-            ..cache.clone()
+            ..cache
         };
         assert!(!super::is_cache_valid(&expired_cache));
     }
@@ -6699,13 +7006,13 @@ mod tests {
 
         // Create 4 backup files + entries. After pruning, oldest should be gone.
         let mut manifest = super::RollbackManifest {
-            entries: (0..4)
+            entries: (0u64..4)
                 .map(|i| {
                     let filename = format!("fsfs-prune-test-{i}");
                     fs::write(dir.join(&filename), b"binary").unwrap();
                     super::BackupEntry {
                         version: format!("0.{i}.0"),
-                        backed_up_at_epoch: (i + 1) as u64 * 1000,
+                        backed_up_at_epoch: (i + 1) * 1000,
                         original_path: "/bin/fsfs".into(),
                         binary_filename: filename,
                         sha256: String::new(),

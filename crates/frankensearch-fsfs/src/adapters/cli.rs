@@ -181,6 +181,8 @@ pub struct CliInput {
     pub overrides: CliOverrides,
     /// Output format (default: table).
     pub format: OutputFormat,
+    /// Whether output format was explicitly set by `--format`/`-f`.
+    pub format_explicit: bool,
     /// Search query text (for search command).
     pub query: Option<String>,
     /// Optional target path for index/watch.
@@ -264,6 +266,25 @@ pub const fn detect_auto_mode(
             None // Pipe without subcommand — show help.
         }
         _ => Some(command),
+    }
+}
+
+/// Resolve the effective output format using terminal awareness.
+///
+/// Contract:
+/// - explicit `--format` always wins
+/// - implicit default on TTY stays `table`
+/// - implicit default on non-TTY switches to `jsonl`
+#[must_use]
+pub const fn resolve_output_format(
+    format: OutputFormat,
+    format_explicit: bool,
+    is_tty: bool,
+) -> OutputFormat {
+    if !format_explicit && matches!(format, OutputFormat::Table) && !is_tty {
+        OutputFormat::Jsonl
+    } else {
+        format
     }
 }
 
@@ -384,6 +405,7 @@ where
                         value: value.into(),
                         reason: "expected table|json|csv|jsonl|toon".into(),
                     })?;
+                input.format_explicit = true;
                 idx += 2;
             }
             "--fast-only" => {
@@ -984,9 +1006,11 @@ mod tests {
     fn parse_output_format() {
         let input = parse_cli_args(["status", "--format", "json"]).unwrap();
         assert_eq!(input.format, OutputFormat::Json);
+        assert!(input.format_explicit);
 
         let toon = parse_cli_args(["status", "--format", "toon"]).unwrap();
         assert_eq!(toon.format, OutputFormat::Toon);
+        assert!(toon.format_explicit);
     }
 
     #[test]
@@ -1002,6 +1026,7 @@ mod tests {
         let input = parse_cli_args(["search", "test", "--stream"]).unwrap();
         assert!(input.stream);
         assert_eq!(input.format, OutputFormat::Jsonl);
+        assert!(!input.format_explicit);
     }
 
     #[test]
@@ -1009,6 +1034,7 @@ mod tests {
         let input = parse_cli_args(["search", "test", "--stream", "--format", "toon"]).unwrap();
         assert!(input.stream);
         assert_eq!(input.format, OutputFormat::Toon);
+        assert!(input.format_explicit);
     }
 
     #[test]
@@ -1373,6 +1399,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_output_format_defaults_to_jsonl_on_non_tty() {
+        assert_eq!(
+            resolve_output_format(OutputFormat::Table, false, false),
+            OutputFormat::Jsonl
+        );
+    }
+
+    #[test]
+    fn resolve_output_format_keeps_table_on_tty() {
+        assert_eq!(
+            resolve_output_format(OutputFormat::Table, false, true),
+            OutputFormat::Table
+        );
+    }
+
+    #[test]
+    fn resolve_output_format_respects_explicit_override() {
+        assert_eq!(
+            resolve_output_format(OutputFormat::Table, true, false),
+            OutputFormat::Table
+        );
+        assert_eq!(
+            resolve_output_format(OutputFormat::Json, true, false),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
     fn output_format_display() {
         assert_eq!(OutputFormat::Table.to_string(), "table");
         assert_eq!(OutputFormat::Json.to_string(), "json");
@@ -1416,6 +1470,7 @@ mod tests {
         assert_eq!(input.command, CliCommand::Status);
         assert_eq!(input.command_source, CommandSource::ImplicitDefault);
         assert_eq!(input.format, OutputFormat::Table);
+        assert!(!input.format_explicit);
         assert!(input.query.is_none());
         assert!(!input.stream);
     }

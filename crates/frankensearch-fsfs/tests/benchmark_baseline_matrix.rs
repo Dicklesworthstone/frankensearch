@@ -240,7 +240,7 @@ fn load_golden_dataset(profile: &str) -> GoldenDataset {
     serde_json::from_str::<GoldenDataset>(&raw).expect("parse golden dataset fixture")
 }
 
-fn baseline_value(dataset: &GoldenDataset, metric: ComparatorMetric) -> u64 {
+const fn baseline_value(dataset: &GoldenDataset, metric: ComparatorMetric) -> u64 {
     match metric {
         ComparatorMetric::IndexingThroughputDocsPerSecond => {
             dataset.baseline_metrics.indexing_throughput_docs_per_second
@@ -251,14 +251,16 @@ fn baseline_value(dataset: &GoldenDataset, metric: ComparatorMetric) -> u64 {
         ComparatorMetric::FastTierLatencyMs => dataset.baseline_metrics.fast_tier_latency_ms,
         ComparatorMetric::QualityTierLatencyMs => dataset.baseline_metrics.quality_tier_latency_ms,
         ComparatorMetric::IndexingPeakMemoryMb => dataset.baseline_metrics.indexing_peak_memory_mb,
-        ComparatorMetric::SearchingPeakMemoryMb => dataset.baseline_metrics.searching_peak_memory_mb,
+        ComparatorMetric::SearchingPeakMemoryMb => {
+            dataset.baseline_metrics.searching_peak_memory_mb
+        }
         ComparatorMetric::IndexSizeBytesPerDocument => {
             dataset.baseline_metrics.index_size_bytes_per_document
         }
     }
 }
 
-fn regression_pct_x100(metric: ComparatorMetric, baseline: u64, measured: u64) -> u64 {
+const fn regression_pct_x100(metric: ComparatorMetric, baseline: u64, measured: u64) -> u64 {
     if baseline == 0 {
         return 0;
     }
@@ -439,10 +441,12 @@ fn benchmark_matrix_declares_required_regression_metrics() {
     ]);
 
     assert_eq!(actual_metrics, expected_metrics);
-    assert!(matrix
-        .comparators
-        .iter()
-        .all(|comparator| comparator.max_regression_pct == MAX_ALLOWED_REGRESSION_PCT));
+    assert!(
+        matrix
+            .comparators
+            .iter()
+            .all(|comparator| comparator.max_regression_pct == MAX_ALLOWED_REGRESSION_PCT)
+    );
 }
 
 #[test]
@@ -481,9 +485,7 @@ fn regression_detector_enforces_twenty_percent_budget() {
 
     let throughput = regressions
         .iter()
-        .find(|violation| {
-            violation.metric == ComparatorMetric::IndexingThroughputDocsPerSecond
-        })
+        .find(|violation| violation.metric == ComparatorMetric::IndexingThroughputDocsPerSecond)
         .expect("throughput regression is present");
     assert!(throughput.regression_pct_x100 > throughput.threshold_pct_x100);
 }

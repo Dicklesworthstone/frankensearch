@@ -45,6 +45,7 @@ pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
 /// Minimum schema version that consumers in lenient mode should accept.
 pub const OUTPUT_SCHEMA_MIN_SUPPORTED: u32 = 1;
+const KNOWN_OUTPUT_FORMATS: &[&str] = &["table", "json", "jsonl", "csv", "toon"];
 
 // ─── Compatibility Mode ─────────────────────────────────────────────────────
 
@@ -896,6 +897,7 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
 /// 4. `ok == false` implies `error.is_some()` and `data.is_none()`.
 /// 5. Error code, if present, is a recognized stable code.
 /// 6. `meta.command` and `meta.format` are non-empty.
+/// 7. In strict mode, `meta.format` must be a canonical known format label.
 #[must_use]
 pub fn validate_envelope<T>(
     envelope: &OutputEnvelope<T>,
@@ -1000,6 +1002,17 @@ pub fn validate_envelope<T>(
             field: "meta.format".into(),
             code: "output.meta.format_empty".into(),
             message: "meta.format must be non-empty".into(),
+        });
+    } else if matches!(mode, CompatibilityMode::Strict)
+        && !KNOWN_OUTPUT_FORMATS.contains(&envelope.meta.format.as_str())
+    {
+        violations.push(ValidationViolation {
+            field: "meta.format".into(),
+            code: "output.meta.format_unrecognized".into(),
+            message: format!(
+                "meta.format must be one of: {}",
+                KNOWN_OUTPUT_FORMATS.join(", ")
+            ),
         });
     }
 
@@ -1823,6 +1836,38 @@ mod tests {
                 .iter()
                 .any(|v| v.code == "output.meta.format_empty")
         );
+    }
+
+    #[test]
+    fn strict_mode_rejects_unrecognized_meta_format() {
+        let meta = OutputMeta::new("search", "yaml");
+        let env = OutputEnvelope::success("ok", meta, sample_ts());
+        let result = validate_envelope(&env, CompatibilityMode::Strict);
+        assert!(!result.valid);
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| v.code == "output.meta.format_unrecognized")
+        );
+    }
+
+    #[test]
+    fn lenient_mode_allows_unrecognized_meta_format() {
+        let meta = OutputMeta::new("search", "yaml");
+        let env = OutputEnvelope::success("ok", meta, sample_ts());
+        let result = validate_envelope(&env, CompatibilityMode::Lenient);
+        assert!(result.valid, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn strict_mode_accepts_all_known_meta_formats() {
+        for format in KNOWN_OUTPUT_FORMATS {
+            let meta = OutputMeta::new("search", *format);
+            let env = OutputEnvelope::success("ok", meta, sample_ts());
+            let result = validate_envelope(&env, CompatibilityMode::Strict);
+            assert!(result.valid, "format `{format}` should be accepted");
+        }
     }
 
     // ─── Version compatibility ─────────────────────────────────────────
