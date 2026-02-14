@@ -167,11 +167,19 @@ frankensearch = "0.1"
 [dependencies]
 frankensearch = { version = "0.1", features = ["model2vec"] }
 
-# Full hybrid search (semantic + lexical + RRF)
+# Stateless hybrid search (semantic + lexical + RRF)
 [dependencies]
 frankensearch = { version = "0.1", features = ["hybrid"] }
 
-# Everything: all models, reranking, ANN, model downloads
+# Persistent hybrid search (adds FrankenSQLite metadata + queue)
+[dependencies]
+frankensearch = { version = "0.1", features = ["persistent"] }
+
+# Durable persistent search (adds RaptorQ self-healing)
+[dependencies]
+frankensearch = { version = "0.1", features = ["durable"] }
+
+# Everything: durable + rerank + ANN + downloads
 [dependencies]
 frankensearch = { version = "0.1", features = ["full"] }
 ```
@@ -184,12 +192,18 @@ frankensearch = { version = "0.1", features = ["full"] }
 | `model2vec` | safetensors, tokenizers | potion-128M static embedder (fast tier) |
 | `fastembed` | fastembed (ONNX runtime) | MiniLM-L6-v2 transformer embedder (quality tier) |
 | `lexical` | tantivy | BM25 full-text search + RRF fusion |
+| `storage` | frankensearch-storage | FrankenSQLite metadata + persistent embedding queue |
+| `durability` | frankensearch-durability | RaptorQ repair metadata + self-healing primitives |
+| `fts5` | storage | Enable FrankenSQLite FTS5 lexical backend wiring |
 | `rerank` | ort, tokenizers | FlashRank cross-encoder reranking |
 | `ann` | hnsw_rs | HNSW approximate nearest neighbor index |
 | `download` | asupersync/tls | Model auto-download from HuggingFace |
-| `semantic` | model2vec + fastembed | All embedding models |
-| `hybrid` | semantic + lexical | Full hybrid search pipeline |
-| `full` | Everything | All features enabled |
+| `semantic` | hash + model2vec + fastembed | All embedding models |
+| `hybrid` | semantic + lexical | Stateless hybrid search |
+| `persistent` | hybrid + storage | Hybrid search with persistent metadata/queue |
+| `durable` | persistent + durability | Persistent hybrid + self-healing durability |
+| `full` | durable + rerank + ann + download | Kitchen-sink production bundle |
+| `full-fts5` | full + fts5 | Full bundle plus FTS5 lexical backend |
 
 ### From Source
 
@@ -201,6 +215,12 @@ cargo test --features full
 ```
 
 Requires Rust nightly (edition 2024). A `rust-toolchain.toml` is included.
+
+Feature-flag matrix regression check (used for CI/release gates):
+
+```bash
+bash scripts/check_feature_matrix.sh
+```
 
 ---
 
@@ -831,6 +851,7 @@ The WAL (`.fsvi.wal`) uses the same binary layout as the main FSVI file, so the 
 ## Self-Healing Storage (FrankenSQLite + RaptorQ)
 
 frankensearch integrates [FrankenSQLite](https://github.com/nicholasgasior/frankensqlite) for crash-safe metadata storage and [RaptorQ](https://tools.ietf.org/html/rfc6330) fountain codes for self-healing durability across all persistent files.
+Enable this stack with `persistent` (storage) or `durable` (storage + repair).
 
 ### FrankenSQLite Integration
 
@@ -1329,6 +1350,8 @@ Two interfaces:
 - **Deluxe TUI**: Interactive search with galaxy-brain explainability screens, indexing dashboards, and resource pressure monitoring
 
 Key differentiators from generic file search: adaptive compute-pressure control (backs off when host is busy), evidence-ledger-backed ranking decisions, conformal/e-process calibrated adaptive controllers, and deterministic audit trails for every indexing and ranking decision.
+
+Dual-mode contract spec: `docs/fsfs-dual-mode-contract.md`
 
 ### FrankenTUI Operations Console
 

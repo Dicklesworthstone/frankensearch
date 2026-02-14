@@ -7,6 +7,10 @@ members = [
     "crates/frankensearch-lexical",
     "crates/frankensearch-fusion",
     "crates/frankensearch-rerank",
+    "crates/frankensearch-storage",
+    "crates/frankensearch-durability",
+    "crates/frankensearch-fsfs",
+    "crates/frankensearch-tui",
     "frankensearch",
 ]
 
@@ -24,6 +28,10 @@ frankensearch-index = { path = "crates/frankensearch-index" }
 frankensearch-lexical = { path = "crates/frankensearch-lexical" }
 frankensearch-fusion = { path = "crates/frankensearch-fusion" }
 frankensearch-rerank = { path = "crates/frankensearch-rerank" }
+frankensearch-storage = { path = "crates/frankensearch-storage" }
+frankensearch-durability = { path = "crates/frankensearch-durability" }
+frankensearch-fsfs = { path = "crates/frankensearch-fsfs" }
+frankensearch-tui = { path = "crates/frankensearch-tui" }
 
 # Async runtime (structured concurrency, NO tokio)
 # test-internals enables LabRuntime for deterministic testing
@@ -59,15 +67,28 @@ tantivy = "0.22"
 
 # ONNX Runtime for cross-encoder reranking
 ort = "2.0.0-rc.9"
+ndarray = "0.16"
 
 # HNSW approximate nearest neighbors
 hnsw_rs = "0.3"
+
+# CRC32 checksums for FSVI index integrity
+crc32fast = "1"
 
 # Unicode normalization
 unicode-normalization = "0.1"
 
 # Platform-standard directories for model storage
 dirs = "6"
+
+# TOML parsing for configuration surfaces
+toml = "0.8"
+
+# SHA-256 verification for model manifests
+sha2 = "0.10"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

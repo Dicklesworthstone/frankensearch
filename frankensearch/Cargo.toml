@@ -12,12 +12,18 @@ hash = ["frankensearch-embed/hash"]
 model2vec = ["frankensearch-embed/model2vec"]
 fastembed = ["frankensearch-embed/fastembed"]
 lexical = ["dep:frankensearch-lexical", "frankensearch-fusion/lexical"]
+storage = ["dep:frankensearch-storage"]
+durability = ["dep:frankensearch-durability"]
+fts5 = ["storage"]
 rerank = ["dep:frankensearch-rerank"]
 ann = ["frankensearch-index/ann"]
-download = ["asupersync/tls"]
+download = ["frankensearch-embed/download"]
 semantic = ["hash", "model2vec", "fastembed"]
 hybrid = ["semantic", "lexical"]
-full = ["hybrid", "rerank", "ann", "download"]
+persistent = ["hybrid", "storage"]
+durable = ["persistent", "durability"]
+full = ["durable", "rerank", "ann", "download"]
+full-fts5 = ["full", "fts5"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -26,10 +32,24 @@ frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-fusion = { workspace = true }
 frankensearch-rerank = { workspace = true, optional = true }
+frankensearch-storage = { workspace = true, optional = true }
+frankensearch-durability = { workspace = true, optional = true }
 asupersync = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 asupersync = { workspace = true }
+tempfile = "3"
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true }
+frankensearch-index = { workspace = true }
+frankensearch-fusion = { workspace = true }
+serde_json = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "search_bench"
+harness = false
 
 [lints]
 workspace = true
