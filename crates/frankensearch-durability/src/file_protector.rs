@@ -1929,10 +1929,10 @@ mod e2e_tests {
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
 
     use super::{FileHealth, FileProtector, RepairPipelineConfig};
-    use frankensearch_core::SearchError;
     use crate::config::DurabilityConfig;
     use crate::fsvi_protector::{FsviProtector, FsviVerifyResult};
     use crate::metrics::DurabilityMetrics;
+    use frankensearch_core::SearchError;
 
     /// Mock codec that creates 1:1 repair symbols (each source symbol has a
     /// matching repair symbol at ESI + `1_000_000`). This allows repair of any
