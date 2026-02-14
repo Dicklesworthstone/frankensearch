@@ -16,8 +16,8 @@ use crate::data_source::DataSource;
 use crate::preferences::DisplayPreferences;
 use crate::presets::{ViewPreset, ViewState};
 use crate::screens::{
-    ActionTimelineScreen, AlertsSloScreen, FleetOverviewScreen, IndexResourceScreen,
-    LiveSearchStreamScreen, ProjectDetailScreen,
+    ActionTimelineScreen, AlertsSloScreen, FleetOverviewScreen, HistoricalAnalyticsScreen,
+    IndexResourceScreen, LiveSearchStreamScreen, ProjectDetailScreen,
 };
 use crate::state::{AppState, ControlPlaneHealth};
 
@@ -45,6 +45,8 @@ pub struct OpsApp {
     index_screen_id: ScreenId,
     /// Registered alerts/SLO/capacity screen id.
     alerts_screen_id: ScreenId,
+    /// Registered historical analytics/explainability screen id.
+    analytics_screen_id: ScreenId,
     /// Accessibility and display preferences.
     pub preferences: DisplayPreferences,
     /// Current view state (preset + density + filters).
@@ -91,14 +93,17 @@ impl OpsApp {
         let alerts_screen = AlertsSloScreen::new();
         let alerts_id = alerts_screen.id().clone();
 
+        let analytics_screen = HistoricalAnalyticsScreen::new();
+        let analytics_id = analytics_screen.id().clone();
+
         fleet_screen.set_live_stream_screen_id(live_stream_id.clone());
         fleet_screen.set_timeline_screen_id(timeline_id.clone());
-        fleet_screen.set_analytics_screen_id(alerts_id.clone());
+        fleet_screen.set_analytics_screen_id(analytics_id.clone());
 
         project_screen.set_fleet_screen_id(fleet_id.clone());
         project_screen.set_live_stream_screen_id(live_stream_id.clone());
         project_screen.set_timeline_screen_id(timeline_id.clone());
-        project_screen.set_analytics_screen_id(alerts_id.clone());
+        project_screen.set_analytics_screen_id(analytics_id.clone());
 
         shell.registry.register(Box::new(fleet_screen));
         shell.registry.register(Box::new(project_screen));
@@ -106,6 +111,7 @@ impl OpsApp {
         shell.registry.register(Box::new(timeline_screen));
         shell.registry.register(Box::new(index_screen));
         shell.registry.register(Box::new(alerts_screen));
+        shell.registry.register(Box::new(analytics_screen));
 
         // Set initial active screen.
         shell.navigate_to(&fleet_id);
@@ -120,6 +126,7 @@ impl OpsApp {
             timeline_screen_id: timeline_id,
             index_screen_id: index_id,
             alerts_screen_id: alerts_id,
+            analytics_screen_id: analytics_id,
             preferences: DisplayPreferences::new(),
             view: ViewState::default(),
             last_alerted_health: None,
@@ -202,6 +209,10 @@ impl OpsApp {
             }
             "nav.alerts" => {
                 let id = self.alerts_screen_id.clone();
+                self.shell.navigate_to(&id);
+            }
+            "nav.analytics" => {
+                let id = self.analytics_screen_id.clone();
                 self.shell.navigate_to(&id);
             }
             "debug.refresh" => {
@@ -323,6 +334,15 @@ impl OpsApp {
             .and_then(|screen| screen.as_any().downcast_ref::<AlertsSloScreen>())
     }
 
+    /// Get a reference to the historical analytics screen (for testing/inspection).
+    #[must_use]
+    pub fn analytics_screen(&self) -> Option<&HistoricalAnalyticsScreen> {
+        self.shell
+            .registry
+            .get(&self.analytics_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<HistoricalAnalyticsScreen>())
+    }
+
     /// Get a list of all registered palette actions (for help screen).
     #[must_use]
     #[allow(clippy::too_many_lines)]
@@ -354,6 +374,12 @@ impl OpsApp {
             .with_shortcut("3"),
             Action::new("nav.alerts", "Go to Alerts/SLO", ActionCategory::Navigation)
                 .with_shortcut("5"),
+            Action::new(
+                "nav.analytics",
+                "Go to Historical Analytics",
+                ActionCategory::Navigation,
+            )
+            .with_shortcut("6"),
             Action::new("debug.refresh", "Force Refresh Data", ActionCategory::Debug)
                 .with_shortcut("F5"),
             Action::new(
@@ -490,6 +516,17 @@ impl OpsApp {
             .and_then(|screen| screen.as_any_mut().downcast_mut::<AlertsSloScreen>())
     }
 
+    fn analytics_screen_mut(&mut self) -> Option<&mut HistoricalAnalyticsScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.analytics_screen_id)
+            .and_then(|screen| {
+                screen
+                    .as_any_mut()
+                    .downcast_mut::<HistoricalAnalyticsScreen>()
+            })
+    }
+
     fn selected_project_from_fleet(&self) -> Option<String> {
         self.fleet_screen()
             .and_then(FleetOverviewScreen::selected_project)
@@ -499,6 +536,11 @@ impl OpsApp {
     fn selected_project_from_alerts(&self) -> Option<String> {
         self.alerts_screen()
             .and_then(AlertsSloScreen::selected_project)
+    }
+
+    fn selected_project_from_analytics(&self) -> Option<String> {
+        self.analytics_screen()
+            .and_then(HistoricalAnalyticsScreen::selected_project)
     }
 
     fn open_project_detail_for_selected_project(&mut self) {
@@ -545,6 +587,24 @@ impl OpsApp {
         {
             self.view.apply_preset(ViewPreset::ProjectDeepDive);
             if let Some(project) = self.selected_project_from_alerts() {
+                self.view.set_project_filter(project);
+            }
+            self.sync_screen_states();
+        }
+
+        let moved_analytics_to_project = previous_screen == Some(&self.analytics_screen_id)
+            && current_screen.as_ref() == Some(&self.project_screen_id);
+        if moved_analytics_to_project
+            && matches!(
+                event,
+                frankensearch_tui::InputEvent::Key(
+                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
+                    _
+                )
+            )
+        {
+            self.view.apply_preset(ViewPreset::ProjectDeepDive);
+            if let Some(project) = self.selected_project_from_analytics() {
                 self.view.set_project_filter(project);
             }
             self.sync_screen_states();
@@ -617,6 +677,15 @@ impl OpsApp {
                 target: "frankensearch.ops",
                 screen_id = %self.alerts_screen_id,
                 "alerts/slo screen missing or wrong type; skipping screen state refresh"
+            );
+        }
+        if let Some(screen) = self.analytics_screen_mut() {
+            screen.update_state(&state_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.analytics_screen_id,
+                "historical analytics screen missing or wrong type; skipping screen state refresh"
             );
         }
     }
@@ -789,6 +858,7 @@ mod tests {
         assert!(actions.iter().any(|a| a.id == "nav.fleet"));
         assert!(actions.iter().any(|a| a.id == "nav.project"));
         assert!(actions.iter().any(|a| a.id == "nav.alerts"));
+        assert!(actions.iter().any(|a| a.id == "nav.analytics"));
     }
 
     #[test]
@@ -827,6 +897,15 @@ mod tests {
         let app = OpsApp::new(Box::new(MockDataSource::sample()));
         let alerts = app.alerts_screen().expect("alerts screen should exist");
         assert_eq!(alerts.id(), &ScreenId::new("ops.alerts"));
+    }
+
+    #[test]
+    fn analytics_screen_accessible() {
+        let app = OpsApp::new(Box::new(MockDataSource::sample()));
+        let analytics = app
+            .analytics_screen()
+            .expect("analytics screen should exist");
+        assert_eq!(analytics.id(), &ScreenId::new("ops.analytics"));
     }
 
     #[test]
@@ -950,6 +1029,17 @@ mod tests {
     }
 
     #[test]
+    fn nav_analytics_action_opens_analytics_screen() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.dispatch_palette_action("nav.analytics");
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
+    }
+
+    #[test]
     fn g_from_alerts_opens_project_detail_with_project_context() {
         let discovered = vec![DiscoveredInstance {
             instance_id: "host-a:cass-001".to_string(),
@@ -967,6 +1057,39 @@ mod tests {
         app.refresh_data();
         app.dispatch_palette_action("nav.alerts");
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.alerts")));
+
+        let goto_project = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_project);
+        assert!(!quit);
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
+        assert!(app.view.project_filter.is_some());
+        assert_eq!(app.view.preset, crate::presets::ViewPreset::ProjectDeepDive);
+    }
+
+    #[test]
+    fn g_from_analytics_opens_project_detail_with_project_context() {
+        let discovered = vec![DiscoveredInstance {
+            instance_id: "host-a:cass-002".to_string(),
+            project_key_hint: Some("cass".to_string()),
+            host_name: Some("cass-host".to_string()),
+            pid: Some(4343),
+            version: Some("0.1.0".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["instance:host-a:cass-002".to_string()],
+        }];
+        let mut app = OpsApp::new(Box::new(MockDataSource::from_discovery(&discovered)));
+        app.refresh_data();
+        app.dispatch_palette_action("nav.analytics");
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
 
         let goto_project = frankensearch_tui::InputEvent::Key(
             crossterm::event::KeyCode::Char('g'),
