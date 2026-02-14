@@ -48,7 +48,11 @@ pub use discovery::{
 pub use overlays::{render_overlay, render_palette_overlay};
 pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
 pub use presets::{Density, ViewPreset, ViewState};
-pub use state::{AppState, ControlPlaneHealth, ControlPlaneMetrics};
+pub use state::{
+    AppState, ControlPlaneHealth, ControlPlaneMetrics, InstanceAttribution, InstanceLifecycle,
+    LifecycleEvent, LifecycleSignal, LifecycleTrackerConfig, LifecycleTransition,
+    ProjectAttributionResolver, ProjectLifecycleTracker,
+};
 pub use storage::{
     OPS_SCHEMA_VERSION, OpsStorage, OpsStorageConfig, bootstrap as bootstrap_ops_storage,
     current_version as current_ops_schema_version,

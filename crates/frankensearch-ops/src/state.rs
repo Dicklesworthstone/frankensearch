@@ -5,10 +5,11 @@
 //! Thread safety is provided by the consumer's runtime (asupersync `RwLock`
 //! when integrated; `std::sync::RwLock` for standalone testing).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
+use crate::discovery::{DiscoveredInstance, DiscoveryStatus};
 use frankensearch_core::host_adapter::resolve_host_project_attribution;
 use frankensearch_core::{LifecycleSeverity, LifecycleState};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ pub struct InstanceAttribution {
     pub reason_code: String,
     /// Whether competing project candidates were observed.
     pub collision: bool,
+    /// Explainable attribution evidence trace (ordered strongest -> weakest).
+    pub evidence_trace: Vec<String>,
 }
 
 impl InstanceAttribution {
@@ -56,13 +59,27 @@ impl InstanceAttribution {
         host_name_hint: Option<&str>,
         reason_code: impl Into<String>,
     ) -> Self {
+        let project_key_hint = normalize_hint(project_key_hint);
+        let host_name_hint = normalize_hint(host_name_hint);
+        let reason_code = reason_code.into();
+        let mut evidence_trace = Vec::new();
+        if let Some(project_key_hint) = project_key_hint.as_deref() {
+            evidence_trace.push(format!("project_key_hint={project_key_hint}"));
+        }
+        if let Some(host_name_hint) = host_name_hint.as_deref() {
+            evidence_trace.push(format!("host_name_hint={host_name_hint}"));
+        }
+        evidence_trace.push("resolved_project=unknown".to_owned());
+        evidence_trace.push(format!("reason={reason_code}"));
+
         Self {
-            project_key_hint: project_key_hint.map(str::to_owned),
-            host_name_hint: host_name_hint.map(str::to_owned),
+            project_key_hint,
+            host_name_hint,
             resolved_project: "unknown".to_owned(),
             confidence_score: 20,
-            reason_code: reason_code.into(),
+            reason_code,
             collision: false,
+            evidence_trace,
         }
     }
 }
@@ -80,21 +97,57 @@ impl ProjectAttributionResolver {
         host_name_hint: Option<&str>,
         adapter_identity_hint: Option<&str>,
     ) -> InstanceAttribution {
+        let project_key_hint = normalize_hint(project_key_hint);
+        let host_name_hint = normalize_hint(host_name_hint);
+        let adapter_identity_hint = normalize_hint(adapter_identity_hint);
+
         let attribution = resolve_host_project_attribution(
-            adapter_identity_hint,
-            project_key_hint,
-            host_name_hint,
+            adapter_identity_hint.as_deref(),
+            project_key_hint.as_deref(),
+            host_name_hint.as_deref(),
         );
 
+        let mut evidence_trace = Vec::new();
+        if let Some(adapter_identity_hint) = adapter_identity_hint.as_deref() {
+            evidence_trace.push(format!("adapter_identity_hint={adapter_identity_hint}"));
+        }
+        if let Some(project_key_hint) = project_key_hint.as_deref() {
+            evidence_trace.push(format!("project_key_hint={project_key_hint}"));
+        }
+        if let Some(host_name_hint) = host_name_hint.as_deref() {
+            evidence_trace.push(format!("host_name_hint={host_name_hint}"));
+        }
+        evidence_trace.push(format!(
+            "resolved_project={}",
+            attribution.resolved_project_key
+        ));
+        evidence_trace.push(format!("reason={}", attribution.reason_code));
+        evidence_trace.push(format!("confidence_score={}", attribution.confidence_score));
+        if attribution.collision {
+            evidence_trace.push("collision=true".to_owned());
+        }
+
         InstanceAttribution {
-            project_key_hint: project_key_hint.map(str::to_owned),
-            host_name_hint: host_name_hint.map(str::to_owned),
+            project_key_hint,
+            host_name_hint,
             resolved_project: attribution.resolved_project_key,
             confidence_score: attribution.confidence_score,
             reason_code: attribution.reason_code,
             collision: attribution.collision,
+            evidence_trace,
         }
     }
+}
+
+fn normalize_hint(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
 }
 
 /// Discrete lifecycle signals ingested by the tracker.
@@ -254,6 +307,290 @@ impl InstanceLifecycle {
             reason_code: self.reason_code.clone(),
             changed: true,
         })
+    }
+}
+
+/// Configuration for deterministic lifecycle tracking over discovery snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleTrackerConfig {
+    /// Heartbeat gap threshold that transitions healthy/recovering instances to stale.
+    pub stale_after_ms: u64,
+    /// Absence threshold that transitions stale/healthy instances to stopped.
+    pub stop_after_ms: u64,
+    /// Maximum number of retained lifecycle events for timeline/alerts.
+    pub max_retained_events: usize,
+}
+
+impl Default for LifecycleTrackerConfig {
+    fn default() -> Self {
+        Self {
+            stale_after_ms: 30_000,
+            stop_after_ms: 120_000,
+            max_retained_events: 4_096,
+        }
+    }
+}
+
+impl LifecycleTrackerConfig {
+    #[must_use]
+    pub const fn normalized(self) -> Self {
+        let stop_after_ms = if self.stop_after_ms < self.stale_after_ms {
+            self.stale_after_ms
+        } else {
+            self.stop_after_ms
+        };
+        let max_retained_events = if self.max_retained_events == 0 {
+            1
+        } else {
+            self.max_retained_events
+        };
+        Self {
+            stale_after_ms: self.stale_after_ms,
+            stop_after_ms,
+            max_retained_events,
+        }
+    }
+}
+
+/// Lifecycle transition event suitable for timeline and alert surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    /// Instance identifier this event belongs to.
+    pub instance_id: String,
+    /// Previous lifecycle state.
+    pub from: LifecycleState,
+    /// Resulting lifecycle state.
+    pub to: LifecycleState,
+    /// Reason code associated with the transition.
+    pub reason_code: String,
+    /// Transition timestamp (unix ms).
+    pub at_ms: u64,
+    /// Attribution confidence attached to the instance at transition time.
+    pub attribution_confidence_score: u8,
+    /// Attribution collision status attached at transition time.
+    pub attribution_collision: bool,
+}
+
+/// Deterministic attribution + lifecycle tracker for discovery snapshots.
+#[derive(Debug, Clone)]
+pub struct ProjectLifecycleTracker {
+    config: LifecycleTrackerConfig,
+    resolver: ProjectAttributionResolver,
+    attributions: HashMap<String, InstanceAttribution>,
+    lifecycles: HashMap<String, InstanceLifecycle>,
+    event_log: Vec<LifecycleEvent>,
+}
+
+impl Default for ProjectLifecycleTracker {
+    fn default() -> Self {
+        Self::new(LifecycleTrackerConfig::default())
+    }
+}
+
+impl ProjectLifecycleTracker {
+    #[must_use]
+    pub fn new(config: LifecycleTrackerConfig) -> Self {
+        Self {
+            config: config.normalized(),
+            resolver: ProjectAttributionResolver,
+            attributions: HashMap::new(),
+            lifecycles: HashMap::new(),
+            event_log: Vec::new(),
+        }
+    }
+
+    /// Ingest one discovery snapshot and return transitions emitted in this update.
+    #[allow(clippy::too_many_lines)]
+    pub fn ingest_discovery(
+        &mut self,
+        now_ms: u64,
+        instances: &[DiscoveredInstance],
+    ) -> Vec<LifecycleEvent> {
+        let mut events: Vec<LifecycleEvent> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for instance in instances {
+            let instance_id = instance.instance_id.clone();
+            seen.insert(instance_id.clone());
+
+            let attribution = self.resolver.resolve(
+                instance.project_key_hint.as_deref(),
+                instance.host_name.as_deref(),
+                None,
+            );
+            self.attributions
+                .insert(instance_id.clone(), attribution.clone());
+
+            let lifecycle = self
+                .lifecycles
+                .entry(instance_id.clone())
+                .or_insert_with(|| InstanceLifecycle::new(instance.first_seen_ms));
+
+            if lifecycle.last_transition_ms == instance.first_seen_ms
+                && lifecycle.state == LifecycleState::Started
+            {
+                events.push(Self::event_from_transition(
+                    &instance_id,
+                    LifecycleTransition {
+                        from: LifecycleState::Stopped,
+                        to: LifecycleState::Started,
+                        reason_code: "lifecycle.discovery.start".to_owned(),
+                        changed: true,
+                    },
+                    instance.first_seen_ms,
+                    &attribution,
+                ));
+            }
+
+            if instance.status == DiscoveryStatus::Active
+                && matches!(
+                    lifecycle.state,
+                    LifecycleState::Stopped | LifecycleState::Stale
+                )
+            {
+                let restart = lifecycle.apply_signal(
+                    LifecycleSignal::Start,
+                    instance.last_seen_ms,
+                    Some("lifecycle.discovery.start".to_owned()),
+                );
+                if restart.changed {
+                    events.push(Self::event_from_transition(
+                        &instance_id,
+                        restart,
+                        instance.last_seen_ms,
+                        &attribution,
+                    ));
+                }
+            }
+
+            let heartbeat = lifecycle.apply_signal(
+                LifecycleSignal::Heartbeat,
+                instance.last_seen_ms,
+                Some("lifecycle.discovery.heartbeat".to_owned()),
+            );
+            if heartbeat.changed {
+                events.push(Self::event_from_transition(
+                    &instance_id,
+                    heartbeat,
+                    instance.last_seen_ms,
+                    &attribution,
+                ));
+            }
+
+            if instance.status == DiscoveryStatus::Stale {
+                let stale_at_ms = instance
+                    .last_seen_ms
+                    .saturating_add(self.config.stale_after_ms);
+                if let Some(stale) =
+                    lifecycle.mark_stale_if_heartbeat_gap(stale_at_ms, self.config.stale_after_ms)
+                {
+                    events.push(Self::event_from_transition(
+                        &instance_id,
+                        stale,
+                        stale_at_ms,
+                        &attribution,
+                    ));
+                }
+            }
+        }
+
+        for (instance_id, lifecycle) in &mut self.lifecycles {
+            if seen.contains(instance_id) {
+                continue;
+            }
+
+            let attribution = self
+                .attributions
+                .get(instance_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    InstanceAttribution::unknown(None, None, "attribution.lifecycle_missing")
+                });
+
+            let stop_deadline = lifecycle
+                .last_heartbeat_ms
+                .saturating_add(self.config.stop_after_ms);
+            if now_ms >= stop_deadline {
+                let stop = lifecycle.apply_signal(
+                    LifecycleSignal::Stop,
+                    now_ms,
+                    Some("lifecycle.discovery.stop".to_owned()),
+                );
+                if stop.changed {
+                    events.push(Self::event_from_transition(
+                        instance_id,
+                        stop,
+                        now_ms,
+                        &attribution,
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(stale) =
+                lifecycle.mark_stale_if_heartbeat_gap(now_ms, self.config.stale_after_ms)
+            {
+                events.push(Self::event_from_transition(
+                    instance_id,
+                    stale,
+                    now_ms,
+                    &attribution,
+                ));
+            }
+        }
+
+        self.event_log.extend(events.iter().cloned());
+        if self.event_log.len() > self.config.max_retained_events {
+            let excess = self
+                .event_log
+                .len()
+                .saturating_sub(self.config.max_retained_events);
+            self.event_log.drain(0..excess);
+        }
+
+        events
+    }
+
+    #[must_use]
+    pub fn attribution_snapshot(&self) -> HashMap<String, InstanceAttribution> {
+        self.attributions.clone()
+    }
+
+    #[must_use]
+    pub fn lifecycle_snapshot(&self) -> HashMap<String, InstanceLifecycle> {
+        self.lifecycles.clone()
+    }
+
+    #[must_use]
+    pub fn event_log(&self) -> &[LifecycleEvent] {
+        &self.event_log
+    }
+
+    #[must_use]
+    pub fn attribution_for(&self, instance_id: &str) -> Option<&InstanceAttribution> {
+        self.attributions.get(instance_id)
+    }
+
+    #[must_use]
+    pub fn lifecycle_for(&self, instance_id: &str) -> Option<&InstanceLifecycle> {
+        self.lifecycles.get(instance_id)
+    }
+
+    fn event_from_transition(
+        instance_id: &str,
+        transition: LifecycleTransition,
+        at_ms: u64,
+        attribution: &InstanceAttribution,
+    ) -> LifecycleEvent {
+        LifecycleEvent {
+            instance_id: instance_id.to_owned(),
+            from: transition.from,
+            to: transition.to,
+            reason_code: transition.reason_code,
+            at_ms,
+            attribution_confidence_score: attribution.confidence_score,
+            attribution_collision: attribution.collision,
+        }
     }
 }
 
@@ -476,6 +813,8 @@ pub struct FleetSnapshot {
     pub attribution: HashMap<String, InstanceAttribution>,
     /// Per-instance lifecycle state snapshots (keyed by instance ID).
     pub lifecycle: HashMap<String, InstanceLifecycle>,
+    /// Recent lifecycle transition events for timeline/alerts.
+    pub lifecycle_events: Vec<LifecycleEvent>,
 }
 
 impl FleetSnapshot {
@@ -522,6 +861,12 @@ impl FleetSnapshot {
     #[must_use]
     pub fn lifecycle_for(&self, instance_id: &str) -> Option<&InstanceLifecycle> {
         self.lifecycle.get(instance_id)
+    }
+
+    /// Recent lifecycle transition events.
+    #[must_use]
+    pub fn lifecycle_events(&self) -> &[LifecycleEvent] {
+        &self.lifecycle_events
     }
 }
 
@@ -683,6 +1028,7 @@ mod tests {
             search_metrics: HashMap::new(),
             attribution,
             lifecycle,
+            lifecycle_events: Vec::new(),
         }
     }
 
@@ -789,11 +1135,23 @@ mod tests {
         assert_eq!(known.resolved_project, "mcp_agent_mail_rust");
         assert!(known.confidence_score >= 80);
         assert!(!known.collision);
+        assert!(
+            known
+                .evidence_trace
+                .iter()
+                .any(|entry| entry.starts_with("reason=attribution."))
+        );
 
         let unknown = resolver.resolve(Some("custom-app"), Some("mystery-box"), None);
         assert_eq!(unknown.resolved_project, "unknown");
         assert_eq!(unknown.confidence_score, 20);
         assert_eq!(unknown.reason_code, "attribution.unknown");
+        assert!(
+            unknown
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "resolved_project=unknown")
+        );
     }
 
     #[test]
@@ -806,6 +1164,38 @@ mod tests {
         );
         assert!(result.collision);
         assert_eq!(result.reason_code, "attribution.collision");
+        assert!(
+            result
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "collision=true")
+        );
+    }
+
+    #[test]
+    fn unknown_attribution_records_hint_trace() {
+        let unknown =
+            InstanceAttribution::unknown(Some(" custom-app "), Some(" mystery-host "), "manual");
+        assert_eq!(unknown.project_key_hint.as_deref(), Some("custom-app"));
+        assert_eq!(unknown.host_name_hint.as_deref(), Some("mystery-host"));
+        assert!(
+            unknown
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "project_key_hint=custom-app")
+        );
+        assert!(
+            unknown
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "host_name_hint=mystery-host")
+        );
+        assert!(
+            unknown
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "reason=manual")
+        );
     }
 
     #[test]
@@ -824,5 +1214,194 @@ mod tests {
         let stale = lifecycle.mark_stale_if_heartbeat_gap(10_000, 5_000);
         assert!(stale.is_some());
         assert_eq!(lifecycle.state, LifecycleState::Stale);
+    }
+
+    #[test]
+    fn lifecycle_heartbeat_is_idempotent_when_already_healthy() {
+        let mut lifecycle = InstanceLifecycle::new(10);
+        lifecycle.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+
+        let transition = lifecycle.apply_signal(LifecycleSignal::Heartbeat, 25, None);
+        assert_eq!(transition.from, LifecycleState::Healthy);
+        assert_eq!(transition.to, LifecycleState::Healthy);
+        assert!(!transition.changed);
+        assert_eq!(lifecycle.last_transition_ms, 20);
+        assert_eq!(lifecycle.last_heartbeat_ms, 25);
+    }
+
+    #[test]
+    fn lifecycle_stale_gap_respects_stopped_and_zero_timeout_guards() {
+        let mut stopped = InstanceLifecycle::new(10);
+        stopped.apply_signal(LifecycleSignal::Stop, 15, None);
+        assert!(stopped.mark_stale_if_heartbeat_gap(1_000, 5_000).is_none());
+        assert_eq!(stopped.state, LifecycleState::Stopped);
+
+        let mut healthy = InstanceLifecycle::new(10);
+        healthy.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        assert!(healthy.mark_stale_if_heartbeat_gap(1_000, 0).is_none());
+        assert_eq!(healthy.state, LifecycleState::Healthy);
+    }
+
+    fn discovery_instance(
+        id: &str,
+        project_key_hint: Option<&str>,
+        host_name: Option<&str>,
+        last_seen_ms: u64,
+        status: DiscoveryStatus,
+    ) -> DiscoveredInstance {
+        DiscoveredInstance {
+            instance_id: id.to_owned(),
+            project_key_hint: project_key_hint.map(str::to_owned),
+            host_name: host_name.map(str::to_owned),
+            pid: Some(111),
+            version: Some("0.1.0".to_owned()),
+            first_seen_ms: last_seen_ms.saturating_sub(10),
+            last_seen_ms,
+            status,
+            sources: vec![crate::discovery::DiscoverySignalKind::Heartbeat],
+            identity_keys: vec![format!(
+                "hostpid:{}:111",
+                host_name.unwrap_or("unknown-host")
+            )],
+        }
+    }
+
+    #[test]
+    fn lifecycle_tracker_emits_start_stale_stop_and_restart_transitions() {
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig {
+            stale_after_ms: 10,
+            stop_after_ms: 20,
+            max_retained_events: 128,
+        });
+
+        let first = vec![discovery_instance(
+            "inst-a",
+            Some("cass"),
+            Some("cass-host"),
+            100,
+            DiscoveryStatus::Active,
+        )];
+        let events_first = tracker.ingest_discovery(100, &first);
+        assert!(
+            events_first
+                .iter()
+                .any(|event| event.to == LifecycleState::Started)
+        );
+        assert!(
+            events_first
+                .iter()
+                .any(|event| event.to == LifecycleState::Healthy)
+        );
+        assert_eq!(
+            tracker
+                .lifecycle_for("inst-a")
+                .expect("lifecycle present")
+                .state,
+            LifecycleState::Healthy
+        );
+
+        let events_stale = tracker.ingest_discovery(112, &[]);
+        assert!(
+            events_stale
+                .iter()
+                .any(|event| event.to == LifecycleState::Stale)
+        );
+        assert_eq!(
+            tracker
+                .lifecycle_for("inst-a")
+                .expect("lifecycle present")
+                .state,
+            LifecycleState::Stale
+        );
+
+        let events_stop = tracker.ingest_discovery(125, &[]);
+        assert!(
+            events_stop
+                .iter()
+                .any(|event| event.to == LifecycleState::Stopped)
+        );
+        assert_eq!(
+            tracker
+                .lifecycle_for("inst-a")
+                .expect("lifecycle present")
+                .state,
+            LifecycleState::Stopped
+        );
+
+        let restart = vec![discovery_instance(
+            "inst-a",
+            Some("cass"),
+            Some("cass-host"),
+            130,
+            DiscoveryStatus::Active,
+        )];
+        let events_restart = tracker.ingest_discovery(130, &restart);
+        assert!(
+            events_restart
+                .iter()
+                .any(|event| event.to == LifecycleState::Recovering)
+        );
+        assert!(
+            events_restart
+                .iter()
+                .any(|event| event.to == LifecycleState::Healthy)
+        );
+        assert_eq!(
+            tracker
+                .lifecycle_for("inst-a")
+                .expect("lifecycle present")
+                .restart_count,
+            1
+        );
+        assert!(
+            events_restart
+                .iter()
+                .all(|event| event.reason_code.starts_with("lifecycle."))
+        );
+    }
+
+    #[test]
+    fn lifecycle_tracker_surfaces_attribution_collision_metadata() {
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig::default());
+        let collision = vec![discovery_instance(
+            "inst-collision",
+            Some("xf"),
+            Some("cass-devbox"),
+            50,
+            DiscoveryStatus::Active,
+        )];
+
+        let events = tracker.ingest_discovery(50, &collision);
+        let attribution = tracker
+            .attribution_for("inst-collision")
+            .expect("attribution should exist");
+        assert!(attribution.collision);
+        assert_eq!(attribution.reason_code, "attribution.collision");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.attribution_confidence_score > 0)
+        );
+        assert!(events.iter().all(|event| event.attribution_collision));
+    }
+
+    #[test]
+    fn lifecycle_tracker_respects_event_retention_limit() {
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig {
+            stale_after_ms: 1,
+            stop_after_ms: 2,
+            max_retained_events: 2,
+        });
+        let first = vec![discovery_instance(
+            "inst-retain",
+            Some("cass"),
+            Some("cass-host"),
+            10,
+            DiscoveryStatus::Active,
+        )];
+        let _ = tracker.ingest_discovery(10, &first);
+        let _ = tracker.ingest_discovery(12, &[]);
+
+        assert_eq!(tracker.event_log().len(), 2);
     }
 }

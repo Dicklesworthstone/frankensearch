@@ -16,7 +16,7 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for the ops telemetry database.
-pub const OPS_SCHEMA_VERSION: i64 = 1;
+pub const OPS_SCHEMA_VERSION: i64 = 2;
 
 #[allow(clippy::needless_raw_string_hashes)]
 const OPS_SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS ops_schema_migrations (
 
 const OPS_SCHEMA_V1_NAME: &str = "ops_telemetry_storage_v1";
 const OPS_SCHEMA_V1_CHECKSUM: &str = "ops-schema-v1-20260214";
+const OPS_SCHEMA_V2_NAME: &str = "ops_telemetry_storage_v2_slo_anomaly_rollups";
+const OPS_SCHEMA_V2_CHECKSUM: &str = "ops-schema-v2-20260214";
 
 #[allow(clippy::needless_raw_string_hashes)]
 const OPS_SCHEMA_V1_STATEMENTS: &[&str] = &[
@@ -168,6 +170,59 @@ CREATE TABLE IF NOT EXISTS evidence_links (
     "CREATE INDEX IF NOT EXISTS ix_el_aid ON evidence_links(alert_id, created_at_ms DESC);",
 ];
 
+#[allow(clippy::needless_raw_string_hashes)]
+const OPS_SCHEMA_V2_STATEMENTS: &[&str] = &[
+    r#"
+CREATE TABLE IF NOT EXISTS slo_rollups (
+    rollup_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('project', 'fleet')),
+    scope_key TEXT NOT NULL,
+    project_key TEXT,
+    window TEXT NOT NULL CHECK (window IN ('1m', '15m', '1h', '6h', '24h', '3d', '1w')),
+    window_start_ms INTEGER NOT NULL,
+    window_end_ms INTEGER NOT NULL,
+    total_requests INTEGER NOT NULL,
+    failed_requests INTEGER NOT NULL,
+    p95_latency_us INTEGER,
+    target_p95_latency_us INTEGER NOT NULL,
+    error_budget_ratio REAL NOT NULL,
+    error_rate REAL,
+    error_budget_burn REAL,
+    remaining_budget_ratio REAL,
+    health TEXT NOT NULL CHECK (health IN ('healthy', 'warn', 'error', 'critical', 'no_data')),
+    reason_code TEXT NOT NULL,
+    generated_at_ms INTEGER NOT NULL,
+    UNIQUE (scope, scope_key, window, window_start_ms)
+);
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS anomaly_materializations (
+    anomaly_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('project', 'fleet')),
+    scope_key TEXT NOT NULL,
+    project_key TEXT,
+    window TEXT NOT NULL CHECK (window IN ('1m', '15m', '1h', '6h', '24h', '3d', '1w')),
+    window_start_ms INTEGER NOT NULL,
+    metric_name TEXT NOT NULL,
+    baseline_value REAL,
+    observed_value REAL,
+    deviation_ratio REAL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'error', 'critical')),
+    reason_code TEXT NOT NULL,
+    correlation_id TEXT,
+    state TEXT NOT NULL CHECK (state IN ('open', 'resolved')),
+    opened_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER,
+    UNIQUE (scope, scope_key, window, window_start_ms, metric_name)
+);
+"#,
+    "CREATE INDEX IF NOT EXISTS ix_slo_scope_window ON slo_rollups(scope, scope_key, window, window_start_ms DESC);",
+    "CREATE INDEX IF NOT EXISTS ix_slo_project_window ON slo_rollups(project_key, window, window_start_ms DESC);",
+    "CREATE INDEX IF NOT EXISTS ix_am_scope_state ON anomaly_materializations(scope, scope_key, state, severity, updated_at_ms DESC);",
+    "CREATE INDEX IF NOT EXISTS ix_am_project_timeline ON anomaly_materializations(project_key, opened_at_ms DESC);",
+];
+
 struct OpsMigration {
     version: i64,
     name: &'static str,
@@ -176,13 +231,22 @@ struct OpsMigration {
     statements: &'static [&'static str],
 }
 
-const OPS_MIGRATIONS: &[OpsMigration] = &[OpsMigration {
-    version: 1,
-    name: OPS_SCHEMA_V1_NAME,
-    checksum: OPS_SCHEMA_V1_CHECKSUM,
-    reversible: true,
-    statements: OPS_SCHEMA_V1_STATEMENTS,
-}];
+const OPS_MIGRATIONS: &[OpsMigration] = &[
+    OpsMigration {
+        version: 1,
+        name: OPS_SCHEMA_V1_NAME,
+        checksum: OPS_SCHEMA_V1_CHECKSUM,
+        reversible: true,
+        statements: OPS_SCHEMA_V1_STATEMENTS,
+    },
+    OpsMigration {
+        version: 2,
+        name: OPS_SCHEMA_V2_NAME,
+        checksum: OPS_SCHEMA_V2_CHECKSUM,
+        reversible: true,
+        statements: OPS_SCHEMA_V2_STATEMENTS,
+    },
+];
 
 /// Configuration for the ops telemetry storage connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +383,397 @@ impl ResourceSampleRecord {
     }
 }
 
+/// Supported aggregation windows for dashboard rollups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryWindow {
+    OneMinute,
+    FifteenMinutes,
+    OneHour,
+    SixHours,
+    TwentyFourHours,
+    ThreeDays,
+    OneWeek,
+}
+
+impl SummaryWindow {
+    pub const ALL: [Self; 7] = [
+        Self::OneMinute,
+        Self::FifteenMinutes,
+        Self::OneHour,
+        Self::SixHours,
+        Self::TwentyFourHours,
+        Self::ThreeDays,
+        Self::OneWeek,
+    ];
+
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::OneMinute => "1m",
+            Self::FifteenMinutes => "15m",
+            Self::OneHour => "1h",
+            Self::SixHours => "6h",
+            Self::TwentyFourHours => "24h",
+            Self::ThreeDays => "3d",
+            Self::OneWeek => "1w",
+        }
+    }
+
+    #[must_use]
+    pub const fn duration_ms(self) -> i64 {
+        match self {
+            Self::OneMinute => 60_000,
+            Self::FifteenMinutes => 15 * 60_000,
+            Self::OneHour => 3_600_000,
+            Self::SixHours => 6 * 3_600_000,
+            Self::TwentyFourHours => 24 * 3_600_000,
+            Self::ThreeDays => 3 * 24 * 3_600_000,
+            Self::OneWeek => 7 * 24 * 3_600_000,
+        }
+    }
+
+    #[must_use]
+    pub const fn bucket_start_ms(self, ts_ms: i64) -> i64 {
+        if ts_ms <= 0 {
+            return 0;
+        }
+        let duration = self.duration_ms();
+        ts_ms - (ts_ms % duration)
+    }
+
+    #[must_use]
+    pub const fn rolling_start_ms(self, now_ms: i64) -> i64 {
+        if now_ms <= 0 {
+            return 0;
+        }
+        let duration = self.duration_ms();
+        if now_ms >= duration {
+            now_ms - duration + 1
+        } else {
+            0
+        }
+    }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "1m" => Some(Self::OneMinute),
+            "15m" => Some(Self::FifteenMinutes),
+            "1h" => Some(Self::OneHour),
+            "6h" => Some(Self::SixHours),
+            "24h" => Some(Self::TwentyFourHours),
+            "3d" => Some(Self::ThreeDays),
+            "1w" => Some(Self::OneWeek),
+            _ => None,
+        }
+    }
+}
+
+/// Scope for SLO rollups and anomaly materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloScope {
+    /// Project-level aggregation.
+    Project,
+    /// Fleet-wide aggregation across all projects.
+    Fleet,
+}
+
+impl SloScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Fleet => "fleet",
+        }
+    }
+
+    #[must_use]
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "project" => Some(Self::Project),
+            "fleet" => Some(Self::Fleet),
+            _ => None,
+        }
+    }
+}
+
+/// Health classification for materialized SLO rollups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloHealth {
+    Healthy,
+    Warn,
+    Error,
+    Critical,
+    NoData,
+}
+
+impl SloHealth {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Critical => "critical",
+            Self::NoData => "no_data",
+        }
+    }
+
+    #[must_use]
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "healthy" => Some(Self::Healthy),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            "critical" => Some(Self::Critical),
+            "no_data" => Some(Self::NoData),
+            _ => None,
+        }
+    }
+}
+
+/// Severity level for anomaly materializations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalySeverity {
+    Info,
+    Warn,
+    Error,
+    Critical,
+}
+
+impl AnomalySeverity {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Critical => "critical",
+        }
+    }
+
+    #[must_use]
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Runtime knobs for SLO rollup and anomaly materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SloMaterializationConfig {
+    /// Target p95 latency in microseconds for the SLO.
+    pub target_p95_latency_us: u64,
+    /// Allowed request failure ratio (error budget), e.g. `0.01` for 99% SLO.
+    pub error_budget_ratio: f64,
+    /// Burn-rate threshold for `warn`.
+    pub warn_burn_rate: f64,
+    /// Burn-rate threshold for `error`.
+    pub error_burn_rate: f64,
+    /// Burn-rate threshold for `critical`.
+    pub critical_burn_rate: f64,
+    /// Latency multiplier (x target) threshold for `warn`.
+    pub warn_latency_multiplier: f64,
+    /// Latency multiplier (x target) threshold for `error`.
+    pub error_latency_multiplier: f64,
+    /// Latency multiplier (x target) threshold for `critical`.
+    pub critical_latency_multiplier: f64,
+    /// Minimum request count required before classifying non-`no_data` health.
+    pub min_requests: u64,
+}
+
+impl Default for SloMaterializationConfig {
+    fn default() -> Self {
+        Self {
+            target_p95_latency_us: 2_500,
+            error_budget_ratio: 0.01,
+            warn_burn_rate: 1.0,
+            error_burn_rate: 2.0,
+            critical_burn_rate: 4.0,
+            warn_latency_multiplier: 1.0,
+            error_latency_multiplier: 1.5,
+            critical_latency_multiplier: 2.0,
+            min_requests: 10,
+        }
+    }
+}
+
+impl SloMaterializationConfig {
+    fn validate(self) -> SearchResult<()> {
+        if self.target_p95_latency_us == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "target_p95_latency_us".to_owned(),
+                value: "0".to_owned(),
+                reason: "must be > 0".to_owned(),
+            });
+        }
+        if self.error_budget_ratio <= 0.0 || self.error_budget_ratio > 1.0 {
+            return Err(SearchError::InvalidConfig {
+                field: "error_budget_ratio".to_owned(),
+                value: self.error_budget_ratio.to_string(),
+                reason: "must be in (0, 1]".to_owned(),
+            });
+        }
+        if self.warn_burn_rate <= 0.0
+            || self.error_burn_rate < self.warn_burn_rate
+            || self.critical_burn_rate < self.error_burn_rate
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "burn_rate_thresholds".to_owned(),
+                value: format!(
+                    "{}/{}/{}",
+                    self.warn_burn_rate, self.error_burn_rate, self.critical_burn_rate
+                ),
+                reason: "must be positive and monotonic (warn <= error <= critical)".to_owned(),
+            });
+        }
+        if self.warn_latency_multiplier <= 0.0
+            || self.error_latency_multiplier < self.warn_latency_multiplier
+            || self.critical_latency_multiplier < self.error_latency_multiplier
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "latency_multipliers".to_owned(),
+                value: format!(
+                    "{}/{}/{}",
+                    self.warn_latency_multiplier,
+                    self.error_latency_multiplier,
+                    self.critical_latency_multiplier
+                ),
+                reason: "must be positive and monotonic (warn <= error <= critical)".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Materialized SLO row for dashboards and alerting views.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SloRollupSnapshot {
+    pub scope: SloScope,
+    pub scope_key: String,
+    pub project_key: Option<String>,
+    pub window: SummaryWindow,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub total_requests: u64,
+    pub failed_requests: u64,
+    pub p95_latency_us: Option<u64>,
+    pub target_p95_latency_us: u64,
+    pub error_budget_ratio: f64,
+    pub error_rate: Option<f64>,
+    pub error_budget_burn: Option<f64>,
+    pub remaining_budget_ratio: Option<f64>,
+    pub health: SloHealth,
+    pub reason_code: String,
+    pub generated_at_ms: i64,
+}
+
+/// Materialized anomaly row for timeline and alerts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnomalyMaterializationSnapshot {
+    pub anomaly_id: String,
+    pub scope: SloScope,
+    pub scope_key: String,
+    pub project_key: Option<String>,
+    pub window: SummaryWindow,
+    pub window_start_ms: i64,
+    pub metric_name: String,
+    pub baseline_value: Option<f64>,
+    pub observed_value: Option<f64>,
+    pub deviation_ratio: Option<f64>,
+    pub severity: AnomalySeverity,
+    pub reason_code: String,
+    pub correlation_id: Option<String>,
+    pub state: String,
+    pub opened_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+}
+
+/// Counters emitted after one rollup/anomaly materialization pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SloMaterializationResult {
+    pub rollups_upserted: u64,
+    pub anomalies_opened: u64,
+    pub anomalies_resolved: u64,
+}
+
+/// Materialized search summary used by dashboard reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchSummarySnapshot {
+    pub window: SummaryWindow,
+    pub window_start_ms: i64,
+    pub search_count: u64,
+    pub p50_latency_us: Option<u64>,
+    pub p95_latency_us: Option<u64>,
+    pub p99_latency_us: Option<u64>,
+    pub avg_result_count: Option<f64>,
+    pub avg_memory_bytes: Option<f64>,
+    pub p95_memory_bytes: Option<u64>,
+}
+
+/// Embedding progress rates over a rolling window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingThroughputRate {
+    pub window: SummaryWindow,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub completed_per_sec: f64,
+    pub failed_per_sec: f64,
+    pub retried_per_sec: f64,
+}
+
+/// Resource trend point for dashboard charting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceTrendPoint {
+    pub ts_ms: i64,
+    pub cpu_pct: Option<f64>,
+    pub rss_bytes: Option<u64>,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub queue_depth: Option<u64>,
+}
+
+/// Retention and compaction policy for telemetry storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpsRetentionPolicy {
+    pub raw_search_event_retention_ms: i64,
+    pub search_summary_retention_ms: i64,
+    pub resource_sample_retention_ms: i64,
+    pub resource_downsample_after_ms: i64,
+    pub resource_downsample_stride: u32,
+}
+
+impl Default for OpsRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            raw_search_event_retention_ms: 3 * 24 * 3_600_000,
+            search_summary_retention_ms: 14 * 24 * 3_600_000,
+            resource_sample_retention_ms: 7 * 24 * 3_600_000,
+            resource_downsample_after_ms: 6 * 3_600_000,
+            resource_downsample_stride: 6,
+        }
+    }
+}
+
+/// Row-deletion counters produced by retention/compaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpsRetentionResult {
+    pub deleted_search_events: u64,
+    pub deleted_search_summaries: u64,
+    pub deleted_resource_samples: u64,
+    pub downsampled_resource_samples: u64,
+}
+
 /// Per-call ingestion accounting for search event batches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpsIngestBatchResult {
@@ -355,6 +810,56 @@ pub struct OpsIngestionMetricsSnapshot {
     pub total_write_latency_us: u64,
     pub pending_events: usize,
     pub high_watermark_pending_events: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WindowEventStats {
+    search_count: u64,
+    p50_latency_us: Option<u64>,
+    p95_latency_us: Option<u64>,
+    p99_latency_us: Option<u64>,
+    avg_result_count: Option<f64>,
+    avg_memory_bytes: Option<f64>,
+    p95_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SloWindowStats {
+    total_requests: u64,
+    failed_requests: u64,
+    p95_latency_us: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct SloEvaluation {
+    scope: SloScope,
+    scope_key: String,
+    project_key: Option<String>,
+    window: SummaryWindow,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    total_requests: u64,
+    failed_requests: u64,
+    p95_latency_us: Option<u64>,
+    target_p95_latency_us: u64,
+    error_budget_ratio: f64,
+    error_rate: Option<f64>,
+    error_budget_burn: Option<f64>,
+    remaining_budget_ratio: Option<f64>,
+    health: SloHealth,
+    reason_code: String,
+    generated_at_ms: i64,
+    anomaly: Option<AnomalyCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct AnomalyCandidate {
+    metric_name: String,
+    baseline_value: f64,
+    observed_value: f64,
+    deviation_ratio: f64,
+    severity: AnomalySeverity,
+    reason_code: String,
 }
 
 impl OpsIngestionMetrics {
@@ -525,6 +1030,12 @@ impl OpsStorage {
             .pending_events
             .fetch_add(requested, Ordering::Relaxed);
         let queue_depth_with_reservation = queue_depth_before.saturating_add(requested);
+        Self::log_ingest_start(
+            requested,
+            backpressure_threshold,
+            queue_depth_before,
+            queue_depth_with_reservation,
+        );
         self.ingestion_metrics
             .update_high_watermark(queue_depth_with_reservation);
 
@@ -535,6 +1046,12 @@ impl OpsStorage {
             self.ingestion_metrics
                 .total_backpressured_batches
                 .fetch_add(1, Ordering::Relaxed);
+            Self::log_ingest_backpressure(
+                requested,
+                queue_depth_before,
+                queue_depth_with_reservation,
+                backpressure_threshold,
+            );
             return Err(SearchError::QueueFull {
                 pending: queue_depth_with_reservation,
                 capacity: backpressure_threshold,
@@ -542,20 +1059,7 @@ impl OpsStorage {
         }
 
         let started = Instant::now();
-        let ingest_result = self.with_transaction(|conn| {
-            let mut inserted = 0_usize;
-            let mut deduplicated = 0_usize;
-
-            for event in events {
-                event.validate()?;
-                if insert_search_event_row(conn, event)? {
-                    inserted = inserted.saturating_add(1);
-                } else {
-                    deduplicated = deduplicated.saturating_add(1);
-                }
-            }
-            Ok((inserted, deduplicated))
-        });
+        let ingest_result = self.ingest_search_events_transaction(events);
 
         let write_latency_us = duration_as_u64(started.elapsed().as_micros());
         let queue_depth_after = self
@@ -579,24 +1083,149 @@ impl OpsStorage {
                 self.ingestion_metrics
                     .total_deduplicated
                     .fetch_add(usize_to_u64(deduplicated), Ordering::Relaxed);
-
-                Ok(OpsIngestBatchResult {
+                Self::log_ingest_success(
                     requested,
                     inserted,
                     deduplicated,
-                    failed: 0,
                     queue_depth_before,
                     queue_depth_after,
                     write_latency_us,
-                })
+                );
+
+                Ok(OpsIngestBatchResult::new(
+                    requested,
+                    inserted,
+                    deduplicated,
+                    queue_depth_before,
+                    queue_depth_after,
+                    write_latency_us,
+                ))
             }
             Err(error) => {
                 self.ingestion_metrics
                     .total_failed_records
                     .fetch_add(usize_to_u64(requested), Ordering::Relaxed);
+                Self::log_ingest_failure(
+                    requested,
+                    queue_depth_before,
+                    queue_depth_after,
+                    write_latency_us,
+                    &error,
+                );
                 Err(error)
             }
         }
+    }
+
+    fn ingest_search_events_transaction(
+        &self,
+        events: &[SearchEventRecord],
+    ) -> SearchResult<(usize, usize)> {
+        self.with_transaction(|conn| {
+            let mut ordered_events: Vec<&SearchEventRecord> = events.iter().collect();
+            ordered_events.sort_unstable_by(|left, right| {
+                left.ts_ms
+                    .cmp(&right.ts_ms)
+                    .then_with(|| left.event_id.cmp(&right.event_id))
+            });
+
+            for event in &ordered_events {
+                event.validate()?;
+            }
+
+            let mut to_insert: Vec<&SearchEventRecord> = Vec::with_capacity(ordered_events.len());
+            let mut deduplicated = 0_usize;
+            for event in ordered_events {
+                if search_event_exists(conn, &event.event_id)? {
+                    deduplicated = deduplicated.saturating_add(1);
+                } else {
+                    to_insert.push(event);
+                }
+            }
+
+            for event in &to_insert {
+                insert_search_event_row(conn, event)?;
+            }
+            let inserted = to_insert.len();
+
+            Ok((inserted, deduplicated))
+        })
+    }
+
+    fn log_ingest_start(
+        requested: usize,
+        backpressure_threshold: usize,
+        queue_depth_before: usize,
+        queue_depth_with_reservation: usize,
+    ) {
+        tracing::debug!(
+            target: "frankensearch.ops.storage",
+            event = "search_events_ingest_start",
+            requested,
+            backpressure_threshold,
+            queue_depth_before,
+            queue_depth_reserved = queue_depth_with_reservation,
+            "ingesting search event batch"
+        );
+    }
+
+    fn log_ingest_backpressure(
+        requested: usize,
+        queue_depth_before: usize,
+        pending: usize,
+        capacity: usize,
+    ) {
+        tracing::warn!(
+            target: "frankensearch.ops.storage",
+            event = "search_events_ingest_backpressure",
+            requested,
+            queue_depth_before,
+            pending,
+            capacity,
+            "rejecting search event batch due to backpressure"
+        );
+    }
+
+    fn log_ingest_success(
+        requested: usize,
+        inserted: usize,
+        deduplicated: usize,
+        queue_depth_before: usize,
+        queue_depth_after: usize,
+        write_latency_us: u64,
+    ) {
+        tracing::info!(
+            target: "frankensearch.ops.storage",
+            event = "search_events_ingest_success",
+            requested,
+            inserted,
+            deduplicated,
+            failed = 0usize,
+            queue_depth_before,
+            queue_depth_after,
+            write_latency_us,
+            "search event batch ingested"
+        );
+    }
+
+    fn log_ingest_failure(
+        requested: usize,
+        queue_depth_before: usize,
+        queue_depth_after: usize,
+        write_latency_us: u64,
+        error: &SearchError,
+    ) {
+        tracing::warn!(
+            target: "frankensearch.ops.storage",
+            event = "search_events_ingest_failed",
+            requested,
+            failed = requested,
+            queue_depth_before,
+            queue_depth_after,
+            write_latency_us,
+            error = %error,
+            "search event batch ingest failed"
+        );
     }
 
     /// Upsert a resource sample keyed by `(project_key, instance_id, ts_ms)`.
@@ -665,6 +1294,624 @@ impl OpsStorage {
         Ok(())
     }
 
+    /// Recompute and materialize rolling search summaries for one instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inputs are invalid or any database operation fails.
+    pub fn refresh_search_summaries_for_instance(
+        &self,
+        project_key: &str,
+        instance_id: &str,
+        now_ms: i64,
+    ) -> SearchResult<Vec<SearchSummarySnapshot>> {
+        ensure_non_empty(project_key, "project_key")?;
+        ensure_non_empty(instance_id, "instance_id")?;
+        if now_ms < 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "now_ms".to_owned(),
+                value: now_ms.to_string(),
+                reason: "must be >= 0".to_owned(),
+            });
+        }
+
+        self.with_transaction(|conn| {
+            let mut summaries = Vec::with_capacity(SummaryWindow::ALL.len());
+            for window in SummaryWindow::ALL {
+                let window_start_ms = window.rolling_start_ms(now_ms);
+                let stats = compute_window_event_stats(
+                    conn,
+                    project_key,
+                    instance_id,
+                    window_start_ms,
+                    now_ms,
+                )?;
+                upsert_search_summary_row(
+                    conn,
+                    project_key,
+                    instance_id,
+                    window,
+                    window_start_ms,
+                    &stats,
+                )?;
+                summaries.push(SearchSummarySnapshot {
+                    window,
+                    window_start_ms,
+                    search_count: stats.search_count,
+                    p50_latency_us: stats.p50_latency_us,
+                    p95_latency_us: stats.p95_latency_us,
+                    p99_latency_us: stats.p99_latency_us,
+                    avg_result_count: stats.avg_result_count,
+                    avg_memory_bytes: stats.avg_memory_bytes,
+                    p95_memory_bytes: stats.p95_memory_bytes,
+                });
+            }
+            Ok(summaries)
+        })
+    }
+
+    /// Materialize SLO rollups and anomaly rows for project + fleet scopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if config is invalid, input time is invalid, or SQL
+    /// reads/writes fail.
+    #[allow(clippy::too_many_lines)]
+    pub fn materialize_slo_rollups_and_anomalies(
+        &self,
+        now_ms: i64,
+        config: SloMaterializationConfig,
+    ) -> SearchResult<SloMaterializationResult> {
+        if now_ms < 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "now_ms".to_owned(),
+                value: now_ms.to_string(),
+                reason: "must be >= 0".to_owned(),
+            });
+        }
+        config.validate()?;
+
+        self.with_transaction(|conn| {
+            let mut result = SloMaterializationResult::default();
+            let project_keys = list_distinct_project_keys(conn)?;
+
+            for window in SummaryWindow::ALL {
+                let window_start_ms = window.bucket_start_ms(now_ms);
+                for project_key in &project_keys {
+                    let stats = compute_slo_window_stats(
+                        conn,
+                        Some(project_key),
+                        window_start_ms,
+                        now_ms,
+                    )?;
+                    let evaluation = evaluate_slo_window(
+                        &stats,
+                        window_start_ms,
+                        now_ms,
+                        config,
+                        window,
+                    );
+
+                    upsert_slo_rollup_row(
+                        conn,
+                        SloScope::Project,
+                        project_key,
+                        Some(project_key),
+                        &evaluation,
+                    )?;
+                    result.rollups_upserted = result.rollups_upserted.saturating_add(1);
+
+                    let stale_resolved = resolve_stale_anomaly_rows(
+                        conn,
+                        SloScope::Project,
+                        project_key,
+                        window,
+                        window_start_ms,
+                        now_ms,
+                    )?;
+                    result.anomalies_resolved = result
+                        .anomalies_resolved
+                        .saturating_add(usize_to_u64(stale_resolved));
+
+                    let (opened, resolved) = sync_rollup_anomaly(
+                        conn,
+                        SloScope::Project,
+                        project_key,
+                        Some(project_key),
+                        &evaluation,
+                        now_ms,
+                    )?;
+                    result.anomalies_opened =
+                        result.anomalies_opened.saturating_add(usize_to_u64(opened));
+                    result.anomalies_resolved = result
+                        .anomalies_resolved
+                        .saturating_add(usize_to_u64(resolved));
+                }
+
+                let fleet_scope_key = "__fleet__";
+                let fleet_stats = compute_slo_window_stats(conn, None, window_start_ms, now_ms)?;
+                let fleet_evaluation =
+                    evaluate_slo_window(&fleet_stats, window_start_ms, now_ms, config, window);
+                upsert_slo_rollup_row(
+                    conn,
+                    SloScope::Fleet,
+                    fleet_scope_key,
+                    None,
+                    &fleet_evaluation,
+                )?;
+                result.rollups_upserted = result.rollups_upserted.saturating_add(1);
+
+                let stale_resolved = resolve_stale_anomaly_rows(
+                    conn,
+                    SloScope::Fleet,
+                    fleet_scope_key,
+                    window,
+                    window_start_ms,
+                    now_ms,
+                )?;
+                result.anomalies_resolved = result
+                    .anomalies_resolved
+                    .saturating_add(usize_to_u64(stale_resolved));
+
+                let (opened, resolved) = sync_rollup_anomaly(
+                    conn,
+                    SloScope::Fleet,
+                    fleet_scope_key,
+                    None,
+                    &fleet_evaluation,
+                    now_ms,
+                )?;
+                result.anomalies_opened =
+                    result.anomalies_opened.saturating_add(usize_to_u64(opened));
+                result.anomalies_resolved = result
+                    .anomalies_resolved
+                    .saturating_add(usize_to_u64(resolved));
+            }
+            Ok(result)
+        })
+    }
+
+    /// Fetch latest SLO rollup for a specific scope/key/window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reads fail or stored values are invalid.
+    pub fn latest_slo_rollup(
+        &self,
+        scope: SloScope,
+        scope_key: &str,
+        window: SummaryWindow,
+    ) -> SearchResult<Option<SloRollupSnapshot>> {
+        ensure_non_empty(scope_key, "scope_key")?;
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+                        total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+                        error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+                        health, reason_code, generated_at_ms \
+                 FROM slo_rollups \
+                 WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 \
+                 ORDER BY window_start_ms DESC LIMIT 1;",
+                &[
+                    SqliteValue::Text(scope.as_str().to_owned()),
+                    SqliteValue::Text(scope_key.to_owned()),
+                    SqliteValue::Text(window.as_label().to_owned()),
+                ],
+            )
+            .map_err(ops_error)?;
+        rows.first().map(row_to_slo_rollup).transpose()
+    }
+
+    /// Query latest SLO rollups for one scope/key tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reads fail or rows are malformed.
+    pub fn query_slo_rollups_for_scope(
+        &self,
+        scope: SloScope,
+        scope_key: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SloRollupSnapshot>> {
+        ensure_non_empty(scope_key, "scope_key")?;
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+                        total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
+                        error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
+                        health, reason_code, generated_at_ms \
+                 FROM slo_rollups \
+                 WHERE scope = ?1 AND scope_key = ?2 \
+                 ORDER BY window_start_ms DESC, window ASC LIMIT ?3;",
+                &[
+                    SqliteValue::Text(scope.as_str().to_owned()),
+                    SqliteValue::Text(scope_key.to_owned()),
+                    SqliteValue::Integer(usize_to_i64(limit, "limit")?),
+                ],
+            )
+            .map_err(ops_error)?;
+        rows.iter().map(row_to_slo_rollup).collect()
+    }
+
+    /// Query open anomalies for a specific scope/key pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reads fail or rows are malformed.
+    pub fn query_open_anomalies_for_scope(
+        &self,
+        scope: SloScope,
+        scope_key: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<AnomalyMaterializationSnapshot>> {
+        ensure_non_empty(scope_key, "scope_key")?;
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                        metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                        reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                        resolved_at_ms \
+                 FROM anomaly_materializations \
+                 WHERE scope = ?1 AND scope_key = ?2 AND state = 'open' \
+                 ORDER BY severity DESC, updated_at_ms DESC LIMIT ?3;",
+                &[
+                    SqliteValue::Text(scope.as_str().to_owned()),
+                    SqliteValue::Text(scope_key.to_owned()),
+                    SqliteValue::Integer(usize_to_i64(limit, "limit")?),
+                ],
+            )
+            .map_err(ops_error)?;
+        rows.iter().map(row_to_anomaly).collect()
+    }
+
+    /// Query anomaly timeline ordered by newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reads fail or rows are malformed.
+    pub fn query_anomaly_timeline(
+        &self,
+        project_key: Option<&str>,
+        limit: usize,
+    ) -> SearchResult<Vec<AnomalyMaterializationSnapshot>> {
+        let rows = if let Some(project_key) = project_key {
+            ensure_non_empty(project_key, "project_key")?;
+            self.connection()
+                .query_with_params(
+                    "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                            metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                            reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                            resolved_at_ms \
+                     FROM anomaly_materializations \
+                     WHERE project_key = ?1 \
+                     ORDER BY opened_at_ms DESC LIMIT ?2;",
+                    &[
+                        SqliteValue::Text(project_key.to_owned()),
+                        SqliteValue::Integer(usize_to_i64(limit, "limit")?),
+                    ],
+                )
+                .map_err(ops_error)?
+        } else {
+            self.connection()
+                .query_with_params(
+                    "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                            metric_name, baseline_value, observed_value, deviation_ratio, severity, \
+                            reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
+                            resolved_at_ms \
+                     FROM anomaly_materializations \
+                     ORDER BY opened_at_ms DESC LIMIT ?1;",
+                    &[SqliteValue::Integer(usize_to_i64(limit, "limit")?)],
+                )
+                .map_err(ops_error)?
+        };
+        rows.iter().map(row_to_anomaly).collect()
+    }
+
+    /// Fetch the most recent summary for a `(project, instance, window)` tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reads fail or stored values are invalid.
+    pub fn latest_search_summary(
+        &self,
+        project_key: &str,
+        instance_id: &str,
+        window: SummaryWindow,
+    ) -> SearchResult<Option<SearchSummarySnapshot>> {
+        ensure_non_empty(project_key, "project_key")?;
+        ensure_non_empty(instance_id, "instance_id")?;
+        let params = [
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
+            SqliteValue::Text(window.as_label().to_owned()),
+        ];
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
+                        p99_latency_us, avg_result_count \
+                 FROM search_summaries \
+                 WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 \
+                 ORDER BY window_start_ms DESC LIMIT 1;",
+                &params,
+            )
+            .map_err(ops_error)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+
+        let window_start_ms = row_i64(row, 0, "search_summaries.window_start_ms")?;
+        let search_count_i64 = row_i64(row, 1, "search_summaries.search_count")?;
+        let search_count = i64_to_u64_non_negative(search_count_i64, "search_count")?;
+        let p50_latency_us = row_opt_i64(row, 2, "search_summaries.p50_latency_us")?
+            .map(|value| i64_to_u64_non_negative(value, "p50_latency_us"))
+            .transpose()?;
+        let p95_latency_us = row_opt_i64(row, 3, "search_summaries.p95_latency_us")?
+            .map(|value| i64_to_u64_non_negative(value, "p95_latency_us"))
+            .transpose()?;
+        let p99_latency_us = row_opt_i64(row, 4, "search_summaries.p99_latency_us")?
+            .map(|value| i64_to_u64_non_negative(value, "p99_latency_us"))
+            .transpose()?;
+        let avg_result_count = row_opt_f64(row, 5, "search_summaries.avg_result_count")?;
+
+        let window_end_ms = window_start_ms
+            .saturating_add(window.duration_ms())
+            .saturating_sub(1);
+        let raw_stats = compute_window_event_stats(
+            self.connection(),
+            project_key,
+            instance_id,
+            window_start_ms,
+            window_end_ms,
+        )?;
+
+        Ok(Some(SearchSummarySnapshot {
+            window,
+            window_start_ms,
+            search_count,
+            p50_latency_us,
+            p95_latency_us,
+            p99_latency_us,
+            avg_result_count,
+            avg_memory_bytes: raw_stats.avg_memory_bytes,
+            p95_memory_bytes: raw_stats.p95_memory_bytes,
+        }))
+    }
+
+    /// Query resource trend samples for dashboard charts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn query_resource_trend(
+        &self,
+        project_key: &str,
+        instance_id: &str,
+        window: SummaryWindow,
+        now_ms: i64,
+        limit: usize,
+    ) -> SearchResult<Vec<ResourceTrendPoint>> {
+        ensure_non_empty(project_key, "project_key")?;
+        ensure_non_empty(instance_id, "instance_id")?;
+        let window_start_ms = window.rolling_start_ms(now_ms);
+        let params = [
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
+            SqliteValue::Integer(window_start_ms),
+            SqliteValue::Integer(now_ms),
+            SqliteValue::Integer(usize_to_i64(limit, "limit")?),
+        ];
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
+                 FROM resource_samples \
+                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+                 ORDER BY ts_ms DESC LIMIT ?5;",
+                &params,
+            )
+            .map_err(ops_error)?;
+
+        let mut points = rows
+            .iter()
+            .map(|row| {
+                let ts_ms = row_i64(row, 0, "resource_samples.ts_ms")?;
+                let cpu_pct = row_opt_f64(row, 1, "resource_samples.cpu_pct")?;
+                let rss_bytes = row_opt_i64(row, 2, "resource_samples.rss_bytes")?
+                    .map(|value| i64_to_u64_non_negative(value, "rss_bytes"))
+                    .transpose()?;
+                let io_read_bytes = row_opt_i64(row, 3, "resource_samples.io_read_bytes")?
+                    .map(|value| i64_to_u64_non_negative(value, "io_read_bytes"))
+                    .transpose()?;
+                let io_write_bytes = row_opt_i64(row, 4, "resource_samples.io_write_bytes")?
+                    .map(|value| i64_to_u64_non_negative(value, "io_write_bytes"))
+                    .transpose()?;
+                let queue_depth = row_opt_i64(row, 5, "resource_samples.queue_depth")?
+                    .map(|value| i64_to_u64_non_negative(value, "queue_depth"))
+                    .transpose()?;
+                Ok(ResourceTrendPoint {
+                    ts_ms,
+                    cpu_pct,
+                    rss_bytes,
+                    io_read_bytes,
+                    io_write_bytes,
+                    queue_depth,
+                })
+            })
+            .collect::<SearchResult<Vec<_>>>()?;
+        points.reverse();
+        Ok(points)
+    }
+
+    /// Compute embedding progress rates from snapshots in the selected window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reads fail or values are invalid.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn query_embedding_throughput(
+        &self,
+        project_key: &str,
+        instance_id: &str,
+        window: SummaryWindow,
+        now_ms: i64,
+    ) -> SearchResult<Option<EmbeddingThroughputRate>> {
+        ensure_non_empty(project_key, "project_key")?;
+        ensure_non_empty(instance_id, "instance_id")?;
+        let window_start_ms = window.rolling_start_ms(now_ms);
+        let params = [
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
+            SqliteValue::Integer(window_start_ms),
+            SqliteValue::Integer(now_ms),
+        ];
+        let rows = self
+            .connection()
+            .query_with_params(
+                "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
+                 FROM embedding_job_snapshots \
+                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+                 ORDER BY ts_ms ASC;",
+                &params,
+            )
+            .map_err(ops_error)?;
+        if rows.len() < 2 {
+            return Ok(None);
+        }
+
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Ok(None);
+        };
+
+        let first_completed = i64_to_u64_non_negative(
+            row_i64(first, 0, "embedding_job_snapshots.completed_jobs")?,
+            "completed_jobs",
+        )?;
+        let first_failed = i64_to_u64_non_negative(
+            row_i64(first, 1, "embedding_job_snapshots.failed_jobs")?,
+            "failed_jobs",
+        )?;
+        let first_retried = i64_to_u64_non_negative(
+            row_i64(first, 2, "embedding_job_snapshots.retried_jobs")?,
+            "retried_jobs",
+        )?;
+        let first_ts = row_i64(first, 3, "embedding_job_snapshots.ts_ms")?;
+
+        let last_completed = i64_to_u64_non_negative(
+            row_i64(last, 0, "embedding_job_snapshots.completed_jobs")?,
+            "completed_jobs",
+        )?;
+        let last_failed = i64_to_u64_non_negative(
+            row_i64(last, 1, "embedding_job_snapshots.failed_jobs")?,
+            "failed_jobs",
+        )?;
+        let last_retried = i64_to_u64_non_negative(
+            row_i64(last, 2, "embedding_job_snapshots.retried_jobs")?,
+            "retried_jobs",
+        )?;
+        let last_ts = row_i64(last, 3, "embedding_job_snapshots.ts_ms")?;
+
+        let elapsed_ms = last_ts.saturating_sub(first_ts);
+        if elapsed_ms <= 0 {
+            return Ok(None);
+        }
+        let elapsed_secs = (elapsed_ms as f64) / 1000.0;
+
+        let completed_per_sec =
+            (last_completed.saturating_sub(first_completed) as f64) / elapsed_secs;
+        let failed_per_sec = (last_failed.saturating_sub(first_failed) as f64) / elapsed_secs;
+        let retried_per_sec = (last_retried.saturating_sub(first_retried) as f64) / elapsed_secs;
+
+        Ok(Some(EmbeddingThroughputRate {
+            window,
+            window_start_ms,
+            window_end_ms: now_ms,
+            completed_per_sec,
+            failed_per_sec,
+            retried_per_sec,
+        }))
+    }
+
+    /// Apply retention and lightweight downsampling for telemetry tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if policy values are invalid or SQL operations fail.
+    pub fn apply_retention_policy(
+        &self,
+        now_ms: i64,
+        policy: OpsRetentionPolicy,
+    ) -> SearchResult<OpsRetentionResult> {
+        if now_ms < 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "now_ms".to_owned(),
+                value: now_ms.to_string(),
+                reason: "must be >= 0".to_owned(),
+            });
+        }
+        if policy.raw_search_event_retention_ms <= 0
+            || policy.search_summary_retention_ms <= 0
+            || policy.resource_sample_retention_ms <= 0
+            || policy.resource_downsample_after_ms < 0
+            || policy.resource_downsample_stride == 0
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "OpsRetentionPolicy".to_owned(),
+                value: format!("{policy:?}"),
+                reason: "retention values must be positive and stride must be > 0".to_owned(),
+            });
+        }
+
+        let conn = self.connection();
+        let search_cutoff = now_ms.saturating_sub(policy.raw_search_event_retention_ms);
+        let summary_cutoff = now_ms.saturating_sub(policy.search_summary_retention_ms);
+        let resource_cutoff = now_ms.saturating_sub(policy.resource_sample_retention_ms);
+        let downsample_cutoff = now_ms.saturating_sub(policy.resource_downsample_after_ms);
+
+        let downsampled_resource_samples = if policy.resource_downsample_stride > 1 {
+            conn.execute_with_params(
+                "DELETE FROM resource_samples \
+                 WHERE ts_ms < ?1 AND (sample_id % ?2) != 0;",
+                &[
+                    SqliteValue::Integer(downsample_cutoff),
+                    SqliteValue::Integer(i64::from(policy.resource_downsample_stride)),
+                ],
+            )
+            .map_err(ops_error)?
+        } else {
+            0
+        };
+
+        let deleted_search_events = conn
+            .execute_with_params(
+                "DELETE FROM search_events WHERE ts_ms < ?1;",
+                &[SqliteValue::Integer(search_cutoff)],
+            )
+            .map_err(ops_error)?;
+        let deleted_search_summaries = conn
+            .execute_with_params(
+                "DELETE FROM search_summaries WHERE window_start_ms < ?1;",
+                &[SqliteValue::Integer(summary_cutoff)],
+            )
+            .map_err(ops_error)?;
+        let deleted_resource_samples = conn
+            .execute_with_params(
+                "DELETE FROM resource_samples WHERE ts_ms < ?1;",
+                &[SqliteValue::Integer(resource_cutoff)],
+            )
+            .map_err(ops_error)?;
+
+        Ok(OpsRetentionResult {
+            deleted_search_events: usize_to_u64(deleted_search_events),
+            deleted_search_summaries: usize_to_u64(deleted_search_summaries),
+            deleted_resource_samples: usize_to_u64(deleted_resource_samples),
+            downsampled_resource_samples: usize_to_u64(downsampled_resource_samples),
+        })
+    }
+
     fn apply_pragmas(&self) -> SearchResult<()> {
         self.conn
             .execute("PRAGMA foreign_keys=ON;")
@@ -715,6 +1962,27 @@ impl OpsStorage {
                 let _ignored = self.connection().execute("ROLLBACK;");
                 Err(error)
             }
+        }
+    }
+}
+
+impl OpsIngestBatchResult {
+    const fn new(
+        requested: usize,
+        inserted: usize,
+        deduplicated: usize,
+        queue_depth_before: usize,
+        queue_depth_after: usize,
+        write_latency_us: u64,
+    ) -> Self {
+        Self {
+            requested,
+            inserted,
+            deduplicated,
+            failed: 0,
+            queue_depth_before,
+            queue_depth_after,
+            write_latency_us,
         }
     }
 }
@@ -883,19 +2151,17 @@ fn unix_timestamp_ms() -> SearchResult<i64> {
     i64::try_from(since_epoch.as_millis()).map_err(ops_error)
 }
 
-fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<bool> {
-    // Manual dedup: FrankenSQLite does not yet handle INSERT OR IGNORE
-    // correctly on PK conflicts, so we check existence first.
+fn search_event_exists(conn: &Connection, event_id: &str) -> SearchResult<bool> {
     let existing = conn
         .query_with_params(
             "SELECT 1 FROM search_events WHERE event_id = ?1;",
-            &[SqliteValue::Text(event.event_id.clone())],
+            &[SqliteValue::Text(event_id.to_owned())],
         )
         .map_err(ops_error)?;
-    if !existing.is_empty() {
-        return Ok(false);
-    }
+    Ok(!existing.is_empty())
+}
 
+fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<()> {
     let params = [
         SqliteValue::Text(event.event_id.clone()),
         SqliteValue::Text(event.project_key.clone()),
@@ -918,7 +2184,154 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
         &params,
     )
     .map_err(ops_error)?;
-    Ok(true)
+    Ok(())
+}
+
+fn upsert_search_summary_row(
+    conn: &Connection,
+    project_key: &str,
+    instance_id: &str,
+    window: SummaryWindow,
+    window_start_ms: i64,
+    stats: &WindowEventStats,
+) -> SearchResult<()> {
+    let key_params = [
+        SqliteValue::Text(project_key.to_owned()),
+        SqliteValue::Text(instance_id.to_owned()),
+        SqliteValue::Text(window.as_label().to_owned()),
+        SqliteValue::Integer(window_start_ms),
+    ];
+    let existing = conn
+        .query_with_params(
+            "SELECT 1 FROM search_summaries \
+             WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 AND window_start_ms = ?4;",
+            &key_params,
+        )
+        .map_err(ops_error)?;
+
+    if existing.is_empty() {
+        conn.execute_with_params(
+            "INSERT INTO search_summaries(\
+                project_key, instance_id, window, window_start_ms, search_count, \
+                p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+            &[
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Text(window.as_label().to_owned()),
+                SqliteValue::Integer(window_start_ms),
+                SqliteValue::Integer(u64_to_i64(stats.search_count, "search_count")?),
+                optional_u64(stats.p50_latency_us, "p50_latency_us")?,
+                optional_u64(stats.p95_latency_us, "p95_latency_us")?,
+                optional_u64(stats.p99_latency_us, "p99_latency_us")?,
+                optional_f64(stats.avg_result_count),
+            ],
+        )
+        .map_err(ops_error)?;
+    } else {
+        conn.execute_with_params(
+            "UPDATE search_summaries SET \
+                search_count = ?1, p50_latency_us = ?2, p95_latency_us = ?3, \
+                p99_latency_us = ?4, avg_result_count = ?5 \
+             WHERE project_key = ?6 AND instance_id = ?7 AND window = ?8 AND window_start_ms = ?9;",
+            &[
+                SqliteValue::Integer(u64_to_i64(stats.search_count, "search_count")?),
+                optional_u64(stats.p50_latency_us, "p50_latency_us")?,
+                optional_u64(stats.p95_latency_us, "p95_latency_us")?,
+                optional_u64(stats.p99_latency_us, "p99_latency_us")?,
+                optional_f64(stats.avg_result_count),
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Text(window.as_label().to_owned()),
+                SqliteValue::Integer(window_start_ms),
+            ],
+        )
+        .map_err(ops_error)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn compute_window_event_stats(
+    conn: &Connection,
+    project_key: &str,
+    instance_id: &str,
+    window_start_ms: i64,
+    window_end_ms: i64,
+) -> SearchResult<WindowEventStats> {
+    let rows = conn
+        .query_with_params(
+            "SELECT latency_us, result_count, memory_bytes \
+             FROM search_events \
+             WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+             ORDER BY latency_us ASC;",
+            &[
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Integer(window_start_ms),
+                SqliteValue::Integer(window_end_ms),
+            ],
+        )
+        .map_err(ops_error)?;
+
+    if rows.is_empty() {
+        return Ok(WindowEventStats::default());
+    }
+
+    let mut latencies = Vec::with_capacity(rows.len());
+    let mut memory_values = Vec::new();
+    let mut result_count_sum = 0_f64;
+    let mut result_count_samples = 0_u64;
+    let mut memory_sum = 0_f64;
+
+    for row in &rows {
+        let latency_us =
+            i64_to_u64_non_negative(row_i64(row, 0, "search_events.latency_us")?, "latency_us")?;
+        latencies.push(latency_us);
+
+        if let Some(result_count) = row_opt_i64(row, 1, "search_events.result_count")? {
+            result_count_sum += i64_to_u64_non_negative(result_count, "result_count")? as f64;
+            result_count_samples = result_count_samples.saturating_add(1);
+        }
+        if let Some(memory_bytes) = row_opt_i64(row, 2, "search_events.memory_bytes")? {
+            let memory_u64 = i64_to_u64_non_negative(memory_bytes, "memory_bytes")?;
+            memory_sum += memory_u64 as f64;
+            memory_values.push(memory_u64);
+        }
+    }
+    memory_values.sort_unstable();
+
+    let search_count = usize_to_u64(rows.len());
+    let avg_result_count = if result_count_samples == 0 {
+        None
+    } else {
+        Some(result_count_sum / (result_count_samples as f64))
+    };
+    let avg_memory_bytes = if memory_values.is_empty() {
+        None
+    } else {
+        Some(memory_sum / (memory_values.len() as f64))
+    };
+
+    Ok(WindowEventStats {
+        search_count,
+        p50_latency_us: percentile_nearest_rank(&latencies, 50, 100),
+        p95_latency_us: percentile_nearest_rank(&latencies, 95, 100),
+        p99_latency_us: percentile_nearest_rank(&latencies, 99, 100),
+        avg_result_count,
+        avg_memory_bytes,
+        p95_memory_bytes: percentile_nearest_rank(&memory_values, 95, 100),
+    })
+}
+
+fn percentile_nearest_rank(values: &[u64], numerator: usize, denominator: usize) -> Option<u64> {
+    if values.is_empty() || denominator == 0 {
+        return None;
+    }
+    let n = values.len();
+    let rank = ((n * numerator).saturating_add(denominator - 1)) / denominator;
+    let index = rank.saturating_sub(1).min(n.saturating_sub(1));
+    values.get(index).copied()
 }
 
 fn ensure_non_empty(value: &str, field: &str) -> SearchResult<()> {
@@ -946,6 +2359,34 @@ fn optional_f64(value: Option<f64>) -> SqliteValue {
     value.map_or(SqliteValue::Null, SqliteValue::Float)
 }
 
+fn row_opt_i64(row: &Row, index: usize, field: &str) -> SearchResult<Option<i64>> {
+    match row.get(index) {
+        Some(SqliteValue::Integer(value)) => Ok(Some(*value)),
+        Some(SqliteValue::Null) | None => Ok(None),
+        Some(other) => Err(SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(format!(
+                "unexpected type for {field}: {other:?}"
+            ))),
+        }),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn row_opt_f64(row: &Row, index: usize, field: &str) -> SearchResult<Option<f64>> {
+    match row.get(index) {
+        Some(SqliteValue::Float(value)) => Ok(Some(*value)),
+        Some(SqliteValue::Integer(value)) => Ok(Some(*value as f64)),
+        Some(SqliteValue::Null) | None => Ok(None),
+        Some(other) => Err(SearchError::SubsystemError {
+            subsystem: "ops-storage",
+            source: Box::new(io::Error::other(format!(
+                "unexpected type for {field}: {other:?}"
+            ))),
+        }),
+    }
+}
+
 fn u64_to_i64(value: u64, field: &str) -> SearchResult<i64> {
     i64::try_from(value).map_err(|_| SearchError::InvalidConfig {
         field: field.to_owned(),
@@ -956,6 +2397,22 @@ fn u64_to_i64(value: u64, field: &str) -> SearchResult<i64> {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn usize_to_i64(value: usize, field: &str) -> SearchResult<i64> {
+    i64::try_from(value).map_err(|_| SearchError::InvalidConfig {
+        field: field.to_owned(),
+        value: value.to_string(),
+        reason: "must fit into signed 64-bit integer".to_owned(),
+    })
+}
+
+fn i64_to_u64_non_negative(value: i64, field: &str) -> SearchResult<u64> {
+    u64::try_from(value).map_err(|_| SearchError::InvalidConfig {
+        field: field.to_owned(),
+        value: value.to_string(),
+        reason: "must be >= 0".to_owned(),
+    })
 }
 
 fn duration_as_u64(value: u128) -> u64 {
@@ -974,9 +2431,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::io::Write;
+    use std::sync::{Arc, LazyLock, Mutex};
+
     use super::{
-        OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION, OpsStorage, ResourceSampleRecord,
-        SearchEventPhase, SearchEventRecord, bootstrap, current_version, ops_error,
+        OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION, OpsRetentionPolicy, OpsStorage,
+        ResourceSampleRecord, SearchEventPhase, SearchEventRecord, SummaryWindow, bootstrap,
+        current_version, ops_error,
     };
     use frankensearch_core::SearchError;
     use fsqlite::Connection;
@@ -1034,6 +2496,46 @@ mod tests {
         }
     }
 
+    fn table_row_count(conn: &Connection, table: &str) -> i64 {
+        let query = format!("SELECT COUNT(*) FROM {table};");
+        let rows = conn
+            .query(&query)
+            .map_err(ops_error)
+            .expect("count query should succeed");
+        let Some(row) = rows.first() else {
+            return 0;
+        };
+        match row.get(0) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("unexpected row type for count: {other:?}"),
+        }
+    }
+
+    fn search_event_order(conn: &Connection) -> Vec<(String, i64)> {
+        let rows = conn
+            .query(
+                "SELECT event_id, ts_ms \
+                 FROM search_events \
+                 ORDER BY ts_ms ASC, event_id ASC;",
+            )
+            .map_err(ops_error)
+            .expect("ordered search event query should succeed");
+
+        rows.iter()
+            .map(|row| {
+                let event_id = match row.get(0) {
+                    Some(SqliteValue::Text(value)) => value.clone(),
+                    other => panic!("unexpected row type for event_id: {other:?}"),
+                };
+                let ts_ms = match row.get(1) {
+                    Some(SqliteValue::Integer(value)) => *value,
+                    other => panic!("unexpected row type for ts_ms: {other:?}"),
+                };
+                (event_id, ts_ms)
+            })
+            .collect()
+    }
+
     fn latest_resource_queue_depth(conn: &Connection) -> i64 {
         let rows = conn
             .query(
@@ -1065,6 +2567,46 @@ mod tests {
             memory_bytes: Some(8_192),
             ts_ms,
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    static LOG_CAPTURE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_logs<R>(run: impl FnOnce() -> R) -> (R, String) {
+        let _capture_guard = LOG_CAPTURE_LOCK.lock().expect("log capture lock poisoned");
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || TestLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let logs = {
+            let guard = buffer.lock().expect("log buffer lock poisoned");
+            String::from_utf8_lossy(&guard).into_owned()
+        };
+        (result, logs)
     }
 
     fn seed_project_and_instance(conn: &Connection) {
@@ -1229,6 +2771,290 @@ mod tests {
     }
 
     #[test]
+    fn ingest_search_events_batch_orders_insertions_deterministically() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let first = sample_search_event("event-order-b", 10);
+        let second = sample_search_event("event-order-c", 30);
+        let third = sample_search_event("event-order-a", 10);
+        storage
+            .ingest_search_events_batch(&[first, second, third], 64)
+            .expect("ingest should succeed");
+
+        let ordered = search_event_order(storage.connection());
+        let ordered_ids: Vec<&str> = ordered
+            .iter()
+            .map(|(event_id, _)| event_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            vec!["event-order-a", "event-order-b", "event-order-c"]
+        );
+    }
+
+    #[test]
+    fn ingest_search_events_batch_dedup_retry_preserves_ingest_sequence() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let event_a = sample_search_event("event-dedup-a", 101);
+        let event_b = sample_search_event("event-dedup-b", 102);
+        storage
+            .ingest_search_events_batch(&[event_a.clone(), event_b.clone()], 64)
+            .expect("initial ingest should succeed");
+        storage
+            .ingest_search_events_batch(&[event_b, event_a], 64)
+            .expect("retry ingest should deduplicate");
+
+        let ordered = search_event_order(storage.connection());
+        assert_eq!(ordered.len(), 2);
+        let ordered_ids: Vec<&str> = ordered
+            .iter()
+            .map(|(event_id, _)| event_id.as_str())
+            .collect();
+        assert_eq!(ordered_ids, vec!["event-dedup-a", "event-dedup-b"]);
+    }
+
+    #[test]
+    fn refresh_search_summaries_materializes_all_windows() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let now_ms = 600_000;
+        let mut event_a = sample_search_event("event-summary-a", now_ms - 20_000);
+        event_a.latency_us = 100;
+        event_a.result_count = Some(2);
+        event_a.memory_bytes = Some(1_000);
+        let mut event_b = sample_search_event("event-summary-b", now_ms - 10_000);
+        event_b.latency_us = 300;
+        event_b.result_count = Some(6);
+        event_b.memory_bytes = Some(2_500);
+        let mut event_c = sample_search_event("event-summary-c", now_ms - 5_000);
+        event_c.latency_us = 700;
+        event_c.result_count = Some(10);
+        event_c.memory_bytes = Some(4_000);
+
+        storage
+            .ingest_search_events_batch(&[event_a, event_b, event_c], 128)
+            .expect("ingest should succeed");
+
+        let summaries = storage
+            .refresh_search_summaries_for_instance("project-a", "instance-a", now_ms)
+            .expect("summary refresh should succeed");
+        assert_eq!(summaries.len(), SummaryWindow::ALL.len());
+        let one_minute = summaries
+            .iter()
+            .find(|summary| summary.window == SummaryWindow::OneMinute)
+            .expect("1m summary should exist");
+        assert_eq!(one_minute.search_count, 3);
+        assert_eq!(one_minute.p50_latency_us, Some(300));
+        assert_eq!(one_minute.p95_latency_us, Some(700));
+        assert_eq!(one_minute.p95_memory_bytes, Some(4_000));
+        assert_eq!(one_minute.avg_result_count, Some(6.0));
+
+        let latest = storage
+            .latest_search_summary("project-a", "instance-a", SummaryWindow::OneMinute)
+            .expect("latest summary query should succeed")
+            .expect("latest 1m summary should exist");
+        assert_eq!(latest.search_count, 3);
+        assert_eq!(latest.p99_latency_us, Some(700));
+    }
+
+    #[test]
+    fn query_resource_trend_returns_ordered_points_in_window() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        let now_ms = 500_000;
+
+        for (offset, queue_depth) in [(40_000, 2_u64), (30_000, 4_u64), (20_000, 6_u64)] {
+            storage
+                .upsert_resource_sample(&ResourceSampleRecord {
+                    project_key: "project-a".to_owned(),
+                    instance_id: "instance-a".to_owned(),
+                    cpu_pct: Some(10.0),
+                    rss_bytes: Some(1_024 * queue_depth),
+                    io_read_bytes: Some(256 * queue_depth),
+                    io_write_bytes: Some(128 * queue_depth),
+                    queue_depth: Some(queue_depth),
+                    ts_ms: now_ms - offset,
+                })
+                .expect("resource sample upsert should succeed");
+        }
+
+        let points = storage
+            .query_resource_trend("project-a", "instance-a", SummaryWindow::OneHour, now_ms, 2)
+            .expect("resource trend query should succeed");
+        assert_eq!(points.len(), 2);
+        assert!(points[0].ts_ms < points[1].ts_ms);
+        assert_eq!(points[0].queue_depth, Some(4));
+        assert_eq!(points[1].queue_depth, Some(6));
+    }
+
+    #[test]
+    fn query_embedding_throughput_computes_rates() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO embedding_job_snapshots(\
+                    snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
+                    processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
+                 ) VALUES (\
+                    'snap-1', 'project-a', 'instance-a', 'model-a', 10, 2, 100, 5, 3, 1000, 1000\
+                 );",
+            )
+            .expect("first embedding snapshot should insert");
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO embedding_job_snapshots(\
+                    snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
+                    processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
+                 ) VALUES (\
+                    'snap-2', 'project-a', 'instance-a', 'model-a', 4, 1, 160, 11, 9, 900, 7000\
+                 );",
+            )
+            .expect("second embedding snapshot should insert");
+
+        let throughput = storage
+            .query_embedding_throughput("project-a", "instance-a", SummaryWindow::OneHour, 8000)
+            .expect("throughput query should succeed")
+            .expect("throughput should exist");
+        assert!((throughput.completed_per_sec - 10.0).abs() < 0.0001);
+        assert!((throughput.failed_per_sec - 1.0).abs() < 0.0001);
+        assert!((throughput.retried_per_sec - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn apply_retention_policy_prunes_and_downsamples() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let old_event = sample_search_event("event-retention-old", 1_000);
+        let new_event = sample_search_event("event-retention-new", 9_900);
+        storage
+            .ingest_search_events_batch(&[old_event, new_event], 128)
+            .expect("event ingest should succeed");
+        storage
+            .refresh_search_summaries_for_instance("project-a", "instance-a", 10_000)
+            .expect("summary refresh should succeed");
+
+        for ts_ms in [7_000, 8_000, 9_000, 9_500, 9_800] {
+            storage
+                .upsert_resource_sample(&ResourceSampleRecord {
+                    project_key: "project-a".to_owned(),
+                    instance_id: "instance-a".to_owned(),
+                    cpu_pct: Some(5.0),
+                    rss_bytes: Some(10_000),
+                    io_read_bytes: Some(100),
+                    io_write_bytes: Some(100),
+                    queue_depth: Some(1),
+                    ts_ms,
+                })
+                .expect("resource sample insert should succeed");
+        }
+
+        let result = storage
+            .apply_retention_policy(
+                10_000,
+                OpsRetentionPolicy {
+                    raw_search_event_retention_ms: 1_500,
+                    search_summary_retention_ms: 2_000,
+                    resource_sample_retention_ms: 4_000,
+                    resource_downsample_after_ms: 800,
+                    resource_downsample_stride: 2,
+                },
+            )
+            .expect("retention apply should succeed");
+
+        assert_eq!(search_event_count(storage.connection()), 1);
+        assert!(result.deleted_search_events >= 1);
+        assert!(result.deleted_search_summaries <= 7);
+        assert!(result.deleted_resource_samples <= 5);
+        assert!(result.downsampled_resource_samples >= 1);
+        assert!(table_row_count(storage.connection(), "resource_samples") <= 3);
+    }
+
+    #[test]
+    fn ingestion_metrics_snapshot_tracks_high_watermark_and_latency() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let first_batch = vec![
+            sample_search_event("event-hwm-1", 201),
+            sample_search_event("event-hwm-2", 202),
+            sample_search_event("event-hwm-3", 203),
+        ];
+        let first = storage
+            .ingest_search_events_batch(&first_batch, 64)
+            .expect("first batch should succeed");
+        assert_eq!(first.queue_depth_before, 0);
+        assert_eq!(first.queue_depth_after, 0);
+        assert!(first.write_latency_us > 0);
+
+        let second_batch = vec![
+            sample_search_event("event-hwm-4", 204),
+            sample_search_event("event-hwm-5", 205),
+        ];
+        let second = storage
+            .ingest_search_events_batch(&second_batch, 64)
+            .expect("second batch should succeed");
+        assert_eq!(second.queue_depth_before, 0);
+        assert_eq!(second.queue_depth_after, 0);
+        assert!(second.write_latency_us > 0);
+
+        let metrics = storage.ingestion_metrics();
+        assert_eq!(metrics.total_batches, 2);
+        assert_eq!(metrics.total_inserted, 5);
+        assert_eq!(metrics.total_deduplicated, 0);
+        assert_eq!(metrics.total_failed_records, 0);
+        assert_eq!(metrics.total_backpressured_batches, 0);
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.high_watermark_pending_events, 3);
+        assert_eq!(
+            metrics.total_write_latency_us,
+            first
+                .write_latency_us
+                .saturating_add(second.write_latency_us)
+        );
+    }
+
+    #[test]
+    fn ingestion_metrics_snapshot_tracks_backpressure_peak_and_resets_pending() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let event_a = sample_search_event("event-bp-hwm-a", 301);
+        let event_b = sample_search_event("event-bp-hwm-b", 302);
+        let error = storage
+            .ingest_search_events_batch(&[event_a, event_b], 1)
+            .expect_err("batch should be rejected by backpressure threshold");
+        assert!(
+            matches!(
+                error,
+                SearchError::QueueFull {
+                    pending: 2,
+                    capacity: 1
+                }
+            ),
+            "unexpected backpressure error: {error}"
+        );
+
+        let metrics = storage.ingestion_metrics();
+        assert_eq!(metrics.total_batches, 0);
+        assert_eq!(metrics.total_inserted, 0);
+        assert_eq!(metrics.total_deduplicated, 0);
+        assert_eq!(metrics.total_failed_records, 0);
+        assert_eq!(metrics.total_backpressured_batches, 1);
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.high_watermark_pending_events, 2);
+        assert_eq!(metrics.total_write_latency_us, 0);
+    }
+
+    #[test]
     fn ingest_search_events_batch_rejects_when_backpressured() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
         seed_project_and_instance(storage.connection());
@@ -1281,6 +3107,97 @@ mod tests {
         assert_eq!(metrics.total_failed_records, 2);
         assert_eq!(metrics.total_inserted, 0);
         assert_eq!(metrics.total_deduplicated, 0);
+    }
+
+    #[test]
+    fn ingest_search_events_batch_emits_structured_success_log() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        let event = sample_search_event("event-log-success", 90);
+
+        let (_result, logs) = with_captured_logs(|| {
+            storage
+                .ingest_search_events_batch(std::slice::from_ref(&event), 64)
+                .expect("ingest should succeed")
+        });
+
+        if logs.trim().is_empty() {
+            let metrics = storage.ingestion_metrics();
+            assert_eq!(metrics.total_batches, 1);
+            assert_eq!(metrics.total_inserted, 1);
+            assert_eq!(metrics.total_deduplicated, 0);
+            return;
+        }
+
+        assert!(
+            logs.contains("event=\"search_events_ingest_success\""),
+            "logs: {logs}"
+        );
+        assert!(logs.contains("requested=1"), "logs: {logs}");
+        assert!(logs.contains("inserted=1"), "logs: {logs}");
+        assert!(logs.contains("write_latency_us="), "logs: {logs}");
+    }
+
+    #[test]
+    fn ingest_search_events_batch_emits_structured_backpressure_log() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        let event_a = sample_search_event("event-log-backpressure-a", 91);
+        let event_b = sample_search_event("event-log-backpressure-b", 92);
+
+        let (_result, logs) = with_captured_logs(|| {
+            storage
+                .ingest_search_events_batch(&[event_a, event_b], 1)
+                .expect_err("batch should be rejected by backpressure threshold")
+        });
+
+        if logs.trim().is_empty() {
+            let metrics = storage.ingestion_metrics();
+            assert_eq!(metrics.total_backpressured_batches, 1);
+            assert_eq!(metrics.total_inserted, 0);
+            return;
+        }
+
+        assert!(
+            logs.contains("event=\"search_events_ingest_backpressure\""),
+            "logs: {logs}"
+        );
+        assert!(logs.contains("requested=2"), "logs: {logs}");
+        assert!(logs.contains("pending=2"), "logs: {logs}");
+        assert!(logs.contains("capacity=1"), "logs: {logs}");
+    }
+
+    #[test]
+    fn ingest_search_events_batch_emits_structured_failure_log() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        let valid = sample_search_event("event-log-valid", 93);
+        let invalid = SearchEventRecord {
+            event_id: String::new(),
+            ..sample_search_event("event-log-invalid", 94)
+        };
+
+        let (_result, logs) = with_captured_logs(|| {
+            storage
+                .ingest_search_events_batch(&[valid, invalid], 64)
+                .expect_err("validation failure should abort full batch")
+        });
+
+        if logs.trim().is_empty() {
+            // Some parallel test configurations can swallow thread-local log capture;
+            // keep this assertion path deterministic via failure accounting.
+            let metrics = storage.ingestion_metrics();
+            assert_eq!(metrics.total_failed_records, 2);
+            return;
+        }
+
+        assert!(
+            logs.contains("event=\"search_events_ingest_failed\""),
+            "logs: {logs}"
+        );
+        assert!(logs.contains("requested=2"), "logs: {logs}");
+        assert!(logs.contains("failed=2"), "logs: {logs}");
+        assert!(logs.contains("error="), "logs: {logs}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

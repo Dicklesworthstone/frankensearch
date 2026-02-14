@@ -7,7 +7,8 @@
 
 use crate::state::{
     ControlPlaneMetrics, FleetSnapshot, InstanceAttribution, InstanceInfo, InstanceLifecycle,
-    LifecycleSignal, ProjectAttributionResolver, ResourceMetrics, SearchMetrics,
+    LifecycleSignal, LifecycleTrackerConfig, ProjectAttributionResolver, ProjectLifecycleTracker,
+    ResourceMetrics, SearchMetrics,
 };
 use crate::{DiscoveredInstance, DiscoveryStatus};
 
@@ -273,20 +274,42 @@ impl MockDataSource {
     #[must_use]
     pub fn from_discovery(instances: &[DiscoveredInstance]) -> Self {
         let mut snapshot = FleetSnapshot::default();
+        let now_ms = instances
+            .iter()
+            .map(|instance| instance.last_seen_ms)
+            .max()
+            .unwrap_or(0);
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig::default());
+        let lifecycle_events = tracker.ingest_discovery(now_ms, instances);
+
         for instance in instances {
+            let instance_id = instance.instance_id.clone();
+            let attribution = tracker
+                .attribution_for(&instance_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    InstanceAttribution::unknown(
+                        instance.project_key_hint.as_deref(),
+                        instance.host_name.as_deref(),
+                        "attribution.discovery.unresolved",
+                    )
+                });
+
             snapshot.instances.push(InstanceInfo {
-                id: instance.instance_id.clone(),
-                project: instance
-                    .project_key_hint
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned()),
+                id: instance_id.clone(),
+                project: attribution.resolved_project.clone(),
                 pid: instance.pid,
                 healthy: instance.status == DiscoveryStatus::Active,
                 doc_count: 0,
                 pending_jobs: 0,
             });
         }
-        snapshot.instances.sort_by(|left, right| left.id.cmp(&right.id));
+        snapshot.attribution = tracker.attribution_snapshot();
+        snapshot.lifecycle = tracker.lifecycle_snapshot();
+        snapshot.lifecycle_events = lifecycle_events;
+        snapshot
+            .instances
+            .sort_by(|left, right| left.id.cmp(&right.id));
         Self {
             snapshot,
             control_plane: ControlPlaneMetrics::default(),
@@ -424,8 +447,69 @@ mod tests {
         let fleet = mock.fleet_snapshot();
         assert_eq!(fleet.instance_count(), 2);
         assert_eq!(fleet.healthy_count(), 1);
-        assert_eq!(fleet.instances[0].project, "cass");
+        assert_eq!(fleet.instances[0].project, "coding_agent_session_search");
         assert_eq!(fleet.instances[1].project, "unknown");
+
+        let inst_a_attr = mock
+            .attribution("inst-a")
+            .expect("inst-a attribution should be present");
+        assert_eq!(inst_a_attr.resolved_project, "coding_agent_session_search");
+        assert!(!inst_a_attr.collision);
+        assert_eq!(inst_a_attr.reason_code, "attribution.telemetry_project_key");
+
+        let inst_b_lifecycle = mock
+            .lifecycle("inst-b")
+            .expect("inst-b lifecycle should be present");
+        assert_eq!(
+            inst_b_lifecycle.state,
+            frankensearch_core::LifecycleState::Stale
+        );
+        assert_eq!(inst_b_lifecycle.reason_code, "lifecycle.heartbeat_gap");
+        assert!(
+            !fleet.lifecycle_events().is_empty(),
+            "lifecycle transitions should be emitted for timeline/alerts"
+        );
+    }
+
+    #[test]
+    fn mock_from_discovery_surfaces_attribution_collisions() {
+        let instances = vec![DiscoveredInstance {
+            instance_id: "inst-collision".to_owned(),
+            project_key_hint: Some("xf".to_owned()),
+            host_name: Some("cass-devbox".to_owned()),
+            pid: Some(333),
+            version: Some("0.3.0".to_owned()),
+            first_seen_ms: 100,
+            last_seen_ms: 120,
+            status: DiscoveryStatus::Active,
+            sources: vec![crate::DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["hostpid:cass-devbox:333".to_owned()],
+        }];
+
+        let mock = MockDataSource::from_discovery(&instances);
+        let attribution = mock
+            .attribution("inst-collision")
+            .expect("collision attribution should exist");
+        assert_eq!(attribution.resolved_project, "xf");
+        assert!(attribution.collision);
+        assert_eq!(attribution.reason_code, "attribution.collision");
+
+        let lifecycle = mock
+            .lifecycle("inst-collision")
+            .expect("collision lifecycle should exist");
+        assert_eq!(lifecycle.state, frankensearch_core::LifecycleState::Healthy);
+
+        let events = mock.fleet_snapshot().lifecycle_events;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.instance_id == "inst-collision"),
+            "collision instance should emit lifecycle events"
+        );
+        assert!(
+            events.iter().all(|event| event.attribution_collision),
+            "event metadata should carry attribution collision flag"
+        );
     }
 
     #[test]
