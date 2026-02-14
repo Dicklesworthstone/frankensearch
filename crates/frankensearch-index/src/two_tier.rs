@@ -39,6 +39,7 @@ pub struct TwoTierIndex {
     #[cfg(feature = "ann")]
     quality_ann: Option<HnswIndex>,
     doc_ids: Vec<String>,
+    doc_id_to_fast_index: HashMap<String, usize>,
     has_quality: Vec<bool>,
     quality_lookup: Vec<Option<usize>>,
     config: TwoTierConfig,
@@ -64,6 +65,11 @@ impl TwoTierIndex {
 
         let fast_index = VectorIndex::open(&fast_path)?;
         let doc_ids = load_doc_ids(&fast_index)?;
+        let doc_id_to_fast_index: HashMap<String, usize> = doc_ids
+            .iter()
+            .enumerate()
+            .map(|(index, doc_id)| (doc_id.clone(), index))
+            .collect();
         let mut has_quality = vec![false; doc_ids.len()];
         let mut quality_lookup = vec![None; doc_ids.len()];
 
@@ -155,6 +161,7 @@ impl TwoTierIndex {
             #[cfg(feature = "ann")]
             quality_ann,
             doc_ids,
+            doc_id_to_fast_index,
             has_quality,
             quality_lookup,
             config,
@@ -251,6 +258,12 @@ impl TwoTierIndex {
     #[must_use]
     pub fn doc_ids(&self) -> &[String] {
         &self.doc_ids
+    }
+
+    /// Fast-tier index position for a given document id.
+    #[must_use]
+    pub fn fast_index_for_doc_id(&self, doc_id: &str) -> Option<usize> {
+        self.doc_id_to_fast_index.get(doc_id).copied()
     }
 
     /// Whether the fast-tier document at `index` has a quality-tier vector.
@@ -567,6 +580,9 @@ mod tests {
         assert_eq!(index.doc_count(), 2);
         assert!(!index.has_quality_index());
         assert_eq!(index.doc_ids(), &["doc-a".to_owned(), "doc-b".to_owned()]);
+        assert_eq!(index.fast_index_for_doc_id("doc-a"), Some(0));
+        assert_eq!(index.fast_index_for_doc_id("doc-b"), Some(1));
+        assert_eq!(index.fast_index_for_doc_id("missing"), None);
 
         let hits = index
             .search_fast(&[1.0, 0.0, 0.0, 0.0], 1)

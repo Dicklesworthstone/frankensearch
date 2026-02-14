@@ -338,16 +338,18 @@ impl VectorIndex {
     /// Returns `SearchError::Io` for filesystem write/sync failures and
     /// `SearchError::IndexCorrupted` if the on-disk record table is malformed.
     pub fn soft_delete(&mut self, doc_id: &str) -> SearchResult<bool> {
-        let Some(index) = self.find_index_by_doc_id(doc_id)? else {
-            return Ok(false);
-        };
-        let entry = self.record_at(index)?;
-        if is_tombstoned_flags(entry.flags) {
-            return Ok(false);
+        if let Some(index) = self.find_index_by_doc_id(doc_id)? {
+            let entry = self.record_at(index)?;
+            if is_tombstoned_flags(entry.flags) {
+                return Ok(false);
+            }
+            let flags = entry.flags | RECORD_FLAG_TOMBSTONE;
+            self.set_record_flags(index, flags)?;
+            let _ = self.soft_delete_wal_entry(doc_id)?;
+            return Ok(true);
         }
-        let flags = entry.flags | RECORD_FLAG_TOMBSTONE;
-        self.set_record_flags(index, flags)?;
-        Ok(true)
+
+        self.soft_delete_wal_entry(doc_id)
     }
 
     /// Tombstone a batch of document ids.
@@ -919,6 +921,50 @@ impl VectorIndex {
         file.write_all(&flag_bytes)?;
         file.sync_data()?;
         Ok(())
+    }
+
+    fn soft_delete_wal_entry(&mut self, doc_id: &str) -> SearchResult<bool> {
+        let previous_len = self.wal_entries.len();
+        self.wal_entries.retain(|entry| entry.doc_id != doc_id);
+        if self.wal_entries.len() == previous_len {
+            return Ok(false);
+        }
+        self.rewrite_wal_sidecar()?;
+        Ok(true)
+    }
+
+    fn rewrite_wal_sidecar(&self) -> SearchResult<()> {
+        let wal_path = wal::wal_path_for(&self.path);
+        if self.wal_entries.is_empty() {
+            wal::remove_wal(&wal_path)?;
+            return Ok(());
+        }
+
+        let mut tmp = wal_path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp_path = PathBuf::from(tmp);
+        let _ = wal::remove_wal(&tmp_path);
+
+        wal::append_wal_batch(
+            &tmp_path,
+            &self.wal_entries,
+            self.dimension(),
+            self.quantization(),
+            self.wal_config.fsync_on_write,
+        )?;
+
+        match fs::rename(&tmp_path, &wal_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                wal::remove_wal(&wal_path)?;
+                fs::rename(&tmp_path, &wal_path)?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = wal::remove_wal(&tmp_path);
+                Err(error.into())
+            }
+        }
     }
 
     fn record_at(&self, index: usize) -> SearchResult<RecordEntry> {
@@ -1784,8 +1830,11 @@ mod tests {
                 let index = Arc::clone(&shared);
                 std::thread::spawn(move || {
                     for _ in 0..32 {
-                        let guard = index.lock().expect("lock for search");
-                        let hits = guard.search_top_k(&query, 10, None).expect("search");
+                        let hits = index
+                            .lock()
+                            .expect("lock for search")
+                            .search_top_k(&query, 10, None)
+                            .expect("search");
                         assert!(!hits.is_empty());
                     }
                 })
@@ -1797,8 +1846,9 @@ mod tests {
             handle.join().expect("join searcher");
         }
 
-        let final_guard = shared.lock().expect("lock final");
-        let hits = final_guard
+        let hits = shared
+            .lock()
+            .expect("lock final")
             .search_top_k(&query, 64, None)
             .expect("final search");
         let deleted_ids: HashSet<String> = (0..32).map(|i| format!("doc-{i:03}")).collect();
@@ -2026,7 +2076,10 @@ mod tests {
         let hits = index
             .search_top_k(&sample_vector(0.1, 4), 10, None)
             .expect("search");
-        assert!(hits.is_empty(), "search with all deleted should return nothing");
+        assert!(
+            hits.is_empty(),
+            "search with all deleted should return nothing"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2452,6 +2505,82 @@ mod tests {
             .search_top_k(&sample_vector(1.0, dim), 100, None)
             .expect("search");
         assert_eq!(hits.len(), 6);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn soft_delete_removes_wal_only_record_and_persists() {
+        let path = temp_index_path("wal-soft-delete-only");
+        let dim = 4;
+
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("main-0", &sample_vector(1.0, dim))
+            .expect("write");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        index
+            .append("wal-only", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append wal-only");
+        assert_eq!(index.wal_record_count(), 1);
+
+        assert!(index.soft_delete("wal-only").expect("soft delete wal-only"));
+        assert_eq!(index.wal_record_count(), 0);
+        let hits = index
+            .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
+            .expect("search");
+        assert!(hits.iter().all(|hit| hit.doc_id != "wal-only"));
+
+        drop(index);
+        let reopened = VectorIndex::open(&path).expect("reopen");
+        assert_eq!(reopened.wal_record_count(), 0);
+        let reopened_hits = reopened
+            .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
+            .expect("search after reopen");
+        assert!(reopened_hits.iter().all(|hit| hit.doc_id != "wal-only"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn soft_delete_clears_pending_wal_updates_for_same_doc_id() {
+        let path = temp_index_path("wal-soft-delete-main-and-wal");
+        let dim = 4;
+
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("doc-a", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write doc-a");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        index
+            .append("doc-a", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append doc-a update");
+        index
+            .append("doc-b", &[0.0, 0.0, 1.0, 0.0])
+            .expect("append doc-b");
+        assert_eq!(index.wal_record_count(), 2);
+
+        assert!(index.soft_delete("doc-a").expect("soft delete doc-a"));
+        assert_eq!(
+            index.wal_record_count(),
+            1,
+            "doc-a WAL entries should be purged"
+        );
+
+        let hits = index
+            .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
+            .expect("search");
+        assert!(
+            hits.iter().all(|hit| hit.doc_id != "doc-a"),
+            "doc-a should not be searchable from main or WAL"
+        );
+        assert!(hits.iter().any(|hit| hit.doc_id == "doc-b"));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();

@@ -290,12 +290,12 @@ mod tests {
 
     #[test]
     fn fit_and_roundtrip_small() {
-        let vectors = vec![
+        let vectors = [
             vec![0.1_f32, 0.5, -0.3],
             vec![0.2, 0.8, -0.1],
             vec![-0.1, 0.6, 0.4],
         ];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         assert_eq!(q.dims(), 3);
@@ -314,8 +314,8 @@ mod tests {
 
     #[test]
     fn fit_single_vector() {
-        let vectors = vec![vec![1.0_f32, 2.0, 3.0]];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let vectors = [vec![1.0_f32, 2.0, 3.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         // Single vector: all dimensions are constant → scales = 0
@@ -329,8 +329,9 @@ mod tests {
         // Generate diverse vectors.
         let vectors: Vec<Vec<f32>> = (0..20)
             .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
                 let i_f = i as f32;
-                l2_normalize(&vec![
+                l2_normalize(&[
                     (i_f * 0.1).sin(),
                     (i_f * 0.2).cos(),
                     (i_f * 0.3).sin(),
@@ -338,7 +339,7 @@ mod tests {
                 ])
             })
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         // Check cosine similarity between all pairs.
@@ -363,12 +364,12 @@ mod tests {
 
     #[test]
     fn dot_product_quantized_matches_dequantized() {
-        let vectors = vec![
+        let vectors = [
             vec![0.1_f32, 0.5, -0.3, 0.8],
             vec![0.2, 0.8, -0.1, 0.3],
             vec![-0.1, 0.6, 0.4, -0.2],
         ];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         let query = vec![0.3_f32, 0.4, -0.2, 0.5];
@@ -391,18 +392,15 @@ mod tests {
     fn cosine_similarity_quantized_matches() {
         let vectors: Vec<Vec<f32>> = (0..10)
             .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
                 let i_f = i as f32;
-                l2_normalize(&vec![
-                    (i_f * 0.5).sin(),
-                    (i_f * 0.7).cos(),
-                    (i_f * 0.3).sin(),
-                ])
+                l2_normalize(&[(i_f * 0.5).sin(), (i_f * 0.7).cos(), (i_f * 0.3).sin()])
             })
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
-        let query = l2_normalize(&vec![0.5, 0.3, -0.1]);
+        let query = l2_normalize(&[0.5, 0.3, -0.1]);
 
         for vec in &vectors {
             let stored = q.quantize(vec);
@@ -423,8 +421,9 @@ mod tests {
     fn error_bound_is_valid() {
         let vectors: Vec<Vec<f32>> = (0..50)
             .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
                 let i_f = i as f32;
-                l2_normalize(&vec![
+                l2_normalize(&[
                     (i_f * 0.1).sin(),
                     (i_f * 0.2).cos(),
                     (i_f * 0.3).sin(),
@@ -436,7 +435,7 @@ mod tests {
                 ])
             })
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         let bound = q.cosine_error_bound();
@@ -467,8 +466,8 @@ mod tests {
 
     #[test]
     fn memory_accounting() {
-        let vectors = vec![vec![0.0_f32; 384]];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let vectors = [vec![0.0_f32; 384]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         assert_eq!(q.quantized_vector_bytes(), 384);
@@ -479,12 +478,12 @@ mod tests {
 
     #[test]
     fn constant_dimension_handled() {
-        let vectors = vec![
+        let vectors = [
             vec![0.5_f32, 0.0, 0.3], // dim 1 is constant
             vec![0.1, 0.0, 0.8],
             vec![0.9, 0.0, -0.2],
         ];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         // Dim 1 has zero scale.
@@ -498,8 +497,8 @@ mod tests {
 
     #[test]
     fn values_outside_training_range_clamp() {
-        let vectors = vec![vec![0.0_f32, 1.0], vec![1.0, 0.0]];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let vectors = [vec![0.0_f32, 1.0], vec![1.0, 0.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         // Value outside training range.
@@ -515,8 +514,8 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let vectors = vec![vec![0.1_f32, 0.5, -0.3], vec![0.2, 0.8, -0.1]];
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let vectors = [vec![0.1_f32, 0.5, -0.3], vec![0.2, 0.8, -0.1]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
         let q = ScalarQuantizer::fit(&refs);
 
         let json = serde_json::to_string(&q).unwrap();
