@@ -4,8 +4,6 @@
 //! (`frankensearch-ops.db`) and a small connection wrapper that applies
 //! pragmas, runs migrations, and validates migration checksums.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1333,51 +1331,78 @@ impl OpsStorage {
     /// or the database write fails.
     pub fn insert_evidence_link(&self, link: &EvidenceLinkRecord) -> SearchResult<()> {
         link.validate()?;
-        let conn = self.connection();
+        self.with_transaction(|conn| {
+            let alert_params = [SqliteValue::Text(link.alert_id.clone())];
+            let alert_rows = conn
+                .query_with_params(
+                    "SELECT project_key FROM alerts_timeline \
+                     WHERE alert_id = ?1 LIMIT 1;",
+                    &alert_params,
+                )
+                .map_err(ops_error)?;
+            let Some(alert_row) = alert_rows.first() else {
+                return Err(SearchError::InvalidConfig {
+                    field: "alert_id".to_owned(),
+                    value: link.alert_id.clone(),
+                    reason: "unknown alert_id".to_owned(),
+                });
+            };
+            let alert_project_key = row_text(alert_row, 0, "alerts_timeline.project_key")?;
+            if alert_project_key != link.project_key {
+                return Err(SearchError::InvalidConfig {
+                    field: "project_key".to_owned(),
+                    value: link.project_key.clone(),
+                    reason: format!(
+                        "alert_id '{}' belongs to project_key '{}'",
+                        link.alert_id, alert_project_key
+                    ),
+                });
+            }
 
-        let duplicate_params = [
-            SqliteValue::Text(link.alert_id.clone()),
-            SqliteValue::Text(link.evidence_uri.clone()),
-        ];
-        let duplicate_rows = conn
-            .query_with_params(
-                "SELECT link_id FROM evidence_links \
-                 WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
-                &duplicate_params,
+            let duplicate_params = [
+                SqliteValue::Text(link.alert_id.clone()),
+                SqliteValue::Text(link.evidence_uri.clone()),
+            ];
+            let duplicate_rows = conn
+                .query_with_params(
+                    "SELECT link_id FROM evidence_links \
+                     WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
+                    &duplicate_params,
+                )
+                .map_err(ops_error)?;
+            if !duplicate_rows.is_empty() {
+                return Err(SearchError::InvalidConfig {
+                    field: "evidence_uri".to_owned(),
+                    value: link.evidence_uri.clone(),
+                    reason: format!(
+                        "duplicate evidence link pair for alert_id='{}'",
+                        link.alert_id
+                    ),
+                });
+            }
+
+            let link_id = evidence_link_id(&link.alert_id, &link.evidence_uri);
+            let params = [
+                SqliteValue::Text(link_id),
+                SqliteValue::Text(link.project_key.clone()),
+                SqliteValue::Text(link.alert_id.clone()),
+                SqliteValue::Text(link.evidence_type.clone()),
+                SqliteValue::Text(link.evidence_uri.clone()),
+                link.evidence_hash
+                    .clone()
+                    .map_or(SqliteValue::Null, SqliteValue::Text),
+                SqliteValue::Integer(link.created_at_ms),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO evidence_links(\
+                    link_id, project_key, alert_id, evidence_type, evidence_uri, \
+                    evidence_hash, created_at_ms\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                &params,
             )
             .map_err(ops_error)?;
-        if !duplicate_rows.is_empty() {
-            return Err(SearchError::InvalidConfig {
-                field: "evidence_uri".to_owned(),
-                value: link.evidence_uri.clone(),
-                reason: format!(
-                    "duplicate evidence link pair for alert_id='{}'",
-                    link.alert_id
-                ),
-            });
-        }
-
-        let link_id = evidence_link_id(&link.alert_id, &link.evidence_uri);
-        let params = [
-            SqliteValue::Text(link_id),
-            SqliteValue::Text(link.project_key.clone()),
-            SqliteValue::Text(link.alert_id.clone()),
-            SqliteValue::Text(link.evidence_type.clone()),
-            SqliteValue::Text(link.evidence_uri.clone()),
-            link.evidence_hash
-                .clone()
-                .map_or(SqliteValue::Null, SqliteValue::Text),
-            SqliteValue::Integer(link.created_at_ms),
-        ];
-        conn.execute_with_params(
-            "INSERT INTO evidence_links(\
-                link_id, project_key, alert_id, evidence_type, evidence_uri, \
-                evidence_hash, created_at_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-            &params,
-        )
-        .map_err(ops_error)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Recompute and materialize rolling search summaries for one instance.
@@ -2236,11 +2261,20 @@ fn search_event_exists(conn: &Connection, event_id: &str) -> SearchResult<bool> 
 }
 
 fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    alert_id.hash(&mut hasher);
-    '\u{1f}'.hash(&mut hasher);
-    evidence_uri.hash(&mut hasher);
-    format!("evlnk:{:016x}", hasher.finish())
+    // Deterministic FNV-1a 64-bit hash over (alert_id, U+001F, evidence_uri).
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in alert_id
+        .bytes()
+        .chain(std::iter::once(0x1f))
+        .chain(evidence_uri.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("evlnk:{hash:016x}")
 }
 
 fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<()> {
@@ -3158,7 +3192,7 @@ mod tests {
         EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
         OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
         SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
-        ops_error,
+        evidence_link_id, ops_error,
     };
     use frankensearch_core::SearchError;
     use fsqlite::Connection;
@@ -4388,5 +4422,114 @@ mod tests {
             duplicate_result.is_err(),
             "duplicate alert/evidence_uri pair should be rejected by insert_evidence_link"
         );
+    }
+
+    #[test]
+    fn insert_evidence_link_rejects_unknown_alert_id() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let link = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "missing-alert".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///tmp/missing-alert.jsonl".to_owned(),
+            evidence_hash: None,
+            created_at_ms: 10,
+        };
+        let error = storage
+            .insert_evidence_link(&link)
+            .expect_err("unknown alert_id should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown alert_id"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn insert_evidence_link_rejects_alert_project_mismatch() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        seed_second_project_and_instance(storage.connection());
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO alerts_timeline(\
+                    alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+                    state, opened_at_ms, updated_at_ms\
+                 ) VALUES (\
+                    'alert-project-a', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
+                    'spike', 'open', 1, 1\
+                 );",
+            )
+            .expect("alert row should insert");
+
+        let link = EvidenceLinkRecord {
+            project_key: "project-b".to_owned(),
+            alert_id: "alert-project-a".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///tmp/project-mismatch.jsonl".to_owned(),
+            evidence_hash: Some("hash-project-mismatch".to_owned()),
+            created_at_ms: 2,
+        };
+        let error = storage
+            .insert_evidence_link(&link)
+            .expect_err("project mismatch should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("belongs to project_key 'project-a'"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn insert_evidence_link_uses_deterministic_link_id() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO alerts_timeline(\
+                    alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+                    state, opened_at_ms, updated_at_ms\
+                 ) VALUES (\
+                    'alert-stable-id', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', \
+                    'spike', 'open', 1, 1\
+                 );",
+            )
+            .expect("alert row should insert");
+
+        let link = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "alert-stable-id".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///tmp/stable-id.jsonl".to_owned(),
+            evidence_hash: Some("hash-stable-id".to_owned()),
+            created_at_ms: 3,
+        };
+        let expected_link_id = evidence_link_id(&link.alert_id, &link.evidence_uri);
+        storage
+            .insert_evidence_link(&link)
+            .expect("evidence link insert should succeed");
+
+        let rows = storage
+            .connection()
+            .query_with_params(
+                "SELECT link_id FROM evidence_links \
+                 WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
+                &[
+                    SqliteValue::Text(link.alert_id),
+                    SqliteValue::Text(link.evidence_uri),
+                ],
+            )
+            .map_err(ops_error)
+            .expect("link id query should succeed");
+        let row = rows.first().expect("expected one evidence link row");
+        let actual_link_id = match row.get(0) {
+            Some(SqliteValue::Text(value)) => value,
+            other => panic!("unexpected row type for evidence_links.link_id: {other:?}"),
+        };
+        assert_eq!(actual_link_id, &expected_link_id);
     }
 }
