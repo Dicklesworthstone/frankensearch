@@ -1148,6 +1148,7 @@ mod tests {
     use frankensearch_core::{
         AdapterIdentity, AdapterLifecycleEvent, HostAdapter, TelemetryEnvelope, TelemetryEvent,
     };
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -2050,6 +2051,132 @@ mod tests {
             assert!(initial_results.is_empty());
             assert!(metrics.phase1_total_ms > 0.0);
         });
+    }
+
+    #[test]
+    fn exclusion_full_pipeline_rust_unsafe_returns_safe_docs() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher =
+                TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
+
+            let mut initial_results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "rust -unsafe",
+                    12,
+                    |doc_id| {
+                        let text = match doc_id {
+                            "doc-0" => "unsafe rust pointer tricks",
+                            "doc-1" => "rust ownership and borrowing",
+                            "lex-doc-0" => "unsafe lexical result",
+                            "lex-doc-1" => "safe rust lexical result",
+                            "lex-doc-2" => "safe rust patterns",
+                            _ => "safe rust systems programming",
+                        };
+                        Some(text.to_owned())
+                    },
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(
+                !initial_results.iter().any(|result| result.doc_id == "doc-0"),
+                "unsafe semantic result should be filtered"
+            );
+            assert!(
+                !initial_results.iter().any(|result| result.doc_id == "lex-doc-0"),
+                "unsafe lexical result should be filtered"
+            );
+            assert!(
+                initial_results.iter().all(|result| result.doc_id != "doc-0"
+                    && result.doc_id != "lex-doc-0")
+            );
+            assert!(
+                initial_results.len() >= 1,
+                "expected at least one safe rust result to remain"
+            );
+        });
+    }
+
+    #[test]
+    fn exclusion_overhead_is_sub_millisecond_for_typical_query() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let baseline = searcher
+                .search(&cx, "rust systems", 10, |_| Some("safe rust systems".to_owned()), |_| {})
+                .await
+                .expect("baseline search should succeed")
+                .phase1_total_ms;
+            let negated = searcher
+                .search(
+                    &cx,
+                    "rust systems -unsafe",
+                    10,
+                    |doc_id| {
+                        let text = if doc_id == "doc-0" {
+                            "unsafe rust systems"
+                        } else {
+                            "safe rust systems"
+                        };
+                        Some(text.to_owned())
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("negated search should succeed")
+                .phase1_total_ms;
+
+            let overhead_ms = (negated - baseline).max(0.0);
+            assert!(
+                overhead_ms < 1.0,
+                "expected exclusion overhead <1ms, observed {overhead_ms:.4}ms (baseline={baseline:.4}ms, negated={negated:.4}ms)"
+            );
+        });
+    }
+
+    #[test]
+    #[traced_test]
+    fn exclusion_emits_query_parsed_and_doc_excluded_logs() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let _metrics = searcher
+                .search(
+                    &cx,
+                    "rust -unsafe",
+                    10,
+                    |doc_id| {
+                        let text = if doc_id == "doc-0" {
+                            "unsafe rust patterns"
+                        } else {
+                            "safe rust patterns"
+                        };
+                        Some(text.to_owned())
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("search should succeed");
+        });
+
+        assert!(logs_contain("query_parsed"));
+        assert!(logs_contain("excluded_terms=1"));
+        assert!(logs_contain("doc_excluded"));
+        assert!(logs_contain("matched_exclusion_term=unsafe"));
     }
 
     #[test]
