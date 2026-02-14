@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/frankensearch-core",
+    "crates/frankensearch-embed",
+    "crates/frankensearch-index",
+    "crates/frankensearch-lexical",
+    "crates/frankensearch-fusion",
+    "crates/frankensearch-rerank",
+    "frankensearch",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/frankensearch"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+frankensearch-core = { path = "crates/frankensearch-core" }
+frankensearch-embed = { path = "crates/frankensearch-embed" }
+frankensearch-index = { path = "crates/frankensearch-index" }
+frankensearch-lexical = { path = "crates/frankensearch-lexical" }
+frankensearch-fusion = { path = "crates/frankensearch-fusion" }
+frankensearch-rerank = { path = "crates/frankensearch-rerank" }
+
+# Async runtime (structured concurrency, NO tokio)
+# test-internals enables LabRuntime for deterministic testing
+asupersync = { path = "/dp/asupersync", features = ["proc-macros", "test-internals"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Structured logging
+tracing = "0.1"
+
+# Data parallelism (CPU-bound vector ops, NOT an async runtime)
+rayon = "1.10"
+
+# SIMD and f16 quantization (unconditional for frankensearch-index)
+half = "2.4"
+wide = "0.7"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# Embedder dependencies (feature-gated per crate)
+fastembed = "4.9"
+safetensors = "0.5"
+tokenizers = "0.21"
+
+# Full-text search
+tantivy = "0.22"
+
+# ONNX Runtime for cross-encoder reranking
+ort = "2.0.0-rc.9"
+
+# HNSW approximate nearest neighbors
+hnsw_rs = "0.3"
+
+# Unicode normalization
+unicode-normalization = "0.1"
+
+# Platform-standard directories for model storage
+dirs = "6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

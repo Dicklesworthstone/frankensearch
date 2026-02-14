@@ -1,0 +1,35 @@
+[package]
+name = "frankensearch"
+version = "0.1.0"
+description = "Two-tier hybrid search for Rust: sub-millisecond initial results, quality-refined rankings in 150ms"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["hash"]
+hash = ["frankensearch-embed/hash"]
+model2vec = ["frankensearch-embed/model2vec"]
+fastembed = ["frankensearch-embed/fastembed"]
+lexical = ["dep:frankensearch-lexical", "frankensearch-fusion/lexical"]
+rerank = ["dep:frankensearch-rerank"]
+ann = ["frankensearch-index/ann"]
+download = ["asupersync/tls"]
+semantic = ["hash", "model2vec", "fastembed"]
+hybrid = ["semantic", "lexical"]
+full = ["hybrid", "rerank", "ann", "download"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true }
+frankensearch-index = { workspace = true }
+frankensearch-lexical = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true }
+frankensearch-rerank = { workspace = true, optional = true }
+asupersync = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+
+[lints]
+workspace = true

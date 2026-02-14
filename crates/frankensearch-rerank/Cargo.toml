@@ -1,0 +1,20 @@
+[package]
+name = "frankensearch-rerank"
+version = "0.1.0"
+description = "FlashRank cross-encoder reranking for frankensearch"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+frankensearch-core = { workspace = true }
+ort = { workspace = true }
+tokenizers = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+
+[lints]
+workspace = true

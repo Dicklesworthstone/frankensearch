@@ -1,0 +1,30 @@
+[package]
+name = "frankensearch-embed"
+version = "0.1.0"
+description = "Embedder implementations for frankensearch (hash, model2vec, fastembed)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["hash"]
+hash = []
+model2vec = ["dep:safetensors", "dep:tokenizers"]
+fastembed = ["dep:fastembed"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+
+# Feature-gated embedder dependencies
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+
+[lints]
+workspace = true

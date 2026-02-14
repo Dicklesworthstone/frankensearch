@@ -1,0 +1,29 @@
+[package]
+name = "frankensearch-index"
+version = "0.1.0"
+description = "FSVI vector index, SIMD dot product, and top-k search for frankensearch"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+ann = ["dep:hnsw_rs"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+half = { workspace = true }
+wide = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+# Optional ANN
+hnsw_rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+
+[lints]
+workspace = true
