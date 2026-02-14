@@ -43,6 +43,7 @@ impl QueryClass {
     /// - Contains path separators, `::`, dots-without-spaces, or ID patterns → `Identifier`
     /// - 1-3 words → `ShortKeyword`
     /// - 4+ words → `NaturalLanguage`
+    #[must_use]
     pub fn classify(query: &str) -> Self {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -98,7 +99,8 @@ impl QueryClass {
     ///
     /// Applied to `TwoTierConfig::candidate_multiplier` to produce the
     /// per-source candidate budget.
-    pub fn lexical_budget_multiplier(self) -> f32 {
+    #[must_use]
+    pub const fn lexical_budget_multiplier(self) -> f32 {
         match self {
             Self::Empty => 0.0,
             Self::Identifier => 2.0,      // Lean heavily lexical
@@ -108,7 +110,8 @@ impl QueryClass {
     }
 
     /// Suggested candidate multiplier for semantic search.
-    pub fn semantic_budget_multiplier(self) -> f32 {
+    #[must_use]
+    pub const fn semantic_budget_multiplier(self) -> f32 {
         match self {
             Self::Empty => 0.0,
             Self::Identifier => 0.5,      // Lean lexical
@@ -270,10 +273,7 @@ mod tests {
         assert_eq!(QueryClass::Empty.to_string(), "empty");
         assert_eq!(QueryClass::Identifier.to_string(), "identifier");
         assert_eq!(QueryClass::ShortKeyword.to_string(), "short_keyword");
-        assert_eq!(
-            QueryClass::NaturalLanguage.to_string(),
-            "natural_language"
-        );
+        assert_eq!(QueryClass::NaturalLanguage.to_string(), "natural_language");
     }
 
     // ── Serialization ───────────────────────────────────────────────────

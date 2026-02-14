@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::SearchError;
+use crate::query_class::QueryClass;
 
 // ---------------------------------------------------------------------------
 // Document types
@@ -209,6 +210,57 @@ pub struct PhaseMetrics {
     pub lexical_candidates: usize,
     /// Number of results after fusion.
     pub fused_count: usize,
+}
+
+/// Structured telemetry for a completed search request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMetrics {
+    /// Which search mode ran.
+    pub mode: SearchMode,
+    /// Query class selected by the classifier, when available.
+    pub query_class: Option<QueryClass>,
+    /// End-to-end latency for the search request.
+    pub total_latency_ms: f64,
+    /// Latency for phase 1 (`Initial`) when available.
+    pub phase1_latency_ms: Option<f64>,
+    /// Latency for phase 2 (`Refined`) when available.
+    pub phase2_latency_ms: Option<f64>,
+    /// Number of results returned to the caller.
+    pub result_count: usize,
+    /// Number of lexical candidates retrieved.
+    pub lexical_candidates: usize,
+    /// Number of semantic candidates retrieved.
+    pub semantic_candidates: usize,
+    /// Whether quality refinement was applied.
+    pub refined: bool,
+}
+
+/// Structured telemetry for an embedding operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingMetrics {
+    /// Stable embedder identifier (for example, `potion-multilingual-128M`).
+    pub embedder_id: String,
+    /// Number of texts embedded in this operation.
+    pub batch_size: usize,
+    /// Embedding operation latency.
+    pub duration_ms: f64,
+    /// Embedding vector dimension.
+    pub dimension: usize,
+    /// Whether this embedder is semantically meaningful.
+    pub is_semantic: bool,
+}
+
+/// Structured telemetry for index update operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexMetrics {
+    /// Document count after the update.
+    pub doc_count: usize,
+    /// Total on-disk index size after the update.
+    pub index_size_bytes: u64,
+    /// Number of documents added or modified by this update.
+    pub updated_docs: usize,
+    /// Whether the index was marked stale during this update.
+    pub staleness_detected: bool,
 }
 
 /// Tracks how rankings changed between initial and refined phases.
@@ -505,5 +557,63 @@ mod tests {
         assert_eq!(rt.id, "id-1");
         assert_eq!(rt.title.as_deref(), Some("Test"));
         assert_eq!(rt.metadata.get("lang").map(String::as_str), Some("en"));
+    }
+
+    #[test]
+    fn search_metrics_serde_roundtrip() {
+        let metrics = SearchMetrics {
+            mode: SearchMode::Hybrid,
+            query_class: Some(QueryClass::NaturalLanguage),
+            total_latency_ms: 12.5,
+            phase1_latency_ms: Some(5.4),
+            phase2_latency_ms: Some(7.1),
+            result_count: 10,
+            lexical_candidates: 60,
+            semantic_candidates: 45,
+            refined: true,
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialize");
+        let decoded: SearchMetrics = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.mode, SearchMode::Hybrid);
+        assert_eq!(decoded.query_class, Some(QueryClass::NaturalLanguage));
+        assert!((decoded.total_latency_ms - 12.5).abs() < f64::EPSILON);
+        assert_eq!(decoded.result_count, 10);
+        assert!(decoded.refined);
+    }
+
+    #[test]
+    fn embedding_metrics_serde_roundtrip() {
+        let metrics = EmbeddingMetrics {
+            embedder_id: "potion-multilingual-128M".into(),
+            batch_size: 32,
+            duration_ms: 1.9,
+            dimension: 256,
+            is_semantic: true,
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialize");
+        let decoded: EmbeddingMetrics = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.embedder_id, "potion-multilingual-128M");
+        assert_eq!(decoded.batch_size, 32);
+        assert_eq!(decoded.dimension, 256);
+        assert!(decoded.is_semantic);
+    }
+
+    #[test]
+    fn index_metrics_serde_roundtrip() {
+        let metrics = IndexMetrics {
+            doc_count: 1_000,
+            index_size_bytes: 12_345_678,
+            updated_docs: 11,
+            staleness_detected: false,
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialize");
+        let decoded: IndexMetrics = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.doc_count, 1_000);
+        assert_eq!(decoded.index_size_bytes, 12_345_678);
+        assert_eq!(decoded.updated_docs, 11);
+        assert!(!decoded.staleness_detected);
     }
 }

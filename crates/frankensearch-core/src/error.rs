@@ -124,8 +124,12 @@ pub enum SearchError {
     },
 
     /// Reranking inference failed.
-    #[error("Reranking failed: {source}. Results still valid with original RRF scores.")]
+    #[error(
+        "Reranking failed for {model}: {source}. Results still valid with original RRF scores."
+    )]
     RerankFailed {
+        /// Which reranker model failed.
+        model: String,
         /// The underlying error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,

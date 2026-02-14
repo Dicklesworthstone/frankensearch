@@ -4,15 +4,24 @@
 //! - [`Reranker`]: Cross-encoder reranking model interface.
 //! - [`LexicalSearch`]: Full-text search backend interface (Tantivy, FTS5).
 //!
-//! All traits are object-safe (`dyn`-compatible) and `Send + Sync` for use
-//! across async contexts.
+//! Async operations are represented as boxed futures so the traits remain
+//! dyn-compatible for runtime polymorphism (`Box<dyn Embedder>`, etc.).
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use asupersync::Cx;
 use serde::{Deserialize, Serialize};
 
-use crate::error::SearchResult;
-use crate::types::{IndexableDocument, ScoredResult};
+use crate::error::{SearchError, SearchResult};
+use crate::types::{
+    EmbeddingMetrics, IndexMetrics, IndexableDocument, ScoredResult, SearchMetrics,
+};
+
+/// Boxed future carrying a `SearchResult<T>`.
+pub type SearchFuture<'a, T> = Pin<Box<dyn Future<Output = SearchResult<T>> + Send + 'a>>;
 
 // ─── Model Category ─────────────────────────────────────────────────────────
 
@@ -22,51 +31,127 @@ use crate::types::{IndexableDocument, ScoredResult};
 /// for the two-tier progressive search pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelCategory {
-    /// Zero-dependency hash embedder (deterministic, no semantic understanding).
-    Hash,
-    /// Fast static embedder (~0.57ms, good quality). E.g., potion-128M.
-    Fast,
-    /// Quality transformer embedder (~128ms, excellent quality). E.g., MiniLM-L6-v2.
-    Quality,
+    /// Hash-based (FNV-1a): ultra-fast, deterministic, not semantically meaningful.
+    HashEmbedder,
+    /// Static token embeddings (Model2Vec/potion): fast with good semantic quality.
+    StaticEmbedder,
+    /// Transformer inference (MiniLM/BGE): highest quality but slower.
+    TransformerEmbedder,
 }
 
 impl fmt::Display for ModelCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Hash => write!(f, "hash"),
+            Self::HashEmbedder => write!(f, "hash_embedder"),
+            Self::StaticEmbedder => write!(f, "static_embedder"),
+            Self::TransformerEmbedder => write!(f, "transformer_embedder"),
+        }
+    }
+}
+
+impl ModelCategory {
+    /// Returns the default progressive tier for this model category.
+    #[must_use]
+    pub const fn default_tier(self) -> ModelTier {
+        match self {
+            Self::HashEmbedder | Self::StaticEmbedder => ModelTier::Fast,
+            Self::TransformerEmbedder => ModelTier::Quality,
+        }
+    }
+
+    /// Whether this category is semantically meaningful by default.
+    #[must_use]
+    pub const fn default_semantic_flag(self) -> bool {
+        !matches!(self, Self::HashEmbedder)
+    }
+}
+
+/// Tier assignment in the progressive two-tier pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelTier {
+    /// Ultra-fast path for immediate results.
+    Fast,
+    /// Higher-quality path for deferred refinement.
+    Quality,
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Self::Fast => write!(f, "fast"),
             Self::Quality => write!(f, "quality"),
         }
     }
 }
 
+/// Static metadata describing an embedder implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Stable model identifier used in index metadata.
+    pub id: String,
+    /// Human-friendly model name.
+    pub name: String,
+    /// Embedding dimensionality.
+    pub dimension: usize,
+    /// Embedder category by architecture/performance profile.
+    pub category: ModelCategory,
+    /// Default tier assignment in progressive search.
+    pub tier: ModelTier,
+    /// Whether embeddings encode semantic similarity.
+    pub is_semantic: bool,
+    /// Whether Matryoshka truncation is supported.
+    pub supports_mrl: bool,
+    /// Optional upstream model id (e.g., `HuggingFace`).
+    pub huggingface_id: Option<String>,
+    /// Optional model footprint on disk.
+    pub size_bytes: Option<u64>,
+    /// Optional model license string.
+    pub license: Option<String>,
+}
+
 // ─── Embedder Trait ─────────────────────────────────────────────────────────
 
 /// Core trait for text embedding models.
 ///
-/// Implementations must be `Send + Sync` for use across async contexts.
-/// The trait is object-safe for runtime polymorphism via `Box<dyn Embedder>`.
+/// Implementations run under structured concurrency, so each async operation
+/// receives a capability context (`&Cx`) as its first parameter.
 ///
 /// # Contract
 ///
-/// - `embed()` and `embed_batch()` are synchronous. Neural models (fastembed,
-///   model2vec) do inference on the calling thread. For non-blocking search,
-///   wrap calls in `rayon::spawn()` or an asupersync task.
+/// - `embed()` and `embed_batch()` are cancel-aware and return boxed futures.
 /// - `dimension()` must be constant for the lifetime of the embedder.
 /// - `id()` must be stable across process restarts (it's stored in FSVI headers).
 pub trait Embedder: Send + Sync {
     /// Embed a single text string into a vector of f32 floats.
     ///
     /// The returned vector has exactly `self.dimension()` elements.
-    fn embed(&self, text: &str) -> SearchResult<Vec<f32>>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if embedding inference fails.
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>>;
 
     /// Embed a batch of text strings.
     ///
     /// Default implementation calls `embed` in a loop. Neural models should
     /// override this to exploit batch inference (ONNX has high fixed overhead
     /// but low marginal cost per additional input).
-    fn embed_batch(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if any embedding inference fails.
+    fn embed_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed(cx, text).await?);
+            }
+            Ok(out)
+        })
     }
 
     /// The dimensionality of embedding vectors produced by this model.
@@ -78,6 +163,14 @@ pub trait Embedder: Send + Sync {
     /// Stored in FSVI index headers for embedder-revision matching.
     fn id(&self) -> &str;
 
+    /// Human-readable model name.
+    fn model_name(&self) -> &str;
+
+    /// Whether this embedder is loaded and operational.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Whether this embedder produces semantically meaningful vectors.
     ///
     /// Hash embedders return `false`; neural models return `true`.
@@ -86,10 +179,36 @@ pub trait Embedder: Send + Sync {
     /// The speed/quality category of this embedder.
     fn category(&self) -> ModelCategory;
 
+    /// Default progressive tier assignment.
+    fn tier(&self) -> ModelTier {
+        self.category().default_tier()
+    }
+
     /// Whether this model supports Matryoshka Representation Learning
     /// (dimension truncation for faster search with controlled quality loss).
     fn supports_mrl(&self) -> bool {
         false
+    }
+
+    /// Truncate and re-normalize embedding to `target_dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when `target_dim` is zero.
+    fn truncate_embedding(&self, embedding: &[f32], target_dim: usize) -> SearchResult<Vec<f32>> {
+        if target_dim == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "target_dim".to_owned(),
+                value: "0".to_owned(),
+                reason: "target dimension must be at least 1".to_owned(),
+            });
+        }
+
+        if target_dim >= embedding.len() {
+            return Ok(embedding.to_vec());
+        }
+
+        Ok(l2_normalize(&embedding[..target_dim]))
     }
 }
 
@@ -187,14 +306,32 @@ pub trait Reranker: Send + Sync {
     /// Score and re-rank documents against a query.
     ///
     /// Returns documents sorted by descending cross-encoder score.
-    fn rerank(
-        &self,
-        query: &str,
-        documents: &[RerankDocument],
-    ) -> SearchResult<Vec<RerankScore>>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::RerankFailed` if cross-encoder inference fails.
+    fn rerank<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>>;
 
     /// A unique identifier for this reranker model.
     fn id(&self) -> &str;
+
+    /// Human-friendly reranker model name.
+    fn model_name(&self) -> &str;
+
+    /// Maximum supported token length for query+document pair input.
+    fn max_length(&self) -> usize {
+        512
+    }
+
+    /// Whether this reranker is loaded and ready for inference.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 // ─── Lexical Search Trait ───────────────────────────────────────────────────
@@ -209,24 +346,91 @@ pub trait Reranker: Send + Sync {
 pub trait LexicalSearch: Send + Sync {
     /// Search for documents matching the query, returning up to `limit` results
     /// sorted by BM25 relevance.
-    fn search(&self, query: &str, limit: usize) -> SearchResult<Vec<ScoredResult>>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the query cannot be parsed or the search backend fails.
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>>;
 
     /// Index a single document for full-text search.
-    fn index_document(&self, doc: &IndexableDocument) -> SearchResult<()>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the document cannot be indexed.
+    fn index_document<'a>(&'a self, cx: &'a Cx, doc: &'a IndexableDocument)
+    -> SearchFuture<'a, ()>;
 
     /// Index a batch of documents.
-    fn index_documents(&self, docs: &[IndexableDocument]) -> SearchResult<()> {
-        for doc in docs {
-            self.index_document(doc)?;
-        }
-        Ok(())
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if any document cannot be indexed.
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            for doc in docs {
+                self.index_document(cx, doc).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Commit any pending writes to the index.
-    fn commit(&self) -> SearchResult<()>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the commit fails (e.g., I/O error).
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()>;
 
     /// Number of documents currently indexed.
     fn doc_count(&self) -> usize;
+}
+
+// ─── Metrics Exporter Trait ─────────────────────────────────────────────────
+
+/// Trait for exporting search/index/embed telemetry to external consumers.
+///
+/// Implementations must be non-blocking and fast, because callbacks are invoked
+/// directly from hot paths.
+pub trait MetricsExporter: fmt::Debug + Send + Sync {
+    /// Called when a search request completes.
+    fn on_search_completed(&self, metrics: &SearchMetrics);
+
+    /// Called when an embedding operation completes.
+    fn on_embedding_completed(&self, metrics: &EmbeddingMetrics);
+
+    /// Called when index state changes after an update/commit.
+    fn on_index_updated(&self, metrics: &IndexMetrics);
+
+    /// Called when a search pipeline error is observed.
+    fn on_error(&self, error: &SearchError);
+}
+
+/// Shared handle for dynamic telemetry exporters.
+pub type SharedMetricsExporter = Arc<dyn MetricsExporter>;
+
+/// No-op exporter used when no telemetry sink is attached.
+///
+/// This is intentionally empty so callers can cheaply opt out of telemetry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpMetricsExporter;
+
+impl MetricsExporter for NoOpMetricsExporter {
+    fn on_search_completed(&self, _: &SearchMetrics) {}
+
+    fn on_embedding_completed(&self, _: &EmbeddingMetrics) {}
+
+    fn on_index_updated(&self, _: &IndexMetrics) {}
+
+    fn on_error(&self, _: &SearchError) {}
 }
 
 #[cfg(test)]
@@ -235,23 +439,68 @@ mod tests {
 
     #[test]
     fn model_category_display() {
-        assert_eq!(ModelCategory::Hash.to_string(), "hash");
-        assert_eq!(ModelCategory::Fast.to_string(), "fast");
-        assert_eq!(ModelCategory::Quality.to_string(), "quality");
+        assert_eq!(ModelCategory::HashEmbedder.to_string(), "hash_embedder");
+        assert_eq!(ModelCategory::StaticEmbedder.to_string(), "static_embedder");
+        assert_eq!(
+            ModelCategory::TransformerEmbedder.to_string(),
+            "transformer_embedder"
+        );
     }
 
     #[test]
     fn model_category_serialization() {
-        let json = serde_json::to_string(&ModelCategory::Fast).unwrap();
+        let json = serde_json::to_string(&ModelCategory::StaticEmbedder).unwrap();
         let decoded: ModelCategory = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, ModelCategory::Fast);
+        assert_eq!(decoded, ModelCategory::StaticEmbedder);
     }
 
     #[test]
     fn model_category_equality() {
-        assert_eq!(ModelCategory::Hash, ModelCategory::Hash);
-        assert_ne!(ModelCategory::Hash, ModelCategory::Fast);
-        assert_ne!(ModelCategory::Fast, ModelCategory::Quality);
+        assert_eq!(ModelCategory::HashEmbedder, ModelCategory::HashEmbedder);
+        assert_ne!(ModelCategory::HashEmbedder, ModelCategory::StaticEmbedder);
+        assert_ne!(
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder
+        );
+    }
+
+    #[test]
+    fn model_category_default_tier() {
+        assert_eq!(ModelCategory::HashEmbedder.default_tier(), ModelTier::Fast);
+        assert_eq!(
+            ModelCategory::StaticEmbedder.default_tier(),
+            ModelTier::Fast
+        );
+        assert_eq!(
+            ModelCategory::TransformerEmbedder.default_tier(),
+            ModelTier::Quality
+        );
+    }
+
+    #[test]
+    fn model_tier_display() {
+        assert_eq!(ModelTier::Fast.to_string(), "fast");
+        assert_eq!(ModelTier::Quality.to_string(), "quality");
+    }
+
+    #[test]
+    fn model_info_roundtrip() {
+        let info = ModelInfo {
+            id: "potion-multilingual-128M".to_owned(),
+            name: "Potion 128M".to_owned(),
+            dimension: 256,
+            category: ModelCategory::StaticEmbedder,
+            tier: ModelTier::Fast,
+            is_semantic: true,
+            supports_mrl: false,
+            huggingface_id: Some("minishlab/potion-multilingual-128M".to_owned()),
+            size_bytes: Some(128_000_000),
+            license: Some("apache-2.0".to_owned()),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: ModelInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, info);
     }
 
     #[test]
@@ -282,7 +531,6 @@ mod tests {
     // Compile-time checks for trait object safety
     #[test]
     fn embedder_trait_is_object_safe() {
-        // This function existing and compiling proves object safety.
         fn _takes_dyn_embedder(_: &dyn Embedder) {}
     }
 
@@ -294,6 +542,49 @@ mod tests {
     #[test]
     fn lexical_search_trait_is_object_safe() {
         fn _takes_dyn_lexical(_: &dyn LexicalSearch) {}
+    }
+
+    #[test]
+    fn metrics_exporter_trait_is_object_safe() {
+        fn _takes_dyn_metrics_exporter(_: &dyn MetricsExporter) {}
+    }
+
+    #[test]
+    fn noop_metrics_exporter_callbacks_are_noops() {
+        let exporter = NoOpMetricsExporter;
+
+        let search_metrics = SearchMetrics {
+            mode: crate::types::SearchMode::Hybrid,
+            query_class: None,
+            total_latency_ms: 10.0,
+            phase1_latency_ms: Some(4.0),
+            phase2_latency_ms: Some(6.0),
+            result_count: 8,
+            lexical_candidates: 30,
+            semantic_candidates: 25,
+            refined: true,
+        };
+        let embedding_metrics = EmbeddingMetrics {
+            embedder_id: "fnv-hash-384".into(),
+            batch_size: 1,
+            duration_ms: 0.07,
+            dimension: 384,
+            is_semantic: false,
+        };
+        let index_metrics = IndexMetrics {
+            doc_count: 100,
+            index_size_bytes: 4096,
+            updated_docs: 1,
+            staleness_detected: false,
+        };
+
+        exporter.on_search_completed(&search_metrics);
+        exporter.on_embedding_completed(&embedding_metrics);
+        exporter.on_index_updated(&index_metrics);
+        exporter.on_error(&SearchError::SearchTimeout {
+            elapsed_ms: 11,
+            budget_ms: 10,
+        });
     }
 
     // ─── Utility function tests ─────────────────────────────────────────

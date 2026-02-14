@@ -180,7 +180,7 @@ impl DefaultCanonicalizer {
             .join("\n")
     }
 
-    /// Truncate to max_length at a char boundary.
+    /// Truncate to `max_length` at a char boundary.
     fn truncate(text: &str, max_length: usize) -> String {
         if text.len() <= max_length {
             return text.to_string();
@@ -218,6 +218,8 @@ impl Canonicalizer for DefaultCanonicalizer {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write;
+
     use super::*;
 
     #[test]
@@ -272,7 +274,7 @@ mod tests {
     fn collapse_long_code_block() {
         let mut input = String::from("before\n```\n");
         for i in 0..50 {
-            input.push_str(&format!("code line {i}\n"));
+            let _ = writeln!(input, "code line {i}");
         }
         input.push_str("```\nafter");
 
@@ -312,7 +314,10 @@ mod tests {
 
     #[test]
     fn truncate_long_text() {
-        let canon = DefaultCanonicalizer { max_length: 50, ..Default::default() };
+        let canon = DefaultCanonicalizer {
+            max_length: 50,
+            ..Default::default()
+        };
         let input = "a".repeat(100);
         let result = canon.canonicalize(&input);
         assert_eq!(result.len(), 50);
@@ -320,7 +325,10 @@ mod tests {
 
     #[test]
     fn truncate_at_char_boundary() {
-        let canon = DefaultCanonicalizer { max_length: 5, ..Default::default() };
+        let canon = DefaultCanonicalizer {
+            max_length: 5,
+            ..Default::default()
+        };
         // "café" is 5 bytes (é is 2 bytes), truncating at 5 should work
         let input = "café!extra";
         let result = canon.canonicalize(input);
