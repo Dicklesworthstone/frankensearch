@@ -176,6 +176,12 @@ pub struct DaemonStatus {
     pub total_panics_recovered: u64,
     /// Resource usage snapshot.
     pub resources: ResourceUsage,
+    /// Disk-budget state derived from current resource usage and configured limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_budget: Option<DiskBudgetSnapshot>,
+    /// Stable reason code for the current disk-budget state for JSON/TOON consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_budget_reason_code: Option<String>,
 }
 
 /// Resource usage snapshot.
@@ -301,6 +307,7 @@ pub struct DiskBudgetSnapshot {
     pub usage_per_mille: u16,
     pub stage: DiskBudgetStage,
     pub action: DiskBudgetAction,
+    #[serde(skip)]
     pub reason_code: &'static str,
 }
 
@@ -1395,6 +1402,9 @@ impl LifecycleTracker {
         let subs = lock_or_recover(&self.subsystems);
         let subsystem_vec: Vec<SubsystemHealth> = subs.values().cloned().collect();
         drop(subs);
+        let resources = self.current_resource_usage();
+        let disk_budget = self.evaluate_usage_budget(&resources);
+        let disk_budget_reason_code = disk_budget.map(|snapshot| snapshot.reason_code.to_owned());
 
         let started_at_ms = (SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1413,7 +1423,9 @@ impl LifecycleTracker {
             subsystems: subsystem_vec,
             total_errors: self.total_errors.load(Ordering::Relaxed),
             total_panics_recovered: self.total_panics.load(Ordering::Relaxed),
-            resources: self.current_resource_usage(),
+            resources,
+            disk_budget,
+            disk_budget_reason_code,
         }
     }
 
@@ -2082,6 +2094,35 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_tracker_status_includes_disk_budget_snapshot() {
+        let tracker = LifecycleTracker::new(
+            WatchdogConfig::default(),
+            ResourceLimits {
+                max_index_bytes: 1_000,
+                ..ResourceLimits::default()
+            },
+        );
+        tracker.set_resource_usage(ResourceUsage {
+            index_bytes: Some(1_100),
+            ..ResourceUsage::default()
+        });
+
+        let status = tracker.status();
+        let snapshot = status
+            .disk_budget
+            .expect("disk budget snapshot should be present");
+        assert_eq!(snapshot.budget_bytes, 1_000);
+        assert_eq!(snapshot.used_bytes, 1_100);
+        assert_eq!(snapshot.stage, DiskBudgetStage::Critical);
+        assert_eq!(snapshot.action, DiskBudgetAction::PauseWrites);
+        assert_eq!(snapshot.reason_code, FsfsReasonCode::DEGRADE_DISK_CRITICAL);
+        assert_eq!(
+            status.disk_budget_reason_code.as_deref(),
+            Some(FsfsReasonCode::DEGRADE_DISK_CRITICAL)
+        );
+    }
+
+    #[test]
     fn daemon_status_serializes_to_json() {
         let status = DaemonStatus {
             phase: DaemonPhase::Running,
@@ -2099,12 +2140,44 @@ mod tests {
             total_errors: 0,
             total_panics_recovered: 0,
             resources: ResourceUsage::default(),
+            disk_budget: None,
+            disk_budget_reason_code: None,
         };
 
         let json = serde_json::to_string_pretty(&status).unwrap();
         assert!(json.contains("\"running\""));
         assert!(json.contains("12345"));
         assert!(json.contains("\"crawler\""));
+    }
+
+    #[test]
+    fn daemon_status_serializes_disk_budget_reason_code() {
+        let status = DaemonStatus {
+            phase: DaemonPhase::Running,
+            pid: 12345,
+            started_at: "2026-02-14T06:00:00Z".into(),
+            uptime_secs: 3600,
+            subsystems: vec![],
+            total_errors: 0,
+            total_panics_recovered: 0,
+            resources: ResourceUsage {
+                index_bytes: Some(1_100),
+                ..ResourceUsage::default()
+            },
+            disk_budget: Some(DiskBudgetSnapshot {
+                budget_bytes: 1_000,
+                used_bytes: 1_100,
+                usage_per_mille: 1_100,
+                stage: DiskBudgetStage::Critical,
+                action: DiskBudgetAction::PauseWrites,
+                reason_code: FsfsReasonCode::DEGRADE_DISK_CRITICAL,
+            }),
+            disk_budget_reason_code: Some(FsfsReasonCode::DEGRADE_DISK_CRITICAL.to_owned()),
+        };
+
+        let json = serde_json::to_string(&status).expect("status should serialize");
+        assert!(json.contains("\"disk_budget_reason_code\":\"degrade.disk.critical\""));
+        assert!(!json.contains("\"reason_code\":"));
     }
 
     // ── Date Formatting ──

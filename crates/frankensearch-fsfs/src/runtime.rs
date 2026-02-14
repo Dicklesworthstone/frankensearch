@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use frankensearch_core::SearchResult;
+use frankensearch_core::{SearchError, SearchResult};
 use tracing::{info, warn};
 
+use crate::adapters::tui::FsfsTuiShellModel;
 use crate::config::{
     DegradationOverrideMode, DiscoveryCandidate, DiscoveryDecision, FsfsConfig, IngestionClass,
     PressureProfile, RootDiscoveryDecision,
@@ -578,9 +579,27 @@ impl FsfsRuntime {
     /// # Errors
     ///
     /// Returns `SearchError` when downstream TUI runtime logic fails.
+    #[allow(clippy::unused_async)]
     pub async fn run_tui(&self, _cx: &Cx) -> SearchResult<()> {
-        std::future::ready(()).await;
-        info!(theme = ?self.config.tui.theme, "fsfs tui runtime scaffold invoked");
+        let shell_model = FsfsTuiShellModel::from_config(&self.config);
+        shell_model
+            .validate()
+            .map_err(|error| SearchError::InvalidConfig {
+                field: "tui.shell_model".to_owned(),
+                value: format!("{shell_model:?}"),
+                reason: error.to_string(),
+            })?;
+
+        let palette = shell_model.palette.build_palette();
+        info!(
+            theme = ?shell_model.settings.theme,
+            density = ?shell_model.settings.density,
+            show_explanations = shell_model.settings.show_explanations,
+            screen_count = shell_model.navigation.screen_order.len(),
+            keybinding_count = shell_model.keymap.bindings.len(),
+            palette_action_count = palette.len(),
+            "fsfs tui shell model initialized"
+        );
         Ok(())
     }
 

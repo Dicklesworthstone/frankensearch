@@ -13,6 +13,7 @@ pub mod concurrency;
 pub mod config;
 pub mod evidence;
 pub mod explanation_payload;
+pub mod interaction_primitives;
 pub mod lexical_pipeline;
 pub mod lifecycle;
 pub mod mount_info;
@@ -23,6 +24,7 @@ pub mod pressure_sensing;
 pub mod profiling;
 pub mod query_execution;
 pub mod query_planning;
+pub mod ranking_priors;
 pub mod redaction;
 pub mod repro;
 pub mod runtime;
@@ -38,7 +40,12 @@ pub use adapters::format_emitter::{
     emit_envelope, emit_envelope_string, emit_stream_frame, emit_stream_frame_string,
     meta_for_format, verify_json_toon_parity,
 };
-pub use adapters::tui::TuiAdapterSettings;
+pub use adapters::tui::{
+    ContextRetentionPolicy, ContextRetentionRule, FsfsScreen, FsfsTuiShellModel,
+    TuiAdapterSettings, TuiKeyBindingScope, TuiKeyBindingSpec, TuiKeymapModel,
+    TuiModelValidationError, TuiNavigationModel, TuiPaletteActionSpec, TuiPaletteCategory,
+    TuiPaletteModel,
+};
 pub use agent_ergonomics::{
     CompactEnvelope, CompactError, CompactHit, CompactLevel, CompactSearchResponse,
     QUERY_TEMPLATE_VERSION, QueryTemplate, RESULT_ID_PREFIX, ResultIdEntry, ResultIdRegistry,
@@ -82,6 +89,12 @@ pub use explanation_payload::{
     EXPLANATION_PAYLOAD_SCHEMA_VERSION, FsfsExplanationPayload, FusionContext,
     PolicyDecisionExplanation, PolicyDomain, RankMovementSnapshot, RankingExplanation,
     ScoreComponentBreakdown, ScoreComponentSource, TuiExplanationPanel,
+};
+pub use interaction_primitives::{
+    CyclicFilter, INTERACTION_PRIMITIVES_SCHEMA_VERSION, InteractionBudget, InteractionCycleTiming,
+    InteractionSnapshot, LayoutConstraint, LayoutDirection, LatencyPhase, PanelDescriptor,
+    PanelFocusState, PanelRole, PhaseTiming, RenderTier, ScreenAction, ScreenLayout,
+    VirtualizedListState, canonical_layout, fnv1a_64,
 };
 pub use lexical_pipeline::{
     InMemoryLexicalBackend, InMemoryLexicalEntry, LexicalAction, LexicalBatchStats, LexicalChunk,
@@ -135,6 +148,14 @@ pub use query_execution::{
 pub use query_planning::{
     DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE, QueryBudgetProfile, QueryFallbackPath,
     QueryIntentClass, QueryIntentDecision, QueryPlanner, QueryPlannerConfig, RetrievalBudget,
+};
+pub use ranking_priors::{
+    ALL_PRIOR_FAMILIES, DEFAULT_MAX_PRIOR_BOOST, DEFAULT_PATH_PROXIMITY_RADIUS,
+    DEFAULT_RECENCY_HALF_LIFE_DAYS, DocumentPriorMetadata, MIN_PRIOR_MULTIPLIER,
+    PRIOR_CONFIG_SCHEMA_VERSION, PRIOR_TIE_BREAK_CONTRACT, PriorApplicationResult, PriorApplier,
+    PriorEvidence, PriorFamily, PriorFamilyConfig, QueryPriorContext, RankingPriorConfig,
+    path_proximity_multiplier, project_affinity_multiplier, recency_multiplier,
+    shared_prefix_depth,
 };
 pub use redaction::{
     ArtifactRetention, ArtifactType, DataClass, HARD_DENY_PATH_PATTERNS, MaskSeed, OutputSurface,

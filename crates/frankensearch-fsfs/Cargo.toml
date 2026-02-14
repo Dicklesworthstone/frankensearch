@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 frankensearch-core = { workspace = true }
+frankensearch-tui = { workspace = true }
 asupersync = { workspace = true }
 fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
@@ -31,6 +32,7 @@ notify = "7.0"
 [dev-dependencies]
 asupersync = { workspace = true }
 tempfile = "3"
+proptest = { workspace = true }
 
 [lints]
 workspace = true

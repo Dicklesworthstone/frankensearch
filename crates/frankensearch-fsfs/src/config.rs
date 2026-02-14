@@ -2380,11 +2380,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::SearchError;
+    use proptest::prelude::*;
 
     use super::{
         CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, IngestionClass,
         PRESSURE_PROFILE_VERSION, PressureProfileField, ProfileOverrideSource,
-        default_config_file_path, load_from_sources, load_from_str,
+        default_config_file_path, load_from_sources, load_from_str, parse_bool, parse_csv,
     };
 
     fn home() -> &'static Path {
@@ -2594,6 +2595,69 @@ mod tests {
         let err = load_from_str(None, None, &env, &CliOverrides::default(), home())
             .expect_err("must reject invalid bool");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    fn with_case_mask(input: &str, mask: u32) -> String {
+        let mut bit = 0_u32;
+        input
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphabetic() {
+                    let upper = (mask >> bit) & 1 == 1;
+                    bit = bit.saturating_add(1);
+                    if upper {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        ch.to_ascii_lowercase()
+                    }
+                } else {
+                    ch
+                }
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn parse_bool_accepts_case_variants(
+            is_true in any::<bool>(),
+            token_idx in 0usize..4,
+            mask in any::<u32>(),
+        ) {
+            const TRUE_TOKENS: [&str; 4] = ["true", "yes", "on", "1"];
+            const FALSE_TOKENS: [&str; 4] = ["false", "no", "off", "0"];
+            let base = if is_true {
+                TRUE_TOKENS[token_idx]
+            } else {
+                FALSE_TOKENS[token_idx]
+            };
+            let candidate = with_case_mask(base, mask);
+            let parsed = parse_bool(&candidate, "test.bool").expect("recognized boolean token");
+            prop_assert_eq!(parsed, is_true);
+        }
+
+        #[test]
+        fn parse_bool_rejects_non_boolean_tokens(token in "[A-Za-z_][A-Za-z0-9_\\-]{0,15}") {
+            let normalized = token.to_ascii_lowercase();
+            prop_assume!(!matches!(
+                normalized.as_str(),
+                "1" | "0" | "true" | "false" | "yes" | "no" | "on" | "off"
+            ));
+            let parsed = parse_bool(&token, "test.bool");
+            assert!(matches!(parsed, Err(SearchError::InvalidConfig { .. })));
+        }
+
+        #[test]
+        fn parse_csv_roundtrips_trimmed_tokens(tokens in prop::collection::vec("[A-Za-z0-9_./\\-]{1,12}", 1..8)) {
+            let csv = tokens
+                .iter()
+                .map(|token| format!("  {token}  "))
+                .collect::<Vec<_>>()
+                .join(" , ");
+            let parsed = parse_csv(&csv, "test.csv").expect("csv parse must succeed");
+            assert!(parsed.iter().all(|token| !token.trim().is_empty()));
+            prop_assert_eq!(parsed, tokens);
+        }
     }
 
     fn assert_invalid_field(file: &str, field: &str) {

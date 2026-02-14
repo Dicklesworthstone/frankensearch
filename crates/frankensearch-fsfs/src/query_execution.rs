@@ -389,11 +389,138 @@ impl SemanticCandidate {
 pub struct FusedCandidate {
     pub doc_id: String,
     pub fused_score: f64,
+    pub prior_boost: f64,
     pub lexical_rank: Option<usize>,
     pub semantic_rank: Option<usize>,
     pub lexical_score: Option<f32>,
     pub semantic_score: Option<f32>,
     pub in_both_sources: bool,
+}
+
+/// Optional prior signals attached to a candidate.
+///
+/// All signals are expected in the normalized range `[0.0, 1.0]`.
+/// Non-finite values are sanitized to `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RankingPriorSignals {
+    pub recency: Option<f64>,
+    pub path: Option<f64>,
+    pub project: Option<f64>,
+}
+
+impl RankingPriorSignals {
+    #[must_use]
+    pub const fn new(recency: Option<f64>, path: Option<f64>, project: Option<f64>) -> Self {
+        Self {
+            recency,
+            path,
+            project,
+        }
+    }
+}
+
+/// Weights for prior families used to post-adjust fused scores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankingPriorWeights {
+    pub recency: f64,
+    pub path: f64,
+    pub project: f64,
+}
+
+impl RankingPriorWeights {
+    #[must_use]
+    pub const fn new(recency: f64, path: f64, project: f64) -> Self {
+        Self {
+            recency,
+            path,
+            project,
+        }
+    }
+}
+
+impl Default for RankingPriorWeights {
+    fn default() -> Self {
+        Self::new(0.12, 0.08, 0.05)
+    }
+}
+
+/// Deterministic tuning controls for recency/path/project priors.
+///
+/// `max_total_boost` caps the total additive prior contribution so priors
+/// cannot dominate base retrieval signals. This preserves reproducibility and
+/// stable tie-break behavior under profile changes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankingPriorTuning {
+    pub enabled: bool,
+    pub weights: RankingPriorWeights,
+    pub max_total_boost: f64,
+}
+
+impl RankingPriorTuning {
+    #[must_use]
+    pub const fn for_profile(profile: PressureProfile) -> Self {
+        match profile {
+            PressureProfile::Strict => Self {
+                enabled: true,
+                weights: RankingPriorWeights::new(0.03, 0.02, 0.01),
+                max_total_boost: 0.002,
+            },
+            PressureProfile::Performance => Self {
+                enabled: true,
+                weights: RankingPriorWeights::new(0.12, 0.08, 0.05),
+                max_total_boost: 0.01,
+            },
+            PressureProfile::Degraded => Self {
+                enabled: true,
+                weights: RankingPriorWeights::new(0.06, 0.03, 0.02),
+                max_total_boost: 0.004,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        let max_total_boost = sanitize_max_prior_boost(self.max_total_boost);
+        let raw_weights = self.weights;
+        let mut recency = sanitize_non_negative(raw_weights.recency);
+        let mut path = sanitize_non_negative(raw_weights.path);
+        let mut project = sanitize_non_negative(raw_weights.project);
+        let sum = recency + path + project;
+        if sum > max_total_boost && sum > 0.0 {
+            let scale = max_total_boost / sum;
+            recency *= scale;
+            path *= scale;
+            project *= scale;
+        }
+        Self {
+            enabled: self.enabled,
+            weights: RankingPriorWeights::new(recency, path, project),
+            max_total_boost,
+        }
+    }
+
+    #[must_use]
+    fn boost_for(self, signals: RankingPriorSignals) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
+        let recency = sanitize_signal(signals.recency);
+        let path = sanitize_signal(signals.path);
+        let project = sanitize_signal(signals.project);
+        let boost = self.weights.recency.mul_add(
+            recency,
+            self.weights
+                .path
+                .mul_add(path, self.weights.project * project),
+        );
+        boost.clamp(0.0, self.max_total_boost)
+    }
+}
+
+impl Default for RankingPriorTuning {
+    fn default() -> Self {
+        Self::for_profile(PressureProfile::Performance)
+    }
 }
 
 /// Deterministic fusion policy.
@@ -590,7 +717,32 @@ impl QueryExecutionOrchestrator {
         limit: usize,
         offset: usize,
     ) -> Vec<FusedCandidate> {
+        self.fuse_rankings_with_priors(
+            lexical,
+            semantic,
+            limit,
+            offset,
+            &HashMap::new(),
+            RankingPriorTuning::default(),
+        )
+    }
+
+    /// Fuse lexical + semantic rankings and apply optional prior boosts.
+    ///
+    /// Prior boosts are additive and bounded by `tuning.max_total_boost`.
+    /// Deterministic tie-break ordering is always preserved.
+    #[must_use]
+    pub fn fuse_rankings_with_priors(
+        &self,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+        limit: usize,
+        offset: usize,
+        prior_signals: &HashMap<String, RankingPriorSignals>,
+        tuning: RankingPriorTuning,
+    ) -> Vec<FusedCandidate> {
         let k = self.fusion_policy.effective_k();
+        let tuning = tuning.normalized();
         let mut merged: HashMap<String, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
 
@@ -615,6 +767,7 @@ impl QueryExecutionOrchestrator {
                 .or_insert_with(|| FusedCandidate {
                     doc_id: candidate.doc_id.clone(),
                     fused_score: contribution,
+                    prior_boost: 0.0,
                     lexical_rank: Some(rank),
                     semantic_rank: None,
                     lexical_score: Some(lexical_score),
@@ -644,6 +797,7 @@ impl QueryExecutionOrchestrator {
                 .or_insert_with(|| FusedCandidate {
                     doc_id: candidate.doc_id.clone(),
                     fused_score: contribution,
+                    prior_boost: 0.0,
                     lexical_rank: None,
                     semantic_rank: Some(rank),
                     lexical_score: None,
@@ -652,7 +806,19 @@ impl QueryExecutionOrchestrator {
                 });
         }
 
-        let mut fused: Vec<FusedCandidate> = merged.into_values().collect();
+        let mut fused: Vec<FusedCandidate> = merged
+            .into_values()
+            .map(|mut candidate| {
+                let signals = prior_signals
+                    .get(&candidate.doc_id)
+                    .copied()
+                    .unwrap_or_default();
+                let prior_boost = tuning.boost_for(signals);
+                candidate.prior_boost = prior_boost;
+                candidate.fused_score += prior_boost;
+                candidate
+            })
+            .collect();
         fused.sort_by(fused_cmp);
 
         fused.into_iter().skip(offset).take(limit).collect()
@@ -788,6 +954,30 @@ fn option_score(score: Option<f32>) -> f32 {
     score.map_or(f32::NEG_INFINITY, sanitize_score)
 }
 
+#[must_use]
+fn sanitize_non_negative(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+#[must_use]
+fn sanitize_signal(value: Option<f64>) -> f64 {
+    value.map_or(0.0, |v| sanitize_non_negative(v).clamp(0.0, 1.0))
+}
+
+#[must_use]
+fn sanitize_max_prior_boost(value: f64) -> f64 {
+    let sanitized = sanitize_non_negative(value);
+    if sanitized > 0.0 {
+        sanitized.min(0.05)
+    } else {
+        0.01
+    }
+}
+
 fn fused_cmp(left: &FusedCandidate, right: &FusedCandidate) -> Ordering {
     right
         .fused_score
@@ -807,12 +997,14 @@ mod tests {
     use super::{
         CancellationAction, CancellationPoint, DegradationOverride, DegradationPolicy,
         DegradationSignals, DegradationStateMachine, DegradedRetrievalMode, LexicalCandidate,
-        QueryExecutionOrchestrator, RetrievalStage, SemanticCandidate,
+        QueryExecutionOrchestrator, RankingPriorSignals, RankingPriorTuning, RetrievalStage,
+        SemanticCandidate,
     };
     use crate::config::{FsfsConfig, PressureProfile};
     use crate::orchestration::BackpressureMode;
     use crate::pressure::PressureState;
     use crate::query_planning::QueryPlanner;
+    use std::collections::HashMap;
 
     fn stage_names(plan: &super::QueryExecutionPlan) -> Vec<RetrievalStage> {
         plan.stages.iter().map(|stage| stage.stage).collect()
@@ -931,6 +1123,69 @@ mod tests {
         let ids: Vec<&str> = fused.iter().map(|hit| hit.doc_id.as_str()).collect();
 
         assert_eq!(ids, vec!["doc-b", "doc-a", "doc-c"]);
+    }
+
+    #[test]
+    fn fusion_priors_promote_candidates_without_breaking_determinism() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let lexical = vec![
+            LexicalCandidate::new("doc-a", 10.0),
+            LexicalCandidate::new("doc-b", 10.0),
+        ];
+        let semantic = vec![
+            SemanticCandidate::new("doc-a", 0.8),
+            SemanticCandidate::new("doc-b", 0.8),
+        ];
+        let mut priors = HashMap::new();
+        priors.insert(
+            "doc-b".to_owned(),
+            RankingPriorSignals::new(Some(1.0), Some(0.5), Some(0.25)),
+        );
+        let tuning = RankingPriorTuning::for_profile(PressureProfile::Performance);
+
+        let fused =
+            orchestrator.fuse_rankings_with_priors(&lexical, &semantic, 10, 0, &priors, tuning);
+        let ids: Vec<&str> = fused.iter().map(|hit| hit.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["doc-b", "doc-a"]);
+        assert!(fused[0].prior_boost > 0.0);
+        assert!(fused[1].prior_boost.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn prior_boost_is_clamped_and_sanitized() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let lexical = vec![LexicalCandidate::new("doc-a", 1.0)];
+        let semantic = vec![SemanticCandidate::new("doc-a", 1.0)];
+        let mut priors = HashMap::new();
+        priors.insert(
+            "doc-a".to_owned(),
+            RankingPriorSignals::new(Some(f64::NAN), Some(99.0), Some(99.0)),
+        );
+        let tuning = RankingPriorTuning {
+            enabled: true,
+            max_total_boost: 0.002,
+            ..RankingPriorTuning::for_profile(PressureProfile::Performance)
+        };
+
+        let fused =
+            orchestrator.fuse_rankings_with_priors(&lexical, &semantic, 10, 0, &priors, tuning);
+        assert_eq!(fused.len(), 1);
+        assert!(fused[0].prior_boost.is_finite());
+        assert!(fused[0].prior_boost > 0.0);
+        assert!(fused[0].prior_boost <= 0.002 + 1e-12);
+    }
+
+    #[test]
+    fn prior_profile_defaults_are_compatible_with_pressure_modes() {
+        let strict = RankingPriorTuning::for_profile(PressureProfile::Strict).normalized();
+        let performance =
+            RankingPriorTuning::for_profile(PressureProfile::Performance).normalized();
+        let degraded = RankingPriorTuning::for_profile(PressureProfile::Degraded).normalized();
+
+        assert!(strict.max_total_boost < performance.max_total_boost);
+        assert!(degraded.max_total_boost <= performance.max_total_boost);
+        assert!(strict.weights.recency <= performance.weights.recency);
+        assert!(degraded.weights.path <= performance.weights.path);
     }
 
     #[test]

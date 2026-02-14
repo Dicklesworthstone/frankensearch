@@ -82,7 +82,7 @@ pub struct CliE2eRunConfig {
 impl Default for CliE2eRunConfig {
     fn default() -> Self {
         Self {
-            run_id: "01JCLI7E2ECONTRACT000000000".to_owned(),
+            run_id: "01JABCD3EFGHJKMNPQRSTVWXYZ".to_owned(),
             ts: "2026-02-14T00:00:00Z".to_owned(),
             seed: 42,
             config_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
