@@ -345,6 +345,17 @@ impl AdaptiveFusion {
         event
     }
 
+    /// Reset all learned parameters to their priors.
+    ///
+    /// Clears all per-class and global observations, returning the fusion
+    /// state to its initial configuration.
+    pub fn reset(&self) {
+        let mut state = self.state.lock().expect("adaptive lock poisoned");
+        state.per_class.clear();
+        state.global = ClassState::default();
+        debug!("adaptive fusion state reset to prior");
+    }
+
     /// Snapshot the current state for serialization or inspection.
     #[must_use]
     pub fn snapshot(&self) -> AdaptiveSnapshot {
@@ -687,5 +698,280 @@ mod tests {
         let af = AdaptiveFusion::with_defaults();
         let debug = format!("{af:?}");
         assert!(debug.contains("AdaptiveFusion"));
+    }
+
+    // --- Reset ---
+
+    #[test]
+    fn reset_clears_observations_to_prior() {
+        let af = AdaptiveFusion::new(test_config());
+
+        // Feed many observations so posterior diverges from prior.
+        for _ in 0..20 {
+            af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+            af.update_k(QueryClass::NaturalLanguage, 80.0, SignalSource::NdcgEval);
+        }
+
+        // Verify parameters have shifted.
+        let snap_before = af.snapshot();
+        assert!(snap_before.global_blend.n > 0);
+        assert!(snap_before.global_k.n > 0);
+
+        // Reset.
+        af.reset();
+
+        // After reset, should be back at prior.
+        let snap_after = af.snapshot();
+        assert_eq!(snap_after.global_blend.n, 0);
+        assert_eq!(snap_after.global_k.n, 0);
+        assert!((snap_after.global_blend.alpha - 7.0).abs() < f64::EPSILON);
+        assert!((snap_after.global_blend.beta - 3.0).abs() < f64::EPSILON);
+        assert!((snap_after.global_k.mu - 60.0).abs() < f64::EPSILON);
+        assert!(snap_after.per_class.is_empty());
+
+        // Blend factor should return to default 0.7.
+        assert!((af.blend_factor(QueryClass::NaturalLanguage) - 0.7).abs() < 1e-10);
+        assert!((af.rrf_k(QueryClass::NaturalLanguage) - 60.0).abs() < 1e-10);
+    }
+
+    // --- Determinism ---
+
+    #[test]
+    fn determinism_same_sequence_same_result() {
+        let run = || {
+            let af = AdaptiveFusion::new(test_config());
+            let observations = [
+                (QueryClass::NaturalLanguage, true),
+                (QueryClass::NaturalLanguage, false),
+                (QueryClass::ShortKeyword, true),
+                (QueryClass::ShortKeyword, true),
+                (QueryClass::Identifier, false),
+                (QueryClass::NaturalLanguage, true),
+                (QueryClass::NaturalLanguage, true),
+            ];
+            for &(qc, success) in &observations {
+                af.update_blend(qc, success, SignalSource::Click);
+            }
+            let k_observations = [
+                (QueryClass::NaturalLanguage, 55.0),
+                (QueryClass::ShortKeyword, 70.0),
+                (QueryClass::NaturalLanguage, 45.0),
+                (QueryClass::Identifier, 80.0),
+            ];
+            for &(qc, k) in &k_observations {
+                af.update_k(qc, k, SignalSource::NdcgEval);
+            }
+            af.snapshot()
+        };
+
+        let snap_a = run();
+        let snap_b = run();
+
+        assert!((snap_a.global_blend.alpha - snap_b.global_blend.alpha).abs() < f64::EPSILON);
+        assert!((snap_a.global_blend.beta - snap_b.global_blend.beta).abs() < f64::EPSILON);
+        assert!((snap_a.global_k.mu - snap_b.global_k.mu).abs() < f64::EPSILON);
+        assert!((snap_a.global_k.sigma_sq - snap_b.global_k.sigma_sq).abs() < f64::EPSILON);
+        assert_eq!(snap_a.per_class.len(), snap_b.per_class.len());
+    }
+
+    // --- Numerical stability ---
+
+    #[test]
+    fn numerical_stability_no_nan_or_inf() {
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: 0,
+            ..AdaptiveConfig::default()
+        });
+
+        // Many alternating observations to stress the posteriors.
+        for i in 0..1_000 {
+            let success = i % 3 != 0;
+            af.update_blend(QueryClass::NaturalLanguage, success, SignalSource::Click);
+            af.update_k(
+                QueryClass::NaturalLanguage,
+                if i % 2 == 0 { 1.0 } else { 200.0 },
+                SignalSource::NdcgEval,
+            );
+        }
+
+        let blend = af.blend_factor(QueryClass::NaturalLanguage);
+        let k = af.rrf_k(QueryClass::NaturalLanguage);
+        assert!(blend.is_finite(), "blend factor must be finite: {blend}");
+        assert!(k.is_finite(), "RRF K must be finite: {k}");
+        assert!(!blend.is_nan(), "blend factor must not be NaN");
+        assert!(!k.is_nan(), "RRF K must not be NaN");
+
+        let snap = af.snapshot();
+        assert!(snap.global_blend.alpha.is_finite());
+        assert!(snap.global_blend.beta.is_finite());
+        assert!(snap.global_k.mu.is_finite());
+        assert!(snap.global_k.sigma_sq.is_finite());
+        assert!(snap.global_k.sigma_sq > 0.0, "K variance must stay positive");
+    }
+
+    // --- Conflicting observations edge case ---
+
+    #[test]
+    fn conflicting_observations_stay_near_prior() {
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: 0,
+            ..AdaptiveConfig::default()
+        });
+
+        // Equal success and failure → blend stays near prior.
+        for _ in 0..100 {
+            af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+            af.update_blend(QueryClass::NaturalLanguage, false, SignalSource::Skip);
+        }
+
+        let blend = af.blend_factor(QueryClass::NaturalLanguage);
+        // 200 observations: 100 success + 7 prior alpha, 100 failure + 3 prior beta
+        // Expected mean: 107 / 210 ≈ 0.5095
+        assert!(
+            (blend - 0.5).abs() < 0.1,
+            "conflicting 50/50 observations should pull blend near 0.5, got {blend}"
+        );
+
+        let snap = af.snapshot();
+        let var = snap.global_blend.alpha * snap.global_blend.beta
+            / ((snap.global_blend.alpha + snap.global_blend.beta).powi(2)
+                * (snap.global_blend.alpha + snap.global_blend.beta + 1.0));
+        assert!(var > 0.0, "variance should remain positive with conflicting data");
+    }
+
+    // --- Identical observations edge case ---
+
+    #[test]
+    fn identical_observations_converge_precisely() {
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: 0,
+            ..AdaptiveConfig::default()
+        });
+
+        // All successes.
+        for _ in 0..200 {
+            af.update_blend(QueryClass::ShortKeyword, true, SignalSource::Click);
+        }
+
+        let blend = af.blend_factor(QueryClass::ShortKeyword);
+        // (7 + 200) / (7 + 200 + 3) = 207/210 ≈ 0.9857, clamped to 0.95
+        assert!(
+            blend >= 0.95 - f64::EPSILON,
+            "all-success should hit safety clamp, got {blend}"
+        );
+
+        // All observations of K=100.
+        for _ in 0..200 {
+            af.update_k(QueryClass::ShortKeyword, 100.0, SignalSource::NdcgEval);
+        }
+
+        let k = af.rrf_k(QueryClass::ShortKeyword);
+        assert!(
+            (k - 100.0).abs() < 1.0,
+            "identical K observations should converge precisely, got {k}"
+        );
+    }
+
+    // --- Config serde roundtrip ---
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = AdaptiveConfig {
+            min_samples: 42,
+            blend_min: 0.15,
+            blend_max: 0.85,
+            k_min: 5.0,
+            k_max: 100.0,
+            thompson_sampling: true,
+            seed: Some(12345),
+        };
+        let json = serde_json::to_string(&config).expect("serialize config");
+        let decoded: AdaptiveConfig = serde_json::from_str(&json).expect("deserialize config");
+        assert_eq!(decoded.min_samples, 42);
+        assert!((decoded.blend_min - 0.15).abs() < f64::EPSILON);
+        assert!(decoded.thompson_sampling);
+        assert_eq!(decoded.seed, Some(12345));
+    }
+
+    // --- Blend posterior variance ---
+
+    #[test]
+    fn blend_posterior_variance_formulas() {
+        let bp = BlendPosterior {
+            alpha: 10.0,
+            beta: 5.0,
+            n: 5,
+        };
+        // Variance = alpha*beta / (alpha+beta)^2 / (alpha+beta+1)
+        let expected = (10.0 * 5.0) / (15.0 * 15.0 * 16.0);
+        assert!((bp.variance() - expected).abs() < 1e-12);
+    }
+
+    // --- K posterior std_dev ---
+
+    #[test]
+    fn k_posterior_std_dev() {
+        let kp = KPosterior {
+            mu: 60.0,
+            sigma_sq: 25.0,
+            sigma_obs_sq: 225.0,
+            n: 0,
+        };
+        assert!((kp.std_dev() - 5.0).abs() < f64::EPSILON);
+    }
+
+    // --- Signal source serde ---
+
+    #[test]
+    fn signal_source_serde_all_variants() {
+        for signal in [
+            SignalSource::Click,
+            SignalSource::Skip,
+            SignalSource::Dwell,
+            SignalSource::NdcgEval,
+        ] {
+            let json = serde_json::to_string(&signal).expect("serialize signal");
+            let decoded: SignalSource = serde_json::from_str(&json).expect("deserialize signal");
+            assert_eq!(decoded, signal);
+        }
+    }
+
+    // --- Evidence event serde ---
+
+    #[test]
+    fn evidence_event_serde_roundtrip() {
+        let event = EvidenceEvent {
+            query_class: QueryClass::NaturalLanguage,
+            blend_used: 0.72,
+            k_used: 61.5,
+            blend_posterior: (8.0, 3.0),
+            k_posterior: (61.5, 90.0),
+            signal_source: SignalSource::Click,
+        };
+        let json = serde_json::to_string(&event).expect("serialize event");
+        let decoded: EvidenceEvent = serde_json::from_str(&json).expect("deserialize event");
+        assert_eq!(decoded.query_class, QueryClass::NaturalLanguage);
+        assert!((decoded.blend_used - 0.72).abs() < f64::EPSILON);
+    }
+
+    // --- Multiple query classes in snapshot ---
+
+    #[test]
+    fn snapshot_captures_all_query_classes() {
+        let af = AdaptiveFusion::new(test_config());
+
+        af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+        af.update_blend(QueryClass::ShortKeyword, false, SignalSource::Skip);
+        af.update_blend(QueryClass::Identifier, true, SignalSource::Dwell);
+        af.update_blend(QueryClass::Empty, false, SignalSource::NdcgEval);
+
+        let snap = af.snapshot();
+        assert_eq!(snap.per_class.len(), 4);
+
+        let classes: Vec<QueryClass> = snap.per_class.iter().map(|(qc, _, _)| *qc).collect();
+        assert!(classes.contains(&QueryClass::NaturalLanguage));
+        assert!(classes.contains(&QueryClass::ShortKeyword));
+        assert!(classes.contains(&QueryClass::Identifier));
+        assert!(classes.contains(&QueryClass::Empty));
     }
 }

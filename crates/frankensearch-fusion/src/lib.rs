@@ -10,6 +10,7 @@
 //! - **Phase gate**: Anytime-valid sequential testing for phase transition decisions.
 //! - **Feedback**: Implicit relevance feedback with exponentially-decaying boost map.
 
+pub mod adaptive;
 pub mod blend;
 pub mod cache;
 pub mod calibration;
@@ -27,6 +28,10 @@ pub mod refresh;
 pub mod rrf;
 pub mod searcher;
 
+pub use adaptive::{
+    AdaptiveConfig, AdaptiveFusion, AdaptiveSnapshot, BlendPosterior, EvidenceEvent, KPosterior,
+    SignalSource,
+};
 pub use blend::{blend_two_tier, compute_rank_changes, kendall_tau};
 pub use cache::{
     IndexCache, IndexSentinel, IndexStaleness, SENTINEL_FILENAME, SENTINEL_VERSION,
