@@ -11,6 +11,7 @@
 //! │  frankensearch-ops (this crate)                 │
 //! │  ├─ app: OpsApp entry point and event loop      │
 //! │  ├─ data_source: DataSource trait + mock impl   │
+//! │  ├─ storage: Ops telemetry DB bootstrap          │
 //! │  ├─ state: Shared AppState for async bridge     │
 //! │  ├─ screens: Fleet, Search, Index, Resource     │
 //! │  └─ category: Screen groupings for navigation   │
@@ -32,6 +33,7 @@ pub mod preferences;
 pub mod presets;
 pub mod screens;
 pub mod state;
+pub mod storage;
 
 // ─── Re-exports ─────────────────────────────────────────────────────────────
 
@@ -42,3 +44,7 @@ pub use overlays::{render_overlay, render_palette_overlay};
 pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
 pub use presets::{Density, ViewPreset, ViewState};
 pub use state::{AppState, ControlPlaneHealth, ControlPlaneMetrics};
+pub use storage::{
+    OPS_SCHEMA_VERSION, OpsStorage, OpsStorageConfig, bootstrap as bootstrap_ops_storage,
+    current_version as current_ops_schema_version,
+};
