@@ -5,10 +5,254 @@
 //! All types are `Serialize`/`Deserialize` for JSON/JSONL emission.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
 
 /// Schema version for the e2e artifact envelope.
 pub const E2E_SCHEMA_VERSION: u32 = 1;
+/// Schema discriminator for manifest artifacts.
+pub const E2E_SCHEMA_MANIFEST: &str = "e2e-manifest-v1";
+/// Schema discriminator for event artifacts.
+pub const E2E_SCHEMA_EVENT: &str = "e2e-event-v1";
+/// Schema discriminator for oracle report artifacts.
+pub const E2E_SCHEMA_ORACLE_REPORT: &str = "e2e-oracle-report-v1";
+/// Schema discriminator for replay artifacts.
+pub const E2E_SCHEMA_REPLAY: &str = "e2e-replay-v1";
+/// Schema discriminator for snapshot diff artifacts.
+pub const E2E_SCHEMA_SNAPSHOT_DIFF: &str = "e2e-snapshot-diff-v1";
+
+/// Mandatory structured events stream for unified e2e packs.
+pub const E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL: &str = "structured_events.jsonl";
+/// Mandatory artifact index for failed runs.
+pub const E2E_ARTIFACT_ARTIFACTS_INDEX_JSON: &str = "artifacts_index.json";
+/// Mandatory replay command pointer for failed runs.
+pub const E2E_ARTIFACT_REPLAY_COMMAND_TXT: &str = "replay_command.txt";
+/// Mandatory terminal transcript for failed ops/ui lanes.
+pub const E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT: &str = "terminal_transcript.txt";
+
+/// Validation errors for unified e2e artifact bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum E2eArtifactValidationError {
+    #[error("unsupported e2e schema version: expected {expected}, found {found}")]
+    UnsupportedSchemaVersion { expected: u32, found: u32 },
+    #[error("schema tag mismatch: expected '{expected}', found '{found}'")]
+    SchemaTagMismatch {
+        expected: &'static str,
+        found: String,
+    },
+    #[error("invalid run_id '{run_id}': expected 26-char Crockford ULID")]
+    InvalidRunId { run_id: String },
+    #[error("manifest missing required artifact entry '{required_file}'")]
+    MissingRequiredArtifact { required_file: &'static str },
+    #[error("manifest contains duplicate artifact entry '{file}'")]
+    DuplicateArtifactEntry { file: String },
+    #[error("artifact '{file}' is JSONL and must include line_count")]
+    MissingLineCountForJsonl { file: String },
+    #[error("artifact '{file}' is not JSONL and must not include line_count")]
+    UnexpectedLineCountForNonJsonl { file: String },
+    #[error("event '{event_type:?}' requires lane_id")]
+    MissingLaneId { event_type: E2eEventType },
+    #[error("oracle_check event requires oracle_id and outcome")]
+    MissingOracleFields,
+    #[error("event outcome '{outcome:?}' requires reason_code")]
+    MissingReasonCode { outcome: E2eOutcome },
+    #[error("reason_code '{reason_code}' does not match e2e namespace pattern")]
+    InvalidReasonCode { reason_code: String },
+}
+
+/// Validate common envelope invariants shared by all e2e artifacts.
+///
+/// # Errors
+///
+/// Returns an error if the schema version, schema tag, or run ID is invalid.
+pub fn validate_envelope<B>(
+    envelope: &E2eEnvelope<B>,
+    expected_schema: &'static str,
+) -> Result<(), E2eArtifactValidationError> {
+    if envelope.v != E2E_SCHEMA_VERSION {
+        return Err(E2eArtifactValidationError::UnsupportedSchemaVersion {
+            expected: E2E_SCHEMA_VERSION,
+            found: envelope.v,
+        });
+    }
+    if envelope.schema != expected_schema {
+        return Err(E2eArtifactValidationError::SchemaTagMismatch {
+            expected: expected_schema,
+            found: envelope.schema.clone(),
+        });
+    }
+    if !is_valid_ulid(&envelope.run_id) {
+        return Err(E2eArtifactValidationError::InvalidRunId {
+            run_id: envelope.run_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a manifest envelope and its body contract.
+///
+/// # Errors
+///
+/// Returns an error if envelope invariants or manifest body constraints are violated.
+pub fn validate_manifest_envelope(
+    envelope: &E2eEnvelope<ManifestBody>,
+) -> Result<(), E2eArtifactValidationError> {
+    validate_envelope(envelope, E2E_SCHEMA_MANIFEST)?;
+    validate_manifest_body(&envelope.body)
+}
+
+/// Validate an event envelope and its body contract.
+///
+/// # Errors
+///
+/// Returns an error if envelope invariants or event body constraints are violated.
+pub fn validate_event_envelope(
+    envelope: &E2eEnvelope<EventBody>,
+) -> Result<(), E2eArtifactValidationError> {
+    validate_envelope(envelope, E2E_SCHEMA_EVENT)?;
+    validate_event_body(&envelope.body)
+}
+
+/// Validate manifest body invariants that JSON shape checks cannot guarantee.
+///
+/// # Errors
+///
+/// Returns an error if required artifacts are missing, duplicated, or have invalid line count.
+pub fn validate_manifest_body(body: &ManifestBody) -> Result<(), E2eArtifactValidationError> {
+    let mut seen_files = BTreeSet::new();
+
+    for artifact in &body.artifacts {
+        if !seen_files.insert(artifact.file.as_str()) {
+            return Err(E2eArtifactValidationError::DuplicateArtifactEntry {
+                file: artifact.file.clone(),
+            });
+        }
+
+        let is_jsonl = artifact
+            .file
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("jsonl"));
+        if is_jsonl && artifact.line_count.is_none() {
+            return Err(E2eArtifactValidationError::MissingLineCountForJsonl {
+                file: artifact.file.clone(),
+            });
+        }
+        if !is_jsonl && artifact.line_count.is_some() {
+            return Err(E2eArtifactValidationError::UnexpectedLineCountForNonJsonl {
+                file: artifact.file.clone(),
+            });
+        }
+    }
+
+    if !seen_files.contains(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL) {
+        return Err(E2eArtifactValidationError::MissingRequiredArtifact {
+            required_file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+        });
+    }
+
+    if matches!(body.exit_status, ExitStatus::Fail | ExitStatus::Error) {
+        for required_file in [
+            E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
+            E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+        ] {
+            if !seen_files.contains(required_file) {
+                return Err(E2eArtifactValidationError::MissingRequiredArtifact { required_file });
+            }
+        }
+
+        if body.suite == Suite::Ops && !seen_files.contains(E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT) {
+            return Err(E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate event body invariants for lane/oracle semantics.
+///
+/// # Errors
+///
+/// Returns an error if required fields for the event type are missing or invalid.
+pub fn validate_event_body(event: &EventBody) -> Result<(), E2eArtifactValidationError> {
+    match event.event_type {
+        E2eEventType::LaneStart | E2eEventType::LaneEnd => {
+            if !has_non_empty_text(event.lane_id.as_deref()) {
+                return Err(E2eArtifactValidationError::MissingLaneId {
+                    event_type: event.event_type,
+                });
+            }
+        }
+        E2eEventType::OracleCheck => {
+            if !has_non_empty_text(event.oracle_id.as_deref()) || event.outcome.is_none() {
+                return Err(E2eArtifactValidationError::MissingOracleFields);
+            }
+        }
+        E2eEventType::E2eStart
+        | E2eEventType::E2eEnd
+        | E2eEventType::PhaseTransition
+        | E2eEventType::Assertion => {}
+    }
+
+    if let Some(outcome) = event.outcome
+        && matches!(outcome, E2eOutcome::Fail | E2eOutcome::Skip)
+        && !has_non_empty_text(event.reason_code.as_deref())
+    {
+        return Err(E2eArtifactValidationError::MissingReasonCode { outcome });
+    }
+
+    if let Some(reason_code) = event.reason_code.as_deref()
+        && !is_valid_reason_code(reason_code)
+    {
+        return Err(E2eArtifactValidationError::InvalidReasonCode {
+            reason_code: reason_code.to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn has_non_empty_text(value: Option<&str>) -> bool {
+    value.is_some_and(|text| !text.is_empty())
+}
+
+fn is_valid_ulid(value: &str) -> bool {
+    value.len() == 26 && value.bytes().all(is_valid_ulid_byte)
+}
+
+const fn is_valid_ulid_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'
+    )
+}
+
+fn is_valid_reason_code(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(namespace) = parts.next() else {
+        return false;
+    };
+    let Some(category) = parts.next() else {
+        return false;
+    };
+    let Some(code) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    is_reason_segment(namespace, false)
+        && is_reason_segment(category, true)
+        && is_reason_segment(code, true)
+}
+
+fn is_reason_segment(segment: &str, allow_underscore: bool) -> bool {
+    !segment.is_empty()
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (allow_underscore && byte == b'_')
+        })
+}
 
 // ─── Envelope ────────────────────────────────────────────────────────────────
 
@@ -280,9 +524,8 @@ pub mod reason_codes {
 mod tests {
     use super::*;
 
-    #[test]
-    fn manifest_roundtrip() {
-        let manifest = ManifestBody {
+    fn make_valid_manifest() -> ManifestBody {
+        ManifestBody {
             suite: Suite::Interaction,
             determinism_tier: DeterminismTier::BitExact,
             seed: 42,
@@ -302,14 +545,37 @@ mod tests {
             clock_mode: ClockMode::Simulated,
             tie_break_policy: "doc_id_lexical".to_owned(),
             artifacts: vec![ArtifactEntry {
-                file: "events.jsonl".to_owned(),
+                file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
                 checksum: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
                     .to_owned(),
                 line_count: Some(147),
             }],
             duration_ms: 1234,
             exit_status: ExitStatus::Pass,
-        };
+        }
+    }
+
+    fn make_valid_event() -> EventBody {
+        EventBody {
+            event_type: E2eEventType::OracleCheck,
+            correlation: Correlation {
+                event_id: "01HQXG5M7QABCDEF12345678AB".to_owned(),
+                root_request_id: "01HQXG5M7P3KZFV9N2RSTW6YAB".to_owned(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: Some("baseline".to_owned()),
+            oracle_id: Some("ORACLE_NO_DUPLICATES".to_owned()),
+            outcome: Some(E2eOutcome::Pass),
+            reason_code: None,
+            context: Some("0 duplicates in 10 results".to_owned()),
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn manifest_roundtrip() {
+        let manifest = make_valid_manifest();
 
         let envelope = E2eEnvelope::new(
             "e2e-manifest-v1",
@@ -327,21 +593,7 @@ mod tests {
 
     #[test]
     fn event_roundtrip() {
-        let event = EventBody {
-            event_type: E2eEventType::OracleCheck,
-            correlation: Correlation {
-                event_id: "01HQXG5M7QABCDEF12345678AB".to_owned(),
-                root_request_id: "01HQXG5M7P3KZFV9N2RSTW6YAB".to_owned(),
-                parent_event_id: None,
-            },
-            severity: E2eSeverity::Info,
-            lane_id: Some("baseline".to_owned()),
-            oracle_id: Some("ORACLE_NO_DUPLICATES".to_owned()),
-            outcome: Some(E2eOutcome::Pass),
-            reason_code: None,
-            context: Some("0 duplicates in 10 results".to_owned()),
-            metrics: None,
-        };
+        let event = make_valid_event();
 
         let envelope = E2eEnvelope::new(
             "e2e-event-v1",
@@ -548,5 +800,196 @@ mod tests {
             let decoded: Suite = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, suite);
         }
+    }
+
+    #[test]
+    fn manifest_validator_accepts_valid_manifest() {
+        assert!(validate_manifest_body(&make_valid_manifest()).is_ok());
+    }
+
+    #[test]
+    fn manifest_validator_requires_events_stream_artifact() {
+        let mut manifest = make_valid_manifest();
+        manifest.artifacts = vec![ArtifactEntry {
+            file: "oracle-report.json".to_owned(),
+            checksum: "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_owned(),
+            line_count: None,
+        }];
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_validator_rejects_duplicate_artifact_entries() {
+        let mut manifest = make_valid_manifest();
+        manifest.artifacts.push(manifest.artifacts[0].clone());
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::DuplicateArtifactEntry { file }
+            if file == E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL
+        ));
+    }
+
+    #[test]
+    fn manifest_validator_rejects_line_count_on_non_jsonl() {
+        let mut manifest = make_valid_manifest();
+        manifest.artifacts.push(ArtifactEntry {
+            file: "oracle-report.json".to_owned(),
+            checksum: "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_owned(),
+            line_count: Some(1),
+        });
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::UnexpectedLineCountForNonJsonl { file }
+            if file == "oracle-report.json"
+        ));
+    }
+
+    #[test]
+    fn manifest_validator_requires_failure_artifacts_for_failed_runs() {
+        let mut manifest = make_valid_manifest();
+        manifest.exit_status = ExitStatus::Fail;
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
+            }
+        );
+
+        manifest.artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+            checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            line_count: None,
+        });
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+            }
+        );
+
+        manifest.artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT.to_owned(),
+            checksum: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            line_count: None,
+        });
+        assert!(validate_manifest_body(&manifest).is_ok());
+    }
+
+    #[test]
+    fn manifest_validator_requires_transcript_for_failed_ops_runs() {
+        let mut manifest = make_valid_manifest();
+        manifest.suite = Suite::Ops;
+        manifest.exit_status = ExitStatus::Error;
+        manifest.artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+            checksum: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+            line_count: None,
+        });
+        manifest.artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT.to_owned(),
+            checksum: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_owned(),
+            line_count: None,
+        });
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT,
+            }
+        );
+
+        manifest.artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT.to_owned(),
+            checksum: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                .to_owned(),
+            line_count: None,
+        });
+        assert!(validate_manifest_body(&manifest).is_ok());
+    }
+
+    #[test]
+    fn event_validator_accepts_pass_without_reason_code() {
+        assert!(validate_event_body(&make_valid_event()).is_ok());
+    }
+
+    #[test]
+    fn event_validator_requires_reason_code_for_failures() {
+        let mut event = make_valid_event();
+        event.outcome = Some(E2eOutcome::Fail);
+        event.reason_code = None;
+
+        let err = validate_event_body(&event).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingReasonCode {
+                outcome: E2eOutcome::Fail,
+            }
+        );
+    }
+
+    #[test]
+    fn event_validator_rejects_invalid_reason_code_pattern() {
+        let mut event = make_valid_event();
+        event.outcome = Some(E2eOutcome::Skip);
+        event.reason_code = Some("E2E.INVALID.CODE".to_owned());
+
+        let err = validate_event_body(&event).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::InvalidReasonCode { reason_code }
+            if reason_code == "E2E.INVALID.CODE"
+        ));
+    }
+
+    #[test]
+    fn envelope_validator_rejects_invalid_run_id() {
+        let envelope = E2eEnvelope::new(
+            E2E_SCHEMA_MANIFEST,
+            "not-a-ulid",
+            "2026-02-14T12:00:00Z",
+            make_valid_manifest(),
+        );
+        let err = validate_manifest_envelope(&envelope).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::InvalidRunId { run_id } if run_id == "not-a-ulid"
+        ));
+    }
+
+    #[test]
+    fn envelope_validator_rejects_schema_tag_mismatch() {
+        let envelope = E2eEnvelope::new(
+            E2E_SCHEMA_EVENT,
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:00Z",
+            make_valid_manifest(),
+        );
+        let err = validate_manifest_envelope(&envelope).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::SchemaTagMismatch { expected, found }
+            if expected == E2E_SCHEMA_MANIFEST && found == E2E_SCHEMA_EVENT
+        ));
     }
 }
