@@ -413,7 +413,7 @@ fn apply_migration(conn: &Connection, migration: &OpsMigration) -> SearchResult<
     })();
 
     match apply_result {
-        Ok(()) => conn.execute("COMMIT;").map_err(ops_error),
+        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(ops_error),
         Err(error) => {
             let _ = conn.execute("ROLLBACK;");
             Err(error)
