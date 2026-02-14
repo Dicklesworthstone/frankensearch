@@ -270,6 +270,18 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
+    conn.execute("BEGIN IMMEDIATE;").map_err(storage_error)?;
+    let result = bootstrap_inner(conn);
+    match result {
+        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(storage_error),
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
         .map_err(storage_error)?;
 
@@ -285,10 +297,15 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
             conn.execute(statement).map_err(storage_error)?;
         }
 
+        // Multiple processes/threads may bootstrap the same on-disk database at once.
+        // Use OR REPLACE so every bootstrap transaction leaves a visible marker row.
         let params = [SqliteValue::Integer(SCHEMA_VERSION)];
-        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
-            .map_err(storage_error)?;
-        version = SCHEMA_VERSION;
+        conn.execute_with_params(
+            "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
+            &params,
+        )
+        .map_err(storage_error)?;
+        version = current_version(conn)?;
     }
 
     if version > SCHEMA_VERSION {
@@ -332,6 +349,14 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
         .map_err(storage_error)?;
         version = migration.version;
     }
+
+    let params = [SqliteValue::Integer(SCHEMA_VERSION)];
+    conn.execute_with_params(
+        "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
+        &params,
+    )
+    .map_err(storage_error)?;
+    version = current_version(conn)?;
 
     tracing::debug!(
         target: "frankensearch.storage",
@@ -388,6 +413,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
         SCHEMA_VERSION, bootstrap, current_version, current_version_optional, storage_error,
     };
@@ -462,5 +493,59 @@ mod tests {
             current_version(&conn).expect("schema version should exist"),
             SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn concurrent_bootstrap_on_disk_is_race_safe() {
+        const THREADS: usize = 6;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "frankensearch-schema-bootstrap-{}-{nanos}.sqlite3",
+            process::id()
+        ));
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let (tx, rx) = mpsc::channel::<i64>();
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let gate = Arc::clone(&barrier);
+            let sender = tx.clone();
+            let path = db_path.clone();
+            handles.push(thread::spawn(move || {
+                gate.wait();
+                let conn = Connection::open(path.to_string_lossy().to_string())
+                    .expect("connection should open");
+                bootstrap(&conn).expect("bootstrap should succeed");
+                let version = current_version(&conn).expect("schema version should exist");
+                sender.send(version).expect("sender should send version");
+            }));
+        }
+        drop(tx);
+
+        let versions: Vec<i64> = rx.iter().collect();
+        for handle in handles {
+            handle.join().expect("bootstrap thread should join");
+        }
+
+        assert_eq!(versions.len(), THREADS);
+        assert!(
+            versions.iter().all(|version| *version == SCHEMA_VERSION),
+            "all concurrent bootstraps should resolve to latest schema"
+        );
+
+        let db_path_display = db_path.display().to_string();
+        let cleanup_targets = [
+            db_path,
+            PathBuf::from(format!("{db_path_display}.wal")),
+            PathBuf::from(format!("{db_path_display}.shm")),
+        ];
+        for target in cleanup_targets {
+            let _ = std::fs::remove_file(target);
+        }
     }
 }

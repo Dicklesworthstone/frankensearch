@@ -547,6 +547,10 @@ mod tests {
             schema::current_version(storage.connection()).expect("connection should remain usable"),
             SCHEMA_VERSION
         );
+
+        let metrics = storage.metrics_snapshot();
+        assert_eq!(metrics.tx_rollbacks, 1);
+        assert_eq!(metrics.tx_commits, 0);
     }
 
     #[test]
@@ -644,6 +648,10 @@ mod tests {
             0,
             "outer transaction should rollback when nested begin fails"
         );
+
+        let metrics = storage.metrics_snapshot();
+        assert_eq!(metrics.tx_rollbacks, 1);
+        assert_eq!(metrics.tx_commits, 0);
     }
 
     #[test]
