@@ -559,6 +559,31 @@ fn different_k_values_respected() {
     });
 }
 
+#[test]
+fn optimized_config_can_drive_searcher_for_multiple_queries() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let (dir, _) = build_hash_index("optimized-config-smoke", TEST_CORPUS);
+        let config = TwoTierConfig::optimized();
+        let index = Arc::new(TwoTierIndex::open(&dir, config.clone()).expect("open"));
+        let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
+        let searcher = TwoTierSearcher::new(index, embedder, config);
+
+        for query in [
+            "rust ownership borrowing",
+            "distributed consensus raft",
+            "simd vector operations",
+        ] {
+            let (results, metrics) = searcher.search_collect(&cx, query, 5).await.unwrap();
+            assert!(!results.is_empty(), "query '{query}' should return results");
+            assert!(results.len() <= 5, "query '{query}' should respect k");
+            assert!(
+                metrics.phase1_total_ms >= 0.0,
+                "query '{query}' should emit metrics"
+            );
+        }
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. Concurrent reads
 // ═══════════════════════════════════════════════════════════════════════════
