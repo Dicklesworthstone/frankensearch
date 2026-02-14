@@ -191,6 +191,7 @@ pub struct TransformRule {
 ///   appear in explain/display surfaces.
 /// - Operational data passes through everywhere.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn default_rule_matrix() -> Vec<TransformRule> {
     use DataClass::{
         CloudSecret, Credential, FinancialData, HealthData, Operational, PersonalData, PrivateKey,
@@ -937,7 +938,8 @@ pub fn is_hard_deny_path(path: &str) -> bool {
 #[must_use]
 pub fn classify_path(path: &str) -> Vec<DataClass> {
     let mut classes = Vec::new();
-    let lower = path.to_ascii_lowercase();
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
 
     if lower.contains(".ssh/")
         || lower.contains("id_rsa")
@@ -968,7 +970,7 @@ pub fn classify_path(path: &str) -> Vec<DataClass> {
         classes.push(DataClass::SessionArtifact);
     }
 
-    if classes.is_empty() && path.contains('/') {
+    if classes.is_empty() && normalized.contains('/') {
         classes.push(DataClass::UserPath);
     }
 
@@ -1373,8 +1375,21 @@ mod tests {
     }
 
     #[test]
+    fn classify_windows_ssh_key() {
+        let classes = classify_path(r"C:\Users\alice\.ssh\id_rsa");
+        assert!(classes.contains(&DataClass::PrivateKey));
+    }
+
+    #[test]
     fn classify_aws_creds() {
         let classes = classify_path("/home/user/.aws/credentials");
+        assert!(classes.contains(&DataClass::CloudSecret));
+    }
+
+    #[test]
+    fn classify_windows_cloud_creds() {
+        let classes =
+            classify_path(r"C:\Users\alice\.config\gcloud\application_default_credentials.json");
         assert!(classes.contains(&DataClass::CloudSecret));
     }
 

@@ -93,13 +93,23 @@ impl CliCommand {
     ];
 }
 
+/// Whether the command token was explicitly provided or defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandSource {
+    /// No command token provided; parser used the default command.
+    #[default]
+    ImplicitDefault,
+    /// User explicitly provided a command token.
+    Explicit,
+}
+
 /// Parsed CLI input including command and high-priority overrides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliInput {
     /// The selected command.
     pub command: CliCommand,
     /// Whether the command token was explicitly provided by the user.
-    pub command_explicit: bool,
+    pub command_source: CommandSource,
     /// Configuration overrides from flags.
     pub overrides: CliOverrides,
     /// Output format (default: table).
@@ -133,24 +143,6 @@ pub enum ConfigAction {
     Reset,
 }
 
-impl Default for CliInput {
-    fn default() -> Self {
-        Self {
-            command: CliCommand::default(),
-            command_explicit: false,
-            overrides: CliOverrides::default(),
-            format: OutputFormat::default(),
-            query: None,
-            filter: None,
-            stream: false,
-            watch: false,
-            full_reindex: false,
-            model_name: None,
-            config_action: None,
-        }
-    }
-}
-
 /// Detect interface mode based on command and terminal state.
 ///
 /// - No subcommand + TTY → launch TUI
@@ -161,11 +153,13 @@ impl Default for CliInput {
 pub const fn detect_auto_mode(
     command: CliCommand,
     is_tty: bool,
-    command_explicit: bool,
+    command_source: CommandSource,
 ) -> Option<CliCommand> {
-    match (command, command_explicit, is_tty) {
-        (CliCommand::Status, false, true) => Some(CliCommand::Tui),
-        (CliCommand::Status, false, false) => None, // Pipe without subcommand — show help.
+    match (command, command_source, is_tty) {
+        (CliCommand::Status, CommandSource::ImplicitDefault, true) => Some(CliCommand::Tui),
+        (CliCommand::Status, CommandSource::ImplicitDefault, false) => {
+            None // Pipe without subcommand — show help.
+        }
         _ => Some(command),
     }
 }
@@ -178,23 +172,36 @@ pub const fn detect_auto_mode(
 /// # Errors
 ///
 /// Returns `SearchError::InvalidConfig` if the command/flags are malformed.
+#[allow(clippy::too_many_lines)]
 pub fn parse_cli_args<I, S>(args: I) -> SearchResult<CliInput>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
     let tokens: Vec<String> = args.into_iter().map(Into::into).collect();
-    let (command, mut idx, command_explicit) = extract_command(&tokens)?;
+    let (command, mut idx, command_source) = extract_command(&tokens)?;
     let mut input = CliInput {
         command,
-        command_explicit,
+        command_source,
         ..CliInput::default()
     };
 
-    // For search command, the next non-flag token is the query.
-    if command == CliCommand::Search && idx < tokens.len() && !tokens[idx].starts_with('-') {
-        input.query = Some(tokens[idx].clone());
-        idx += 1;
+    // For search command, capture an explicit query token before flags.
+    if command == CliCommand::Search && idx < tokens.len() {
+        if tokens[idx] == "--" {
+            let query = tokens
+                .get(idx + 1)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "cli.search_query".into(),
+                    value: "--".into(),
+                    reason: "missing query after '--'".into(),
+                })?;
+            input.query = Some(query.clone());
+            idx += 2;
+        } else if !is_known_cli_flag(tokens[idx].as_str()) {
+            input.query = Some(tokens[idx].clone());
+            idx += 1;
+        }
     }
 
     // For download command, the next non-flag token is the model name.
@@ -229,13 +236,12 @@ where
             }
             "--format" | "-f" => {
                 let value = expect_value(&tokens, idx, "--format")?;
-                input.format = OutputFormat::from_str(value).map_err(|()| {
-                    SearchError::InvalidConfig {
+                input.format =
+                    OutputFormat::from_str(value).map_err(|()| SearchError::InvalidConfig {
                         field: "cli.format".into(),
                         value: value.into(),
                         reason: "expected table|json|csv|jsonl".into(),
-                    }
-                })?;
+                    })?;
                 idx += 2;
             }
             "--fast-only" => {
@@ -269,25 +275,25 @@ where
             }
             "--profile" => {
                 let value = expect_value(&tokens, idx, "--profile")?;
-                input.overrides.profile =
-                    Some(PressureProfile::from_str(value).map_err(|()| {
-                        SearchError::InvalidConfig {
-                            field: "pressure.profile".into(),
-                            value: value.into(),
-                            reason: "expected strict|performance|degraded".into(),
-                        }
-                    })?);
+                input.overrides.profile = Some(PressureProfile::from_str(value).map_err(|()| {
+                    SearchError::InvalidConfig {
+                        field: "pressure.profile".into(),
+                        value: value.into(),
+                        reason: "expected strict|performance|degraded".into(),
+                    }
+                })?);
                 idx += 2;
             }
             "--theme" => {
                 let value = expect_value(&tokens, idx, "--theme")?;
-                input.overrides.theme = Some(
-                    TuiTheme::from_str(value).map_err(|()| SearchError::InvalidConfig {
-                        field: "tui.theme".into(),
-                        value: value.into(),
-                        reason: "expected auto|light|dark".into(),
-                    })?,
-                );
+                input.overrides.theme =
+                    Some(
+                        TuiTheme::from_str(value).map_err(|()| SearchError::InvalidConfig {
+                            field: "tui.theme".into(),
+                            value: value.into(),
+                            reason: "expected auto|light|dark".into(),
+                        })?,
+                    );
                 idx += 2;
             }
             "--config" => {
@@ -311,13 +317,13 @@ where
     Ok(input)
 }
 
-fn extract_command(tokens: &[String]) -> SearchResult<(CliCommand, usize, bool)> {
+fn extract_command(tokens: &[String]) -> SearchResult<(CliCommand, usize, CommandSource)> {
     if let Some(token) = tokens.first()
         && !token.starts_with('-')
     {
-        return Ok((parse_command(token)?, 1, true));
+        return Ok((parse_command(token)?, 1, CommandSource::Explicit));
     }
-    Ok((CliCommand::default(), 0, false))
+    Ok((CliCommand::default(), 0, CommandSource::ImplicitDefault))
 }
 
 fn parse_command(token: &str) -> SearchResult<CliCommand> {
@@ -349,38 +355,30 @@ fn parse_config_action(tokens: &[String], idx: &mut usize) -> SearchResult<Confi
         "list" | "ls" => Ok(ConfigAction::List),
         "reset" => Ok(ConfigAction::Reset),
         "get" => {
-            let key = tokens
-                .get(*idx)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "config.get".into(),
-                    value: String::new(),
-                    reason: "missing key for config get".into(),
-                })?;
+            let key = tokens.get(*idx).ok_or_else(|| SearchError::InvalidConfig {
+                field: "config.get".into(),
+                value: String::new(),
+                reason: "missing key for config get".into(),
+            })?;
             *idx += 1;
-            Ok(ConfigAction::Get {
-                key: key.to_string(),
-            })
+            Ok(ConfigAction::Get { key: key.clone() })
         }
         "set" => {
-            let key = tokens
-                .get(*idx)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "config.set".into(),
-                    value: String::new(),
-                    reason: "missing key for config set".into(),
-                })?;
+            let key = tokens.get(*idx).ok_or_else(|| SearchError::InvalidConfig {
+                field: "config.set".into(),
+                value: String::new(),
+                reason: "missing key for config set".into(),
+            })?;
             *idx += 1;
-            let value = tokens
-                .get(*idx)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "config.set".into(),
-                    value: key.clone(),
-                    reason: "missing value for config set".into(),
-                })?;
+            let value = tokens.get(*idx).ok_or_else(|| SearchError::InvalidConfig {
+                field: "config.set".into(),
+                value: key.clone(),
+                reason: "missing value for config set".into(),
+            })?;
             *idx += 1;
             Ok(ConfigAction::Set {
-                key: key.to_string(),
-                value: value.to_string(),
+                key: key.clone(),
+                value: value.clone(),
             })
         }
         _ => Err(SearchError::InvalidConfig {
@@ -431,6 +429,30 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
         })
 }
 
+#[must_use]
+fn is_known_cli_flag(token: &str) -> bool {
+    matches!(
+        token,
+        "--roots"
+            | "--exclude"
+            | "--limit"
+            | "-l"
+            | "--format"
+            | "-f"
+            | "--fast-only"
+            | "--no-fast-only"
+            | "--explain"
+            | "-e"
+            | "--stream"
+            | "--watch"
+            | "--full"
+            | "--filter"
+            | "--profile"
+            | "--theme"
+            | "--config"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,7 +499,7 @@ mod tests {
     fn default_command_is_status() {
         let input = parse_cli_args(["--limit", "10"]).expect("parse");
         assert_eq!(input.command, CliCommand::Status);
-        assert!(!input.command_explicit);
+        assert_eq!(input.command_source, CommandSource::ImplicitDefault);
     }
 
     #[test]
@@ -490,10 +512,7 @@ mod tests {
             parse_cli_args(["doctor"]).unwrap().command,
             CliCommand::Doctor
         );
-        assert_eq!(
-            parse_cli_args(["tui"]).unwrap().command,
-            CliCommand::Tui
-        );
+        assert_eq!(parse_cli_args(["tui"]).unwrap().command, CliCommand::Tui);
         assert_eq!(
             parse_cli_args(["version"]).unwrap().command,
             CliCommand::Version
@@ -502,34 +521,16 @@ mod tests {
 
     #[test]
     fn parse_command_aliases() {
-        assert_eq!(
-            parse_cli_args(["s"]).unwrap().command,
-            CliCommand::Search
-        );
-        assert_eq!(
-            parse_cli_args(["idx"]).unwrap().command,
-            CliCommand::Index
-        );
-        assert_eq!(
-            parse_cli_args(["st"]).unwrap().command,
-            CliCommand::Status
-        );
-        assert_eq!(
-            parse_cli_args(["ex"]).unwrap().command,
-            CliCommand::Explain
-        );
-        assert_eq!(
-            parse_cli_args(["cfg"]).unwrap().command,
-            CliCommand::Config
-        );
+        assert_eq!(parse_cli_args(["s"]).unwrap().command, CliCommand::Search);
+        assert_eq!(parse_cli_args(["idx"]).unwrap().command, CliCommand::Index);
+        assert_eq!(parse_cli_args(["st"]).unwrap().command, CliCommand::Status);
+        assert_eq!(parse_cli_args(["ex"]).unwrap().command, CliCommand::Explain);
+        assert_eq!(parse_cli_args(["cfg"]).unwrap().command, CliCommand::Config);
         assert_eq!(
             parse_cli_args(["dl"]).unwrap().command,
             CliCommand::Download
         );
-        assert_eq!(
-            parse_cli_args(["doc"]).unwrap().command,
-            CliCommand::Doctor
-        );
+        assert_eq!(parse_cli_args(["doc"]).unwrap().command, CliCommand::Doctor);
         assert_eq!(
             parse_cli_args(["ver"]).unwrap().command,
             CliCommand::Version
@@ -585,6 +586,26 @@ mod tests {
     fn parse_filter_flag() {
         let input = parse_cli_args(["search", "query", "--filter", "type:rs"]).unwrap();
         assert_eq!(input.filter.as_deref(), Some("type:rs"));
+    }
+
+    #[test]
+    fn parse_search_query_starting_with_dash() {
+        let input = parse_cli_args(["search", "-secret-token"]).unwrap();
+        assert_eq!(input.command, CliCommand::Search);
+        assert_eq!(input.query.as_deref(), Some("-secret-token"));
+    }
+
+    #[test]
+    fn parse_search_query_after_double_dash() {
+        let input = parse_cli_args(["search", "--", "--limit"]).unwrap();
+        assert_eq!(input.command, CliCommand::Search);
+        assert_eq!(input.query.as_deref(), Some("--limit"));
+    }
+
+    #[test]
+    fn parse_search_double_dash_requires_query() {
+        let err = parse_cli_args(["search", "--"]).expect_err("must fail");
+        assert!(err.to_string().contains("missing query after '--'"));
     }
 
     #[test]
@@ -647,20 +668,23 @@ mod tests {
     #[test]
     fn auto_mode_tty_no_command_launches_tui() {
         assert_eq!(
-            detect_auto_mode(CliCommand::Status, true, false),
+            detect_auto_mode(CliCommand::Status, true, CommandSource::ImplicitDefault),
             Some(CliCommand::Tui)
         );
     }
 
     #[test]
     fn auto_mode_pipe_no_command_returns_none() {
-        assert_eq!(detect_auto_mode(CliCommand::Status, false, false), None);
+        assert_eq!(
+            detect_auto_mode(CliCommand::Status, false, CommandSource::ImplicitDefault),
+            None
+        );
     }
 
     #[test]
     fn auto_mode_explicit_status_stays_cli() {
         assert_eq!(
-            detect_auto_mode(CliCommand::Status, true, true),
+            detect_auto_mode(CliCommand::Status, true, CommandSource::Explicit),
             Some(CliCommand::Status)
         );
     }
@@ -668,11 +692,11 @@ mod tests {
     #[test]
     fn auto_mode_explicit_command_always_works() {
         assert_eq!(
-            detect_auto_mode(CliCommand::Search, false, true),
+            detect_auto_mode(CliCommand::Search, false, CommandSource::Explicit),
             Some(CliCommand::Search)
         );
         assert_eq!(
-            detect_auto_mode(CliCommand::Tui, false, true),
+            detect_auto_mode(CliCommand::Tui, false, CommandSource::Explicit),
             Some(CliCommand::Tui)
         );
     }
@@ -712,7 +736,7 @@ mod tests {
     fn empty_args_defaults() {
         let input = parse_cli_args::<[&str; 0], _>([]).unwrap();
         assert_eq!(input.command, CliCommand::Status);
-        assert!(!input.command_explicit);
+        assert_eq!(input.command_source, CommandSource::ImplicitDefault);
         assert_eq!(input.format, OutputFormat::Table);
         assert!(input.query.is_none());
         assert!(!input.stream);

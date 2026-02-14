@@ -360,6 +360,44 @@ pub fn should_capture_env(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
+/// Build an environment snapshot from an iterator of key/value pairs.
+///
+/// Captures only allowlisted keys, redacts sensitive values, and sorts entries
+/// by key for deterministic pack generation.
+#[must_use]
+pub fn capture_env_snapshot<I>(vars: I) -> EnvSnapshot
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut variables: Vec<EnvEntry> = vars
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if !should_capture_env(&key) {
+                return None;
+            }
+            let redacted = should_redact_env(&key);
+            Some(EnvEntry {
+                key,
+                value: if redacted { "<redacted>".into() } else { value },
+                redacted,
+            })
+        })
+        .collect();
+
+    variables.sort_by(|left, right| left.key.cmp(&right.key));
+
+    EnvSnapshot {
+        variables,
+        redaction_note: "Sensitive values redacted by key policy".into(),
+    }
+}
+
+/// Capture a snapshot of the current process environment.
+#[must_use]
+pub fn capture_current_env_snapshot() -> EnvSnapshot {
+    capture_env_snapshot(std::env::vars())
+}
+
 // ─── Pack File Listing ──────────────────────────────────────────────────────
 
 /// All files that belong to a complete repro pack.
@@ -683,6 +721,33 @@ mod tests {
         assert!(!should_capture_env("AWS_ACCESS_KEY_ID"));
     }
 
+    #[test]
+    fn capture_env_snapshot_filters_redacts_and_sorts() {
+        let snapshot = capture_env_snapshot(vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("FSFS_SECRET_TOKEN".into(), "abc123".into()),
+            ("HOME".into(), "/home/tester".into()),
+            ("FRANKENSEARCH_OPS_MODE".into(), "dev".into()),
+        ]);
+
+        let keys: Vec<&str> = snapshot
+            .variables
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["FRANKENSEARCH_OPS_MODE", "FSFS_SECRET_TOKEN", "HOME"]
+        );
+        let secret = snapshot
+            .variables
+            .iter()
+            .find(|entry| entry.key == "FSFS_SECRET_TOKEN")
+            .expect("secret present");
+        assert!(secret.redacted);
+        assert_eq!(secret.value, "<redacted>");
+    }
+
     // ─── Pack Files ─────────────────────────────────────────────────────
 
     #[test]
@@ -744,7 +809,7 @@ mod tests {
         let entry = ArtifactEntry {
             filename: EVIDENCE_FILENAME.into(),
             size_bytes: 0,
-            checksum_xxh3: "".into(),
+            checksum_xxh3: String::new(),
             content_type: "application/x-ndjson".into(),
             present: false,
         };

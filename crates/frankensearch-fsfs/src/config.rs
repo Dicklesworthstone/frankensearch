@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::BuildHasher;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use frankensearch_core::{SearchError, SearchResult};
@@ -76,6 +77,137 @@ pub enum Density {
     Expanded,
 }
 
+const HIGH_UTILITY_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "swift", "c", "cpp", "h", "hpp",
+    "toml", "yaml", "yml", "json", "md", "markdown", "txt", "rst", "sql", "proto", "ini", "cfg",
+    "conf", "sh", "bash", "zsh", "fish",
+];
+
+const TEXT_ALLOWLIST_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "swift", "c", "cpp", "h", "hpp",
+    "toml", "yaml", "yml", "json", "md", "markdown", "txt", "rst", "sql", "proto", "ini", "cfg",
+    "conf", "sh", "bash", "zsh", "fish", "xml", "html", "css", "scss", "csv", "log",
+];
+
+const LOW_UTILITY_PATH_COMPONENTS: &[&str] = &[
+    "node_modules",
+    "target",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+];
+
+const HIGH_SIGNAL_FILENAMES: &[&str] = &[
+    "readme.md",
+    "cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "makefile",
+    "justfile",
+];
+
+const LOW_UTILITY_FILENAMES: &[&str] = &[
+    "cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+];
+
+const REASON_DISCOVERY_ROOT_ACCEPTED: &str = "discovery.root.accepted";
+const REASON_DISCOVERY_ROOT_REJECTED: &str = "discovery.root.rejected";
+const REASON_DISCOVERY_FILE_INCLUDED: &str = "discovery.file.included";
+const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded_pattern";
+const REASON_DISCOVERY_FILE_TOO_LARGE: &str = "discovery.file.too_large";
+const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
+
+/// Ingestion class assigned by discovery policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionClass {
+    FullSemanticLexical,
+    LexicalOnly,
+    MetadataOnly,
+    Skip,
+}
+
+impl IngestionClass {
+    #[must_use]
+    pub const fn is_indexed(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+}
+
+/// Discovery scope decision produced by root/candidate policy evaluation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryScopeDecision {
+    Include,
+    Exclude,
+}
+
+/// Policy input for file-level discovery decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryCandidate<'a> {
+    pub path: &'a Path,
+    pub byte_len: u64,
+    pub is_symlink: bool,
+    pub mount_category: Option<crate::mount_info::FsCategory>,
+}
+
+impl<'a> DiscoveryCandidate<'a> {
+    #[must_use]
+    pub const fn new(path: &'a Path, byte_len: u64) -> Self {
+        Self {
+            path,
+            byte_len,
+            is_symlink: false,
+            mount_category: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_symlink(mut self, is_symlink: bool) -> Self {
+        self.is_symlink = is_symlink;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_mount_category(
+        mut self,
+        mount_category: crate::mount_info::FsCategory,
+    ) -> Self {
+        self.mount_category = Some(mount_category);
+        self
+    }
+}
+
+/// Policy output for root-level discovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootDiscoveryDecision {
+    pub scope: DiscoveryScopeDecision,
+    pub reason_codes: Vec<String>,
+}
+
+impl RootDiscoveryDecision {
+    #[must_use]
+    pub const fn include(&self) -> bool {
+        matches!(self.scope, DiscoveryScopeDecision::Include)
+    }
+}
+
+/// Policy output for file-level discovery and ingestion class assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryDecision {
+    pub scope: DiscoveryScopeDecision,
+    pub ingestion_class: IngestionClass,
+    pub utility_score: i32,
+    pub reason_codes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryConfig {
     pub roots: Vec<String>,
@@ -84,6 +216,329 @@ pub struct DiscoveryConfig {
     pub binary_blocklist_extensions: Vec<String>,
     pub max_file_size_mb: usize,
     pub follow_symlinks: bool,
+    /// Per-mount-point policy overrides. Each entry maps a mount path
+    /// (e.g., "/mnt/nfs") to its behavioral override.
+    #[serde(default)]
+    pub mount_overrides: Vec<MountPolicyEntry>,
+    /// Whether to skip network mounts entirely during discovery.
+    #[serde(default)]
+    pub skip_network_mounts: bool,
+}
+
+/// A named mount-point policy override for the config file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MountPolicyEntry {
+    /// Mount point path (e.g., "/mnt/nfs").
+    pub mount_point: String,
+    /// Whether to enable or disable this mount.
+    pub enabled: Option<bool>,
+    /// Override change detection strategy.
+    pub change_detection: Option<crate::mount_info::ChangeDetectionStrategy>,
+    /// Override stat timeout in milliseconds.
+    pub stat_timeout_ms: Option<u64>,
+    /// Override max concurrent I/O.
+    pub max_concurrent_io: Option<usize>,
+    /// Override poll interval in seconds.
+    pub poll_interval_secs: Option<u64>,
+}
+
+impl MountPolicyEntry {
+    /// Convert to a `MountOverride` for use with `MountTable`.
+    #[must_use]
+    pub const fn to_mount_override(&self) -> crate::mount_info::MountOverride {
+        crate::mount_info::MountOverride {
+            category: None,
+            change_detection: self.change_detection,
+            stat_timeout_ms: self.stat_timeout_ms,
+            max_concurrent_io: self.max_concurrent_io,
+            poll_interval_secs: self.poll_interval_secs,
+            enabled: self.enabled,
+        }
+    }
+}
+
+impl DiscoveryConfig {
+    /// Build a `HashMap` of mount overrides suitable for `MountTable::new`.
+    #[must_use]
+    pub fn mount_override_map(
+        &self,
+    ) -> std::collections::HashMap<String, crate::mount_info::MountOverride> {
+        self.mount_overrides
+            .iter()
+            .map(|entry| (entry.mount_point.clone(), entry.to_mount_override()))
+            .collect()
+    }
+
+    /// Evaluate whether a discovery root should be included before any walk.
+    #[must_use]
+    pub fn evaluate_root(
+        &self,
+        root: &Path,
+        mount_category: Option<crate::mount_info::FsCategory>,
+    ) -> RootDiscoveryDecision {
+        let mut reason_codes = Vec::new();
+        let normalized = normalize_path(root);
+
+        if root.as_os_str().is_empty() {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            return RootDiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                reason_codes,
+            };
+        }
+
+        if mount_category.is_some_and(crate::mount_info::FsCategory::is_virtual) {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            return RootDiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                reason_codes,
+            };
+        }
+
+        if self.skip_network_mounts
+            && mount_category.is_some_and(crate::mount_info::FsCategory::is_network)
+        {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            return RootDiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                reason_codes,
+            };
+        }
+
+        if self.matches_exclude_patterns(root, &normalized) {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            return RootDiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                reason_codes,
+            };
+        }
+
+        reason_codes.push(REASON_DISCOVERY_ROOT_ACCEPTED.to_string());
+        RootDiscoveryDecision {
+            scope: DiscoveryScopeDecision::Include,
+            reason_codes,
+        }
+    }
+
+    /// Evaluate a file candidate for inclusion and ingestion class assignment.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn evaluate_candidate(&self, candidate: &DiscoveryCandidate<'_>) -> DiscoveryDecision {
+        let mut reason_codes = Vec::new();
+
+        if candidate.path.as_os_str().is_empty() {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        if candidate
+            .mount_category
+            .is_some_and(crate::mount_info::FsCategory::is_virtual)
+        {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        if self.skip_network_mounts
+            && candidate
+                .mount_category
+                .is_some_and(crate::mount_info::FsCategory::is_network)
+        {
+            reason_codes.push(REASON_DISCOVERY_ROOT_REJECTED.to_string());
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        reason_codes.push(REASON_DISCOVERY_ROOT_ACCEPTED.to_string());
+        let normalized = normalize_path(candidate.path);
+
+        if self.matches_exclude_patterns(candidate.path, &normalized) {
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        if candidate.is_symlink && !self.follow_symlinks {
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        let extension = lower_extension(candidate.path);
+        if extension
+            .as_deref()
+            .is_some_and(|ext| self.binary_blocklist_contains(ext))
+        {
+            reason_codes.push(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score: i32::MIN,
+                reason_codes,
+            };
+        }
+
+        let filename = lower_filename(candidate.path);
+        let max_bytes = self.max_file_size_mb.saturating_mul(1024 * 1024) as u64;
+        let mut utility_score = 50_i32;
+
+        if candidate.byte_len > max_bytes {
+            utility_score -= 20;
+            reason_codes.push(REASON_DISCOVERY_FILE_TOO_LARGE.to_string());
+        }
+
+        if candidate.byte_len > max_bytes.saturating_mul(4) {
+            reason_codes.push(REASON_DISCOVERY_FILE_TOO_LARGE.to_string());
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            normalize_reason_codes(&mut reason_codes);
+            return DiscoveryDecision {
+                scope: DiscoveryScopeDecision::Exclude,
+                ingestion_class: IngestionClass::Skip,
+                utility_score,
+                reason_codes,
+            };
+        }
+
+        if candidate
+            .mount_category
+            .is_some_and(crate::mount_info::FsCategory::is_network)
+        {
+            utility_score -= 10;
+        }
+
+        if has_low_utility_component(candidate.path) {
+            utility_score -= 30;
+        }
+
+        if filename
+            .as_deref()
+            .is_some_and(|value| HIGH_SIGNAL_FILENAMES.contains(&value))
+        {
+            utility_score += 20;
+        }
+
+        if filename
+            .as_deref()
+            .is_some_and(|value| LOW_UTILITY_FILENAMES.contains(&value))
+        {
+            utility_score -= 20;
+        }
+
+        if filename
+            .as_deref()
+            .is_some_and(is_generated_or_minified_filename)
+        {
+            utility_score -= 25;
+        }
+
+        match extension.as_deref() {
+            Some(ext) if HIGH_UTILITY_EXTENSIONS.contains(&ext) => {
+                utility_score += 30;
+            }
+            Some(ext) if is_low_value_extension(ext) => {
+                utility_score -= 15;
+            }
+            None => {
+                utility_score -= 5;
+            }
+            _ => {}
+        }
+
+        if self.text_selection_mode == TextSelectionMode::Allowlist
+            && extension
+                .as_deref()
+                .is_none_or(|ext| !TEXT_ALLOWLIST_EXTENSIONS.contains(&ext))
+        {
+            utility_score -= 35;
+        }
+
+        let mut ingestion_class = if utility_score >= 70 {
+            IngestionClass::FullSemanticLexical
+        } else if utility_score >= 45 {
+            IngestionClass::LexicalOnly
+        } else if utility_score >= 20 {
+            IngestionClass::MetadataOnly
+        } else {
+            IngestionClass::Skip
+        };
+
+        if candidate.byte_len > max_bytes && ingestion_class == IngestionClass::FullSemanticLexical
+        {
+            ingestion_class = IngestionClass::LexicalOnly;
+        }
+
+        if candidate.byte_len > max_bytes.saturating_mul(2)
+            && ingestion_class == IngestionClass::LexicalOnly
+        {
+            ingestion_class = IngestionClass::MetadataOnly;
+        }
+
+        let scope = if ingestion_class.is_indexed() {
+            reason_codes.push(REASON_DISCOVERY_FILE_INCLUDED.to_string());
+            DiscoveryScopeDecision::Include
+        } else {
+            reason_codes.push(REASON_DISCOVERY_FILE_EXCLUDED.to_string());
+            DiscoveryScopeDecision::Exclude
+        };
+
+        normalize_reason_codes(&mut reason_codes);
+        DiscoveryDecision {
+            scope,
+            ingestion_class,
+            utility_score,
+            reason_codes,
+        }
+    }
+
+    fn matches_exclude_patterns(&self, path: &Path, normalized_path: &str) -> bool {
+        let components = normalized_components(path);
+        self.exclude_patterns.iter().any(|pattern| {
+            path_matches_pattern(
+                &pattern.replace('\\', "/").to_ascii_lowercase(),
+                normalized_path,
+                &components,
+            )
+        })
+    }
+
+    fn binary_blocklist_contains(&self, extension: &str) -> bool {
+        self.binary_blocklist_extensions.iter().any(|blocked| {
+            blocked
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(extension)
+        })
+    }
 }
 
 impl Default for DiscoveryConfig {
@@ -118,6 +573,8 @@ impl Default for DiscoveryConfig {
             ],
             max_file_size_mb: 10,
             follow_symlinks: false,
+            mount_overrides: Vec::new(),
+            skip_network_mounts: false,
         }
     }
 }
@@ -255,6 +712,8 @@ struct DiscoveryConfigPatch {
     binary_blocklist_extensions: Option<Vec<String>>,
     max_file_size_mb: Option<usize>,
     follow_symlinks: Option<bool>,
+    mount_overrides: Option<Vec<MountPolicyEntry>>,
+    skip_network_mounts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -442,6 +901,28 @@ pub fn default_config_file_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config").join("fsfs").join("config.toml")
 }
 
+#[must_use]
+fn expand_home_prefix(path: &Path, home_dir: &Path) -> PathBuf {
+    let mut components = path.components();
+    let Some(Component::Normal(first_segment)) = components.next() else {
+        return path.to_path_buf();
+    };
+
+    if first_segment != OsStr::new("~") {
+        return path.to_path_buf();
+    }
+
+    let mut expanded = home_dir.to_path_buf();
+    for segment in components {
+        match segment {
+            Component::Normal(part) => expanded.push(part),
+            _ => return path.to_path_buf(),
+        }
+    }
+
+    expanded
+}
+
 /// Load config from file/env/CLI overlays using the fsfs precedence contract.
 ///
 /// # Errors
@@ -457,8 +938,9 @@ pub fn load_from_sources<S>(
 where
     S: BuildHasher,
 {
-    let (toml_contents, config_file_used) = match config_file {
-        Some(path) if path.exists() => (Some(fs::read_to_string(path)?), Some(path.to_path_buf())),
+    let expanded_config_file = config_file.map(|path| expand_home_prefix(path, home_dir));
+    let (toml_contents, config_file_used) = match expanded_config_file {
+        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
         Some(_) | None => (None, None),
     };
 
@@ -549,6 +1031,12 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         }
         if let Some(follow_symlinks) = discovery.follow_symlinks {
             config.discovery.follow_symlinks = follow_symlinks;
+        }
+        if let Some(mount_overrides) = discovery.mount_overrides {
+            config.discovery.mount_overrides = mount_overrides;
+        }
+        if let Some(skip_network_mounts) = discovery.skip_network_mounts {
+            config.discovery.skip_network_mounts = skip_network_mounts;
         }
     }
 
@@ -791,6 +1279,8 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "binary_blocklist_extensions",
                 "max_file_size_mb",
                 "follow_symlinks",
+                "mount_overrides",
+                "skip_network_mounts",
             ]
             .into_iter()
             .collect(),
@@ -897,6 +1387,30 @@ fn expand_tilde(value: &str, home_dir: &Path) -> Option<String> {
 }
 
 fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> SearchResult<()> {
+    if !(1_usize..=1024_usize).contains(&config.discovery.max_file_size_mb) {
+        return Err(SearchError::InvalidConfig {
+            field: "discovery.max_file_size_mb".into(),
+            value: config.discovery.max_file_size_mb.to_string(),
+            reason: "must be between 1 and 1024".into(),
+        });
+    }
+
+    if !(1_usize..=4096_usize).contains(&config.indexing.embedding_batch_size) {
+        return Err(SearchError::InvalidConfig {
+            field: "indexing.embedding_batch_size".into(),
+            value: config.indexing.embedding_batch_size.to_string(),
+            reason: "must be between 1 and 4096".into(),
+        });
+    }
+
+    if !(1_usize..=200_usize).contains(&config.search.default_limit) {
+        return Err(SearchError::InvalidConfig {
+            field: "search.default_limit".into(),
+            value: config.search.default_limit.to_string(),
+            reason: "must be between 1 and 200".into(),
+        });
+    }
+
     if config.storage.summary_retention_days < config.storage.evidence_retention_days {
         return Err(SearchError::InvalidConfig {
             field: "storage.summary_retention_days".into(),
@@ -910,6 +1424,62 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "search.quality_weight".into(),
             value: config.search.quality_weight.to_string(),
             reason: "must be between 0.0 and 1.0".into(),
+        });
+    }
+
+    if !config.search.rrf_k.is_finite() || config.search.rrf_k < 1.0 {
+        return Err(SearchError::InvalidConfig {
+            field: "search.rrf_k".into(),
+            value: config.search.rrf_k.to_string(),
+            reason: "must be >= 1.0".into(),
+        });
+    }
+
+    if config.search.quality_timeout_ms < 50 {
+        return Err(SearchError::InvalidConfig {
+            field: "search.quality_timeout_ms".into(),
+            value: config.search.quality_timeout_ms.to_string(),
+            reason: "must be >= 50".into(),
+        });
+    }
+
+    if !(1_u8..=100_u8).contains(&config.pressure.cpu_ceiling_pct) {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.cpu_ceiling_pct".into(),
+            value: config.pressure.cpu_ceiling_pct.to_string(),
+            reason: "must be between 1 and 100".into(),
+        });
+    }
+
+    if config.pressure.memory_ceiling_mb < 128 {
+        return Err(SearchError::InvalidConfig {
+            field: "pressure.memory_ceiling_mb".into(),
+            value: config.pressure.memory_ceiling_mb.to_string(),
+            reason: "must be >= 128".into(),
+        });
+    }
+
+    if !(8_u16..=200_u16).contains(&config.tui.frame_budget_ms) {
+        return Err(SearchError::InvalidConfig {
+            field: "tui.frame_budget_ms".into(),
+            value: config.tui.frame_budget_ms.to_string(),
+            reason: "must be between 8 and 200".into(),
+        });
+    }
+
+    if !(1_u16..=3650_u16).contains(&config.storage.evidence_retention_days) {
+        return Err(SearchError::InvalidConfig {
+            field: "storage.evidence_retention_days".into(),
+            value: config.storage.evidence_retention_days.to_string(),
+            reason: "must be between 1 and 3650".into(),
+        });
+    }
+
+    if !(1_u16..=3650_u16).contains(&config.storage.summary_retention_days) {
+        return Err(SearchError::InvalidConfig {
+            field: "storage.summary_retention_days".into(),
+            value: config.storage.summary_retention_days.to_string(),
+            reason: "must be between 1 and 3650".into(),
         });
     }
 
@@ -966,14 +1536,124 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
         })
 }
 
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn normalized_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn path_matches_pattern(pattern: &str, normalized_path: &str, components: &[String]) -> bool {
+    let trimmed = pattern.trim_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.contains('*') {
+        return wildcard_match(normalized_path, trimmed);
+    }
+
+    if trimmed.contains('/') {
+        return normalized_path.contains(trimmed);
+    }
+
+    components.iter().any(|component| component == trimmed)
+}
+
+fn wildcard_match(haystack: &str, pattern: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.is_empty() {
+        return haystack.is_empty();
+    }
+
+    let starts_with_wildcard = pattern.starts_with('*');
+    let ends_with_wildcard = pattern.ends_with('*');
+    let mut search_from = 0_usize;
+
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        if idx == 0 && !starts_with_wildcard {
+            if !haystack.starts_with(part) {
+                return false;
+            }
+            search_from = part.len();
+            continue;
+        }
+
+        if let Some(offset) = haystack[search_from..].find(part) {
+            search_from += offset + part.len();
+        } else {
+            return false;
+        }
+    }
+
+    if ends_with_wildcard {
+        return true;
+    }
+
+    parts
+        .iter()
+        .rev()
+        .find(|part| !part.is_empty())
+        .is_none_or(|last_non_empty| haystack.ends_with(last_non_empty))
+}
+
+fn lower_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+}
+
+fn lower_filename(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+}
+
+fn has_low_utility_component(path: &Path) -> bool {
+    normalized_components(path)
+        .iter()
+        .any(|component| LOW_UTILITY_PATH_COMPONENTS.contains(&component.as_str()))
+}
+
+fn is_low_value_extension(extension: &str) -> bool {
+    matches!(extension, "log" | "tmp" | "bak" | "old" | "map")
+}
+
+fn is_generated_or_minified_filename(filename: &str) -> bool {
+    filename.ends_with(".min.js")
+        || filename.ends_with(".bundle.js")
+        || filename.ends_with(".generated.rs")
+        || filename.ends_with(".generated.ts")
+}
+
+fn normalize_reason_codes(reason_codes: &mut Vec<String>) {
+    reason_codes.sort_unstable();
+    reason_codes.dedup();
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::SearchError;
 
-    use super::{CliOverrides, default_config_file_path, load_from_str};
+    use super::{
+        CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, IngestionClass,
+        default_config_file_path, load_from_sources, load_from_str,
+    };
 
     fn home() -> &'static Path {
         Path::new("/home/tester")
@@ -1101,6 +1781,233 @@ mod tests {
         let err = load_from_str(None, None, &env, &CliOverrides::default(), home())
             .expect_err("must reject invalid bool");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    fn assert_invalid_field(file: &str, field: &str) {
+        let err = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect_err("must reject invalid config");
+        assert!(
+            matches!(err, SearchError::InvalidConfig { field: err_field, .. } if err_field == field)
+        );
+    }
+
+    #[test]
+    fn enforces_numeric_range_constraints() {
+        assert_invalid_field(
+            "[discovery]\nmax_file_size_mb = 0\n",
+            "discovery.max_file_size_mb",
+        );
+        assert_invalid_field(
+            "[indexing]\nembedding_batch_size = 0\n",
+            "indexing.embedding_batch_size",
+        );
+        assert_invalid_field("[search]\ndefault_limit = 0\n", "search.default_limit");
+        assert_invalid_field("[search]\nrrf_k = 0.5\n", "search.rrf_k");
+        assert_invalid_field(
+            "[search]\nquality_timeout_ms = 49\n",
+            "search.quality_timeout_ms",
+        );
+        assert_invalid_field(
+            "[pressure]\ncpu_ceiling_pct = 0\n",
+            "pressure.cpu_ceiling_pct",
+        );
+        assert_invalid_field(
+            "[pressure]\nmemory_ceiling_mb = 64\n",
+            "pressure.memory_ceiling_mb",
+        );
+        assert_invalid_field("[tui]\nframe_budget_ms = 7\n", "tui.frame_budget_ms");
+        assert_invalid_field(
+            "[storage]\nevidence_retention_days = 0\n",
+            "storage.evidence_retention_days",
+        );
+        assert_invalid_field(
+            "[storage]\nsummary_retention_days = 0\n",
+            "storage.summary_retention_days",
+        );
+    }
+
+    #[test]
+    fn load_from_sources_expands_tilde_config_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home_dir = std::env::temp_dir().join(format!("fsfs-config-home-{unique}"));
+        let config_file = home_dir.join(".config").join("fsfs").join("config.toml");
+        fs::create_dir_all(config_file.parent().expect("parent")).expect("mkdir");
+        fs::write(&config_file, "[search]\ndefault_limit = 42\n").expect("write");
+
+        let result = load_from_sources(
+            Some(Path::new("~/.config/fsfs/config.toml")),
+            &HashMap::new(),
+            &CliOverrides::default(),
+            &home_dir,
+        )
+        .expect("load with tilde path");
+
+        assert_eq!(result.config.search.default_limit, 42);
+        assert_eq!(result.config_file_used, Some(config_file));
+    }
+
+    #[test]
+    fn discovery_policy_excludes_binary_extension() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let candidate = DiscoveryCandidate::new(Path::new("/home/tester/app/main.wasm"), 2_048);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.file.binary_blocked")
+        );
+    }
+
+    #[test]
+    fn discovery_policy_assigns_full_for_source_code() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let candidate = DiscoveryCandidate::new(Path::new("/home/tester/src/lib.rs"), 8_192);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Include);
+        assert_eq!(
+            decision.ingestion_class,
+            IngestionClass::FullSemanticLexical
+        );
+        assert!(decision.utility_score >= 70);
+    }
+
+    #[test]
+    fn discovery_policy_downgrades_large_candidate() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let oversized = (config.discovery.max_file_size_mb as u64 * 1024 * 1024) + 1;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/tester/docs/reference.md"), oversized);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Include);
+        assert!(matches!(
+            decision.ingestion_class,
+            IngestionClass::LexicalOnly | IngestionClass::MetadataOnly
+        ));
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.file.too_large")
+        );
+    }
+
+    #[test]
+    fn discovery_policy_skips_network_mount_when_configured() {
+        let file = "\
+[discovery]\nskip_network_mounts = true\n";
+        let config = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("config")
+        .config;
+        let candidate = DiscoveryCandidate::new(Path::new("/mnt/nfs/project/main.rs"), 4_096)
+            .with_mount_category(crate::mount_info::FsCategory::Nfs);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.root.rejected")
+        );
+    }
+
+    #[test]
+    fn discovery_policy_is_deterministic() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/tester/node_modules/pkg/index.ts"), 6_144);
+        let first = config.discovery.evaluate_candidate(&candidate);
+        let second = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(first, second);
+
+        let mut sorted = first.reason_codes.clone();
+        sorted.sort_unstable();
+        assert_eq!(first.reason_codes, sorted);
+    }
+
+    #[test]
+    fn discovery_policy_uses_file_excluded_reason_for_path_match() {
+        let config = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("defaults")
+        .config;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/tester/target/debug/fsfs.log"), 1_024);
+        let decision = config.discovery.evaluate_candidate(&candidate);
+
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.file.excluded_pattern")
+        );
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "discovery.root.accepted")
+        );
     }
 
     #[test]
