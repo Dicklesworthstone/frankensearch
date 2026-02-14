@@ -4425,6 +4425,66 @@ mod tests {
     }
 
     #[test]
+    fn evidence_links_allow_same_uri_across_distinct_alerts() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO alerts_timeline(\
+                alert_id, project_key, instance_id, category, severity, reason_code, summary, \
+                state, opened_at_ms, updated_at_ms\
+             ) VALUES \
+                ('alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 1, 1), \
+                ('alert-2', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 2, 2);",
+            )
+            .expect("alert rows should insert");
+
+        let shared_uri = "file:///tmp/shared-evidence.jsonl";
+        let first = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "alert-1".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: shared_uri.to_owned(),
+            evidence_hash: Some("hash-1".to_owned()),
+            created_at_ms: 3,
+        };
+        let second = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "alert-2".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: shared_uri.to_owned(),
+            evidence_hash: Some("hash-2".to_owned()),
+            created_at_ms: 4,
+        };
+        storage
+            .insert_evidence_link(&first)
+            .expect("first alert/uri pair should insert");
+        storage
+            .insert_evidence_link(&second)
+            .expect("second alert with same uri should also insert");
+
+        let rows = storage
+            .connection()
+            .query_with_params(
+                "SELECT link_id FROM evidence_links \
+                 WHERE project_key = ?1 AND evidence_uri = ?2 \
+                 ORDER BY alert_id ASC;",
+                &[
+                    SqliteValue::Text("project-a".to_owned()),
+                    SqliteValue::Text(shared_uri.to_owned()),
+                ],
+            )
+            .map_err(ops_error)
+            .expect("shared-uri query should succeed");
+        assert_eq!(
+            rows.len(),
+            2,
+            "shared evidence_uri must be allowed for different alert_id values"
+        );
+    }
+
+    #[test]
     fn insert_evidence_link_rejects_unknown_alert_id() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
         seed_project_and_instance(storage.connection());
@@ -4444,6 +4504,28 @@ mod tests {
         assert!(
             message.contains("unknown alert_id"),
             "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn insert_evidence_link_rejects_empty_evidence_uri() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let link = EvidenceLinkRecord {
+            project_key: "project-a".to_owned(),
+            alert_id: "alert-does-not-matter".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: String::new(),
+            evidence_hash: None,
+            created_at_ms: 10,
+        };
+        let error = storage
+            .insert_evidence_link(&link)
+            .expect_err("empty evidence_uri should fail validation");
+        assert!(
+            error.to_string().contains("evidence_uri"),
+            "error should mention invalid evidence_uri"
         );
     }
 
@@ -4531,5 +4613,26 @@ mod tests {
             other => panic!("unexpected row type for evidence_links.link_id: {other:?}"),
         };
         assert_eq!(actual_link_id, &expected_link_id);
+    }
+
+    #[test]
+    fn evidence_link_id_is_stable_and_separator_sensitive() {
+        let alert = "alert-stable";
+        let uri_a = "file:///tmp/a.jsonl";
+        let uri_b = "file:///tmp/b.jsonl";
+
+        let id_a_1 = evidence_link_id(alert, uri_a);
+        let id_a_2 = evidence_link_id(alert, uri_a);
+        let id_b = evidence_link_id(alert, uri_b);
+
+        assert_eq!(id_a_1, id_a_2, "same inputs must yield identical IDs");
+        assert_ne!(
+            id_a_1, id_b,
+            "different evidence_uri values should yield distinct IDs"
+        );
+        assert!(
+            id_a_1.starts_with("evlnk:"),
+            "stable IDs should keep expected prefix"
+        );
     }
 }

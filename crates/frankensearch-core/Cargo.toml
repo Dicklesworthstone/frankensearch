@@ -17,6 +17,7 @@ unicode-normalization = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

@@ -70,15 +70,17 @@ pub use distributed_observability::{
     DistributedEvent, DistributedMetrics, emit_event, service_state_label,
 };
 pub use e2e_artifact::{
-    ArtifactEntry, ClockMode, Correlation, DeterminismTier, DiffEntry,
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier, DiffEntry,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_MANIFEST_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
     E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT, E2E_SCHEMA_EVENT,
     E2E_SCHEMA_MANIFEST, E2E_SCHEMA_ORACLE_REPORT, E2E_SCHEMA_REPLAY, E2E_SCHEMA_SNAPSHOT_DIFF,
-    E2E_SCHEMA_VERSION, E2eArtifactValidationError, E2eEnvelope, E2eEventType, E2eOutcome,
-    E2eSeverity, EventBody, ExitStatus, LaneReport, ManifestBody, ModelVersion, OracleReportBody,
-    OracleVerdictRecord, Platform, ReplayBody, ReplayEventType, ReportTotals, SnapshotDiffBody,
-    Suite, validate_envelope, validate_event_body, validate_event_envelope, validate_manifest_body,
-    validate_manifest_envelope,
+    E2E_SCHEMA_VERSION, E2eArtifactEmitterError, E2eArtifactValidationError, E2eEnvelope,
+    E2eEventType, E2eOutcome, E2eSeverity, EventBody, ExitStatus, LaneReport, ManifestBody,
+    ModelVersion, OracleReportBody, OracleVerdictRecord, Platform, ReplayBody, ReplayEventType,
+    ReportTotals, SnapshotDiffBody, Suite, build_artifact_entries, build_core_manifest_artifacts,
+    normalize_artifact_file_name, normalize_replay_command, render_artifacts_index,
+    sha256_checksum, validate_envelope, validate_event_body, validate_event_envelope,
+    validate_manifest_body, validate_manifest_envelope,
 };
 pub use error::{SearchError, SearchResult};
 pub use explanation::{

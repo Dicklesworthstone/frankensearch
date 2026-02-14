@@ -43,6 +43,7 @@ pub mod determinism;
 pub mod evidence;
 pub mod frame;
 pub mod input;
+pub mod interaction;
 pub mod overlay;
 pub mod palette;
 pub mod replay;
@@ -62,6 +63,12 @@ pub use evidence::{
 };
 pub use frame::{FrameBudget, FrameMetrics, JankCallback};
 pub use input::{InputEvent, KeyAction, KeyBinding, Keymap};
+pub use interaction::{
+    CardLayoutRule, CardRole, DeterministicCheckpoint, DeterministicStateBoundary,
+    InteractionLatencyHooks, InteractionSurfaceContract, InteractionSurfaceKind, LayoutAxis,
+    PaletteIntent, PaletteIntentRoute, SHOWCASE_INTERACTION_SPEC_VERSION, ShowcaseInteractionSpec,
+    ShowcaseInteractionSpecError,
+};
 pub use overlay::{OverlayKind, OverlayManager, OverlayRequest};
 pub use palette::{Action, ActionCategory, CommandPalette, PaletteState};
 pub use replay::{InputRecord, ReplayPlayer, ReplayRecorder, ReplayState};

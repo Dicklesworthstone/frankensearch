@@ -551,7 +551,24 @@ impl StorageBackedJobRunner {
                 continue;
             }
 
-            let embedder = self.embedder_for_id(&job.embedder_id)?;
+            let embedder = match self.embedder_for_id(&job.embedder_id) {
+                Ok(embedder) => embedder,
+                Err(error) => {
+                    let error_message = error.to_string();
+                    self.handle_job_failure(job, &error);
+                    result.jobs_failed += 1;
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "process_batch",
+                        worker_id,
+                        doc_id = %job.doc_id,
+                        embedder_id = %job.embedder_id,
+                        error = %error_message,
+                        "failed to resolve embedder for queued job"
+                    );
+                    continue;
+                }
+            };
             let embedding = match embedder.embed(cx, text).await {
                 Ok(embedding) => embedding,
                 Err(error) => {
@@ -1066,7 +1083,7 @@ mod tests {
         runner
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Debug)]
     struct TestLogWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
@@ -1226,6 +1243,60 @@ mod tests {
                 .count_by_status("fast-tier")
                 .expect("status counts should succeed");
             assert_eq!(counts.failed, 1);
+        });
+    }
+
+    #[test]
+    fn process_batch_unknown_embedder_fails_job_without_aborting_batch() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 4, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig {
+                    max_retries: 0,
+                    ..JobQueueConfig::default()
+                },
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            let _ = runner
+                .ingest(IngestRequest::new(
+                    "doc-unknown-embedder",
+                    "valid content for processing",
+                ))
+                .expect("ingest should succeed");
+
+            let queued_unknown = runner
+                .queue
+                .enqueue("doc-unknown-embedder", "missing-tier", &[7_u8; 32], 0)
+                .expect("unknown embedder job enqueue should succeed");
+            assert!(queued_unknown, "unknown embedder job should be enqueued");
+
+            let processed = runner
+                .process_batch(&cx, "worker-unknown-embedder")
+                .await
+                .expect("process_batch should not abort on unknown embedder id");
+
+            assert_eq!(processed.jobs_claimed, 2);
+            assert_eq!(processed.jobs_completed, 1);
+            assert_eq!(processed.jobs_failed, 1);
+
+            let depth = runner
+                .queue
+                .queue_depth()
+                .expect("queue depth should succeed");
+            assert_eq!(depth.processing, 0);
+            assert_eq!(depth.failed, 1);
+
+            let missing_tier_counts = runner
+                .storage
+                .count_by_status("missing-tier")
+                .expect("missing-tier status counts should succeed");
+            assert_eq!(missing_tier_counts.failed, 1);
+            assert_eq!(missing_tier_counts.pending, 0);
         });
     }
 

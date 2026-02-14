@@ -93,6 +93,7 @@ sha2 = "0.10"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.6"
 
 # System information (CPU, memory, etc.)
 sysinfo = "0.33"

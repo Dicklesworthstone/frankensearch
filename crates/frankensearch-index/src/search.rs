@@ -505,6 +505,7 @@ fn parse_parallel_search_env(value: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -512,6 +513,7 @@ mod tests {
     use super::*;
     use crate::{Quantization, VectorIndex};
     use frankensearch_core::PredicateFilter;
+    use proptest::prelude::*;
 
     fn temp_index_path(name: &str) -> PathBuf {
         let now = SystemTime::now()
@@ -539,6 +541,83 @@ mod tests {
             writer.write_record(doc_id, vector)?;
         }
         writer.finish()
+    }
+
+    fn create_rows(vectors: &[Vec<f32>]) -> Vec<(String, Vec<f32>)> {
+        vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, vector)| (format!("doc-{idx:03}"), vector.clone()))
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn property_top_k_invariants_hold(
+            vectors in prop::collection::vec(prop::collection::vec(-1.0_f32..1.0_f32, 4), 1..20),
+            query in prop::collection::vec(-1.0_f32..1.0_f32, 4),
+            limit in 1_usize..20,
+        ) {
+            let path = temp_index_path("prop-top-k");
+            let rows = create_rows(&vectors);
+            let row_refs: Vec<(&str, Vec<f32>)> = rows
+                .iter()
+                .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+                .collect();
+            write_index(&path, &row_refs).expect("write index");
+
+            let index = VectorIndex::open(&path).expect("open index");
+            let hits = index.search_top_k(&query, limit, None).expect("search");
+
+            let expected_len = limit.min(vectors.len());
+            prop_assert_eq!(hits.len(), expected_len);
+            let mut seen_indices = HashSet::new();
+            for hit in &hits {
+                prop_assert!(seen_indices.insert(hit.index));
+            }
+            for pair in hits.windows(2) {
+                let left = &pair[0];
+                let right = &pair[1];
+                let ordered = match left.score.total_cmp(&right.score) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => left.index <= right.index,
+                    Ordering::Less => false,
+                };
+                prop_assert!(ordered, "hits must be score-descending with index tie-breaks");
+            }
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn property_parallel_and_sequential_paths_match(
+            vectors in prop::collection::vec(prop::collection::vec(-1.0_f32..1.0_f32, 4), 8..40),
+            query in prop::collection::vec(-1.0_f32..1.0_f32, 4),
+            limit in 1_usize..20,
+        ) {
+            let path = temp_index_path("prop-parallel");
+            let rows = create_rows(&vectors);
+            let row_refs: Vec<(&str, Vec<f32>)> = rows
+                .iter()
+                .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+                .collect();
+            write_index(&path, &row_refs).expect("write index");
+
+            let index = VectorIndex::open(&path).expect("open index");
+            let sequential = index
+                .search_top_k_internal(&query, limit, None, usize::MAX, PARALLEL_CHUNK_SIZE, true)
+                .expect("sequential search");
+            let parallel = index
+                .search_top_k_internal(&query, limit, None, 1, 4, true)
+                .expect("parallel search");
+
+            prop_assert_eq!(sequential.len(), parallel.len());
+            for (left, right) in sequential.iter().zip(parallel.iter()) {
+                prop_assert_eq!(&left.doc_id, &right.doc_id);
+                prop_assert_eq!(left.index, right.index);
+                prop_assert!((left.score - right.score).abs() <= 1e-6);
+            }
+            let _ = fs::remove_file(&path);
+        }
     }
 
     #[test]

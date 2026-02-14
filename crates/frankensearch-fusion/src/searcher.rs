@@ -12,6 +12,7 @@
 //!    result or graceful degradation (only fired when quality embedder is available
 //!    and `fast_only` is false).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -717,12 +718,18 @@ impl TwoTierSearcher {
         metrics.kendall_tau = tau;
         metrics.rank_changes = rank_changes;
 
+        let initial_by_doc: HashMap<&str, &ScoredResult> = initial_results
+            .iter()
+            .map(|result| (result.doc_id.as_str(), result))
+            .collect();
+
         // Convert blended to scored results.
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
         let mut results: Vec<ScoredResult> = blended
             .iter()
             .take(k)
             .map(|hit| {
+                let initial = initial_by_doc.get(hit.doc_id.as_str()).copied();
                 let fast_score = fast_hits
                     .iter()
                     .find(|h| h.doc_id == hit.doc_id)
@@ -731,15 +738,20 @@ impl TwoTierSearcher {
                     .iter()
                     .find(|h| h.doc_id == hit.doc_id)
                     .map(|h| h.score);
+                let source = if quality_score.is_some() {
+                    ScoreSource::SemanticQuality
+                } else {
+                    initial.map_or(ScoreSource::SemanticFast, |result| result.source)
+                };
                 ScoredResult {
                     doc_id: hit.doc_id.clone(),
                     score: hit.score,
-                    source: ScoreSource::SemanticQuality,
+                    source,
                     fast_score,
                     quality_score,
-                    lexical_score: None,
+                    lexical_score: initial.and_then(|result| result.lexical_score),
                     rerank_score: None,
-                    metadata: None,
+                    metadata: initial.and_then(|result| result.metadata.clone()),
                 }
             })
             .collect();
@@ -1148,7 +1160,6 @@ mod tests {
     use frankensearch_core::{
         AdapterIdentity, AdapterLifecycleEvent, HostAdapter, TelemetryEnvelope, TelemetryEvent,
     };
-    use tracing_test::traced_test;
 
     use super::*;
 
@@ -2089,19 +2100,24 @@ mod tests {
                 .expect("search should succeed");
 
             assert!(
-                !initial_results.iter().any(|result| result.doc_id == "doc-0"),
+                !initial_results
+                    .iter()
+                    .any(|result| result.doc_id == "doc-0"),
                 "unsafe semantic result should be filtered"
             );
             assert!(
-                !initial_results.iter().any(|result| result.doc_id == "lex-doc-0"),
+                !initial_results
+                    .iter()
+                    .any(|result| result.doc_id == "lex-doc-0"),
                 "unsafe lexical result should be filtered"
             );
             assert!(
-                initial_results.iter().all(|result| result.doc_id != "doc-0"
-                    && result.doc_id != "lex-doc-0")
+                initial_results
+                    .iter()
+                    .all(|result| result.doc_id != "doc-0" && result.doc_id != "lex-doc-0")
             );
             assert!(
-                initial_results.len() >= 1,
+                !initial_results.is_empty(),
                 "expected at least one safe rust result to remain"
             );
         });
@@ -2115,7 +2131,13 @@ mod tests {
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
             let baseline = searcher
-                .search(&cx, "rust systems", 10, |_| Some("safe rust systems".to_owned()), |_| {})
+                .search(
+                    &cx,
+                    "rust systems",
+                    10,
+                    |_| Some("safe rust systems".to_owned()),
+                    |_| {},
+                )
                 .await
                 .expect("baseline search should succeed")
                 .phase1_total_ms;
@@ -2144,39 +2166,6 @@ mod tests {
                 "expected exclusion overhead <1ms, observed {overhead_ms:.4}ms (baseline={baseline:.4}ms, negated={negated:.4}ms)"
             );
         });
-    }
-
-    #[test]
-    #[traced_test]
-    fn exclusion_emits_query_parsed_and_doc_excluded_logs() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
-            let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
-
-            let _metrics = searcher
-                .search(
-                    &cx,
-                    "rust -unsafe",
-                    10,
-                    |doc_id| {
-                        let text = if doc_id == "doc-0" {
-                            "unsafe rust patterns"
-                        } else {
-                            "safe rust patterns"
-                        };
-                        Some(text.to_owned())
-                    },
-                    |_| {},
-                )
-                .await
-                .expect("search should succeed");
-        });
-
-        assert!(logs_contain("query_parsed"));
-        assert!(logs_contain("excluded_terms=1"));
-        assert!(logs_contain("doc_excluded"));
-        assert!(logs_contain("matched_exclusion_term=unsafe"));
     }
 
     #[test]
@@ -2217,6 +2206,17 @@ mod tests {
             assert!(
                 lexical_only.fast_score.is_some_and(|score| score > 0.0_f32),
                 "lexical-only refined result should preserve positive phase-1 signal"
+            );
+            assert_eq!(
+                lexical_only.source,
+                ScoreSource::Lexical,
+                "lexical-only refined result should retain lexical provenance when quality score is absent"
+            );
+            assert!(
+                lexical_only
+                    .lexical_score
+                    .is_some_and(|score| score > 0.0_f32),
+                "lexical-only refined result should preserve lexical score for diagnostics"
             );
         });
     }

@@ -5,6 +5,7 @@
 //! All types are `Serialize`/`Deserialize` for JSON/JSONL emission.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -23,6 +24,8 @@ pub const E2E_SCHEMA_SNAPSHOT_DIFF: &str = "e2e-snapshot-diff-v1";
 
 /// Mandatory structured events stream for unified e2e packs.
 pub const E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL: &str = "structured_events.jsonl";
+/// Canonical manifest file name inside an e2e artifact bundle.
+pub const E2E_ARTIFACT_MANIFEST_JSON: &str = "manifest.json";
 /// Mandatory artifact index for failed runs.
 pub const E2E_ARTIFACT_ARTIFACTS_INDEX_JSON: &str = "artifacts_index.json";
 /// Mandatory replay command pointer for failed runs.
@@ -58,6 +61,29 @@ pub enum E2eArtifactValidationError {
     MissingReasonCode { outcome: E2eOutcome },
     #[error("reason_code '{reason_code}' does not match e2e namespace pattern")]
     InvalidReasonCode { reason_code: String },
+}
+
+/// One artifact payload candidate used by shared emitters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactEmissionInput<'a> {
+    pub file: &'a str,
+    pub bytes: &'a [u8],
+    pub line_count: Option<u64>,
+}
+
+/// Errors surfaced by shared artifact-entry emitter helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum E2eArtifactEmitterError {
+    #[error("duplicate artifact file after normalization: '{file}'")]
+    DuplicateNormalizedArtifactFile { file: String },
+    #[error("artifact '{file}' is JSONL and must include line_count")]
+    MissingLineCountForJsonl { file: String },
+    #[error("artifact '{file}' is not JSONL and must not include line_count")]
+    UnexpectedLineCountForNonJsonl { file: String },
+    #[error("failed to render artifacts_index.json: {detail}")]
+    ArtifactsIndexRender { detail: String },
+    #[error("failed run requires replay command payload")]
+    MissingReplayCommandForFailure,
 }
 
 /// Validate common envelope invariants shared by all e2e artifacts.
@@ -211,6 +237,197 @@ pub fn validate_event_body(event: &EventBody) -> Result<(), E2eArtifactValidatio
     }
 
     Ok(())
+}
+
+/// Normalize artifact filenames to canonical v1 names.
+///
+/// Legacy names are mapped according to `docs/e2e-artifact-contract.md` and
+/// path prefixes are stripped so all suites emit one stable filename grammar.
+#[must_use]
+pub fn normalize_artifact_file_name(file: &str) -> String {
+    let trimmed = file.trim();
+    let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    match basename {
+        "run_manifest.json" => E2E_ARTIFACT_MANIFEST_JSON.to_owned(),
+        "events.jsonl" => E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
+        "artifacts-index.json" => E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+        "replay.txt" => E2E_ARTIFACT_REPLAY_COMMAND_TXT.to_owned(),
+        _ => basename.to_owned(),
+    }
+}
+
+/// Normalize replay commands so all suites emit equivalent, copy/paste-safe
+/// command strings regardless of input whitespace formatting.
+#[must_use]
+pub fn normalize_replay_command(command: &str) -> String {
+    let trimmed = command.trim();
+    let raw = if trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() >= 2 {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    let mut normalized = String::with_capacity(raw.len());
+    let mut in_single_quotes = false;
+    let mut in_double_quotes = false;
+    let mut pending_space = false;
+
+    for ch in raw.chars() {
+        match ch {
+            '\'' if !in_double_quotes => {
+                in_single_quotes = !in_single_quotes;
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                    pending_space = false;
+                }
+                normalized.push(ch);
+            }
+            '"' if !in_single_quotes => {
+                in_double_quotes = !in_double_quotes;
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                    pending_space = false;
+                }
+                normalized.push(ch);
+            }
+            c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
+                pending_space = !normalized.is_empty();
+            }
+            c => {
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                    pending_space = false;
+                }
+                normalized.push(c);
+            }
+        }
+    }
+
+    normalized.trim().to_owned()
+}
+
+/// Compute a canonical SHA-256 checksum string for artifact payload bytes.
+#[must_use]
+pub fn sha256_checksum(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+/// Build deterministic manifest artifact entries from raw artifact payloads.
+///
+/// Output is stably sorted by canonical filename and rejects duplicate names
+/// after legacy-name normalization.
+///
+/// # Errors
+///
+/// Returns an error if canonicalized names collide or line-count contracts are
+/// violated (`*.jsonl` requires `line_count`; non-JSONL forbids it).
+pub fn build_artifact_entries<'a, I>(
+    inputs: I,
+) -> Result<Vec<ArtifactEntry>, E2eArtifactEmitterError>
+where
+    I: IntoIterator<Item = ArtifactEmissionInput<'a>>,
+{
+    let mut ordered_entries = BTreeMap::<String, ArtifactEntry>::new();
+
+    for input in inputs {
+        let file = normalize_artifact_file_name(input.file);
+        let is_jsonl = file
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("jsonl"));
+
+        if is_jsonl && input.line_count.is_none() {
+            return Err(E2eArtifactEmitterError::MissingLineCountForJsonl { file });
+        }
+        if !is_jsonl && input.line_count.is_some() {
+            return Err(E2eArtifactEmitterError::UnexpectedLineCountForNonJsonl { file });
+        }
+
+        let entry = ArtifactEntry {
+            file: file.clone(),
+            checksum: sha256_checksum(input.bytes),
+            line_count: input.line_count,
+        };
+
+        if ordered_entries.insert(file.clone(), entry).is_some() {
+            return Err(E2eArtifactEmitterError::DuplicateNormalizedArtifactFile { file });
+        }
+    }
+
+    Ok(ordered_entries.into_values().collect())
+}
+
+/// Render a stable `artifacts_index.json` payload from manifest artifact entries.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub fn render_artifacts_index(entries: &[ArtifactEntry]) -> Result<String, serde_json::Error> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|left, right| left.file.cmp(&right.file));
+    serde_json::to_string_pretty(&sorted)
+}
+
+/// Build canonical manifest artifact entries for core e2e lanes.
+///
+/// For failed/error runs this emits a normalized `replay_command.txt` entry
+/// and materializes `artifacts_index.json` content. For passing runs, only the
+/// structured events stream entry is required.
+///
+/// Returns `(manifest_entries, artifacts_index_json)` where the second item is
+/// `Some(...)` only for failed/error runs.
+///
+/// # Errors
+///
+/// Returns an error if payload contracts are invalid or artifact index
+/// serialization fails.
+pub fn build_core_manifest_artifacts(
+    structured_events_jsonl: &[u8],
+    structured_event_line_count: u64,
+    exit_status: ExitStatus,
+    replay_command: Option<&str>,
+) -> Result<(Vec<ArtifactEntry>, Option<String>), E2eArtifactEmitterError> {
+    let mut emission_inputs = vec![ArtifactEmissionInput {
+        file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+        bytes: structured_events_jsonl,
+        line_count: Some(structured_event_line_count),
+    }];
+
+    let normalized_replay_command = if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
+        let raw_replay_command =
+            replay_command.ok_or(E2eArtifactEmitterError::MissingReplayCommandForFailure)?;
+        Some(normalize_replay_command(raw_replay_command))
+    } else {
+        None
+    };
+
+    if let Some(replay_command_payload) = normalized_replay_command.as_deref() {
+        emission_inputs.push(ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+            bytes: replay_command_payload.as_bytes(),
+            line_count: None,
+        });
+    }
+
+    let mut entries = build_artifact_entries(emission_inputs)?;
+    let artifacts_index_json = if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
+        let index_payload = render_artifacts_index(&entries).map_err(|err| {
+            E2eArtifactEmitterError::ArtifactsIndexRender {
+                detail: err.to_string(),
+            }
+        })?;
+        entries.push(ArtifactEntry {
+            file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+            checksum: sha256_checksum(index_payload.as_bytes()),
+            line_count: None,
+        });
+        entries.sort_by(|left, right| left.file.cmp(&right.file));
+        Some(index_payload)
+    } else {
+        None
+    };
+
+    Ok((entries, artifacts_index_json))
 }
 
 fn has_non_empty_text(value: Option<&str>) -> bool {
@@ -991,5 +1208,249 @@ mod tests {
             E2eArtifactValidationError::SchemaTagMismatch { expected, found }
             if expected == E2E_SCHEMA_MANIFEST && found == E2E_SCHEMA_EVENT
         ));
+    }
+
+    #[test]
+    fn normalize_artifact_file_name_maps_legacy_aliases() {
+        assert_eq!(
+            normalize_artifact_file_name("legacy/run_manifest.json"),
+            E2E_ARTIFACT_MANIFEST_JSON
+        );
+        assert_eq!(
+            normalize_artifact_file_name("events.jsonl"),
+            E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL
+        );
+        assert_eq!(
+            normalize_artifact_file_name("artifacts-index.json"),
+            E2E_ARTIFACT_ARTIFACTS_INDEX_JSON
+        );
+        assert_eq!(
+            normalize_artifact_file_name("replay.txt"),
+            E2E_ARTIFACT_REPLAY_COMMAND_TXT
+        );
+    }
+
+    #[test]
+    fn normalize_replay_command_collapses_outer_whitespace_only() {
+        let normalized = normalize_replay_command(
+            "  cargo   test   -p frankensearch-fsfs -- --exact \"scenario  with  spaces\"  ",
+        );
+        assert_eq!(
+            normalized,
+            "cargo test -p frankensearch-fsfs -- --exact \"scenario  with  spaces\""
+        );
+    }
+
+    #[test]
+    fn build_artifact_entries_is_sorted_and_uses_sha256_format() {
+        let entries = build_artifact_entries([
+            ArtifactEmissionInput {
+                file: "replay.txt",
+                bytes: b"cargo test -p frankensearch-fsfs -- --exact scenario_cli_degrade_path\n",
+                line_count: None,
+            },
+            ArtifactEmissionInput {
+                file: "events.jsonl",
+                bytes: b"{\"line\":1}\n{\"line\":2}\n",
+                line_count: Some(2),
+            },
+            ArtifactEmissionInput {
+                file: "artifacts-index.json",
+                bytes: b"[]",
+                line_count: None,
+            },
+        ])
+        .expect("entries should build");
+
+        let files: Vec<&str> = entries.iter().map(|entry| entry.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
+                E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+                E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.checksum.starts_with("sha256:") && entry.checksum.len() == 71)
+        );
+    }
+
+    #[test]
+    fn build_artifact_entries_rejects_duplicates_after_name_normalization() {
+        let err = build_artifact_entries([
+            ArtifactEmissionInput {
+                file: "events.jsonl",
+                bytes: b"{}\n",
+                line_count: Some(1),
+            },
+            ArtifactEmissionInput {
+                file: "structured_events.jsonl",
+                bytes: b"{}\n",
+                line_count: Some(1),
+            },
+        ])
+        .expect_err("duplicate canonical name must fail");
+        assert!(matches!(
+            err,
+            E2eArtifactEmitterError::DuplicateNormalizedArtifactFile { file }
+                if file == E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL
+        ));
+    }
+
+    #[test]
+    fn build_artifact_entries_enforces_jsonl_line_count_contract() {
+        let missing_line_count = build_artifact_entries([ArtifactEmissionInput {
+            file: "events.jsonl",
+            bytes: b"{}\n",
+            line_count: None,
+        }])
+        .expect_err("jsonl without line_count must fail");
+        assert!(matches!(
+            missing_line_count,
+            E2eArtifactEmitterError::MissingLineCountForJsonl { file }
+                if file == E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL
+        ));
+
+        let unexpected_line_count = build_artifact_entries([ArtifactEmissionInput {
+            file: "replay_command.txt",
+            bytes: b"cargo test -p frankensearch-fsfs\n",
+            line_count: Some(1),
+        }])
+        .expect_err("non-jsonl with line_count must fail");
+        assert!(matches!(
+            unexpected_line_count,
+            E2eArtifactEmitterError::UnexpectedLineCountForNonJsonl { file }
+                if file == E2E_ARTIFACT_REPLAY_COMMAND_TXT
+        ));
+    }
+
+    #[test]
+    fn render_artifacts_index_is_deterministically_sorted() {
+        let entries = vec![
+            ArtifactEntry {
+                file: E2E_ARTIFACT_REPLAY_COMMAND_TXT.to_owned(),
+                checksum: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+                line_count: None,
+            },
+            ArtifactEntry {
+                file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
+                checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                line_count: Some(2),
+            },
+        ];
+        let rendered = render_artifacts_index(&entries).expect("render must succeed");
+        let replay_pos = rendered
+            .find(E2E_ARTIFACT_REPLAY_COMMAND_TXT)
+            .expect("replay file present");
+        let events_pos = rendered
+            .find(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL)
+            .expect("events file present");
+        assert!(replay_pos < events_pos);
+    }
+
+    #[test]
+    fn core_manifest_artifacts_for_failed_run_are_v1_compliant() {
+        let events = vec![
+            E2eEnvelope::new(
+                E2E_SCHEMA_EVENT,
+                "01HQXG5M7P3KZFV9N2RSTW6YAB",
+                "2026-02-14T12:00:01Z",
+                EventBody {
+                    event_type: E2eEventType::E2eStart,
+                    correlation: Correlation {
+                        event_id: "evt-start".to_owned(),
+                        root_request_id: "root-1".to_owned(),
+                        parent_event_id: None,
+                    },
+                    severity: E2eSeverity::Info,
+                    lane_id: None,
+                    oracle_id: None,
+                    outcome: None,
+                    reason_code: Some(reason_codes::RUN_SETUP_FAILED.to_owned()),
+                    context: Some("starting core lane".to_owned()),
+                    metrics: None,
+                },
+            ),
+            E2eEnvelope::new(
+                E2E_SCHEMA_EVENT,
+                "01HQXG5M7P3KZFV9N2RSTW6YAB",
+                "2026-02-14T12:00:02Z",
+                EventBody {
+                    event_type: E2eEventType::E2eEnd,
+                    correlation: Correlation {
+                        event_id: "evt-end".to_owned(),
+                        root_request_id: "root-1".to_owned(),
+                        parent_event_id: Some("evt-start".to_owned()),
+                    },
+                    severity: E2eSeverity::Warn,
+                    lane_id: None,
+                    oracle_id: None,
+                    outcome: Some(E2eOutcome::Fail),
+                    reason_code: Some(reason_codes::RUN_SETUP_FAILED.to_owned()),
+                    context: Some("core lane failed".to_owned()),
+                    metrics: None,
+                },
+            ),
+        ];
+
+        let mut events_jsonl = String::new();
+        for event in &events {
+            events_jsonl.push_str(&serde_json::to_string(event).expect("serialize event"));
+            events_jsonl.push('\n');
+        }
+
+        let (artifacts, artifacts_index_json) = build_core_manifest_artifacts(
+            events_jsonl.as_bytes(),
+            u64::try_from(events.len()).expect("line count within u64"),
+            ExitStatus::Fail,
+            Some("  cargo   run --example validate_full_pipeline  "),
+        )
+        .expect("core failed-run artifacts should build");
+
+        let artifact_files: Vec<&str> = artifacts.iter().map(|entry| entry.file.as_str()).collect();
+        assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+        assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
+        assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
+        assert!(artifacts_index_json.is_some());
+
+        let mut manifest = make_valid_manifest();
+        manifest.suite = Suite::Core;
+        manifest.exit_status = ExitStatus::Fail;
+        manifest.artifacts = artifacts;
+        let manifest_envelope = E2eEnvelope::new(
+            E2E_SCHEMA_MANIFEST,
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:03Z",
+            manifest,
+        );
+
+        assert!(validate_manifest_envelope(&manifest_envelope).is_ok());
+        for event in &events {
+            assert!(validate_event_envelope(event).is_ok());
+        }
+    }
+
+    #[test]
+    fn core_manifest_artifacts_for_pass_run_omit_failure_only_files() {
+        let structured_events_jsonl = b"{\"v\":1}\n";
+        let (artifacts, artifacts_index_json) =
+            build_core_manifest_artifacts(structured_events_jsonl, 1, ExitStatus::Pass, None)
+                .expect("pass-run artifacts should build");
+
+        assert!(artifacts_index_json.is_none());
+        let artifact_files: Vec<&str> = artifacts.iter().map(|entry| entry.file.as_str()).collect();
+        assert_eq!(artifact_files, vec![E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL]);
+    }
+
+    #[test]
+    fn core_manifest_artifacts_require_replay_command_for_failure() {
+        let err = build_core_manifest_artifacts(b"{}\n", 1, ExitStatus::Fail, None)
+            .expect_err("failure artifacts without replay command must fail");
+        assert_eq!(err, E2eArtifactEmitterError::MissingReplayCommandForFailure);
     }
 }

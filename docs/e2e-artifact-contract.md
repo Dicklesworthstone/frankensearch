@@ -321,6 +321,55 @@ E2e-specific reason codes use the `e2e.*` namespace:
 | `e2e.diff.tolerance_exceeded` | Snapshot diff exceeded tolerance |
 | `e2e.diff.field_missing` | Expected field absent in current run |
 
+## Suite-to-Schema Migration Matrix (bd-2hz.10.11.2)
+
+This matrix maps each producing suite to the unified v1 artifact contract and records migration status.
+
+Status legend:
+- `adopted`: suite already emits/validates canonical v1 artifacts.
+- `in_progress`: suite emits part of the contract; remaining lanes are being landed.
+- `pending`: suite adoption work has not landed yet.
+
+| Suite / Bead | Status | Current Evidence Surface | Canonical V1 Mapping | Gap / Adapter Notes |
+|---|---|---|---|---|
+| Core e2e validation scripts (`bd-3un.40`) | `adopted` | `crates/frankensearch-core/src/e2e_artifact.rs` | `manifest.json` + `structured_events.jsonl` + failure-required `artifacts_index.json` / `replay_command.txt` (+ `terminal_transcript.txt` for ops failures) | Contract constants + validator are authoritative; keep schema and validator lockstep. |
+| fsfs CLI scenarios (`bd-2hz.10.4`) | `in_progress` | `crates/frankensearch-fsfs/src/cli_e2e.rs` | Emits `structured_events.jsonl`, `artifacts_index.json`, `replay_command.txt`; normalize full bundle to v1 naming | Finish scenario matrix coverage (index/search/explain/degrade) and enforce all failure-path required artifacts. |
+| fsfs TUI replay suite (`bd-2hz.10.5`) | `pending` | Deluxe TUI e2e lane | Must emit canonical bundle with `terminal_transcript.txt` + snapshot assets on failures | Add adapter hooks for TUI snapshot diff outputs into `artifacts_index.json`. |
+| fsfs chaos suite (`bd-2hz.10.7`) | `pending` | Filesystem-chaos e2e lane | Must emit canonical bundle plus reproducible replay command | Add reason-code taxonomy mapping for permission/symlink/mount/binary-blob failures. |
+| fsfs privacy/redaction suite (`bd-2hz.10.9`) | `pending` | Privacy leak-detection e2e lane | Must emit canonical bundle with structured redaction evidence in `structured_events.jsonl` | Add deterministic redaction outcome fields + replay-safe scrubbed transcript pathing. |
+| Ops PTY + snapshot suite (`bd-2yu.8.3`) | `pending` | Ops/control-plane PTY snapshot lane | Must emit canonical bundle with `terminal_transcript.txt`, snapshot diffs, and artifact checksums | Add PTY snapshot metadata adapter and enforce transcript-on-failure requirement. |
+
+### Canonical Field Mapping Rules
+
+All suites must map producer-specific fields to the following canonical envelope/body keys:
+
+| Canonical Field | Source/Mapping Rule |
+|---|---|
+| `suite` | Producer lane identifier normalized to `core` / `fsfs` / `ops` / `interaction` |
+| `run_id` | Shared ULID across every file in one artifact pack |
+| `seed` | Suite master seed (single deterministic replay root) |
+| `config_hash` | SHA-256 of effective run config, not raw config text |
+| `reason_code` | Stable machine code (`e2e.*` namespace), never free-form text |
+| `artifacts[].file` | Canonical file names defined in this contract |
+| `artifacts[].checksum` | `sha256:<hex>` for every listed artifact |
+
+### Legacy Name Normalization (If Encountered)
+
+When older suites emit legacy names, adapters must normalize before validation:
+
+| Legacy Name | Canonical Name |
+|---|---|
+| `run_manifest.json` | `manifest.json` |
+| `events.jsonl` | `structured_events.jsonl` |
+| `artifacts-index.json` | `artifacts_index.json` |
+| `replay.txt` | `replay_command.txt` |
+
+### Completion Criteria For This Matrix
+
+- Every listed suite has status moved to `adopted`.
+- No open gap/adaptor notes remain for required artifact files.
+- CI enforcement lane (`bd-2hz.10.11.7`) validates canonical naming and required failure artifacts uniformly.
+
 ## Validation Artifacts
 
 - Schema: `schemas/e2e-artifact-v1.schema.json`

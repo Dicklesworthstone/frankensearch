@@ -134,6 +134,8 @@ impl fmt::Display for QueryClass {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     // ── Empty ───────────────────────────────────────────────────────────
@@ -289,6 +291,39 @@ mod tests {
             let json = serde_json::to_string(&variant).unwrap();
             let decoded: QueryClass = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, variant);
+        }
+    }
+
+    // ── Property Invariants ───────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn classify_is_trim_invariant(query in ".{0,128}") {
+            prop_assert_eq!(
+                QueryClass::classify(&query),
+                QueryClass::classify(query.trim()),
+            );
+        }
+
+        #[test]
+        fn budget_multipliers_are_consistent(query in ".{0,128}") {
+            let class = QueryClass::classify(&query);
+            let lexical = class.lexical_budget_multiplier();
+            let semantic = class.semantic_budget_multiplier();
+
+            prop_assert!(lexical.is_finite());
+            prop_assert!(semantic.is_finite());
+            prop_assert!(lexical >= 0.0);
+            prop_assert!(semantic >= 0.0);
+
+            if class == QueryClass::Empty {
+                prop_assert!(query.trim().is_empty());
+                prop_assert!(lexical.abs() < f32::EPSILON);
+                prop_assert!(semantic.abs() < f32::EPSILON);
+            } else {
+                prop_assert!(!query.trim().is_empty());
+                prop_assert!(lexical > 0.0 || semantic > 0.0);
+            }
         }
     }
 }
