@@ -485,4 +485,44 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn candidate_count_zero_multiplier_returns_zero() {
+        assert_eq!(candidate_count(100, 50, 0), 0);
+        assert_eq!(candidate_count(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn candidate_count_zero_limit_and_offset() {
+        assert_eq!(candidate_count(0, 0, 3), 0);
+    }
+
+    #[test]
+    fn limit_zero_returns_empty() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("a", 10.0)];
+        let results = rrf_fuse(&lexical, &[], 0, 0, &config);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn offset_beyond_results_returns_empty() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("a", 10.0)];
+        let results = rrf_fuse(&lexical, &[], 10, 100, &config);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn single_element_single_source_correct_rank() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("only", 1.0)];
+        let results = rrf_fuse(&lexical, &[], 10, 0, &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "only");
+        assert_eq!(results[0].lexical_rank, Some(0));
+        assert_eq!(results[0].semantic_rank, None);
+        assert!(!results[0].in_both_sources);
+    }
 }

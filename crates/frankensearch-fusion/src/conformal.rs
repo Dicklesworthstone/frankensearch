@@ -533,4 +533,84 @@ mod tests {
             .expect_err("must reject min_examples=0");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
     }
+
+    #[test]
+    fn adaptive_state_rejects_zero_gamma() {
+        let err = AdaptiveConformalState::new(0.1, 0.0).expect_err("must reject gamma=0");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn adaptive_state_rejects_nan_gamma() {
+        let err = AdaptiveConformalState::new(0.1, f32::NAN).expect_err("must reject NaN gamma");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn adaptive_state_rejects_negative_gamma() {
+        let err = AdaptiveConformalState::new(0.1, -0.5).expect_err("must reject negative gamma");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn adaptive_update_rejects_nan_error_rate() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        let mut state = AdaptiveConformalState::new(0.1, 0.5).expect("state");
+        let err = state
+            .update(f32::NAN, &cal)
+            .expect_err("must reject NaN error rate");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn adaptive_update_rejects_out_of_range_error_rate() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        let mut state = AdaptiveConformalState::new(0.1, 0.5).expect("state");
+        let err = state
+            .update(1.5, &cal)
+            .expect_err("must reject >1 error rate");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn p_value_for_rank_beyond_all_calibration() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        let p = cal.p_value(100);
+        // Rank 100 >> max calibration rank 3, so p-value should be very small.
+        assert!((0.0..=1.0).contains(&p));
+        assert!(p < 0.5);
+    }
+
+    #[test]
+    fn single_element_calibration_works() {
+        let cal = ConformalSearchCalibration::calibrate(&[5]).expect("calibrate");
+        assert_eq!(cal.len(), 1);
+        assert!(!cal.is_empty());
+        assert_eq!(cal.required_k(0.1), 5);
+        let (lo, hi) = cal.rank_prediction_interval(0.1);
+        assert_eq!(lo, 5);
+        assert_eq!(hi, 5);
+    }
+
+    #[test]
+    fn mondrian_rejects_empty_examples() {
+        let err = MondrianConformalCalibration::calibrate(&[], 3)
+            .expect_err("must reject empty examples");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn mondrian_rejects_zero_rank_in_examples() {
+        let err = MondrianConformalCalibration::calibrate(&[("query".to_owned(), 0)], 1)
+            .expect_err("must reject zero rank");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn adaptive_update_decreases_alpha_when_error_below_target() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 5, 8]).expect("calibrate");
+        let mut state = AdaptiveConformalState::new(0.3, 0.5).expect("state");
+        let update = state.update(0.05, &cal).expect("update");
+        assert!(update.alpha_after < update.alpha_before);
+    }
 }

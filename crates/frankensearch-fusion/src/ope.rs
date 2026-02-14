@@ -522,4 +522,85 @@ mod tests {
         assert!((decoded.estimated_reward - 0.42).abs() < f64::EPSILON);
         assert!(decoded.reliable);
     }
+
+    #[test]
+    fn ips_single_observation_reward_one() {
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: 1.0,
+            logging_propensity: 0.5,
+        }];
+        let target_p = vec![0.5];
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!((result.estimated_reward - 1.0).abs() < 1e-10);
+        assert_eq!(result.n_observations, 1);
+    }
+
+    #[test]
+    fn ips_all_zero_rewards() {
+        let obs: Vec<LoggedObservation> = (0..10)
+            .map(|i| LoggedObservation {
+                query: format!("q-{i}"),
+                doc_id: format!("d-{i}"),
+                rank: i,
+                reward: 0.0,
+                logging_propensity: 0.5,
+            })
+            .collect();
+        let target_p = vec![0.5; 10];
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!(result.estimated_reward.abs() < 1e-10);
+    }
+
+    #[test]
+    fn ips_all_one_rewards() {
+        let obs: Vec<LoggedObservation> = (0..10)
+            .map(|i| LoggedObservation {
+                query: format!("q-{i}"),
+                doc_id: format!("d-{i}"),
+                rank: i,
+                reward: 1.0,
+                logging_propensity: 0.5,
+            })
+            .collect();
+        let target_p = vec![0.5; 10];
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!((result.estimated_reward - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ess_all_zero_weights() {
+        let weights = vec![0.0; 10];
+        let ess = effective_sample_size(&weights);
+        assert!(ess.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dr_zero_predictions_degrades_to_ips_like() {
+        let obs = make_observations(20);
+        let target_p = vec![0.5; 20];
+        let predictions = vec![0.0; 20];
+        let config = OpeConfig::default();
+
+        let ips = ips_estimate(&obs, &target_p, &config);
+        let dr = dr_estimate(&obs, &target_p, &predictions, &config);
+
+        // With zero predictions and weight=1, DR = (1/N) * sum(0 + 1*(reward - 0)) = IPS.
+        assert!((dr.estimated_reward - ips.estimated_reward).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ips_ci_is_non_negative() {
+        let obs = make_observations(50);
+        let target_p = vec![0.5; 50];
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!(result.confidence_interval_95 >= 0.0);
+        assert!(result.confidence_interval_95.is_finite());
+    }
 }

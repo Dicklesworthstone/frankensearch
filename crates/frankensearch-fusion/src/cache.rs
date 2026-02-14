@@ -829,4 +829,71 @@ mod tests {
         assert!(rt.quality_embedder.is_none());
         assert!(rt.quality_dimension.is_none());
     }
+
+    #[test]
+    fn sentinel_detector_expected_hash_but_sentinel_has_no_hash() {
+        // Expected hash set, but sentinel lacks source_hash -> should be fresh
+        // because the hash comparison only triggers when BOTH are present.
+        let dir = temp_dir("stale-hash-missing-sentinel");
+        write_fast_index(&dir, &sample_records());
+        // Sentinel with no source_hash (default from sample_sentinel)
+        sample_sentinel(3).write_to(&dir).expect("write sentinel");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let detector = SentinelFileDetector::new().with_expected_hash("sha256:anything");
+        let report = detector.check(&dir, &index).expect("check");
+        // No sentinel hash to compare against, so not stale from hash mismatch.
+        assert!(!report.is_stale);
+    }
+
+    #[test]
+    fn sentinel_detector_count_mismatch_takes_priority_over_hash() {
+        // When sentinel count differs from index, it triggers before hash check.
+        let dir = temp_dir("stale-count-before-hash");
+        write_fast_index(&dir, &sample_records());
+        let sentinel = IndexSentinel {
+            source_hash: Some("sha256:old".to_owned()),
+            ..sample_sentinel(999) // Mismatched count
+        };
+        sentinel.write_to(&dir).expect("write sentinel");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let detector = SentinelFileDetector::new().with_expected_hash("sha256:new");
+        let report = detector.check(&dir, &index).expect("check");
+        assert!(report.is_stale);
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("document count mismatch")
+        );
+    }
+
+    #[test]
+    fn staleness_fresh_has_no_estimated_source_count() {
+        let report = IndexStaleness::fresh(10);
+        assert!(report.estimated_source_count.is_none());
+    }
+
+    #[test]
+    fn staleness_serde_roundtrip() {
+        let report = IndexStaleness::stale(42, "content changed");
+        let json = serde_json::to_string(&report).expect("serialize");
+        let rt: IndexStaleness = serde_json::from_str(&json).expect("deserialize");
+        assert!(rt.is_stale);
+        assert_eq!(rt.index_record_count, 42);
+        assert_eq!(rt.reason.as_deref(), Some("content changed"));
+    }
+
+    #[test]
+    fn sentinel_zero_source_count_roundtrips() {
+        let dir = temp_dir("sentinel-zero-count");
+        let sentinel = sample_sentinel(0);
+        sentinel.write_to(&dir).expect("write");
+        let read = IndexSentinel::read_from(&dir)
+            .expect("read")
+            .expect("exists");
+        assert_eq!(read.source_count, 0);
+    }
 }

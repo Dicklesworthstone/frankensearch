@@ -364,4 +364,68 @@ mod tests {
         let refined = vec![hit("b", 0.9, 1)];
         assert!(kendall_tau(&initial, &refined).is_none());
     }
+
+    #[test]
+    fn blend_both_empty_returns_empty() {
+        let blended = blend_two_tier(&[], &[], 0.7);
+        assert!(blended.is_empty());
+    }
+
+    #[test]
+    fn blend_fast_only_returns_results() {
+        let fast = vec![hit("a", 1.0, 0), hit("b", 0.5, 1)];
+        let blended = blend_two_tier(&fast, &[], 0.7);
+        assert_eq!(blended.len(), 2);
+        assert!(blended.iter().all(|h| h.score.is_finite()));
+    }
+
+    #[test]
+    fn blend_quality_only_returns_results() {
+        let quality = vec![hit("a", 1.0, 0), hit("b", 0.5, 1)];
+        let blended = blend_two_tier(&[], &quality, 0.7);
+        assert_eq!(blended.len(), 2);
+        assert!(blended.iter().all(|h| h.score.is_finite()));
+    }
+
+    #[test]
+    fn blend_factor_half_weights_equally() {
+        let fast = vec![hit("a", 10.0, 0), hit("b", 0.0, 1)];
+        let quality = vec![hit("a", 0.0, 0), hit("b", 10.0, 1)];
+        let blended = blend_two_tier(&fast, &quality, 0.5);
+        let a_score = score_for("a", &blended);
+        let b_score = score_for("b", &blended);
+        assert!(
+            (a_score - b_score).abs() <= EPSILON,
+            "symmetric blend should produce equal scores: a={a_score}, b={b_score}"
+        );
+    }
+
+    #[test]
+    fn non_finite_blend_factor_falls_back_to_default() {
+        let fast = vec![hit("a", 1.0, 0)];
+        let quality = vec![hit("a", 1.0, 0)];
+        let blended_nan = blend_two_tier(&fast, &quality, f32::NAN);
+        let blended_default = blend_two_tier(&fast, &quality, 0.7);
+        assert!(
+            (blended_nan[0].score - blended_default[0].score).abs() <= EPSILON,
+            "NaN blend_factor should fall back to 0.7"
+        );
+    }
+
+    #[test]
+    fn compute_rank_changes_identical_lists_are_all_stable() {
+        let list = vec![hit("a", 1.0, 0), hit("b", 0.9, 1)];
+        let changes = compute_rank_changes(&list, &list);
+        assert_eq!(changes.stable, 2);
+        assert_eq!(changes.promoted, 0);
+        assert_eq!(changes.demoted, 0);
+    }
+
+    #[test]
+    fn compute_rank_changes_empty_lists() {
+        let changes = compute_rank_changes(&[], &[]);
+        assert_eq!(changes.stable, 0);
+        assert_eq!(changes.promoted, 0);
+        assert_eq!(changes.demoted, 0);
+    }
 }

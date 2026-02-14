@@ -224,4 +224,61 @@ mod tests {
         assert!(min_max[0] < min_max[1] && min_max[1] < min_max[2]);
         assert!(z_score[0] < z_score[1] && z_score[1] < z_score[2]);
     }
+
+    #[test]
+    fn min_max_normalize_all_negative_values() {
+        let mut scores = vec![-5.0, -3.0, -1.0];
+        min_max_normalize(&mut scores);
+        assert_approx_slice(&scores, &[0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn z_score_normalize_all_negative_values_preserves_order() {
+        let mut scores = vec![-10.0, -5.0, -1.0];
+        z_score_normalize(&mut scores);
+        assert!(scores.iter().all(|s| (0.0..=1.0).contains(s)));
+        assert!(scores[0] < scores[1] && scores[1] < scores[2]);
+    }
+
+    #[test]
+    fn min_max_normalize_single_element() {
+        let mut scores = vec![42.0];
+        min_max_normalize(&mut scores);
+        assert_approx_slice(&scores, &[0.5]);
+    }
+
+    #[test]
+    fn z_score_normalize_single_element() {
+        let mut scores = vec![42.0];
+        z_score_normalize(&mut scores);
+        assert_approx_slice(&scores, &[0.5]);
+    }
+
+    #[test]
+    fn min_max_normalize_empty_is_noop() {
+        let mut scores: Vec<f32> = vec![];
+        min_max_normalize(&mut scores);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn z_score_normalize_empty_is_noop() {
+        let mut scores: Vec<f32> = vec![];
+        z_score_normalize(&mut scores);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn min_max_normalize_all_nan_maps_to_zero() {
+        let mut scores = vec![f32::NAN, f32::NAN, f32::NAN];
+        min_max_normalize(&mut scores);
+        assert!(scores.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn z_score_normalize_all_nan_maps_to_zero() {
+        let mut scores = vec![f32::NAN, f32::NAN, f32::NAN];
+        z_score_normalize(&mut scores);
+        assert!(scores.iter().all(|s| *s == 0.0));
+    }
 }

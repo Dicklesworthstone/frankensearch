@@ -819,4 +819,110 @@ mod tests {
         assert_eq!(outcome, JobOutcome::Succeeded);
         assert_eq!(queue.pending_count(), 1);
     }
+
+    #[test]
+    fn zero_capacity_queue_immediately_full() {
+        let queue = make_queue(0);
+        let err = queue
+            .submit(request("doc-1", "Any text"))
+            .expect_err("should be full");
+        assert!(matches!(
+            err,
+            SearchError::QueueFull {
+                pending: 0,
+                capacity: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn metadata_preserved_through_pipeline() {
+        let queue = make_queue(10);
+        let mut req = request("doc-1", "Some real content");
+        req.metadata = Some(serde_json::json!({"source": "test", "page": 42}));
+        queue.submit(req).unwrap();
+
+        let batch = queue.drain_batch();
+        let meta = batch[0].metadata.as_ref().expect("metadata should exist");
+        assert_eq!(meta["source"], "test");
+        assert_eq!(meta["page"], 42);
+    }
+
+    #[test]
+    fn requeue_at_boundary_succeeds_then_fails() {
+        let queue = EmbeddingQueue::new(
+            EmbeddingQueueConfig {
+                capacity: 100,
+                batch_size: 32,
+                max_retries: 2,
+            },
+            Box::new(DefaultCanonicalizer::default()),
+        );
+        queue.submit(request("doc-1", "Text")).unwrap();
+        let mut job = queue.drain_batch().into_iter().next().unwrap();
+        assert_eq!(job.retry_count, 0);
+
+        // First requeue: retry_count becomes 1 (< max_retries=2)
+        let outcome = queue.requeue(job);
+        assert_eq!(outcome, JobOutcome::Retryable);
+
+        job = queue.drain_batch().into_iter().next().unwrap();
+        assert_eq!(job.retry_count, 1);
+
+        // Second requeue: retry_count becomes 2 (== max_retries=2)
+        let outcome = queue.requeue(job);
+        assert_eq!(outcome, JobOutcome::Retryable);
+
+        job = queue.drain_batch().into_iter().next().unwrap();
+        assert_eq!(job.retry_count, 2);
+
+        // Third requeue: retry_count becomes 3 (> max_retries=2) -> Failed
+        let outcome = queue.requeue(job);
+        assert_eq!(outcome, JobOutcome::Failed);
+    }
+
+    #[test]
+    fn drain_empty_twice_is_stable() {
+        let queue = make_queue(10);
+        let b1 = queue.drain_batch();
+        let b2 = queue.drain_batch();
+        assert!(b1.is_empty());
+        assert!(b2.is_empty());
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn pending_count_and_is_empty_are_consistent() {
+        let queue = make_queue(10);
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_count(), 0);
+
+        queue.submit(request("doc-1", "Content")).unwrap();
+        assert!(!queue.is_empty());
+        assert_eq!(queue.pending_count(), 1);
+
+        let _ = queue.drain_batch();
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn metrics_track_retries_and_failures() {
+        let queue = make_queue(10);
+        queue.submit(request("doc-1", "Text")).unwrap();
+        let job = queue.drain_batch().into_iter().next().unwrap();
+
+        // Requeue -> Retryable
+        let outcome = queue.requeue(job);
+        assert_eq!(outcome, JobOutcome::Retryable);
+        assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 1);
+
+        // Drain and exceed max retries
+        let mut job = queue.drain_batch().into_iter().next().unwrap();
+        job.retry_count = 3; // at max
+        let outcome = queue.requeue(job);
+        assert_eq!(outcome, JobOutcome::Failed);
+        assert_eq!(queue.metrics().total_failed.load(Ordering::Relaxed), 1);
+    }
 }
