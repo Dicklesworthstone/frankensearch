@@ -32,7 +32,10 @@ impl CommitRange {
     /// Number of commits covered by this range.
     #[must_use]
     pub const fn len(&self) -> u64 {
-        self.high.saturating_sub(self.low) + 1
+        if self.high < self.low {
+            return 0;
+        }
+        self.high - self.low + 1
     }
 
     /// Whether the range is empty (high < low after wrapping / invalid state).
@@ -587,7 +590,7 @@ fn check_repair_descriptors(m: &GenerationManifest, f: &mut Vec<ValidationFindin
                 ),
             });
         }
-        if rd.overhead_ratio < 0.0 || rd.overhead_ratio > 10.0 {
+        if rd.overhead_ratio.is_nan() || rd.overhead_ratio < 0.0 || rd.overhead_ratio > 10.0 {
             f.push(ValidationFinding {
                 check: "repair_descriptor_overhead",
                 severity: FindingSeverity::Warning,

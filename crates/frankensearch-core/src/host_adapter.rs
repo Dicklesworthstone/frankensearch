@@ -6,6 +6,7 @@
 //! - Shared conformance validators for schema-version and redaction compliance.
 //! - A harness that runs fixture-based contract checks with actionable diagnostics.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,123 @@ pub struct AdapterIdentity {
     pub telemetry_schema_version: u8,
     /// Redaction policy version enforced by this adapter.
     pub redaction_policy_version: String,
+}
+
+/// Canonical host-project attribution result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProjectAttribution {
+    /// Canonical project key or `unknown` when unresolved.
+    pub resolved_project_key: String,
+    /// Confidence score in `[0, 100]`.
+    pub confidence_score: u8,
+    /// Machine-stable reason code for diagnostics.
+    pub reason_code: String,
+    /// Whether multiple conflicting project candidates were observed.
+    pub collision: bool,
+}
+
+impl HostProjectAttribution {
+    #[must_use]
+    pub fn unknown(reason_code: impl Into<String>) -> Self {
+        Self {
+            resolved_project_key: "unknown".to_owned(),
+            confidence_score: 20,
+            reason_code: reason_code.into(),
+            collision: false,
+        }
+    }
+}
+
+/// Resolve canonical host-project attribution from adapter identity + telemetry hints.
+///
+/// The algorithm is deterministic with source-precedence tie breaks:
+/// adapter identity > telemetry project key > host name hint.
+#[must_use]
+pub fn resolve_host_project_attribution(
+    identity_host_project: Option<&str>,
+    telemetry_project_key: Option<&str>,
+    host_name_hint: Option<&str>,
+) -> HostProjectAttribution {
+    #[derive(Debug, Clone, Copy)]
+    struct Candidate {
+        project: &'static str,
+        weight: u8,
+        reason: &'static str,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    if let Some(hint) = identity_host_project {
+        for project in canonical_projects_from_hint(hint) {
+            candidates.push(Candidate {
+                project,
+                weight: 4,
+                reason: "adapter_identity",
+            });
+        }
+    }
+
+    if let Some(hint) = telemetry_project_key {
+        for project in canonical_projects_from_hint(hint) {
+            candidates.push(Candidate {
+                project,
+                weight: 3,
+                reason: "telemetry_project_key",
+            });
+        }
+    }
+
+    if let Some(hint) = host_name_hint {
+        for project in canonical_projects_from_hint(hint) {
+            candidates.push(Candidate {
+                project,
+                weight: 1,
+                reason: "host_name",
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return HostProjectAttribution::unknown("attribution.unknown");
+    }
+
+    let unique_projects: BTreeSet<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.project)
+        .collect();
+    let collision = unique_projects.len() > 1;
+
+    let Some(winner) = candidates.into_iter().max_by(|left, right| {
+        left.weight
+            .cmp(&right.weight)
+            .then_with(|| right.project.cmp(left.project))
+            .then_with(|| right.reason.cmp(left.reason))
+    }) else {
+        return HostProjectAttribution::unknown("attribution.unknown");
+    };
+
+    let mut confidence_score: u8 = match winner.weight {
+        4 => 95,
+        3 => 85,
+        1 => 60,
+        _ => 50,
+    };
+    if collision {
+        confidence_score = confidence_score.saturating_sub(25);
+    }
+
+    let reason_code = if collision {
+        "attribution.collision".to_owned()
+    } else {
+        format!("attribution.{}", winner.reason)
+    };
+
+    HostProjectAttribution {
+        resolved_project_key: winner.project.to_owned(),
+        confidence_score,
+        reason_code,
+        collision,
+    }
 }
 
 /// Lifecycle hooks exposed to host adapters.
@@ -532,9 +650,22 @@ fn is_valid_ulid(candidate: &str) -> bool {
     if candidate.len() != 26 {
         return false;
     }
-    candidate
-        .bytes()
-        .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'))
+    candidate.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'0'..=b'9'
+                | b'A'..=b'H'
+                | b'J'..=b'K'
+                | b'M'..=b'N'
+                | b'P'..=b'T'
+                | b'V'..=b'Z'
+                | b'a'..=b'h'
+                | b'j'..=b'k'
+                | b'm'..=b'n'
+                | b'p'..=b't'
+                | b'v'..=b'z'
+        )
+    })
 }
 
 fn violation(code: &str, field: &str, message: &str) -> ConformanceViolation {
@@ -551,6 +682,74 @@ fn adapter_error_violation(context: &str, error: &SearchError) -> ConformanceVio
         field: context.to_owned(),
         message: error.to_string(),
     }
+}
+
+fn canonical_projects_from_hint(hint: &str) -> Vec<&'static str> {
+    const CANONICAL_ALIASES: &[(&str, &[&str])] = &[
+        (
+            "coding_agent_session_search",
+            &[
+                "coding_agent_session_search",
+                "codingagentsessionsearch",
+                "cass",
+            ],
+        ),
+        ("xf", &["xf"]),
+        (
+            "mcp_agent_mail_rust",
+            &[
+                "mcp_agent_mail_rust",
+                "mcpagentmailrust",
+                "mcpagentmail",
+                "agent_mail",
+                "agentmail",
+                "amail",
+            ],
+        ),
+        ("frankenterm", &["frankenterm"]),
+    ];
+
+    let normalized = normalize_project_hint(hint);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let tokens: BTreeSet<&str> = normalized
+        .split('_')
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    let mut matches = Vec::new();
+    for (canonical, aliases) in CANONICAL_ALIASES {
+        if aliases
+            .iter()
+            .any(|alias| normalized == *alias || tokens.contains(alias))
+        {
+            matches.push(*canonical);
+        }
+    }
+
+    matches.sort_unstable();
+    matches.dedup();
+    matches
+}
+
+fn normalize_project_hint(hint: &str) -> String {
+    let mut normalized = String::with_capacity(hint.len());
+    let mut pending_separator = false;
+
+    for ch in hint.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+
+    normalized
 }
 
 #[cfg(test)]
@@ -698,5 +897,50 @@ mod tests {
                 .iter()
                 .any(|violation| violation.code == "adapter.hook.error")
         );
+    }
+
+    #[test]
+    fn host_project_attribution_prefers_adapter_identity_hint() {
+        let attribution = resolve_host_project_attribution(
+            Some("mcp_agent_mail_rust"),
+            Some("agent-mail"),
+            Some("mail-host-01"),
+        );
+        assert_eq!(attribution.resolved_project_key, "mcp_agent_mail_rust");
+        assert_eq!(attribution.reason_code, "attribution.adapter_identity");
+        assert!(!attribution.collision);
+        assert!(attribution.confidence_score >= 90);
+    }
+
+    #[test]
+    fn host_project_attribution_falls_back_to_unknown_bucket() {
+        let attribution =
+            resolve_host_project_attribution(None, Some("custom-app"), Some("odd-host-name"));
+        assert_eq!(attribution.resolved_project_key, "unknown");
+        assert_eq!(attribution.reason_code, "attribution.unknown");
+        assert_eq!(attribution.confidence_score, 20);
+        assert!(!attribution.collision);
+    }
+
+    #[test]
+    fn host_project_attribution_flags_collisions() {
+        let attribution =
+            resolve_host_project_attribution(Some("cass"), Some("xf"), Some("mixed-host"));
+        assert_eq!(
+            attribution.resolved_project_key,
+            "coding_agent_session_search"
+        );
+        assert_eq!(attribution.reason_code, "attribution.collision");
+        assert!(attribution.collision);
+        assert!(attribution.confidence_score < 95);
+    }
+
+    #[test]
+    fn host_project_attribution_uses_host_name_hint_when_needed() {
+        let attribution =
+            resolve_host_project_attribution(None, None, Some("frankenterm-prod-runner"));
+        assert_eq!(attribution.resolved_project_key, "frankenterm");
+        assert_eq!(attribution.reason_code, "attribution.host_name");
+        assert!(!attribution.collision);
     }
 }

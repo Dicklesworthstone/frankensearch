@@ -261,8 +261,9 @@ impl GenerationHistory {
         }
 
         // Count-based pruning (remove oldest first).
-        while retained.len() > self.policy.max_retained {
-            retained.remove(0);
+        if retained.len() > self.policy.max_retained {
+            let excess = retained.len() - self.policy.max_retained;
+            retained.drain(..excess);
         }
     }
 }

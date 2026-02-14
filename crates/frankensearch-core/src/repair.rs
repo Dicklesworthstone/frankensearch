@@ -306,13 +306,11 @@ impl RepairOrchestrator {
         let log = self
             .corruption_log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let history = self
             .repair_history
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unrepaired_artifacts(&log, &history).len()
     }
 
@@ -511,17 +509,17 @@ impl RepairOrchestrator {
 
     /// Unique artifact paths that have corruption events but no successful repair.
     fn corrupted_artifact_paths(&self) -> Vec<String> {
-        let log = self
-            .corruption_log
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let history = self
-            .repair_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let unrepaired = unrepaired_artifacts(&log, &history);
+        let unrepaired = {
+            let log = self
+                .corruption_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let history = self
+                .repair_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unrepaired_artifacts(&log, &history)
+        };
         let mut paths: Vec<String> = unrepaired.into_iter().collect();
         paths.sort();
         paths

@@ -7,8 +7,9 @@
 //! - **Recall@K**: Fraction of relevant documents retrieved in top-K
 
 #[inline]
-fn usize_to_f64(value: usize) -> f64 {
-    u32::try_from(value).map_or_else(|_| f64::from(u32::MAX), f64::from)
+#[allow(clippy::cast_precision_loss)]
+const fn usize_to_f64(value: usize) -> f64 {
+    value as f64
 }
 
 /// Normalized Discounted Cumulative Gain at K.

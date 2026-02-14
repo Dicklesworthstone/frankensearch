@@ -356,7 +356,11 @@ fn emit_info_event(event: &DistributedEvent) {
             recovered_at, degraded_duration_ms,
             "exited read-degraded mode"
         ),
-        _ => {}
+        // Variants dispatched to other severity handlers.
+        DistributedEvent::GenerationActivationFailed { .. }
+        | DistributedEvent::ArtifactRepairStarted { .. }
+        | DistributedEvent::ArtifactRepairFailed { .. }
+        | DistributedEvent::ReadDegradedModeEntered { .. } => {}
     }
 }
 
@@ -396,7 +400,13 @@ fn emit_warn_event(event: &DistributedEvent) {
             entered_at, reason = ?reason, unrepaired_count,
             "entered read-degraded mode"
         ),
-        _ => {}
+        // Variants dispatched to other severity handlers.
+        DistributedEvent::GenerationBuildStarted { .. }
+        | DistributedEvent::GenerationBuildCompleted { .. }
+        | DistributedEvent::GenerationActivationSucceeded { .. }
+        | DistributedEvent::ArtifactRepairStarted { .. }
+        | DistributedEvent::ArtifactRepairCompleted { .. }
+        | DistributedEvent::ReadDegradedModeExited { .. } => {}
     }
 }
 
