@@ -283,8 +283,7 @@ impl TDigest {
 
             if current.weight + c.weight <= limit {
                 let new_weight = current.weight + c.weight;
-                current.mean =
-                    (current.mean * current.weight + c.mean * c.weight) / new_weight;
+                current.mean = (current.mean * current.weight + c.mean * c.weight) / new_weight;
                 current.weight = new_weight;
             } else {
                 weight_so_far += current.weight;
@@ -581,7 +580,8 @@ impl HyperLogLog {
         let hash = self.hash_value(value);
         let index = (hash >> (64 - self.precision)) as usize;
         let w = hash << self.precision;
-        let rho = w.leading_zeros() as u8 + 1;
+        let max_rank = 64_u8 - self.precision + 1;
+        let rho = (w.leading_zeros() as u8 + 1).min(max_rank);
         self.registers[index] = self.registers[index].max(rho);
     }
 
@@ -607,10 +607,14 @@ impl HyperLogLog {
             }
         }
 
-        // Large-range correction (hash collision)
-        let two_32 = (1u64 << 32) as f64;
-        if raw_estimate > two_32 / 30.0 {
-            return (-two_32 * (1.0 - raw_estimate / two_32).ln()) as u64;
+        // Large-range correction (hash collision) for 64-bit hashes.
+        let two_64 = (1_u128 << 64) as f64;
+        if raw_estimate > two_64 / 30.0 {
+            let ratio = raw_estimate / two_64;
+            if ratio >= 1.0 {
+                return u64::MAX;
+            }
+            return (-two_64 * (1.0 - ratio).ln()) as u64;
         }
 
         raw_estimate as u64
@@ -910,22 +914,13 @@ mod tests {
         }
 
         let p50 = td.p50().unwrap();
-        assert!(
-            (p50 - 500.0).abs() < 15.0,
-            "p50 should be ~500, got {p50}"
-        );
+        assert!((p50 - 500.0).abs() < 15.0, "p50 should be ~500, got {p50}");
 
         let p90 = td.p90().unwrap();
-        assert!(
-            (p90 - 900.0).abs() < 30.0,
-            "p90 should be ~900, got {p90}"
-        );
+        assert!((p90 - 900.0).abs() < 30.0, "p90 should be ~900, got {p90}");
 
         let p99 = td.p99().unwrap();
-        assert!(
-            (p99 - 990.0).abs() < 20.0,
-            "p99 should be ~990, got {p99}"
-        );
+        assert!((p99 - 990.0).abs() < 20.0, "p99 should be ~990, got {p99}");
 
         assert_eq!(td.min(), Some(1.0));
         assert_eq!(td.max(), Some(1000.0));
@@ -1248,10 +1243,7 @@ mod tests {
         );
 
         let p90 = rm.p90().unwrap();
-        assert!(
-            (p90 - 90.0).abs() < 10.0,
-            "p90 should be ~90, got {p90}"
-        );
+        assert!((p90 - 90.0).abs() < 10.0, "p90 should be ~90, got {p90}");
 
         assert_eq!(rm.min(), Some(1.0));
         assert_eq!(rm.max(), Some(100.0));
@@ -1344,10 +1336,7 @@ mod tests {
             rm.insert(i as f64);
         }
         let q75 = rm.quantile(0.75).unwrap();
-        assert!(
-            (q75 - 750.0).abs() < 30.0,
-            "p75 should be ~750, got {q75}"
-        );
+        assert!((q75 - 750.0).abs() < 30.0, "p75 should be ~750, got {q75}");
     }
 
     // ---- Performance sanity ----

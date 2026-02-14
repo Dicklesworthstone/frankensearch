@@ -139,6 +139,35 @@ impl TwoTierConfig {
         self
     }
 
+    /// Load optimized parameters from `data/optimized_params.toml` at the workspace root.
+    ///
+    /// Falls back to `Default::default()` if the file does not exist or cannot be parsed.
+    /// The TOML file uses flat keys matching the field names of `TwoTierConfig`.
+    #[must_use]
+    pub fn optimized() -> Self {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root = std::path::Path::new(manifest_dir)
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| std::path::Path::new(manifest_dir));
+        let path = workspace_root.join("data").join("optimized_params.toml");
+
+        std::fs::read_to_string(&path).map_or_else(
+            |_| Self::default(),
+            |contents| match toml::from_str::<Self>(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to parse optimized params, using defaults"
+                    );
+                    Self::default()
+                }
+            },
+        )
+    }
+
     /// Attach a telemetry exporter.
     #[must_use]
     pub fn with_metrics_exporter(mut self, exporter: Arc<dyn MetricsExporter>) -> Self {

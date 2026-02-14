@@ -113,6 +113,17 @@ pub enum SearchError {
         budget_ms: u64,
     },
 
+    /// Federated search did not receive enough successful shard responses.
+    #[error(
+        "Federated search required at least {required} index responses, but only {received} succeeded."
+    )]
+    FederatedInsufficientResponses {
+        /// Minimum responses required by config.
+        required: usize,
+        /// Number of successful shard responses observed.
+        received: usize,
+    },
+
     // === Reranker errors ===
     /// The reranking model is not available.
     #[error(
@@ -243,6 +254,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("256"));
         assert!(msg.contains("384"));
+    }
+
+    #[test]
+    fn federated_insufficient_responses_message_has_counts() {
+        let err = SearchError::FederatedInsufficientResponses {
+            required: 2,
+            received: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains('2'));
+        assert!(msg.contains('1'));
     }
 
     #[test]

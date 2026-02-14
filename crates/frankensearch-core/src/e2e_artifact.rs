@@ -1,0 +1,552 @@
+//! Unified E2E artifact schema types (bd-2hz.10.11.1).
+//!
+//! Defines the canonical envelope and body types for all e2e test artifacts:
+//! manifest, events, oracle reports, replay recordings, and snapshot diffs.
+//! All types are `Serialize`/`Deserialize` for JSON/JSONL emission.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Schema version for the e2e artifact envelope.
+pub const E2E_SCHEMA_VERSION: u32 = 1;
+
+// ─── Envelope ────────────────────────────────────────────────────────────────
+
+/// Top-level envelope wrapping every e2e artifact (JSON object or JSONL line).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct E2eEnvelope<B> {
+    /// Schema version (currently 1).
+    pub v: u32,
+    /// Artifact type discriminant (e.g. `e2e-manifest-v1`).
+    pub schema: String,
+    /// Unique run identifier (ULID, 26-char Crockford base32).
+    pub run_id: String,
+    /// RFC 3339 timestamp of artifact creation.
+    pub ts: String,
+    /// Type-specific body payload.
+    pub body: B,
+}
+
+impl<B> E2eEnvelope<B> {
+    pub fn new(schema: &str, run_id: &str, ts: &str, body: B) -> Self {
+        Self {
+            v: E2E_SCHEMA_VERSION,
+            schema: schema.to_owned(),
+            run_id: run_id.to_owned(),
+            ts: ts.to_owned(),
+            body,
+        }
+    }
+}
+
+// ─── Manifest ────────────────────────────────────────────────────────────────
+
+/// Body of the `e2e-manifest-v1` artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestBody {
+    pub suite: Suite,
+    pub determinism_tier: DeterminismTier,
+    pub seed: u64,
+    pub config_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_version: Option<String>,
+    pub model_versions: Vec<ModelVersion>,
+    pub platform: Platform,
+    pub clock_mode: ClockMode,
+    pub tie_break_policy: String,
+    pub artifacts: Vec<ArtifactEntry>,
+    pub duration_ms: u64,
+    pub exit_status: ExitStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Suite {
+    Core,
+    Fsfs,
+    Ops,
+    Interaction,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeterminismTier {
+    BitExact,
+    Semantic,
+    Statistical,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockMode {
+    Simulated,
+    Frozen,
+    Realtime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStatus {
+    Pass,
+    Fail,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelVersion {
+    pub name: String,
+    pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Platform {
+    pub os: String,
+    pub arch: String,
+    pub rustc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactEntry {
+    pub file: String,
+    pub checksum: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<u64>,
+}
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+/// Body of the `e2e-event-v1` artifact (one per JSONL line).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventBody {
+    #[serde(rename = "type")]
+    pub event_type: E2eEventType,
+    pub correlation: Correlation,
+    pub severity: E2eSeverity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<E2eOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<BTreeMap<String, f64>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum E2eEventType {
+    E2eStart,
+    E2eEnd,
+    LaneStart,
+    LaneEnd,
+    OracleCheck,
+    PhaseTransition,
+    Assertion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum E2eSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum E2eOutcome {
+    Pass,
+    Fail,
+    Skip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Correlation {
+    pub event_id: String,
+    pub root_request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+}
+
+// ─── Oracle Report ───────────────────────────────────────────────────────────
+
+/// Body of the `e2e-oracle-report-v1` artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OracleReportBody {
+    pub lanes: Vec<LaneReport>,
+    pub totals: ReportTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaneReport {
+    pub lane_id: String,
+    pub seed: u64,
+    pub query_count: u32,
+    pub verdicts: Vec<OracleVerdictRecord>,
+    pub pass_count: u32,
+    pub fail_count: u32,
+    pub skip_count: u32,
+    pub all_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OracleVerdictRecord {
+    pub oracle_id: String,
+    pub outcome: E2eOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportTotals {
+    pub lanes_run: u32,
+    pub lanes_passed: u32,
+    pub oracles_pass: u32,
+    pub oracles_fail: u32,
+    pub oracles_skip: u32,
+    pub all_passed: bool,
+}
+
+// ─── Replay ──────────────────────────────────────────────────────────────────
+
+/// Body of the `e2e-replay-v1` artifact (one per JSONL line).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayBody {
+    #[serde(rename = "type")]
+    pub replay_type: ReplayEventType,
+    pub offset_ms: u64,
+    pub seq: u64,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayEventType {
+    Query,
+    ConfigChange,
+    ClockAdvance,
+    Signal,
+}
+
+// ─── Snapshot Diff ───────────────────────────────────────────────────────────
+
+/// Body of the `e2e-snapshot-diff-v1` artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotDiffBody {
+    pub comparison_mode: DeterminismTier,
+    pub baseline_run_id: String,
+    pub diffs: Vec<DiffEntry>,
+    pub pass: bool,
+    pub mismatch_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffEntry {
+    pub field_path: String,
+    pub baseline: String,
+    pub current: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    pub within_tolerance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<String>,
+}
+
+// ─── Reason Code Constants ───────────────────────────────────────────────────
+
+/// E2e-specific reason code constants.
+pub mod reason_codes {
+    pub const ORACLE_PASS: &str = "e2e.oracle.pass";
+    pub const ORACLE_ORDERING_VIOLATED: &str = "e2e.oracle.ordering_violated";
+    pub const ORACLE_DUPLICATES_FOUND: &str = "e2e.oracle.duplicates_found";
+    pub const ORACLE_PHASE_MISMATCH: &str = "e2e.oracle.phase_mismatch";
+    pub const ORACLE_SCORE_NON_MONOTONIC: &str = "e2e.oracle.score_non_monotonic";
+    pub const ORACLE_SKIP_FEATURE_DISABLED: &str = "e2e.oracle.skip_feature_disabled";
+    pub const ORACLE_SKIP_STUB_BACKEND: &str = "e2e.oracle.skip_stub_backend";
+    pub const RUN_SETUP_FAILED: &str = "e2e.run.setup_failed";
+    pub const RUN_TIMEOUT: &str = "e2e.run.timeout";
+    pub const REPLAY_SEED_MISMATCH: &str = "e2e.replay.seed_mismatch";
+    pub const DIFF_TOLERANCE_EXCEEDED: &str = "e2e.diff.tolerance_exceeded";
+    pub const DIFF_FIELD_MISSING: &str = "e2e.diff.field_missing";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_roundtrip() {
+        let manifest = ManifestBody {
+            suite: Suite::Interaction,
+            determinism_tier: DeterminismTier::BitExact,
+            seed: 42,
+            config_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_owned(),
+            index_version: Some("fsvi-v3".to_owned()),
+            model_versions: vec![ModelVersion {
+                name: "potion-128M".to_owned(),
+                revision: "abc123".to_owned(),
+                digest: None,
+            }],
+            platform: Platform {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                rustc: "nightly-2026-02-01".to_owned(),
+            },
+            clock_mode: ClockMode::Simulated,
+            tie_break_policy: "doc_id_lexical".to_owned(),
+            artifacts: vec![ArtifactEntry {
+                file: "events.jsonl".to_owned(),
+                checksum: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                    .to_owned(),
+                line_count: Some(147),
+            }],
+            duration_ms: 1234,
+            exit_status: ExitStatus::Pass,
+        };
+
+        let envelope = E2eEnvelope::new(
+            "e2e-manifest-v1",
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:00Z",
+            manifest,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let decoded: E2eEnvelope<ManifestBody> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+        assert_eq!(decoded.v, 1);
+        assert_eq!(decoded.schema, "e2e-manifest-v1");
+    }
+
+    #[test]
+    fn event_roundtrip() {
+        let event = EventBody {
+            event_type: E2eEventType::OracleCheck,
+            correlation: Correlation {
+                event_id: "01HQXG5M7QABCDEF12345678AB".to_owned(),
+                root_request_id: "01HQXG5M7P3KZFV9N2RSTW6YAB".to_owned(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: Some("baseline".to_owned()),
+            oracle_id: Some("ORACLE_NO_DUPLICATES".to_owned()),
+            outcome: Some(E2eOutcome::Pass),
+            reason_code: None,
+            context: Some("0 duplicates in 10 results".to_owned()),
+            metrics: None,
+        };
+
+        let envelope = E2eEnvelope::new(
+            "e2e-event-v1",
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:01Z",
+            event,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let decoded: E2eEnvelope<EventBody> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn oracle_report_roundtrip() {
+        let report = OracleReportBody {
+            lanes: vec![LaneReport {
+                lane_id: "baseline".to_owned(),
+                seed: 3_405_643_776,
+                query_count: 5,
+                verdicts: vec![
+                    OracleVerdictRecord {
+                        oracle_id: "ORACLE_NO_DUPLICATES".to_owned(),
+                        outcome: E2eOutcome::Pass,
+                        context: None,
+                    },
+                    OracleVerdictRecord {
+                        oracle_id: "ORACLE_EXPLAIN_PRESENT".to_owned(),
+                        outcome: E2eOutcome::Skip,
+                        context: Some("explain disabled".to_owned()),
+                    },
+                ],
+                pass_count: 1,
+                fail_count: 0,
+                skip_count: 1,
+                all_passed: true,
+            }],
+            totals: ReportTotals {
+                lanes_run: 1,
+                lanes_passed: 1,
+                oracles_pass: 1,
+                oracles_fail: 0,
+                oracles_skip: 1,
+                all_passed: true,
+            },
+        };
+
+        let envelope = E2eEnvelope::new(
+            "e2e-oracle-report-v1",
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:02Z",
+            report,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let decoded: E2eEnvelope<OracleReportBody> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn replay_roundtrip() {
+        let replay = ReplayBody {
+            replay_type: ReplayEventType::Query,
+            offset_ms: 0,
+            seq: 0,
+            payload: serde_json::json!({"query_text": "test", "k": 10}),
+        };
+
+        let envelope = E2eEnvelope::new(
+            "e2e-replay-v1",
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:00Z",
+            replay,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let decoded: E2eEnvelope<ReplayBody> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn snapshot_diff_roundtrip() {
+        let diff = SnapshotDiffBody {
+            comparison_mode: DeterminismTier::Statistical,
+            baseline_run_id: "01HQXG4K6N2JYFV8M1QRSV5XZA".to_owned(),
+            diffs: vec![DiffEntry {
+                field_path: "results[0].score".to_owned(),
+                baseline: "0.8765".to_owned(),
+                current: "0.8764".to_owned(),
+                delta: Some("0.0001".to_owned()),
+                within_tolerance: true,
+                tolerance: Some("0.001".to_owned()),
+            }],
+            pass: true,
+            mismatch_count: 0,
+        };
+
+        let envelope = E2eEnvelope::new(
+            "e2e-snapshot-diff-v1",
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:03Z",
+            diff,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let decoded: E2eEnvelope<SnapshotDiffBody> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn reason_codes_follow_namespace_pattern() {
+        let codes = [
+            reason_codes::ORACLE_PASS,
+            reason_codes::ORACLE_ORDERING_VIOLATED,
+            reason_codes::ORACLE_DUPLICATES_FOUND,
+            reason_codes::ORACLE_PHASE_MISMATCH,
+            reason_codes::ORACLE_SCORE_NON_MONOTONIC,
+            reason_codes::ORACLE_SKIP_FEATURE_DISABLED,
+            reason_codes::ORACLE_SKIP_STUB_BACKEND,
+            reason_codes::RUN_SETUP_FAILED,
+            reason_codes::RUN_TIMEOUT,
+            reason_codes::REPLAY_SEED_MISMATCH,
+            reason_codes::DIFF_TOLERANCE_EXCEEDED,
+            reason_codes::DIFF_FIELD_MISSING,
+        ];
+
+        for code in &codes {
+            let parts: Vec<&str> = code.split('.').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "reason code '{code}' must have exactly 3 dot-separated parts"
+            );
+            assert_eq!(
+                parts[0], "e2e",
+                "reason code '{code}' must start with 'e2e'"
+            );
+        }
+    }
+
+    #[test]
+    fn event_type_serde_matches_schema() {
+        let event = EventBody {
+            event_type: E2eEventType::LaneStart,
+            correlation: Correlation {
+                event_id: "01HQXG5M7QABCDEF12345678AB".to_owned(),
+                root_request_id: "01HQXG5M7P3KZFV9N2RSTW6YAB".to_owned(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: Some("baseline".to_owned()),
+            oracle_id: None,
+            outcome: None,
+            reason_code: None,
+            context: None,
+            metrics: None,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"lane_start\""));
+        assert!(json.contains("\"severity\":\"info\""));
+    }
+
+    #[test]
+    fn optional_fields_omitted_when_none() {
+        let event = EventBody {
+            event_type: E2eEventType::E2eStart,
+            correlation: Correlation {
+                event_id: "01HQXG5M7QABCDEF12345678AB".to_owned(),
+                root_request_id: "01HQXG5M7P3KZFV9N2RSTW6YAB".to_owned(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: None,
+            oracle_id: None,
+            outcome: None,
+            reason_code: None,
+            context: None,
+            metrics: None,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("lane_id"));
+        assert!(!json.contains("oracle_id"));
+        assert!(!json.contains("outcome"));
+        assert!(!json.contains("reason_code"));
+        assert!(!json.contains("context"));
+        assert!(!json.contains("metrics"));
+    }
+
+    #[test]
+    fn exit_status_variants_roundtrip() {
+        for status in [ExitStatus::Pass, ExitStatus::Fail, ExitStatus::Error] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: ExitStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn suite_variants_roundtrip() {
+        for suite in [Suite::Core, Suite::Fsfs, Suite::Ops, Suite::Interaction] {
+            let json = serde_json::to_string(&suite).unwrap();
+            let decoded: Suite = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, suite);
+        }
+    }
+}

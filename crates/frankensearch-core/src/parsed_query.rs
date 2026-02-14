@@ -102,7 +102,12 @@ impl ParsedQuery {
 
             // Check for negation dash: -term
             // Must be preceded by whitespace or be at start of string.
-            if chars[i] == '-' && i + 1 < len && !chars[i + 1].is_whitespace() {
+            if chars[i] == '-'
+                && (i == 0 || chars[i - 1].is_whitespace())
+                && i + 1 < len
+                && chars[i + 1] != '-'
+                && !chars[i + 1].is_whitespace()
+            {
                 i += 1; // skip dash
                 let start = i;
                 while i < len && !chars[i].is_whitespace() {
@@ -273,6 +278,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_dash_inside_word_is_literal() {
+        let q = ParsedQuery::parse("foo-bar baz");
+        assert_eq!(q.positive, "foo-bar baz");
+        assert!(q.negative_terms.is_empty());
+        assert!(!q.has_negations());
+    }
+
+    #[test]
     fn parse_not_without_quote() {
         // "NOT" without a following quote is treated as a regular word.
         let q = ParsedQuery::parse("why NOT this");
@@ -315,6 +328,8 @@ mod tests {
         // A lone dash with nothing after it.
         let q = ParsedQuery::parse("query -");
         assert_eq!(q.positive, "query -");
+        assert!(q.negative_terms.is_empty());
+        assert!(!q.has_negations());
     }
 
     #[test]
@@ -367,12 +382,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_double_dash_is_treated_as_negation() {
-        // Current behavior: `--flag` is parsed as negation of `-flag`.
-        // The first `-` triggers negation, the second `-` is part of the term.
+    fn parse_double_dash_is_treated_as_literal() {
+        // `--flag` is treated as a literal token (CLI-like), not exclusion syntax.
         let q = ParsedQuery::parse("query --flag");
-        assert_eq!(q.positive, "query");
-        assert_eq!(q.negative_terms, vec!["-flag"]);
+        assert_eq!(q.positive, "query --flag");
+        assert!(q.negative_terms.is_empty());
+        assert!(!q.has_negations());
     }
 
     #[test]
