@@ -79,7 +79,7 @@ impl QueryClass {
             let parts: Vec<&str> = s.splitn(2, '-').collect();
             if parts.len() == 2
                 && parts[0].chars().all(|c| c.is_ascii_alphanumeric())
-                && parts[1].chars().all(|c| c.is_ascii_alphanumeric())
+                && parts[1].chars().all(|c| c.is_ascii_digit())
                 && !parts[0].is_empty()
                 && !parts[1].is_empty()
             {
@@ -166,6 +166,19 @@ mod tests {
     fn classify_issue_id() {
         assert_eq!(QueryClass::classify("bd-123"), QueryClass::Identifier);
         assert_eq!(QueryClass::classify("JIRA-456"), QueryClass::Identifier);
+    }
+
+    #[test]
+    fn classify_hyphenated_keywords_as_short_keyword() {
+        assert_eq!(
+            QueryClass::classify("error-handling"),
+            QueryClass::ShortKeyword
+        );
+        assert_eq!(
+            QueryClass::classify("load-balancer"),
+            QueryClass::ShortKeyword
+        );
+        assert_eq!(QueryClass::classify("bd-ab"), QueryClass::ShortKeyword);
     }
 
     #[test]

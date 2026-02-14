@@ -56,11 +56,16 @@ impl DefaultCanonicalizer {
     fn strip_markdown(text: &str) -> String {
         let mut result = String::with_capacity(text.len());
         let mut chars = text.chars().peekable();
+        let mut at_line_start = true;
 
         while let Some(c) = chars.next() {
             match c {
-                '#' => {
-                    // Skip heading markers at start of line
+                '\n' => {
+                    result.push('\n');
+                    at_line_start = true;
+                }
+                '#' if at_line_start => {
+                    // Skip heading markers only at start of line.
                     while chars.peek() == Some(&'#') {
                         chars.next();
                     }
@@ -73,6 +78,7 @@ impl DefaultCanonicalizer {
                     if chars.peek() == Some(&c) {
                         chars.next();
                     }
+                    at_line_start = false;
                 }
                 '[' => {
                     // Convert [text](url) → text
@@ -98,8 +104,17 @@ impl DefaultCanonicalizer {
                         }
                     }
                     result.push_str(&link_text);
+                    if !link_text.is_empty() {
+                        at_line_start = false;
+                    }
                 }
-                _ => result.push(c),
+                ' ' | '\t' if at_line_start => {
+                    result.push(c);
+                }
+                _ => {
+                    result.push(c);
+                    at_line_start = false;
+                }
             }
         }
 
@@ -236,6 +251,17 @@ mod tests {
         let canon = DefaultCanonicalizer::default();
         let input = "## Heading\nText";
         let result = canon.canonicalize(input);
+        assert!(result.contains("Heading"));
+        assert!(!result.contains("##"));
+    }
+
+    #[test]
+    fn strip_markdown_preserves_inline_hash_tokens() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "C# and #hashtag\n## Heading";
+        let result = canon.canonicalize(input);
+        assert!(result.contains("C#"));
+        assert!(result.contains("#hashtag"));
         assert!(result.contains("Heading"));
         assert!(!result.contains("##"));
     }
