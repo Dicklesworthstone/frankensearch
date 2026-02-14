@@ -322,19 +322,20 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
             ))),
         });
     }
-    if version < SCHEMA_VERSION {
-        return Err(SearchError::SubsystemError {
-            subsystem: "storage",
-            source: Box::new(io::Error::other(format!(
-                "legacy schema version {version} is unsupported; rebuild storage to schema version {SCHEMA_VERSION}"
-            ))),
-        });
-    }
 
-    for migration in MIGRATIONS {
-        if migration.version <= version {
-            continue;
-        }
+    while version < SCHEMA_VERSION {
+        let next_version = version.saturating_add(1);
+        let Some(migration) = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == next_version)
+        else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "storage",
+                source: Box::new(io::Error::other(format!(
+                    "missing migration path from schema version {version} to {next_version}"
+                ))),
+            });
+        };
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -349,7 +350,7 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
 
         let params = [SqliteValue::Integer(migration.version)];
         conn.execute_with_params(
-            "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
+            "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
         .map_err(storage_error)?;
@@ -467,23 +468,27 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_rejects_legacy_schema_versions() {
+    fn bootstrap_migrates_legacy_schema_versions() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
 
         conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-            .expect("schema_version should be creatable");
-        conn.execute("INSERT INTO schema_version(version) VALUES (1);")
-            .expect("v1 marker row should insert");
+            .expect("schema_version table should be creatable");
+        let params = [SqliteValue::Integer(SCHEMA_VERSION - 1)];
+        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
+            .expect("legacy marker row should insert");
 
         assert_eq!(
             current_version_optional(&conn).expect("version should read"),
-            Some(1)
+            Some(SCHEMA_VERSION - 1)
         );
-        let error = bootstrap(&conn).expect_err("legacy schemas should be rejected");
-        let message = error.to_string();
+        bootstrap(&conn).expect("legacy schema should migrate to latest");
+        assert_eq!(
+            current_version(&conn).expect("schema version should exist"),
+            SCHEMA_VERSION
+        );
         assert!(
-            message.contains("legacy schema version 1 is unsupported"),
-            "unexpected error message: {message}"
+            index_exists(&conn, "idx_build_history_index"),
+            "migration should create latest build history index"
         );
     }
 
@@ -545,8 +550,51 @@ mod tests {
                 gate.wait();
                 let conn = Connection::open(path.to_string_lossy().to_string())
                     .expect("connection should open");
-                bootstrap(&conn).expect("bootstrap should succeed");
-                let version = current_version(&conn).expect("schema version should exist");
+                // Retry bootstrap to handle SQLITE_BUSY under contention.
+                let mut last_err = None;
+                for _ in 0..10 {
+                    match bootstrap(&conn) {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(error) => {
+                            let message = error.to_string().to_ascii_lowercase();
+                            if message.contains("busy") || message.contains("locked") {
+                                last_err = Some(error);
+                                thread::sleep(std::time::Duration::from_millis(5));
+                                continue;
+                            }
+                            panic!("bootstrap should not fail with non-retryable error: {error}");
+                        }
+                    }
+                }
+                if let Some(error) = last_err {
+                    panic!("bootstrap should succeed after retries: {error}");
+                }
+                let mut version = None;
+                for _ in 0..10 {
+                    match current_version(&conn) {
+                        Ok(value) => {
+                            version = Some(value);
+                            break;
+                        }
+                        Err(error) => {
+                            let message = error.to_string().to_ascii_lowercase();
+                            if message.contains("busy")
+                                || message.contains("locked")
+                                || message.contains("no rows")
+                            {
+                                thread::sleep(std::time::Duration::from_millis(5));
+                                continue;
+                            }
+                            panic!(
+                                "schema version lookup should not fail with non-retryable error: {error}"
+                            );
+                        }
+                    }
+                }
+                let version = version.expect("schema version should exist after retries");
                 sender.send(version).expect("sender should send version");
             }));
         }

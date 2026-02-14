@@ -815,10 +815,14 @@ fn dedup_state_for_doc(
     ];
     let rows = conn
         .query_with_params(
-            "SELECT d.content_hash, e.status \
+            "SELECT d.content_hash, e.status, j.job_id \
              FROM documents d \
              LEFT JOIN embedding_status e \
                ON d.doc_id = e.doc_id AND e.embedder_id = ?2 \
+             LEFT JOIN embedding_jobs j \
+               ON d.doc_id = j.doc_id \
+              AND j.embedder_id = ?2 \
+              AND j.status IN ('pending', 'processing') \
              WHERE d.doc_id = ?1 \
              LIMIT 1;",
             &params,
@@ -841,11 +845,24 @@ fn dedup_state_for_doc(
 
     let raw_status = row_optional_text(row, 1)?;
     let status = raw_status.as_deref().and_then(EmbeddingStatus::from_str);
-    let state = match status {
-        Some(EmbeddingStatus::Embedded | EmbeddingStatus::Pending | EmbeddingStatus::Skipped) => {
-            DedupState::Unchanged
+    let has_active_job = match row.get(2) {
+        Some(SqliteValue::Integer(_)) => true,
+        Some(SqliteValue::Null) | None => false,
+        Some(other) => {
+            return Err(pipeline_error(format!(
+                "unexpected type for dedup active-job flag: {other:?}"
+            )));
         }
-        Some(EmbeddingStatus::Failed) | None => DedupState::New,
+    };
+    let state = if has_active_job {
+        DedupState::Unchanged
+    } else {
+        match status {
+            Some(
+                EmbeddingStatus::Embedded | EmbeddingStatus::Pending | EmbeddingStatus::Skipped,
+            ) => DedupState::Unchanged,
+            Some(EmbeddingStatus::Failed) | None => DedupState::New,
+        }
     };
 
     Ok(DedupCheckResult {
@@ -1202,6 +1219,38 @@ mod tests {
             assert_eq!(depth.pending, 0);
             assert_eq!(depth.processing, 0);
         });
+    }
+
+    #[test]
+    fn ingest_unchanged_document_with_pending_job_is_not_reenqueued() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 3, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let first = runner
+            .ingest(IngestRequest::new("doc-pending", "same content"))
+            .expect("initial ingest should succeed");
+        assert_eq!(first.action, IngestAction::New);
+        assert!(first.fast_job_enqueued);
+
+        let second = runner
+            .ingest(IngestRequest::new("doc-pending", "same content"))
+            .expect("second ingest should succeed");
+        assert_eq!(second.action, IngestAction::Unchanged);
+        assert!(!second.fast_job_enqueued);
+        assert!(!second.quality_job_enqueued);
+
+        let depth = runner
+            .queue
+            .queue_depth()
+            .expect("queue depth should succeed");
+        assert_eq!(depth.pending, 1, "pending job should be deduplicated");
     }
 
     #[test]
@@ -1664,11 +1713,9 @@ mod tests {
             .expect("batch ingest should succeed");
 
         assert_eq!(summary.requested, 3);
-        // The second "doc-a" ingest happens before processing marks status as embedded/pending,
-        // so it is treated as new work for queue reconciliation.
-        assert_eq!(summary.inserted, 2);
+        assert_eq!(summary.inserted, 1);
         assert_eq!(summary.skipped, 1);
-        assert_eq!(summary.unchanged, 0);
+        assert_eq!(summary.unchanged, 1);
     }
 
     #[test]
