@@ -27,7 +27,8 @@ pub use model_cache::{
 pub use model_manifest::{
     ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, MANIFEST_SCHEMA_VERSION, ModelFile,
     ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
-    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, resolve_download_consent, verify_file_sha256,
+    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker, is_verification_cached,
+    resolve_download_consent, verify_dir_cached, verify_file_sha256, write_verification_marker,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,

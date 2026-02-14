@@ -1025,6 +1025,163 @@ pub fn verify_file_sha256(
     Ok(())
 }
 
+// ─── Verification Cache ────────────────────────────────────────────────────
+
+/// Name of the verification marker file within a model directory.
+const VERIFIED_MARKER_FILE: &str = ".verified";
+
+/// Lightweight filesystem fingerprint for one verified model file.
+///
+/// This is intentionally cheap to read and compare:
+/// - file size (bytes)
+/// - last-modified timestamp (unix nanos)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileVerificationState {
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// Last-modified timestamp since unix epoch (nanoseconds).
+    pub modified_unix_nanos: u64,
+}
+
+fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let modified_unix_nanos = u64::try_from(modified).ok()?;
+    Some(FileVerificationState {
+        size_bytes: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+/// Cached verification result stored as a small JSON file alongside model files.
+///
+/// When a model directory passes SHA-256 verification, a `.verified` marker is written
+/// containing the manifest ID, schema version, and lightweight file fingerprints
+/// captured at verification time. Subsequent loads check whether the marker is still
+/// valid (all fingerprints unchanged) and skip re-hashing when it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationMarker {
+    /// Manifest identifier that was verified against.
+    pub manifest_id: String,
+    /// Manifest schema version at time of verification.
+    pub schema_version: u32,
+    /// Unix timestamp (seconds) when verification was performed.
+    pub verified_at: u64,
+    /// Per-file lightweight fingerprint at verification time, keyed by file name.
+    pub file_states: BTreeMap<String, FileVerificationState>,
+}
+
+impl VerificationMarker {
+    /// Create a new marker for a successfully verified model directory.
+    fn new_for(manifest: &ModelManifest, model_dir: &Path) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let mut file_states = BTreeMap::new();
+        for file in &manifest.files {
+            let path = model_dir.join(&file.name);
+            if let Some(state) = capture_file_verification_state(&path) {
+                file_states.insert(file.name.clone(), state);
+            }
+        }
+
+        Self {
+            manifest_id: manifest.id.clone(),
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            verified_at: now,
+            file_states,
+        }
+    }
+
+    /// Check whether this cached marker is still valid for the given manifest and directory.
+    ///
+    /// Returns `true` when:
+    /// 1. The manifest ID matches.
+    /// 2. The schema version matches.
+    /// 3. No model file metadata fingerprint has changed since verification.
+    fn is_valid_for(&self, manifest: &ModelManifest, model_dir: &Path) -> bool {
+        if self.manifest_id != manifest.id || self.schema_version != MANIFEST_SCHEMA_VERSION {
+            return false;
+        }
+
+        for file in &manifest.files {
+            let Some(expected_state) = self.file_states.get(&file.name) else {
+                return false;
+            };
+            let path = model_dir.join(&file.name);
+            let Some(current_state) = capture_file_verification_state(&path) else {
+                return false;
+            };
+            if current_state != *expected_state {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Write a `.verified` marker after successful verification of a model directory.
+///
+/// The marker is best-effort: failures to write are logged but do not propagate errors.
+pub fn write_verification_marker(manifest: &ModelManifest, model_dir: &Path) {
+    let marker = VerificationMarker::new_for(manifest, model_dir);
+    let Ok(json) = serde_json::to_string_pretty(&marker) else {
+        return;
+    };
+    let _ = fs::write(model_dir.join(VERIFIED_MARKER_FILE), json);
+}
+
+/// Check whether a valid verification marker exists for the given manifest and directory.
+///
+/// Returns `true` when a `.verified` file exists, parses correctly, and all file mtimes
+/// match. In that case, the caller can skip full SHA-256 re-verification.
+#[must_use]
+pub fn is_verification_cached(manifest: &ModelManifest, model_dir: &Path) -> bool {
+    let path = model_dir.join(VERIFIED_MARKER_FILE);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<VerificationMarker>(&raw) else {
+        return false;
+    };
+    marker.is_valid_for(manifest, model_dir)
+}
+
+/// Verify a model directory, using cached results when available.
+///
+/// If a valid `.verified` marker exists (matching manifest ID, schema version, and
+/// file mtimes), verification succeeds immediately without re-hashing. Otherwise,
+/// full SHA-256 verification is performed via [`ModelManifest::verify_dir`], and
+/// on success a new marker is written for future loads.
+///
+/// # Errors
+///
+/// Returns `SearchError` when the manifest has verified checksums and full
+/// verification fails (hash mismatch, missing files, etc.).
+pub fn verify_dir_cached(manifest: &ModelManifest, model_dir: &Path) -> SearchResult<()> {
+    if !manifest.has_verified_checksums() {
+        return Ok(());
+    }
+
+    if is_verification_cached(manifest, model_dir) {
+        return Ok(());
+    }
+
+    manifest.verify_dir(model_dir)?;
+    write_verification_marker(manifest, model_dir);
+    Ok(())
+}
+
 fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult<Option<PathBuf>> {
     let destination_parent =
         destination_dir
@@ -2237,5 +2394,154 @@ mod tests {
             ids.contains(&"ms-marco-minilm-l-6-v2"),
             "registry should contain ms-marco reranker, got: {ids:?}"
         );
+    }
+
+    // ─── Verification Cache Tests ──────────────────────────────────────
+
+    fn make_test_manifest(file_name: &str, content: &[u8]) -> ModelManifest {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let sha = to_hex_lowercase(&hasher.finalize());
+        ModelManifest {
+            id: "test-model".to_owned(),
+            repo: "test/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: vec![ModelFile {
+                name: file_name.to_owned(),
+                sha256: sha,
+                size: u64::try_from(content.len()).unwrap(),
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            tier: None,
+            dimension: None,
+            display_name: None,
+            version: String::new(),
+            description: None,
+            download_size_bytes: u64::try_from(content.len()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn verification_marker_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"hello model";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        let marker = VerificationMarker::new_for(&manifest, tmp.path());
+        let json = serde_json::to_string_pretty(&marker).unwrap();
+        let restored: VerificationMarker = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.manifest_id, "test-model");
+        assert_eq!(restored.schema_version, MANIFEST_SCHEMA_VERSION);
+        let state = restored.file_states.get("model.bin").unwrap();
+        assert_eq!(state.size_bytes, u64::try_from(content.len()).unwrap());
+        assert!(state.modified_unix_nanos > 0);
+    }
+
+    #[test]
+    fn verification_cache_hit_when_files_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        assert!(!is_verification_cached(&manifest, tmp.path()));
+        write_verification_marker(&manifest, tmp.path());
+        assert!(is_verification_cached(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn verification_cache_miss_when_manifest_id_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        write_verification_marker(&manifest, tmp.path());
+        let mut changed = manifest;
+        changed.id = "different-model".to_owned();
+        assert!(!is_verification_cached(&changed, tmp.path()));
+    }
+
+    #[test]
+    fn verification_cache_miss_when_file_state_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        // Write marker, then tamper with the recorded file state.
+        write_verification_marker(&manifest, tmp.path());
+        assert!(is_verification_cached(&manifest, tmp.path()));
+
+        let marker_path = tmp.path().join(VERIFIED_MARKER_FILE);
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        let mut marker: VerificationMarker = serde_json::from_str(&raw).unwrap();
+        // Change recorded metadata so it no longer matches the actual file.
+        marker.file_states.insert(
+            "model.bin".to_owned(),
+            FileVerificationState {
+                size_bytes: 1,
+                modified_unix_nanos: 1,
+            },
+        );
+        let tampered = serde_json::to_string_pretty(&marker).unwrap();
+        std::fs::write(&marker_path, tampered).unwrap();
+
+        assert!(!is_verification_cached(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn verify_dir_cached_writes_marker_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data for verify";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        assert!(!tmp.path().join(VERIFIED_MARKER_FILE).exists());
+        verify_dir_cached(&manifest, tmp.path()).unwrap();
+        assert!(tmp.path().join(VERIFIED_MARKER_FILE).exists());
+        assert!(is_verification_cached(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn verify_dir_cached_skips_rehash_on_cached_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = b"model data cached";
+        let manifest = make_test_manifest("model.bin", content);
+        write_temp_file(&tmp.path().join("model.bin"), content);
+
+        // First call: full verification + writes marker
+        verify_dir_cached(&manifest, tmp.path()).unwrap();
+
+        // Second call: should succeed from cache (no rehash)
+        verify_dir_cached(&manifest, tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn verify_dir_cached_skips_when_no_verified_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest {
+            id: "test".to_owned(),
+            repo: "r".to_owned(),
+            revision: "v".to_owned(),
+            files: vec![ModelFile {
+                name: "f.bin".to_owned(),
+                sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                size: 0,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            tier: None,
+            dimension: None,
+            display_name: None,
+            version: String::new(),
+            description: None,
+            download_size_bytes: 0,
+        };
+        // Should not error even though file doesn't exist — skips verification
+        verify_dir_cached(&manifest, tmp.path()).unwrap();
     }
 }

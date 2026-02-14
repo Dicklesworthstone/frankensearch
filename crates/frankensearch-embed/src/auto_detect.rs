@@ -1362,15 +1362,14 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
         if !manifest_files_exist(&manifest, &candidate) {
             continue;
         }
-        if manifest.has_verified_checksums()
-            && let Err(error) = manifest.verify_dir(&candidate)
-        {
+        if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
             warn!(
                 model = POTION_MODEL_NAME,
                 path = %candidate.display(),
                 error = %error,
-                "model2vec manifest verification failed, attempting load anyway"
+                "model2vec manifest verification failed, skipping candidate"
             );
+            continue;
         }
 
         match Model2VecEmbedder::load_with_name(&candidate, POTION_MODEL_NAME) {
@@ -1424,15 +1423,14 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
         if !manifest_files_exist(&manifest, &candidate) {
             continue;
         }
-        if manifest.has_verified_checksums()
-            && let Err(error) = manifest.verify_dir(&candidate)
-        {
+        if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
             warn!(
                 model = MINILM_MODEL_NAME,
                 path = %candidate.display(),
                 error = %error,
-                "quality manifest verification failed, attempting load anyway"
+                "quality manifest verification failed, skipping candidate"
             );
+            continue;
         }
 
         match FastEmbedEmbedder::load_with_name(&candidate, MINILM_MODEL_NAME) {
