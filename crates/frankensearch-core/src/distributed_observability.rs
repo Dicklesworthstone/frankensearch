@@ -779,4 +779,273 @@ mod tests {
             assert!(!field.is_empty());
         }
     }
+
+    // ─── bd-p6cv tests begin ───
+
+    #[test]
+    fn distributed_event_debug() {
+        let event = DistributedEvent::GenerationBuildStarted {
+            generation_id: "g1".into(),
+            commit_low: 1,
+            commit_high: 100,
+            started_at: 1000,
+        };
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("GenerationBuildStarted"));
+        assert!(debug_str.contains("g1"));
+    }
+
+    #[test]
+    fn distributed_event_clone_produces_equal() {
+        let event = DistributedEvent::ArtifactRepairCompleted {
+            artifact_path: "vector.fsvi".into(),
+            symbols_used: 12,
+            repair_duration_ms: 450,
+        };
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+    }
+
+    #[test]
+    fn distributed_event_equality_and_inequality() {
+        let a = DistributedEvent::GenerationActivationSucceeded {
+            generation_id: "g1".into(),
+            activation_seq: 1,
+            activation_duration_ms: 50,
+            commit_low: 1,
+            commit_high: 100,
+        };
+        let b = DistributedEvent::GenerationActivationSucceeded {
+            generation_id: "g1".into(),
+            activation_seq: 1,
+            activation_duration_ms: 50,
+            commit_low: 1,
+            commit_high: 100,
+        };
+        let c = DistributedEvent::GenerationActivationSucceeded {
+            generation_id: "g2".into(),
+            activation_seq: 2,
+            activation_duration_ms: 50,
+            commit_low: 1,
+            commit_high: 200,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn distributed_event_different_variants_are_not_equal() {
+        let build = DistributedEvent::GenerationBuildStarted {
+            generation_id: "g1".into(),
+            commit_low: 1,
+            commit_high: 100,
+            started_at: 1000,
+        };
+        let complete = DistributedEvent::GenerationBuildCompleted {
+            generation_id: "g1".into(),
+            total_documents: 100,
+            vector_artifact_count: 2,
+            lexical_artifact_count: 1,
+            build_duration_ms: 5000,
+        };
+        assert_ne!(build, complete);
+    }
+
+    #[test]
+    fn distributed_metrics_debug() {
+        let m = DistributedMetrics::default();
+        let debug_str = format!("{m:?}");
+        assert!(debug_str.contains("DistributedMetrics"));
+    }
+
+    #[test]
+    fn distributed_metrics_clone_produces_equal() {
+        let m = DistributedMetrics {
+            commit_lag_ms: 100,
+            generation_activate_ms: 50,
+            artifact_repair_ratio: 0.25,
+            snapshot_bootstrap_ms: 10_000,
+            query_generation_skew: 3,
+            repair_failures_total: 5,
+        };
+        let cloned = m.clone();
+        assert_eq!(m, cloned);
+    }
+
+    #[test]
+    fn compute_repair_ratio_repaired_exceeds_total() {
+        // Edge case: repaired > total (shouldn't happen in practice but API allows it)
+        let ratio = DistributedMetrics::compute_repair_ratio(15, 10);
+        assert!((ratio - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn serde_roundtrip_generation_build_started() {
+        let event = DistributedEvent::GenerationBuildStarted {
+            generation_id: "gen-abc".into(),
+            commit_low: 50,
+            commit_high: 150,
+            started_at: 999_999,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_generation_build_completed() {
+        let event = DistributedEvent::GenerationBuildCompleted {
+            generation_id: "gen-xyz".into(),
+            total_documents: 5000,
+            vector_artifact_count: 3,
+            lexical_artifact_count: 2,
+            build_duration_ms: 12_000,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_generation_activation_failed() {
+        let event = DistributedEvent::GenerationActivationFailed {
+            generation_id: "gen-fail".into(),
+            failure_reason: "checksum mismatch on vector.fsvi".into(),
+            failed_invariant_count: 3,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_artifact_repair_started() {
+        let event = DistributedEvent::ArtifactRepairStarted {
+            artifact_path: "index/vector.fast.idx".into(),
+            detection_method: DetectionMethod::ReadTimeVerification,
+            attempt_number: 2,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_artifact_repair_failed() {
+        let event = DistributedEvent::ArtifactRepairFailed {
+            artifact_path: "index/vector.quality.idx".into(),
+            outcome: RepairOutcome::InsufficientSymbols {
+                available: 3,
+                required: 10,
+            },
+            retries_remaining: 0,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_read_degraded_mode_entered() {
+        let event = DistributedEvent::ReadDegradedModeEntered {
+            entered_at: 123_456,
+            reason: DegradedReason::UnrepairableCorruption {
+                failed_artifacts: vec!["a.fsvi".into(), "b.fsvi".into()],
+            },
+            unrepaired_count: 2,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_read_degraded_mode_exited() {
+        let event = DistributedEvent::ReadDegradedModeExited {
+            recovered_at: 200_000,
+            degraded_duration_ms: 76_544,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: DistributedEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn field_name_values_match_expected() {
+        assert_eq!(field_names::GENERATION_ID, "generation_id");
+        assert_eq!(field_names::AS_OF_COMMIT_SEQ, "as_of_commit_seq");
+        assert_eq!(field_names::ACTIVATION_SEQ, "activation_seq");
+        assert_eq!(field_names::COMMIT_LOW, "commit_low");
+        assert_eq!(field_names::COMMIT_HIGH, "commit_high");
+        assert_eq!(field_names::ARTIFACT_PATH, "artifact_path");
+        assert_eq!(field_names::SYMBOLS_USED, "symbols_used");
+        assert_eq!(field_names::TOTAL_DOCUMENTS, "total_documents");
+        assert_eq!(field_names::DURATION_MS, "duration_ms");
+        assert_eq!(field_names::UNREPAIRED_COUNT, "unrepaired_count");
+        assert_eq!(field_names::SERVICE_STATE, "service_state");
+        assert_eq!(field_names::FAILURE_REASON, "failure_reason");
+        assert_eq!(field_names::NODE_ID, "node_id");
+    }
+
+    #[test]
+    fn span_names_count_is_nine() {
+        let spans = [
+            span_names::GENERATION_LIFECYCLE,
+            span_names::ARTIFACT_ENCODE,
+            span_names::ARTIFACT_TRANSFER,
+            span_names::ARTIFACT_DECODE,
+            span_names::ARTIFACT_VERIFY,
+            span_names::GENERATION_ACTIVATE,
+            span_names::REPAIR_CYCLE,
+            span_names::ARTIFACT_REPAIR,
+            span_names::BOOTSTRAP,
+        ];
+        assert_eq!(spans.len(), 9);
+    }
+
+    #[test]
+    fn service_state_label_degraded_variants() {
+        // UnrepairableCorruption
+        assert_eq!(
+            service_state_label(&ServiceState::Degraded {
+                entered_at: 100,
+                reason: DegradedReason::UnrepairableCorruption {
+                    failed_artifacts: vec!["a.fsvi".into()],
+                },
+            }),
+            "degraded"
+        );
+        // ExcessiveCorruptionRate
+        assert_eq!(
+            service_state_label(&ServiceState::Degraded {
+                entered_at: 200,
+                reason: DegradedReason::ExcessiveCorruptionRate {
+                    event_count: 10,
+                    threshold: 5,
+                },
+            }),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn distributed_metrics_field_mutation() {
+        let m = DistributedMetrics {
+            commit_lag_ms: 500,
+            generation_activate_ms: 75,
+            artifact_repair_ratio: 0.42,
+            snapshot_bootstrap_ms: 15_000,
+            query_generation_skew: 4,
+            repair_failures_total: 12,
+        };
+
+        assert_eq!(m.commit_lag_ms, 500);
+        assert_eq!(m.generation_activate_ms, 75);
+        assert!((m.artifact_repair_ratio - 0.42).abs() < f64::EPSILON);
+        assert_eq!(m.snapshot_bootstrap_ms, 15_000);
+        assert_eq!(m.query_generation_skew, 4);
+        assert_eq!(m.repair_failures_total, 12);
+    }
+
+    // ─── bd-p6cv tests end ───
 }

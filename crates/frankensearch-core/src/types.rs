@@ -616,4 +616,385 @@ mod tests {
         assert_eq!(decoded.updated_docs, 11);
         assert!(!decoded.staleness_detected);
     }
+
+    // ─── bd-ta55 tests begin ───
+
+    #[test]
+    fn indexable_document_multiple_metadata() {
+        let doc = IndexableDocument::new("d1", "content")
+            .with_metadata("a", "1")
+            .with_metadata("b", "2")
+            .with_metadata("c", "3");
+        assert_eq!(doc.metadata.len(), 3);
+        assert_eq!(doc.metadata["a"], "1");
+        assert_eq!(doc.metadata["b"], "2");
+        assert_eq!(doc.metadata["c"], "3");
+    }
+
+    #[test]
+    fn indexable_document_metadata_overwrite() {
+        let doc = IndexableDocument::new("d1", "content")
+            .with_metadata("key", "old")
+            .with_metadata("key", "new");
+        assert_eq!(doc.metadata.len(), 1);
+        assert_eq!(doc.metadata["key"], "new");
+    }
+
+    #[test]
+    fn indexable_document_clone_debug() {
+        let doc = IndexableDocument::new("d1", "text").with_title("T");
+        let cloned = doc.clone();
+        assert_eq!(cloned.id, "d1");
+        assert_eq!(cloned.title.as_deref(), Some("T"));
+        let dbg = format!("{doc:?}");
+        assert!(dbg.contains("IndexableDocument"));
+        assert!(dbg.contains("d1"));
+    }
+
+    #[test]
+    fn vector_hit_partial_eq() {
+        let a = VectorHit {
+            index: 0,
+            score: 0.5,
+            doc_id: "a".into(),
+        };
+        let b = VectorHit {
+            index: 0,
+            score: 0.5,
+            doc_id: "a".into(),
+        };
+        assert_eq!(a, b);
+
+        let c = VectorHit {
+            index: 1,
+            score: 0.5,
+            doc_id: "a".into(),
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn vector_hit_serde_roundtrip() {
+        let hit = VectorHit {
+            index: 42,
+            score: 0.95,
+            doc_id: "doc-x".into(),
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let decoded: VectorHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, hit);
+    }
+
+    #[test]
+    fn vector_hit_both_nan() {
+        let a = VectorHit {
+            index: 0,
+            score: f32::NAN,
+            doc_id: "a".into(),
+        };
+        let b = VectorHit {
+            index: 1,
+            score: f32::NAN,
+            doc_id: "b".into(),
+        };
+        // Both NaN -> treated as equal (both map to NEG_INFINITY)
+        assert_eq!(a.cmp_by_score(&b), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn vector_hit_equal_scores() {
+        let a = VectorHit {
+            index: 0,
+            score: 0.75,
+            doc_id: "a".into(),
+        };
+        let b = VectorHit {
+            index: 1,
+            score: 0.75,
+            doc_id: "b".into(),
+        };
+        assert_eq!(a.cmp_by_score(&b), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn vector_hit_descending_order() {
+        let high = VectorHit {
+            index: 0,
+            score: 0.9,
+            doc_id: "h".into(),
+        };
+        let low = VectorHit {
+            index: 1,
+            score: 0.1,
+            doc_id: "l".into(),
+        };
+        // Descending: high comes first (Less means "before")
+        assert_eq!(high.cmp_by_score(&low), std::cmp::Ordering::Less);
+        assert_eq!(low.cmp_by_score(&high), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn fused_hit_serde_roundtrip() {
+        let hit = FusedHit {
+            doc_id: "fused-1".into(),
+            rrf_score: 0.025,
+            lexical_rank: Some(3),
+            semantic_rank: Some(7),
+            lexical_score: Some(8.5),
+            semantic_score: Some(0.72),
+            in_both_sources: true,
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let decoded: FusedHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.doc_id, "fused-1");
+        assert!((decoded.rrf_score - 0.025).abs() < f64::EPSILON);
+        assert!(decoded.in_both_sources);
+        assert_eq!(decoded.lexical_rank, Some(3));
+    }
+
+    #[test]
+    fn fused_hit_lexical_score_tiebreak() {
+        // Same RRF, same in_both_sources -> lexical_score descending
+        let high_lex = FusedHit {
+            doc_id: "z".into(), // worse doc_id
+            rrf_score: 0.02,
+            lexical_rank: Some(1),
+            semantic_rank: None,
+            lexical_score: Some(15.0),
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        let low_lex = FusedHit {
+            doc_id: "a".into(), // better doc_id
+            rrf_score: 0.02,
+            lexical_rank: Some(5),
+            semantic_rank: None,
+            lexical_score: Some(3.0),
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        // Higher lexical_score wins (level 3)
+        assert_eq!(high_lex.cmp_for_ranking(&low_lex), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn fused_hit_clone_debug() {
+        let hit = FusedHit {
+            doc_id: "test".into(),
+            rrf_score: 0.01,
+            lexical_rank: None,
+            semantic_rank: Some(5),
+            lexical_score: None,
+            semantic_score: Some(0.6),
+            in_both_sources: false,
+        };
+        let cloned = hit.clone();
+        assert_eq!(cloned.doc_id, "test");
+        let dbg = format!("{hit:?}");
+        assert!(dbg.contains("FusedHit"));
+    }
+
+    #[test]
+    fn score_source_all_variants_serde() {
+        let variants = [
+            ScoreSource::Lexical,
+            ScoreSource::SemanticFast,
+            ScoreSource::SemanticQuality,
+            ScoreSource::Hybrid,
+            ScoreSource::Reranked,
+        ];
+        for variant in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let decoded: ScoreSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, variant);
+        }
+    }
+
+    #[test]
+    fn score_source_clone_copy_eq() {
+        let a = ScoreSource::Hybrid;
+        let b = a; // Copy
+        let c = a; // Copy (ScoreSource is Copy)
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(ScoreSource::Lexical, ScoreSource::Hybrid);
+    }
+
+    #[test]
+    fn scored_result_all_none_optionals() {
+        let result = ScoredResult {
+            doc_id: "min".into(),
+            score: 0.1,
+            source: ScoreSource::Lexical,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: ScoredResult = serde_json::from_str(&json).unwrap();
+        assert!(decoded.fast_score.is_none());
+        assert!(decoded.quality_score.is_none());
+        assert!(decoded.rerank_score.is_none());
+        assert!(decoded.metadata.is_none());
+    }
+
+    #[test]
+    fn scored_result_all_some_optionals() {
+        let result = ScoredResult {
+            doc_id: "max".into(),
+            score: 0.99,
+            source: ScoreSource::Reranked,
+            fast_score: Some(0.7),
+            quality_score: Some(0.9),
+            lexical_score: Some(15.0),
+            rerank_score: Some(0.95),
+            metadata: Some(serde_json::json!({"key": "value"})),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: ScoredResult = serde_json::from_str(&json).unwrap();
+        assert!(decoded.fast_score.is_some());
+        assert!(decoded.quality_score.is_some());
+        assert!(decoded.lexical_score.is_some());
+        assert!(decoded.rerank_score.is_some());
+        assert!(decoded.metadata.is_some());
+    }
+
+    #[test]
+    fn scored_result_clone_debug() {
+        let result = ScoredResult {
+            doc_id: "d".into(),
+            score: 0.5,
+            source: ScoreSource::SemanticFast,
+            fast_score: Some(0.5),
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            metadata: None,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.doc_id, "d");
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("ScoredResult"));
+        assert!(dbg.contains("SemanticFast"));
+    }
+
+    #[test]
+    fn search_mode_all_variants_serde() {
+        let variants = [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+            SearchMode::TwoTier,
+        ];
+        for variant in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let decoded: SearchMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, variant);
+        }
+    }
+
+    #[test]
+    fn phase_metrics_serde_clone_debug() {
+        let metrics = PhaseMetrics {
+            embedder_id: "test-embed".into(),
+            vectors_searched: 500,
+            lexical_candidates: 30,
+            fused_count: 10,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let decoded: PhaseMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.embedder_id, "test-embed");
+        assert_eq!(decoded.vectors_searched, 500);
+
+        let cloned = metrics.clone();
+        assert_eq!(cloned.fused_count, 10);
+
+        let dbg = format!("{metrics:?}");
+        assert!(dbg.contains("PhaseMetrics"));
+    }
+
+    #[test]
+    fn rank_changes_default_and_zero_total() {
+        let changes = RankChanges::default();
+        assert_eq!(changes.promoted, 0);
+        assert_eq!(changes.demoted, 0);
+        assert_eq!(changes.stable, 0);
+        assert_eq!(changes.total(), 0);
+    }
+
+    #[test]
+    fn rank_changes_serde_roundtrip() {
+        let changes = RankChanges {
+            promoted: 5,
+            demoted: 3,
+            stable: 12,
+        };
+        let json = serde_json::to_string(&changes).unwrap();
+        let decoded: RankChanges = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.promoted, 5);
+        assert_eq!(decoded.demoted, 3);
+        assert_eq!(decoded.stable, 12);
+        assert_eq!(decoded.total(), 20);
+    }
+
+    #[test]
+    fn search_phase_refined_construction() {
+        let phase = SearchPhase::Refined {
+            results: vec![ScoredResult {
+                doc_id: "r1".into(),
+                score: 0.9,
+                source: ScoreSource::Hybrid,
+                fast_score: Some(0.7),
+                quality_score: Some(0.9),
+                lexical_score: None,
+                rerank_score: None,
+                metadata: None,
+            }],
+            latency: Duration::from_millis(120),
+            metrics: PhaseMetrics {
+                embedder_id: "minilm".into(),
+                vectors_searched: 2000,
+                lexical_candidates: 100,
+                fused_count: 20,
+            },
+            rank_changes: RankChanges {
+                promoted: 4,
+                demoted: 2,
+                stable: 14,
+            },
+        };
+        if let SearchPhase::Refined {
+            results,
+            latency,
+            rank_changes,
+            ..
+        } = phase
+        {
+            assert_eq!(results.len(), 1);
+            assert_eq!(latency, Duration::from_millis(120));
+            assert_eq!(rank_changes.total(), 20);
+        } else {
+            panic!("expected Refined variant");
+        }
+    }
+
+    #[test]
+    fn search_phase_debug() {
+        let phase = SearchPhase::Initial {
+            results: vec![],
+            latency: Duration::from_millis(5),
+            metrics: PhaseMetrics {
+                embedder_id: "e".into(),
+                vectors_searched: 0,
+                lexical_candidates: 0,
+                fused_count: 0,
+            },
+        };
+        let dbg = format!("{phase:?}");
+        assert!(dbg.contains("Initial"));
+    }
+
+    // ─── bd-ta55 tests end ───
 }

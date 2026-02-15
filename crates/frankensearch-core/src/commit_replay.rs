@@ -959,4 +959,284 @@ mod tests {
         assert!(matches!(outcome, CommitOutcome::Applied { .. }));
         assert_eq!(engine.watermark().last_applied_seq, 42);
     }
+
+    // ─── bd-sloo tests begin ───
+
+    #[test]
+    fn document_op_debug_clone_eq() {
+        let add = add_op("d1", "content");
+        let cloned = add.clone();
+        assert_eq!(add, cloned);
+        let dbg = format!("{add:?}");
+        assert!(dbg.contains("Add"));
+        assert!(dbg.contains("d1"));
+
+        let upd = update_op("d2", "new");
+        assert_ne!(
+            add,
+            DocumentOp::Delete {
+                doc_id: "d1".into()
+            }
+        );
+        let dbg_upd = format!("{upd:?}");
+        assert!(dbg_upd.contains("Update"));
+    }
+
+    #[test]
+    fn document_op_serde_each_variant() {
+        let add = add_op("a", "content-a");
+        let json = serde_json::to_string(&add).unwrap();
+        let decoded: DocumentOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, add);
+
+        let upd = update_op("b", "content-b");
+        let json = serde_json::to_string(&upd).unwrap();
+        let decoded: DocumentOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, upd);
+
+        let del = delete_op("c");
+        let json = serde_json::to_string(&del).unwrap();
+        let decoded: DocumentOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, del);
+    }
+
+    #[test]
+    fn document_op_with_metadata() {
+        let mut meta = BTreeMap::new();
+        meta.insert("lang".to_string(), "en".to_string());
+        meta.insert("source".to_string(), "test".to_string());
+        let op = DocumentOp::Add {
+            doc_id: "m1".into(),
+            content: "hello".into(),
+            metadata: meta.clone(),
+        };
+        assert_eq!(op.doc_id(), "m1");
+        let json = serde_json::to_string(&op).unwrap();
+        let decoded: DocumentOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, op);
+        if let DocumentOp::Add { metadata: m, .. } = decoded {
+            assert_eq!(m.len(), 2);
+            assert_eq!(m["lang"], "en");
+        }
+    }
+
+    #[test]
+    fn commit_entry_debug_clone() {
+        let entry = make_commit(5, vec![add_op("d1", "text")]);
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+        let dbg = format!("{entry:?}");
+        assert!(dbg.contains("CommitEntry"));
+        assert!(dbg.contains("commit-5"));
+    }
+
+    #[test]
+    fn replay_watermark_empty_and_debug_clone() {
+        let wm = ReplayWatermark::empty();
+        assert_eq!(wm.last_applied_seq, 0);
+        assert_eq!(wm.last_applied_at, 0);
+        assert_eq!(wm.total_commits_applied, 0);
+        assert_eq!(wm.total_ops_applied, 0);
+
+        let cloned = wm.clone();
+        assert_eq!(wm, cloned);
+
+        let dbg = format!("{wm:?}");
+        assert!(dbg.contains("ReplayWatermark"));
+    }
+
+    #[test]
+    fn commit_outcome_applied_serde() {
+        let outcome = CommitOutcome::Applied {
+            commit_seq: 10,
+            ops_applied: 3,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: CommitOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn commit_outcome_skipped_serde() {
+        let outcome = CommitOutcome::Skipped {
+            commit_seq: 5,
+            reason: SkipReason::AlreadyApplied,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: CommitOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn commit_outcome_failed_serde() {
+        let outcome = CommitOutcome::Failed {
+            commit_seq: 7,
+            error: "something broke".into(),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let decoded: CommitOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn commit_outcome_debug_clone() {
+        let outcomes = vec![
+            CommitOutcome::Applied {
+                commit_seq: 1,
+                ops_applied: 2,
+            },
+            CommitOutcome::Skipped {
+                commit_seq: 2,
+                reason: SkipReason::EmptyCommit,
+            },
+            CommitOutcome::Failed {
+                commit_seq: 3,
+                error: "err".into(),
+            },
+        ];
+        for o in &outcomes {
+            let cloned = o.clone();
+            assert_eq!(o, &cloned);
+            let dbg = format!("{o:?}");
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn skip_reason_all_variants_serde() {
+        let variants = vec![
+            SkipReason::AlreadyApplied,
+            SkipReason::OutOfOrder {
+                expected: 5,
+                got: 8,
+            },
+            SkipReason::EmptyCommit,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let decoded: SkipReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, v);
+        }
+    }
+
+    #[test]
+    fn skip_reason_debug_clone() {
+        let r = SkipReason::OutOfOrder {
+            expected: 2,
+            got: 5,
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("OutOfOrder"));
+    }
+
+    #[test]
+    fn replay_policy_debug_default() {
+        let policy = ReplayPolicy::default();
+        assert!(policy.strict_ordering);
+        assert!(policy.skip_duplicates);
+        assert!(policy.skip_empty);
+        assert!(policy.stop_on_failure);
+        let dbg = format!("{policy:?}");
+        assert!(dbg.contains("ReplayPolicy"));
+    }
+
+    #[test]
+    fn watermark_timestamp_tracking() {
+        let engine = CommitReplayEngine::default();
+        let consumer = RecordingConsumer::new();
+
+        let c1 = make_commit(1, vec![add_op("d1", "v1")]);
+        engine.apply(&c1, &consumer, 42_000);
+        assert_eq!(engine.watermark().last_applied_at, 42_000);
+
+        let c2 = make_commit(2, vec![add_op("d2", "v2")]);
+        engine.apply(&c2, &consumer, 99_000);
+        assert_eq!(engine.watermark().last_applied_at, 99_000);
+    }
+
+    #[test]
+    fn batch_replay_empty_entries() {
+        let engine = CommitReplayEngine::default();
+        let consumer = RecordingConsumer::new();
+        let outcomes = engine.replay_batch(&[], &consumer, 1000);
+        assert!(outcomes.is_empty());
+        assert_eq!(engine.watermark().last_applied_seq, 0);
+    }
+
+    #[test]
+    fn batch_replay_mixed_skip_and_apply() {
+        let engine = CommitReplayEngine::default();
+        let consumer = RecordingConsumer::new();
+
+        // Apply commit 1 first
+        let c1 = make_commit(1, vec![add_op("a", "1")]);
+        engine.apply(&c1, &consumer, 1000);
+
+        // Batch: c1 again (skip), c2 (apply), empty c3 (skip)
+        let batch = vec![
+            make_commit(1, vec![add_op("a", "1")]),
+            make_commit(2, vec![add_op("b", "2")]),
+            make_commit(3, vec![]),
+        ];
+        let outcomes = engine.replay_batch(&batch, &consumer, 2000);
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(
+            outcomes[0],
+            CommitOutcome::Skipped {
+                reason: SkipReason::AlreadyApplied,
+                ..
+            }
+        ));
+        assert!(matches!(outcomes[1], CommitOutcome::Applied { .. }));
+        assert!(matches!(
+            outcomes[2],
+            CommitOutcome::Skipped {
+                reason: SkipReason::EmptyCommit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reset_then_replay_full_cycle() {
+        let engine = CommitReplayEngine::default();
+        let consumer = RecordingConsumer::new();
+
+        let c1 = make_commit(1, vec![add_op("d1", "v1")]);
+        engine.apply(&c1, &consumer, 1000);
+        assert_eq!(engine.watermark().last_applied_seq, 1);
+
+        engine.reset();
+        assert_eq!(engine.watermark(), ReplayWatermark::empty());
+
+        // After reset, commit 1 can be re-applied
+        let outcome = engine.apply(&c1, &consumer, 2000);
+        assert!(matches!(outcome, CommitOutcome::Applied { .. }));
+        assert_eq!(engine.watermark().last_applied_seq, 1);
+        assert_eq!(engine.watermark().total_commits_applied, 1);
+    }
+
+    #[test]
+    fn skip_duplicates_disabled_allows_reapply() {
+        let policy = ReplayPolicy {
+            skip_duplicates: false,
+            strict_ordering: false,
+            ..ReplayPolicy::default()
+        };
+        let engine = CommitReplayEngine::new(policy);
+        let consumer = RecordingConsumer::new();
+
+        let c1 = make_commit(1, vec![add_op("d1", "v1")]);
+        engine.apply(&c1, &consumer, 1000);
+
+        // With skip_duplicates=false, same commit goes through
+        let outcome = engine.apply(&c1, &consumer, 2000);
+        assert!(matches!(outcome, CommitOutcome::Applied { .. }));
+        assert_eq!(engine.watermark().total_commits_applied, 2);
+        assert_eq!(consumer.entries().len(), 2);
+    }
+
+    // ─── bd-sloo tests end ───
 }

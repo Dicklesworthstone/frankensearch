@@ -994,4 +994,461 @@ mod tests {
         assert_eq!(checks.len(), 3);
         assert!(checks.iter().all(|c| c.passed));
     }
+
+    // ─── bd-2cz8 tests begin ───
+
+    #[test]
+    fn artifact_verification_debug_clone_eq() {
+        let v = ArtifactVerification {
+            path: "a.fsvi".into(),
+            passed: true,
+            detail: "ok".into(),
+        };
+        let v2 = v.clone();
+        assert_eq!(v, v2);
+        assert_eq!(format!("{v:?}"), format!("{v2:?}"));
+    }
+
+    #[test]
+    fn artifact_verification_not_equal_different_passed() {
+        let v1 = ArtifactVerification {
+            path: "a.fsvi".into(),
+            passed: true,
+            detail: "ok".into(),
+        };
+        let v2 = ArtifactVerification {
+            path: "a.fsvi".into(),
+            passed: false,
+            detail: "ok".into(),
+        };
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn invariant_check_debug_clone_eq() {
+        let c = InvariantCheck {
+            invariant_id: "inv_1".into(),
+            passed: true,
+            reason: "ok".into(),
+        };
+        let c2 = c.clone();
+        assert_eq!(c, c2);
+        assert_eq!(format!("{c:?}"), format!("{c2:?}"));
+    }
+
+    #[test]
+    fn invariant_check_not_equal_different_reason() {
+        let c1 = InvariantCheck {
+            invariant_id: "inv_1".into(),
+            passed: true,
+            reason: "ok".into(),
+        };
+        let c2 = InvariantCheck {
+            invariant_id: "inv_1".into(),
+            passed: true,
+            reason: "different".into(),
+        };
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn active_generation_debug_clone() {
+        let ag = ActiveGeneration {
+            manifest: sample_manifest(),
+            activation_seq: 1,
+            activated_at: 100,
+            vector_paths: BTreeMap::new(),
+            lexical_paths: BTreeMap::new(),
+        };
+        let ag2 = ag.clone();
+        assert_eq!(ag.activation_seq, ag2.activation_seq);
+        assert_eq!(ag.activated_at, ag2.activated_at);
+        assert_eq!(ag.manifest.generation_id, ag2.manifest.generation_id);
+        let dbg = format!("{ag:?}");
+        assert!(dbg.contains("ActiveGeneration"));
+    }
+
+    #[test]
+    fn embedder_revision_mismatch_fails() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "emb_rev".into(),
+            description: "Embedder revision match".into(),
+            kind: InvariantKind::EmbedderRevisionMatch,
+        }];
+        // Use a verifier whose runtime embedder has different model name.
+        let mut verifier = AlwaysPassVerifier::new("/data");
+        verifier.runtime_embedders.insert(
+            "fast".into(),
+            EmbedderRevision {
+                model_name: "different-model".into(),
+                weights_hash: "abcdef1234567890".into(),
+                dimension: 256,
+                quantization: QuantizationFormat::F16,
+            },
+        );
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("mismatch"));
+    }
+
+    #[test]
+    fn embedder_revision_match_passes() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "emb_rev".into(),
+            description: "Embedder revision match".into(),
+            kind: InvariantKind::EmbedderRevisionMatch,
+        }];
+        let verifier = AlwaysPassVerifier::new("/data");
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].passed);
+        assert!(checks[0].reason.contains("match manifest"));
+    }
+
+    #[test]
+    fn embedder_revision_missing_runtime_fails() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "emb_rev".into(),
+            description: "Embedder revision match".into(),
+            kind: InvariantKind::EmbedderRevisionMatch,
+        }];
+        // Use a verifier with no runtime embedders.
+        let mut verifier = AlwaysPassVerifier::new("/data");
+        verifier.runtime_embedders.clear();
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("missing"));
+    }
+
+    #[test]
+    fn custom_invariant_failing_check_name() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "custom_fail".into(),
+            description: "Custom check".into(),
+            kind: InvariantKind::Custom {
+                check_name: "wrong_check".into(),
+            },
+        }];
+        // CustomHookVerifier only passes "my_check", so "wrong_check" should fail.
+        let verifier = CustomHookVerifier::new("/data", "my_check");
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(!checks[0].passed);
+    }
+
+    #[test]
+    fn lexical_artifact_verification_failure() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "all_art".into(),
+            description: "All artifacts verified".into(),
+            kind: InvariantKind::AllArtifactsVerified,
+        }];
+        // Fail on lexical artifact path.
+        let verifier = FailingVerifier {
+            fail_paths: vec!["lexical/segment_0".into()],
+        };
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("lexical/segment_0"));
+    }
+
+    #[test]
+    fn both_vector_and_lexical_failures_reported() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "all_art".into(),
+            description: "All artifacts verified".into(),
+            kind: InvariantKind::AllArtifactsVerified,
+        }];
+        let verifier = FailingVerifier {
+            fail_paths: vec!["vectors/shard_0.fsvi".into(), "lexical/segment_0".into()],
+        };
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("2 artifact(s) failed"));
+    }
+
+    /// Default `runtime_embedder` returns None.
+    struct MinimalVerifier;
+
+    impl ArtifactVerifier for MinimalVerifier {
+        fn verify(
+            &self,
+            manifest_path: &str,
+            _checksum: &str,
+            _expected_size: u64,
+        ) -> ArtifactVerification {
+            ArtifactVerification {
+                path: manifest_path.into(),
+                passed: true,
+                detail: "minimal".into(),
+            }
+        }
+
+        fn resolve_path(&self, manifest_path: &str) -> String {
+            manifest_path.into()
+        }
+    }
+
+    #[test]
+    fn default_runtime_embedder_returns_none() {
+        let v = MinimalVerifier;
+        assert!(v.runtime_embedder("fast").is_none());
+        assert!(v.runtime_embedder("quality").is_none());
+    }
+
+    #[test]
+    fn default_check_custom_invariant_returns_none() {
+        let v = MinimalVerifier;
+        let m = sample_manifest();
+        assert!(v.check_custom_invariant("anything", &m, None).is_none());
+    }
+
+    #[test]
+    fn empty_invariants_returns_empty_checks() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants.clear();
+        let verifier = AlwaysPassVerifier::new("/data");
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn vector_count_consistency_multiple_artifacts() {
+        let mut manifest = sample_manifest();
+        manifest.vector_artifacts = vec![
+            VectorArtifact {
+                path: "vectors/shard_0.fsvi".into(),
+                size_bytes: 1024,
+                checksum: "aaa".into(),
+                vector_count: 60,
+                dimension: 256,
+                embedder_tier: EmbedderTierTag::Fast,
+            },
+            VectorArtifact {
+                path: "vectors/shard_1.fsvi".into(),
+                size_bytes: 1024,
+                checksum: "bbb".into(),
+                vector_count: 40,
+                dimension: 256,
+                embedder_tier: EmbedderTierTag::Fast,
+            },
+        ];
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "vec_count".into(),
+            description: "Vector count check".into(),
+            kind: InvariantKind::VectorCountConsistency {
+                expected_total: 100,
+            },
+        }];
+        let verifier = AlwaysPassVerifier::new("/data");
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(checks[0].passed);
+        assert!(checks[0].reason.contains("100"));
+    }
+
+    #[test]
+    fn commit_continuity_saturating_add_at_max() {
+        let mut manifest = sample_manifest();
+        manifest.commit_range = CommitRange {
+            low: u64::MAX,
+            high: u64::MAX,
+        };
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "continuity".into(),
+            description: "Commit continuity at max".into(),
+            kind: InvariantKind::CommitContinuity {
+                previous_high: u64::MAX - 1,
+            },
+        }];
+        let prev_manifest_inner = {
+            let mut m = sample_manifest();
+            m.commit_range = CommitRange {
+                low: 1,
+                high: u64::MAX - 1,
+            };
+            m
+        };
+        let prev = ActiveGeneration {
+            manifest: prev_manifest_inner,
+            activation_seq: 1,
+            activated_at: 100,
+            vector_paths: BTreeMap::new(),
+            lexical_paths: BTreeMap::new(),
+        };
+        let verifier = AlwaysPassVerifier::new("/data");
+        // expected_low = (u64::MAX - 1).saturating_add(1) = u64::MAX
+        // actual_low = u64::MAX → should pass
+        let checks = check_invariants(&manifest, &verifier, Some(&prev));
+        assert!(checks[0].passed);
+    }
+
+    #[test]
+    fn commit_continuity_saturating_add_overflow() {
+        let mut manifest = sample_manifest();
+        manifest.commit_range = CommitRange { low: 1, high: 100 };
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "continuity".into(),
+            description: "Commit continuity overflow".into(),
+            kind: InvariantKind::CommitContinuity {
+                previous_high: u64::MAX,
+            },
+        }];
+        let prev_manifest_inner = {
+            let mut m = sample_manifest();
+            m.commit_range = CommitRange {
+                low: 1,
+                high: u64::MAX,
+            };
+            m
+        };
+        let prev = ActiveGeneration {
+            manifest: prev_manifest_inner,
+            activation_seq: 1,
+            activated_at: 100,
+            vector_paths: BTreeMap::new(),
+            lexical_paths: BTreeMap::new(),
+        };
+        let verifier = AlwaysPassVerifier::new("/data");
+        // expected_low = u64::MAX.saturating_add(1) = u64::MAX (saturated)
+        // actual_low = 1 → should fail (1 != u64::MAX)
+        let checks = check_invariants(&manifest, &verifier, Some(&prev));
+        assert!(!checks[0].passed);
+    }
+
+    #[test]
+    fn rollback_after_three_activations_only_one_slot() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/data");
+
+        let mut m1 = sample_manifest();
+        m1.generation_id = "gen-001".into();
+        m1.manifest_hash = compute_manifest_hash(&m1).expect("hash");
+        ctrl.activate(m1, &verifier, 100).unwrap();
+
+        let mut m2 = sample_manifest();
+        m2.generation_id = "gen-002".into();
+        m2.manifest_hash = compute_manifest_hash(&m2).expect("hash");
+        ctrl.activate(m2, &verifier, 200).unwrap();
+
+        let mut m3 = sample_manifest();
+        m3.generation_id = "gen-003".into();
+        m3.manifest_hash = compute_manifest_hash(&m3).expect("hash");
+        ctrl.activate(m3, &verifier, 300).unwrap();
+        assert_eq!(ctrl.active().unwrap().manifest.generation_id, "gen-003");
+
+        // Rollback restores gen-002 (the one just before gen-003).
+        assert!(ctrl.rollback());
+        assert_eq!(ctrl.active().unwrap().manifest.generation_id, "gen-002");
+
+        // No further rollback possible.
+        assert!(!ctrl.rollback());
+    }
+
+    #[test]
+    fn activation_error_formats_validation_failures() {
+        let mut manifest = sample_manifest();
+        manifest.generation_id = String::new(); // triggers validation failure
+        manifest.schema_version = 0; // triggers another validation failure
+        let validation = validate_manifest(&manifest);
+        assert!(!validation.is_valid());
+        let err = activation_error(&validation);
+        let msg = err.to_string();
+        assert!(msg.contains("manifest validation failed"));
+    }
+
+    #[test]
+    fn activation_with_empty_invariants_succeeds() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/data");
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants.clear();
+        manifest.manifest_hash = compute_manifest_hash(&manifest).expect("hash");
+        let result = ctrl.activate(manifest, &verifier, 100).unwrap();
+        assert_eq!(result.activation_seq, 1);
+        assert!(!ctrl.is_degraded());
+    }
+
+    #[test]
+    fn active_generation_resolved_lexical_paths() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/mnt/gen");
+        let manifest = sample_manifest();
+        let result = ctrl.activate(manifest, &verifier, 100).unwrap();
+        assert_eq!(
+            result.lexical_paths.get("lexical/segment_0").unwrap(),
+            "/mnt/gen/lexical/segment_0"
+        );
+    }
+
+    #[test]
+    fn activation_records_timestamp() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/data");
+        let manifest = sample_manifest();
+        let timestamp = 1_700_555_000_000_u64;
+        let result = ctrl.activate(manifest, &verifier, timestamp).unwrap();
+        assert_eq!(result.activated_at, timestamp);
+    }
+
+    #[test]
+    fn is_degraded_after_single_activation_then_no_rollback() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/data");
+        let manifest = sample_manifest();
+        ctrl.activate(manifest, &verifier, 100).unwrap();
+        assert!(!ctrl.is_degraded());
+        // No rollback slot yet (no previous gen), so rollback returns false.
+        assert!(!ctrl.rollback());
+        // Controller still has the activated generation.
+        assert!(!ctrl.is_degraded());
+    }
+
+    #[test]
+    fn concurrent_arc_snapshot_isolation() {
+        let ctrl = GenerationController::new();
+        let verifier = AlwaysPassVerifier::new("/data");
+
+        let mut m1 = sample_manifest();
+        m1.generation_id = "gen-001".into();
+        m1.manifest_hash = compute_manifest_hash(&m1).expect("hash");
+        ctrl.activate(m1, &verifier, 100).unwrap();
+
+        // Acquire snapshot before second activation.
+        let snapshot = ctrl.active().unwrap();
+        assert_eq!(snapshot.manifest.generation_id, "gen-001");
+
+        // Activate gen-002.
+        let mut m2 = sample_manifest();
+        m2.generation_id = "gen-002".into();
+        m2.manifest_hash = compute_manifest_hash(&m2).expect("hash");
+        ctrl.activate(m2, &verifier, 200).unwrap();
+
+        // Snapshot still sees gen-001 (Arc isolation).
+        assert_eq!(snapshot.manifest.generation_id, "gen-001");
+        // Current sees gen-002.
+        assert_eq!(ctrl.active().unwrap().manifest.generation_id, "gen-002");
+    }
+
+    #[test]
+    fn vector_count_consistency_zero_expected_and_empty() {
+        let mut manifest = sample_manifest();
+        manifest.vector_artifacts.clear();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "vec_count".into(),
+            description: "Zero vectors".into(),
+            kind: InvariantKind::VectorCountConsistency { expected_total: 0 },
+        }];
+        let verifier = AlwaysPassVerifier::new("/data");
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(checks[0].passed);
+        assert!(checks[0].reason.contains('0'));
+    }
+
+    // ─── bd-2cz8 tests end ───
 }

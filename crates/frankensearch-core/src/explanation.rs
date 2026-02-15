@@ -600,4 +600,307 @@ mod tests {
         let display = source.to_string();
         assert!(display.contains("BM25(terms=[]"));
     }
+
+    // ─── bd-7fn8 tests begin ───
+
+    #[test]
+    fn explanation_phase_serde_roundtrip() {
+        for phase in [ExplanationPhase::Initial, ExplanationPhase::Refined] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let decoded: ExplanationPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, phase);
+        }
+    }
+
+    #[test]
+    fn explanation_phase_clone_copy_eq() {
+        let a = ExplanationPhase::Initial;
+        let b = a; // Copy
+        let c = a; // Copy (ExplanationPhase is Copy)
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(ExplanationPhase::Initial, ExplanationPhase::Refined);
+    }
+
+    #[test]
+    fn explanation_phase_debug() {
+        let dbg = format!("{:?}", ExplanationPhase::Initial);
+        assert_eq!(dbg, "Initial");
+        let dbg2 = format!("{:?}", ExplanationPhase::Refined);
+        assert_eq!(dbg2, "Refined");
+    }
+
+    #[test]
+    fn explained_source_clone() {
+        let original = ExplainedSource::LexicalBm25 {
+            matched_terms: vec!["hello".into(), "world".into()],
+            tf: 2.0,
+            idf: 3.5,
+        };
+        let cloned = original.clone();
+        assert_eq!(original.to_string(), cloned.to_string());
+
+        let fast = ExplainedSource::SemanticFast {
+            embedder: "potion".into(),
+            cosine_sim: 0.75,
+        };
+        let fast_cloned = fast.clone();
+        assert_eq!(fast.to_string(), fast_cloned.to_string());
+    }
+
+    #[test]
+    fn explained_source_debug() {
+        let source = ExplainedSource::Rerank {
+            model: "test-model".into(),
+            logit: 1.0,
+            sigmoid: 0.73,
+        };
+        let dbg = format!("{source:?}");
+        assert!(dbg.contains("Rerank"));
+        assert!(dbg.contains("test-model"));
+    }
+
+    #[test]
+    fn score_component_display() {
+        let component = ScoreComponent {
+            source: ExplainedSource::SemanticFast {
+                embedder: "potion-128M".into(),
+                cosine_sim: 0.65,
+            },
+            raw_score: 0.65,
+            normalized_score: 0.72,
+            rrf_contribution: 0.012_345,
+            weight: 0.3,
+        };
+        let display = component.to_string();
+        assert!(display.contains("FastSemantic"));
+        assert!(display.contains("raw=0.6500"));
+        assert!(display.contains("norm=0.7200"));
+        assert!(display.contains("rrf=0.012345"));
+        assert!(display.contains("w=0.30"));
+    }
+
+    #[test]
+    fn score_component_clone_debug() {
+        let component = ScoreComponent {
+            source: ExplainedSource::LexicalBm25 {
+                matched_terms: vec!["test".into()],
+                tf: 1.0,
+                idf: 2.0,
+            },
+            raw_score: 5.0,
+            normalized_score: 0.5,
+            rrf_contribution: 0.016,
+            weight: 0.3,
+        };
+        let cloned = component.clone();
+        assert!((cloned.raw_score - 5.0).abs() < f64::EPSILON);
+        assert!((cloned.weight - 0.3).abs() < f64::EPSILON);
+
+        let dbg = format!("{component:?}");
+        assert!(dbg.contains("ScoreComponent"));
+        assert!(dbg.contains("raw_score"));
+    }
+
+    #[test]
+    fn score_component_serde_roundtrip() {
+        let component = ScoreComponent {
+            source: ExplainedSource::SemanticQuality {
+                embedder: "minilm".into(),
+                cosine_sim: 0.88,
+            },
+            raw_score: 0.88,
+            normalized_score: 0.92,
+            rrf_contribution: 0.015,
+            weight: 0.7,
+        };
+        let json = serde_json::to_string(&component).unwrap();
+        let decoded: ScoreComponent = serde_json::from_str(&json).unwrap();
+        assert!((decoded.raw_score - 0.88).abs() < f64::EPSILON);
+        assert!((decoded.weight - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rank_movement_stable_display() {
+        let movement = RankMovement {
+            initial_rank: 3,
+            refined_rank: 3,
+            delta: 0,
+            reason: "no change".into(),
+        };
+        let display = movement.to_string();
+        assert!(display.contains("stable"));
+        assert!(display.contains("#3 -> #3"));
+        assert!(display.contains("delta=0"));
+    }
+
+    #[test]
+    fn rank_movement_clone_debug() {
+        let movement = RankMovement {
+            initial_rank: 1,
+            refined_rank: 4,
+            delta: 3,
+            reason: "penalized".into(),
+        };
+        let cloned = movement.clone();
+        assert_eq!(cloned.initial_rank, 1);
+        assert_eq!(cloned.refined_rank, 4);
+        assert_eq!(cloned.delta, 3);
+        assert_eq!(cloned.reason, "penalized");
+
+        let dbg = format!("{movement:?}");
+        assert!(dbg.contains("RankMovement"));
+        assert!(dbg.contains("penalized"));
+    }
+
+    #[test]
+    fn rank_movement_serde_roundtrip() {
+        let movement = RankMovement {
+            initial_rank: 10,
+            refined_rank: 2,
+            delta: -8,
+            reason: "major promotion".into(),
+        };
+        let json = serde_json::to_string(&movement).unwrap();
+        let decoded: RankMovement = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.initial_rank, 10);
+        assert_eq!(decoded.refined_rank, 2);
+        assert_eq!(decoded.delta, -8);
+        assert_eq!(decoded.reason, "major promotion");
+    }
+
+    #[test]
+    fn hit_explanation_display_with_movement() {
+        let explanation = HitExplanation {
+            final_score: 0.05,
+            components: vec![ScoreComponent {
+                source: ExplainedSource::SemanticFast {
+                    embedder: "potion".into(),
+                    cosine_sim: 0.9,
+                },
+                raw_score: 0.9,
+                normalized_score: 0.95,
+                rrf_contribution: 0.016,
+                weight: 0.5,
+            }],
+            phase: ExplanationPhase::Refined,
+            rank_movement: Some(RankMovement {
+                initial_rank: 7,
+                refined_rank: 1,
+                delta: -6,
+                reason: "boosted".into(),
+            }),
+        };
+        let display = explanation.to_string();
+        assert!(display.contains("Refined"));
+        assert!(display.contains("Rank:"));
+        assert!(display.contains("promoted"));
+        assert!(display.contains("#7 -> #1"));
+    }
+
+    #[test]
+    fn hit_explanation_clone() {
+        let explanation = HitExplanation {
+            final_score: 0.03,
+            components: vec![ScoreComponent {
+                source: ExplainedSource::LexicalBm25 {
+                    matched_terms: vec!["clone".into()],
+                    tf: 1.0,
+                    idf: 2.0,
+                },
+                raw_score: 4.0,
+                normalized_score: 0.4,
+                rrf_contribution: 0.01,
+                weight: 0.3,
+            }],
+            phase: ExplanationPhase::Initial,
+            rank_movement: None,
+        };
+        assert!((explanation.final_score - 0.03).abs() < f64::EPSILON);
+        assert_eq!(explanation.source_count(), 1);
+        assert_eq!(explanation.phase, ExplanationPhase::Initial);
+        assert!(explanation.rank_movement.is_none());
+    }
+
+    #[test]
+    fn hit_explanation_debug() {
+        let explanation = HitExplanation {
+            final_score: 0.01,
+            components: vec![],
+            phase: ExplanationPhase::Initial,
+            rank_movement: None,
+        };
+        let dbg = format!("{explanation:?}");
+        assert!(dbg.contains("HitExplanation"));
+        assert!(dbg.contains("final_score"));
+    }
+
+    #[test]
+    fn negative_cosine_sim() {
+        let source = ExplainedSource::SemanticFast {
+            embedder: "model".into(),
+            cosine_sim: -0.35,
+        };
+        let display = source.to_string();
+        assert!(display.contains("-0.3500"));
+
+        let component = ScoreComponent {
+            source,
+            raw_score: -0.35,
+            normalized_score: 0.0,
+            rrf_contribution: 0.001,
+            weight: 0.3,
+        };
+        let json = serde_json::to_string(&component).unwrap();
+        let decoded: ScoreComponent = serde_json::from_str(&json).unwrap();
+        assert!((decoded.raw_score - (-0.35)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn many_components() {
+        let components: Vec<ScoreComponent> = (0..100)
+            .map(|i| ScoreComponent {
+                source: ExplainedSource::LexicalBm25 {
+                    matched_terms: vec![format!("term{i}")],
+                    tf: f64::from(i),
+                    idf: 1.0,
+                },
+                raw_score: f64::from(i),
+                normalized_score: f64::from(i) / 100.0,
+                rrf_contribution: 1.0 / (60.0 + f64::from(i) + 1.0),
+                weight: 0.3,
+            })
+            .collect();
+
+        let explanation = HitExplanation {
+            final_score: 0.5,
+            components,
+            phase: ExplanationPhase::Refined,
+            rank_movement: None,
+        };
+        assert_eq!(explanation.source_count(), 100);
+        assert!(explanation.total_rrf_contribution() > 0.0);
+
+        // Display should render all 100 components
+        let display = explanation.to_string();
+        assert!(display.contains("[99]"));
+    }
+
+    #[test]
+    fn serde_explanation_no_movement() {
+        let explanation = HitExplanation {
+            final_score: 0.0,
+            components: vec![],
+            phase: ExplanationPhase::Initial,
+            rank_movement: None,
+        };
+        let json = serde_json::to_string(&explanation).unwrap();
+        let decoded: HitExplanation = serde_json::from_str(&json).unwrap();
+        assert!(decoded.rank_movement.is_none());
+        assert_eq!(decoded.phase, ExplanationPhase::Initial);
+        assert!((decoded.final_score).abs() < f64::EPSILON);
+        assert!(decoded.components.is_empty());
+    }
+
+    // ─── bd-7fn8 tests end ───
 }

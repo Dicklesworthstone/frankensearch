@@ -1185,4 +1185,255 @@ mod tests {
         orch.report_corruption(corruption_event("vectors/shard_0.fsvi", 3000));
         assert_eq!(orch.unrepaired_artifact_count(), 1);
     }
+
+    // ─── bd-mxcb tests begin ───
+
+    #[test]
+    fn repair_outcome_is_success_for_all_variants() {
+        assert!(RepairOutcome::Success { symbols_used: 1 }.is_success());
+        assert!(
+            !RepairOutcome::InsufficientSymbols {
+                available: 1,
+                required: 5
+            }
+            .is_success()
+        );
+        assert!(!RepairOutcome::SidecarMissing.is_success());
+        assert!(!RepairOutcome::SidecarCorrupted.is_success());
+        assert!(
+            !RepairOutcome::Failed {
+                reason: "test".into()
+            }
+            .is_success()
+        );
+    }
+
+    #[test]
+    fn service_state_is_healthy_for_all_variants() {
+        assert!(ServiceState::Healthy.is_healthy());
+        assert!(
+            !ServiceState::Degraded {
+                entered_at: 0,
+                reason: DegradedReason::ActivationFailure {
+                    detail: String::new()
+                },
+            }
+            .is_healthy()
+        );
+        assert!(
+            !ServiceState::Suspended {
+                entered_at: 0,
+                reason: String::new(),
+            }
+            .is_healthy()
+        );
+    }
+
+    #[test]
+    fn service_state_is_suspended_for_all_variants() {
+        assert!(!ServiceState::Healthy.is_suspended());
+        assert!(
+            !ServiceState::Degraded {
+                entered_at: 0,
+                reason: DegradedReason::ActivationFailure {
+                    detail: String::new()
+                },
+            }
+            .is_suspended()
+        );
+        assert!(
+            ServiceState::Suspended {
+                entered_at: 0,
+                reason: String::new(),
+            }
+            .is_suspended()
+        );
+    }
+
+    #[test]
+    fn corruption_event_serde_roundtrip() {
+        let event = CorruptionEvent {
+            artifact_path: "vectors/shard_0.fsvi".into(),
+            detection_method: DetectionMethod::ChecksumMismatch,
+            detected_at: 12345,
+            detail: "byte 0x42 at offset 1024".into(),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: CorruptionEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn repair_attempt_serde_roundtrip() {
+        let attempt = RepairAttempt {
+            artifact_path: "lexical/segment_0".into(),
+            started_at: 1000,
+            completed_at: 1050,
+            outcome: RepairOutcome::Success { symbols_used: 7 },
+        };
+        let json = serde_json::to_string(&attempt).expect("serialize");
+        let back: RepairAttempt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn corruption_policy_serde_roundtrip() {
+        let policy = CorruptionPolicy {
+            max_corrupted_artifacts: 5,
+            max_repair_attempts_per_artifact: 10,
+            suspension_threshold: 8,
+            cooldown_after_suspension_ms: 120_000,
+        };
+        let json = serde_json::to_string(&policy).expect("serialize");
+        let back: CorruptionPolicy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(policy, back);
+    }
+
+    #[test]
+    fn corruption_policy_debug_and_clone() {
+        let policy = CorruptionPolicy::default();
+        let debug_str = format!("{policy:?}");
+        assert!(debug_str.contains("CorruptionPolicy"));
+        let cloned = policy.clone();
+        assert_eq!(policy, cloned);
+    }
+
+    #[test]
+    fn detection_method_copy() {
+        let method = DetectionMethod::PeriodicScan;
+        let copied = method; // Copy
+        assert_eq!(method, copied);
+    }
+
+    #[test]
+    fn try_recover_when_already_healthy_returns_true() {
+        let orch = RepairOrchestrator::default();
+        assert!(orch.try_recover(1000));
+        assert!(orch.state().is_healthy());
+    }
+
+    #[test]
+    fn degraded_to_suspended_transition() {
+        let policy = CorruptionPolicy {
+            max_corrupted_artifacts: 1,
+            suspension_threshold: 3,
+            ..Default::default()
+        };
+        let orch = RepairOrchestrator::new(policy);
+
+        // First: enter degraded via single corruption
+        orch.report_corruption(corruption_event("a.fsvi", 1000));
+        assert!(matches!(orch.state(), ServiceState::Degraded { .. }));
+
+        // Then: more corruptions push to suspended
+        orch.report_corruption(corruption_event("b.fsvi", 1001));
+        orch.report_corruption(corruption_event("c.fsvi", 1002));
+        assert!(orch.state().is_suspended());
+    }
+
+    #[test]
+    fn reset_while_suspended_restores_healthy() {
+        let orch = RepairOrchestrator::default();
+        orch.suspend("emergency".into(), 1000);
+        assert!(orch.state().is_suspended());
+
+        orch.reset();
+        assert!(orch.state().is_healthy());
+        assert_eq!(orch.corruption_count(), 0);
+        assert_eq!(orch.repair_attempt_count(), 0);
+    }
+
+    #[test]
+    fn repair_attempts_accessor_returns_history() {
+        let orch = RepairOrchestrator::default();
+        let manifest = sample_manifest();
+        let provider = AlwaysSucceedProvider;
+
+        orch.report_corruption(corruption_event("vectors/shard_0.fsvi", 1000));
+        orch.run_repair_cycle(&manifest, &provider, 2000);
+
+        let attempts = orch.repair_attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].artifact_path, "vectors/shard_0.fsvi");
+        assert!(attempts[0].outcome.is_success());
+    }
+
+    #[test]
+    fn default_orchestrator_uses_default_policy() {
+        let orch = RepairOrchestrator::default();
+        assert!(orch.state().is_healthy());
+
+        // Verify default policy thresholds by testing behavior
+        // Default: max_corrupted_artifacts=3, so 3 corruptions should trigger degraded
+        orch.report_corruption(corruption_event("a.fsvi", 1000));
+        orch.report_corruption(corruption_event("b.fsvi", 1001));
+        assert!(orch.state().is_healthy()); // 2 < 3
+        orch.report_corruption(corruption_event("c.fsvi", 1002));
+        assert!(!orch.state().is_healthy()); // 3 >= 3 → degraded
+    }
+
+    #[test]
+    fn suspension_reason_contains_threshold() {
+        let policy = CorruptionPolicy {
+            max_corrupted_artifacts: 1,
+            suspension_threshold: 2,
+            ..Default::default()
+        };
+        let orch = RepairOrchestrator::new(policy);
+
+        orch.report_corruption(corruption_event("a.fsvi", 1000));
+        orch.report_corruption(corruption_event("b.fsvi", 1001));
+
+        if let ServiceState::Suspended { reason, .. } = orch.state() {
+            assert!(
+                reason.contains('2'),
+                "suspension reason should contain threshold: {reason}"
+            );
+        } else {
+            panic!("expected Suspended state");
+        }
+    }
+
+    #[test]
+    fn corruption_event_debug_and_clone() {
+        let event = corruption_event("test.fsvi", 5000);
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("CorruptionEvent"));
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+    }
+
+    #[test]
+    fn repair_attempt_debug_and_clone() {
+        let attempt = RepairAttempt {
+            artifact_path: "test.fsvi".into(),
+            started_at: 100,
+            completed_at: 200,
+            outcome: RepairOutcome::SidecarCorrupted,
+        };
+        let debug_str = format!("{attempt:?}");
+        assert!(debug_str.contains("RepairAttempt"));
+        let cloned = attempt.clone();
+        assert_eq!(attempt, cloned);
+    }
+
+    #[test]
+    fn enter_degraded_overrides_current_state() {
+        let orch = RepairOrchestrator::default();
+
+        // Start suspended
+        orch.suspend("initial".into(), 1000);
+        assert!(orch.state().is_suspended());
+
+        // Enter degraded overrides suspended
+        orch.enter_degraded(
+            DegradedReason::ActivationFailure {
+                detail: "test".into(),
+            },
+            2000,
+        );
+        assert!(matches!(orch.state(), ServiceState::Degraded { .. }));
+    }
+
+    // ─── bd-mxcb tests end ───
 }
