@@ -105,12 +105,18 @@ is_advanced_ranking_control_issue() {
 
   haystack="$(printf '%s\n%s\n%s' "$labels_csv" "$title" "$description" | tr '[:upper:]' '[:lower:]')"
 
+  if grep -Eq '(^|,)(program|planning)(,|$)' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$labels_csv")" \
+    && ! grep -Eq '(^|,)(ranking|control|adaptive)(,|$)' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$labels_csv")"; then
+    echo "no"
+    return
+  fi
+
   if grep -Eq 'advanced ranking/control|ranking/control' <<<"$haystack"; then
     echo "yes"
     return
   fi
 
-  if grep -Eq '(^|,)(ranking|control|adaptive|composition)(,|$)' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$labels_csv")"; then
+  if grep -Eq '(^|,)(ranking|control|adaptive)(,|$)' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$labels_csv")"; then
     echo "yes"
     return
   fi

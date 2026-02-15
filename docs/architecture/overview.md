@@ -258,4 +258,61 @@ Core contract references:
 
 ## 10) Scope Notes
 
+## 11) Sprint 2 Release-Readiness Snapshot (`bd-3vw3`)
+
+Snapshot time: `2026-02-15T04:35Z` (from `br` + `bv --robot-*` outputs).
+
+### Gate Decision Records
+
+| Gate / Policy bead | Status | Closed at (UTC) | Decision record |
+|---|---|---|---|
+| `bd-ehuk` (release gate) | `closed` | `2026-02-15T03:44:03.768970671Z` | Close reason records that blocker dependencies were closed and interaction-matrix artifacts/tests/sign-off prerequisites were satisfied. |
+| `bd-1pkl` (composition-matrix policy gate) | `closed` | `2026-02-15T04:07:04.505835470Z` | Policy gate marked complete; required composition-linkage governance is now closed. |
+| `bd-ls2f` (reproducibility contract) | `closed` | `2026-02-15T03:42:53.427719531Z` | Close reason records `env.json` + `repro.lock` contract implementation plus validator-backed coverage. |
+
+`bd-3vw3` blocker check: `13/13` `blocks` dependencies are currently `closed`.
+
+### Composition Coverage Evidence
+
+| Coverage lane | Evidence surface | Replay/diagnostic contract |
+|---|---|---|
+| Unit interaction invariants | `crates/frankensearch-fusion/tests/interaction_unit.rs` | Deterministic lane/oracle assertions with stable lane IDs and reason codes. |
+| Integration interaction matrix | `crates/frankensearch-fusion/tests/interaction_integration.rs` | High-risk lane matrix emits replay-ready bundles and failure summaries. |
+| Multi-controller composition harness | `crates/frankensearch-fusion/tests/composition_harness.rs` | Deterministic fallback/ordering composition checks across controller combinations. |
+| Unified e2e artifact schema | `docs/e2e-artifact-contract.md` | Canonical `manifest.json`, `env.json`, `repro.lock`, `replay_command.txt`, plus CI interaction-matrix gate expectations. |
+
+### Risk Ledger, Known Limitations, and Fallback Playbooks
+
+| Risk ID | Residual limitation | Mitigation / fallback playbook |
+|---|---|---|
+| `R-01` | Active downstream delivery tracks still open (`bd-2hz`, `bd-2yu.8`, `bd-2w7x.12`). | Use `bv --robot-next`/`--robot-triage` to prioritize unblockers; keep strict bead claiming + reservation discipline. |
+| `R-02` | Not all producer lanes are in `adopted` state under the unified artifact contract yet. | Treat `docs/e2e-artifact-contract.md` as source of truth; require replay bundle completeness (`manifest/env/repro/replay`) on failing lanes. |
+| `R-03` | Progressive search quality lane can degrade under timeout/failure conditions. | Preserve `Initial` phase UX and route through explicit degradation paths (`SearchPhase::RefinementFailed`, `fast_only`, `skip_reason`). |
+
+### Dependency-Graph Health Revalidation (`bv`)
+
+| Metric | Value |
+|---|---|
+| Open issues | `23` |
+| Actionable issues | `19` |
+| Blocked issues | `4` |
+| In-progress issues | `12` |
+| Cycle count | `0` |
+| Health trend | `improving` |
+
+Current highest-impact unblock candidates remain single-hop unblockers (`bd-2hz`, `bd-2w7x.12`, `bd-2yu.8`), each directly unblocking one downstream item.
+
+### Sprint Retrospective Delta (`bv --robot-diff --diff-since HEAD~30`)
+
+| Delta metric | Value |
+|---|---|
+| Open issue delta | `-20` |
+| Closed issue delta | `+88` |
+| Blocked issue delta | `0` |
+| Issues closed in diff window | `22` |
+| Backlog health trend | `improving` |
+| Regression-gate proxy (`bv --robot-alerts`) | `0 alerts` (`critical=0`, `warning=0`) |
+
+This release-readiness snapshot closes the Sprint-2 composition hardening bookkeeping loop by linking gate decisions, deterministic interaction coverage, artifact/replay requirements, and graph-health deltas in one auditable location.
+
 This document is intentionally a high-signal architecture map, not a full API reference. Detailed behavior, config invariants, and integration rules live in crate-level docs and the contracts under `docs/`.

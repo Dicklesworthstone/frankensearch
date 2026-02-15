@@ -641,7 +641,7 @@ host-specific env var drift.
 | Two-tier blending | [`crates/frankensearch-fusion/src/blend.rs`](crates/frankensearch-fusion/src/blend.rs) | Fast/quality score normalization and blending |
 | Two-tier index wrapper | [`crates/frankensearch-index/src/two_tier.rs`](crates/frankensearch-index/src/two_tier.rs) | Fast/quality index alignment and lookup |
 | Top-k vector search | [`crates/frankensearch-index/src/search.rs`](crates/frankensearch-index/src/search.rs) | Heap-based top-k selection and scoring paths |
-| On-disk vector format | [`crates/frankensearch-index/src/fsvi.rs`](crates/frankensearch-index/src/fsvi.rs) | FSVI format, quantization, mmap reads |
+| On-disk vector format | [`crates/frankensearch-index/src/format.rs`](crates/frankensearch-index/src/format.rs) | FSVI format, quantization, mmap reads |
 | Core config knobs | [`crates/frankensearch-core/src/config.rs`](crates/frankensearch-core/src/config.rs) | `TwoTierConfig`, defaults, env overrides |
 | Core result types | [`crates/frankensearch-core/src/types.rs`](crates/frankensearch-core/src/types.rs) | `SearchPhase`, `ScoredResult`, hit structs |
 | Query classification | [`crates/frankensearch-core/src/query_class.rs`](crates/frankensearch-core/src/query_class.rs) | Query-type detection and adaptive budgets |

@@ -2611,7 +2611,7 @@ fn evaluate_slo_window(
             metric_name: "query_failure_rate".to_owned(),
             baseline_value: baseline,
             observed_value: error_budget_burn,
-            deviation_ratio: if baseline == 0.0 {
+            deviation_ratio: if baseline.abs() <= f64::EPSILON {
                 0.0
             } else {
                 (error_budget_burn - baseline) / baseline
@@ -2631,7 +2631,7 @@ fn evaluate_slo_window(
             metric_name: "search_latency_p95".to_owned(),
             baseline_value: baseline,
             observed_value: observed,
-            deviation_ratio: if baseline == 0.0 {
+            deviation_ratio: if baseline.abs() <= f64::EPSILON {
                 0.0
             } else {
                 (observed - baseline) / baseline

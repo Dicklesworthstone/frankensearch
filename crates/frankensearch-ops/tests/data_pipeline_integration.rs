@@ -362,6 +362,112 @@ fn pipeline_recovers_after_backpressure_rejection() {
 }
 
 #[test]
+fn pipeline_ingest_batch_is_idempotent_for_duplicate_replays() {
+    let simulator =
+        TelemetrySimulator::new(pipeline_config(4_242)).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+
+    let first_batch = run.batches.first().expect("run should include first batch");
+    let first_records: Vec<_> = first_batch
+        .search_events
+        .iter()
+        .map(|event| event.record.clone())
+        .collect();
+    assert!(
+        !first_records.is_empty(),
+        "expected first batch to include search events"
+    );
+
+    let initial_result = storage
+        .ingest_search_events_batch(&first_records, 8_192)
+        .expect("initial ingest should succeed");
+    assert_eq!(initial_result.requested, first_records.len());
+    assert_eq!(initial_result.inserted, first_records.len());
+    assert_eq!(initial_result.deduplicated, 0);
+    assert_eq!(initial_result.failed, 0);
+    assert_eq!(initial_result.queue_depth_before, 0);
+    assert_eq!(initial_result.queue_depth_after, 0);
+
+    let replay_result = storage
+        .ingest_search_events_batch(&first_records, 8_192)
+        .expect("duplicate replay should be deduplicated");
+    assert_eq!(replay_result.requested, first_records.len());
+    assert_eq!(replay_result.inserted, 0);
+    assert_eq!(replay_result.deduplicated, first_records.len());
+    assert_eq!(replay_result.failed, 0);
+    assert_eq!(replay_result.queue_depth_before, 0);
+    assert_eq!(replay_result.queue_depth_after, 0);
+
+    let metrics = storage.ingestion_metrics();
+    assert_eq!(metrics.total_batches, 2);
+    assert_eq!(
+        metrics.total_inserted,
+        u64::try_from(first_records.len()).expect("len should fit into u64")
+    );
+    assert_eq!(
+        metrics.total_deduplicated,
+        u64::try_from(first_records.len()).expect("len should fit into u64")
+    );
+    assert_eq!(metrics.total_failed_records, 0);
+    assert_eq!(metrics.pending_events, 0);
+    assert!(
+        metrics.high_watermark_pending_events >= first_records.len(),
+        "expected high-watermark to reflect reserved queue depth"
+    );
+}
+
+#[test]
+fn pipeline_resource_sample_upsert_updates_existing_key() {
+    let simulator =
+        TelemetrySimulator::new(pipeline_config(5_150)).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+
+    let first_batch = run.batches.first().expect("run should include first batch");
+    let original = first_batch
+        .resource_samples
+        .first()
+        .cloned()
+        .expect("first batch should include resource samples");
+
+    storage
+        .upsert_resource_sample(&original)
+        .expect("initial upsert should succeed");
+
+    let mut updated = original.clone();
+    updated.rss_bytes = Some(original.rss_bytes.unwrap_or(0).saturating_add(1_024));
+    updated.io_read_bytes = Some(original.io_read_bytes.unwrap_or(0).saturating_add(2_048));
+    updated.io_write_bytes = Some(original.io_write_bytes.unwrap_or(0).saturating_add(4_096));
+    updated.queue_depth = Some(original.queue_depth.unwrap_or(0).saturating_add(9));
+    storage
+        .upsert_resource_sample(&updated)
+        .expect("update upsert should overwrite existing key");
+
+    let trend = storage
+        .query_resource_trend(
+            &updated.project_key,
+            &updated.instance_id,
+            SummaryWindow::OneMinute,
+            updated.ts_ms,
+            8,
+        )
+        .expect("resource trend query should succeed");
+    assert_eq!(
+        trend.len(),
+        1,
+        "expected upsert key collision to update one row, not create duplicates"
+    );
+
+    let point = trend.first().expect("trend should include updated point");
+    assert_eq!(point.ts_ms, updated.ts_ms);
+    assert_eq!(point.rss_bytes, updated.rss_bytes);
+    assert_eq!(point.io_read_bytes, updated.io_read_bytes);
+    assert_eq!(point.io_write_bytes, updated.io_write_bytes);
+    assert_eq!(point.queue_depth, updated.queue_depth);
+}
+
+#[test]
 fn pipeline_performance_entrypoint_enforces_deterministic_budgets() {
     let config = TelemetrySimulatorConfig {
         seed: 777,

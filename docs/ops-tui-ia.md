@@ -310,6 +310,71 @@ If rollout gate fails:
 
 Rollback is complete only when the project returns to known-good telemetry and all blocking alerts are resolved or downgraded with explicit rationale.
 
+### F) Operator Usability Pilot Protocol (`bd-2yu.9.3`)
+
+Use this protocol to run the required operator usability pilot and convert outcomes into concrete defaults/runbook updates.
+
+#### F.1 Pilot Scope and Participant Matrix
+
+Run at least one scenario pass per host profile:
+
+| Host profile | Required scenario focus | Minimum participants |
+|---|---|---|
+| `coding_agent_session_search` | incident triage + replay confirmation | 2 |
+| `xf` | high-volume throughput spike analysis | 2 |
+| `mcp_agent_mail_rust` | concurrent query degradation diagnosis | 2 |
+| `frankenterm` (if enabled) | interactive latency + explainability navigation | 1 |
+
+#### F.2 Scenario Script (Required)
+
+Each participant executes all three scenarios with only this runbook + TUI:
+
+1. Incident triage:
+   - identify failing project from `fleet_overview`,
+   - isolate first failure reason in `alerts_timeline`,
+   - produce a candidate mitigation and supporting evidence path.
+2. Index lag diagnosis:
+   - confirm lag in `index_embed_progress`,
+   - correlate with `resource_trends`/`historical_analytics`,
+   - classify as ingestion bottleneck vs host pressure.
+3. Throughput spike analysis:
+   - detect spike from `live_search_stream`,
+   - validate ordering/fallback behavior in `explainability_cockpit`,
+   - produce go/no-go recommendation for rollout progression.
+
+#### F.3 Quantitative Checkpoints
+
+Capture these metrics for every scenario run:
+
+| Metric | Definition | Target |
+|---|---|---|
+| `time_to_detection_s` | scenario start -> impacted project identified | `<= 90s` |
+| `time_to_diagnosis_s` | scenario start -> root cause classification | `<= 300s` |
+| `navigation_error_count` | wrong screen/hotkey transitions requiring backtrack | `<= 2` |
+| `runbook_lookup_count` | number of times operator needed to re-open help/runbook | `<= 3` |
+| `replay_success_rate` | successful `replay_command.txt` executions | `100%` |
+| `operator_confidence` | post-scenario self-rating (1-5) | `>= 4.0` average |
+
+#### F.4 Findings-to-Defaults Traceability (Required Artifact)
+
+Record every pilot finding using this mapping table:
+
+| Finding ID | Scenario | Surface | Finding | Default/UX change | Doc update | Validation evidence |
+|---|---|---|---|---|---|---|
+| `pilot-<n>` | `incident|lag|throughput` | screen or hotkey path | observed friction/error | exact default/keybinding/text update | runbook section changed | artifact path + replay command |
+
+No finding may be marked complete without both a product/default change decision and a docs/runbook update (or an explicit rejected-with-rationale note).
+
+#### F.5 Post-Pilot Closure Checklist
+
+Before closing `bd-2yu.9.3`, confirm:
+
+1. Pilot data covers all required scenarios and host profiles.
+2. Quantitative checkpoint table is filled with measured values and pass/fail per target.
+3. Each accepted finding has a linked change in defaults, IA wording, or keybinding/help text.
+4. Runbook sections A-E reflect final tuned workflow (no stale instructions).
+5. Artifact bundle references are recorded (manifest/env/repro/replay) for independent verification.
+
 ## Downstream Implementation Boundaries
 
 This spec is now authoritative for:
