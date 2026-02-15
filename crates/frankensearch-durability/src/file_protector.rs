@@ -465,7 +465,7 @@ impl FileProtector {
                 });
             }
 
-            fs::write(path, [])?;
+            write_durable(path, &[])?;
             self.metrics.record_repair_success();
             info!(
                 path = %path.display(),
@@ -514,7 +514,7 @@ impl FileProtector {
                             let data = normalize_recovered_data(data, &header)?;
                             let recovered_crc32 = crc32fast::hash(&data);
                             if recovered_crc32 == header.source_crc32 {
-                                fs::write(path, &data)?;
+                                write_durable(path, &data)?;
                                 self.metrics.record_repair_success();
                                 info!(
                                     path = %path.display(),
@@ -580,7 +580,7 @@ impl FileProtector {
                     });
                 }
 
-                fs::write(path, &data)?;
+                write_durable(path, &data)?;
                 self.metrics.record_repair_success();
                 info!(
                     path = %path.display(),
@@ -1153,12 +1153,21 @@ fn should_rotate(log_path: &Path, max_entries: usize) -> std::io::Result<bool> {
 }
 
 fn append_to_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     file.write_all(data)?;
+    Ok(())
+}
+
+/// Write `data` to `path` and fsync before returning so the content is
+/// durable even under sudden power loss.  Used for repair outputs and
+/// other writes where silent data loss would be unacceptable.
+fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
     Ok(())
 }
 
