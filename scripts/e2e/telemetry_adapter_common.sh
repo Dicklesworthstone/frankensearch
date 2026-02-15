@@ -10,6 +10,7 @@ TELEMETRY_ADAPTER_RUN_MESSAGE=""
 TELEMETRY_ADAPTER_RUN_REASON_CODE="telemetry_adapter.session.ok"
 TELEMETRY_ADAPTER_LAST_FAILURE_STAGE=""
 TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE=""
+TELEMETRY_ADAPTER_ACTIVE_STAGE=""
 TELEMETRY_ADAPTER_EXECUTION_MODE="live"
 
 telemetry_adapter_escape_json() {
@@ -70,11 +71,13 @@ telemetry_adapter_init() {
   local mode="$2"
   local replay_command="$3"
   local stamp
+  local epoch_ns
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  epoch_ns="$(date -u +%s%N 2>/dev/null || printf "%s000000000" "$(date -u +%s)")"
 
   TELEMETRY_ADAPTER_HOST="$host"
   TELEMETRY_ADAPTER_MODE="$mode"
-  TELEMETRY_ADAPTER_RUN_ID="${host}-${mode}-${stamp}"
+  TELEMETRY_ADAPTER_RUN_ID="${host}-${mode}-${stamp}-${epoch_ns}-$$"
   TELEMETRY_ADAPTER_RUN_DIR="${TELEMETRY_ADAPTER_LOG_ROOT}/${TELEMETRY_ADAPTER_RUN_ID}"
   TELEMETRY_ADAPTER_EVENTS_JSONL="${TELEMETRY_ADAPTER_RUN_DIR}/structured_events.jsonl"
   TELEMETRY_ADAPTER_TRANSCRIPT_TXT="${TELEMETRY_ADAPTER_RUN_DIR}/terminal_transcript.txt"
@@ -119,6 +122,8 @@ telemetry_adapter_run_rch_cargo() {
   local duration_s
   local exit_code
 
+  TELEMETRY_ADAPTER_ACTIVE_STAGE="$stage"
+
   telemetry_adapter_emit_event \
     "$stage" \
     "started" \
@@ -133,6 +138,7 @@ telemetry_adapter_run_rch_cargo() {
       "telemetry_adapter.stage.skipped_dry_run" \
       "dry-run: skipped command execution"
     printf '[%s] dry-run: skipped command execution\n' "$stage" >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
+    TELEMETRY_ADAPTER_ACTIVE_STAGE=""
     return 0
   fi
 
@@ -148,6 +154,7 @@ telemetry_adapter_run_rch_cargo() {
       "ok" \
       "telemetry_adapter.stage.ok" \
       "completed in ${duration_s}s"
+    TELEMETRY_ADAPTER_ACTIVE_STAGE=""
     return 0
   fi
 
@@ -164,6 +171,7 @@ telemetry_adapter_run_rch_cargo() {
     "fail" \
     "telemetry_adapter.stage.failed" \
     "exit_code=${exit_code} duration_s=${duration_s}"
+  TELEMETRY_ADAPTER_ACTIVE_STAGE=""
   return "$exit_code"
 }
 
@@ -238,12 +246,39 @@ telemetry_adapter_on_exit() {
     return 0
   fi
 
-  local failed_stage="${TELEMETRY_ADAPTER_LAST_FAILURE_STAGE:-unknown-stage}"
+  local failed_stage="${TELEMETRY_ADAPTER_LAST_FAILURE_STAGE:-${TELEMETRY_ADAPTER_ACTIVE_STAGE:-unknown-stage}}"
   local failed_exit="${TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE:-$exit_code}"
+  local fail_reason="${TELEMETRY_ADAPTER_RUN_REASON_CODE}"
+  if [[ "$fail_reason" == "telemetry_adapter.session.ok" ]]; then
+    fail_reason="telemetry_adapter.session.failed"
+  fi
   local fail_message="${TELEMETRY_ADAPTER_RUN_MESSAGE:-stage ${failed_stage} failed (exit_code=${failed_exit})}"
-  telemetry_adapter_finalize "fail" "$fail_message" "$TELEMETRY_ADAPTER_RUN_REASON_CODE"
+  telemetry_adapter_finalize "fail" "$fail_message" "$fail_reason"
+}
+
+telemetry_adapter_on_signal() {
+  local signal_name="$1"
+  local signal_exit_code="$2"
+  local interrupted_stage="${TELEMETRY_ADAPTER_ACTIVE_STAGE:-unknown-stage}"
+
+  TELEMETRY_ADAPTER_LAST_FAILURE_STAGE="$interrupted_stage"
+  TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE="$signal_exit_code"
+  TELEMETRY_ADAPTER_RUN_STATUS="fail"
+  TELEMETRY_ADAPTER_RUN_REASON_CODE="telemetry_adapter.session.interrupted"
+  TELEMETRY_ADAPTER_RUN_MESSAGE="received ${signal_name} during stage ${interrupted_stage} (exit_code=${signal_exit_code})"
+
+  telemetry_adapter_emit_event \
+    "session.interrupted" \
+    "fail" \
+    "telemetry_adapter.session.interrupted" \
+    "signal=${signal_name} stage=${interrupted_stage} exit_code=${signal_exit_code}"
+
+  exit "$signal_exit_code"
 }
 
 telemetry_adapter_install_exit_trap() {
+  trap 'telemetry_adapter_on_signal INT 130' INT
+  trap 'telemetry_adapter_on_signal TERM 143' TERM
+  trap 'telemetry_adapter_on_signal HUP 129' HUP
   trap 'telemetry_adapter_on_exit "$?"' EXIT
 }

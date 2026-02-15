@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, ErrorKind, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,7 @@ use frankensearch_index::VectorIndex;
 use frankensearch_lexical::{SnippetConfig, TantivyIndex};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sysinfo::Disks;
 use tracing::{info, warn};
 
@@ -800,26 +801,103 @@ fn download_release_asset(url: &str, dest: &Path) -> SearchResult<()> {
     Ok(())
 }
 
-/// Compute SHA-256 hex digest of a file using `sha256sum`.
+/// Compute SHA-256 hex digest of a file.
 fn compute_sha256_of_file(path: &Path) -> SearchResult<String> {
-    let output = std::process::Command::new("sha256sum")
-        .arg(path)
+    let file = fs::File::open(path).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.update.sha256",
+        source: Box::new(e),
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| SearchError::SubsystemError {
+                subsystem: "fsfs.update.sha256",
+                source: Box::new(e),
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn create_secure_update_temp_dir() -> SearchResult<PathBuf> {
+    let base = std::env::temp_dir();
+    for attempt in 0..32_u8 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let candidate = base.join(format!(
+            "fsfs-update-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) => {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.update.tempdir",
+                    source: Box::new(error),
+                });
+            }
+        }
+    }
+    Err(SearchError::InvalidConfig {
+        field: "update.tempdir".into(),
+        value: base.display().to_string(),
+        reason: "failed to allocate a unique temporary directory".into(),
+    })
+}
+
+fn archive_entry_path_is_safe(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return false;
+    }
+    !path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn validate_tar_archive_paths(archive_path: &Path) -> SearchResult<()> {
+    let listing = std::process::Command::new("tar")
+        .args(["-tJf"])
+        .arg(archive_path)
         .output()
         .map_err(|e| SearchError::SubsystemError {
-            subsystem: "fsfs.update.sha256",
+            subsystem: "fsfs.update.tar_list",
             source: Box::new(e),
         })?;
 
-    if !output.status.success() {
-        return Err(SearchError::SubsystemError {
-            subsystem: "fsfs.update.sha256",
-            source: Box::new(std::io::Error::other("sha256sum failed")),
+    if !listing.status.success() {
+        return Err(SearchError::InvalidConfig {
+            field: "update.extract".into(),
+            value: archive_path.display().to_string(),
+            reason: "could not enumerate archive entries before extraction".into(),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let hash = stdout.split_whitespace().next().unwrap_or("").to_owned();
-    Ok(hash)
+    let entries = String::from_utf8_lossy(&listing.stdout);
+    for entry in entries.lines() {
+        if !archive_entry_path_is_safe(entry) {
+            return Err(SearchError::InvalidConfig {
+                field: "update.extract".into(),
+                value: archive_path.display().to_string(),
+                reason: format!("archive contains unsafe path entry: {entry}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Detect the platform target triple for asset naming.
@@ -1956,11 +2034,7 @@ impl FsfsRuntime {
         let asset_url = release_asset_url(&tag, &triple);
         let checksum_url = release_checksum_url(&tag, &triple);
 
-        let temp_dir = std::env::temp_dir().join("fsfs-update");
-        fs::create_dir_all(&temp_dir).map_err(|e| SearchError::SubsystemError {
-            subsystem: "fsfs.update.tempdir",
-            source: Box::new(e),
-        })?;
+        let temp_dir = create_secure_update_temp_dir()?;
 
         let archive_path = temp_dir.join(format!("fsfs-{triple}.tar.xz"));
         let checksum_path = temp_dir.join(format!("fsfs-{triple}.tar.xz.sha256"));
@@ -1990,6 +2064,8 @@ impl FsfsRuntime {
             }
             notes.push("SHA-256 checksum verified".into());
         }
+
+        validate_tar_archive_paths(&archive_path)?;
 
         // Extract binary from the tar.xz archive.
         let extract_dir = temp_dir.join("extract");
@@ -5185,10 +5261,15 @@ fn render_update_table(payload: &FsfsUpdatePayload, no_color: bool) -> String {
 
 /// Recursively search up to 2 levels deep for an extracted binary.
 fn find_extracted_binary(dir: &Path, name: &str) -> SearchResult<PathBuf> {
+    let canonical_root = fs::canonicalize(dir).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.update.extract",
+        source: Box::new(e),
+    })?;
+
     // Check top level first.
     let direct = dir.join(name);
-    if direct.is_file() {
-        return Ok(direct);
+    if let Some(path) = extracted_binary_candidate_if_safe(&canonical_root, &direct) {
+        return Ok(path);
     }
     // Check one level deeper.
     if let Ok(entries) = fs::read_dir(dir) {
@@ -5196,8 +5277,9 @@ fn find_extracted_binary(dir: &Path, name: &str) -> SearchResult<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 let candidate = path.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
+                if let Some(path) = extracted_binary_candidate_if_safe(&canonical_root, &candidate)
+                {
+                    return Ok(path);
                 }
             }
         }
@@ -5207,6 +5289,19 @@ fn find_extracted_binary(dir: &Path, name: &str) -> SearchResult<PathBuf> {
         value: dir.display().to_string(),
         reason: format!("could not find '{name}' binary in extracted archive"),
     })
+}
+
+fn extracted_binary_candidate_if_safe(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let metadata = fs::symlink_metadata(candidate).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let canonical_candidate = fs::canonicalize(candidate).ok()?;
+    if canonical_candidate.starts_with(root) {
+        Some(canonical_candidate)
+    } else {
+        None
+    }
 }
 
 fn render_uninstall_table(payload: &FsfsUninstallPayload, no_color: bool) -> String {
@@ -7630,6 +7725,37 @@ mod tests {
     }
 
     #[test]
+    fn archive_entry_path_is_safe_accepts_normal_relative_paths() {
+        assert!(super::archive_entry_path_is_safe(
+            "fsfs-x86_64-unknown-linux-musl/fsfs"
+        ));
+        assert!(super::archive_entry_path_is_safe("bin/fsfs"));
+        assert!(super::archive_entry_path_is_safe("nested/path/"));
+    }
+
+    #[test]
+    fn archive_entry_path_is_safe_rejects_escape_paths() {
+        assert!(!super::archive_entry_path_is_safe("../etc/passwd"));
+        assert!(!super::archive_entry_path_is_safe("/tmp/owned"));
+    }
+
+    #[test]
+    fn compute_sha256_of_file_matches_known_value() {
+        let dir = std::env::temp_dir().join("fsfs_test_sha256_file");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("payload.txt");
+        fs::write(&path, b"abc").unwrap();
+
+        let hash = super::compute_sha256_of_file(&path).unwrap();
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn find_extracted_binary_direct() {
         let dir = std::env::temp_dir().join("fsfs_test_extract_direct");
         let _ = fs::create_dir_all(&dir);
@@ -7658,6 +7784,22 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let result = super::find_extracted_binary(&dir, "fsfs");
         assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_extracted_binary_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("fsfs_test_extract_symlink");
+        let _ = fs::create_dir_all(&dir);
+        let external = dir.join("external-target");
+        fs::write(&external, b"fake-binary").unwrap();
+        symlink(&external, dir.join("fsfs")).unwrap();
+
+        let result = super::find_extracted_binary(&dir, "fsfs");
+        assert!(result.is_err(), "symlink should be rejected");
         let _ = fs::remove_dir_all(&dir);
     }
 

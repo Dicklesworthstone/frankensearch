@@ -1049,11 +1049,53 @@ impl std::fmt::Debug for TwoTierSearcher {
 }
 
 fn next_telemetry_identifier(prefix: &str) -> String {
+    const CROCKFORD_BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    const TIMESTAMP_SHIFTS: [u32; 10] = [45, 40, 35, 30, 25, 20, 15, 10, 5, 0];
+    const RANDOM_SHIFTS: [u32; 16] = [75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5, 0];
+
+    let _ = prefix;
+
+    // ULID timestamp component is 48 bits of milliseconds since Unix epoch.
+    let timestamp_ms = telemetry_timestamp_ms() & 0x0000_FFFF_FFFF_FFFF;
+
+    // Deterministic, process-local entropy for uniqueness without extra deps.
     let sequence = TELEMETRY_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{sequence:020}")
+    let pid = u64::from(std::process::id());
+    let entropy = sequence ^ timestamp_ms.rotate_left(17) ^ (pid << 32);
+
+    let pid_low16 = u16::try_from(pid % (u64::from(u16::MAX) + 1)).unwrap_or_default();
+    let mut random_bytes = [0_u8; 10];
+    random_bytes[..2].copy_from_slice(&pid_low16.to_be_bytes());
+    random_bytes[2..].copy_from_slice(&entropy.to_be_bytes());
+
+    let random_component = random_bytes
+        .iter()
+        .fold(0_u128, |acc, byte| (acc << 8) | u128::from(*byte));
+
+    let mut id = String::with_capacity(26);
+    for shift in TIMESTAMP_SHIFTS {
+        let index = usize::try_from((timestamp_ms >> shift) & 0x1F).unwrap_or_default();
+        id.push(char::from(CROCKFORD_BASE32[index]));
+    }
+    for shift in RANDOM_SHIFTS {
+        let index = usize::try_from((random_component >> shift) & 0x1F).unwrap_or_default();
+        id.push(char::from(CROCKFORD_BASE32[index]));
+    }
+
+    id
 }
 
 const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
+
+fn telemetry_timestamp_ms() -> u64 {
+    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    if nanos <= 0 {
+        return 0;
+    }
+    let nanos_u128 = u128::try_from(nanos).unwrap_or_default();
+    let millis = nanos_u128 / 1_000_000;
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
 
 fn telemetry_timestamp_now() -> String {
     OffsetDateTime::now_utc()
@@ -1263,6 +1305,23 @@ mod tests {
     };
 
     use super::*;
+
+    fn is_valid_ulid_like(candidate: &str) -> bool {
+        if candidate.len() != 26 {
+            return false;
+        }
+        candidate.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'A'..=b'H'
+                    | b'J'..=b'K'
+                    | b'M'..=b'N'
+                    | b'P'..=b'T'
+                    | b'V'..=b'Z'
+            )
+        })
+    }
 
     #[test]
     fn scaled_budget_clamps_positive_budget_to_at_least_one() {
@@ -2517,22 +2576,24 @@ mod tests {
                 )
             };
             assert!(
-                !initial_event_id.is_empty(),
-                "initial event id should be present"
+                is_valid_ulid_like(&initial_event_id),
+                "initial event id should be ULID-like"
             );
             assert!(
-                !root_request_id.is_empty(),
-                "root request id should be present"
+                is_valid_ulid_like(&root_request_id),
+                "root request id should be ULID-like"
             );
 
             let saw_refined_event = {
                 let (correlation, query) = search_events[1];
                 assert_eq!(query.phase, SearchEventPhase::Refined);
+                assert!(is_valid_ulid_like(&correlation.event_id));
                 assert_eq!(correlation.root_request_id, root_request_id);
                 assert_eq!(
                     correlation.parent_event_id.as_deref(),
                     Some(initial_event_id.as_str())
                 );
+                assert_ne!(correlation.event_id, initial_event_id);
                 true
             };
             assert!(saw_refined_event, "second event should be a search event");
@@ -2564,7 +2625,12 @@ mod tests {
             let search_events: Vec<_> = events
                 .iter()
                 .filter_map(|event| match &event.event {
-                    TelemetryEvent::Search { query, results, .. } => Some((query, results)),
+                    TelemetryEvent::Search {
+                        correlation,
+                        query,
+                        results,
+                        ..
+                    } => Some((correlation, query, results)),
                     _ => None,
                 })
                 .collect();
@@ -2574,21 +2640,29 @@ mod tests {
                 "expected initial + refinement_failed search events"
             );
 
-            let initial_result_count = {
-                let (query, results) = search_events[0];
+            let (initial_event_id, root_request_id, initial_result_count) = {
+                let (correlation, query, results) = search_events[0];
                 assert_eq!(query.phase, SearchEventPhase::Initial);
-                Some(results.result_count)
+                assert!(is_valid_ulid_like(&correlation.event_id));
+                assert!(is_valid_ulid_like(&correlation.root_request_id));
+                (
+                    correlation.event_id.clone(),
+                    correlation.root_request_id.clone(),
+                    results.result_count,
+                )
             };
-            assert!(
-                initial_result_count.is_some(),
-                "first event should be a search event"
-            );
-            let initial_result_count = initial_result_count.unwrap_or_default();
 
             let saw_refinement_failed = {
-                let (query, results) = search_events[1];
+                let (correlation, query, results) = search_events[1];
                 assert_eq!(query.phase, SearchEventPhase::RefinementFailed);
                 assert_eq!(results.result_count, initial_result_count);
+                assert!(is_valid_ulid_like(&correlation.event_id));
+                assert_eq!(correlation.root_request_id, root_request_id);
+                assert_eq!(
+                    correlation.parent_event_id.as_deref(),
+                    Some(initial_event_id.as_str())
+                );
+                assert_ne!(correlation.event_id, initial_event_id);
                 true
             };
             assert!(
@@ -3195,19 +3269,23 @@ mod tests {
     }
 
     #[test]
-    fn next_telemetry_identifier_has_prefix_and_is_unique() {
+    fn next_telemetry_identifier_is_ulid_like_and_unique() {
         let id1 = next_telemetry_identifier("root");
         let id2 = next_telemetry_identifier("root");
-        assert!(id1.starts_with("root-"));
-        assert!(id2.starts_with("root-"));
+        assert!(is_valid_ulid_like(&id1));
+        assert!(is_valid_ulid_like(&id2));
         assert_ne!(id1, id2);
     }
 
     #[test]
-    fn next_telemetry_identifier_sequence_is_zero_padded() {
+    fn next_telemetry_identifier_is_uppercase_crockford_base32() {
         let id = next_telemetry_identifier("evt");
-        let suffix = id.strip_prefix("evt-").expect("should have prefix");
-        assert_eq!(suffix.len(), 20, "sequence number should be 20 digits");
+        assert_eq!(id.len(), 26, "ULID identifiers are 26 chars");
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()),
+            "generated identifier should use uppercase Crockford base32"
+        );
     }
 
     #[test]

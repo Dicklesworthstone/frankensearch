@@ -38,28 +38,39 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Prepare path dependencies under /dp
+      - name: Prepare path dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo mkdir -p /dp
-          sudo chown -R "$USER":"$(id -gn)" /dp
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
 
           clone_or_update() {
             local repo_url="$1"
             local dest_path="$2"
+            local ref="$3"
             if [[ -d "${dest_path}/.git" ]]; then
-              git -C "${dest_path}" fetch --depth 1 origin main
-              git -C "${dest_path}" checkout main
-              git -C "${dest_path}" pull --ff-only origin main
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             else
-              git clone --depth 1 "${repo_url}" "${dest_path}"
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
           }
 
-          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
-          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
-          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+          # Clone as siblings of the checkout (../asupersync relative path),
+          # pinned to explicit commits for reproducible CI.
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          # Cargo.toml files reference /data/projects/<dep> (local dev path).
+          # Rewrite those absolute paths to point at the sibling clones for CI.
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
+          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -98,6 +109,57 @@ jobs:
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+
+      - name: Telemetry adapter dry-run lane smoke
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf test_logs/telemetry_adapters
+          mkdir -p test_logs/telemetry_adapters
+
+          declare -a lanes=(
+            "cass scripts/e2e/telemetry_adapter_cass.sh"
+            "xf scripts/e2e/telemetry_adapter_xf.sh"
+            "mcp_agent_mail_rust scripts/e2e/telemetry_adapter_agent_mail.sh"
+          )
+
+          for lane in "${lanes[@]}"; do
+            host="${lane%% *}"
+            script="${lane#* }"
+
+            bash "${script}" --mode all --dry-run
+
+            run_dir="$(ls -1dt "test_logs/telemetry_adapters/${host}-all-"* 2>/dev/null | head -n1 || true)"
+            if [[ -z "${run_dir}" ]]; then
+              echo "Missing telemetry adapter run directory for host=${host}" >&2
+              exit 1
+            fi
+
+            for artifact in manifest.json summary.json summary.md structured_events.jsonl replay_command.txt terminal_transcript.txt; do
+              if [[ ! -f "${run_dir}/${artifact}" ]]; then
+                echo "Missing artifact ${artifact} for host=${host} run=${run_dir}" >&2
+                exit 1
+              fi
+            done
+
+            jq -e \
+              --arg host "${host}" \
+              '.schema == "telemetry-adapter-e2e-manifest-v1" and .v == 1 and .host == $host and .execution_mode == "dry" and .status == "ok"' \
+              "${run_dir}/manifest.json" >/dev/null
+
+            jq -e \
+              --arg host "${host}" \
+              '.host == $host and .execution_mode == "dry" and .status == "ok" and (.reason_code | length > 0)' \
+              "${run_dir}/summary.json" >/dev/null
+
+            jq -s -e '
+              length >= 2 and
+              all(.[]; .schema == "telemetry-adapter-e2e-event-v1") and
+              any(.[]; .body.stage == "session.init" and .body.status == "ok") and
+              any(.[]; .body.stage == "session.finalize" and .body.status == "ok")
+            ' "${run_dir}/structured_events.jsonl" >/dev/null
+          done
 
       - name: Install JSON schema validator
         if: matrix.os == 'ubuntu-latest'
@@ -161,6 +223,7 @@ jobs:
               {"id":"integration","required":true,"lane":"cargo test --workspace"},
               {"id":"snapshot","required":true,"status":"pending","bead":"bd-2yu.8.3"},
               {"id":"e2e","required":true,"lane":"cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture"},
+              {"id":"telemetry_adapter_dry_run","required":true,"lane":"scripts/e2e/telemetry_adapter_{cass,xf,agent_mail}.sh --mode all --dry-run"},
               {"id":"perf","required":true,"status":"pending","bead":"bd-2yu.8.4"},
               {"id":"fault","required":true,"status":"pending","bead":"bd-2yu.8.4"},
               {"id":"soak","required":true,"status":"pending","bead":"bd-2yu.8.5"},
@@ -169,7 +232,7 @@ jobs:
             "profiles": {
               "premerge": {
                 "description": "Fast gate for PR/push",
-                "required_lanes": ["cargo check","cargo clippy","cargo fmt --check","cargo test --workspace","fsfs_cli_e2e_contract","schema_validation"]
+                "required_lanes": ["cargo check","cargo clippy","cargo fmt --check","cargo test --workspace","fsfs_cli_e2e_contract","telemetry_adapter_dry_run","schema_validation"]
               },
               "nightly": {
                 "description": "Full validation sweep",
@@ -322,6 +385,14 @@ jobs:
           path: ci_artifacts/*
           retention-days: 30
 
+      - name: Upload telemetry adapter dry-run artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-adapter-dry-run-${{ github.run_id }}
+          path: test_logs/telemetry_adapters/*
+          retention-days: 14
+
       - name: Publish replay/triage runbook links on failure
         if: failure() && matrix.os == 'ubuntu-latest'
         shell: bash
@@ -338,6 +409,7 @@ jobs:
             echo "- Operator docs entrypoint: [Ops TUI IA playbook link](${OPS_URL})"
             echo "- Replay source of truth: \`replay_command.txt\` from the failing artifact bundle."
             echo "- Machine index artifact: \`e2e-contract-index-failure-${{ github.run_id }}\` (retention: 30 days)."
+            echo "- Telemetry adapter lane logs: \`telemetry-adapter-dry-run-${{ github.run_id }}\` (retention: 14 days)."
             echo "- Quality gate metadata artifacts: \`quality_gate_matrix.json\`, \`rollout_host_checklist.json\`."
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -376,28 +448,35 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Prepare path dependencies under /dp
+      - name: Prepare path dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo mkdir -p /dp
-          sudo chown -R "$USER":"$(id -gn)" /dp
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
 
           clone_or_update() {
             local repo_url="$1"
             local dest_path="$2"
+            local ref="$3"
             if [[ -d "${dest_path}/.git" ]]; then
-              git -C "${dest_path}" fetch --depth 1 origin main
-              git -C "${dest_path}" checkout main
-              git -C "${dest_path}" pull --ff-only origin main
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             else
-              git clone --depth 1 "${repo_url}" "${dest_path}"
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
           }
 
-          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
-          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
-          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
+          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -529,28 +608,35 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Prepare path dependencies under /dp
+      - name: Prepare path dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo mkdir -p /dp
-          sudo chown -R "$USER":"$(id -gn)" /dp
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
 
           clone_or_update() {
             local repo_url="$1"
             local dest_path="$2"
+            local ref="$3"
             if [[ -d "${dest_path}/.git" ]]; then
-              git -C "${dest_path}" fetch --depth 1 origin main
-              git -C "${dest_path}" checkout main
-              git -C "${dest_path}" pull --ff-only origin main
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             else
-              git clone --depth 1 "${repo_url}" "${dest_path}"
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
             fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
           }
 
-          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
-          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
-          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
+          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
 
       - name: Resolve publish sequence + validate tag/version alignment
         id: publish_plan

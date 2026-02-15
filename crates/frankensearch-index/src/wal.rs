@@ -279,7 +279,7 @@ fn parse_batch(
 }
 
 fn decode_vector(bytes: &[u8], dimension: usize, quantization: Quantization) -> Vec<f32> {
-    match quantization {
+    let vec = match quantization {
         Quantization::F16 => bytes
             .chunks_exact(2)
             .take(dimension)
@@ -290,7 +290,14 @@ fn decode_vector(bytes: &[u8], dimension: usize, quantization: Quantization) -> 
             .take(dimension)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect(),
-    }
+    };
+    debug_assert_eq!(
+        Vec::<f32>::len(&vec),
+        dimension,
+        "decode_vector produced {actual} elements, expected {dimension}",
+        actual = Vec::<f32>::len(&vec),
+    );
+    vec
 }
 
 // ─── WAL writing ────────────────────────────────────────────────────────────
@@ -307,14 +314,14 @@ pub(crate) fn append_wal_batch(
     quantization: Quantization,
     fsync: bool,
 ) -> SearchResult<()> {
-    let file_exists = wal_path.exists();
-
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(wal_path)?;
 
-    if !file_exists {
+    // Use file length instead of a separate exists() check to avoid a TOCTOU
+    // race between checking existence and opening.
+    if file.metadata()?.len() == 0 {
         write_wal_header(&mut file, dimension, quantization)?;
     }
 

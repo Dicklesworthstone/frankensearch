@@ -105,6 +105,8 @@ Contract for each lane:
   - `manifest.json` (schema: `telemetry-adapter-e2e-manifest-v1`)
 - guarantees summary/manifest emission on both success and failure via exit-trap finalization
 - includes machine-stable `reason_code` values in event lines and lane summaries
+- guarantees interrupted runs (`INT`/`TERM`/`HUP`) finalize as `status=fail` with
+  `reason_code=telemetry_adapter.session.interrupted` and the active stage name
 - includes host-specific migration check command against:
   - `/data/projects/coding_agent_session_search`
   - `/data/projects/xf`

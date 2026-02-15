@@ -77,3 +77,4 @@ search.submit_query
 ci-artifacts/
 proptest-regressions/
 test_meminfo
+test_logs/

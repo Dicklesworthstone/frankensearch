@@ -970,12 +970,23 @@ impl VectorIndex {
     }
 
     fn soft_delete_wal_entry(&mut self, doc_id: &str) -> SearchResult<bool> {
-        let previous_len = self.wal_entries.len();
-        self.wal_entries.retain(|entry| entry.doc_id != doc_id);
-        if self.wal_entries.len() == previous_len {
+        if !self.wal_entries.iter().any(|entry| entry.doc_id == doc_id) {
             return Ok(false);
         }
-        self.rewrite_wal_sidecar()?;
+        // Remove the entry from the in-memory list only after the disk write
+        // succeeds, so a failed rewrite doesn't leave state inconsistent.
+        let filtered: Vec<wal::WalEntry> = self
+            .wal_entries
+            .iter()
+            .filter(|entry| entry.doc_id != doc_id)
+            .cloned()
+            .collect();
+        let prev = std::mem::replace(&mut self.wal_entries, filtered);
+        if let Err(err) = self.rewrite_wal_sidecar() {
+            // Restore original entries on write failure.
+            self.wal_entries = prev;
+            return Err(err);
+        }
         Ok(true)
     }
 
@@ -3226,6 +3237,60 @@ mod tests {
         // with 21 main records, 1 WAL entry → ratio ~0.048 < 0.90.
         index.append("wal-2", &sample_vector(0.3, dim)).unwrap();
         assert!(!index.needs_compaction());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn soft_delete_wal_restores_state_on_rewrite_failure() {
+        let path = temp_index_path("wal-delete-restore");
+        let dim = 4;
+
+        let mut writer = VectorIndex::create(&path, "test", dim).unwrap();
+        writer
+            .write_record("main-0", &sample_vector(1.0, dim))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        index
+            .append("wal-a", &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        index
+            .append("wal-b", &[0.0, 0.0, 1.0, 0.0])
+            .unwrap();
+        assert_eq!(index.wal_record_count(), 2);
+
+        // Make the WAL parent directory read-only to force a rewrite failure.
+        let wal_file = wal::wal_path_for(&path);
+        let wal_dir = wal_file.parent().unwrap();
+        let original_perms = fs::metadata(wal_dir).unwrap().permissions();
+        let mut readonly = original_perms.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(wal_dir, readonly).unwrap();
+
+        let result = index.soft_delete("wal-a");
+
+        // Restore directory permissions before any assertions so cleanup works.
+        fs::set_permissions(wal_dir, original_perms).unwrap();
+
+        // The delete should have failed.
+        assert!(result.is_err(), "expected error from read-only directory");
+
+        // In-memory WAL entries must be fully restored.
+        assert_eq!(
+            index.wal_record_count(),
+            2,
+            "WAL entries should be restored after rewrite failure"
+        );
+
+        // Both entries should still be searchable.
+        let hits = index
+            .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.doc_id == "wal-a"));
+        assert!(hits.iter().any(|h| h.doc_id == "wal-b"));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();

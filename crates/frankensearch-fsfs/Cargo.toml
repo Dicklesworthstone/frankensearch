@@ -36,12 +36,12 @@ signal-hook = "0.3"
 sysinfo = { workspace = true }
 notify = "7.0"
 ignore = "0.4"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 asupersync = { workspace = true }
 tempfile = "3"
 proptest = { workspace = true }
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

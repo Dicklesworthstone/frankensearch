@@ -471,6 +471,24 @@ Use this as a pragmatic hardening pass before rollout:
 8. For large corpora, evaluate ANN thresholding and memory budget explicitly.
 9. Keep reproducible artifacts for before/after tuning comparisons.
 
+## Crates.io Publishing (CI)
+
+The `publish-crates` lane in `.github/workflows/ci.yml` is intentionally gated and opt-in.
+
+Required setup:
+- Repository variable: `ENABLE_CRATES_PUBLISH=true`
+- Repository variable: `CRATES_PUBLISH_SEQUENCE` (space-separated crate names in dependency order)
+- Repository secret: `CARGO_REGISTRY_TOKEN` (crates.io publish token)
+
+Behavior:
+- Runs only on stable `v*` tags (skips prerelease tags containing `-`).
+- Verifies tag/version alignment for each crate in `CRATES_PUBLISH_SEQUENCE`.
+- Runs per-crate `cargo publish --dry-run` checks before real publish.
+- Publishes crates sequentially to reduce crates.io index race failures.
+
+Current boundary:
+- Crates with local-only `fsqlite*` path dependencies are not publishable to crates.io until those dependencies are available as versioned crates. Start `CRATES_PUBLISH_SEQUENCE` with publishable crates only.
+
 ## Troubleshooting by Symptom
 
 | Symptom | Likely Cause | What To Check |

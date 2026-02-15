@@ -378,7 +378,7 @@ impl EmbeddingQueue {
 
         debug!(
             target: "frankensearch.queue",
-            doc_id = %state.jobs.back().unwrap().doc_id,
+            doc_id = %state.jobs.back().expect("just pushed").doc_id,
             pending = state.jobs.len(),
             "job enqueued"
         );

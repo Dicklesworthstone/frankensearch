@@ -33,7 +33,7 @@ use frankensearch_index::{
 };
 
 use crate::cache::IndexCache;
-use crate::queue::{EmbeddingJob, EmbeddingQueue};
+use crate::queue::{EmbeddingJob, EmbeddingQueue, JobOutcome};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -376,14 +376,24 @@ impl RefreshWorker {
                     .fetch_add(1, Ordering::Relaxed);
 
                 // Requeue all jobs so they aren't lost.
+                let mut dropped_requeues = 0usize;
                 for job in all_jobs {
-                    self.queue.requeue(job);
+                    if !self.requeue_job(job, "index_rebuild_failed") {
+                        dropped_requeues = dropped_requeues.saturating_add(1);
+                    }
+                }
+                if dropped_requeues > 0 {
+                    self.metrics.docs_failed.fetch_add(
+                        u64::try_from(dropped_requeues).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                 }
 
                 error!(
                     target: "frankensearch.refresh",
                     error = %e,
-                    "index rebuild failed, jobs requeued"
+                    dropped_requeues,
+                    "index rebuild failed, attempted to requeue jobs"
                 );
 
                 Err(e)
@@ -411,8 +421,18 @@ impl RefreshWorker {
                     batch_size = jobs.len(),
                     "fast-tier batch embedding failed, requeueing all"
                 );
+                let mut dropped_requeues = 0usize;
                 for job in jobs {
-                    self.queue.requeue(job.clone());
+                    if !self.requeue_job(job.clone(), "fast_batch_embedding_failed") {
+                        dropped_requeues = dropped_requeues.saturating_add(1);
+                    }
+                }
+                if dropped_requeues > 0 {
+                    warn!(
+                        target: "frankensearch.refresh",
+                        dropped_requeues,
+                        "failed to requeue some jobs after fast-tier batch failure"
+                    );
                 }
                 self.metrics.docs_failed.fetch_add(
                     u64::try_from(jobs.len()).unwrap_or(u64::MAX),
@@ -457,7 +477,13 @@ impl RefreshWorker {
                     got = fast_embeddings.len(),
                     "fast embedder returned fewer vectors than inputs, requeueing"
                 );
-                self.queue.requeue(job.clone());
+                if !self.requeue_job(job.clone(), "fast_batch_missing_vector") {
+                    warn!(
+                        target: "frankensearch.refresh",
+                        doc_id = %job.doc_id,
+                        "failed to requeue job after fast embedder returned fewer vectors than expected"
+                    );
+                }
                 self.metrics.docs_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -481,6 +507,32 @@ impl RefreshWorker {
             .fetch_add(embed_us, Ordering::Relaxed);
 
         records
+    }
+
+    fn requeue_job(&self, job: EmbeddingJob, reason: &'static str) -> bool {
+        let doc_id = job.doc_id.clone();
+        match self.queue.requeue(job) {
+            JobOutcome::Retryable => true,
+            JobOutcome::Failed => {
+                warn!(
+                    target: "frankensearch.refresh",
+                    doc_id = %doc_id,
+                    reason,
+                    "failed to requeue job"
+                );
+                false
+            }
+            outcome => {
+                warn!(
+                    target: "frankensearch.refresh",
+                    doc_id = %doc_id,
+                    reason,
+                    ?outcome,
+                    "unexpected requeue outcome"
+                );
+                false
+            }
+        }
     }
 
     /// Rebuild the `TwoTierIndex` from embedded records.
