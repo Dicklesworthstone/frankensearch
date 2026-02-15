@@ -879,4 +879,271 @@ mod tests {
     }
 
     // ─── bd-2hf5 tests end ───
+
+    // ─── bd-1lni tests begin ───
+
+    #[test]
+    fn stub_reranker_identity() {
+        assert_eq!(StubReranker.id(), "stub-reranker");
+        assert_eq!(StubReranker.model_name(), "stub-reranker");
+        assert_eq!(FailingReranker.id(), "fail-reranker");
+        assert_eq!(FailingReranker.model_name(), "fail-reranker");
+        assert_eq!(MismatchReranker.id(), "mismatch-reranker");
+        assert_eq!(MismatchReranker.model_name(), "mismatch-reranker");
+        assert_eq!(CancellingReranker.id(), "cancel-reranker");
+        assert_eq!(CancellingReranker.model_name(), "cancel-reranker");
+        assert_eq!(EqualScoreReranker.id(), "equal-score");
+        assert_eq!(EqualScoreReranker.model_name(), "equal-score");
+        assert_eq!(OutOfOrderReranker.id(), "out-of-order");
+        assert_eq!(OutOfOrderReranker.model_name(), "out-of-order");
+        assert_eq!(BadRankReranker.id(), "bad-rank");
+        assert_eq!(BadRankReranker.model_name(), "bad-rank");
+    }
+
+    #[test]
+    fn rerank_min_candidates_zero_always_proceeds() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(2);
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 0)
+                .await
+                .unwrap();
+
+            // min_candidates=0 means always rerank
+            assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
+            assert!(candidates.iter().all(|c| c.source == ScoreSource::Reranked));
+        });
+    }
+
+    #[test]
+    fn rerank_top_k_zero_reranks_nothing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(10);
+
+            // top_k=0 means rerank_count = min(10, 0) = 0, so no docs sent to reranker
+            // but 0 < min_candidates=0 is false (0 >= 0), so we proceed past the first check
+            // then included_indices.len() = 0 < min_candidates=0 is false, so we proceed
+            // reranker gets empty slice, returns empty scores, 0 == 0 passes mismatch check
+            // no scores to apply, sort empty range, done
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 0, 0)
+                .await
+                .unwrap();
+
+            // No candidates reranked since top_k=0
+            assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
+        });
+    }
+
+    #[test]
+    fn rerank_top_k_one_reranks_single_candidate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(10);
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 1, 1)
+                .await
+                .unwrap();
+
+            // Only first candidate should be reranked
+            assert!(candidates[0].rerank_score.is_some());
+            assert_eq!(candidates[0].source, ScoreSource::Reranked);
+            for c in &candidates[1..] {
+                assert!(c.rerank_score.is_none());
+                assert_eq!(c.source, ScoreSource::Hybrid);
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_preserves_metadata() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            // Attach metadata to each candidate
+            for c in &mut candidates {
+                c.metadata = Some(serde_json::Value::String(c.doc_id.clone()));
+            }
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // All candidates should still have metadata (even though order may change)
+            assert!(candidates.iter().all(|c| c.metadata.is_some()));
+            // Each tag should appear exactly once
+            let mut tags: Vec<String> = candidates
+                .iter()
+                .map(|c| c.metadata.as_ref().unwrap().as_str().unwrap().to_string())
+                .collect();
+            tags.sort();
+            assert_eq!(
+                tags,
+                vec!["doc-0", "doc-1", "doc-2", "doc-3", "doc-4", "doc-5"]
+            );
+        });
+    }
+
+    #[test]
+    fn rerank_preserves_original_score_field() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            let original_scores: Vec<f32> = candidates.iter().map(|c| c.score).collect();
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // Original score field should be unchanged per doc_id
+            for c in &candidates {
+                let num: usize = c.doc_id.strip_prefix("doc-").unwrap().parse().unwrap();
+                assert!(
+                    (c.score - original_scores[num]).abs() < f32::EPSILON,
+                    "doc-{num} score should be preserved: expected {}, got {}",
+                    original_scores[num],
+                    c.score
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_overwrites_pre_existing_rerank_score() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            // Set pre-existing rerank scores
+            for c in &mut candidates {
+                c.rerank_score = Some(999.0);
+                c.source = ScoreSource::Reranked;
+            }
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // All rerank scores should be overwritten (none should be 999.0)
+            assert!(candidates
+                .iter()
+                .all(|c| c.rerank_score.is_some() && c.rerank_score != Some(999.0)));
+        });
+    }
+
+    #[test]
+    fn rerank_empty_query_succeeds() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+
+            // Empty query should not cause any issues
+            rerank_step(&cx, &reranker, "", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
+        });
+    }
+
+    /// Reranker that returns correct count but with swapped doc_ids.
+    struct SwappedDocIdReranker;
+
+    impl Reranker for SwappedDocIdReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                // Return scores with correct original_rank but wrong doc_id
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _doc)| RerankScore {
+                        doc_id: format!("wrong-{i}"),
+                        score: 0.5,
+                        original_rank: i,
+                    })
+                    .collect())
+            })
+        }
+
+        fn id(&self) -> &str {
+            "swapped-docid"
+        }
+
+        fn model_name(&self) -> &str {
+            "swapped-docid"
+        }
+    }
+
+    #[test]
+    fn rerank_doc_id_mismatch_still_applies_scores() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = SwappedDocIdReranker;
+            let mut candidates = make_candidates(6);
+
+            // Mismatched doc_ids trigger warnings but scores are still applied
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // Scores should still be applied despite doc_id mismatch (just warns)
+            assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
+        });
+    }
+
+    #[test]
+    fn rerank_source_transitions_from_non_hybrid() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            // Set varied source types
+            candidates[0].source = ScoreSource::SemanticFast;
+            candidates[1].source = ScoreSource::SemanticQuality;
+            candidates[2].source = ScoreSource::Lexical;
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // All should now be Reranked regardless of prior source
+            assert!(candidates.iter().all(|c| c.source == ScoreSource::Reranked));
+        });
+    }
+
+    #[test]
+    fn rerank_preserves_fast_and_quality_scores() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            for (i, c) in candidates.iter_mut().enumerate() {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    c.fast_score = Some(i as f32 * 0.1);
+                    c.quality_score = Some(i as f32 * 0.2);
+                    c.lexical_score = Some(i as f32 * 0.3);
+                }
+            }
+
+            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
+                .await
+                .unwrap();
+
+            // fast_score, quality_score, lexical_score should be preserved per doc_id
+            for c in &candidates {
+                let num: usize = c.doc_id.strip_prefix("doc-").unwrap().parse().unwrap();
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    assert_eq!(c.fast_score, Some(num as f32 * 0.1));
+                    assert_eq!(c.quality_score, Some(num as f32 * 0.2));
+                    assert_eq!(c.lexical_score, Some(num as f32 * 0.3));
+                }
+            }
+        });
+    }
+
+    // ─── bd-1lni tests end ───
 }

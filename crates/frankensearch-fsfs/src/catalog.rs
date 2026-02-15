@@ -949,7 +949,13 @@ mod tests {
             cleanup_tombstones_for_path(&db_path, old_cutoff).expect("cleanup helper should work");
         assert_eq!(removed, 1, "only old tombstones should be removed");
 
-        let remaining = conn
+        // Open a fresh connection for verification — the original `conn` holds
+        // a stale MVCC snapshot that predates the DELETE issued by
+        // `cleanup_tombstones_for_path` (which opens its own connection).
+        drop(conn);
+        let conn2 =
+            Connection::open(db_path.display().to_string()).expect("reopen for verification");
+        let remaining = conn2
             .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
             .expect("remaining rows query should execute");
         assert_eq!(remaining.len(), 1);

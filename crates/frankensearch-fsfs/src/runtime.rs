@@ -3707,9 +3707,8 @@ impl FsfsRuntime {
             embedding_cache_roots: vec![index_root.join("cache")],
         };
         let usage = self.collect_index_storage_usage(&storage_paths)?;
+        let tracked_index_bytes = Some(usage.total_bytes());
         let tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
-        let lifecycle = tracker.status();
-        let tracked_index_bytes = lifecycle.resources.index_bytes;
         let disk_budget = self.apply_storage_emergency_override(
             self.evaluate_storage_disk_budget(&tracker, &storage_paths)?,
             tracked_index_bytes,
@@ -5857,7 +5856,12 @@ mod tests {
             i64::try_from(now_ms.saturating_sub(retention_ms)).unwrap()
         );
 
-        let remaining = conn
+        // Reopen connection for verification — original `conn` holds a stale
+        // MVCC snapshot that predates the DELETE from `cleanup_catalog_tombstones`.
+        drop(conn);
+        let conn2 =
+            Connection::open(db_path.display().to_string()).expect("reopen for verification");
+        let remaining = conn2
             .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
             .expect("remaining rows query");
         assert_eq!(remaining.len(), 1);

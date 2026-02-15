@@ -658,6 +658,63 @@ fn explain_json_produces_score_decomposition() {
     }
 }
 
+#[test]
+fn explain_table_renders_human_readable_breakdown() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+
+    let search_output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("explain table: prereq search", &search_output);
+
+    let search_json = parse_json("explain table: prereq search", &search_output);
+    let hit_path = search_json
+        .pointer("/data/hits/0/path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !hit_path.is_empty(),
+        "expected at least one hit path for explain table test"
+    );
+
+    let explain_output = ctx.run(
+        temp.path(),
+        &[
+            "explain",
+            hit_path,
+            "--query",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "table",
+        ],
+    );
+    assert_success("explain table", &explain_output);
+
+    let text = stdout_str(&explain_output);
+    assert!(
+        text.contains("Result ID:"),
+        "table explain output should include result id line:\n{text}"
+    );
+    assert!(
+        text.contains("RRF:"),
+        "table explain output should include RRF breakdown:\n{text}"
+    );
+}
+
 // ─── Version Command ────────────────────────────────────────────────────────
 
 #[test]
