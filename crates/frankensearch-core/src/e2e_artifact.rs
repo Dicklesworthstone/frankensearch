@@ -1542,4 +1542,316 @@ mod tests {
             .expect_err("failure artifacts without replay command must fail");
         assert_eq!(err, E2eArtifactEmitterError::MissingReplayCommandForFailure);
     }
+
+    // ─── bd-1o5g tests begin ───
+
+    #[test]
+    fn schema_constants_have_expected_values() {
+        assert_eq!(E2E_SCHEMA_VERSION, 1);
+        assert_eq!(E2E_SCHEMA_MANIFEST, "e2e-manifest-v1");
+        assert_eq!(E2E_SCHEMA_EVENT, "e2e-event-v1");
+        assert_eq!(E2E_SCHEMA_ORACLE_REPORT, "e2e-oracle-report-v1");
+        assert_eq!(E2E_SCHEMA_REPLAY, "e2e-replay-v1");
+        assert_eq!(E2E_SCHEMA_SNAPSHOT_DIFF, "e2e-snapshot-diff-v1");
+    }
+
+    #[test]
+    fn validation_error_display_all_variants() {
+        let errors = vec![
+            E2eArtifactValidationError::UnsupportedSchemaVersion {
+                expected: 1,
+                found: 2,
+            },
+            E2eArtifactValidationError::SchemaTagMismatch {
+                expected: "e2e-manifest-v1",
+                found: "wrong".into(),
+            },
+            E2eArtifactValidationError::InvalidRunId {
+                run_id: "bad".into(),
+            },
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: "test.json",
+            },
+            E2eArtifactValidationError::DuplicateArtifactEntry {
+                file: "dup.json".into(),
+            },
+            E2eArtifactValidationError::MissingLineCountForJsonl {
+                file: "test.jsonl".into(),
+            },
+            E2eArtifactValidationError::UnexpectedLineCountForNonJsonl {
+                file: "test.json".into(),
+            },
+            E2eArtifactValidationError::MissingLaneId {
+                event_type: E2eEventType::LaneStart,
+            },
+            E2eArtifactValidationError::MissingOracleFields,
+            E2eArtifactValidationError::MissingReasonCode {
+                outcome: E2eOutcome::Fail,
+            },
+            E2eArtifactValidationError::InvalidReasonCode {
+                reason_code: "bad".into(),
+            },
+        ];
+        for err in &errors {
+            let display = err.to_string();
+            assert!(!display.is_empty());
+            let cloned = err.clone();
+            assert_eq!(err, &cloned);
+        }
+    }
+
+    #[test]
+    fn emitter_error_display_all_variants() {
+        let errors = vec![
+            E2eArtifactEmitterError::DuplicateNormalizedArtifactFile {
+                file: "dup.json".into(),
+            },
+            E2eArtifactEmitterError::MissingLineCountForJsonl {
+                file: "test.jsonl".into(),
+            },
+            E2eArtifactEmitterError::UnexpectedLineCountForNonJsonl {
+                file: "test.json".into(),
+            },
+            E2eArtifactEmitterError::ArtifactsIndexRender {
+                detail: "bad json".into(),
+            },
+            E2eArtifactEmitterError::MissingReplayCommandForFailure,
+        ];
+        for err in &errors {
+            let display = err.to_string();
+            assert!(!display.is_empty());
+            let cloned = err.clone();
+            assert_eq!(err, &cloned);
+        }
+    }
+
+    #[test]
+    fn artifact_emission_input_traits() {
+        let input = ArtifactEmissionInput {
+            file: "test.json",
+            bytes: b"hello",
+            line_count: None,
+        };
+        let copied = input; // Copy
+        assert_eq!(input, copied);
+        let dbg = format!("{input:?}");
+        assert!(dbg.contains("ArtifactEmissionInput"));
+    }
+
+    #[test]
+    fn envelope_validator_rejects_unsupported_version() {
+        let mut envelope = E2eEnvelope::new(
+            E2E_SCHEMA_MANIFEST,
+            "01HQXG5M7P3KZFV9N2RSTW6YAB",
+            "2026-02-14T12:00:00Z",
+            make_valid_manifest(),
+        );
+        envelope.v = 99;
+        let err = validate_manifest_envelope(&envelope).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::UnsupportedSchemaVersion {
+                expected: 1,
+                found: 99,
+            }
+        ));
+    }
+
+    #[test]
+    fn determinism_tier_all_variants_serde() {
+        for tier in [
+            DeterminismTier::BitExact,
+            DeterminismTier::Semantic,
+            DeterminismTier::Statistical,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let decoded: DeterminismTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, tier);
+        }
+    }
+
+    #[test]
+    fn clock_mode_all_variants_serde() {
+        for mode in [ClockMode::Simulated, ClockMode::Frozen, ClockMode::Realtime] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let decoded: ClockMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, mode);
+        }
+    }
+
+    #[test]
+    fn replay_event_type_all_variants_serde() {
+        for t in [
+            ReplayEventType::Query,
+            ReplayEventType::ConfigChange,
+            ReplayEventType::ClockAdvance,
+            ReplayEventType::Signal,
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let decoded: ReplayEventType = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, t);
+        }
+    }
+
+    #[test]
+    fn e2e_event_type_all_variants_serde() {
+        for t in [
+            E2eEventType::E2eStart,
+            E2eEventType::E2eEnd,
+            E2eEventType::LaneStart,
+            E2eEventType::LaneEnd,
+            E2eEventType::OracleCheck,
+            E2eEventType::PhaseTransition,
+            E2eEventType::Assertion,
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let decoded: E2eEventType = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, t);
+        }
+    }
+
+    #[test]
+    fn e2e_severity_all_variants_serde() {
+        for s in [E2eSeverity::Info, E2eSeverity::Warn, E2eSeverity::Error] {
+            let json = serde_json::to_string(&s).unwrap();
+            let decoded: E2eSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, s);
+        }
+    }
+
+    #[test]
+    fn e2e_outcome_all_variants_serde() {
+        for o in [E2eOutcome::Pass, E2eOutcome::Fail, E2eOutcome::Skip] {
+            let json = serde_json::to_string(&o).unwrap();
+            let decoded: E2eOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, o);
+        }
+    }
+
+    #[test]
+    fn normalize_artifact_file_name_passthrough_unknown() {
+        assert_eq!(
+            normalize_artifact_file_name("custom_report.json"),
+            "custom_report.json"
+        );
+        assert_eq!(
+            normalize_artifact_file_name("  some/path/to/data.bin  "),
+            "data.bin"
+        );
+    }
+
+    #[test]
+    fn normalize_replay_command_strips_backticks() {
+        let result = normalize_replay_command("`cargo test --release`");
+        assert_eq!(result, "cargo test --release");
+    }
+
+    #[test]
+    fn normalize_replay_command_preserves_single_quoted_whitespace() {
+        let result = normalize_replay_command("cargo test 'with   internal   spaces' --flag");
+        assert_eq!(result, "cargo test 'with   internal   spaces' --flag");
+    }
+
+    #[test]
+    fn sha256_checksum_deterministic_and_format() {
+        let hash1 = sha256_checksum(b"hello world");
+        let hash2 = sha256_checksum(b"hello world");
+        assert_eq!(hash1, hash2);
+        assert!(hash1.starts_with("sha256:"));
+        assert_eq!(hash1.len(), 71); // "sha256:" (7) + 64 hex chars
+
+        let empty_hash = sha256_checksum(b"");
+        assert!(empty_hash.starts_with("sha256:"));
+        assert_ne!(hash1, empty_hash);
+    }
+
+    #[test]
+    fn event_validator_requires_lane_id_for_lane_start() {
+        let mut event = make_valid_event();
+        event.event_type = E2eEventType::LaneStart;
+        event.lane_id = None;
+        event.oracle_id = None;
+        event.outcome = None;
+        let err = validate_event_body(&event).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::MissingLaneId {
+                event_type: E2eEventType::LaneStart
+            }
+        ));
+    }
+
+    #[test]
+    fn event_validator_requires_lane_id_for_lane_end() {
+        let mut event = make_valid_event();
+        event.event_type = E2eEventType::LaneEnd;
+        event.lane_id = Some(String::new()); // empty string
+        event.oracle_id = None;
+        event.outcome = None;
+        let err = validate_event_body(&event).unwrap_err();
+        assert!(matches!(
+            err,
+            E2eArtifactValidationError::MissingLaneId {
+                event_type: E2eEventType::LaneEnd
+            }
+        ));
+    }
+
+    #[test]
+    fn event_validator_requires_oracle_fields() {
+        let mut event = make_valid_event();
+        event.event_type = E2eEventType::OracleCheck;
+        event.oracle_id = None; // missing oracle_id
+        let err = validate_event_body(&event).unwrap_err();
+        assert_eq!(err, E2eArtifactValidationError::MissingOracleFields);
+
+        let mut event2 = make_valid_event();
+        event2.event_type = E2eEventType::OracleCheck;
+        event2.oracle_id = Some("oracle-1".into());
+        event2.outcome = None; // missing outcome
+        let err2 = validate_event_body(&event2).unwrap_err();
+        assert_eq!(err2, E2eArtifactValidationError::MissingOracleFields);
+    }
+
+    #[test]
+    fn event_validator_requires_reason_code_for_skip() {
+        let mut event = make_valid_event();
+        event.outcome = Some(E2eOutcome::Skip);
+        event.reason_code = None;
+        let err = validate_event_body(&event).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingReasonCode {
+                outcome: E2eOutcome::Skip,
+            }
+        );
+    }
+
+    #[test]
+    fn event_validator_accepts_valid_reason_code() {
+        let mut event = make_valid_event();
+        event.outcome = Some(E2eOutcome::Fail);
+        event.reason_code = Some("e2e.oracle.ordering_violated".to_owned());
+        assert!(validate_event_body(&event).is_ok());
+    }
+
+    #[test]
+    fn reason_code_validation_edge_cases() {
+        // Too few segments
+        assert!(!is_valid_reason_code("e2e.oracle"));
+        // Too many segments
+        assert!(!is_valid_reason_code("e2e.oracle.pass.extra"));
+        // Empty segment
+        assert!(!is_valid_reason_code("e2e..pass"));
+        // Uppercase
+        assert!(!is_valid_reason_code("E2E.oracle.pass"));
+        // Valid
+        assert!(is_valid_reason_code("e2e.oracle.pass"));
+        // Underscores allowed in category and code
+        assert!(is_valid_reason_code("e2e.oracle_check.ordering_violated"));
+        // Underscore NOT allowed in namespace
+        assert!(!is_valid_reason_code("e2e_ns.oracle.pass"));
+    }
+
+    // ─── bd-1o5g tests end ───
 }

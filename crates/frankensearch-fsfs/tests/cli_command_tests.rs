@@ -592,13 +592,13 @@ fn search_stream_rejects_non_stream_format() {
             "--no-watch-mode",
             "--stream",
             "--format",
-            "table",
+            "json",
         ],
     );
 
     assert!(
         !output.status.success(),
-        "search --stream with --format table should fail validation"
+        "search --stream with --format json should fail validation"
     );
     let combined = format!("{}\n{}", stdout_str(&output), stderr_str(&output));
     assert!(
