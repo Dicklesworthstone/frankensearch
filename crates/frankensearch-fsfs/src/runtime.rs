@@ -350,21 +350,27 @@ impl LiveIngestPipeline {
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
-        // Reject file_key with ".." or absolute components outright, before
-        // any path resolution.  This prevents traversal even when
-        // canonicalize() fails (the file does not exist yet on disk).
         let key_path = Path::new(file_key);
-        if key_path.is_absolute() || key_path.components().any(|c| c == std::path::Component::ParentDir) {
+        // Reject ".." components outright. This prevents traversal even when
+        // canonicalize() falls back to the raw path for missing files.
+        if key_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
             return Err(frankensearch_core::SearchError::InvalidConfig {
                 field: "file_key".into(),
                 value: file_key.into(),
-                reason: "file_key must be a relative path without '..' components".into(),
+                reason: "file_key must not contain '..' components (directory traversal)".into(),
             });
         }
-        let abs_path = self.target_root.join(file_key);
+        let abs_path = if key_path.is_absolute() {
+            PathBuf::from(file_key)
+        } else {
+            self.target_root.join(file_key)
+        };
         // Resolve symlinks / ".." components, then verify the result stays
-        // inside target_root.  Without this check, symlinks could escape
-        // the project boundary (path traversal).
+        // inside target_root.  Without this check, symlinks or absolute paths
+        // could escape the project boundary (path traversal).
         let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
         if !canonical.starts_with(&self.target_root) {
             return Err(frankensearch_core::SearchError::InvalidConfig {
@@ -6092,6 +6098,42 @@ mod tests {
                 .await
                 .expect("lexical search after delete");
             assert!(hits.is_empty(), "stale lexical doc should be removed");
+        });
+    }
+
+    #[test]
+    fn live_ingest_rejects_absolute_parent_dir_file_key() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(&target_root).expect("target root");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let pipeline = LiveIngestPipeline::new(
+                target_root.clone(),
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+
+            let escaped = target_root.join("../outside.txt");
+            let err = pipeline
+                .resolve_paths(&escaped.display().to_string())
+                .expect_err("absolute file_key with '..' must be rejected");
+            assert!(matches!(
+                err,
+                frankensearch_core::SearchError::InvalidConfig { field, .. }
+                if field == "file_key"
+            ));
         });
     }
 

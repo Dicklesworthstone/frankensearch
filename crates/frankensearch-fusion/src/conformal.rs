@@ -14,15 +14,61 @@ use std::collections::HashMap;
 
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::{SearchError, SearchResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Empirical conformal calibration based on observed nonconformity ranks.
 ///
 /// Ranks are 1-indexed (`1` = best/top hit). Higher ranks are worse.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ConformalSearchCalibration {
     nonconformity_scores: Vec<usize>,
     n_calibration: usize,
+}
+
+#[derive(Deserialize)]
+struct ConformalSearchCalibrationWire {
+    nonconformity_scores: Vec<usize>,
+    n_calibration: usize,
+}
+
+impl<'de> Deserialize<'de> for ConformalSearchCalibration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConformalSearchCalibrationWire::deserialize(deserializer)?;
+        if wire.nonconformity_scores.is_empty() {
+            return Err(serde::de::Error::custom(
+                "conformal.nonconformity_scores must not be empty",
+            ));
+        }
+        if wire.nonconformity_scores.contains(&0) {
+            return Err(serde::de::Error::custom(
+                "conformal.nonconformity_scores ranks must be >= 1",
+            ));
+        }
+        if wire
+            .nonconformity_scores
+            .windows(2)
+            .any(|pair| pair[0] > pair[1])
+        {
+            return Err(serde::de::Error::custom(
+                "conformal.nonconformity_scores must be sorted ascending",
+            ));
+        }
+        if wire.n_calibration != wire.nonconformity_scores.len() {
+            return Err(serde::de::Error::custom(format!(
+                "conformal.n_calibration ({}) must equal nonconformity_scores length ({})",
+                wire.n_calibration,
+                wire.nonconformity_scores.len()
+            )));
+        }
+
+        Ok(Self {
+            nonconformity_scores: wire.nonconformity_scores,
+            n_calibration: wire.n_calibration,
+        })
+    }
 }
 
 impl ConformalSearchCalibration {
@@ -480,6 +526,30 @@ mod tests {
         let decoded: ConformalSearchCalibration =
             serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, cal);
+    }
+
+    #[test]
+    fn serde_rejects_mismatched_n_calibration() {
+        let payload = r#"{"nonconformity_scores":[1,2,3],"n_calibration":2}"#;
+        let err = serde_json::from_str::<ConformalSearchCalibration>(payload)
+            .expect_err("mismatched n_calibration must fail");
+        assert!(err.to_string().contains("n_calibration"));
+    }
+
+    #[test]
+    fn serde_rejects_unsorted_nonconformity_scores() {
+        let payload = r#"{"nonconformity_scores":[2,1,3],"n_calibration":3}"#;
+        let err = serde_json::from_str::<ConformalSearchCalibration>(payload)
+            .expect_err("unsorted scores must fail");
+        assert!(err.to_string().contains("sorted"));
+    }
+
+    #[test]
+    fn serde_rejects_zero_rank() {
+        let payload = r#"{"nonconformity_scores":[0,1,2],"n_calibration":3}"#;
+        let err = serde_json::from_str::<ConformalSearchCalibration>(payload)
+            .expect_err("zero rank must fail");
+        assert!(err.to_string().contains(">= 1"));
     }
 
     #[test]

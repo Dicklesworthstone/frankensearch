@@ -484,6 +484,18 @@ impl EmbeddingQueue {
             return JobOutcome::Failed;
         }
 
+        // Defensive guard: if bookkeeping drift left `pending_ids` stale,
+        // still avoid requeueing a duplicate doc_id into the live queue.
+        if state.jobs.iter().any(|queued| queued.doc_id == job.doc_id) {
+            warn!(
+                target: "frankensearch.queue",
+                doc_id = %job.doc_id,
+                "dropping retry: duplicate doc_id already present in queue"
+            );
+            self.metrics.record(JobOutcome::Failed);
+            return JobOutcome::Failed;
+        }
+
         let seq = state.sequence;
         state.sequence = state.sequence.wrapping_add(1);
         state.pending_ids.insert(job.doc_id.clone(), seq);
@@ -880,6 +892,29 @@ mod tests {
 
         let outcome = queue.requeue(job);
         assert_eq!(outcome, JobOutcome::Failed);
+    }
+
+    #[test]
+    fn requeue_drops_when_duplicate_doc_id_already_queued_even_with_stale_pending_index() {
+        let queue = make_queue(10);
+        queue.submit(request("doc-1", "stale payload")).unwrap();
+        let stale_job = queue.drain_batch().into_iter().next().unwrap();
+
+        queue.submit(request("doc-1", "fresh payload")).unwrap();
+        {
+            let mut state = queue.state.lock().expect("queue lock poisoned");
+            state.pending_ids.clear();
+            assert_eq!(state.jobs.len(), 1);
+            drop(state);
+        }
+
+        let outcome = queue.requeue(stale_job);
+        assert_eq!(outcome, JobOutcome::Failed);
+
+        let batch = queue.drain_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].doc_id, "doc-1");
+        assert_eq!(batch[0].retry_count, 0);
     }
 
     // ── Content hash computation ────────────────────────────────────

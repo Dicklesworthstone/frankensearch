@@ -128,7 +128,11 @@ pub fn prf_expand(
     let dims = original_embedding.len();
     // Guard NaN: f64::clamp propagates NaN, which would poison the entire
     // expanded embedding. Mirror the guard in PrfConfig::clamped_alpha().
-    let alpha = if !alpha.is_finite() { 0.8 } else { alpha.clamp(0.5, 1.0) };
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.5, 1.0)
+    } else {
+        0.8
+    };
     let beta = 1.0 - alpha;
 
     // Compute weighted centroid.
@@ -359,6 +363,44 @@ mod tests {
 
         config.alpha = 1.5;
         assert!((config.clamped_alpha() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn clamped_alpha_non_finite_uses_default() {
+        let nan_config = PrfConfig {
+            alpha: f64::NAN,
+            ..PrfConfig::default()
+        };
+        assert!((nan_config.clamped_alpha() - 0.8).abs() < f64::EPSILON);
+
+        let inf_config = PrfConfig {
+            alpha: f64::INFINITY,
+            ..PrfConfig::default()
+        };
+        assert!((inf_config.clamped_alpha() - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn prf_expand_non_finite_alpha_matches_default_weight() {
+        let original = vec![1.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[0.0, 1.0, 0.0], 1.0)];
+
+        let baseline = prf_expand(&original, &feedback, 0.8).expect("baseline expansion");
+        let with_nan = prf_expand(&original, &feedback, f64::NAN).expect("nan expansion");
+        let with_inf = prf_expand(&original, &feedback, f64::INFINITY).expect("inf expansion");
+
+        assert!(
+            baseline
+                .iter()
+                .zip(with_nan.iter())
+                .all(|(left, right)| approx_eq(*left, *right))
+        );
+        assert!(
+            baseline
+                .iter()
+                .zip(with_inf.iter())
+                .all(|(left, right)| approx_eq(*left, *right))
+        );
     }
 
     // ── should_expand query class guard ──────────────────────────────────
