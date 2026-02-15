@@ -165,7 +165,9 @@ pub fn rrf_fuse(
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
-                hit.in_both_sources = true;
+                // Only mark as in_both_sources if the OTHER source contributed.
+                // Same-source duplicates should not set this flag.
+                hit.in_both_sources = hit.in_both_sources || hit.semantic_rank.is_some();
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: result.doc_id.as_str(),
@@ -187,7 +189,8 @@ pub fn rrf_fuse(
                 fh.rrf_score += rrf_contribution;
                 fh.semantic_rank = Some(rank);
                 fh.semantic_score = Some(hit.score);
-                fh.in_both_sources = true;
+                // Only mark as in_both_sources if the OTHER source contributed.
+                fh.in_both_sources = fh.in_both_sources || fh.lexical_rank.is_some();
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: hit.doc_id.as_str(),

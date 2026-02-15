@@ -350,14 +350,21 @@ impl LiveIngestPipeline {
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
-        let abs_path = if Path::new(file_key).is_absolute() {
-            PathBuf::from(file_key)
-        } else {
-            self.target_root.join(file_key)
-        };
+        // Reject file_key with ".." or absolute components outright, before
+        // any path resolution.  This prevents traversal even when
+        // canonicalize() fails (the file does not exist yet on disk).
+        let key_path = Path::new(file_key);
+        if key_path.is_absolute() || key_path.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(frankensearch_core::SearchError::InvalidConfig {
+                field: "file_key".into(),
+                value: file_key.into(),
+                reason: "file_key must be a relative path without '..' components".into(),
+            });
+        }
+        let abs_path = self.target_root.join(file_key);
         // Resolve symlinks / ".." components, then verify the result stays
-        // inside target_root.  Without this check, a file_key containing
-        // "../" can escape the project boundary (path traversal).
+        // inside target_root.  Without this check, symlinks could escape
+        // the project boundary (path traversal).
         let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
         if !canonical.starts_with(&self.target_root) {
             return Err(frankensearch_core::SearchError::InvalidConfig {

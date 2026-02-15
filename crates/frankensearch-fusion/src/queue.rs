@@ -471,6 +471,19 @@ impl EmbeddingQueue {
             return JobOutcome::Failed;
         }
 
+        // If a newer submission for this doc_id was enqueued while we were
+        // processing the batch, drop the stale retry to preserve the dedup
+        // invariant (one queue entry per doc_id).
+        if state.pending_ids.contains_key(&job.doc_id) {
+            debug!(
+                target: "frankensearch.queue",
+                doc_id = %job.doc_id,
+                "dropping retry: newer submission already pending"
+            );
+            self.metrics.record(JobOutcome::Failed);
+            return JobOutcome::Failed;
+        }
+
         let seq = state.sequence;
         state.sequence = state.sequence.wrapping_add(1);
         state.pending_ids.insert(job.doc_id.clone(), seq);

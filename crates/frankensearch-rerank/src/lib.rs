@@ -314,6 +314,19 @@ impl Reranker for FlashRankReranker {
                 all_scores.extend(batch_scores);
             }
 
+            // Validate inference returned one score per document.
+            if all_scores.len() != documents.len() {
+                return Err(SearchError::RerankFailed {
+                    model: self.name.clone(),
+                    source: format!(
+                        "inference returned {} scores for {} documents",
+                        all_scores.len(),
+                        documents.len()
+                    )
+                    .into(),
+                });
+            }
+
             // Build RerankScore results with original rank tracking
             let mut results: Vec<RerankScore> = documents
                 .iter()

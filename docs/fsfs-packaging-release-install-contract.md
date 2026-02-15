@@ -278,6 +278,93 @@ host-scoped directories to avoid collisions:
 - `artifacts/mcp_agent_mail_rust/`
 - `artifacts/frankenterm/`
 
+## Post-Migration Dead-Code Decommission Template (Required)
+
+Every host migration MUST create and complete a dedicated decommission child bead
+to remove now-dead legacy search code after cutover sign-off.
+
+Instantiation rule:
+
+1. Create a `post-cutover cleanup` child bead when migration parity is near completion.
+2. Use this section as the bead template body.
+3. Keep cleanup bead open until all checklist items and validation evidence are complete.
+
+### Start gate checklist (MUST all pass before edits)
+
+- Parent migration bead is functionally complete with parity evidence.
+- Required quality lanes are green on the frankensearch-backed path.
+- Rollback command path is documented and dry-run validated.
+- Active-agent ownership is deconflicted (file reservations + thread notice).
+
+### Mandatory cleanup surfaces
+
+- Code:
+  - remove legacy retrieval/fusion/embedder implementations replaced by frankensearch.
+  - remove transitional probes/adapters that are no longer needed.
+- Configuration:
+  - remove obsolete feature flags, env vars, and config branches for retired paths.
+- Tests and benches:
+  - remove duplicate legacy-only coverage and retain frankensearch-backed assertions.
+- Documentation and runbooks:
+  - remove dual-path language and update operator guidance to single-owner path.
+- Telemetry contracts:
+  - remove stale legacy reason-code references and keep canonical frankensearch taxonomy only.
+
+### Validation matrix (required before closure)
+
+All cargo-heavy commands MUST run through `rch`.
+
+| Gate | Command pattern | Pass criteria |
+|---|---|---|
+| Compile | `rch exec -- cargo check --all-targets [--features ...]` | zero errors |
+| Lint | `rch exec -- cargo clippy --all-targets [--features ...] -- -D warnings` | zero warnings |
+| Tests | `rch exec -- cargo test [scope] -- --nocapture` | required suites pass |
+| Integration | host-specific migration regression suite | parity or documented improvement |
+| Static bug scan | `ubs <changed-files>` | exit code `0` |
+
+If remote workers fail, run the same command via local-circuit mode and record:
+`execution_mode=local-circuit` plus `remote_failure_signature=<text>`.
+
+### Communication and audit checklist
+
+- Reserve edited files with `reason=<bead-id>`.
+- Send start message in Agent Mail thread `<br-###>` with scope + reserved paths.
+- Post completion message with exact command evidence and changed-file summary.
+- Add bead comment with:
+  - removed/retained surfaces,
+  - validation command list,
+  - residual risks or explicit `none`.
+- Release file reservations after completion.
+
+### Required decommission artifact bundle
+
+- `decommission_manifest.json` (host, removed surfaces, retained surfaces, sign-off metadata)
+- `decommission_validation_report.md` (gate-by-gate pass/fail and command evidence)
+- `decommission_replay_command.txt` (deterministic repro command set)
+
+### Copy/Paste bead template
+
+Use this skeleton for future host cleanup beads:
+
+```text
+Title: Post-cutover cleanup: remove legacy search stack from <host> after frankensearch parity sign-off
+
+Start gate (MUST):
+1) Parent migration bead complete with parity evidence.
+2) Strict check/clippy/tests (+ host integration lane) green.
+3) Rollback command validated.
+
+Scope:
+- Remove legacy search code replaced by frankensearch.
+- Remove obsolete config/feature toggles.
+- Remove legacy-only tests/docs and keep frankensearch-backed coverage.
+
+Closure evidence:
+- rch check/clippy/test command outputs
+- ubs scan on changed files
+- Agent Mail completion note + bead comment with changed surfaces
+```
+
 ## Staged Rollout and Deterministic Fallback Protocol
 
 This rollout protocol is mandatory for project-by-project fsfs adoption.

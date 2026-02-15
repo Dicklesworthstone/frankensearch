@@ -11,10 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{
+    SearchError, SearchResult, SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
+    TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
+};
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Current schema version for the ops telemetry database.
 pub const OPS_SCHEMA_VERSION: i64 = 2;
@@ -321,6 +325,56 @@ pub struct SearchEventRecord {
 }
 
 impl SearchEventRecord {
+    /// Build a storage row from a canonical `search` telemetry envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the envelope is not schema-v1,
+    /// is not a `search` event, has an invalid RFC3339 timestamp, or maps to an
+    /// invalid row payload.
+    pub fn from_search_envelope(envelope: &TelemetryEnvelope) -> SearchResult<Self> {
+        if envelope.v != TELEMETRY_SCHEMA_VERSION {
+            return Err(SearchError::InvalidConfig {
+                field: "telemetry_envelope.v".to_owned(),
+                value: envelope.v.to_string(),
+                reason: format!(
+                    "must be {TELEMETRY_SCHEMA_VERSION} for ops search-event ingestion"
+                ),
+            });
+        }
+
+        let TelemetryEvent::Search {
+            instance,
+            correlation,
+            query,
+            results,
+            metrics,
+        } = &envelope.event
+        else {
+            return Err(SearchError::InvalidConfig {
+                field: "telemetry_envelope.event.type".to_owned(),
+                value: telemetry_event_kind(&envelope.event).to_owned(),
+                reason: "ops search-event ingestion requires event.type=search".to_owned(),
+            });
+        };
+
+        let record = Self {
+            event_id: correlation.event_id.clone(),
+            project_key: instance.project_key.clone(),
+            instance_id: instance.instance_id.clone(),
+            correlation_id: correlation.root_request_id.clone(),
+            query_hash: None,
+            query_class: Some(telemetry_query_class_label(query.class).to_owned()),
+            phase: search_event_phase_from_telemetry(query.phase),
+            latency_us: metrics.latency_us,
+            result_count: Some(usize_to_u64(results.result_count)),
+            memory_bytes: metrics.memory_bytes,
+            ts_ms: parse_rfc3339_timestamp_ms(&envelope.ts)?,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
     fn validate(&self) -> SearchResult<()> {
         ensure_non_empty(&self.event_id, "event_id")?;
         ensure_non_empty(&self.project_key, "project_key")?;
@@ -342,6 +396,49 @@ impl SearchEventRecord {
         }
         Ok(())
     }
+}
+
+const fn search_event_phase_from_telemetry(phase: TelemetrySearchEventPhase) -> SearchEventPhase {
+    match phase {
+        TelemetrySearchEventPhase::Initial => SearchEventPhase::Initial,
+        TelemetrySearchEventPhase::Refined => SearchEventPhase::Refined,
+        TelemetrySearchEventPhase::RefinementFailed => SearchEventPhase::Failed,
+    }
+}
+
+const fn telemetry_query_class_label(class: TelemetryQueryClass) -> &'static str {
+    match class {
+        TelemetryQueryClass::Empty => "empty",
+        TelemetryQueryClass::Identifier => "identifier",
+        TelemetryQueryClass::ShortKeyword => "short_keyword",
+        TelemetryQueryClass::NaturalLanguage => "natural_language",
+    }
+}
+
+const fn telemetry_event_kind(event: &TelemetryEvent) -> &'static str {
+    match event {
+        TelemetryEvent::Search { .. } => "search",
+        TelemetryEvent::Embedding { .. } => "embedding",
+        TelemetryEvent::Index { .. } => "index",
+        TelemetryEvent::Resource { .. } => "resource",
+        TelemetryEvent::Lifecycle { .. } => "lifecycle",
+    }
+}
+
+fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
+    let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| {
+        SearchError::InvalidConfig {
+            field: "telemetry_envelope.ts".to_owned(),
+            value: timestamp.to_owned(),
+            reason: format!("must be RFC3339 ({err})"),
+        }
+    })?;
+    let millis = parsed.unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(millis).map_err(|_| SearchError::InvalidConfig {
+        field: "telemetry_envelope.ts".to_owned(),
+        value: timestamp.to_owned(),
+        reason: "parsed milliseconds overflow i64".to_owned(),
+    })
 }
 
 /// Upsert payload for `resource_samples`.

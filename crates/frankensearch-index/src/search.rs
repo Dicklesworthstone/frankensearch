@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
@@ -377,7 +378,16 @@ impl VectorIndex {
             if is_wal_index(winner.index) {
                 // WAL entry — resolve doc_id from in-memory WAL state.
                 let wal_idx = from_wal_index(winner.index);
-                let entry = &self.wal_entries[wal_idx];
+                let entry = self.wal_entries.get(wal_idx).ok_or_else(|| {
+                    SearchError::IndexCorrupted {
+                        path: PathBuf::new(),
+                        detail: format!(
+                            "WAL index {} out of bounds (wal_entries.len() = {})",
+                            wal_idx,
+                            self.wal_entries.len()
+                        ),
+                    }
+                })?;
                 let virtual_index = self.record_count().saturating_add(wal_idx);
                 let index_u32 =
                     u32::try_from(virtual_index).map_err(|_| SearchError::InvalidConfig {

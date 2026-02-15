@@ -126,7 +126,9 @@ pub fn prf_expand(
     }
 
     let dims = original_embedding.len();
-    let alpha = alpha.clamp(0.5, 1.0);
+    // Guard NaN: f64::clamp propagates NaN, which would poison the entire
+    // expanded embedding. Mirror the guard in PrfConfig::clamped_alpha().
+    let alpha = if !alpha.is_finite() { 0.8 } else { alpha.clamp(0.5, 1.0) };
     let beta = 1.0 - alpha;
 
     // Compute weighted centroid.
@@ -157,7 +159,7 @@ pub fn prf_expand(
 
     // L2-normalize the result.
     let norm_sq: f32 = expanded.iter().map(|x| x * x).sum();
-    if norm_sq < f32::EPSILON {
+    if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
         return None;
     }
     let inv_norm = 1.0 / norm_sq.sqrt();

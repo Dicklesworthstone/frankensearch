@@ -1945,6 +1945,29 @@ mod tests {
     }
 
     #[test]
+    fn fast_embed_failure_without_lexical_returns_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            let mut phase_count = 0;
+            let err = searcher
+                .search(&cx, "test", 5, |_| None, |_| {
+                    phase_count += 1;
+                })
+                .await
+                .expect_err("semantic-only fast embed failure should return an error");
+
+            assert!(matches!(err, SearchError::EmbeddingFailed { .. }));
+            assert_eq!(
+                phase_count, 0,
+                "hard failure in phase 1 should not emit any search phases"
+            );
+        });
+    }
+
+    #[test]
     fn fast_embed_failure_with_quality_configured_skips_refinement() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
@@ -1991,23 +2014,6 @@ mod tests {
             assert_eq!(
                 metrics.skip_reason.as_deref(),
                 Some("no_fast_phase_candidates")
-            );
-        });
-    }
-
-    #[test]
-    fn fast_embed_failure_without_lexical_returns_error() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
-            let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
-
-            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
-
-            let result = searcher.search(&cx, "test", 5, |_| None, |_| {}).await;
-
-            assert!(
-                result.is_err(),
-                "should propagate error without lexical fallback"
             );
         });
     }

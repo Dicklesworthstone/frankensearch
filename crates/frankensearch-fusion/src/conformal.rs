@@ -81,20 +81,32 @@ impl ConformalSearchCalibration {
     /// Invalid alphas return the most conservative fallback (`max(rank)`).
     #[must_use]
     pub fn required_k(&self, alpha: f32) -> usize {
-        self.required_k_checked(alpha)
-            .unwrap_or_else(|_| self.nonconformity_scores[self.n_calibration - 1])
+        self.required_k_checked(alpha).unwrap_or_else(|_| {
+            // Fallback: last element (max rank), guarded against empty state
+            // which can occur if the struct is constructed via Deserialize
+            // bypassing the calibrate() constructor.
+            self.nonconformity_scores.last().copied().unwrap_or(1)
+        })
     }
 
     /// Checked variant of [`required_k`](Self::required_k).
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`.
+    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`,
+    /// or if the calibration data is empty (e.g. from invalid deserialization).
     pub fn required_k_checked(&self, alpha: f32) -> SearchResult<usize> {
+        if self.nonconformity_scores.is_empty() {
+            return Err(invalid_config(
+                "conformal.nonconformity_scores",
+                "[]",
+                "calibration data is empty (possibly from invalid deserialization)",
+            ));
+        }
         let alpha = validate_alpha(alpha)?;
         let coverage = 1.0 - f64::from(alpha);
         let idx = quantile_index(self.n_calibration, coverage);
-        Ok(self.nonconformity_scores[idx])
+        Ok(self.nonconformity_scores[idx.min(self.nonconformity_scores.len() - 1)])
     }
 
     /// Two-sided rank prediction interval at confidence `1 - alpha`.
@@ -104,10 +116,10 @@ impl ConformalSearchCalibration {
     pub fn rank_prediction_interval(&self, alpha: f32) -> (usize, usize) {
         self.rank_prediction_interval_checked(alpha)
             .unwrap_or_else(|_| {
-                (
-                    self.nonconformity_scores[0],
-                    self.nonconformity_scores[self.n_calibration - 1],
-                )
+                // Guarded against empty state from invalid deserialization.
+                let lo = self.nonconformity_scores.first().copied().unwrap_or(1);
+                let hi = self.nonconformity_scores.last().copied().unwrap_or(1);
+                (lo, hi)
             })
     }
 
@@ -115,12 +127,21 @@ impl ConformalSearchCalibration {
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`.
+    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`,
+    /// or if the calibration data is empty.
     pub fn rank_prediction_interval_checked(&self, alpha: f32) -> SearchResult<(usize, usize)> {
+        if self.nonconformity_scores.is_empty() {
+            return Err(invalid_config(
+                "conformal.nonconformity_scores",
+                "[]",
+                "calibration data is empty (possibly from invalid deserialization)",
+            ));
+        }
         let alpha = validate_alpha(alpha)?;
         let tail = f64::from(alpha) / 2.0;
-        let lower_idx = quantile_index(self.n_calibration, tail);
-        let upper_idx = quantile_index(self.n_calibration, 1.0 - tail);
+        let n = self.nonconformity_scores.len();
+        let lower_idx = quantile_index(n, tail).min(n - 1);
+        let upper_idx = quantile_index(n, 1.0 - tail).min(n - 1);
         Ok((
             self.nonconformity_scores[lower_idx],
             self.nonconformity_scores[upper_idx],
