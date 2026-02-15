@@ -29,6 +29,12 @@ Stable rule IDs and default severities:
    Missing explicit `[bd-264r test-matrix] EXCEPTION` annotation for approved workstream exceptions.
 4. `SDOC-POLICY-000` (default: `error`)
    Internal policy self-test failure (classification/severity mapping drift in the checker).
+5. `SDOC-MATRIX-004` (default: `error`)
+   Advanced ranking/control beads are missing the required composition-matrix linkage annotation.
+6. `SDOC-MATRIX-005` (default: `error`)
+   Composition-matrix annotation exists but is missing required linkage/fallback/interaction-test fields.
+7. `SDOC-MATRIX-006` (default: `error`)
+   Composition-matrix exception exists but is missing required waiver metadata.
 
 Severity remapping by bead class for missing-matrix findings:
 
@@ -57,6 +63,7 @@ Any waiver must be explicit and machine-readable in bead comments:
 2. Required metadata:
    `rule_id`, `owner`, `justification`, `expires_on`, `follow_up_bead`
 3. Waivers without `expires_on` are invalid for strict CI.
+4. Composition-matrix waivers must use `rule_id: SDOC-MATRIX-004`.
 
 ## Reporter Payload Contract
 Each rule outcome must include these structured fields:
@@ -68,6 +75,24 @@ Each rule outcome must include these structured fields:
 5. `fix_hint`
 
 `scripts/check_bead_test_matrix.sh` emits this payload as JSON lines for findings.
+
+## Composition Matrix Gate (`bd-1pkl`)
+Advanced ranking/control beads must carry a machine-readable annotation that links to the
+composition matrix lane (`bd-3un.52` or explicit successor), defines fallback semantics, and
+names interaction-test coverage.
+
+Required marker:
+1. `[bd-1pkl composition-matrix] COMPOSITION_MATRIX`
+
+Required fields:
+1. `MATRIX_LINK`
+2. `FALLBACK_SEMANTICS`
+3. `INTERACTION_TEST_PLAN`
+
+Validation expectations:
+1. `MATRIX_LINK` points to `bd-3un.52` or an explicit successor reference.
+2. `FALLBACK_SEMANTICS` includes an `ON_EXHAUSTION` behavior.
+3. `INTERACTION_TEST_PLAN` names deterministic interaction coverage (for example `interaction_unit`, `interaction_integration`).
 
 ## Normalized Scanner Model v1 (`bd-3qwe.7.2`)
 The lint scanner normalizes `.beads/issues.jsonl` into a deterministic in-memory model before rule evaluation.
@@ -119,4 +144,12 @@ Logs/artifacts:
 ## Validation Command
 ```bash
 scripts/check_bead_test_matrix.sh --mode all
+```
+
+## Composition Matrix Template
+```text
+[bd-1pkl composition-matrix] COMPOSITION_MATRIX
+MATRIX_LINK: bd-3un.52
+FALLBACK_SEMANTICS: ON_EXHAUSTION -> lexical_only (reason_code=composition.matrix.exhausted)
+INTERACTION_TEST_PLAN: interaction_unit + interaction_integration + lane ownership artifact check
 ```

@@ -10,6 +10,9 @@ RULE_POLICY_UNIT="SDOC-POLICY-000"
 RULE_MISSING_MATRIX_MARKER="SDOC-MATRIX-001"
 RULE_MISSING_MATRIX_SECTION="SDOC-MATRIX-002"
 RULE_MISSING_EXCEPTION_MARKER="SDOC-MATRIX-003"
+RULE_MISSING_COMPOSITION_MARKER="SDOC-MATRIX-004"
+RULE_MISSING_COMPOSITION_SECTION="SDOC-MATRIX-005"
+RULE_INVALID_COMPOSITION_EXCEPTION="SDOC-MATRIX-006"
 RULE_SCANNER_PARSE_ERROR="SDOC-SCAN-001"
 RULE_SCANNER_NORMALIZATION_ERROR="SDOC-SCAN-002"
 
@@ -66,6 +69,166 @@ severity_for_missing_matrix() {
     exploratory) echo "info" ;;
     *) echo "error" ;;
   esac
+}
+
+yes_no_from_grep() {
+  local pattern="$1"
+  local haystack="$2"
+  if grep -Eq "$pattern" <<<"$haystack"; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+contains_literal() {
+  local needle="$1"
+  local haystack="$2"
+  if grep -Fq "$needle" <<<"$haystack"; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+is_advanced_ranking_control_issue() {
+  local issue_type="$1"
+  local labels_csv="$2"
+  local title="$3"
+  local description="$4"
+  local haystack
+
+  case "$issue_type" in
+    task|feature|bug) ;;
+    *) echo "no"; return ;;
+  esac
+
+  haystack="$(printf '%s\n%s\n%s' "$labels_csv" "$title" "$description" | tr '[:upper:]' '[:lower:]')"
+
+  if grep -Eq 'advanced ranking/control|ranking/control' <<<"$haystack"; then
+    echo "yes"
+    return
+  fi
+
+  if grep -Eq '(^|,)(ranking|control|adaptive|composition)(,|$)' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$labels_csv")"; then
+    echo "yes"
+    return
+  fi
+
+  echo "no"
+}
+
+composition_marker_present() {
+  local comments="$1"
+  contains_literal "[bd-1pkl composition-matrix] COMPOSITION_MATRIX" "$comments"
+}
+
+composition_exception_present() {
+  local comments="$1"
+  if [[ "$(contains_literal "[bd-264r test-matrix] EXCEPTION" "$comments")" == "yes" ]] \
+    && grep -Eq 'rule_id[[:space:]:=]+SDOC-MATRIX-004' <<<"$comments"; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+composition_required_sections_present() {
+  local comments="$1"
+  local required=("MATRIX_LINK:" "FALLBACK_SEMANTICS:" "INTERACTION_TEST_PLAN:")
+
+  for section in "${required[@]}"; do
+    if ! grep -Fqi "$section" <<<"$comments"; then
+      echo "no"
+      return
+    fi
+  done
+  echo "yes"
+}
+
+composition_semantics_present() {
+  local comments="$1"
+
+  if ! grep -Eq 'MATRIX_LINK:[[:space:]]*(bd-3un\.52|.*successor.*bd-3un\.52)' <<<"$comments"; then
+    echo "no"
+    return
+  fi
+  if ! grep -Eq 'FALLBACK_SEMANTICS:.*ON_EXHAUSTION|ON_EXHAUSTION' <<<"$comments"; then
+    echo "no"
+    return
+  fi
+  if ! grep -Eq 'INTERACTION_TEST_PLAN:.*interaction_(unit|integration)|interaction_(unit|integration)' <<<"$comments"; then
+    echo "no"
+    return
+  fi
+  echo "yes"
+}
+
+composition_exception_metadata_complete() {
+  local comments="$1"
+  local required=("rule_id" "owner" "justification" "expires_on" "follow_up_bead")
+
+  for field in "${required[@]}"; do
+    if ! grep -Eq "${field}[[:space:]:=]+" <<<"$comments"; then
+      echo "no"
+      return
+    fi
+  done
+  echo "yes"
+}
+
+check_composition_requirement() {
+  local issue_id="$1"
+  local comments="$2"
+
+  if [[ "$(composition_marker_present "$comments")" != "yes" ]] \
+    && [[ "$(composition_exception_present "$comments")" != "yes" ]]; then
+    report_finding \
+      "$RULE_MISSING_COMPOSITION_MARKER" \
+      "error" \
+      "$issue_id" \
+      "missing composition-matrix marker for advanced ranking/control bead" \
+      "add '[bd-1pkl composition-matrix] COMPOSITION_MATRIX' with MATRIX_LINK/FALLBACK_SEMANTICS/INTERACTION_TEST_PLAN or add EXCEPTION for SDOC-MATRIX-004"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+
+  if [[ "$(composition_exception_present "$comments")" == "yes" ]]; then
+    if [[ "$(composition_exception_metadata_complete "$comments")" != "yes" ]]; then
+      report_finding \
+        "$RULE_INVALID_COMPOSITION_EXCEPTION" \
+        "error" \
+        "$issue_id" \
+        "composition-matrix exception is missing required metadata fields" \
+        "include rule_id, owner, justification, expires_on, and follow_up_bead in the EXCEPTION block"
+      FAILURES=$((FAILURES + 1))
+    fi
+    return
+  fi
+
+  if [[ "$(composition_required_sections_present "$comments")" != "yes" ]]; then
+    report_finding \
+      "$RULE_MISSING_COMPOSITION_SECTION" \
+      "error" \
+      "$issue_id" \
+      "composition-matrix annotation missing required sections" \
+      "include MATRIX_LINK, FALLBACK_SEMANTICS, and INTERACTION_TEST_PLAN fields"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+
+  if [[ "$(composition_semantics_present "$comments")" != "yes" ]]; then
+    report_finding \
+      "$RULE_MISSING_COMPOSITION_SECTION" \
+      "error" \
+      "$issue_id" \
+      "composition-matrix annotation is missing concrete linkage/fallback/test details" \
+      "ensure MATRIX_LINK points to bd-3un.52 (or successor), FALLBACK_SEMANTICS includes ON_EXHAUSTION, and INTERACTION_TEST_PLAN names interaction_unit/integration coverage"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+
+  echo "[policy][OK] $issue_id satisfies composition-matrix gate contract"
 }
 
 assert_eq() {
@@ -398,6 +561,49 @@ run_scanner_unit_tests() {
     "malformed dependency target normalization"
 }
 
+run_composition_policy_unit_tests() {
+  echo "[unit] validating composition-matrix gate helpers"
+
+  assert_eq \
+    "$(is_advanced_ranking_control_issue "task" "ranking,policy" "Any title" "normal text")" \
+    "yes" \
+    "advanced ranking/control detection from labels"
+  assert_eq \
+    "$(is_advanced_ranking_control_issue "task" "ci,gate" "advanced ranking/control gate" "normal text")" \
+    "yes" \
+    "advanced ranking/control detection from title phrase"
+  assert_eq \
+    "$(is_advanced_ranking_control_issue "epic" "control-plane" "Epic title" "normal text")" \
+    "no" \
+    "non-implementation bead excluded from advanced gate"
+
+  local compliant_comment
+  compliant_comment=$'[bd-1pkl composition-matrix] COMPOSITION_MATRIX\nMATRIX_LINK: bd-3un.52\nFALLBACK_SEMANTICS: ON_EXHAUSTION -> lexical_only (reason_code=composition.matrix.exhausted)\nINTERACTION_TEST_PLAN: interaction_unit + interaction_integration lanes'
+  assert_eq \
+    "$(composition_marker_present "$compliant_comment")" \
+    "yes" \
+    "composition marker recognition"
+  assert_eq \
+    "$(composition_required_sections_present "$compliant_comment")" \
+    "yes" \
+    "composition required sections recognition"
+  assert_eq \
+    "$(composition_semantics_present "$compliant_comment")" \
+    "yes" \
+    "composition semantics completeness"
+
+  local exception_comment
+  exception_comment=$'[bd-264r test-matrix] EXCEPTION\nrule_id: SDOC-MATRIX-004\nowner: infra\njustification: temporary waiver\nexpires_on: 2026-03-31\nfollow_up_bead: bd-9999'
+  assert_eq \
+    "$(composition_exception_present "$exception_comment")" \
+    "yes" \
+    "composition exception marker recognition"
+  assert_eq \
+    "$(composition_exception_metadata_complete "$exception_comment")" \
+    "yes" \
+    "composition exception metadata recognition"
+}
+
 usage() {
   cat <<USAGE
 Usage: scripts/check_bead_test_matrix.sh [--mode unit|integration|all] [--issues <path>]
@@ -447,6 +653,7 @@ validate_normalized_model
 
 WAVE1=(bd-3un.31 bd-3un.32 bd-3un.40 bd-3un.52)
 WAVE2_EXCEPTIONS=(bd-2hz.10 bd-2yu.8)
+COMPOSITION_REQUIRED_TARGETS=(bd-1pkl)
 
 check_wave1_matrix() {
   local issue_id="$1"
@@ -505,6 +712,7 @@ check_wave2_exception() {
 check_unit() {
   run_policy_unit_tests
   run_scanner_unit_tests
+  run_composition_policy_unit_tests
   echo "[unit] validating wave-1 and wave-2 policy anchors"
 
   for issue_id in "${WAVE1[@]}"; do
@@ -514,51 +722,47 @@ check_unit() {
   for issue_id in "${WAVE2_EXCEPTIONS[@]}"; do
     check_wave2_exception "$issue_id"
   done
+
+  echo "[unit] validating composition-matrix policy anchors"
+  for issue_id in "${COMPOSITION_REQUIRED_TARGETS[@]}"; do
+    local comments
+    comments="$(jq -r --arg id "$issue_id" '
+      ([.[] | select(.id == $id)] | .[0].comment_text) // ""
+    ' <<<"$NORMALIZED")"
+    check_composition_requirement "$issue_id" "$comments"
+  done
 }
 
 check_integration() {
-  echo "[integration] surfacing candidate open implementation beads missing explicit matrix markers"
+  echo "[integration] enforcing composition-matrix contract for advanced ranking/control beads"
 
-  local candidates
-  candidates="$(jq -r '
+  local advanced_count=0
+  local row issue_id issue_type title description labels_csv comments
+
+  while IFS= read -r row; do
+    issue_id="$(jq -r '.id' <<<"$row")"
+    issue_type="$(jq -r '.issue_type' <<<"$row")"
+    title="$(jq -r '.title' <<<"$row")"
+    description="$(jq -r '.description' <<<"$row")"
+    labels_csv="$(jq -r '(.labels // []) | join(",")' <<<"$row")"
+    comments="$(jq -r '.comment_text // ""' <<<"$row")"
+
+    if [[ "$(is_advanced_ranking_control_issue "$issue_type" "$labels_csv" "$title" "$description")" != "yes" ]]; then
+      continue
+    fi
+
+    advanced_count=$((advanced_count + 1))
+    check_composition_requirement "$issue_id" "$comments"
+  done < <(jq -c '
     .[]
-    | select((.issue_type == "task" or .issue_type == "feature") and (.status == "open" or .status == "in_progress"))
-    | . as $issue
-    | ($issue.description // "") as $desc
-    | ($issue.comment_text // "") as $comments
-    | (
-        ($desc | test("(?i)unit")) and
-        ($desc | test("(?i)integration")) and
-        ($desc | test("(?i)e2e")) and
-        ($desc | test("(?i)bench|perf|performance")) and
-        ($desc | test("(?i)log|metric|artifact"))
-      ) as $desc_has_matrix
-    | (
-        ($comments | test("\\[bd-264r test-matrix\\] TEST_MATRIX")) or
-        ($comments | test("\\[bd-264r test-matrix\\] EXCEPTION"))
-      ) as $comment_has_marker
-    | select(($desc_has_matrix | not) and ($comment_has_marker | not))
-    | [
-        $issue.id,
-        $issue.issue_type,
-        (($issue.labels // []) | join(","))
-      ]
-    | @tsv
-  ' <<<"$NORMALIZED" | sort -u)"
+    | select(.status == "open" or .status == "in_progress")
+  ' <<<"$NORMALIZED")
 
-  if [[ -n "$candidates" ]]; then
-    echo "[integration][INFO] potential missing-matrix candidates (outside scoped retrofit):"
-    while IFS=$'\t' read -r issue_id issue_type labels_csv; do
-      local bead_class severity
-      bead_class="$(classify_bead_class "$issue_type" "$labels_csv")"
-      severity="$(severity_for_missing_matrix "$bead_class")"
-      echo "  - $issue_id (class=$bead_class default_severity=$severity)"
-    done <<<"$candidates"
+  if [[ "$advanced_count" -eq 0 ]]; then
+    echo "[integration][OK]   no advanced ranking/control candidates detected"
   else
-    echo "[integration][OK]   no additional candidates detected"
+    echo "[integration][OK]   evaluated $advanced_count advanced ranking/control candidate(s)"
   fi
-
-  echo "[integration][OK]   scoped retrofit anchors remain enforceable via unit checks"
 }
 
 if [[ "$MODE" == "unit" || "$MODE" == "all" ]]; then

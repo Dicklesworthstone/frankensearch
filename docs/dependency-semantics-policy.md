@@ -71,6 +71,12 @@ Documentation retrofit:
 Checker script:
 - `scripts/check_dependency_semantics.sh`
 
+Composition-matrix policy extension (`bd-1pkl`):
+- Advanced ranking/control governance beads must declare explicit dependency linkage to `bd-3un.52` (or documented successor) and include a composition semantics annotation:
+  - marker: `[bd-1pkl composition-matrix] DEP_SEMANTICS`
+  - required fields: `MATRIX_LINK`, `FALLBACK_SEMANTICS`, `INTERACTION_TEST_PLAN`
+- The lint script now fails if required composition linkage/annotation is missing.
+
 Modes:
 - Unit checks:
   - targeted beads use `parent-child` for `bd-3un`.

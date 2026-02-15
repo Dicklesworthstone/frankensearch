@@ -25,6 +25,12 @@ SUCCESS_THRESHOLDS_AND_STOP_CONDITIONS: <explicit success bars + stop triggers>
 - `ON_EXHAUSTION`: Define what happens when budget is exhausted (fallback mode, disablement, or early termination).
 - `SUCCESS_THRESHOLDS_AND_STOP_CONDITIONS`: Include measurable threshold(s) and a clear abort condition.
 
+## Alignment With Composition Matrix Gate (`bd-1pkl`)
+For advanced ranking/control beads, baseline-budget planning and composition linkage are coupled:
+1. `ON_EXHAUSTION` text must align with the composition annotation `FALLBACK_SEMANTICS`.
+2. `SUCCESS_THRESHOLDS_AND_STOP_CONDITIONS` must be compatible with the interaction-test plan used for composition validation.
+3. Reviewers should reject beads where baseline-budget fields and composition fallback semantics disagree.
+
 ## Migration Notes (Retrofit Wave)
 Backfilled with explicit `bd-2l7y` planning fields:
 - Adaptive/control beads: `bd-21g`, `bd-22k`, `bd-2ps`, `bd-2yj`, `bd-1do`, `bd-2tv`

@@ -9,7 +9,8 @@ usage() {
   cat <<USAGE
 Usage: scripts/check_dependency_semantics.sh [--mode unit|integration|all] [--issues <path>]
 
-Checks dependency-semantics policy invariants for bd-17dv retrofit scope.
+Checks dependency-semantics policy invariants for bd-17dv retrofit scope and
+bd-1pkl composition-matrix linkage policy.
 USAGE
 }
 
@@ -48,14 +49,15 @@ case "$MODE" in
     ;;
 esac
 
-TARGETS=(bd-z3j bd-i37 bd-2rq bd-2u4 bd-2tv bd-6sj bd-1co bd-sot)
+RETROFIT_TARGETS=(bd-z3j bd-i37 bd-2rq bd-2u4 bd-2tv bd-6sj bd-1co bd-sot)
+COMPOSITION_TARGETS=(bd-1pkl)
 DATA="$(jq -cs '.' "$ISSUES_FILE")"
 FAILURES=0
 
 check_unit() {
   echo "[unit] checking target-level dependency semantics"
 
-  for issue_id in "${TARGETS[@]}"; do
+  for issue_id in "${RETROFIT_TARGETS[@]}"; do
     local dep_type
     dep_type="$(jq -r --arg id "$issue_id" '
       ([.[] | select(.id == $id)] | .[0]) as $issue
@@ -84,6 +86,51 @@ check_unit() {
 
     if ! grep -Eq 'HARD_DEP[[:space:]]+bd-' <<<"$comments"; then
       echo "[unit][FAIL] $issue_id missing at least one HARD_DEP example in annotation"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
+  echo "[unit] checking composition-matrix dependency semantics"
+
+  for issue_id in "${COMPOSITION_TARGETS[@]}"; do
+    local dep_type
+    dep_type="$(jq -r --arg id "$issue_id" '
+      ([.[] | select(.id == $id)] | .[0]) as $issue
+      | (($issue.dependencies // []) | map(select(.depends_on_id == "bd-3un.52")) | .[0].type) // ""
+    ' <<<"$DATA")"
+
+    if [[ -z "$dep_type" ]]; then
+      echo "[unit][FAIL] $issue_id missing required dependency edge to bd-3un.52"
+      FAILURES=$((FAILURES + 1))
+    else
+      echo "[unit][OK]   $issue_id links to bd-3un.52 using dependency type '$dep_type'"
+    fi
+
+    local comments
+    comments="$(jq -r --arg id "$issue_id" '
+      ([.[] | select(.id == $id)] | .[0]) as $issue
+      | ($issue.comments // []) | map(.text) | join("\n")
+    ' <<<"$DATA")"
+
+    if ! grep -Fq "[bd-1pkl composition-matrix] DEP_SEMANTICS" <<<"$comments"; then
+      echo "[unit][FAIL] $issue_id missing composition DEP_SEMANTICS annotation comment"
+      FAILURES=$((FAILURES + 1))
+    else
+      echo "[unit][OK]   $issue_id has composition DEP_SEMANTICS annotation"
+    fi
+
+    if ! grep -Eq 'MATRIX_LINK[[:space:]:]+bd-3un\.52' <<<"$comments"; then
+      echo "[unit][FAIL] $issue_id missing MATRIX_LINK to bd-3un.52 in annotation"
+      FAILURES=$((FAILURES + 1))
+    fi
+
+    if ! grep -Eq 'FALLBACK_SEMANTICS' <<<"$comments"; then
+      echo "[unit][FAIL] $issue_id missing FALLBACK_SEMANTICS in annotation"
+      FAILURES=$((FAILURES + 1))
+    fi
+
+    if ! grep -Eq 'INTERACTION_TEST_PLAN' <<<"$comments"; then
+      echo "[unit][FAIL] $issue_id missing INTERACTION_TEST_PLAN in annotation"
       FAILURES=$((FAILURES + 1))
     fi
   done
@@ -117,6 +164,20 @@ check_integration() {
     echo "$global_candidates" | sed 's/^/  - /'
   else
     echo "[integration][OK]   no global bd-3un blocker edges found"
+  fi
+
+  local missing_composition_link
+  missing_composition_link="$(jq -r '
+    .[] as $issue
+    | select($issue.id == "bd-1pkl")
+    | ((($issue.dependencies // []) | map(select(.depends_on_id == "bd-3un.52")) | length) == 0)
+  ' <<<"$DATA")"
+
+  if [[ "$missing_composition_link" == "true" ]]; then
+    echo "[integration][FAIL] bd-1pkl is missing dependency linkage to bd-3un.52"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "[integration][OK]   bd-1pkl composition dependency linkage is present"
   fi
 }
 
