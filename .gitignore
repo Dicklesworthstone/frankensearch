@@ -61,5 +61,13 @@ rustc-ice-*.txt
 # Beads history snapshots
 .beads/.br_history/
 
+# Ephemeral data directories (test/benchmark artifacts)
+data/e2e_optimize_runs/
+data/pressure_artifacts/
+data/tmp_manifest/
+
+# Accidental query files
+search.submit_query
+
 # bv graph output
 --graph-format.svg
