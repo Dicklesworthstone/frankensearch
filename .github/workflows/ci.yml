@@ -563,7 +563,8 @@ jobs:
 
           if [[ -z "${CRATES_PUBLISH_SEQUENCE:-}" ]]; then
             echo "Repository variable CRATES_PUBLISH_SEQUENCE must be set when ENABLE_CRATES_PUBLISH=true." >&2
-            echo "Example: frankensearch-core frankensearch-embed frankensearch-index frankensearch-lexical frankensearch-fusion frankensearch-rerank frankensearch" >&2
+            echo "Example: frankensearch-core" >&2
+            echo "Use dependency order and include only crates whose dependencies are already available on crates.io." >&2
             exit 1
           fi
 
@@ -589,15 +590,6 @@ jobs:
           echo "sequence=${CRATES_PUBLISH_SEQUENCE}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Preflight dry-run for crates publish sequence
-        shell: bash
-        run: |
-          set -euo pipefail
-          for crate in ${{ steps.publish_plan.outputs.sequence }}; do
-            echo "Dry-run publish preflight for ${crate}"
-            cargo publish -p "${crate}" --locked --dry-run
-          done
-
       - name: Publish crates in dependency order
         shell: bash
         env:
@@ -610,6 +602,16 @@ jobs:
             exit 1
           fi
           for crate in ${{ steps.publish_plan.outputs.sequence }}; do
+            for attempt in 1 2 3 4 5; do
+              if cargo publish -p "${crate}" --locked --dry-run; then
+                break
+              fi
+              if [[ "${attempt}" -eq 5 ]]; then
+                echo "Dry-run publish checks failed for ${crate} after ${attempt} attempts." >&2
+                exit 1
+              fi
+              sleep 20
+            done
             echo "Publishing ${crate} (${RELEASE_VERSION})"
             cargo publish -p "${crate}" --locked --token "${CARGO_REGISTRY_TOKEN}"
             sleep 30
