@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use frankensearch_core::{FusedHit, ScoredResult, VectorHit};
-use tracing::{debug, instrument};
+use tracing::{Level, debug, instrument};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const DEFAULT_RRF_K: f64 = 60.0;
@@ -202,20 +202,23 @@ pub fn rrf_fuse(
 
     let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
 
-    let overlap_count = results.iter().filter(|h| h.in_both_sources).count();
+    let overlap_count = tracing::enabled!(target: "frankensearch.rrf", Level::DEBUG)
+        .then(|| results.iter().filter(|h| h.in_both_sources).count());
     let fused_count = results.len();
 
     // Ranking window needed for pagination. For small windows this avoids
     // sorting every fused hit while preserving deterministic output order.
     let window = limit.saturating_add(offset);
     if window == 0 {
-        debug!(
-            target: "frankensearch.rrf",
-            fused_count,
-            overlap_count,
-            output_count = 0,
-            "rrf fusion complete"
-        );
+        if let Some(overlap_count) = overlap_count {
+            debug!(
+                target: "frankensearch.rrf",
+                fused_count,
+                overlap_count,
+                output_count = 0,
+                "rrf fusion complete"
+            );
+        }
         return Vec::new();
     }
     if window < results.len() {
@@ -236,13 +239,15 @@ pub fn rrf_fuse(
         .map(FusedHitScratch::into_owned)
         .collect();
 
-    debug!(
-        target: "frankensearch.rrf",
-        fused_count,
-        overlap_count,
-        output_count = output.len(),
-        "rrf fusion complete"
-    );
+    if let Some(overlap_count) = overlap_count {
+        debug!(
+            target: "frankensearch.rrf",
+            fused_count,
+            overlap_count,
+            output_count = output.len(),
+            "rrf fusion complete"
+        );
+    }
 
     output
 }

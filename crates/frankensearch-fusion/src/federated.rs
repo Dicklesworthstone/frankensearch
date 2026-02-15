@@ -1137,4 +1137,182 @@ mod tests {
             );
         });
     }
+
+    // ─── bd-fj0q tests begin ───
+
+    #[test]
+    fn federated_fusion_debug() {
+        let fusion = FederatedFusion::Rrf { k: 60.0 };
+        let debug_str = format!("{fusion:?}");
+        assert!(debug_str.contains("Rrf"));
+    }
+
+    #[test]
+    fn federated_fusion_clone_and_eq() {
+        let a = FederatedFusion::Rrf { k: 42.0 };
+        let b = a;
+        assert_eq!(a, b);
+
+        let ws = FederatedFusion::WeightedScore {
+            normalization: NormalizationMethod::MinMax,
+        };
+        let ws2 = ws;
+        assert_eq!(ws, ws2);
+
+        let mnz = FederatedFusion::CombMnz {
+            normalization: NormalizationMethod::MinMax,
+        };
+        assert_ne!(a, mnz);
+    }
+
+    #[test]
+    fn federated_fusion_variants_are_distinct() {
+        let rrf = FederatedFusion::Rrf { k: 60.0 };
+        let ws = FederatedFusion::WeightedScore {
+            normalization: NormalizationMethod::MinMax,
+        };
+        let mnz = FederatedFusion::CombMnz {
+            normalization: NormalizationMethod::MinMax,
+        };
+        assert_ne!(rrf, ws);
+        assert_ne!(ws, mnz);
+        assert_ne!(rrf, mnz);
+    }
+
+    #[test]
+    fn federated_config_debug_and_clone() {
+        let config = FederatedConfig::default();
+        let debug_str = format!("{config:?}");
+        assert!(debug_str.contains("FederatedConfig"));
+        let cloned = config.clone();
+        assert_eq!(cloned.per_index_timeout_ms, config.per_index_timeout_ms);
+        assert_eq!(cloned.min_indices, config.min_indices);
+    }
+
+    #[test]
+    fn federated_searcher_debug_and_default() {
+        let searcher = FederatedSearcher::default();
+        let debug_str = format!("{searcher:?}");
+        assert!(debug_str.contains("FederatedSearcher"));
+    }
+
+    #[test]
+    fn federated_searcher_new_is_empty() {
+        let searcher = FederatedSearcher::new();
+        assert!(searcher.is_empty());
+        assert_eq!(searcher.len(), 0);
+    }
+
+    #[test]
+    fn federated_searcher_len_after_add() {
+        let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+        let searcher = FederatedSearcher::new()
+            .add_index("a", Arc::clone(&index), 1.0)
+            .add_index("b", Arc::clone(&index), 0.5)
+            .add_index("c", index, 2.0);
+        assert_eq!(searcher.len(), 3);
+        assert!(!searcher.is_empty());
+    }
+
+    #[test]
+    fn with_config_overrides_defaults() {
+        let config = FederatedConfig {
+            per_index_timeout_ms: 1000,
+            min_indices: 5,
+            candidate_pool_factor: 10,
+            max_indices: 42,
+            fusion_method: FederatedFusion::Rrf { k: 30.0 },
+        };
+        let searcher = FederatedSearcher::new().with_config(config);
+        // Verify it compiles and constructs (config is private, so we test behavior)
+        assert!(searcher.is_empty());
+    }
+
+    #[test]
+    fn sanitize_rrf_k_zero_is_valid() {
+        let k = super::sanitize_rrf_k(0.0);
+        assert!((k - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_rrf_k_positive_is_valid() {
+        let k = super::sanitize_rrf_k(30.0);
+        assert!((k - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_rrf_k_negative_falls_back() {
+        let k = super::sanitize_rrf_k(-1.0);
+        assert!((k - super::DEFAULT_FEDERATED_RRF_K).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_rrf_k_nan_falls_back() {
+        let k = super::sanitize_rrf_k(f64::NAN);
+        assert!((k - super::DEFAULT_FEDERATED_RRF_K).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_rrf_k_infinity_falls_back() {
+        let k = super::sanitize_rrf_k(f64::INFINITY);
+        assert!((k - super::DEFAULT_FEDERATED_RRF_K).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rank_contribution_k_zero_no_damping() {
+        // k=0: contribution = 1/(0 + rank + 1) = 1/(rank+1)
+        let c0 = super::rank_contribution(0.0, 0);
+        assert!((c0 - 1.0).abs() < f32::EPSILON); // 1/(0+0+1) = 1.0
+        let c1 = super::rank_contribution(0.0, 1);
+        assert!((c1 - 0.5).abs() < f32::EPSILON); // 1/(0+1+1) = 0.5
+    }
+
+    #[test]
+    fn federated_hit_debug_and_clone() {
+        let hit = super::FederatedHit {
+            result: frankensearch_core::ScoredResult {
+                doc_id: "doc-test".into(),
+                score: 0.9,
+                source: frankensearch_core::ScoreSource::SemanticFast,
+                fast_score: Some(0.9),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                metadata: None,
+            },
+            source_index: "primary".into(),
+            source_rank: 0,
+            appeared_in: vec!["primary".into(), "secondary".into()],
+        };
+        let debug_str = format!("{hit:?}");
+        assert!(debug_str.contains("FederatedHit"));
+        assert_eq!(hit.source_index, "primary");
+        assert_eq!(hit.source_rank, 0);
+        assert_eq!(hit.appeared_in.len(), 2);
+    }
+
+    #[test]
+    fn rrf_with_k_zero_produces_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_searcher(&[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.5, 0.0])]);
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    fusion_method: FederatedFusion::Rrf { k: 0.0 },
+                    ..FederatedConfig::default()
+                })
+                .add_index("primary", index, 1.0);
+
+            let results = federated.search(&cx, "query", 2, |_| None).await.unwrap();
+            assert_eq!(results.len(), 2);
+            // With k=0, rank 0 gets score 1.0, rank 1 gets 0.5
+            assert!(results[0].result.score > results[1].result.score);
+        });
+    }
+
+    #[test]
+    fn default_rrf_k_constant_value() {
+        assert!((super::DEFAULT_FEDERATED_RRF_K - 60.0).abs() < f64::EPSILON);
+    }
+
+    // ─── bd-fj0q tests end ───
 }

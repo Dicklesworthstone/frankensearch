@@ -1310,4 +1310,315 @@ mod tests {
         assert!(fetched.metadata.is_none());
         assert!(fetched.source_path.is_none());
     }
+
+    // ─── bd-2z2j tests begin ───
+
+    use super::*;
+
+    #[test]
+    fn crud_error_kind_as_str() {
+        assert_eq!(CrudErrorKind::NotFound.as_str(), "not_found");
+        assert_eq!(CrudErrorKind::Conflict.as_str(), "conflict");
+        assert_eq!(CrudErrorKind::Validation.as_str(), "validation");
+    }
+
+    #[test]
+    fn crud_error_kind_debug_clone_copy_eq() {
+        let kind = CrudErrorKind::NotFound;
+        let cloned = kind;
+        assert_eq!(kind, cloned);
+        let dbg = format!("{kind:?}");
+        assert!(dbg.contains("NotFound"));
+    }
+
+    #[test]
+    fn crud_error_kind_serde_roundtrip() {
+        for kind in [
+            CrudErrorKind::NotFound,
+            CrudErrorKind::Conflict,
+            CrudErrorKind::Validation,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: CrudErrorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn crud_error_display() {
+        let err = CrudError {
+            kind: CrudErrorKind::NotFound,
+            message: "doc-123 not found".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not_found"));
+        assert!(msg.contains("doc-123 not found"));
+    }
+
+    #[test]
+    fn crud_error_is_std_error() {
+        let err = CrudError {
+            kind: CrudErrorKind::Conflict,
+            message: "duplicate".into(),
+        };
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn document_record_new_defaults() {
+        let doc = DocumentRecord::new("test-id", "preview", [0_u8; 32], 100, 1000, 2000);
+        assert_eq!(doc.doc_id, "test-id");
+        assert_eq!(doc.content_preview, "preview");
+        assert_eq!(doc.content_hash, [0_u8; 32]);
+        assert_eq!(doc.content_length, 100);
+        assert_eq!(doc.created_at, 1000);
+        assert_eq!(doc.updated_at, 2000);
+        assert!(doc.source_path.is_none());
+        assert!(doc.metadata.is_none());
+    }
+
+    #[test]
+    fn document_record_serde_roundtrip() {
+        let mut doc =
+            DocumentRecord::new("serde-doc", "serde preview", hash_with(99), 512, 100, 200);
+        doc.source_path = Some("/test/path".into());
+        doc.metadata = Some(serde_json::json!({"key": "value"}));
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: DocumentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn embedding_status_as_str_all_variants() {
+        assert_eq!(EmbeddingStatus::Pending.as_str(), "pending");
+        assert_eq!(EmbeddingStatus::Embedded.as_str(), "embedded");
+        assert_eq!(EmbeddingStatus::Failed.as_str(), "failed");
+        assert_eq!(EmbeddingStatus::Skipped.as_str(), "skipped");
+    }
+
+    #[test]
+    fn embedding_status_from_str_all_variants() {
+        assert_eq!(
+            EmbeddingStatus::from_str("pending"),
+            Some(EmbeddingStatus::Pending)
+        );
+        assert_eq!(
+            EmbeddingStatus::from_str("embedded"),
+            Some(EmbeddingStatus::Embedded)
+        );
+        assert_eq!(
+            EmbeddingStatus::from_str("failed"),
+            Some(EmbeddingStatus::Failed)
+        );
+        assert_eq!(
+            EmbeddingStatus::from_str("skipped"),
+            Some(EmbeddingStatus::Skipped)
+        );
+        assert_eq!(EmbeddingStatus::from_str("unknown"), None);
+        assert_eq!(EmbeddingStatus::from_str(""), None);
+    }
+
+    #[test]
+    fn embedding_status_serde_roundtrip() {
+        for status in [
+            EmbeddingStatus::Pending,
+            EmbeddingStatus::Embedded,
+            EmbeddingStatus::Failed,
+            EmbeddingStatus::Skipped,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: EmbeddingStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn status_counts_default() {
+        let counts = StatusCounts::default();
+        assert_eq!(counts.pending, 0);
+        assert_eq!(counts.embedded, 0);
+        assert_eq!(counts.failed, 0);
+        assert_eq!(counts.skipped, 0);
+    }
+
+    #[test]
+    fn status_counts_serde_roundtrip() {
+        let counts = StatusCounts {
+            pending: 10,
+            embedded: 20,
+            failed: 3,
+            skipped: 1,
+        };
+        let json = serde_json::to_string(&counts).unwrap();
+        let back: StatusCounts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, counts);
+    }
+
+    #[test]
+    fn batch_result_default() {
+        let result = BatchResult::default();
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn batch_result_serde_roundtrip() {
+        let result = BatchResult {
+            inserted: 5,
+            updated: 3,
+            unchanged: 2,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: BatchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, result);
+    }
+
+    #[test]
+    fn validate_empty_doc_id_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = DocumentRecord::new("", "preview", hash_with(1), 10, 100, 100);
+        let err = storage
+            .upsert_document(&doc)
+            .expect_err("empty doc_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("doc_id"));
+    }
+
+    #[test]
+    fn validate_whitespace_doc_id_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = DocumentRecord::new("   ", "preview", hash_with(1), 10, 100, 100);
+        let err = storage
+            .upsert_document(&doc)
+            .expect_err("whitespace doc_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("doc_id"));
+    }
+
+    #[test]
+    fn validate_content_preview_too_long() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let long_preview = "A".repeat(401);
+        let doc = DocumentRecord::new("doc-long", long_preview, hash_with(1), 10, 100, 100);
+        let err = storage
+            .upsert_document(&doc)
+            .expect_err("long preview should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("content_preview") || msg.contains("400"));
+    }
+
+    #[test]
+    fn validate_updated_before_created() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let doc = DocumentRecord::new("doc-time", "preview", hash_with(1), 10, 200, 100);
+        let err = storage
+            .upsert_document(&doc)
+            .expect_err("updated < created should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("updated_at") || msg.contains("created_at"));
+    }
+
+    #[test]
+    fn validate_empty_source_path_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let mut doc = DocumentRecord::new("doc-sp", "preview", hash_with(1), 10, 100, 100);
+        doc.source_path = Some(String::new());
+        let err = storage
+            .upsert_document(&doc)
+            .expect_err("empty source_path should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("source_path"));
+    }
+
+    #[test]
+    fn list_document_ids_limit_zero() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        storage
+            .upsert_document(&sample_document("doc-1", 1))
+            .expect("insert should succeed");
+        let ids = list_document_ids(storage.connection(), 0).expect("limit 0 should succeed");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn list_pending_embeddings_limit_zero() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        storage
+            .upsert_document(&sample_document("doc-1", 1))
+            .expect("insert should succeed");
+        let pending = storage
+            .list_pending_embeddings("fast-tier", 0)
+            .expect("limit 0 should succeed");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn list_pending_embeddings_empty_embedder_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let err = storage
+            .list_pending_embeddings("", 10)
+            .expect_err("empty embedder_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("embedder_id"));
+    }
+
+    #[test]
+    fn get_document_empty_doc_id_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let err = storage
+            .get_document("")
+            .expect_err("empty doc_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("doc_id"));
+    }
+
+    #[test]
+    fn mark_failed_empty_error_message_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        storage
+            .upsert_document(&sample_document("doc-1", 1))
+            .expect("insert should succeed");
+        let err = storage
+            .mark_failed("doc-1", "fast-tier", "")
+            .expect_err("empty error_message should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("error_message"));
+    }
+
+    #[test]
+    fn delete_document_empty_doc_id_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let err = storage
+            .delete_document("")
+            .expect_err("empty doc_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("doc_id"));
+    }
+
+    #[test]
+    fn count_by_status_empty_embedder_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let err = storage
+            .count_by_status("")
+            .expect_err("empty embedder_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("embedder_id"));
+    }
+
+    #[test]
+    fn mark_embedded_empty_embedder_rejected() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        storage
+            .upsert_document(&sample_document("doc-1", 1))
+            .expect("insert should succeed");
+        let err = storage
+            .mark_embedded("doc-1", "")
+            .expect_err("empty embedder_id should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("embedder_id"));
+    }
+
+    // ─── bd-2z2j tests end ───
 }

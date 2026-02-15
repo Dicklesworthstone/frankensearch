@@ -424,4 +424,193 @@ mod tests {
             assert_eq!(cached.cache_stats().entries, 1);
         });
     }
+
+    // ─── bd-1ocg tests begin ───
+
+    #[test]
+    fn cache_stats_debug_clone_copy_eq() {
+        let stats = CacheStats {
+            hits: 5,
+            misses: 3,
+            entries: 8,
+            capacity: 128,
+        };
+        let copied = stats; // Copy
+        let cloned = { stats }; // Clone trait is available (Copy implies Clone)
+        assert_eq!(stats, copied);
+        assert_eq!(stats, cloned);
+
+        let different = CacheStats {
+            hits: 0,
+            misses: 0,
+            entries: 0,
+            capacity: 128,
+        };
+        assert_ne!(stats, different);
+
+        let dbg = format!("{stats:?}");
+        assert!(dbg.contains("CacheStats"));
+        assert!(dbg.contains("hits: 5"));
+    }
+
+    #[test]
+    fn capacity_one_evicts_immediately() {
+        let (cached, inner) = make_cached(1);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cached.embed(&cx, "first").await.unwrap();
+            assert_eq!(cached.cache_stats().entries, 1);
+
+            // Second insert evicts "first"
+            cached.embed(&cx, "second").await.unwrap();
+            assert_eq!(inner.call_count(), 2);
+            assert_eq!(cached.cache_stats().entries, 1);
+
+            // "first" is evicted, so it's a miss
+            cached.embed(&cx, "first").await.unwrap();
+            assert_eq!(inner.call_count(), 3);
+
+            // "second" was evicted by "first" re-insert
+            cached.embed(&cx, "second").await.unwrap();
+            assert_eq!(inner.call_count(), 4);
+        });
+    }
+
+    #[test]
+    fn inner_accessor_returns_same_embedder() {
+        let inner = Arc::new(CountingEmbedder::new(64));
+        let cached = CachedEmbedder::new(inner, 16);
+        assert_eq!(cached.inner().id(), "counting-test");
+        assert_eq!(cached.inner().dimension(), 64);
+        assert_eq!(cached.inner().model_name(), "Counting Test Embedder");
+    }
+
+    #[test]
+    fn is_ready_delegates() {
+        let inner = Arc::new(CountingEmbedder::new(64));
+        let cached = CachedEmbedder::new(inner, 16);
+        // CountingEmbedder uses default is_ready() which returns true
+        assert!(cached.is_ready());
+    }
+
+    #[test]
+    fn tier_delegates() {
+        let inner = Arc::new(CountingEmbedder::new(64));
+        let cached = CachedEmbedder::new(inner, 16);
+        // CountingEmbedder uses default tier() which returns ModelTier::Fast
+        assert_eq!(cached.tier(), ModelTier::Fast);
+    }
+
+    #[test]
+    fn supports_mrl_delegates() {
+        let inner = Arc::new(CountingEmbedder::new(64));
+        let cached = CachedEmbedder::new(inner, 16);
+        // CountingEmbedder uses default supports_mrl() which returns false
+        assert!(!cached.supports_mrl());
+    }
+
+    #[test]
+    fn clear_then_reuse_resets_everything() {
+        let (cached, inner) = make_cached(16);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cached.embed(&cx, "alpha").await.unwrap();
+            cached.embed(&cx, "alpha").await.unwrap(); // hit
+            assert_eq!(cached.cache_stats().hits, 1);
+            assert_eq!(cached.cache_stats().misses, 1);
+
+            cached.clear_cache();
+            assert_eq!(cached.cache_stats().hits, 0);
+            assert_eq!(cached.cache_stats().misses, 0);
+            assert_eq!(cached.cache_stats().entries, 0);
+
+            // After clear, "alpha" is a miss again
+            cached.embed(&cx, "alpha").await.unwrap();
+            assert_eq!(inner.call_count(), 2); // called again
+            assert_eq!(cached.cache_stats().misses, 1);
+            assert_eq!(cached.cache_stats().entries, 1);
+        });
+    }
+
+    #[test]
+    fn sequential_evictions_maintain_fifo_order() {
+        let (cached, inner) = make_cached(3);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // Fill cache: a, b, c
+            cached.embed(&cx, "a").await.unwrap();
+            cached.embed(&cx, "b").await.unwrap();
+            cached.embed(&cx, "c").await.unwrap();
+            assert_eq!(inner.call_count(), 3);
+            assert_eq!(cached.cache_stats().entries, 3);
+
+            // Insert d -> evicts a (FIFO)
+            cached.embed(&cx, "d").await.unwrap();
+            assert_eq!(inner.call_count(), 4);
+
+            // a is evicted (miss), b is still cached (hit)
+            cached.embed(&cx, "a").await.unwrap();
+            assert_eq!(inner.call_count(), 5); // miss
+            cached.embed(&cx, "b").await.unwrap();
+            // b was evicted when d was added (b was 2nd oldest after a was evicted,
+            // then a was re-added evicting b)
+            // Actually let's check: after d inserted, cache = [b, c, d]
+            // Then a inserted -> evicts b, cache = [c, d, a]
+            // So b should be a miss
+            assert_eq!(inner.call_count(), 6); // b is a miss
+        });
+    }
+
+    #[test]
+    fn empty_string_embedding() {
+        let (cached, inner) = make_cached(16);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let v1 = cached.embed(&cx, "").await.unwrap();
+            let v2 = cached.embed(&cx, "").await.unwrap();
+            assert_eq!(v1, v2);
+            assert_eq!(inner.call_count(), 1); // second is cache hit
+        });
+    }
+
+    #[test]
+    fn stats_entries_accurate_after_evictions() {
+        let (cached, _inner) = make_cached(2);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cached.embed(&cx, "x").await.unwrap();
+            cached.embed(&cx, "y").await.unwrap();
+            assert_eq!(cached.cache_stats().entries, 2);
+
+            // Evict x, add z
+            cached.embed(&cx, "z").await.unwrap();
+            assert_eq!(cached.cache_stats().entries, 2); // stays at capacity
+
+            // Evict y, add w
+            cached.embed(&cx, "w").await.unwrap();
+            assert_eq!(cached.cache_stats().entries, 2);
+        });
+    }
+
+    #[test]
+    fn debug_format_after_operations() {
+        let (cached, _inner) = make_cached(16);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cached.embed(&cx, "test").await.unwrap();
+            cached.embed(&cx, "test").await.unwrap(); // hit
+            let dbg = format!("{cached:?}");
+            assert!(dbg.contains("hits"));
+            assert!(dbg.contains("misses"));
+            assert!(dbg.contains("entries"));
+            assert!(dbg.contains("capacity"));
+        });
+    }
+
+    #[test]
+    fn embed_batch_empty_input() {
+        let (cached, _inner) = make_cached(16);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let empty: &[&str] = &[];
+            let result = cached.embed_batch(&cx, empty).await.unwrap();
+            assert!(result.is_empty());
+            assert_eq!(cached.cache_stats().entries, 0);
+        });
+    }
+
+    // ─── bd-1ocg tests end ───
 }

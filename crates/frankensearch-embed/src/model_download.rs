@@ -1029,15 +1029,11 @@ mod tests {
         // Exactly KB
         assert_eq!(format_bytes(1024), "1.0 KB");
         // Just below MB
-        let near_mb = 1024 * 1024 - 1;
-        let fmt_kb = format_bytes(near_mb);
-        assert!(fmt_kb.contains("KB"));
+        assert!(format_bytes(1024 * 1024 - 1).contains("KB"));
         // Exactly MB
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         // Just below GB
-        let near_gb = 1024 * 1024 * 1024 - 1;
-        let fmt_mb = format_bytes(near_gb);
-        assert!(fmt_mb.contains("MB"));
+        assert!(format_bytes(1024 * 1024 * 1024 - 1).contains("MB"));
         // Exactly GB
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }

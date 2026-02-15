@@ -3237,7 +3237,10 @@ mod tests {
         assert_eq!(r.doc_id, "my-doc");
         assert!((r.score - 0.95).abs() < f32::EPSILON);
         assert_eq!(r.source, ScoreSource::SemanticFast);
-        assert!(r.fast_score.is_some_and(|s| (s - 0.95).abs() < f32::EPSILON));
+        assert!(
+            r.fast_score
+                .is_some_and(|s| (s - 0.95).abs() < f32::EPSILON)
+        );
         assert!(r.quality_score.is_none());
         assert!(r.lexical_score.is_none());
         assert!(r.rerank_score.is_none());

@@ -961,4 +961,220 @@ mod tests {
         assert_eq!(m.probes_attempted, 1);
         assert_eq!(m.probes_succeeded, 1);
     }
+
+    // ─── bd-3gmt tests begin ───
+
+    #[test]
+    fn config_debug_clone() {
+        let config = test_config();
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("CircuitBreakerConfig"));
+        assert!(dbg.contains("failure_threshold"));
+    }
+
+    #[test]
+    fn circuit_metrics_debug_clone_default() {
+        let m = CircuitMetrics::default();
+        assert_eq!(m.trips, 0);
+        assert_eq!(m.resets, 0);
+        assert_eq!(m.queries_skipped, 0);
+        assert_eq!(m.probes_attempted, 0);
+        assert_eq!(m.probes_succeeded, 0);
+
+        let cloned = m.clone();
+        assert_eq!(cloned.trips, 0);
+
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("CircuitMetrics"));
+    }
+
+    #[test]
+    fn quality_outcome_debug() {
+        let outcomes = vec![
+            QualityOutcome::Success {
+                latency_ms: 100,
+                tau_improvement: 0.1,
+            },
+            QualityOutcome::Slow { latency_ms: 500 },
+            QualityOutcome::NotUseful {
+                tau_improvement: 0.01,
+            },
+            QualityOutcome::Error,
+        ];
+        for o in &outcomes {
+            let dbg = format!("{o:?}");
+            assert!(!dbg.is_empty());
+        }
+    }
+
+    #[test]
+    fn with_defaults_constructor() {
+        let cb = CircuitBreaker::with_defaults();
+        assert!(cb.is_closed());
+        assert_eq!(cb.config().failure_threshold, 5);
+        assert_eq!(cb.config().latency_threshold_ms, 500);
+        assert_eq!(cb.config().half_open_interval_ms, 30_000);
+        assert_eq!(cb.config().reset_threshold, 3);
+    }
+
+    #[test]
+    fn config_accessor() {
+        let config = test_config();
+        let cb = CircuitBreaker::new(config.clone());
+        assert_eq!(cb.config().failure_threshold, config.failure_threshold);
+        assert_eq!(
+            cb.config().latency_threshold_ms,
+            config.latency_threshold_ms
+        );
+        assert!(cb.config().enabled);
+    }
+
+    #[test]
+    fn force_close_when_already_closed() {
+        let cb = CircuitBreaker::new(test_config());
+        assert!(cb.is_closed());
+        let evidence = cb.force_close();
+        assert!(cb.is_closed());
+        // Still emits evidence (reset transition)
+        assert!(!evidence.is_empty());
+    }
+
+    #[test]
+    fn force_open_when_already_open() {
+        let cb = CircuitBreaker::new(test_config());
+        cb.force_open();
+        assert!(cb.is_open());
+        let evidence = cb.force_open();
+        assert!(cb.is_open());
+        // Still emits evidence
+        assert!(!evidence.is_empty());
+        assert_eq!(cb.metrics().trips, 2);
+    }
+
+    #[test]
+    fn multiple_trip_reset_cycles() {
+        let config = CircuitBreakerConfig {
+            half_open_interval_ms: 10,
+            reset_threshold: 1,
+            ..test_config()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        for cycle in 0..3u64 {
+            // Trip
+            for _ in 0..3 {
+                cb.record_outcome(&QualityOutcome::Error);
+            }
+            assert!(cb.is_open());
+
+            // Wait and recover
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cb.should_skip_quality();
+            assert!(cb.is_half_open());
+            cb.record_outcome(&QualityOutcome::Success {
+                latency_ms: 50,
+                tau_improvement: 0.2,
+            });
+            assert!(cb.is_closed());
+
+            assert_eq!(cb.metrics().trips, cycle + 1);
+            assert_eq!(cb.metrics().resets, cycle + 1);
+        }
+    }
+
+    #[test]
+    fn record_outcome_in_open_state() {
+        let cb = CircuitBreaker::new(test_config());
+
+        // Trip the breaker
+        for _ in 0..3 {
+            cb.record_outcome(&QualityOutcome::Error);
+        }
+        assert!(cb.is_open());
+
+        // Recording outcome while open is a no-op (defensive path)
+        let evidence = cb.record_outcome(&QualityOutcome::Success {
+            latency_ms: 50,
+            tau_improvement: 0.5,
+        });
+        assert!(evidence.is_empty());
+        assert!(cb.is_open()); // Still open
+    }
+
+    #[test]
+    fn pipeline_state_all_variants() {
+        let config = CircuitBreakerConfig {
+            half_open_interval_ms: 10,
+            ..test_config()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Closed -> Nominal
+        assert_eq!(cb.pipeline_state(), PipelineState::Nominal);
+
+        // Trip -> CircuitOpen
+        for _ in 0..3 {
+            cb.record_outcome(&QualityOutcome::Error);
+        }
+        assert_eq!(cb.pipeline_state(), PipelineState::CircuitOpen);
+
+        // Wait -> HalfOpen -> Probing
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cb.should_skip_quality();
+        assert_eq!(cb.pipeline_state(), PipelineState::Probing);
+    }
+
+    #[test]
+    fn half_open_does_not_skip() {
+        let config = CircuitBreakerConfig {
+            half_open_interval_ms: 10,
+            ..test_config()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Trip and transition to half-open
+        for _ in 0..3 {
+            cb.record_outcome(&QualityOutcome::Error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cb.should_skip_quality(); // transitions to HalfOpen
+
+        // Second call in HalfOpen should still not skip
+        let (skip, evidence) = cb.should_skip_quality();
+        assert!(!skip);
+        assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn debug_format_shows_open_state() {
+        let cb = CircuitBreaker::new(test_config());
+        for _ in 0..3 {
+            cb.record_outcome(&QualityOutcome::Error);
+        }
+        let dbg = format!("{cb:?}");
+        assert!(dbg.contains("Open"));
+        assert!(dbg.contains("trips"));
+    }
+
+    #[test]
+    fn metrics_serde_all_fields() {
+        let metrics = CircuitMetrics {
+            trips: 10,
+            resets: 5,
+            queries_skipped: 100,
+            probes_attempted: 8,
+            probes_succeeded: 5,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let decoded: CircuitMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.trips, 10);
+        assert_eq!(decoded.resets, 5);
+        assert_eq!(decoded.queries_skipped, 100);
+        assert_eq!(decoded.probes_attempted, 8);
+        assert_eq!(decoded.probes_succeeded, 5);
+    }
+
+    // ─── bd-3gmt tests end ───
 }

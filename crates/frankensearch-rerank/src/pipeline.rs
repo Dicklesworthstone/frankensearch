@@ -558,4 +558,325 @@ mod tests {
             }
         });
     }
+
+    // ─── bd-2hf5 tests begin ───
+
+    #[test]
+    fn default_constants() {
+        assert_eq!(DEFAULT_TOP_K_RERANK, 100);
+        assert_eq!(DEFAULT_MIN_CANDIDATES, 5);
+    }
+
+    /// Reranker that returns `SearchError::Cancelled`.
+    struct CancellingReranker;
+
+    impl Reranker for CancellingReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            _documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async {
+                Err(SearchError::Cancelled {
+                    phase: "rerank".into(),
+                    reason: "test cancellation".into(),
+                })
+            })
+        }
+
+        fn id(&self) -> &str {
+            "cancel-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            "cancel-reranker"
+        }
+    }
+
+    #[test]
+    fn rerank_cancellation_propagates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = CancellingReranker;
+            let mut candidates = make_candidates(10);
+
+            let err = rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .expect_err("cancellation should propagate");
+
+            assert!(
+                matches!(err, SearchError::Cancelled { .. }),
+                "should be Cancelled, got: {err:?}"
+            );
+        });
+    }
+
+    /// Reranker that assigns equal scores to all documents.
+    struct EqualScoreReranker;
+
+    impl Reranker for EqualScoreReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, doc)| RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        score: 0.5,
+                        original_rank: i,
+                    })
+                    .collect())
+            })
+        }
+
+        fn id(&self) -> &str {
+            "equal-score"
+        }
+
+        fn model_name(&self) -> &str {
+            "equal-score"
+        }
+    }
+
+    #[test]
+    fn rerank_sorts_by_rerank_score_descending() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(8);
+
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+
+            // Verify rerank scores are in descending order.
+            for pair in candidates.windows(2) {
+                let a = pair[0].rerank_score.unwrap_or(f32::NEG_INFINITY);
+                let b = pair[1].rerank_score.unwrap_or(f32::NEG_INFINITY);
+                assert!(a >= b, "rerank scores should be descending: {a} >= {b}");
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_tie_breaks_by_doc_id() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = EqualScoreReranker;
+            let mut candidates = make_candidates(6);
+
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+
+            // All scores are equal (0.5), so tie-breaking is by doc_id ascending.
+            for pair in candidates.windows(2) {
+                assert!(
+                    pair[0].doc_id <= pair[1].doc_id,
+                    "tie-breaking should be by doc_id: {} <= {}",
+                    pair[0].doc_id,
+                    pair[1].doc_id
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn non_reranked_candidates_keep_original_order() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(15);
+            let original_tail: Vec<String> =
+                candidates[10..].iter().map(|c| c.doc_id.clone()).collect();
+
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                10, // only rerank top 10
+                5,
+            )
+            .await
+            .unwrap();
+
+            // Candidates beyond top_k_rerank should be unchanged.
+            let current_tail: Vec<String> =
+                candidates[10..].iter().map(|c| c.doc_id.clone()).collect();
+            assert_eq!(original_tail, current_tail);
+            assert!(candidates[10..].iter().all(|c| c.rerank_score.is_none()));
+        });
+    }
+
+    #[test]
+    fn rerank_single_candidate_min_one() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(1);
+
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                1, // min_candidates = 1
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(candidates.len(), 1);
+            assert!(candidates[0].rerank_score.is_some());
+            assert_eq!(candidates[0].source, ScoreSource::Reranked);
+        });
+    }
+
+    #[test]
+    fn rerank_all_text_missing() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(10);
+
+            // text_fn always returns None.
+            rerank_step(&cx, &reranker, "test", &mut candidates, |_| None, 100, 5)
+                .await
+                .unwrap();
+
+            // Should skip reranking (0 < min_candidates=5).
+            assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
+        });
+    }
+
+    /// Reranker that returns an out-of-range `original_rank`.
+    struct BadRankReranker;
+
+    impl Reranker for BadRankReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, doc)| RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        score: 0.8,
+                        original_rank: i + 1000, // Out of range
+                    })
+                    .collect())
+            })
+        }
+
+        fn id(&self) -> &str {
+            "bad-rank"
+        }
+
+        fn model_name(&self) -> &str {
+            "bad-rank"
+        }
+    }
+
+    #[test]
+    fn rerank_out_of_range_original_rank_does_not_crash() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = BadRankReranker;
+            let mut candidates = make_candidates(10);
+
+            // Should not crash — just logs warnings.
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+
+            // No rerank scores applied (all ranks were out of range).
+            assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
+        });
+    }
+
+    #[test]
+    fn rerank_min_candidates_exact_threshold() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(5);
+
+            // Exactly at min_candidates=5 should proceed.
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+
+            assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
+        });
+    }
+
+    #[test]
+    fn rerank_min_candidates_one_below_threshold() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(4);
+
+            // 4 < min_candidates=5, should skip.
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+
+            assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
+        });
+    }
+
+    // ─── bd-2hf5 tests end ───
 }
