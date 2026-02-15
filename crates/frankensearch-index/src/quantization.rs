@@ -528,4 +528,236 @@ mod tests {
         let decoded_q = decoded.quantize(&vectors[0]);
         assert_eq!(original_q, decoded_q);
     }
+
+    // ─── bd-zkx0 tests begin ───
+
+    #[test]
+    fn scalar_quantizer_implements_debug() {
+        let vectors = [vec![1.0_f32, 2.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let debug_str = format!("{q:?}");
+        assert!(debug_str.contains("ScalarQuantizer"));
+    }
+
+    #[test]
+    fn scalar_quantizer_implements_clone() {
+        let vectors = [vec![0.1_f32, 0.5], vec![0.9, 0.2]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let cloned = q.clone();
+
+        assert_eq!(cloned.dims(), q.dims());
+        assert_eq!(cloned.mins(), q.mins());
+        assert_eq!(cloned.scales(), q.scales());
+
+        // Clone produces identical quantization
+        let input = vec![0.5_f32, 0.3];
+        assert_eq!(q.quantize(&input), cloned.quantize(&input));
+    }
+
+    #[test]
+    #[should_panic(expected = "need at least one vector")]
+    fn fit_panics_on_empty_vectors() {
+        let refs: Vec<&[f32]> = vec![];
+        let _ = ScalarQuantizer::fit(&refs);
+    }
+
+    #[test]
+    #[should_panic(expected = "same dimension")]
+    fn fit_panics_on_inconsistent_dimensions() {
+        let v1 = vec![1.0_f32, 2.0];
+        let v2 = vec![1.0_f32, 2.0, 3.0];
+        let refs: Vec<&[f32]> = vec![v1.as_slice(), v2.as_slice()];
+        let _ = ScalarQuantizer::fit(&refs);
+    }
+
+    #[test]
+    #[should_panic(expected = "dimension mismatch")]
+    fn quantize_panics_on_wrong_dimension() {
+        let vectors = [vec![1.0_f32, 2.0, 3.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let _ = q.quantize(&[1.0, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "dimension mismatch")]
+    fn dequantize_panics_on_wrong_dimension() {
+        let vectors = [vec![1.0_f32, 2.0, 3.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let _ = q.dequantize(&[0, 128]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn dot_product_quantized_panics_on_stored_dim_mismatch() {
+        let vectors = [vec![1.0_f32, 2.0], vec![3.0, 4.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let _ = q.dot_product_quantized(&[0, 128, 255], &[1.0, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn dot_product_quantized_panics_on_query_dim_mismatch() {
+        let vectors = [vec![1.0_f32, 2.0], vec![3.0, 4.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let stored = q.quantize(&vectors[0]);
+        let _ = q.dot_product_quantized(&stored, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn cosine_similarity_quantized_panics_on_dim_mismatch() {
+        let vectors = [vec![1.0_f32, 2.0], vec![3.0, 4.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let stored = q.quantize(&vectors[0]);
+        let _ = q.cosine_similarity_quantized(&stored, &[1.0]);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_stored_vector_returns_zero() {
+        // All-zero stored vector after dequantization → denom < EPSILON → return 0.0
+        let vectors = [vec![0.0_f32, 0.0, 0.0], vec![0.0, 0.0, 0.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let stored = q.quantize(&[0.0, 0.0, 0.0]);
+        let sim = q.cosine_similarity_quantized(&stored, &[1.0, 0.0, 0.0]);
+        assert!(sim.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cosine_similarity_self_is_near_one() {
+        let vectors = [vec![0.3_f32, 0.7, -0.2], vec![-0.1, 0.5, 0.9]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+
+        let query = &[0.3_f32, 0.7, -0.2];
+        let stored = q.quantize(query);
+        let sim = q.cosine_similarity_quantized(&stored, query);
+        assert!(
+            (sim - 1.0).abs() < 0.02,
+            "self-similarity should be ~1.0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn dot_product_with_zero_query_returns_zero() {
+        let vectors = [vec![1.0_f32, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let stored = q.quantize(&vectors[0]);
+        let dot = q.dot_product_quantized(&stored, &[0.0, 0.0, 0.0]);
+        assert!(
+            dot.abs() < 1e-5,
+            "dot with zero query should be ~0, got {dot}"
+        );
+    }
+
+    #[test]
+    fn max_error_per_dim_values() {
+        let vectors = [vec![0.0_f32, 10.0], vec![1.0, 20.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+
+        let errors = q.max_error_per_dim();
+        assert_eq!(errors.len(), 2);
+        // dim 0: scale = (1.0 - 0.0) / 255.0 ≈ 0.00392, error = scale/2
+        assert!((errors[0] - (1.0 / 255.0 / 2.0)).abs() < 1e-6);
+        // dim 1: scale = (20.0 - 10.0) / 255.0 ≈ 0.03922, error = scale/2
+        assert!((errors[1] - (10.0 / 255.0 / 2.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn max_error_per_dim_constant_dimension_is_zero() {
+        let vectors = [vec![5.0_f32, 0.0], vec![5.0, 1.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+
+        let errors = q.max_error_per_dim();
+        // dim 0 is constant → scale 0 → error 0
+        assert!(errors[0].abs() < f32::EPSILON);
+        // dim 1 has range → error > 0
+        assert!(errors[1] > 0.0);
+    }
+
+    #[test]
+    fn cosine_error_bound_positive_for_nonconstant() {
+        let vectors = [vec![0.1_f32, 0.9], vec![0.9, 0.1]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let bound = q.cosine_error_bound();
+        assert!(bound > 0.0);
+        assert!(bound < 1.0);
+    }
+
+    #[test]
+    fn cosine_error_bound_zero_for_all_constant() {
+        let vectors = [vec![3.0_f32, 3.0], vec![3.0, 3.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let bound = q.cosine_error_bound();
+        assert!(bound.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mins_accessor_returns_correct_values() {
+        let vectors = [vec![-5.0_f32, 10.0, 0.0], vec![5.0, 20.0, 0.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        let mins = q.mins();
+        assert_eq!(mins.len(), 3);
+        assert!((mins[0] - (-5.0)).abs() < f32::EPSILON);
+        assert!((mins[1] - 10.0).abs() < f32::EPSILON);
+        assert!((mins[2] - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn quantized_vector_bytes_equals_dims() {
+        let vectors = [vec![0.0_f32; 128]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        assert_eq!(q.quantized_vector_bytes(), 128);
+        assert_eq!(q.parameter_bytes(), 128 * 8);
+    }
+
+    #[test]
+    fn fit_two_identical_vectors_all_scales_zero() {
+        let vectors = [vec![0.5_f32, -0.3, 0.7], vec![0.5, -0.3, 0.7]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+        assert!(q.scales().iter().all(|s| *s < f32::EPSILON));
+    }
+
+    #[test]
+    fn quantize_identical_inputs_yields_identical_output() {
+        let vectors = [vec![0.1_f32, 0.5, -0.3], vec![0.9, 0.2, 0.8]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+
+        let input = vec![0.4_f32, 0.3, 0.1];
+        let q1 = q.quantize(&input);
+        let q2 = q.quantize(&input);
+        assert_eq!(q1, q2);
+    }
+
+    #[test]
+    fn quantize_constant_dimension_maps_to_zero() {
+        let vectors = [vec![7.0_f32, 1.0], vec![7.0, 5.0]];
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let q = ScalarQuantizer::fit(&refs);
+
+        let quantized = q.quantize(&[7.0, 3.0]);
+        // dim 0 is constant → always maps to 0
+        assert_eq!(quantized[0], 0);
+        // dim 1 has range → some value between 0..255
+        assert!(quantized[1] > 0);
+        assert!(quantized[1] < 255);
+    }
+
+    // ─── bd-zkx0 tests end ───
 }

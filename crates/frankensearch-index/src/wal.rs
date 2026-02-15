@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn wal_too_small_returns_empty() {
         let path = temp_wal_path("too-small");
-        std::fs::write(path.as_path(), &[0u8; 10]).unwrap();
+        std::fs::write(&path, [0u8; 10]).unwrap();
         let loaded = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
         std::fs::remove_file(&path).ok();

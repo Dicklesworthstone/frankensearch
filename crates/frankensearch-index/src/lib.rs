@@ -2,6 +2,45 @@
 //!
 //! This crate implements the FSVI binary format reader/writer plus exact
 //! brute-force top-k vector search, with optional HNSW ANN acceleration.
+//!
+//! # FSVI File Layout
+//!
+//! All multi-byte integers are little-endian. The vector slab is 64-byte
+//! aligned for cache-line / SIMD friendliness.
+//!
+//! ```text
+//! ┌───────────────────────────────────────────┐
+//! │ Header (variable length)                  │
+//! │   magic: b"FSVI"              (4 bytes)   │
+//! │   version: u16                (2 bytes)   │
+//! │   embedder_id_len: u16        (2 bytes)   │
+//! │   embedder_id: [u8]           (variable)  │
+//! │   embedder_revision_len: u16  (2 bytes)   │
+//! │   embedder_revision: [u8]     (variable)  │
+//! │   dimension: u32              (4 bytes)   │
+//! │   quantization: u8            (1 byte)    │
+//! │   reserved: [u8; 3]           (3 bytes)   │
+//! │   record_count: u64           (8 bytes)   │
+//! │   vectors_offset: u64         (8 bytes)   │
+//! │   header_crc32: u32           (4 bytes)   │
+//! ├───────────────────────────────────────────┤
+//! │ Record Table                              │
+//! │   record_count × 16 bytes each:           │
+//! │     doc_id_hash: u64          (8 bytes)   │
+//! │     doc_id_offset: u32        (4 bytes)   │
+//! │     doc_id_len: u16           (2 bytes)   │
+//! │     flags: u16                (2 bytes)   │
+//! ├───────────────────────────────────────────┤
+//! │ String Table                              │
+//! │   Concatenated UTF-8 doc_id strings       │
+//! ├───────────────────────────────────────────┤
+//! │ Padding (to 64-byte alignment)            │
+//! ├───────────────────────────────────────────┤
+//! │ Vector Slab                               │
+//! │   record_count × dimension × elem_size    │
+//! │   (2 bytes/elem for f16, 4 for f32)       │
+//! └───────────────────────────────────────────┘
+//! ```
 
 #[cfg(feature = "ann")]
 pub mod hnsw;

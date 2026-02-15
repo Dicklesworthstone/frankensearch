@@ -1225,4 +1225,472 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    // ─── bd-2c7e tests begin ───
+
+    #[test]
+    fn mrl_config_default_values() {
+        let config = MrlConfig::default();
+        assert_eq!(config.search_dims, 64);
+        assert_eq!(config.rescore_dims, 0);
+        assert_eq!(config.rescore_top_k, 0);
+    }
+
+    #[test]
+    fn mrl_config_debug_clone() {
+        let config = MrlConfig {
+            search_dims: 32,
+            rescore_dims: 128,
+            rescore_top_k: 20,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.search_dims, 32);
+        assert_eq!(cloned.rescore_dims, 128);
+        assert_eq!(cloned.rescore_top_k, 20);
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("MrlConfig"));
+        assert!(dbg.contains("32"));
+    }
+
+    #[test]
+    fn mrl_search_stats_default_values() {
+        let stats = MrlSearchStats::default();
+        assert_eq!(stats.scan_dims, 0);
+        assert_eq!(stats.rescore_dims, 0);
+        assert_eq!(stats.candidates_rescored, 0);
+        assert_eq!(stats.records_scanned, 0);
+        assert!(!stats.fell_back_to_full);
+    }
+
+    #[test]
+    fn mrl_search_stats_debug_clone() {
+        let stats = MrlSearchStats {
+            scan_dims: 64,
+            rescore_dims: 256,
+            candidates_rescored: 30,
+            records_scanned: 1000,
+            fell_back_to_full: true,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.scan_dims, 64);
+        assert_eq!(cloned.rescore_dims, 256);
+        assert_eq!(cloned.candidates_rescored, 30);
+        assert_eq!(cloned.records_scanned, 1000);
+        assert!(cloned.fell_back_to_full);
+        let dbg = format!("{stats:?}");
+        assert!(dbg.contains("MrlSearchStats"));
+    }
+
+    #[test]
+    fn nan_safe_replaces_nan_with_neg_infinity() {
+        assert!((nan_safe(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!(nan_safe(0.0).abs() < f32::EPSILON);
+        assert!((nan_safe(-1.0) + 1.0).abs() < f32::EPSILON);
+        assert!(nan_safe(f32::NEG_INFINITY) == f32::NEG_INFINITY);
+        assert!(nan_safe(f32::INFINITY) == f32::INFINITY);
+        assert!(nan_safe(f32::NAN) == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn mrl_heap_entry_eq_same_values() {
+        let a = MrlHeapEntry {
+            index: 5,
+            score: 0.9,
+        };
+        let b = MrlHeapEntry {
+            index: 5,
+            score: 0.9,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mrl_heap_entry_ne_different_index() {
+        let a = MrlHeapEntry {
+            index: 5,
+            score: 0.9,
+        };
+        let b = MrlHeapEntry {
+            index: 6,
+            score: 0.9,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mrl_heap_entry_ne_different_score() {
+        let a = MrlHeapEntry {
+            index: 5,
+            score: 0.9,
+        };
+        let b = MrlHeapEntry {
+            index: 5,
+            score: 0.8,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mrl_heap_entry_ordering_min_heap() {
+        // Min-heap: worse (lower) score should be "Greater" so it comes to top.
+        let low = MrlHeapEntry {
+            index: 0,
+            score: 0.1,
+        };
+        let high = MrlHeapEntry {
+            index: 1,
+            score: 0.9,
+        };
+        // In std BinaryHeap (max-heap), the "greatest" element is popped first.
+        // Our Ord reversal makes the lowest-score entry the "greatest" → it gets popped first.
+        assert_eq!(low.cmp(&high), Ordering::Greater);
+        assert_eq!(high.cmp(&low), Ordering::Less);
+    }
+
+    #[test]
+    fn mrl_heap_entry_ordering_nan_treated_as_worst() {
+        let nan_entry = MrlHeapEntry {
+            index: 0,
+            score: f32::NAN,
+        };
+        let normal = MrlHeapEntry {
+            index: 1,
+            score: 0.5,
+        };
+        // NaN → NEG_INFINITY → worst score → should be "Greater" (popped first from min-heap).
+        assert_eq!(nan_entry.cmp(&normal), Ordering::Greater);
+    }
+
+    #[test]
+    fn mrl_heap_entry_ordering_tie_breaks_on_index() {
+        let a = MrlHeapEntry {
+            index: 3,
+            score: 0.5,
+        };
+        let b = MrlHeapEntry {
+            index: 7,
+            score: 0.5,
+        };
+        // Same score, lower index is "stable" (comes after in min-heap → Less).
+        assert_eq!(a.cmp(&b), Ordering::Less);
+        assert_eq!(b.cmp(&a), Ordering::Greater);
+    }
+
+    #[test]
+    fn mrl_heap_entry_partial_ord_consistent() {
+        let a = MrlHeapEntry {
+            index: 0,
+            score: 0.3,
+        };
+        let b = MrlHeapEntry {
+            index: 1,
+            score: 0.7,
+        };
+        assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+    }
+
+    #[test]
+    fn insert_mrl_candidate_limit_zero_noop() {
+        let mut heap = BinaryHeap::new();
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 0,
+                score: 1.0,
+            },
+            0,
+        );
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn insert_mrl_candidate_fills_heap() {
+        let mut heap = BinaryHeap::new();
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 0,
+                score: 0.5,
+            },
+            3,
+        );
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 1,
+                score: 0.8,
+            },
+            3,
+        );
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 2,
+                score: 0.3,
+            },
+            3,
+        );
+        assert_eq!(heap.len(), 3);
+    }
+
+    #[test]
+    fn insert_mrl_candidate_replaces_worst_when_better() {
+        let mut heap = BinaryHeap::new();
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 0,
+                score: 0.1,
+            },
+            2,
+        );
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 1,
+                score: 0.2,
+            },
+            2,
+        );
+        // Insert better candidate — should replace the worst (0.1).
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 2,
+                score: 0.9,
+            },
+            2,
+        );
+        assert_eq!(heap.len(), 2);
+        let entries: Vec<MrlHeapEntry> = heap.into_vec();
+        assert!(entries.iter().all(|e| e.index != 0));
+    }
+
+    #[test]
+    fn insert_mrl_candidate_keeps_worst_when_candidate_worse() {
+        let mut heap = BinaryHeap::new();
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 0,
+                score: 0.5,
+            },
+            1,
+        );
+        // Insert worse candidate — heap should not change.
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 1,
+                score: 0.1,
+            },
+            1,
+        );
+        assert_eq!(heap.len(), 1);
+        assert_eq!(heap.peek().unwrap().index, 0);
+    }
+
+    #[test]
+    fn insert_mrl_candidate_tie_prefers_lower_index() {
+        let mut heap = BinaryHeap::new();
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 5,
+                score: 0.5,
+            },
+            1,
+        );
+        // Same score, lower index → should replace.
+        insert_mrl_candidate(
+            &mut heap,
+            MrlHeapEntry {
+                index: 2,
+                score: 0.5,
+            },
+            1,
+        );
+        assert_eq!(heap.peek().unwrap().index, 2);
+    }
+
+    #[test]
+    fn effective_rescore_dims_uses_explicit_value() {
+        let config = MrlConfig {
+            search_dims: 8,
+            rescore_dims: 128,
+            rescore_top_k: 0,
+        };
+        assert_eq!(config.effective_rescore_dims(384), 128);
+    }
+
+    #[test]
+    fn effective_rescore_top_k_uses_explicit_value() {
+        let config = MrlConfig {
+            search_dims: 8,
+            rescore_dims: 0,
+            rescore_top_k: 42,
+        };
+        assert_eq!(config.effective_rescore_top_k(10), 42);
+        assert_eq!(config.effective_rescore_top_k(1), 42);
+    }
+
+    #[test]
+    fn mrl_search_f32_quantization() {
+        let dim = 16;
+        let path = temp_index_path("f32-quant");
+
+        let dimension = dim;
+        let mut writer = VectorIndex::create_with_revision(
+            &path,
+            "test",
+            "mrl-test",
+            dimension,
+            Quantization::F32,
+        )
+        .expect("writer");
+        let v_a = vec![1.0_f32; dim];
+        let v_b = vec![0.5_f32; dim];
+        writer.write_record("doc-a", &v_a).expect("write a");
+        writer.write_record("doc-b", &v_b).expect("write b");
+        writer.finish().expect("finish");
+
+        let index = VectorIndex::open(&path).expect("open");
+        let query = vec![1.0; dim];
+
+        let config = MrlConfig {
+            search_dims: 8,
+            rescore_dims: 0,
+            rescore_top_k: 0,
+        };
+
+        let (hits, stats) = index
+            .mrl_search_with_stats(&query, 2, &config, None)
+            .expect("mrl search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "doc-a");
+        assert!(!stats.fell_back_to_full);
+        assert_eq!(stats.scan_dims, 8);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrl_search_wal_entries_with_filter() {
+        let dim = 16;
+        let path = temp_index_path("wal-filter");
+
+        let rows = [("doc-main", vec![0.3; dim])];
+        write_index(&path, &rows).expect("write index");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        index
+            .append("doc-wal-keep", &vec![1.0; dim])
+            .expect("append keep");
+        index
+            .append("doc-wal-skip", &vec![0.9; dim])
+            .expect("append skip");
+
+        let query = vec![1.0; dim];
+        let config = MrlConfig {
+            search_dims: 8,
+            ..MrlConfig::default()
+        };
+
+        let filter = PredicateFilter::new("keep-only", |id| id != "doc-wal-skip");
+        let hits = index
+            .mrl_search(&query, 10, &config, Some(&filter))
+            .expect("mrl search");
+
+        assert!(hits.iter().all(|h| h.doc_id != "doc-wal-skip"));
+        assert!(hits.iter().any(|h| h.doc_id == "doc-wal-keep"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(crate::wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn mrl_search_explicit_rescore_top_k() {
+        let dim = 16;
+        let path = temp_index_path("explicit-rescore-k");
+
+        let rows = [
+            ("doc-a", vec![1.0; dim]),
+            ("doc-b", vec![0.8; dim]),
+            ("doc-c", vec![0.5; dim]),
+            ("doc-d", vec![0.3; dim]),
+        ];
+        write_index(&path, &rows).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open");
+        let query = vec![1.0; dim];
+
+        let config = MrlConfig {
+            search_dims: 8,
+            rescore_dims: 0,
+            rescore_top_k: 2, // Only rescore top 2 candidates.
+        };
+
+        let (hits, stats) = index
+            .mrl_search_with_stats(&query, 2, &config, None)
+            .expect("mrl search");
+
+        assert_eq!(hits.len(), 2);
+        assert!(stats.candidates_rescored <= 2);
+        assert!(!stats.fell_back_to_full);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrl_search_explicit_rescore_dims() {
+        let dim = 16;
+        let path = temp_index_path("explicit-rescore-dims");
+
+        let rows = [("doc-a", vec![1.0; dim]), ("doc-b", vec![0.5; dim])];
+        write_index(&path, &rows).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open");
+        let query = vec![1.0; dim];
+
+        let config = MrlConfig {
+            search_dims: 4,
+            rescore_dims: 12, // Rescore with 12 dims (not full 16).
+            rescore_top_k: 0,
+        };
+
+        let (hits, stats) = index
+            .mrl_search_with_stats(&query, 2, &config, None)
+            .expect("mrl search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(stats.rescore_dims, 12);
+        assert_eq!(stats.scan_dims, 4);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrl_heap_entry_debug() {
+        let entry = MrlHeapEntry {
+            index: 42,
+            score: 0.75,
+        };
+        let dbg = format!("{entry:?}");
+        assert!(dbg.contains("MrlHeapEntry"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn mrl_heap_entry_copy() {
+        let a = MrlHeapEntry {
+            index: 1,
+            score: 0.5,
+        };
+        let b = a; // Copy
+        assert_eq!(a.index, b.index);
+        assert_eq!(a.score.to_bits(), b.score.to_bits());
+    }
+
+    // ─── bd-2c7e tests end ───
 }

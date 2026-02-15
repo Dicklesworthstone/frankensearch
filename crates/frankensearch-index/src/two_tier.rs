@@ -989,4 +989,342 @@ mod tests {
         assert_eq!(after_config.ef_construction, 96);
         assert_eq!(after_config.ef_search, 48);
     }
+
+    // ─── bd-3szp tests begin ───
+
+    #[test]
+    fn filename_constants_are_correct() {
+        assert_eq!(VECTOR_INDEX_FAST_FILENAME, "vector.fast.idx");
+        assert_eq!(VECTOR_INDEX_QUALITY_FILENAME, "vector.quality.idx");
+        assert_eq!(VECTOR_INDEX_FALLBACK_FILENAME, "vector.idx");
+    }
+
+    #[test]
+    fn two_tier_index_implements_debug() {
+        let dir = temp_index_dir("debug-index");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let debug_str = format!("{index:?}");
+        assert!(debug_str.contains("TwoTierIndex"));
+    }
+
+    #[test]
+    fn two_tier_index_builder_implements_debug() {
+        let dir = temp_index_dir("debug-builder");
+        let builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        let debug_str = format!("{builder:?}");
+        assert!(debug_str.contains("TwoTierIndexBuilder"));
+    }
+
+    #[test]
+    fn fast_index_preferred_over_fallback_when_both_exist() {
+        let dir = temp_index_dir("prefer-fast");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Write fallback with doc-fallback
+        let fallback_path = dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        write_index_file(&fallback_path, &[("doc-fallback", &[0.0, 1.0])]).expect("write fallback");
+
+        // Write explicit fast with doc-fast
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-fast", &[1.0, 0.0])]).expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert_eq!(index.doc_count(), 1);
+        assert_eq!(index.doc_ids(), &["doc-fast".to_owned()]);
+    }
+
+    #[test]
+    fn search_fast_returns_sorted_by_score_descending() {
+        let dir = temp_index_dir("sort-order");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-low", &[0.1, 0.0, 0.0]),
+                ("doc-mid", &[0.5, 0.5, 0.0]),
+                ("doc-high", &[1.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let hits = index.search_fast(&[1.0, 0.0, 0.0], 3).expect("search");
+        assert_eq!(hits.len(), 3);
+        // Scores should be in descending order
+        assert!(hits[0].score >= hits[1].score);
+        assert!(hits[1].score >= hits[2].score);
+        assert_eq!(hits[0].doc_id, "doc-high");
+    }
+
+    #[test]
+    fn search_fast_k_zero_returns_empty() {
+        let dir = temp_index_dir("k-zero");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let hits = index.search_fast(&[1.0, 0.0], 0).expect("search k=0");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_fast_k_larger_than_doc_count_returns_all() {
+        let dir = temp_index_dir("k-large");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.0, 1.0])],
+        )
+        .expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let hits = index.search_fast(&[1.0, 0.0], 100).expect("search k=100");
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn quality_scores_empty_indices_returns_empty() {
+        let dir = temp_index_dir("empty-indices");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+        write_index_file(&quality_path, &[("doc-a", &[1.0, 0.0])]).expect("write quality");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let scores = index
+            .quality_scores_for_indices(&[1.0, 0.0], &[])
+            .expect("empty indices");
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn quality_scores_full_coverage() {
+        let dir = temp_index_dir("full-quality");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0, 0.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write fast");
+
+        write_index_file(
+            &quality_path,
+            &[("doc-a", &[0.0, 0.0, 1.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write quality");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(index.has_quality_for_index(0));
+        assert!(index.has_quality_for_index(1));
+
+        let scores = index
+            .quality_scores_for_indices(&[0.0, 1.0, 0.0], &[0, 1])
+            .expect("quality scores");
+        assert_eq!(scores.len(), 2);
+        // doc-a quality = [0,0,1] dot [0,1,0] = 0.0
+        assert!(scores[0].abs() < 1e-6);
+        // doc-b quality = [0,1,0] dot [0,1,0] = 1.0
+        assert!((scores[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn builder_embedder_id_chaining() {
+        let dir = temp_index_dir("embedder-chain");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+
+        // Verify chaining returns &mut Self
+        let _same_ref = builder
+            .set_fast_embedder_id("custom-fast")
+            .set_quality_embedder_id("custom-quality");
+
+        builder
+            .add_record("doc-a", &[1.0, 0.0], Some(&[0.0, 1.0]))
+            .expect("add record");
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.doc_count(), 1);
+    }
+
+    #[test]
+    fn builder_fast_only_no_quality_index_created() {
+        let dir = temp_index_dir("fast-only-builder");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("doc-a", &[1.0, 0.0, 0.0])
+            .expect("fast a");
+        builder
+            .add_fast_record("doc-b", &[0.0, 1.0, 0.0])
+            .expect("fast b");
+
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.doc_count(), 2);
+        assert!(!index.has_quality_index());
+        assert!(!dir.join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+    }
+
+    #[test]
+    fn builder_add_record_with_quality_creates_both_tiers() {
+        let dir = temp_index_dir("both-tiers-builder");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0], Some(&[0.5, 0.5, 0.0]))
+            .expect("add doc-a");
+        builder
+            .add_record("doc-b", &[0.0, 1.0], Some(&[0.0, 0.5, 0.5]))
+            .expect("add doc-b");
+
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.doc_count(), 2);
+        assert!(index.has_quality_index());
+        assert!(index.has_quality_for_index(0));
+        assert!(index.has_quality_for_index(1));
+    }
+
+    #[test]
+    fn builder_preserves_all_doc_ids() {
+        let dir = temp_index_dir("all-docids");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        let names = ["zebra", "apple", "mango", "banana"];
+        for name in &names {
+            builder
+                .add_fast_record(*name, &[1.0, 0.0])
+                .expect("add record");
+        }
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.doc_count(), 4);
+        let mut actual: Vec<&str> = index.doc_ids().iter().map(String::as_str).collect();
+        actual.sort_unstable();
+        let mut expected = names.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fast_index_for_doc_id_empty_string_returns_none() {
+        let dir = temp_index_dir("empty-docid-lookup");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert_eq!(index.fast_index_for_doc_id(""), None);
+    }
+
+    #[test]
+    fn has_quality_for_index_boundary_last_valid() {
+        let dir = temp_index_dir("boundary-last");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0]),
+                ("doc-b", &[0.0, 1.0]),
+                ("doc-c", &[0.5, 0.5]),
+            ],
+        )
+        .expect("write fast");
+
+        // Quality only has last doc
+        write_index_file(&quality_path, &[("doc-c", &[0.5, 0.5])]).expect("write quality");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(!index.has_quality_for_index(0));
+        assert!(!index.has_quality_for_index(1));
+        assert!(index.has_quality_for_index(2)); // last valid index
+        assert!(!index.has_quality_for_index(3)); // out of bounds
+    }
+
+    #[test]
+    fn quality_scores_no_quality_index_ignores_query_dimension() {
+        // When there's no quality index, any query dimension is accepted (returns all 0.0)
+        let dir = temp_index_dir("no-quality-any-dim");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(!index.has_quality_index());
+
+        // Use a completely different dimension query — should still return 0s
+        let scores = index
+            .quality_scores_for_indices(&[1.0, 2.0, 3.0, 4.0, 5.0], &[0])
+            .expect("any dim accepted");
+        assert_eq!(scores, vec![0.0]);
+    }
+
+    #[test]
+    fn search_fast_returns_correct_doc_ids() {
+        let dir = temp_index_dir("correct-docids");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("alpha", &[1.0, 0.0, 0.0]),
+                ("beta", &[0.0, 1.0, 0.0]),
+                ("gamma", &[0.0, 0.0, 1.0]),
+            ],
+        )
+        .expect("write fast");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+
+        // Query aligned with beta
+        let hits = index
+            .search_fast(&[0.0, 1.0, 0.0], 1)
+            .expect("search for beta");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "beta");
+
+        // Query aligned with gamma
+        let hits = index
+            .search_fast(&[0.0, 0.0, 1.0], 1)
+            .expect("search for gamma");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "gamma");
+    }
+
+    #[test]
+    fn builder_add_record_dimension_mismatch_in_quality() {
+        let dir = temp_index_dir("record-quality-dim");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0], Some(&[1.0, 0.0, 0.0]))
+            .expect("first record ok");
+
+        // Second record has different quality dimension
+        let err = builder
+            .add_record("doc-b", &[0.0, 1.0], Some(&[1.0, 0.0]))
+            .expect_err("quality dim mismatch");
+        assert!(matches!(
+            err,
+            SearchError::DimensionMismatch {
+                expected: 3,
+                found: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn open_nonexistent_directory_returns_error() {
+        let dir = temp_index_dir("nonexistent-subdir");
+        // Don't create the directory
+        let result = TwoTierIndex::open(&dir, TwoTierConfig::default());
+        assert!(result.is_err());
+    }
+
+    // ─── bd-3szp tests end ───
 }
