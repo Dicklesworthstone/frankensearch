@@ -958,4 +958,455 @@ mod tests {
                 .any(|v| v.code == "stream.schema_tag.mismatch")
         );
     }
+
+    // ─── bd-zp7z tests begin ───
+
+    #[test]
+    fn protocol_constants() {
+        assert_eq!(STREAM_PROTOCOL_VERSION, 1);
+        assert_eq!(STREAM_SCHEMA_VERSION, "fsfs.stream.query.v1");
+        assert_eq!(TOON_STREAM_RECORD_SEPARATOR, '\u{001E}');
+        assert_eq!(TOON_STREAM_RECORD_SEPARATOR_BYTE, 0x1E);
+        assert_eq!(SUBSYSTEM, "fsfs_stream_protocol");
+    }
+
+    #[test]
+    fn event_kind_result() {
+        let event = StreamEvent::<String>::Result(StreamResultEvent {
+            rank: 1,
+            item: "doc".into(),
+        });
+        assert_eq!(event.kind(), StreamEventKind::Result);
+    }
+
+    #[test]
+    fn event_kind_warning() {
+        let event = StreamEvent::<()>::Warning(StreamWarningEvent {
+            warning: OutputWarning::new("test_warn", "warning message"),
+        });
+        assert_eq!(event.kind(), StreamEventKind::Warning);
+    }
+
+    #[test]
+    fn stream_frame_new_sets_version_and_schema() {
+        let frame: StreamFrame<()> = StreamFrame::new(
+            "stream-1",
+            0,
+            "2026-01-01T00:00:00Z",
+            "search",
+            StreamEvent::Terminal(terminal_event_completed()),
+        );
+        assert_eq!(frame.v, STREAM_PROTOCOL_VERSION);
+        assert_eq!(frame.schema_version, STREAM_SCHEMA_VERSION);
+        assert_eq!(frame.stream_id, "stream-1");
+        assert_eq!(frame.seq, 0);
+        assert_eq!(frame.ts, "2026-01-01T00:00:00Z");
+        assert_eq!(frame.command, "search");
+    }
+
+    #[test]
+    fn failure_category_index_errors() {
+        assert_eq!(
+            failure_category_for_error(&SearchError::IndexCorrupted {
+                path: "test".into(),
+                detail: "bad".into(),
+            }),
+            StreamFailureCategory::Index
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::IndexNotFound {
+                path: "test".into(),
+            }),
+            StreamFailureCategory::Index
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::DimensionMismatch {
+                expected: 256,
+                found: 384,
+            }),
+            StreamFailureCategory::Index
+        );
+    }
+
+    #[test]
+    fn failure_category_model_errors() {
+        assert_eq!(
+            failure_category_for_error(&SearchError::EmbedderUnavailable {
+                model: "test".into(),
+                reason: "not loaded".into(),
+            }),
+            StreamFailureCategory::Model
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::RerankFailed {
+                model: "test".into(),
+                source: "fail".into(),
+            }),
+            StreamFailureCategory::Model
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::ModelNotFound {
+                name: "test".into(),
+            }),
+            StreamFailureCategory::Model
+        );
+    }
+
+    #[test]
+    fn failure_category_resource_errors() {
+        assert_eq!(
+            failure_category_for_error(&SearchError::SearchTimeout {
+                budget_ms: 100,
+                elapsed_ms: 200,
+            }),
+            StreamFailureCategory::Resource
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::QueueFull {
+                pending: 50,
+                capacity: 100
+            }),
+            StreamFailureCategory::Resource
+        );
+    }
+
+    #[test]
+    fn failure_category_io_errors() {
+        assert_eq!(
+            failure_category_for_error(&SearchError::Io(io::Error::other("disk"))),
+            StreamFailureCategory::Io
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::DurabilityDisabled),
+            StreamFailureCategory::Io
+        );
+    }
+
+    #[test]
+    fn failure_category_internal_errors() {
+        assert_eq!(
+            failure_category_for_error(&SearchError::SubsystemError {
+                subsystem: "test",
+                source: "bug".into(),
+            }),
+            StreamFailureCategory::Internal
+        );
+    }
+
+    #[test]
+    fn is_retryable_error_true_cases() {
+        assert!(is_retryable_error(&SearchError::EmbeddingFailed {
+            model: "m".into(),
+            source: Box::new(io::Error::other("e")),
+        }));
+        assert!(is_retryable_error(&SearchError::SearchTimeout {
+            budget_ms: 100,
+            elapsed_ms: 200,
+        }));
+        assert!(is_retryable_error(&SearchError::Io(io::Error::other("e"))));
+        assert!(is_retryable_error(&SearchError::QueueFull {
+            pending: 5,
+            capacity: 10
+        }));
+        assert!(is_retryable_error(&SearchError::SubsystemError {
+            subsystem: "test",
+            source: "e".into(),
+        }));
+        assert!(is_retryable_error(&SearchError::RerankFailed {
+            model: "m".into(),
+            source: "e".into(),
+        }));
+    }
+
+    #[test]
+    fn is_retryable_error_false_cases() {
+        assert!(!is_retryable_error(&SearchError::InvalidConfig {
+            field: "f".into(),
+            value: "v".into(),
+            reason: "r".into(),
+        }));
+        assert!(!is_retryable_error(&SearchError::IndexCorrupted {
+            path: "p".into(),
+            detail: "d".into(),
+        }));
+        assert!(!is_retryable_error(&SearchError::DimensionMismatch {
+            expected: 256,
+            found: 384,
+        }));
+        assert!(!is_retryable_error(&SearchError::Cancelled {
+            phase: "p".into(),
+            reason: "r".into(),
+        }));
+    }
+
+    #[test]
+    fn validate_empty_stream_id() {
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
+            stream_id: "x".into(),
+            query: "q".into(),
+            format: "jsonl".into(),
+        }));
+        frame.stream_id = String::new();
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.stream_id.empty")
+        );
+    }
+
+    #[test]
+    fn validate_empty_timestamp() {
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
+            stream_id: "x".into(),
+            query: "q".into(),
+            format: "jsonl".into(),
+        }));
+        frame.ts = String::new();
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.timestamp.empty")
+        );
+    }
+
+    #[test]
+    fn validate_empty_command() {
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
+            stream_id: "x".into(),
+            query: "q".into(),
+            format: "jsonl".into(),
+        }));
+        frame.command = String::new();
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.command.empty")
+        );
+    }
+
+    #[test]
+    fn validate_failed_terminal_missing_category_and_error() {
+        let frame = sample_frame(StreamEvent::Terminal(StreamTerminalEvent {
+            status: StreamTerminalStatus::Failed,
+            exit_code: 0,
+            failure_category: None,
+            error: None,
+            retry: StreamRetryDirective::None,
+        }));
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.terminal.failed_zero_exit")
+        );
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.terminal.failed_missing_category")
+        );
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.terminal.failed_missing_error")
+        );
+    }
+
+    #[test]
+    fn validate_cancelled_terminal_exit_mismatch() {
+        let frame = sample_frame(StreamEvent::Terminal(StreamTerminalEvent {
+            status: StreamTerminalStatus::Cancelled,
+            exit_code: 1,
+            failure_category: None,
+            error: None,
+            retry: StreamRetryDirective::None,
+        }));
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.terminal.cancelled_exit_mismatch")
+        );
+    }
+
+    #[test]
+    fn validate_cancelled_terminal_with_retry() {
+        let frame = sample_frame(StreamEvent::Terminal(StreamTerminalEvent {
+            status: StreamTerminalStatus::Cancelled,
+            exit_code: crate::adapters::cli::exit_code::INTERRUPTED,
+            failure_category: None,
+            error: None,
+            retry: StreamRetryDirective::RetryAfterMs {
+                delay_ms: 100,
+                next_attempt: 1,
+                max_attempts: 3,
+            },
+        }));
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.terminal.cancelled_has_retry")
+        );
+    }
+
+    #[test]
+    fn stream_terminal_status_serde_roundtrip() {
+        for status in [
+            StreamTerminalStatus::Completed,
+            StreamTerminalStatus::Failed,
+            StreamTerminalStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: StreamTerminalStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn stream_failure_category_serde_roundtrip() {
+        for cat in [
+            StreamFailureCategory::Config,
+            StreamFailureCategory::Index,
+            StreamFailureCategory::Model,
+            StreamFailureCategory::Resource,
+            StreamFailureCategory::Io,
+            StreamFailureCategory::Internal,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let back: StreamFailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, cat);
+        }
+    }
+
+    #[test]
+    fn stream_retry_directive_serde_none() {
+        let d = StreamRetryDirective::None;
+        let json = serde_json::to_string(&d).unwrap();
+        let back: StreamRetryDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn stream_retry_directive_serde_retry_after() {
+        let d = StreamRetryDirective::RetryAfterMs {
+            delay_ms: 500,
+            next_attempt: 2,
+            max_attempts: 5,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: StreamRetryDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn stream_retry_directive_serde_exhausted() {
+        let d = StreamRetryDirective::RetryExhausted { exhausted_after: 3 };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: StreamRetryDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn decode_ndjson_invalid_json() {
+        let result = decode_stream_frame_ndjson::<String>("not valid json{{{");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, SearchError::SubsystemError { .. }));
+    }
+
+    #[test]
+    fn retry_directive_max_attempts_zero() {
+        // max_attempts=0 should always return None regardless of error type.
+        let err = SearchError::Io(io::Error::other("transient"));
+        let directive = retry_directive_for_error(&err, 0, 0);
+        assert!(matches!(directive, StreamRetryDirective::None));
+    }
+
+    #[test]
+    fn retry_backoff_progressive() {
+        // Verify backoff increases progressively.
+        let mut prev = 0;
+        for attempt in 0..8 {
+            let delay = retry_backoff_ms(attempt);
+            assert!(
+                delay >= prev,
+                "backoff should be non-decreasing: attempt {attempt}, {delay} >= {prev}"
+            );
+            prev = delay;
+        }
+    }
+
+    #[test]
+    fn terminal_event_from_error_max_attempts_zero() {
+        // max_attempts=0 means no retries regardless of error type.
+        let err = SearchError::Io(io::Error::other("transient"));
+        let terminal = terminal_event_from_error(&err, 0, 0);
+        assert!(matches!(terminal.retry, StreamRetryDirective::None));
+    }
+
+    #[test]
+    fn stream_event_kind_serde_roundtrip() {
+        for kind in [
+            StreamEventKind::Started,
+            StreamEventKind::Progress,
+            StreamEventKind::Result,
+            StreamEventKind::Explain,
+            StreamEventKind::Warning,
+            StreamEventKind::Terminal,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: StreamEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn progress_event_total_units_none_skipped_in_json() {
+        let event = StreamProgressEvent {
+            stage: "retrieve.fast".into(),
+            completed_units: 50,
+            total_units: None,
+            reason_code: "query.phase.initial".into(),
+            message: "in progress".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("total_units"));
+    }
+
+    #[test]
+    fn validate_wrong_protocol_version() {
+        let mut frame = sample_frame(StreamEvent::Started(StreamStartedEvent {
+            stream_id: "x".into(),
+            query: "q".into(),
+            format: "jsonl".into(),
+        }));
+        frame.v = 99;
+        let validation = validate_stream_frame(&frame);
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .violations
+                .iter()
+                .any(|v| v.code == "stream.schema_version.mismatch")
+        );
+    }
+
+    // ─── bd-zp7z tests end ───
 }

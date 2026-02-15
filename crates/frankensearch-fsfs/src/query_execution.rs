@@ -1859,7 +1859,8 @@ mod tests {
 
     #[test]
     fn sanitize_score_nan_becomes_neg_infinity() {
-        assert!(super::sanitize_score(f32::NAN) == f32::NEG_INFINITY);
+        let value = super::sanitize_score(f32::NAN);
+        assert!(value.is_infinite() && value.is_sign_negative());
     }
 
     #[test]
@@ -1869,7 +1870,8 @@ mod tests {
 
     #[test]
     fn sanitize_score_infinity_unchanged() {
-        assert!(super::sanitize_score(f32::INFINITY) == f32::INFINITY);
+        let value = super::sanitize_score(f32::INFINITY);
+        assert!(value.is_infinite() && value.is_sign_positive());
     }
 
     // --- sanitize_fused_score ---
@@ -1959,12 +1961,14 @@ mod tests {
 
     #[test]
     fn option_score_none_is_neg_infinity() {
-        assert!(super::option_score(None) == f32::NEG_INFINITY);
+        let value = super::option_score(None);
+        assert!(value.is_infinite() && value.is_sign_negative());
     }
 
     #[test]
     fn option_score_some_nan_is_neg_infinity() {
-        assert!(super::option_score(Some(f32::NAN)) == f32::NEG_INFINITY);
+        let value = super::option_score(Some(f32::NAN));
+        assert!(value.is_infinite() && value.is_sign_negative());
     }
 
     #[test]

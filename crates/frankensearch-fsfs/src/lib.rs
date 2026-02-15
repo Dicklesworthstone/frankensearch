@@ -59,8 +59,8 @@ pub use catalog::{
     CatalogIngestionClass, CatalogPipelineStatus, DIRTY_CATALOG_LOOKUP_SQL, INDEX_CATALOG_CLEANUP,
     INDEX_CATALOG_CONTENT_HASH, INDEX_CATALOG_DIRTY_LOOKUP, INDEX_CATALOG_REVISIONS,
     INDEX_CHANGELOG_FILE_REVISION, INDEX_CHANGELOG_PENDING_APPLY, INDEX_CHANGELOG_REPLAY,
-    ReplayDecision, bootstrap_catalog_schema, classify_replay_sequence,
-    current_catalog_schema_version,
+    ReplayDecision, bootstrap_catalog_schema, classify_replay_sequence, cleanup_tombstones,
+    cleanup_tombstones_for_path, current_catalog_schema_version,
 };
 pub use cli_e2e::{
     CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED, CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,

@@ -916,6 +916,8 @@ pub struct StorageConfig {
     pub db_path: String,
     pub evidence_retention_days: u16,
     pub summary_retention_days: u16,
+    pub disk_budget_bytes: Option<u64>,
+    pub storage_pressure_emergency: bool,
 }
 
 impl Default for StorageConfig {
@@ -925,6 +927,8 @@ impl Default for StorageConfig {
             db_path: "~/.local/share/fsfs/fsfs.db".into(),
             evidence_retention_days: 7,
             summary_retention_days: 90,
+            disk_budget_bytes: None,
+            storage_pressure_emergency: false,
         }
     }
 }
@@ -1016,6 +1020,8 @@ struct StorageConfigPatch {
     db_path: Option<String>,
     evidence_retention_days: Option<u16>,
     summary_retention_days: Option<u16>,
+    disk_budget_bytes: Option<u64>,
+    storage_pressure_emergency: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -1826,6 +1832,12 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(summary_retention_days) = storage.summary_retention_days {
             config.storage.summary_retention_days = summary_retention_days;
         }
+        if let Some(disk_budget_bytes) = storage.disk_budget_bytes {
+            config.storage.disk_budget_bytes = Some(disk_budget_bytes);
+        }
+        if let Some(storage_pressure_emergency) = storage.storage_pressure_emergency {
+            config.storage.storage_pressure_emergency = storage_pressure_emergency;
+        }
     }
 
     if let Some(privacy) = patch.privacy {
@@ -2064,6 +2076,25 @@ fn apply_env_overrides(
         keys_used.push(key.into());
     }
 
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_STORAGE_DISK_BUDGET_BYTES",
+        "FSFS_STORAGE_DISK_BUDGET_BYTES",
+    ) {
+        config.storage.disk_budget_bytes = Some(parse_u64(value, "storage.disk_budget_bytes")?);
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_STORAGE_PRESSURE_EMERGENCY",
+        "FSFS_STORAGE_PRESSURE_EMERGENCY",
+    ) {
+        config.storage.storage_pressure_emergency =
+            parse_bool(value, "storage.storage_pressure_emergency")?;
+        keys_used.push(key.into());
+    }
+
     if let Some((key, value)) = env_override(env, "FRANKENSEARCH_MODEL_DIR", "FSFS_MODEL_DIR") {
         config.indexing.model_dir.clone_from(value);
         keys_used.push(key.into());
@@ -2229,6 +2260,8 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "db_path",
                 "evidence_retention_days",
                 "summary_retention_days",
+                "disk_budget_bytes",
+                "storage_pressure_emergency",
             ]
             .into_iter()
             .collect(),
@@ -4141,6 +4174,8 @@ mod tests {
         assert_eq!(cfg.db_path, "~/.local/share/fsfs/fsfs.db");
         assert_eq!(cfg.evidence_retention_days, 7);
         assert_eq!(cfg.summary_retention_days, 90);
+        assert_eq!(cfg.disk_budget_bytes, None);
+        assert!(!cfg.storage_pressure_emergency);
     }
 
     #[test]
@@ -4720,6 +4755,24 @@ mod tests {
         let result =
             load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
         assert_eq!(result.config.storage.db_path, "/tmp/custom.db");
+    }
+
+    #[test]
+    fn env_override_storage_budget_and_emergency() {
+        let env = HashMap::from([
+            (
+                "FRANKENSEARCH_STORAGE_DISK_BUDGET_BYTES".into(),
+                "123456".into(),
+            ),
+            (
+                "FRANKENSEARCH_STORAGE_PRESSURE_EMERGENCY".into(),
+                "true".into(),
+            ),
+        ]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(result.config.storage.disk_budget_bytes, Some(123_456));
+        assert!(result.config.storage.storage_pressure_emergency);
     }
 
     #[test]

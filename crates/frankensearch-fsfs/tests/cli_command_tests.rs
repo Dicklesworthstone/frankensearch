@@ -579,6 +579,34 @@ fn search_stream_emits_ndjson_lines() {
     );
 }
 
+#[test]
+fn search_stream_rejects_non_stream_format() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--stream",
+            "--format",
+            "table",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "search --stream with --format table should fail validation"
+    );
+    let combined = format!("{}\n{}", stdout_str(&output), stderr_str(&output));
+    assert!(
+        combined.contains("stream mode requires --format jsonl or --format toon"),
+        "expected stream-format validation message, got:\n{combined}"
+    );
+}
+
 // ─── Explain Command ────────────────────────────────────────────────────────
 
 #[test]
@@ -737,11 +765,19 @@ fn download_list_csv_output_uses_generic_csv_envelope() {
 }
 
 #[test]
-fn explain_csv_output_uses_generic_csv_envelope() {
+fn explain_csv_without_search_context_reports_error() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let ctx = TestContext::new(temp.path());
     let output = ctx.run(temp.path(), &["explain", "R1", "--format", "csv"]);
-    assert_generic_csv_envelope("explain csv", &output);
+    assert!(
+        !output.status.success(),
+        "explain without prior search should fail"
+    );
+    let combined = format!("{}\n{}", stdout_str(&output), stderr_str(&output));
+    assert!(
+        combined.contains("no saved search context"),
+        "error should mention missing search context"
+    );
 }
 
 #[test]

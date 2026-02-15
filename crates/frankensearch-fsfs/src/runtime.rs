@@ -26,12 +26,14 @@ use tracing::{info, warn};
 use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
 use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
 use crate::adapters::tui::FsfsTuiShellModel;
+use crate::agent_ergonomics::result_id;
+use crate::catalog::cleanup_tombstones_for_path;
 use crate::config::{
     DegradationOverrideMode, DiscoveryCandidate, DiscoveryDecision, DiscoveryScopeDecision,
     FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision,
     default_project_config_file_path, default_user_config_file_path,
 };
-use crate::explanation_payload::{FsfsExplanationPayload, RankingExplanation};
+use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
@@ -44,8 +46,8 @@ use crate::pressure::{
     PressureState, PressureTransition,
 };
 use crate::query_execution::{
-    FusionPolicy as QueryFusionPolicy, LexicalCandidate, QueryExecutionOrchestrator,
-    SemanticCandidate,
+    FusedCandidate, FusionPolicy as QueryFusionPolicy, LexicalCandidate,
+    QueryExecutionOrchestrator, SemanticCandidate,
 };
 use crate::query_planning::{CapabilityState, QueryExecutionCapabilities, QueryPlanner};
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
@@ -175,10 +177,15 @@ pub struct DiskBudgetControlPlan {
 const DISK_BUDGET_RATIO_DIVISOR: u64 = 10;
 const DISK_BUDGET_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DISK_BUDGET_FALLBACK_BYTES: u64 = DISK_BUDGET_CAP_BYTES;
+const DISK_BUDGET_REASON_EMERGENCY_OVERRIDE: &str = "disk.budget.emergency_override";
+const MILLIS_PER_DAY: u64 = 86_400_000;
+const TOMBSTONE_CLEANUP_MIN_INTERVAL_MS: u64 = 60_000;
 const FSFS_SENTINEL_FILE: &str = "index_sentinel.json";
 const FSFS_VECTOR_MANIFEST_FILE: &str = "vector/index_manifest.json";
 const FSFS_LEXICAL_MANIFEST_FILE: &str = "lexical/index_manifest.json";
 const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
+const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
+const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
 const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
@@ -220,6 +227,83 @@ struct IndexSentinel {
     reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ExplainSession {
+    schema_version: String,
+    generated_at_ms: u64,
+    query: String,
+    phase: SearchOutputPhase,
+    rrf_k: f64,
+    hits: Vec<ExplainSessionHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ExplainSessionHit {
+    result_id: String,
+    rank: usize,
+    path: String,
+    final_score: f64,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    lexical_score: Option<f32>,
+    semantic_score: Option<f32>,
+    in_both_sources: bool,
+}
+
+impl ExplainSession {
+    fn from_fused(
+        query: &str,
+        phase: SearchOutputPhase,
+        rrf_k: f64,
+        fused: &[FusedCandidate],
+    ) -> Self {
+        let hits = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| ExplainSessionHit {
+                result_id: result_id(idx),
+                rank: idx.saturating_add(1),
+                path: candidate.doc_id.clone(),
+                final_score: sanitize_explain_score(candidate.fused_score),
+                lexical_rank: candidate.lexical_rank,
+                semantic_rank: candidate.semantic_rank,
+                lexical_score: candidate.lexical_score,
+                semantic_score: candidate.semantic_score,
+                in_both_sources: candidate.in_both_sources,
+            })
+            .collect();
+
+        Self {
+            schema_version: EXPLAIN_SESSION_SCHEMA_VERSION.to_owned(),
+            generated_at_ms: pressure_timestamp_ms(),
+            query: query.to_owned(),
+            phase,
+            rrf_k,
+            hits,
+        }
+    }
+
+    fn resolve(&self, id: &str) -> Option<&ExplainSessionHit> {
+        self.hits.iter().find(|hit| hit.result_id == id)
+    }
+
+    fn preview_ids(&self) -> String {
+        if self.hits.is_empty() {
+            return "none".to_owned();
+        }
+        self.hits
+            .iter()
+            .take(10)
+            .map(|hit| hit.result_id.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+const fn sanitize_explain_score(score: f64) -> f64 {
+    if score.is_finite() { score } else { 0.0 }
 }
 
 /// Live ingest pipeline that re-indexes changed files detected by the watcher.
@@ -468,7 +552,9 @@ struct FsfsRuntimeStatus {
     disk_budget_stage: Option<String>,
     disk_budget_action: Option<String>,
     disk_budget_reason_code: Option<String>,
+    disk_budget_bytes: Option<u64>,
     tracked_index_bytes: Option<u64>,
+    storage_pressure_emergency: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1323,6 +1409,19 @@ impl FsfsRuntime {
     /// state.
     #[must_use]
     pub fn disk_budget_control_plan(snapshot: DiskBudgetSnapshot) -> DiskBudgetControlPlan {
+        if snapshot.reason_code == DISK_BUDGET_REASON_EMERGENCY_OVERRIDE {
+            return DiskBudgetControlPlan {
+                watcher_pressure_state: PressureState::Emergency,
+                throttle_ingest: true,
+                pause_writes: true,
+                request_eviction: false,
+                request_compaction: false,
+                request_tombstone_cleanup: true,
+                eviction_target_bytes: 0,
+                reason_code: snapshot.reason_code,
+            };
+        }
+
         let over_bytes = snapshot.used_bytes.saturating_sub(snapshot.budget_bytes);
         let reclaim_floor = snapshot.budget_bytes / 20;
 
@@ -1371,6 +1470,57 @@ impl FsfsRuntime {
     }
 
     #[must_use]
+    fn apply_storage_emergency_override(
+        &self,
+        snapshot: Option<DiskBudgetSnapshot>,
+        tracked_index_bytes: Option<u64>,
+        fallback_budget_bytes: u64,
+    ) -> Option<DiskBudgetSnapshot> {
+        if !self.config.storage.storage_pressure_emergency {
+            return snapshot;
+        }
+
+        let budget_bytes = snapshot.as_ref().map_or_else(
+            || fallback_budget_bytes.max(1),
+            |value| value.budget_bytes.max(1),
+        );
+        let used_bytes = snapshot.as_ref().map_or_else(
+            || tracked_index_bytes.unwrap_or(0),
+            |value| value.used_bytes,
+        );
+        let usage_per_mille = used_bytes
+            .saturating_mul(1000)
+            .checked_div(budget_bytes)
+            .map_or(0, |per_mille| {
+                u16::try_from(per_mille.min(u64::from(u16::MAX))).unwrap_or(u16::MAX)
+            });
+
+        Some(DiskBudgetSnapshot {
+            stage: DiskBudgetStage::Critical,
+            action: DiskBudgetAction::PauseWrites,
+            used_bytes,
+            budget_bytes,
+            usage_per_mille,
+            reason_code: DISK_BUDGET_REASON_EMERGENCY_OVERRIDE,
+        })
+    }
+
+    #[must_use]
+    fn tombstone_cleanup_cutoff_ms(&self, now_ms: u64) -> i64 {
+        let retention_ms =
+            u64::from(self.config.storage.evidence_retention_days).saturating_mul(MILLIS_PER_DAY);
+        let cutoff = now_ms.saturating_sub(retention_ms);
+        i64::try_from(cutoff).unwrap_or(i64::MAX)
+    }
+
+    fn cleanup_catalog_tombstones(&self, now_ms: u64) -> SearchResult<(usize, i64)> {
+        let cutoff_ms = self.tombstone_cleanup_cutoff_ms(now_ms);
+        let deleted_rows =
+            cleanup_tombstones_for_path(Path::new(&self.config.storage.db_path), cutoff_ms)?;
+        Ok((deleted_rows, cutoff_ms))
+    }
+
+    #[must_use]
     fn new_runtime_lifecycle_tracker(&self, paths: &IndexStoragePaths) -> LifecycleTracker {
         let max_index_bytes = self.resolve_index_budget_bytes(paths);
         LifecycleTracker::new(
@@ -1414,6 +1564,10 @@ impl FsfsRuntime {
     }
 
     fn resolve_index_budget_bytes(&self, paths: &IndexStoragePaths) -> u64 {
+        if let Some(configured_budget_bytes) = self.config.storage.disk_budget_bytes {
+            return configured_budget_bytes;
+        }
+
         let primary_probe = PathBuf::from(&self.config.storage.index_dir);
         let fallback_probe = PathBuf::from(&self.config.storage.db_path);
         let available = available_space_for_path(&primary_probe)
@@ -2608,6 +2762,7 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_explain_command(&self) -> SearchResult<()> {
         let result_id =
             self.cli_input
@@ -2618,14 +2773,65 @@ impl FsfsRuntime {
                     value: String::new(),
                     reason: "missing result identifier argument".to_owned(),
                 })?;
-        let query = self.cli_input.query.clone().unwrap_or_default();
-        let matched_terms = query
+        let session = self
+            .load_explain_session()?
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "cli.explain.result_id".to_owned(),
+                value: result_id.to_owned(),
+                reason: "no saved search context found; run `fsfs search <query>` first".to_owned(),
+            })?;
+        let hit = session
+            .resolve(result_id)
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "cli.explain.result_id".to_owned(),
+                value: result_id.to_owned(),
+                reason: format!(
+                    "unknown result id; available ids: {}",
+                    session.preview_ids()
+                ),
+            })?;
+
+        let matched_terms = session
+            .query
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let explanation = HitExplanation {
-            final_score: 0.0,
-            components: vec![ScoreComponent {
+        let source_count = usize::from(hit.lexical_score.is_some())
+            .saturating_add(usize::from(hit.semantic_score.is_some()));
+        let shared_weight = if source_count == 0 {
+            1.0
+        } else {
+            1.0 / f64::from(u32::try_from(source_count).unwrap_or(1))
+        };
+
+        let mut components = Vec::new();
+        if let Some(lexical_score) = hit.lexical_score {
+            components.push(ScoreComponent {
+                source: ExplainedSource::LexicalBm25 {
+                    matched_terms: matched_terms.clone(),
+                    tf: 0.0,
+                    idf: 0.0,
+                },
+                raw_score: f64::from(lexical_score),
+                normalized_score: f64::from(lexical_score),
+                rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.lexical_rank),
+                weight: shared_weight,
+            });
+        }
+        if let Some(semantic_score) = hit.semantic_score {
+            components.push(ScoreComponent {
+                source: ExplainedSource::SemanticFast {
+                    embedder: "fast-tier".to_owned(),
+                    cosine_sim: f64::from(semantic_score),
+                },
+                raw_score: f64::from(semantic_score),
+                normalized_score: f64::from(semantic_score),
+                rrf_contribution: rrf_contribution_for_rank(session.rrf_k, hit.semantic_rank),
+                weight: shared_weight,
+            });
+        }
+        if components.is_empty() {
+            components.push(ScoreComponent {
                 source: ExplainedSource::LexicalBm25 {
                     matched_terms,
                     tf: 0.0,
@@ -2635,20 +2841,41 @@ impl FsfsRuntime {
                 normalized_score: 0.0,
                 rrf_contribution: 0.0,
                 weight: 1.0,
-            }],
-            phase: ExplanationPhase::Initial,
+            });
+        }
+
+        let explanation = HitExplanation {
+            final_score: hit.final_score,
+            components,
+            phase: match session.phase {
+                SearchOutputPhase::Refined => ExplanationPhase::Refined,
+                SearchOutputPhase::Initial | SearchOutputPhase::RefinementFailed => {
+                    ExplanationPhase::Initial
+                }
+            },
             rank_movement: None,
         };
-        let ranking = RankingExplanation::from_hit_explanation(
-            result_id,
+        let mut ranking = RankingExplanation::from_hit_explanation(
+            &hit.path,
             &explanation,
-            "query.explain.stub",
-            500,
+            "query.explain.attached",
+            920,
         );
-        let payload = FsfsExplanationPayload::new(query, ranking);
+        ranking.fusion = Some(FusionContext {
+            fused_score: hit.final_score,
+            lexical_rank: hit.lexical_rank,
+            semantic_rank: hit.semantic_rank,
+            lexical_score: hit.lexical_score,
+            semantic_score: hit.semantic_score,
+            in_both_sources: hit.in_both_sources,
+        });
+        let payload = FsfsExplanationPayload::new(session.query.clone(), ranking);
 
         if self.cli_input.format == OutputFormat::Table {
-            println!("{}", payload.to_toon());
+            println!(
+                "{}",
+                render_explain_table(result_id, &payload, hit, session.rrf_k)
+            );
             return Ok(());
         }
 
@@ -2666,6 +2893,54 @@ impl FsfsRuntime {
         }
 
         Ok(())
+    }
+
+    fn explain_session_path(index_root: &Path) -> PathBuf {
+        index_root.join(FSFS_EXPLAIN_SESSION_FILE)
+    }
+
+    fn persist_explain_session(
+        &self,
+        index_root: &Path,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+    ) -> SearchResult<()> {
+        let session = ExplainSession::from_fused(query, phase, self.config.search.rrf_k, fused);
+        let path = Self::explain_session_path(index_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&session).map_err(|source| {
+            SearchError::SubsystemError {
+                subsystem: "fsfs.explain.session",
+                source: Box::new(source),
+            }
+        })?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn load_explain_session(&self) -> SearchResult<Option<ExplainSession>> {
+        let index_root = self.resolve_status_index_root()?;
+        let path = Self::explain_session_path(&index_root);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.explain.session",
+                    source: Box::new(source),
+                });
+            }
+        };
+        let session = serde_json::from_str::<ExplainSession>(&raw).map_err(|source| {
+            SearchError::SubsystemError {
+                subsystem: "fsfs.explain.session",
+                source: Box::new(source),
+            }
+        })?;
+        Ok(Some(session))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2847,6 +3122,15 @@ impl FsfsRuntime {
             &fused,
             &snippets_by_doc,
         );
+        if let Err(error) =
+            self.persist_explain_session(&index_root, &normalized_query, payload.phase, &fused)
+        {
+            warn!(
+                error = %error,
+                path = %Self::explain_session_path(&index_root).display(),
+                "failed to persist explain-session context for follow-up `fsfs explain`"
+            );
+        }
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
         info!(
@@ -3424,8 +3708,13 @@ impl FsfsRuntime {
         };
         let usage = self.collect_index_storage_usage(&storage_paths)?;
         let tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
-        let disk_budget = self.evaluate_storage_disk_budget(&tracker, &storage_paths)?;
         let lifecycle = tracker.status();
+        let tracked_index_bytes = lifecycle.resources.index_bytes;
+        let disk_budget = self.apply_storage_emergency_override(
+            self.evaluate_storage_disk_budget(&tracker, &storage_paths)?,
+            tracked_index_bytes,
+            tracker.resource_limits().max_index_bytes,
+        );
 
         let config_status = FsfsConfigStatus {
             source: self.status_config_source_summary()?,
@@ -3448,7 +3737,9 @@ impl FsfsRuntime {
             disk_budget_reason_code: disk_budget
                 .as_ref()
                 .map(|snapshot| snapshot.reason_code.to_owned()),
-            tracked_index_bytes: lifecycle.resources.index_bytes,
+            disk_budget_bytes: disk_budget.as_ref().map(|snapshot| snapshot.budget_bytes),
+            tracked_index_bytes,
+            storage_pressure_emergency: self.config.storage.storage_pressure_emergency,
         };
 
         Ok(FsfsStatusPayload {
@@ -4247,6 +4538,7 @@ impl FsfsRuntime {
         self.finalize_shutdown(cx, reason).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn await_shutdown(
         &self,
         cx: &Cx,
@@ -4260,6 +4552,7 @@ impl FsfsRuntime {
         let mut last_pressure_sample_ms = 0_u64;
         let mut last_applied_watcher_state: Option<PressureState> = None;
         let mut last_disk_stage: Option<DiskBudgetStage> = None;
+        let mut last_tombstone_cleanup_ms: Option<u64> = None;
 
         loop {
             if let Some(watcher) = watcher {
@@ -4286,36 +4579,71 @@ impl FsfsRuntime {
 
                     if let Some((tracker, storage_paths)) = disk_budget {
                         match self.evaluate_storage_disk_budget(tracker, storage_paths) {
-                            Ok(Some(snapshot)) => {
-                                let control_plan = Self::disk_budget_control_plan(snapshot);
-                                if last_disk_stage != Some(snapshot.stage) {
-                                    info!(
-                                        stage = ?snapshot.stage,
-                                        action = ?snapshot.action,
-                                        reason_code = control_plan.reason_code,
-                                        used_bytes = snapshot.used_bytes,
-                                        budget_bytes = snapshot.budget_bytes,
-                                        usage_per_mille = snapshot.usage_per_mille,
-                                        eviction_target_bytes = control_plan.eviction_target_bytes,
-                                        request_eviction = control_plan.request_eviction,
-                                        request_compaction = control_plan.request_compaction,
-                                        request_tombstone_cleanup = control_plan.request_tombstone_cleanup,
-                                        "fsfs disk budget stage updated"
-                                    );
-                                    last_disk_stage = Some(snapshot.stage);
-                                }
-                                let combined_state = target_watcher_state.map_or(
-                                    control_plan.watcher_pressure_state,
-                                    |state| {
-                                        more_severe_pressure_state(
-                                            state,
-                                            control_plan.watcher_pressure_state,
-                                        )
-                                    },
+                            Ok(snapshot) => {
+                                let snapshot = self.apply_storage_emergency_override(
+                                    snapshot,
+                                    tracker.current_resource_usage().effective_index_bytes(),
+                                    tracker.resource_limits().max_index_bytes,
                                 );
-                                target_watcher_state = Some(combined_state);
+                                if let Some(snapshot) = snapshot {
+                                    let control_plan = Self::disk_budget_control_plan(snapshot);
+                                    if last_disk_stage != Some(snapshot.stage) {
+                                        info!(
+                                            stage = ?snapshot.stage,
+                                            action = ?snapshot.action,
+                                            reason_code = control_plan.reason_code,
+                                            used_bytes = snapshot.used_bytes,
+                                            budget_bytes = snapshot.budget_bytes,
+                                            usage_per_mille = snapshot.usage_per_mille,
+                                            eviction_target_bytes = control_plan.eviction_target_bytes,
+                                            request_eviction = control_plan.request_eviction,
+                                            request_compaction = control_plan.request_compaction,
+                                            request_tombstone_cleanup = control_plan.request_tombstone_cleanup,
+                                            "fsfs disk budget stage updated"
+                                        );
+                                        last_disk_stage = Some(snapshot.stage);
+                                    }
+
+                                    if control_plan.request_tombstone_cleanup {
+                                        let cleanup_due =
+                                            last_tombstone_cleanup_ms.is_none_or(|last| {
+                                                now_ms.saturating_sub(last)
+                                                    >= TOMBSTONE_CLEANUP_MIN_INTERVAL_MS
+                                            });
+                                        if cleanup_due {
+                                            match self.cleanup_catalog_tombstones(now_ms) {
+                                                Ok((deleted_rows, cutoff_ms)) => {
+                                                    info!(
+                                                        deleted_rows,
+                                                        cutoff_ms,
+                                                        reason_code = control_plan.reason_code,
+                                                        "fsfs catalog tombstone cleanup executed"
+                                                    );
+                                                    last_tombstone_cleanup_ms = Some(now_ms);
+                                                }
+                                                Err(error) => {
+                                                    warn!(
+                                                        error = %error,
+                                                        reason_code = control_plan.reason_code,
+                                                        "fsfs catalog tombstone cleanup failed"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let combined_state = target_watcher_state.map_or(
+                                        control_plan.watcher_pressure_state,
+                                        |state| {
+                                            more_severe_pressure_state(
+                                                state,
+                                                control_plan.watcher_pressure_state,
+                                            )
+                                        },
+                                    );
+                                    target_watcher_state = Some(combined_state);
+                                }
                             }
-                            Ok(None) => {}
                             Err(err) => {
                                 warn!(error = %err, "fsfs disk budget evaluation failed");
                             }
@@ -4405,6 +4733,59 @@ const fn completion_script(shell: CompletionShell) -> &'static str {
             "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
+}
+
+fn rrf_contribution_for_rank(k: f64, rank: Option<usize>) -> f64 {
+    let Some(rank) = rank else {
+        return 0.0;
+    };
+    let safe_k = if k.is_finite() && k >= 0.0 { k } else { 60.0 };
+    let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
+    1.0 / (safe_k + f64::from(rank_u32) + 1.0)
+}
+
+fn render_explain_table(
+    requested_result_id: &str,
+    payload: &FsfsExplanationPayload,
+    hit: &ExplainSessionHit,
+    rrf_k: f64,
+) -> String {
+    let lexical_score = hit
+        .lexical_score
+        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
+    let semantic_fast_score = hit
+        .semantic_score
+        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"));
+    let quality_score = "n/a";
+    let rerank_score = "n/a";
+    let lexical_rrf = rrf_contribution_for_rank(rrf_k, hit.lexical_rank);
+    let semantic_rrf = rrf_contribution_for_rank(rrf_k, hit.semantic_rank);
+    let total_rrf = lexical_rrf + semantic_rrf;
+    let lexical_rank = hit
+        .lexical_rank
+        .map_or_else(|| "-".to_owned(), |rank| rank.saturating_add(1).to_string());
+    let semantic_rank = hit
+        .semantic_rank
+        .map_or_else(|| "-".to_owned(), |rank| rank.saturating_add(1).to_string());
+
+    let mut lines = Vec::new();
+    lines.push(format!("Result ID: {requested_result_id}"));
+    lines.push(format!("Result: {}", payload.ranking.doc_id));
+    lines.push(format!("Query: {}", payload.query));
+    lines.push(String::new());
+    lines.push(format!("Lexical (BM25): {lexical_score}"));
+    lines.push(format!("Semantic (fast): {semantic_fast_score}"));
+    lines.push(format!("Semantic (quality): {quality_score}"));
+    lines.push(format!("Reranker: {rerank_score}"));
+    lines.push(format!(
+        "RRF: k={rrf_k:.1}, lexical_rank={lexical_rank}, semantic_rank={semantic_rank}, lexical_contrib={lexical_rrf:.6}, semantic_contrib={semantic_rrf:.6}, total={total_rrf:.6}"
+    ));
+    lines.push(format!(
+        "Final blended score: {:.6}",
+        payload.ranking.final_score
+    ));
+
+    lines.join("\n")
 }
 
 fn pressure_timestamp_ms() -> u64 {
@@ -4681,6 +5062,14 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             humanize_bytes(index_bytes)
         );
     }
+    if let Some(budget_bytes) = status.runtime.disk_budget_bytes {
+        let _ = writeln!(out, "  disk budget bytes: {}", humanize_bytes(budget_bytes));
+    }
+    let _ = writeln!(
+        out,
+        "  storage pressure emergency: {}",
+        status.runtime.storage_pressure_emergency
+    );
 
     out
 }
@@ -5027,6 +5416,8 @@ mod tests {
     use frankensearch_embed::HashEmbedder;
     use frankensearch_index::VectorIndex;
     use frankensearch_lexical::TantivyIndex;
+    use fsqlite::Connection;
+    use fsqlite_types::value::SqliteValue;
 
     use super::{
         EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
@@ -5034,6 +5425,7 @@ mod tests {
         degradation_controller_config_for_profile, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
+    use crate::catalog::bootstrap_catalog_schema;
     use crate::config::{
         DegradationOverrideMode, DiscoveryCandidate, DiscoveryScopeDecision, FsfsConfig,
         IngestionClass, PressureProfile,
@@ -5345,6 +5737,133 @@ mod tests {
         assert_eq!(
             paths.embedding_cache_roots,
             vec![PathBuf::from("/tmp/fsfs-index/cache")]
+        );
+    }
+
+    #[test]
+    fn runtime_resolve_index_budget_prefers_storage_override() {
+        let mut config = FsfsConfig::default();
+        config.storage.disk_budget_bytes = Some(42_000);
+        let runtime = FsfsRuntime::new(config);
+        assert_eq!(
+            runtime.resolve_index_budget_bytes(&IndexStoragePaths::default()),
+            42_000
+        );
+    }
+
+    #[test]
+    fn runtime_storage_pressure_emergency_forces_pause_writes_plan() {
+        let mut config = FsfsConfig::default();
+        config.storage.storage_pressure_emergency = true;
+        let runtime = FsfsRuntime::new(config);
+        let tracker = LifecycleTracker::new(
+            WatchdogConfig::default(),
+            ResourceLimits {
+                max_index_bytes: 1_000,
+                ..ResourceLimits::default()
+            },
+        );
+
+        let snapshot = runtime
+            .apply_storage_emergency_override(
+                runtime.evaluate_index_disk_budget(&tracker, 500),
+                Some(500),
+                tracker.resource_limits().max_index_bytes,
+            )
+            .expect("emergency override should always provide a snapshot");
+        assert_eq!(snapshot.stage, DiskBudgetStage::Critical);
+        assert_eq!(snapshot.action, DiskBudgetAction::PauseWrites);
+        assert_eq!(
+            snapshot.reason_code,
+            super::DISK_BUDGET_REASON_EMERGENCY_OVERRIDE
+        );
+
+        let plan = FsfsRuntime::disk_budget_control_plan(snapshot);
+        assert_eq!(plan.watcher_pressure_state, PressureState::Emergency);
+        assert!(plan.pause_writes);
+        assert!(plan.request_tombstone_cleanup);
+        assert!(!plan.request_eviction);
+        assert!(!plan.request_compaction);
+    }
+
+    #[test]
+    fn runtime_cleanup_catalog_tombstones_prunes_old_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("fsfs.db");
+        let conn = Connection::open(db_path.display().to_string()).expect("open sqlite");
+        bootstrap_catalog_schema(&conn).expect("bootstrap catalog schema");
+
+        let now_ms = 1_710_000_000_000_u64;
+        let retention_days = 7_u16;
+        let retention_ms = u64::from(retention_days).saturating_mul(super::MILLIS_PER_DAY);
+        let old_deleted_ts =
+            i64::try_from(now_ms.saturating_sub(retention_ms).saturating_sub(1_000)).unwrap();
+        let fresh_deleted_ts = i64::try_from(now_ms.saturating_sub(retention_ms / 2)).unwrap();
+
+        let old_row = [
+            SqliteValue::Text("home:/tmp/old.txt".to_owned()),
+            SqliteValue::Text("home".to_owned()),
+            SqliteValue::Text("/tmp/old.txt".to_owned()),
+            SqliteValue::Blob(vec![1_u8; 32]),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("full_semantic_lexical".to_owned()),
+            SqliteValue::Text("tombstoned".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(old_deleted_ts - 500),
+            SqliteValue::Integer(old_deleted_ts),
+            SqliteValue::Integer(old_deleted_ts),
+            SqliteValue::Integer(old_deleted_ts),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO fsfs_catalog_files \
+             (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
+            &old_row,
+        )
+        .expect("insert old tombstone row");
+
+        let fresh_row = [
+            SqliteValue::Text("home:/tmp/fresh.txt".to_owned()),
+            SqliteValue::Text("home".to_owned()),
+            SqliteValue::Text("/tmp/fresh.txt".to_owned()),
+            SqliteValue::Blob(vec![2_u8; 32]),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("full_semantic_lexical".to_owned()),
+            SqliteValue::Text("tombstoned".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(fresh_deleted_ts - 500),
+            SqliteValue::Integer(fresh_deleted_ts),
+            SqliteValue::Integer(fresh_deleted_ts),
+            SqliteValue::Integer(fresh_deleted_ts),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO fsfs_catalog_files \
+             (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
+            &fresh_row,
+        )
+        .expect("insert fresh tombstone row");
+
+        let mut config = FsfsConfig::default();
+        config.storage.db_path = db_path.display().to_string();
+        config.storage.evidence_retention_days = retention_days;
+        let runtime = FsfsRuntime::new(config);
+        let (deleted_rows, cutoff_ms) = runtime
+            .cleanup_catalog_tombstones(now_ms)
+            .expect("cleanup should succeed");
+        assert_eq!(deleted_rows, 1);
+        assert_eq!(
+            cutoff_ms,
+            i64::try_from(now_ms.saturating_sub(retention_ms)).unwrap()
+        );
+
+        let remaining = conn
+            .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
+            .expect("remaining rows query");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].get(0),
+            Some(&SqliteValue::Text("home:/tmp/fresh.txt".to_owned()))
         );
     }
 
@@ -6092,6 +6611,132 @@ mod tests {
     }
 
     #[test]
+    fn runtime_search_payload_persists_explain_session_context() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let payload = search_runtime
+                .execute_search_payload(&cx, "authentication middleware", 5)
+                .await
+                .expect("search payload");
+
+            let session = search_runtime
+                .load_explain_session()
+                .expect("load explain session")
+                .expect("explain session should be written");
+            assert_eq!(session.query, "authentication middleware");
+            assert_eq!(session.phase, SearchOutputPhase::Initial);
+            assert_eq!(session.hits.len(), payload.hits.len());
+            assert_eq!(session.hits[0].result_id, "R0");
+            assert_eq!(session.hits[0].path, payload.hits[0].path);
+        });
+    }
+
+    #[test]
+    fn runtime_explain_command_errors_without_saved_search_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Explain,
+            result_id: Some("R0".to_owned()),
+            index_dir: Some(temp.path().join("index-root")),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        });
+
+        let err = runtime
+            .run_explain_command()
+            .expect_err("missing explain session should fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("run `fsfs search <query>` first"),
+            "unexpected explain-session error: {text}"
+        );
+    }
+
+    #[test]
+    fn runtime_explain_command_uses_saved_search_context() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let search_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let _ = search_runtime
+                .execute_search_payload(&cx, "authentication middleware", 5)
+                .await
+                .expect("search payload");
+
+            let explain_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Explain,
+                result_id: Some("R0".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            explain_runtime
+                .run_explain_command()
+                .expect("explain command should resolve saved R0 context");
+        });
+    }
+
+    #[test]
     fn runtime_search_payload_falls_back_to_lexical_when_vector_index_is_corrupt() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -6449,6 +7094,7 @@ mod tests {
             payload.runtime.tracked_index_bytes,
             Some(payload.index.size_bytes)
         );
+        assert!(payload.runtime.disk_budget_bytes.is_some());
         assert!(
             payload.runtime.disk_budget_stage.is_some(),
             "status payload should expose disk budget stage"
@@ -6461,11 +7107,14 @@ mod tests {
             payload.runtime.disk_budget_reason_code.is_some(),
             "status payload should expose disk budget reason code"
         );
+        assert!(!payload.runtime.storage_pressure_emergency);
 
         let table = render_status_table(&payload, true);
         assert!(table.contains("disk budget stage:"));
         assert!(table.contains("disk budget action:"));
         assert!(table.contains("disk budget reason:"));
+        assert!(table.contains("disk budget bytes:"));
+        assert!(table.contains("storage pressure emergency: false"));
     }
 
     #[test]

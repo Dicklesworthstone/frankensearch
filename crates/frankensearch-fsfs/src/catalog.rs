@@ -7,6 +7,7 @@
 //! - `fsfs_catalog_replay_checkpoint`: deterministic resume cursor per consumer
 
 use std::io;
+use std::path::Path;
 
 use frankensearch_core::{SearchError, SearchResult};
 use fsqlite::{Connection, Row};
@@ -93,6 +94,36 @@ pub const CLEANUP_TOMBSTONES_SQL: &str = "DELETE FROM fsfs_catalog_files \
     WHERE deleted_ts IS NOT NULL \
       AND deleted_ts <= ?1 \
       AND pipeline_status = 'tombstoned';";
+
+/// Delete tombstoned catalog rows at or before the provided cutoff timestamp.
+///
+/// # Errors
+///
+/// Returns an error if `SQLite` execution fails.
+pub fn cleanup_tombstones(conn: &Connection, cutoff_ts_ms: i64) -> SearchResult<usize> {
+    conn.execute_with_params(
+        CLEANUP_TOMBSTONES_SQL,
+        &[SqliteValue::Integer(cutoff_ts_ms)],
+    )
+    .map_err(catalog_error)
+}
+
+/// Open a catalog database file and prune tombstoned rows past retention.
+///
+/// Missing database files are treated as empty catalogs and return `0`.
+///
+/// # Errors
+///
+/// Returns an error if the catalog cannot be opened/bootstrapped or SQL execution
+/// fails.
+pub fn cleanup_tombstones_for_path(db_path: &Path, cutoff_ts_ms: i64) -> SearchResult<usize> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open(db_path.display().to_string()).map_err(catalog_error)?;
+    bootstrap_catalog_schema(&conn)?;
+    cleanup_tombstones(&conn, cutoff_ts_ms)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogIngestionClass {
@@ -340,8 +371,8 @@ mod tests {
         DIRTY_CATALOG_LOOKUP_SQL, INDEX_CATALOG_CLEANUP, INDEX_CATALOG_CONTENT_HASH,
         INDEX_CATALOG_DIRTY_LOOKUP, INDEX_CATALOG_REVISIONS, INDEX_CHANGELOG_FILE_REVISION,
         INDEX_CHANGELOG_PENDING_APPLY, INDEX_CHANGELOG_REPLAY, ReplayDecision,
-        bootstrap_catalog_schema, catalog_error, classify_replay_sequence,
-        current_catalog_schema_version,
+        bootstrap_catalog_schema, catalog_error, classify_replay_sequence, cleanup_tombstones,
+        cleanup_tombstones_for_path, current_catalog_schema_version,
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
@@ -666,6 +697,7 @@ mod tests {
         let a = CatalogIngestionClass::FullSemanticLexical;
         let b = a; // Copy
         assert_eq!(a, b);
+        #[allow(clippy::clone_on_copy)]
         let c = a.clone();
         assert_eq!(a, c);
         let debug = format!("{a:?}");
@@ -794,7 +826,7 @@ mod tests {
 
     #[test]
     fn schema_version_constant_is_positive() {
-        assert!(CATALOG_SCHEMA_VERSION >= 1);
+        const { assert!(CATALOG_SCHEMA_VERSION >= 1) };
     }
 
     #[test]
@@ -825,6 +857,106 @@ mod tests {
 
         assert!(CLEANUP_TOMBSTONES_SQL.contains("DELETE"));
         assert!(CLEANUP_TOMBSTONES_SQL.contains("tombstoned"));
+    }
+
+    #[test]
+    fn cleanup_tombstones_executes_sql_against_existing_connection() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
+
+        let now = 1_710_000_000_000_i64;
+        let params = [
+            SqliteValue::Text("home:/tmp/a.txt".to_owned()),
+            SqliteValue::Text("home".to_owned()),
+            SqliteValue::Text("/tmp/a.txt".to_owned()),
+            SqliteValue::Blob(vec![7_u8; 32]),
+            SqliteValue::Integer(3),
+            SqliteValue::Text("full_semantic_lexical".to_owned()),
+            SqliteValue::Text("tombstoned".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(now - 1_000),
+            SqliteValue::Integer(now),
+            SqliteValue::Integer(now),
+            SqliteValue::Integer(now),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO fsfs_catalog_files \
+             (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
+            &params,
+        )
+        .expect("seed tombstone row");
+
+        let removed = cleanup_tombstones(&conn, now).expect("cleanup SQL should execute");
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn cleanup_tombstones_for_path_prunes_old_tombstones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("catalog.db");
+        let conn = Connection::open(db_path.display().to_string()).expect("open sqlite file");
+        bootstrap_catalog_schema(&conn).expect("catalog bootstrap should succeed");
+
+        let now = 1_710_000_000_000_i64;
+        let old_cutoff = now - 10_000;
+
+        let old_tombstone = [
+            SqliteValue::Text("home:/tmp/old.txt".to_owned()),
+            SqliteValue::Text("home".to_owned()),
+            SqliteValue::Text("/tmp/old.txt".to_owned()),
+            SqliteValue::Blob(vec![1_u8; 32]),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("full_semantic_lexical".to_owned()),
+            SqliteValue::Text("tombstoned".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(now - 20_000),
+            SqliteValue::Integer(now - 15_000),
+            SqliteValue::Integer(now - 15_000),
+            SqliteValue::Integer(now - 15_000),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO fsfs_catalog_files \
+             (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
+            &old_tombstone,
+        )
+        .expect("old tombstone seed should insert");
+
+        let fresh_tombstone = [
+            SqliteValue::Text("home:/tmp/fresh.txt".to_owned()),
+            SqliteValue::Text("home".to_owned()),
+            SqliteValue::Text("/tmp/fresh.txt".to_owned()),
+            SqliteValue::Blob(vec![2_u8; 32]),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("full_semantic_lexical".to_owned()),
+            SqliteValue::Text("tombstoned".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(now - 9_000),
+            SqliteValue::Integer(now - 5_000),
+            SqliteValue::Integer(now - 5_000),
+            SqliteValue::Integer(now - 5_000),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO fsfs_catalog_files \
+             (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
+            &fresh_tombstone,
+        )
+        .expect("fresh tombstone seed should insert");
+
+        let removed =
+            cleanup_tombstones_for_path(&db_path, old_cutoff).expect("cleanup helper should work");
+        assert_eq!(removed, 1, "only old tombstones should be removed");
+
+        let remaining = conn
+            .query("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
+            .expect("remaining rows query should execute");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].get(0),
+            Some(&SqliteValue::Text("home:/tmp/fresh.txt".to_owned()))
+        );
     }
 
     #[test]

@@ -265,10 +265,9 @@ pub fn default_cli_e2e_scenarios() -> Vec<CliE2eScenario> {
             kind: CliE2eScenarioKind::Explain,
             args: vec![
                 "explain".to_owned(),
+                "R0".to_owned(),
                 "--format".to_owned(),
                 "toon".to_owned(),
-                "--query".to_owned(),
-                "embedding budget".to_owned(),
             ],
             expected_exit_code: 0,
             expected_reason_code: CLI_E2E_REASON_SCENARIO_PASS.to_owned(),
