@@ -1442,4 +1442,493 @@ mod tests {
             assert_eq!(mapping, &back);
         }
     }
+
+    // ─── bd-2q5f tests begin ───
+
+    #[test]
+    fn invariant_group_display_all_variants() {
+        let expected = [
+            (InvariantGroup::Ordering, "ordering"),
+            (InvariantGroup::PhaseTransitions, "phase_transitions"),
+            (InvariantGroup::ReasonCodes, "reason_codes"),
+            (InvariantGroup::FallbackSemantics, "fallback_semantics"),
+            (
+                InvariantGroup::ExplanationIntegrity,
+                "explanation_integrity",
+            ),
+            (
+                InvariantGroup::CalibrationConsistency,
+                "calibration_consistency",
+            ),
+            (InvariantGroup::FeedbackConsistency, "feedback_consistency"),
+            (InvariantGroup::ExclusionSemantics, "exclusion_semantics"),
+            (InvariantGroup::DiversityGuarantees, "diversity_guarantees"),
+            (InvariantGroup::ExpansionSemantics, "expansion_semantics"),
+            (InvariantGroup::AdaptiveStability, "adaptive_stability"),
+            (InvariantGroup::ConformalCoverage, "conformal_coverage"),
+        ];
+        for (group, label) in expected {
+            assert_eq!(group.to_string(), label, "Display mismatch for {group:?}");
+        }
+    }
+
+    #[test]
+    fn invariant_category_display_all_variants() {
+        let expected = [
+            (InvariantCategory::Ordering, "ordering"),
+            (InvariantCategory::Phase, "phase"),
+            (InvariantCategory::Explanation, "explanation"),
+            (InvariantCategory::Calibration, "calibration"),
+            (InvariantCategory::Feedback, "feedback"),
+            (InvariantCategory::Fallback, "fallback"),
+            (InvariantCategory::Conformal, "conformal"),
+            (InvariantCategory::Exclusion, "exclusion"),
+            (InvariantCategory::Diversity, "diversity"),
+            (InvariantCategory::Expansion, "expansion"),
+            (InvariantCategory::Adaptive, "adaptive"),
+        ];
+        for (cat, label) in expected {
+            assert_eq!(cat.to_string(), label, "Display mismatch for {cat:?}");
+        }
+    }
+
+    #[test]
+    fn oracle_outcome_serde_roundtrip() {
+        for outcome in [
+            OracleOutcome::Pass,
+            OracleOutcome::Fail,
+            OracleOutcome::Skip,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            let back: OracleOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(outcome, back);
+        }
+    }
+
+    #[test]
+    fn invariant_group_serde_roundtrip() {
+        let groups = [
+            InvariantGroup::Ordering,
+            InvariantGroup::PhaseTransitions,
+            InvariantGroup::ReasonCodes,
+            InvariantGroup::FallbackSemantics,
+            InvariantGroup::ExplanationIntegrity,
+            InvariantGroup::CalibrationConsistency,
+            InvariantGroup::FeedbackConsistency,
+            InvariantGroup::ExclusionSemantics,
+            InvariantGroup::DiversityGuarantees,
+            InvariantGroup::ExpansionSemantics,
+            InvariantGroup::AdaptiveStability,
+            InvariantGroup::ConformalCoverage,
+        ];
+        for group in groups {
+            let json = serde_json::to_string(&group).unwrap();
+            let back: InvariantGroup = serde_json::from_str(&json).unwrap();
+            assert_eq!(group, back);
+        }
+    }
+
+    #[test]
+    fn lane_oracle_template_serde_roundtrip() {
+        let lane = lane_by_id("kitchen_sink").unwrap();
+        let template = oracle_template_for_lane(&lane);
+        let json = serde_json::to_string(&template).unwrap();
+        let back: LaneOracleTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(template, back);
+    }
+
+    #[test]
+    fn required_feature_all_variants_satisfied_by() {
+        // All features ON
+        let all_on = FeatureToggles {
+            explain: true,
+            mmr: true,
+            negation_queries: true,
+            prf: true,
+            adaptive_fusion: true,
+            conformal: true,
+            circuit_breaker: true,
+            feedback: true,
+            calibration: CalibratorChoice::Platt,
+        };
+        for feat in [
+            RequiredFeature::Explain,
+            RequiredFeature::Mmr,
+            RequiredFeature::NegationQueries,
+            RequiredFeature::Prf,
+            RequiredFeature::AdaptiveFusion,
+            RequiredFeature::NonIdentityCalibration,
+            RequiredFeature::Conformal,
+            RequiredFeature::CircuitBreaker,
+            RequiredFeature::Feedback,
+        ] {
+            assert!(
+                feat.satisfied_by(&all_on),
+                "{feat:?} should be satisfied when all features ON"
+            );
+        }
+
+        // All features OFF (identity calibration counts as "off")
+        let all_off = FeatureToggles {
+            explain: false,
+            mmr: false,
+            negation_queries: false,
+            prf: false,
+            adaptive_fusion: false,
+            conformal: false,
+            circuit_breaker: false,
+            feedback: false,
+            calibration: CalibratorChoice::Identity,
+        };
+        for feat in [
+            RequiredFeature::Explain,
+            RequiredFeature::Mmr,
+            RequiredFeature::NegationQueries,
+            RequiredFeature::Prf,
+            RequiredFeature::AdaptiveFusion,
+            RequiredFeature::NonIdentityCalibration,
+            RequiredFeature::Conformal,
+            RequiredFeature::CircuitBreaker,
+            RequiredFeature::Feedback,
+        ] {
+            assert!(
+                !feat.satisfied_by(&all_off),
+                "{feat:?} should NOT be satisfied when all features OFF"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_report_all_passed() {
+        let report = LaneTestReport::new("empty_lane");
+        assert!(report.all_passed(), "empty report is vacuously passing");
+        assert_eq!(report.pass_count(), 0);
+        assert_eq!(report.failure_count(), 0);
+        assert_eq!(report.skip_count(), 0);
+    }
+
+    #[test]
+    fn verdict_display_pass_no_context() {
+        let v = OracleVerdict::pass("deterministic_ordering", "baseline");
+        let s = format!("{v}");
+        assert!(s.contains("PASS"));
+        assert!(s.contains("deterministic_ordering"));
+        assert!(s.contains("baseline"));
+        // Pass has empty context, so no dash separator
+        assert!(!s.contains('—'));
+    }
+
+    #[test]
+    fn verdict_display_skip_with_reason() {
+        let v = OracleVerdict::skip("explain_present", "baseline", "explain disabled");
+        let s = format!("{v}");
+        assert!(s.contains("SKIP"));
+        assert!(s.contains("explain_present"));
+        assert!(s.contains("explain disabled"));
+    }
+
+    #[test]
+    fn oracle_requirements_default_is_empty() {
+        let reqs = OracleRequirements::default();
+        assert!(reqs.features.is_empty());
+        assert_eq!(reqs.expected_phase, None);
+    }
+
+    #[test]
+    fn oracle_applicable_multi_feature_requires_all() {
+        use crate::interaction_lanes::{CorpusSlice, QuerySlice, RiskLevel};
+
+        // ORACLE_BREAKER_NO_POSTERIOR_UPDATE requires CircuitBreaker + AdaptiveFusion
+        let only_breaker = FeatureToggles {
+            circuit_breaker: true,
+            adaptive_fusion: false,
+            ..FeatureToggles::default()
+        };
+        let lane_breaker_only = InteractionLane {
+            id: "test_breaker_only",
+            description: "test",
+            bead_refs: &[],
+            toggles: only_breaker,
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialThenMaybeRefined,
+            risk: RiskLevel::Low,
+            seed: 42,
+        };
+        // Missing AdaptiveFusion → not applicable
+        assert!(!oracle_applicable(
+            &ORACLE_BREAKER_NO_POSTERIOR_UPDATE,
+            &lane_breaker_only
+        ));
+
+        let both_features = FeatureToggles {
+            circuit_breaker: true,
+            adaptive_fusion: true,
+            ..FeatureToggles::default()
+        };
+        let lane_both = InteractionLane {
+            id: "test_both",
+            description: "test",
+            bead_refs: &[],
+            toggles: both_features,
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialThenMaybeRefined,
+            risk: RiskLevel::Low,
+            seed: 42,
+        };
+        // Both features + correct phase → applicable
+        assert!(oracle_applicable(
+            &ORACLE_BREAKER_NO_POSTERIOR_UPDATE,
+            &lane_both
+        ));
+    }
+
+    #[test]
+    fn report_display_no_failures_shows_zero() {
+        let mut report = LaneTestReport::new("clean_lane");
+        report.add(OracleVerdict::pass("o1", "clean_lane"));
+        report.add(OracleVerdict::pass("o2", "clean_lane"));
+        let display = format!("{report}");
+        assert!(display.contains("2 passed"));
+        assert!(display.contains("0 failed"));
+        assert!(display.contains("0 skipped"));
+    }
+
+    // ─── bd-2q5f tests end ───
+
+    // ─── bd-1pst tests begin ───
+
+    #[test]
+    fn invariant_group_ord_is_declaration_order() {
+        // Ord is derived, so variants follow declaration order
+        assert!(InvariantGroup::Ordering < InvariantGroup::PhaseTransitions);
+        assert!(InvariantGroup::PhaseTransitions < InvariantGroup::ReasonCodes);
+        assert!(InvariantGroup::ReasonCodes < InvariantGroup::FallbackSemantics);
+        assert!(InvariantGroup::FallbackSemantics < InvariantGroup::ExplanationIntegrity);
+        assert!(InvariantGroup::ExplanationIntegrity < InvariantGroup::CalibrationConsistency);
+        assert!(InvariantGroup::CalibrationConsistency < InvariantGroup::FeedbackConsistency);
+        assert!(InvariantGroup::FeedbackConsistency < InvariantGroup::ExclusionSemantics);
+        assert!(InvariantGroup::ExclusionSemantics < InvariantGroup::DiversityGuarantees);
+        assert!(InvariantGroup::DiversityGuarantees < InvariantGroup::ExpansionSemantics);
+        assert!(InvariantGroup::ExpansionSemantics < InvariantGroup::AdaptiveStability);
+        assert!(InvariantGroup::AdaptiveStability < InvariantGroup::ConformalCoverage);
+    }
+
+    #[test]
+    fn oracle_outcome_hash_usable_in_hashset() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(OracleOutcome::Pass);
+        set.insert(OracleOutcome::Fail);
+        set.insert(OracleOutcome::Skip);
+        set.insert(OracleOutcome::Pass); // duplicate
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&OracleOutcome::Pass));
+        assert!(set.contains(&OracleOutcome::Fail));
+        assert!(set.contains(&OracleOutcome::Skip));
+    }
+
+    #[test]
+    fn invariant_category_hash_usable_in_hashset() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for cat in [
+            InvariantCategory::Ordering,
+            InvariantCategory::Phase,
+            InvariantCategory::Explanation,
+            InvariantCategory::Calibration,
+            InvariantCategory::Feedback,
+            InvariantCategory::Fallback,
+            InvariantCategory::Conformal,
+            InvariantCategory::Exclusion,
+            InvariantCategory::Diversity,
+            InvariantCategory::Expansion,
+            InvariantCategory::Adaptive,
+        ] {
+            set.insert(cat);
+        }
+        assert_eq!(
+            set.len(),
+            11,
+            "all 11 InvariantCategory variants are distinct"
+        );
+    }
+
+    #[test]
+    fn report_verdicts_preserve_insertion_order() {
+        let mut report = LaneTestReport::new("order_test");
+        report.add(OracleVerdict::pass("oracle_a", "order_test"));
+        report.add(OracleVerdict::fail("oracle_b", "order_test", "err".into()));
+        report.add(OracleVerdict::skip("oracle_c", "order_test", "n/a"));
+        assert_eq!(report.verdicts.len(), 3);
+        assert_eq!(report.verdicts[0].oracle_id, "oracle_a");
+        assert_eq!(report.verdicts[1].oracle_id, "oracle_b");
+        assert_eq!(report.verdicts[2].oracle_id, "oracle_c");
+    }
+
+    #[test]
+    fn all_invariant_categories_have_at_least_one_oracle() {
+        use std::collections::HashSet;
+        let categories_in_catalog: HashSet<InvariantCategory> =
+            all_oracles().iter().map(|o| o.category).collect();
+        for cat in [
+            InvariantCategory::Ordering,
+            InvariantCategory::Phase,
+            InvariantCategory::Explanation,
+            InvariantCategory::Calibration,
+            InvariantCategory::Feedback,
+            InvariantCategory::Fallback,
+            InvariantCategory::Conformal,
+            InvariantCategory::Exclusion,
+            InvariantCategory::Diversity,
+            InvariantCategory::Expansion,
+            InvariantCategory::Adaptive,
+        ] {
+            assert!(
+                categories_in_catalog.contains(&cat),
+                "no oracle found for category {cat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_only_lane_excludes_phase2_oracles() {
+        use crate::interaction_lanes::{CorpusSlice, QuerySlice, RiskLevel};
+
+        let lane = InteractionLane {
+            id: "test_initial_only",
+            description: "initial-only phase test",
+            bead_refs: &[],
+            toggles: FeatureToggles::default(),
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialOnly,
+            risk: RiskLevel::Low,
+            seed: 99,
+        };
+        let oracles = oracles_for_lane(&lane);
+        let ids: Vec<&str> = oracles.iter().map(|o| o.id).collect();
+        // InitialOnly should NOT get phase2_refined (requires InitialThenRefined)
+        assert!(!ids.contains(&"phase2_refined"));
+        // InitialOnly should NOT get phase2_graceful (requires InitialThenMaybeRefined)
+        assert!(!ids.contains(&"phase2_graceful"));
+        // Universal oracles still apply
+        assert!(ids.contains(&"deterministic_ordering"));
+        assert!(ids.contains(&"phase1_always_yields"));
+    }
+
+    #[test]
+    fn oracle_explain_exclusion_absent_requires_both_features() {
+        use crate::interaction_lanes::{CorpusSlice, QuerySlice, RiskLevel};
+
+        // Only explain — exclusion oracle should NOT apply
+        let explain_only = InteractionLane {
+            id: "test_explain_only",
+            description: "test",
+            bead_refs: &[],
+            toggles: FeatureToggles {
+                explain: true,
+                negation_queries: false,
+                ..FeatureToggles::default()
+            },
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialThenRefined,
+            risk: RiskLevel::Low,
+            seed: 50,
+        };
+        assert!(!oracle_applicable(
+            &ORACLE_EXPLAIN_EXCLUSION_ABSENT,
+            &explain_only
+        ));
+
+        // Only negation — exclusion oracle should NOT apply
+        let negation_only = InteractionLane {
+            id: "test_negation_only",
+            description: "test",
+            bead_refs: &[],
+            toggles: FeatureToggles {
+                explain: false,
+                negation_queries: true,
+                ..FeatureToggles::default()
+            },
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialThenRefined,
+            risk: RiskLevel::Low,
+            seed: 51,
+        };
+        assert!(!oracle_applicable(
+            &ORACLE_EXPLAIN_EXCLUSION_ABSENT,
+            &negation_only
+        ));
+
+        // Both features — oracle SHOULD apply
+        let both = InteractionLane {
+            id: "test_both",
+            description: "test",
+            bead_refs: &[],
+            toggles: FeatureToggles {
+                explain: true,
+                negation_queries: true,
+                ..FeatureToggles::default()
+            },
+            corpus_slices: &[CorpusSlice::Full],
+            query_slice: QuerySlice::default(),
+            expected_phase: ExpectedPhase::InitialThenRefined,
+            risk: RiskLevel::Low,
+            seed: 52,
+        };
+        assert!(oracle_applicable(&ORACLE_EXPLAIN_EXCLUSION_ABSENT, &both));
+    }
+
+    #[test]
+    fn required_feature_serde_roundtrip() {
+        for feat in [
+            RequiredFeature::Explain,
+            RequiredFeature::Mmr,
+            RequiredFeature::NegationQueries,
+            RequiredFeature::Prf,
+            RequiredFeature::AdaptiveFusion,
+            RequiredFeature::NonIdentityCalibration,
+            RequiredFeature::Conformal,
+            RequiredFeature::CircuitBreaker,
+            RequiredFeature::Feedback,
+        ] {
+            let json = serde_json::to_string(&feat).unwrap();
+            let back: RequiredFeature = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                feat, back,
+                "RequiredFeature serde roundtrip failed for {feat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lane_mapping_categories_are_unique() {
+        for mapping in compute_lane_oracle_mappings() {
+            let original_len = mapping.categories.len();
+            let mut deduped = mapping.categories.clone();
+            deduped.dedup();
+            assert_eq!(
+                deduped.len(),
+                original_len,
+                "lane {} has duplicate categories in mapping",
+                mapping.lane_id
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_descriptor_debug_format() {
+        let debug = format!("{ORACLE_DETERMINISTIC_ORDERING:?}");
+        assert!(debug.contains("deterministic_ordering"));
+        assert!(debug.contains("Ordering"));
+        let debug_prf = format!("{ORACLE_PRF_NORMALIZED:?}");
+        assert!(debug_prf.contains("prf_normalized"));
+        assert!(debug_prf.contains("Expansion"));
+    }
+
+    // ─── bd-1pst tests end ───
 }

@@ -75,7 +75,17 @@ impl PrfConfig {
     /// Returns alpha clamped to `[0.5, 1.0]`.
     #[must_use]
     pub const fn clamped_alpha(&self) -> f64 {
-        self.alpha.clamp(0.5, 1.0)
+        // f64::clamp propagates NaN; guard explicitly to prevent
+        // NaN-poisoned embeddings from escaping as valid results.
+        if !self.alpha.is_finite() {
+            0.8
+        } else if self.alpha < 0.5 {
+            0.5
+        } else if self.alpha > 1.0 {
+            1.0
+        } else {
+            self.alpha
+        }
     }
 
     /// Check whether PRF should activate for this query class.
@@ -404,4 +414,120 @@ mod tests {
         assert!(approx_eq(result[0], 0.8 / expected_norm));
         assert!(approx_eq(result[1], 0.2 / expected_norm));
     }
+
+    // ─── bd-2fuy tests begin ───
+
+    #[test]
+    fn prf_config_debug_format() {
+        let config = PrfConfig {
+            enabled: true,
+            alpha: 0.75,
+            top_k_feedback: 8,
+            min_feedback_docs: 4,
+            score_weighted: false,
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("true"));
+        assert!(debug.contains("0.75"));
+        assert!(debug.contains('8'));
+        assert!(debug.contains('4'));
+        assert!(debug.contains("false"));
+    }
+
+    #[test]
+    fn zero_magnitude_original_with_feedback_works() {
+        let original = vec![0.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[0.0, 1.0, 0.0], 1.0)];
+        let result = prf_expand(&original, &feedback, 0.5).unwrap();
+        // 0.5*[0,0,0] + 0.5*[0,1,0] = [0, 0.5, 0] → normalized to [0, 1, 0]
+        assert!(is_l2_normalized(&result));
+        assert!(approx_eq(result[1], 1.0));
+    }
+
+    #[test]
+    fn identical_original_and_feedback_returns_original_direction() {
+        let original = vec![1.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[1.0, 0.0, 0.0], 1.0)];
+        let result = prf_expand(&original, &feedback, 0.8).unwrap();
+        // alpha*[1,0,0] + (1-alpha)*[1,0,0] = [1,0,0] → normalized
+        assert!(is_l2_normalized(&result));
+        assert!(approx_eq(result[0], 1.0));
+        assert!(approx_eq(result[1], 0.0));
+    }
+
+    #[test]
+    fn clamped_alpha_at_exact_boundaries() {
+        let config = PrfConfig {
+            alpha: 0.5,
+            ..Default::default()
+        };
+        assert!((config.clamped_alpha() - 0.5).abs() < f64::EPSILON);
+
+        let config = PrfConfig {
+            alpha: 1.0,
+            ..Default::default()
+        };
+        assert!((config.clamped_alpha() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn expanded_has_same_dimensionality() {
+        let original = vec![1.0, 0.5, 0.3, 0.1, 0.7];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[0.2, 0.8, 0.1, 0.9, 0.4], 0.7)];
+        let result = prf_expand(&original, &feedback, 0.8).unwrap();
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn mixed_positive_and_negative_weights() {
+        let original = vec![1.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![
+            (&[0.0, 1.0, 0.0], -0.5), // negative → treated as 0
+            (&[0.0, 0.0, 1.0], 1.0),  // positive → only this counts
+        ];
+        let result = prf_expand(&original, &feedback, 0.5).unwrap();
+        assert!(is_l2_normalized(&result));
+        // Centroid should only come from the second doc [0,0,1]
+        // so result[1] should be ~0 (no contribution from dim 1)
+        assert!(result[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn feedback_longer_than_original_truncated() {
+        let original = vec![1.0, 0.0]; // 2 dims
+        let long_feedback = vec![0.0, 1.0, 0.5, 0.3]; // 4 dims
+        let feedback: Vec<(&[f32], f64)> = vec![(long_feedback.as_slice(), 1.0)];
+        let result = prf_expand(&original, &feedback, 0.5).unwrap();
+        // Output should have 2 dims (same as original)
+        assert_eq!(result.len(), 2);
+        assert!(is_l2_normalized(&result));
+    }
+
+    #[test]
+    fn high_dimensionality_384d_works() {
+        let original: Vec<f32> = (0_u16..384).map(|i| (f32::from(i) * 0.01).sin()).collect();
+        let feedback_emb: Vec<f32> = (0_u16..384).map(|i| (f32::from(i) * 0.02).cos()).collect();
+        let feedback: Vec<(&[f32], f64)> = vec![(feedback_emb.as_slice(), 0.9)];
+        let result = prf_expand(&original, &feedback, 0.8).unwrap();
+        assert_eq!(result.len(), 384);
+        assert!(is_l2_normalized(&result));
+    }
+
+    #[test]
+    fn very_small_weights_still_produce_result() {
+        let original = vec![1.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[0.0, 1.0, 0.0], 1e-8)];
+        let result = prf_expand(&original, &feedback, 0.8).unwrap();
+        assert!(is_l2_normalized(&result));
+    }
+
+    #[test]
+    fn all_zero_original_and_centroid_returns_none() {
+        let original = vec![0.0, 0.0, 0.0];
+        let feedback: Vec<(&[f32], f64)> = vec![(&[0.0, 0.0, 0.0], 1.0)];
+        // 0.5*[0,0,0] + 0.5*[0,0,0] = [0,0,0] → zero magnitude → None
+        assert!(prf_expand(&original, &feedback, 0.5).is_none());
+    }
+
+    // ─── bd-2fuy tests end ───
 }

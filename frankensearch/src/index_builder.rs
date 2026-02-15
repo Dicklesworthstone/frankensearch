@@ -226,7 +226,7 @@ impl IndexBuilder {
             embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
 
             if let Some(ref mut callback) = self.on_progress {
-                let completed = (batch_idx + 1) * self.batch_size;
+                let completed = (batch_idx + 1).saturating_mul(self.batch_size);
                 callback(IndexProgress {
                     completed: completed.min(total),
                     total,
@@ -632,6 +632,64 @@ mod tests {
         let debug = format!("{builder:?}");
         assert!(debug.contains("IndexBuilder"));
         assert!(debug.contains("doc_count"));
+    }
+
+    #[test]
+    fn batch_size_zero_clamped_to_one() {
+        let builder = IndexBuilder::new("/tmp/test").with_batch_size(0);
+        assert_eq!(builder.batch_size, 1);
+    }
+
+    #[test]
+    fn batch_size_one_still_works() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .with_batch_size(1)
+                .add_document("doc-1", "First document")
+                .add_document("doc-2", "Second document")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 0);
+        });
+    }
+
+    #[test]
+    fn index_build_stats_debug_clone() {
+        let stats = IndexBuildStats {
+            doc_count: 5,
+            error_count: 1,
+            errors: vec![("bad-doc".into(), "embed failed".into())],
+            total_ms: 42.0,
+            embed_ms: 30.0,
+            has_quality_index: true,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.doc_count, 5);
+        assert_eq!(cloned.error_count, 1);
+        assert_eq!(cloned.errors.len(), 1);
+        assert!(cloned.has_quality_index);
+        let dbg = format!("{stats:?}");
+        assert!(dbg.contains("IndexBuildStats"));
+    }
+
+    #[test]
+    fn index_progress_debug_clone() {
+        let progress = IndexProgress {
+            completed: 50,
+            total: 100,
+            phase: "embedding",
+        };
+        let cloned = progress.clone();
+        assert_eq!(cloned.completed, 50);
+        assert_eq!(cloned.total, 100);
+        assert_eq!(cloned.phase, "embedding");
+        let dbg = format!("{progress:?}");
+        assert!(dbg.contains("IndexProgress"));
     }
 
     #[test]

@@ -1091,4 +1091,160 @@ mod tests {
         assert_eq!(outcome, JobOutcome::Failed);
         assert_eq!(queue.metrics().total_failed.load(Ordering::Relaxed), 1);
     }
+
+    // ─── bd-yvte tests begin ───
+
+    #[test]
+    fn embedding_queue_config_default_exact_values() {
+        let config = EmbeddingQueueConfig::default();
+        assert_eq!(config.capacity, 1000);
+        assert_eq!(config.batch_size, 32);
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn embedding_queue_debug_format() {
+        let queue = make_queue(42);
+        queue.submit(request("doc-1", "Some content")).unwrap();
+        let dbg = format!("{queue:?}");
+        assert!(dbg.contains("EmbeddingQueue"));
+        assert!(dbg.contains("42")); // capacity in config
+        assert!(dbg.contains('1')); // pending count
+    }
+
+    #[test]
+    fn config_accessor_returns_construction_config() {
+        let queue = EmbeddingQueue::new(
+            EmbeddingQueueConfig {
+                capacity: 77,
+                batch_size: 11,
+                max_retries: 5,
+            },
+            Box::new(DefaultCanonicalizer::default()),
+        );
+        assert_eq!(queue.config().capacity, 77);
+        assert_eq!(queue.config().batch_size, 11);
+        assert_eq!(queue.config().max_retries, 5);
+    }
+
+    #[test]
+    fn drain_batch_up_to_limits_correctly() {
+        let queue = make_queue(100);
+        for i in 0..10 {
+            queue
+                .submit(request(&format!("doc-{i}"), &format!("Content {i}")))
+                .unwrap();
+        }
+
+        let batch = queue.drain_batch_up_to(3);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(queue.pending_count(), 7);
+
+        let batch = queue.drain_batch_up_to(100);
+        assert_eq!(batch.len(), 7);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn drain_batch_up_to_zero_returns_empty() {
+        let queue = make_queue(10);
+        queue.submit(request("doc-1", "Content")).unwrap();
+        let batch = queue.drain_batch_up_to(0);
+        assert!(batch.is_empty());
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn metrics_track_batch_count() {
+        let queue = EmbeddingQueue::new(
+            EmbeddingQueueConfig {
+                capacity: 100,
+                batch_size: 2,
+                max_retries: 3,
+            },
+            Box::new(DefaultCanonicalizer::default()),
+        );
+        for i in 0..5 {
+            queue
+                .submit(request(&format!("doc-{i}"), &format!("Text {i}")))
+                .unwrap();
+        }
+
+        let _ = queue.drain_batch(); // batch 1 (2 items)
+        let _ = queue.drain_batch(); // batch 2 (2 items)
+        let _ = queue.drain_batch(); // batch 3 (1 item)
+
+        assert_eq!(queue.metrics().total_batches.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn queue_metrics_record_all_outcomes() {
+        let metrics = QueueMetrics::default();
+        metrics.record(JobOutcome::Succeeded);
+        metrics.record(JobOutcome::SkippedUnchanged);
+        metrics.record(JobOutcome::SkippedEmpty);
+        metrics.record(JobOutcome::Retryable);
+        metrics.record(JobOutcome::Failed);
+
+        assert_eq!(metrics.total_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.total_deduped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.total_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.total_retryable.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.total_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn job_outcome_copy_and_eq() {
+        let a = JobOutcome::Succeeded;
+        let b = a; // Copy
+        assert_eq!(a, b);
+
+        // All variants are distinct.
+        let variants = [
+            JobOutcome::Succeeded,
+            JobOutcome::SkippedUnchanged,
+            JobOutcome::SkippedEmpty,
+            JobOutcome::Retryable,
+            JobOutcome::Failed,
+        ];
+        for (i, v1) in variants.iter().enumerate() {
+            for (j, v2) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(v1, v2);
+                } else {
+                    assert_ne!(v1, v2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_doc_id_same_content_refreshes_metadata() {
+        let queue = make_queue(10);
+        let mut req1 = request("doc-1", "Same text");
+        req1.metadata = Some(serde_json::json!({"version": 1}));
+        queue.submit(req1).unwrap();
+
+        // Submit again with same text but different metadata.
+        let mut req2 = request("doc-1", "Same text");
+        req2.metadata = Some(serde_json::json!({"version": 2}));
+        queue.submit(req2).unwrap();
+
+        assert_eq!(queue.pending_count(), 1);
+        let batch = queue.drain_batch();
+        let meta = batch[0].metadata.as_ref().expect("metadata");
+        assert_eq!(meta["version"], 2);
+    }
+
+    #[test]
+    fn sha256_hex_known_value() {
+        // SHA-256 of "hello" is well-known.
+        let hash = sha256_hex("hello");
+        assert_eq!(
+            hash,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    // ─── bd-yvte tests end ───
 }

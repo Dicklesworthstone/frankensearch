@@ -160,17 +160,27 @@ impl LossVector {
     /// Weights should sum to 1.0 but this is not enforced.
     #[must_use]
     pub fn weighted_total(&self, w_quality: f64, w_latency: f64, w_resource: f64) -> f64 {
-        let total = self.quality.mul_add(
-            w_quality,
-            self.latency.mul_add(w_latency, self.resource * w_resource),
-        );
-        // NaN from any non-finite field or weight → worst-case loss so
-        // the action is never silently preferred over a valid alternative.
-        if total.is_finite() {
-            total
-        } else {
-            f64::MAX
+        // Any non-finite component or weight is treated as an invalid action
+        // and mapped to worst-case loss so it is never silently preferred.
+        if !self.quality.is_finite()
+            || !self.latency.is_finite()
+            || !self.resource.is_finite()
+            || !w_quality.is_finite()
+            || !w_latency.is_finite()
+            || !w_resource.is_finite()
+        {
+            return f64::MAX;
         }
+
+        let quality = self.quality.max(0.0);
+        let latency = self.latency.max(0.0);
+        let resource = self.resource.max(0.0);
+        let w_quality = w_quality.max(0.0);
+        let w_latency = w_latency.max(0.0);
+        let w_resource = w_resource.max(0.0);
+
+        let total = quality.mul_add(w_quality, latency.mul_add(w_latency, resource * w_resource));
+        if total.is_finite() { total } else { f64::MAX }
     }
 }
 
@@ -1544,6 +1554,36 @@ mod tests {
         };
         let total = loss.weighted_total(0.0, 0.0, 0.0);
         assert!(total.abs() < 1e-10);
+    }
+
+    #[test]
+    fn loss_vector_weighted_total_non_finite_inputs_return_worst_case() {
+        let loss = LossVector {
+            quality: f64::NAN,
+            latency: 0.2,
+            resource: 0.3,
+        };
+        assert_eq!(
+            loss.weighted_total(0.5, 0.3, 0.2).to_bits(),
+            f64::MAX.to_bits()
+        );
+        assert_eq!(
+            LossVector::ZERO
+                .weighted_total(f64::NAN, 0.3, 0.2)
+                .to_bits(),
+            f64::MAX.to_bits()
+        );
+    }
+
+    #[test]
+    fn loss_vector_weighted_total_negative_values_are_clamped() {
+        let loss = LossVector {
+            quality: -1.0,
+            latency: 0.4,
+            resource: -0.2,
+        };
+        let total = loss.weighted_total(-0.5, 1.0, 0.5);
+        assert!((total - 0.4).abs() < 1e-10);
     }
 
     // ─── bd-2jqx tests end ───

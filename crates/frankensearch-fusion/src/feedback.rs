@@ -286,13 +286,12 @@ impl FeedbackCollector {
         let now_secs = self.elapsed_secs();
         // NaN cleanup_threshold → retain everything (never cleanup is safer than
         // always cleanup).
-        let threshold = if self.config.cleanup_threshold.is_finite()
-            && self.config.cleanup_threshold >= 0.0
-        {
-            self.config.cleanup_threshold
-        } else {
-            return 0;
-        };
+        let threshold =
+            if self.config.cleanup_threshold.is_finite() && self.config.cleanup_threshold >= 0.0 {
+                self.config.cleanup_threshold
+            } else {
+                return 0;
+            };
 
         let before = map.len();
         map.retain(|_, entry| {
@@ -374,11 +373,7 @@ impl FeedbackCollector {
         } else {
             2.0
         };
-        if lo <= hi {
-            (lo, hi)
-        } else {
-            (hi, lo)
-        }
+        if lo <= hi { (lo, hi) } else { (hi, lo) }
     }
 
     fn signal_weight(&self, signal: &FeedbackSignal) -> f64 {

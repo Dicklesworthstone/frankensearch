@@ -1410,6 +1410,164 @@ mod tests {
         }
     }
 
+    // ─── bd-1opw tests begin ───
+
+    #[test]
+    fn coalescer_config_debug_clone() {
+        let config = CoalescerConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("CoalescerConfig"));
+        assert!(debug.contains("32")); // max_batch_size default
+
+        let cloned = config.clone();
+        assert_eq!(cloned.max_batch_size, config.max_batch_size);
+        assert_eq!(cloned.max_wait_ms, config.max_wait_ms);
+        assert_eq!(cloned.min_batch_size, config.min_batch_size);
+        assert_eq!(cloned.use_priority_lanes, config.use_priority_lanes);
+    }
+
+    #[test]
+    fn priority_debug_clone_copy_eq_hash() {
+        use std::collections::HashSet;
+
+        let p = Priority::Interactive;
+        let debug = format!("{p:?}");
+        assert_eq!(debug, "Interactive");
+
+        let bg_debug = format!("{:?}", Priority::Background);
+        assert_eq!(bg_debug, "Background");
+
+        // Copy
+        let a = Priority::Interactive;
+        let b = a;
+        assert_eq!(a, b);
+
+        // Clone
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone();
+        assert_eq!(a, c);
+
+        // Eq
+        assert_ne!(Priority::Interactive, Priority::Background);
+
+        // Hash
+        let mut set = HashSet::new();
+        set.insert(Priority::Interactive);
+        set.insert(Priority::Background);
+        set.insert(Priority::Interactive); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn coalescer_metrics_debug_default() {
+        let m = CoalescerMetrics::default();
+        let debug = format!("{m:?}");
+        assert!(debug.contains("CoalescerMetrics"));
+
+        assert_eq!(m.total_submitted.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_batches.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_texts_batched.load(Ordering::Relaxed), 0);
+        assert_eq!(m.interactive_submissions.load(Ordering::Relaxed), 0);
+        assert_eq!(m.background_submissions.load(Ordering::Relaxed), 0);
+        assert_eq!(m.early_dispatches.load(Ordering::Relaxed), 0);
+        assert_eq!(m.deadline_dispatches.load(Ordering::Relaxed), 0);
+        assert_eq!(m.full_batch_dispatches.load(Ordering::Relaxed), 0);
+        assert_eq!(m.timeout_dispatches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn is_shutdown_starts_false() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig::default());
+        assert!(!coalescer.is_shutdown());
+    }
+
+    #[test]
+    fn deliver_extra_results_are_dropped() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig {
+            max_batch_size: 2,
+            max_wait_ms: 10_000,
+            min_batch_size: 1,
+            use_priority_lanes: false,
+        });
+
+        let rx1 = coalescer.submit("text a".into(), Priority::Background);
+        let rx2 = coalescer.submit("text b".into(), Priority::Background);
+
+        let batch = coalescer.try_form_batch().unwrap();
+        // Deliver 4 results for 2 requests — extra 2 should be silently dropped
+        batch.deliver(Ok(vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]]));
+
+        assert_eq!(rx1.recv().unwrap().unwrap(), vec![1.0]);
+        assert_eq!(rx2.recv().unwrap().unwrap(), vec![2.0]);
+    }
+
+    #[test]
+    fn deliver_zero_results_for_nonzero_requests() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig {
+            max_batch_size: 2,
+            max_wait_ms: 10_000,
+            min_batch_size: 1,
+            use_priority_lanes: false,
+        });
+
+        let rx1 = coalescer.submit("text a".into(), Priority::Background);
+        let rx2 = coalescer.submit("text b".into(), Priority::Background);
+
+        let batch = coalescer.try_form_batch().unwrap();
+        // Deliver 0 results for 2 requests — both should get mismatch error
+        batch.deliver(Ok(vec![]));
+
+        let r1 = rx1.recv().unwrap();
+        let r2 = rx2.recv().unwrap();
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+        assert!(r1.unwrap_err().to_string().contains("mismatch"));
+        assert!(r2.unwrap_err().to_string().contains("mismatch"));
+    }
+
+    #[test]
+    fn avg_batch_size_single_batch() {
+        let m = CoalescerMetrics::default();
+        m.total_batches.store(1, Ordering::Relaxed);
+        m.total_texts_batched.store(7, Ordering::Relaxed);
+        assert!((m.avg_batch_size() - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_arc_is_shared() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig::default());
+        let m1 = Arc::clone(coalescer.metrics());
+        let m2 = Arc::clone(coalescer.metrics());
+        m1.total_submitted.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(m2.total_submitted.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn pending_count_decreases_after_batch_formed() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig {
+            max_batch_size: 2,
+            max_wait_ms: 10_000,
+            min_batch_size: 1,
+            use_priority_lanes: false,
+        });
+
+        coalescer.submit("a".into(), Priority::Background);
+        coalescer.submit("b".into(), Priority::Background);
+        assert_eq!(coalescer.pending_count(), 2);
+
+        let batch = coalescer.try_form_batch().unwrap();
+        assert_eq!(coalescer.pending_count(), 0);
+        batch.deliver(Ok(vec![vec![1.0], vec![2.0]]));
+    }
+
+    #[test]
+    fn try_form_batch_returns_none_when_empty() {
+        let coalescer = BatchCoalescer::new(CoalescerConfig::default());
+        assert!(coalescer.try_form_batch().is_none());
+    }
+
+    // ─── bd-1opw tests end ───
+
     // ── Multiple priorities interleaved correctly ─────────────────────
 
     #[test]

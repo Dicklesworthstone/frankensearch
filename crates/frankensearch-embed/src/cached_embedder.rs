@@ -64,7 +64,8 @@ impl CacheState {
     }
 
     fn insert(&mut self, key: String, value: Vec<f32>) {
-        if self.map.contains_key(&key) {
+        // capacity == 0 means caching is disabled.
+        if self.capacity == 0 || self.map.contains_key(&key) {
             return;
         }
         if self.order.len() >= self.capacity
@@ -609,6 +610,28 @@ mod tests {
             let result = cached.embed_batch(&cx, empty).await.unwrap();
             assert!(result.is_empty());
             assert_eq!(cached.cache_stats().entries, 0);
+        });
+    }
+
+    #[test]
+    fn embed_batch_deduplicates_within_batch() {
+        let (cached, inner) = make_cached(16);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // Batch with duplicate items: "hello" appears twice, "world" once
+            let batch = cached
+                .embed_batch(&cx, &["hello", "hello", "world"])
+                .await
+                .unwrap();
+            assert_eq!(batch.len(), 3);
+            // Only 2 unique texts → 2 inner calls (second "hello" hits cache)
+            assert_eq!(inner.call_count(), 2);
+            // Both "hello" embeddings should be identical
+            assert_eq!(batch[0], batch[1]);
+            // "world" should differ
+            assert_ne!(batch[0], batch[2]);
+            // Stats: 1 hit (second "hello"), 2 misses (first "hello" + "world")
+            assert_eq!(cached.cache_stats().hits, 1);
+            assert_eq!(cached.cache_stats().misses, 2);
         });
     }
 

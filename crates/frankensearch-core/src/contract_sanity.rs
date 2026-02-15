@@ -17,6 +17,8 @@
 //!    are rejected outright with a deprecation violation.
 //! 5. **Forward compatibility**: Adapters reporting a schema version *newer*
 //!    than the core library must be rejected (core must be upgraded first).
+//! 6. **Canonical identity pairing**: For known first-class hosts, `adapter_id`
+//!    and `host_project` must match the canonical pair.
 
 use serde::{Deserialize, Serialize};
 
@@ -302,6 +304,7 @@ pub fn replay_command_for_reason(reason_code: &str, adapter_id: &str) -> String 
         "contract.schema.lagging"
             | "contract.schema.deprecated"
             | "contract.schema.too_new"
+            | "adapter.identity.canonical_pair_mismatch"
             | "adapter.identity.schema_version_mismatch"
     ) {
         format!("{adapter_prefix} {REPLAY_CONTRACT_SANITY_TESTS}")
@@ -586,6 +589,70 @@ mod tests {
     }
 
     #[test]
+    fn canonical_identity_pair_match_passes() {
+        let checker = ContractSanityChecker::default();
+        let adapter = StubAdapter::with_identity("xf-host-adapter", "xf", TELEMETRY_SCHEMA_VERSION);
+        let result = checker.check_adapter(&adapter);
+
+        assert!(result.passed);
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.canonical_pair_mismatch")
+        );
+    }
+
+    #[test]
+    fn canonical_host_with_wrong_adapter_id_fails() {
+        let checker = ContractSanityChecker::default();
+        let adapter =
+            StubAdapter::with_identity("cass-host-adapter", "xf", TELEMETRY_SCHEMA_VERSION);
+        let result = checker.check_adapter(&adapter);
+
+        assert!(!result.passed);
+        assert!(result.violations.iter().any(|v| {
+            v.code == "adapter.identity.canonical_pair_mismatch" && v.field == "identity.adapter_id"
+        }));
+    }
+
+    #[test]
+    fn canonical_adapter_id_with_wrong_host_fails() {
+        let checker = ContractSanityChecker::default();
+        let adapter = StubAdapter::with_identity(
+            "mcp-agent-mail-host-adapter",
+            "custom-mail-host",
+            TELEMETRY_SCHEMA_VERSION,
+        );
+        let result = checker.check_adapter(&adapter);
+
+        assert!(!result.passed);
+        assert!(result.violations.iter().any(|v| {
+            v.code == "adapter.identity.canonical_pair_mismatch"
+                && v.field == "identity.host_project"
+        }));
+    }
+
+    #[test]
+    fn unknown_identity_pair_remains_allowed_for_future_hosts() {
+        let checker = ContractSanityChecker::default();
+        let adapter = StubAdapter::with_identity(
+            "custom-host-adapter",
+            "custom_host",
+            TELEMETRY_SCHEMA_VERSION,
+        );
+        let result = checker.check_adapter(&adapter);
+
+        assert!(result.passed);
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.canonical_pair_mismatch")
+        );
+    }
+
+    #[test]
     fn contract_report_serde_roundtrip() {
         let report = ContractSanityReport {
             core_schema_version: TELEMETRY_SCHEMA_VERSION,
@@ -676,6 +743,44 @@ mod tests {
     }
 
     #[test]
+    fn canonical_pair_mismatch_uses_contract_replay_and_error_severity() {
+        let report = ContractSanityReport {
+            core_schema_version: TELEMETRY_SCHEMA_VERSION,
+            adapters_checked: 1,
+            adapters_passed: 0,
+            adapter_results: vec![AdapterContractResult {
+                adapter_id: "xf-host-adapter".to_owned(),
+                host_project: "wrong-host".to_owned(),
+                adapter_schema_version: TELEMETRY_SCHEMA_VERSION,
+                passed: false,
+                compatibility: CompatibilityStatus::Exact,
+                violations: vec![ConformanceViolation {
+                    code: "adapter.identity.canonical_pair_mismatch".to_owned(),
+                    field: "identity.host_project".to_owned(),
+                    message: "adapter_id 'xf-host-adapter' expects host_project 'xf'".to_owned(),
+                }],
+            }],
+            passed: false,
+        };
+
+        let diagnostics = report.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, ViolationSeverity::Error);
+        assert!(
+            diagnostics[0]
+                .replay_command
+                .contains("contract_sanity::tests"),
+            "canonical pair mismatch must replay contract_sanity tests"
+        );
+        assert!(
+            !diagnostics[0]
+                .replay_command
+                .contains("host_adapter::tests"),
+            "canonical pair mismatch should not route to host_adapter tests"
+        );
+    }
+
+    #[test]
     fn lagging_schema_mismatch_is_warning_in_diagnostics() {
         let report = ContractSanityReport {
             core_schema_version: TELEMETRY_SCHEMA_VERSION,
@@ -741,6 +846,13 @@ mod tests {
         assert!(schema_cmd.contains("contract_sanity::tests"));
         assert!(schema_cmd.contains("FRANKENSEARCH_HOST_ADAPTER=xf-host-adapter"));
 
+        let pair_cmd = replay_command_for_reason(
+            "adapter.identity.canonical_pair_mismatch",
+            "xf-host-adapter",
+        );
+        assert!(pair_cmd.contains("contract_sanity::tests"));
+        assert!(pair_cmd.contains("FRANKENSEARCH_HOST_ADAPTER=xf-host-adapter"));
+
         let adapter_cmd = replay_command_for_reason(
             "adapter.identity.redaction_policy_mismatch",
             "cass-host-adapter",
@@ -748,4 +860,155 @@ mod tests {
         assert!(adapter_cmd.contains("host_adapter::tests"));
         assert!(adapter_cmd.contains("FRANKENSEARCH_HOST_ADAPTER=cass-host-adapter"));
     }
+
+    // ─── bd-2rp4 tests begin ──────────────────────────────────────────
+
+    #[test]
+    fn compatibility_status_serde_roundtrip() {
+        for status in [
+            CompatibilityStatus::Exact,
+            CompatibilityStatus::Compatible { lag: 1 },
+            CompatibilityStatus::Deprecated { lag: 3 },
+            CompatibilityStatus::TooNew { ahead: 2 },
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: CompatibilityStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, back);
+        }
+    }
+
+    #[test]
+    fn violation_severity_serde_roundtrip() {
+        for severity in [ViolationSeverity::Warning, ViolationSeverity::Error] {
+            let json = serde_json::to_string(&severity).unwrap();
+            let back: ViolationSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(severity, back);
+        }
+    }
+
+    #[test]
+    fn contract_violation_diagnostic_debug_clone_eq() {
+        let diag = ContractViolationDiagnostic {
+            adapter_id: "test-adapter".to_owned(),
+            host_project: "test-project".to_owned(),
+            compatibility: CompatibilityStatus::Exact,
+            reason_code: "test.code".to_owned(),
+            field: "test.field".to_owned(),
+            message: "test message".to_owned(),
+            severity: ViolationSeverity::Warning,
+            replay_command: "cargo test".to_owned(),
+        };
+        let debug = format!("{diag:?}");
+        assert!(debug.contains("ContractViolationDiagnostic"));
+
+        let cloned = diag.clone();
+        assert_eq!(diag, cloned);
+    }
+
+    #[test]
+    fn contract_violation_diagnostic_serde_roundtrip() {
+        let diag = ContractViolationDiagnostic {
+            adapter_id: "xf".to_owned(),
+            host_project: "xf-project".to_owned(),
+            compatibility: CompatibilityStatus::TooNew { ahead: 1 },
+            reason_code: "contract.schema.too_new".to_owned(),
+            field: "identity.telemetry_schema_version".to_owned(),
+            message: "too new".to_owned(),
+            severity: ViolationSeverity::Error,
+            replay_command: "cargo test".to_owned(),
+        };
+        let json = serde_json::to_string(&diag).unwrap();
+        let back: ContractViolationDiagnostic = serde_json::from_str(&json).unwrap();
+        assert_eq!(diag, back);
+    }
+
+    #[test]
+    fn classify_violation_severity_all_cases() {
+        assert_eq!(
+            classify_violation_severity("contract.schema.lagging", &CompatibilityStatus::Exact),
+            ViolationSeverity::Warning
+        );
+        assert_eq!(
+            classify_violation_severity(
+                "adapter.identity.schema_version_mismatch",
+                &CompatibilityStatus::Compatible { lag: 1 }
+            ),
+            ViolationSeverity::Warning
+        );
+        assert_eq!(
+            classify_violation_severity(
+                "adapter.identity.schema_version_mismatch",
+                &CompatibilityStatus::Deprecated { lag: 2 }
+            ),
+            ViolationSeverity::Error
+        );
+        assert_eq!(
+            classify_violation_severity(
+                "contract.schema.deprecated",
+                &CompatibilityStatus::Deprecated { lag: 2 }
+            ),
+            ViolationSeverity::Error
+        );
+        assert_eq!(
+            classify_violation_severity(
+                "contract.schema.too_new",
+                &CompatibilityStatus::TooNew { ahead: 1 }
+            ),
+            ViolationSeverity::Error
+        );
+        assert_eq!(
+            classify_violation_severity("unknown.reason", &CompatibilityStatus::Exact),
+            ViolationSeverity::Error
+        );
+    }
+
+    #[test]
+    fn replay_command_unknown_reason_falls_back() {
+        let cmd = replay_command_for_reason("completely.unknown.code", "my-adapter");
+        assert!(cmd.contains("FRANKENSEARCH_HOST_ADAPTER=my-adapter"));
+        assert!(cmd.contains("cargo test -p frankensearch-core"));
+        // Should NOT contain specific test module paths.
+        assert!(!cmd.contains("contract_sanity::tests"));
+        assert!(!cmd.contains("host_adapter::tests"));
+    }
+
+    #[test]
+    fn replay_command_for_lagging_and_deprecated() {
+        let lagging = replay_command_for_reason("contract.schema.lagging", "ops-adapter");
+        assert!(lagging.contains("contract_sanity::tests"));
+
+        let deprecated = replay_command_for_reason("contract.schema.deprecated", "old-adapter");
+        assert!(deprecated.contains("contract_sanity::tests"));
+    }
+
+    #[test]
+    fn diagnostics_empty_report_returns_empty() {
+        let report = ContractSanityReport {
+            core_schema_version: TELEMETRY_SCHEMA_VERSION,
+            adapters_checked: 0,
+            adapters_passed: 0,
+            adapter_results: vec![],
+            passed: true,
+        };
+        assert!(report.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn classify_version_against_zero_lag_requires_exact() {
+        // With max_lag=0, only exact match is compatible.
+        assert_eq!(
+            classify_version_against(5, 5, 0),
+            CompatibilityStatus::Exact
+        );
+        assert_eq!(
+            classify_version_against(5, 4, 0),
+            CompatibilityStatus::Deprecated { lag: 1 }
+        );
+        assert_eq!(
+            classify_version_against(5, 6, 0),
+            CompatibilityStatus::TooNew { ahead: 1 }
+        );
+    }
+
+    // ─── bd-2rp4 tests end ────────────────────────────────────────────
 }

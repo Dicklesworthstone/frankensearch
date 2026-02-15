@@ -241,4 +241,115 @@ mod tests {
             "f32_dot={f32_dot}, f16_dot={f16_dot}"
         );
     }
+
+    // ─── bd-1l4g tests begin ───
+
+    #[test]
+    fn cosine_similarity_f16_matches_dot_product() {
+        let stored: Vec<f16> = (0_u16..16)
+            .map(|i| f16::from_f32(f32::from(i) * 0.1))
+            .collect();
+        let query: Vec<f32> = (0_u16..16).map(|i| f32::from(i) * 0.2).collect();
+
+        let cosine = cosine_similarity_f16(&stored, &query).expect("cosine");
+        let dot = dot_product_f16_f32(&stored, &query).expect("dot");
+        assert!(
+            (cosine - dot).abs() < f32::EPSILON,
+            "cosine_similarity_f16 should delegate to dot_product_f16_f32"
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_f16_dimension_mismatch() {
+        let stored = vec![f16::from_f32(1.0); 8];
+        let query = vec![1.0_f32; 9];
+        let err = cosine_similarity_f16(&stored, &query).expect_err("must fail");
+        assert!(matches!(
+            err,
+            SearchError::DimensionMismatch {
+                expected: 8,
+                found: 9
+            }
+        ));
+    }
+
+    #[test]
+    fn dot_product_f16_f32_dimension_mismatch() {
+        let stored = vec![f16::from_f32(1.0); 4];
+        let query = vec![1.0_f32; 5];
+        let err = dot_product_f16_f32(&stored, &query).expect_err("must fail");
+        assert!(matches!(
+            err,
+            SearchError::DimensionMismatch {
+                expected: 4,
+                found: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_vectors_dot_product_f32() {
+        let result = dot_product_f32_f32(&[], &[]).expect("dot product");
+        assert!(result.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn empty_vectors_dot_product_f16() {
+        let result = dot_product_f16_f32(&[], &[]).expect("dot product");
+        assert!(result.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn exactly_eight_elements_f32() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let simd = dot_product_f32_f32(&a, &b).expect("dot product");
+        let scalar = scalar_dot_f32(&a, &b);
+        assert!(
+            (simd - scalar).abs() < 1e-6,
+            "exactly 8 elements (one full SIMD chunk, no remainder)"
+        );
+    }
+
+    #[test]
+    fn single_element_dot_product() {
+        let a = vec![3.0_f32];
+        let b = vec![4.0_f32];
+        let result = dot_product_f32_f32(&a, &b).expect("dot product");
+        assert!((result - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn self_dot_product_is_norm_squared() {
+        let v = vec![3.0_f32, 4.0];
+        let result = dot_product_f32_f32(&v, &v).expect("dot product");
+        assert!((result - 25.0).abs() < f32::EPSILON); // 3^2 + 4^2 = 25
+    }
+
+    #[test]
+    fn f16_nan_propagates() {
+        let stored = vec![
+            f16::from_f32(1.0),
+            f16::NAN,
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+        ];
+        let query = vec![1.0_f32; 4];
+        let result = dot_product_f16_f32(&stored, &query).expect("dot product");
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn large_256d_matches_scalar_f32() {
+        let a: Vec<f32> = (0_u16..256).map(|i| (f32::from(i) * 0.01).sin()).collect();
+        let b: Vec<f32> = (0_u16..256).map(|i| (f32::from(i) * 0.02).cos()).collect();
+        let simd = dot_product_f32_f32(&a, &b).expect("dot product");
+        let scalar = scalar_dot_f32(&a, &b);
+        assert!(
+            (simd - scalar).abs() < 1e-4,
+            "256d: simd={simd}, scalar={scalar}"
+        );
+    }
+
+    // ─── bd-1l4g tests end ───
 }

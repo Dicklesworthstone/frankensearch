@@ -92,7 +92,14 @@ impl DocumentFingerprint {
             return true;
         }
 
-        self.semantic_distance_ratio(other) > threshold.clamp(0.0, 1.0)
+        // NaN.clamp() returns NaN, making the comparison always false and
+        // silently disabling semantic change detection. Fall back to default.
+        let safe_threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_SEMANTIC_CHANGE_THRESHOLD
+        };
+        self.semantic_distance_ratio(other) > safe_threshold
     }
 
     /// Convenience wrapper using [`DEFAULT_SEMANTIC_CHANGE_THRESHOLD`].
@@ -280,4 +287,106 @@ mod tests {
         assert_eq!(fp.token_estimate, 200_000);
         assert!(fp.char_count >= 1_200_000);
     }
+
+    // ─── bd-1b49 tests begin ───
+
+    #[test]
+    fn fingerprint_serde_roundtrip() {
+        let fp = DocumentFingerprint::compute("hello world rust search");
+        let json = serde_json::to_string(&fp).unwrap();
+        let decoded: DocumentFingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, fp);
+    }
+
+    #[test]
+    fn fingerprint_debug_format() {
+        let fp = DocumentFingerprint::compute("test");
+        let debug = format!("{fp:?}");
+        assert!(debug.contains("content_hash"));
+        assert!(debug.contains("semantic_hash"));
+        assert!(debug.contains("char_count"));
+        assert!(debug.contains("token_estimate"));
+    }
+
+    #[test]
+    fn semantic_hamming_distance_with_self_is_zero() {
+        let fp = DocumentFingerprint::compute("alpha beta gamma delta epsilon zeta");
+        assert_eq!(fp.semantic_hamming_distance(&fp), 0);
+    }
+
+    #[test]
+    fn semantic_distance_ratio_exact_value() {
+        let a = DocumentFingerprint::compute("test");
+        let mut b = a;
+        // Force exactly 8 bits different in semantic_hash
+        b.semantic_hash = a.semantic_hash ^ 0xFF; // 8 bits flipped
+        b.content_hash = !a.content_hash; // ensure different content hash
+        let ratio = a.semantic_distance_ratio(&b);
+        assert!(
+            (ratio - 8.0 / 64.0).abs() < f64::EPSILON,
+            "expected 0.125, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn char_count_delta_ratio_both_zero() {
+        let a = DocumentFingerprint::compute("");
+        let b = DocumentFingerprint::compute("");
+        assert!(a.char_count_delta_ratio(&b).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn char_count_delta_ratio_exact_calculation() {
+        let mut a = DocumentFingerprint::compute("test");
+        let mut b = a;
+        a.char_count = 100;
+        b.char_count = 80;
+        // delta = 20, max = 100, ratio = 0.2
+        assert!((a.char_count_delta_ratio(&b) - 0.2).abs() < f64::EPSILON);
+        assert!((b.char_count_delta_ratio(&a) - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn needs_reembedding_same_hash_always_false() {
+        let a = DocumentFingerprint::compute("hello world");
+        let mut b = a;
+        // Same content_hash, but fake different semantic_hash
+        b.semantic_hash = !a.semantic_hash;
+        b.char_count = a.char_count * 5;
+        // content_hash still matches → should NOT trigger reembedding
+        assert!(!a.needs_reembedding(&b, 0.0));
+        assert!(!a.needs_reembedding_default(&b));
+    }
+
+    #[test]
+    fn needs_reembedding_negative_threshold_clamped_to_zero() {
+        let a = DocumentFingerprint::compute("alpha beta gamma delta");
+        let b = DocumentFingerprint::compute("alpha beta gamma epsilon");
+        // Any hamming distance > 0 should trigger with threshold clamped to 0.0
+        if a.content_hash != b.content_hash && a.semantic_hamming_distance(&b) > 0 {
+            assert!(a.needs_reembedding(&b, -1.0));
+        }
+    }
+
+    #[test]
+    fn two_token_input_uses_individual_hashing() {
+        // With < SHINGLE_SIZE (3) tokens, individual tokens are hashed
+        let fp = DocumentFingerprint::compute("hello world");
+        assert_eq!(fp.token_estimate, 2);
+        assert!(fp.semantic_hash != 0); // should still produce a non-zero hash
+    }
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert!(
+            (DEFAULT_SEMANTIC_CHANGE_THRESHOLD - 0.125).abs() < f64::EPSILON,
+            "DEFAULT_SEMANTIC_CHANGE_THRESHOLD should be 8/64 = 0.125"
+        );
+        assert!(
+            (SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD - 0.20).abs() < f64::EPSILON,
+            "SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD should be 0.20"
+        );
+    }
+
+    // ─── bd-1b49 tests end ───
 }

@@ -43,10 +43,11 @@ use frankensearch_core::traits::{Embedder, SearchFuture};
 ))]
 use frankensearch_core::traits::{ModelCategory, ModelTier};
 
+#[cfg(all(feature = "download", feature = "fastembed"))]
+use crate::fastembed_embedder::DEFAULT_DIMENSION as MINILM_DIMENSION;
 #[cfg(feature = "fastembed")]
 use crate::fastembed_embedder::{
-    DEFAULT_DIMENSION as MINILM_DIMENSION, DEFAULT_HF_ID as MINILM_HF_ID,
-    DEFAULT_MODEL_NAME as MINILM_MODEL_NAME, FastEmbedEmbedder,
+    DEFAULT_HF_ID as MINILM_HF_ID, DEFAULT_MODEL_NAME as MINILM_MODEL_NAME, FastEmbedEmbedder,
     find_model_dir_with_hf_id as find_fastembed_model_dir,
 };
 #[cfg(feature = "hash")]
@@ -1999,6 +2000,387 @@ mod tests {
         let display = format!("{diag}");
         assert!(display.contains("OFFLINE"));
     }
+
+    // ─── bd-1il3 tests begin ───
+
+    #[test]
+    fn two_tier_availability_clone_copy_eq() {
+        let a = TwoTierAvailability::Full;
+        let b = a;
+        assert_eq!(a, b);
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone();
+        assert_eq!(a, c);
+        assert_ne!(TwoTierAvailability::Full, TwoTierAvailability::HashOnly);
+        assert_ne!(TwoTierAvailability::FastOnly, TwoTierAvailability::HashOnly);
+    }
+
+    #[test]
+    fn two_tier_availability_debug() {
+        let debug = format!("{:?}", TwoTierAvailability::Full);
+        assert_eq!(debug, "Full");
+        let debug = format!("{:?}", TwoTierAvailability::FastOnly);
+        assert_eq!(debug, "FastOnly");
+        let debug = format!("{:?}", TwoTierAvailability::HashOnly);
+        assert_eq!(debug, "HashOnly");
+    }
+
+    #[test]
+    fn model_status_debug_all_variants() {
+        let ready = ModelStatus::Ready {
+            id: "test".to_owned(),
+        };
+        let debug = format!("{ready:?}");
+        assert!(debug.contains("Ready"));
+        assert!(debug.contains("test"));
+
+        let not_found = ModelStatus::NotFound {
+            model_name: "m".to_owned(),
+            hf_repo_url: "url".to_owned(),
+            searched_paths: vec![],
+        };
+        let debug = format!("{not_found:?}");
+        assert!(debug.contains("NotFound"));
+
+        let blocked = ModelStatus::DownloadBlocked {
+            model_name: "m".to_owned(),
+            reason: "r".to_owned(),
+        };
+        let debug = format!("{blocked:?}");
+        assert!(debug.contains("DownloadBlocked"));
+
+        let disabled = ModelStatus::FeatureDisabled {
+            feature_flag: "f".to_owned(),
+        };
+        let debug = format!("{disabled:?}");
+        assert!(debug.contains("FeatureDisabled"));
+
+        let hash = ModelStatus::HashFallback;
+        let debug = format!("{hash:?}");
+        assert!(debug.contains("HashFallback"));
+    }
+
+    #[test]
+    fn model_status_clone_all_variants() {
+        // Verify Clone works for each variant by cloning into a Vec and formatting
+        fn clone_and_format(status: &ModelStatus) -> String {
+            format!("{}", status.clone())
+        }
+
+        assert!(
+            clone_and_format(&ModelStatus::Ready {
+                id: "test".to_owned(),
+            })
+            .contains("test")
+        );
+
+        assert!(
+            clone_and_format(&ModelStatus::NotFound {
+                model_name: "m".to_owned(),
+                hf_repo_url: "u".to_owned(),
+                searched_paths: vec![std::path::PathBuf::from("/tmp/p")],
+            })
+            .contains("NOT FOUND")
+        );
+
+        assert!(
+            clone_and_format(&ModelStatus::DownloadBlocked {
+                model_name: "m".to_owned(),
+                reason: "r".to_owned(),
+            })
+            .contains("BLOCKED")
+        );
+
+        assert!(
+            clone_and_format(&ModelStatus::FeatureDisabled {
+                feature_flag: "f".to_owned(),
+            })
+            .contains("DISABLED")
+        );
+
+        assert!(clone_and_format(&ModelStatus::HashFallback).contains("hash fallback"));
+    }
+
+    #[test]
+    fn model_status_hash_fallback_display() {
+        let status = ModelStatus::HashFallback;
+        let display = format!("{status}");
+        assert_eq!(display, "hash fallback (no semantic model)");
+    }
+
+    #[test]
+    fn model_availability_diagnostic_clone_debug() {
+        let diag = ModelAvailabilityDiagnostic {
+            availability: TwoTierAvailability::Full,
+            cache_dir: std::path::PathBuf::from("/tmp/cache"),
+            offline: false,
+            fast_status: ModelStatus::Ready {
+                id: "fast".to_owned(),
+            },
+            quality_status: ModelStatus::Ready {
+                id: "quality".to_owned(),
+            },
+            suggestions: vec![],
+        };
+        let cloned = diag.clone();
+        assert_eq!(cloned.availability, TwoTierAvailability::Full);
+        assert!(!cloned.offline);
+        assert!(cloned.suggestions.is_empty());
+
+        let debug = format!("{diag:?}");
+        assert!(debug.contains("ModelAvailabilityDiagnostic"));
+        assert!(debug.contains("Full"));
+    }
+
+    #[test]
+    fn diagnostic_display_no_suggestions_skips_resolve_section() {
+        let diag = ModelAvailabilityDiagnostic {
+            availability: TwoTierAvailability::Full,
+            cache_dir: std::path::PathBuf::from("/tmp/cache"),
+            offline: false,
+            fast_status: ModelStatus::Ready {
+                id: "fast".to_owned(),
+            },
+            quality_status: ModelStatus::Ready {
+                id: "quality".to_owned(),
+            },
+            suggestions: vec![],
+        };
+        let display = format!("{diag}");
+        assert!(!display.contains("To resolve:"));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn embedder_stack_clone() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(fast, None);
+        let cloned = stack.clone();
+        assert_eq!(cloned.availability(), stack.availability());
+        assert_eq!(cloned.fast().id(), stack.fast().id());
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn embedder_stack_fast_arc_returns_same_id() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(fast, None);
+        let arc = stack.fast_arc();
+        assert_eq!(arc.id(), stack.fast().id());
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn format_bytes_edge_cases() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(
+            format_bytes(1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "1.5 GB"
+        );
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn format_speed_edge_cases() {
+        assert_eq!(format_speed(0.0), "0 B/s");
+        assert_eq!(format_speed(-1.0), "0 B/s");
+        assert_eq!(format_speed(f64::NAN), "0 B/s");
+        assert_eq!(format_speed(f64::INFINITY), "0 B/s");
+        assert_eq!(format_speed(f64::NEG_INFINITY), "0 B/s");
+        assert_eq!(format_speed(500.0), "500 B/s");
+        assert!(format_speed(2048.0).contains("KB/s"));
+        assert!(format_speed(2.0 * 1024.0 * 1024.0).contains("MB/s"));
+        assert!(format_speed(2.0 * 1024.0 * 1024.0 * 1024.0).contains("GB/s"));
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn format_eta_edge_cases() {
+        assert_eq!(format_eta(None), "?");
+        assert_eq!(format_eta(Some(f64::NAN)), "?");
+        assert_eq!(format_eta(Some(f64::INFINITY)), "?");
+        assert_eq!(format_eta(Some(-1.0)), "?");
+        assert_eq!(format_eta(Some(0.0)), "0.0s");
+        assert_eq!(format_eta(Some(5.5)), "5.5s");
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn render_progress_bar_edge_cases() {
+        let empty_bar = render_progress_bar(0);
+        assert_eq!(empty_bar.len(), PROGRESS_BAR_WIDTH);
+        assert!(empty_bar.chars().all(|c| c == ' '));
+
+        let full_bar = render_progress_bar(10_000);
+        assert_eq!(full_bar.len(), PROGRESS_BAR_WIDTH);
+        assert!(full_bar.chars().all(|c| c == '='));
+
+        let half_bar = render_progress_bar(5_000);
+        assert_eq!(half_bar.len(), PROGRESS_BAR_WIDTH);
+        let filled = half_bar.chars().filter(|&c| c == '=').count();
+        assert_eq!(filled, PROGRESS_BAR_WIDTH / 2);
+
+        // Over 100% should clamp
+        let bar_over = render_progress_bar(20_000);
+        assert_eq!(bar_over.len(), PROGRESS_BAR_WIDTH);
+        assert!(bar_over.chars().all(|c| c == '='));
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn parse_bool_flag_whitespace_and_on() {
+        assert_eq!(parse_bool_flag(" 1 "), Some(true));
+        assert_eq!(parse_bool_flag("  true  "), Some(true));
+        assert_eq!(parse_bool_flag("on"), Some(true));
+        assert_eq!(parse_bool_flag("ON"), Some(true));
+        assert_eq!(parse_bool_flag("On"), Some(true));
+        assert_eq!(parse_bool_flag("no"), Some(false));
+        assert_eq!(parse_bool_flag("NO"), Some(false));
+        assert_eq!(parse_bool_flag("No"), Some(false));
+        assert_eq!(parse_bool_flag(""), None);
+        assert_eq!(parse_bool_flag("   "), None);
+        assert_eq!(parse_bool_flag("maybe"), None);
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn progress_percent_zero_files_completed() {
+        let progress = DownloadProgress {
+            file_name: "model.onnx".to_owned(),
+            bytes_downloaded: 0,
+            total_bytes: Some(100),
+            files_completed: 0,
+            files_total: 2,
+            speed_bytes_per_sec: 0.0,
+            eta_seconds: None,
+        };
+        assert_eq!(progress_percent_x100(&progress), 0);
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn progress_percent_all_files_completed() {
+        let progress = DownloadProgress {
+            file_name: "last.onnx".to_owned(),
+            bytes_downloaded: 100,
+            total_bytes: Some(100),
+            files_completed: 3,
+            files_total: 4,
+            speed_bytes_per_sec: 1000.0,
+            eta_seconds: Some(0.0),
+        };
+        // 3 complete files + 100% of current file / 4 total = 100%
+        assert_eq!(progress_percent_x100(&progress), 10_000);
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn progress_percent_no_total_bytes() {
+        let progress = DownloadProgress {
+            file_name: "model.onnx".to_owned(),
+            bytes_downloaded: 50,
+            total_bytes: None,
+            files_completed: 1,
+            files_total: 2,
+            speed_bytes_per_sec: 100.0,
+            eta_seconds: None,
+        };
+        // No total_bytes means current file contributes 0%
+        // 1 complete / 2 total = 50% = 5000
+        assert_eq!(progress_percent_x100(&progress), 5_000);
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn download_policy_can_download_logic() {
+        use crate::model_manifest::ConsentSource;
+
+        let allowed = DownloadPolicy::for_tests(
+            DownloadConsent::granted(ConsentSource::Programmatic),
+            false,
+            false,
+        );
+        assert!(allowed.can_download());
+
+        let offline = DownloadPolicy::for_tests(
+            DownloadConsent::granted(ConsentSource::Programmatic),
+            true,
+            false,
+        );
+        assert!(!offline.can_download());
+
+        let denied = DownloadPolicy::for_tests(
+            DownloadConsent::denied(Some(ConsentSource::Programmatic)),
+            false,
+            false,
+        );
+        assert!(!denied.can_download());
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn download_policy_blocked_reason_offline() {
+        let policy = DownloadPolicy::for_tests(
+            DownloadConsent::granted(ConsentSource::Programmatic),
+            true,
+            false,
+        );
+        let reason = policy.blocked_reason();
+        assert!(reason.contains("OFFLINE"));
+    }
+
+    #[cfg(all(
+        feature = "download",
+        any(feature = "model2vec", feature = "fastembed")
+    ))]
+    #[test]
+    fn download_policy_blocked_reason_consent_denied() {
+        let policy = DownloadPolicy::for_tests(
+            DownloadConsent::denied(Some(ConsentSource::Environment)),
+            false,
+            false,
+        );
+        let reason = policy.blocked_reason();
+        assert!(reason.contains("consent denied"));
+    }
+
+    // ─── bd-1il3 tests end ───
 
     #[cfg(all(feature = "model2vec", feature = "hash"))]
     fn create_test_safetensors(dir: &Path, vocab_size: usize, dimensions: usize) {

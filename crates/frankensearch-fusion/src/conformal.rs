@@ -613,4 +613,114 @@ mod tests {
         let update = state.update(0.05, &cal).expect("update");
         assert!(update.alpha_after < update.alpha_before);
     }
+
+    // ─── bd-1epq tests begin ───
+
+    #[test]
+    fn nonconformity_scores_are_sorted_after_calibration() {
+        let cal = ConformalSearchCalibration::calibrate(&[9, 1, 5, 3, 7]).expect("calibrate");
+        let scores = cal.nonconformity_scores();
+        assert_eq!(scores, &[1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn mondrian_class_calibration_accessor() {
+        let examples: Vec<(String, usize)> = vec![
+            ("vector search".into(), 1),
+            ("error handling".into(), 2),
+            ("index format".into(), 3),
+            ("ranking logic".into(), 4),
+        ];
+        let mondrian = MondrianConformalCalibration::calibrate(&examples, 3).expect("calibrate");
+        // ShortKeyword should have 4 examples >= min 3
+        let class_cal = mondrian.class_calibration(QueryClass::ShortKeyword);
+        assert!(class_cal.is_some());
+        assert_eq!(class_cal.unwrap().len(), 4);
+        // Identifier class has no examples
+        assert!(mondrian.class_calibration(QueryClass::Identifier).is_none());
+    }
+
+    #[test]
+    fn mondrian_min_examples_per_class_accessor() {
+        let examples = vec![("test query".to_owned(), 5)];
+        let mondrian = MondrianConformalCalibration::calibrate(&examples, 7).expect("calibrate");
+        assert_eq!(mondrian.min_examples_per_class(), 7);
+    }
+
+    #[test]
+    fn mondrian_required_k_checked_validates_alpha() {
+        let examples = vec![
+            ("search query".to_owned(), 1),
+            ("another query".to_owned(), 3),
+        ];
+        let mondrian = MondrianConformalCalibration::calibrate(&examples, 1).expect("calibrate");
+        // Valid alpha should work
+        assert!(mondrian.required_k_checked("search query", 0.1).is_ok());
+        // Invalid alpha (1.0) should fail
+        assert!(mondrian.required_k_checked("search query", 1.0).is_err());
+        // NaN alpha should fail
+        assert!(mondrian.required_k_checked("test", f32::NAN).is_err());
+    }
+
+    #[test]
+    fn adaptive_conformal_update_debug_format() {
+        let update = AdaptiveConformalUpdate {
+            alpha_before: 0.1,
+            alpha_after: 0.15,
+            observed_error_rate: 0.2,
+            required_k: 5,
+        };
+        let debug = format!("{update:?}");
+        assert!(debug.contains("0.1"));
+        assert!(debug.contains("0.15"));
+        assert!(debug.contains("0.2"));
+        assert!(debug.contains('5'));
+    }
+
+    #[test]
+    fn adaptive_conformal_state_serde_roundtrip() {
+        let state = AdaptiveConformalState::new(0.15, 0.3).expect("state");
+        let json = serde_json::to_string(&state).expect("serialize");
+        let decoded: AdaptiveConformalState = serde_json::from_str(&json).expect("deserialize");
+        assert!((decoded.alpha - 0.15).abs() < f32::EPSILON);
+        assert!((decoded.gamma - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn p_value_for_best_rank_is_high() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 4, 5]).expect("calibrate");
+        let p = cal.p_value(1);
+        // All 5 scores >= 1, so p = (5+1)/(5+1) = 1.0
+        assert!((p - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn required_k_with_alpha_zero_returns_max() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 10, 20]).expect("calibrate");
+        let k = cal.required_k(0.0);
+        // alpha=0 means coverage=1.0, should need max rank
+        assert_eq!(k, 20);
+    }
+
+    #[test]
+    fn adaptive_update_clamps_alpha_to_valid_range() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        // Start near 0, push error rate to 0 -> alpha decreases toward epsilon
+        let mut state = AdaptiveConformalState::new(0.01, 1.0).expect("state");
+        let update = state.update(0.0, &cal).expect("update");
+        // Alpha should be clamped to >= 1e-6
+        assert!(update.alpha_after >= 1e-6);
+        assert!(update.alpha_after.is_finite());
+    }
+
+    #[test]
+    fn rank_prediction_interval_checked_negative_alpha_error() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        let err = cal
+            .rank_prediction_interval_checked(-0.1)
+            .expect_err("must reject negative alpha");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    // ─── bd-1epq tests end ───
 }

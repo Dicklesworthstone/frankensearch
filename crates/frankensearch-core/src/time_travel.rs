@@ -589,4 +589,172 @@ mod tests {
         assert_eq!(pruned, 0);
         assert_eq!(history.retained_count(), 1);
     }
+
+    // ─── bd-2qr7 tests begin ───
+
+    #[test]
+    fn retention_policy_default_exact_values() {
+        let policy = RetentionPolicy::default();
+        assert_eq!(policy.max_retained, 10);
+        assert_eq!(policy.max_age_ms, 3_600_000);
+    }
+
+    #[test]
+    fn retained_generation_debug_format() {
+        let generation = make_generation("gen-dbg", 1, 50);
+        let retained = RetainedGeneration {
+            generation,
+            retained_at: 42_000,
+        };
+        let dbg = format!("{retained:?}");
+        assert!(dbg.contains("RetainedGeneration"));
+        assert!(dbg.contains("42000"));
+    }
+
+    #[test]
+    fn resolve_detailed_at_boundaries() {
+        let history = GenerationHistory::default();
+        history.retain(make_generation("gen-1", 10, 20), 1000);
+
+        // At low boundary.
+        let result = history.resolve_detailed(10);
+        assert!(matches!(
+            result,
+            TimeTravelResult::Found {
+                commit_low: 10,
+                commit_high: 20,
+                ..
+            }
+        ));
+
+        // At high boundary.
+        let result = history.resolve_detailed(20);
+        assert!(matches!(
+            result,
+            TimeTravelResult::Found {
+                commit_low: 10,
+                commit_high: 20,
+                ..
+            }
+        ));
+
+        // One below low → not found.
+        let result = history.resolve_detailed(9);
+        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
+
+        // One above high → not found.
+        let result = history.resolve_detailed(21);
+        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
+    }
+
+    #[test]
+    fn prune_returns_zero_when_empty() {
+        let history = GenerationHistory::default();
+        let pruned = history.prune(999_999);
+        assert_eq!(pruned, 0);
+        assert_eq!(history.retained_count(), 0);
+    }
+
+    #[test]
+    fn clear_on_empty_is_noop() {
+        let history = GenerationHistory::default();
+        history.clear();
+        assert_eq!(history.retained_count(), 0);
+    }
+
+    #[test]
+    fn retained_summary_on_empty() {
+        let history = GenerationHistory::default();
+        let summary = history.retained_summary();
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn count_pruning_keeps_newest_drops_oldest() {
+        let policy = RetentionPolicy {
+            max_retained: 3,
+            max_age_ms: 0,
+        };
+        let history = GenerationHistory::new(policy);
+
+        // Insert 5 generations.
+        for i in 1..=5 {
+            let low = (i - 1) * 100 + 1;
+            let high = i * 100;
+            history.retain(make_generation(&format!("gen-{i}"), low, high), i * 1000);
+        }
+
+        // Should keep 3 newest by drain(..excess) which removes lowest-indexed
+        // (sorted by commit_range.high ascending, so oldest by commit range).
+        assert_eq!(history.retained_count(), 3);
+        let summary = history.retained_summary();
+        assert_eq!(summary[0].0, "gen-3");
+        assert_eq!(summary[1].0, "gen-4");
+        assert_eq!(summary[2].0, "gen-5");
+    }
+
+    #[test]
+    fn time_travel_result_debug_format() {
+        let found = TimeTravelResult::Found {
+            generation_id: "g1".into(),
+            commit_low: 1,
+            commit_high: 10,
+        };
+        assert!(format!("{found:?}").contains("Found"));
+
+        let not_found = TimeTravelResult::NotFound {
+            requested_seq: 99,
+            closest_range: None,
+        };
+        assert!(format!("{not_found:?}").contains("NotFound"));
+        assert!(format!("{not_found:?}").contains("99"));
+
+        let active = TimeTravelResult::ActiveGeneration {
+            generation_id: "active-1".into(),
+        };
+        assert!(format!("{active:?}").contains("ActiveGeneration"));
+    }
+
+    #[test]
+    fn retain_same_high_bound_inserts_both() {
+        let history = GenerationHistory::default();
+
+        // Two generations sharing the same commit_range.high.
+        history.retain(make_generation("gen-a", 1, 100), 1000);
+        history.retain(make_generation("gen-b", 50, 100), 2000);
+
+        assert_eq!(history.retained_count(), 2);
+
+        // Both in history; binary_search inserts gen-b before gen-a (same key),
+        // so resolve (iterating from start) finds gen-b first for the overlap.
+        let resolved = history.resolve(75).unwrap();
+        assert_eq!(resolved.manifest.generation_id, "gen-b");
+    }
+
+    #[test]
+    fn resolve_detailed_closest_range_accuracy() {
+        let history = GenerationHistory::default();
+
+        // Ranges: [1,100], [500,600]
+        history.retain(make_generation("gen-near", 1, 100), 1000);
+        history.retain(make_generation("gen-far", 500, 600), 2000);
+
+        // Seq 120 is 20 away from gen-near (high=100) and 380 from gen-far (low=500).
+        let result = history.resolve_detailed(120);
+        if let TimeTravelResult::NotFound { closest_range, .. } = result {
+            assert_eq!(closest_range, Some((1, 100)));
+        } else {
+            panic!("expected NotFound");
+        }
+
+        // Seq 400 is 300 away from gen-near and 100 from gen-far.
+        let result = history.resolve_detailed(400);
+        if let TimeTravelResult::NotFound { closest_range, .. } = result {
+            assert_eq!(closest_range, Some((500, 600)));
+        } else {
+            panic!("expected NotFound");
+        }
+    }
+
+    // ─── bd-2qr7 tests end ───
 }

@@ -70,8 +70,9 @@ impl MmrConfig {
     /// Returns lambda clamped to `[0.0, 1.0]`.
     #[must_use]
     pub const fn clamped_lambda(&self) -> f64 {
-        // const clamp: manual because f64::clamp is not const
-        if self.lambda < 0.0 {
+        // NaN comparisons are always false, so NaN would fall through to
+        // the else branch returning NaN. Guard explicitly.
+        if !self.lambda.is_finite() || self.lambda < 0.0 {
             0.0
         } else if self.lambda > 1.0 {
             1.0
@@ -529,4 +530,168 @@ mod tests {
             assert!(seen.insert(idx), "duplicate index {idx} in output");
         }
     }
+
+    // ─── bd-2gcl tests begin ───
+
+    #[test]
+    fn mmr_config_debug_format() {
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.65,
+            candidate_pool: 25,
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("true"));
+        assert!(debug.contains("0.65"));
+        assert!(debug.contains("25"));
+    }
+
+    #[test]
+    fn clamped_lambda_at_exact_boundaries() {
+        let zero = MmrConfig {
+            lambda: 0.0,
+            ..Default::default()
+        };
+        assert!(approx_eq(zero.clamped_lambda(), 0.0));
+
+        let one = MmrConfig {
+            lambda: 1.0,
+            ..Default::default()
+        };
+        assert!(approx_eq(one.clamped_lambda(), 1.0));
+    }
+
+    #[test]
+    fn lambda_zero_is_pure_diversity() {
+        let scores = vec![0.9, 0.5, 0.8];
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],  // orthogonal to 0
+            vec![0.99, 0.1], // near-duplicate of 0
+        ];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.0, // pure diversity
+            ..Default::default()
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 3, &config);
+        // First pick: highest normalized score (index 0, norm=1.0)
+        assert_eq!(selected[0], 0);
+        // Second pick: doc 1 (orthogonal) should beat doc 2 (near-dup) on diversity
+        assert_eq!(selected[1], 1);
+    }
+
+    #[test]
+    fn cosine_sim_different_lengths_uses_min() {
+        let a = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let b = vec![1.0_f32, 0.0];
+        // Only first 2 elements used: dot=1, norm_a=1, norm_b=1 -> cosine=1.0
+        assert!(approx_eq(cosine_sim(&a, &b), 1.0));
+    }
+
+    #[test]
+    fn all_identical_scores_normalized_to_one() {
+        // When all scores are identical, norm_scores should all be 1.0
+        // and MMR should still work (degrades to diversity ordering after first pick)
+        let scores = vec![0.5, 0.5, 0.5];
+        let embeddings: Vec<Vec<f32>> = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.7]];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.5,
+            ..Default::default()
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 3, &config);
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn negative_scores_normalize_correctly() {
+        let scores = vec![-0.5, -0.1, -0.9];
+        let embeddings: Vec<Vec<f32>> = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.0, 0.0, 1.0]];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 1.0, // pure relevance
+            ..Default::default()
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 3, &config);
+        // Highest score is -0.1 (index 1)
+        assert_eq!(selected[0], 1);
+    }
+
+    #[test]
+    fn candidate_pool_one_selects_best_only() {
+        let scores = vec![0.9, 0.8, 0.7];
+        let embeddings: Vec<Vec<f32>> = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.7,
+            candidate_pool: 1,
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 3, &config);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], 0);
+    }
+
+    #[test]
+    fn two_candidates_k_two_selects_both() {
+        let scores = vec![0.9, 0.5];
+        let embeddings: Vec<Vec<f32>> = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.7,
+            ..Default::default()
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 2, &config);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&0));
+        assert!(selected.contains(&1));
+    }
+
+    #[test]
+    fn cosine_sim_non_unit_vectors() {
+        // Scaling vectors shouldn't change cosine similarity
+        let a = vec![2.0_f32, 0.0];
+        let b = vec![3.0_f32, 0.0];
+        assert!(approx_eq(cosine_sim(&a, &b), 1.0));
+
+        let c = vec![5.0_f32, 5.0];
+        let d = vec![1.0_f32, 1.0];
+        assert!(approx_eq(cosine_sim(&c, &d), 1.0));
+    }
+
+    #[test]
+    fn selected_indices_within_pool_bounds() {
+        let scores = vec![0.9, 0.85, 0.8, 0.75, 0.7, 0.65];
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.5, 0.5, 0.0],
+            vec![0.0, 0.5, 0.5],
+            vec![0.5, 0.0, 0.5],
+        ];
+        let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.6,
+            candidate_pool: 4,
+        };
+
+        let selected = mmr_rerank(&scores, &refs, 6, &config);
+        for &idx in &selected {
+            assert!(idx < 4, "index {idx} exceeds candidate_pool=4");
+        }
+    }
+
+    // ─── bd-2gcl tests end ───
 }

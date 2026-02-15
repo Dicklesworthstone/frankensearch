@@ -360,7 +360,14 @@ impl VectorIndex {
         if self.record_count() > 0 {
             #[allow(clippy::cast_precision_loss)]
             let ratio = self.wal_entries.len() as f64 / self.record_count() as f64;
-            if ratio >= self.wal_config.compaction_ratio {
+            // NaN compaction_ratio makes >= always false, silently disabling
+            // ratio-based compaction. Fall back to the default.
+            let threshold = if self.wal_config.compaction_ratio.is_finite() {
+                self.wal_config.compaction_ratio
+            } else {
+                0.10
+            };
+            if ratio >= threshold {
                 return true;
             }
         }
@@ -3022,4 +3029,207 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    // ─── bd-1fh4 tests begin ──────────────────────────────────────────
+
+    #[test]
+    fn vacuum_stats_debug_clone_partial_eq() {
+        let stats = VacuumStats {
+            records_before: 10,
+            records_after: 8,
+            tombstones_removed: 2,
+            bytes_reclaimed: 1024,
+            duration: Duration::from_millis(5),
+        };
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("VacuumStats"));
+        assert!(debug.contains("records_before: 10"));
+
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn quantization_debug_clone_copy_eq() {
+        let f16 = Quantization::F16;
+        let f32q = Quantization::F32;
+
+        let debug_f16 = format!("{f16:?}");
+        assert!(debug_f16.contains("F16"));
+        let debug_f32 = format!("{f32q:?}");
+        assert!(debug_f32.contains("F32"));
+
+        let f16_copy = f16;
+        assert_eq!(f16, f16_copy);
+        let f32_copy = f32q;
+        assert_eq!(f32q, f32_copy);
+        assert_ne!(f16, f32q);
+    }
+
+    #[test]
+    fn vector_index_debug_includes_path() {
+        let path = temp_index_path("debug-fmt");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let debug = format!("{index:?}");
+        assert!(debug.contains("VectorIndex"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn set_wal_config_overrides_defaults() {
+        let path = temp_index_path("wal-cfg-override");
+        let dim = 4;
+        let mut writer = VectorIndex::create(&path, "test", dim).unwrap();
+        for i in 0..100 {
+            writer
+                .write_record(&format!("d{i}"), &sample_vector(0.1, dim))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        // With 100 main records and default config, 1 WAL entry should not trigger.
+        index.append("wal-1", &sample_vector(0.5, dim)).unwrap();
+        assert!(!index.needs_compaction());
+
+        // Set a low threshold to trigger compaction.
+        index.set_wal_config(WalConfig {
+            compaction_threshold: 1,
+            compaction_ratio: 0.001,
+            fsync_on_write: false,
+        });
+        assert!(index.needs_compaction());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn find_index_by_doc_hash_empty_index_none() {
+        let path = temp_index_path("hash-empty");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert!(index.find_index_by_doc_hash(0xDEAD_BEEF).is_none());
+        assert!(index.find_index_by_doc_hash(0).is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn get_embeddings_mixed_hit_miss() {
+        let path = temp_index_path("emb-mixed");
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", 3, Quantization::F16).unwrap();
+        writer.write_record("alpha", &[1.0, 0.0, 0.0]).unwrap();
+        writer.write_record("beta", &[0.0, 1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let alpha_hash = fnv1a_hash(b"alpha");
+        let beta_hash = fnv1a_hash(b"beta");
+        let missing_hash = fnv1a_hash(b"gamma");
+
+        let results = index.get_embeddings(&[alpha_hash, missing_hash, beta_hash]);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some(), "alpha should be found");
+        assert!(results[1].is_none(), "gamma should be missing");
+        assert!(results[2].is_some(), "beta should be found");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_batch_empty_is_noop() {
+        let path = temp_index_path("append-empty-batch");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        index.append_batch(&[]).unwrap();
+        assert_eq!(index.wal_record_count(), 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_nan_embedding_rejected() {
+        let path = temp_index_path("append-nan");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        let result = index.append("doc", &[1.0, f32::NAN, 0.0, 0.0]);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("finite"), "expected finite error, got: {err}");
+    }
+
+    #[test]
+    fn append_inf_embedding_rejected() {
+        let path = temp_index_path("append-inf");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        let result = index.append("doc", &[1.0, 0.0, f32::INFINITY, 0.0]);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("finite"), "expected finite error, got: {err}");
+    }
+
+    #[test]
+    fn soft_delete_already_deleted_returns_false() {
+        let path = temp_index_path("double-delete");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.write_record("doc", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        assert!(index.soft_delete("doc").unwrap(), "first delete");
+        assert!(!index.soft_delete("doc").unwrap(), "second delete");
+        assert!(!index.soft_delete("doc").unwrap(), "third delete");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn compact_preserves_wal_config() {
+        let path = temp_index_path("compact-cfg");
+        let dim = 4;
+        let mut writer = VectorIndex::create(&path, "test", dim).unwrap();
+        for i in 0..20 {
+            writer
+                .write_record(&format!("d{i}"), &sample_vector(0.1, dim))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        let custom = WalConfig {
+            compaction_threshold: 99,
+            compaction_ratio: 0.90,
+            fsync_on_write: false,
+        };
+        index.set_wal_config(custom);
+        index.append("wal-1", &sample_vector(0.5, dim)).unwrap();
+        index.compact().unwrap();
+
+        // After compaction, the custom config should be preserved.
+        assert_eq!(index.wal_record_count(), 0);
+        // Verify config persists: threshold=99 and ratio=0.90,
+        // with 21 main records, 1 WAL entry → ratio ~0.048 < 0.90.
+        index.append("wal-2", &sample_vector(0.3, dim)).unwrap();
+        assert!(!index.needs_compaction());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    // ─── bd-1fh4 tests end ────────────────────────────────────────────
 }

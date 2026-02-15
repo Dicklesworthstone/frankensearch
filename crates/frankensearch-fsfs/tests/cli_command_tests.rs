@@ -15,6 +15,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use frankensearch_fsfs::output_schema::SearchHitPayload;
+use frankensearch_fsfs::stream_protocol::{
+    StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson,
+    decode_stream_frame_toon,
+};
 use serde_json::Value;
 
 // ─── Test Infrastructure ────────────────────────────────────────────────────
@@ -268,6 +273,94 @@ fn index_empty_corpus_succeeds() {
     assert!(
         output.status.success() || output.status.code().is_some(),
         "empty corpus must not crash the process"
+    );
+}
+
+#[test]
+fn index_exclude_pattern_skips_matching_paths() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let corpus = temp.path().join("corpus");
+    let index_dir = temp.path().join("index");
+    let keep_dir = corpus.join("src");
+    let skip_dir = corpus.join("vendor");
+    fs::create_dir_all(&keep_dir).expect("create keep dir");
+    fs::create_dir_all(&skip_dir).expect("create skip dir");
+
+    fs::write(
+        keep_dir.join("keep.md"),
+        "keep_token_alpha retained in searchable corpus",
+    )
+    .expect("write keep fixture");
+    fs::write(
+        skip_dir.join("skip.md"),
+        "skip_token_omega should be excluded from indexing",
+    )
+    .expect("write skip fixture");
+
+    let ctx = TestContext::new(temp.path());
+    let index_output = ctx.run(
+        temp.path(),
+        &[
+            "index",
+            &corpus.display().to_string(),
+            "--index-dir",
+            &index_dir.display().to_string(),
+            "--exclude",
+            "vendor/**",
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("index with exclude", &index_output);
+
+    let keep_output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "keep_token_alpha",
+            "--index-dir",
+            &index_dir.display().to_string(),
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("search keep token", &keep_output);
+    let keep_json = parse_json("search keep token", &keep_output);
+    let keep_hits = keep_json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert!(
+        keep_hits > 0,
+        "included fixture should remain searchable after exclude pattern"
+    );
+
+    let skip_output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "skip_token_omega",
+            "--index-dir",
+            &index_dir.display().to_string(),
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("search excluded token", &skip_output);
+    let skip_json = parse_json("search excluded token", &skip_output);
+    let vendor_paths_present = skip_json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit.get("path").and_then(Value::as_str))
+        .any(|path| path.contains("vendor"));
+    assert!(
+        !vendor_paths_present,
+        "excluded vendor paths should not appear in search results"
     );
 }
 
@@ -541,6 +634,62 @@ fn search_limit_zero_returns_no_hits() {
     }
 }
 
+#[test]
+fn search_limit_three_caps_hit_count() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let corpus = temp.path().join("corpus");
+    let index_dir = temp.path().join("index");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    for idx in 0..6 {
+        fs::write(
+            corpus.join(format!("doc-{idx}.md")),
+            format!("limit_token_shared content block {idx}"),
+        )
+        .expect("write limit fixture");
+    }
+
+    let ctx = TestContext::new(temp.path());
+    let index_output = ctx.run(
+        temp.path(),
+        &[
+            "index",
+            &corpus.display().to_string(),
+            "--index-dir",
+            &index_dir.display().to_string(),
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("index limit fixture", &index_output);
+
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "limit_token_shared",
+            "--index-dir",
+            &index_dir.display().to_string(),
+            "--no-watch-mode",
+            "--limit",
+            "3",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("search limit 3", &output);
+    let json = parse_json("search limit 3", &output);
+    let hits = json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert!(hits <= 3, "limit=3 must cap hit count (got {hits})");
+    assert!(
+        hits > 0,
+        "limit fixture query should return at least one hit"
+    );
+}
+
 // ─── Search --stream Command ────────────────────────────────────────────────
 
 #[test]
@@ -577,6 +726,94 @@ fn search_stream_emits_ndjson_lines() {
         line_count >= 1,
         "stream output must emit at least one NDJSON line"
     );
+}
+
+#[test]
+fn search_stream_ndjson_starts_and_ends_with_terminal_frame() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--stream",
+            "--format",
+            "jsonl",
+        ],
+    );
+    assert_success("search stream frame order", &output);
+
+    let text = stdout_str(&output);
+    let mut frames = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame =
+            decode_stream_frame_ndjson::<SearchHitPayload>(trimmed).expect("decode stream frame");
+        frames.push(frame);
+    }
+    assert!(!frames.is_empty(), "stream should emit at least one frame");
+    assert_eq!(frames[0].event.kind(), StreamEventKind::Started);
+    assert_eq!(
+        frames
+            .last()
+            .expect("stream should contain terminal frame")
+            .event
+            .kind(),
+        StreamEventKind::Terminal
+    );
+}
+
+#[test]
+fn search_stream_toon_emits_record_separated_frames() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--stream",
+            "--format",
+            "toon",
+        ],
+    );
+    assert_success("search stream toon", &output);
+
+    let bytes = &output.stdout;
+    assert_eq!(
+        bytes.first().copied(),
+        Some(TOON_STREAM_RECORD_SEPARATOR_BYTE),
+        "toon stream should prefix each frame with record separator"
+    );
+
+    let records = bytes
+        .split(|byte| *byte == TOON_STREAM_RECORD_SEPARATOR_BYTE)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !records.is_empty(),
+        "toon stream should emit at least one framed record"
+    );
+
+    let mut kinds = Vec::new();
+    for record in records {
+        let payload = std::str::from_utf8(record)
+            .expect("utf8 stream record")
+            .trim_end_matches('\n');
+        let frame: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_toon(payload).expect("decode toon stream frame");
+        kinds.push(frame.event.kind());
+    }
+    assert_eq!(kinds.first().copied(), Some(StreamEventKind::Started));
+    assert_eq!(kinds.last().copied(), Some(StreamEventKind::Terminal));
 }
 
 #[test]
@@ -679,20 +916,20 @@ fn explain_table_renders_human_readable_breakdown() {
     assert_success("explain table: prereq search", &search_output);
 
     let search_json = parse_json("explain table: prereq search", &search_output);
-    let hit_path = search_json
-        .pointer("/data/hits/0/path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let hit_count = search_json
+        .pointer("/data/hits")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     assert!(
-        !hit_path.is_empty(),
-        "expected at least one hit path for explain table test"
+        hit_count > 0,
+        "expected at least one hit for explain table test"
     );
 
     let explain_output = ctx.run(
         temp.path(),
         &[
             "explain",
-            hit_path,
+            "R0",
             "--index-dir",
             &index_arg,
             "--no-watch-mode",
@@ -710,6 +947,52 @@ fn explain_table_renders_human_readable_breakdown() {
     assert!(
         text.contains("RRF:"),
         "table explain output should include RRF breakdown:\n{text}"
+    );
+}
+
+#[test]
+fn explain_invalid_result_id_reports_available_ids() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let search_output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "2",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("explain invalid id: prereq search", &search_output);
+
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "explain",
+            "R999",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "explain with unknown result id should fail"
+    );
+    let combined = format!("{}\n{}", stdout_str(&output), stderr_str(&output));
+    assert!(
+        combined.contains("unknown result id"),
+        "error should mention unknown result id: {combined}"
+    );
+    assert!(
+        combined.contains("available ids"),
+        "error should list available result ids: {combined}"
     );
 }
 

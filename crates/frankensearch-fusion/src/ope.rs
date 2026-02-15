@@ -42,6 +42,10 @@
 
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_CLIPPING_THRESHOLD: f64 = 100.0;
+const DEFAULT_MIN_EFFECTIVE_SAMPLE_SIZE: f64 = 10.0;
+const LOGGING_PROPENSITY_FLOOR: f64 = 1e-10;
+
 /// A single logged observation from the search pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggedObservation {
@@ -140,20 +144,12 @@ pub fn ips_estimate(
     }
 
     // Compute clipped importance weights.
-    // NaN/non-positive clipping_threshold → fall back to default 100.0.
-    let clip = if config.clipping_threshold.is_finite() && config.clipping_threshold > 0.0 {
-        config.clipping_threshold
-    } else {
-        100.0
-    };
+    // NaN/non-positive clipping_threshold → fall back to default.
+    let clip = sanitize_clipping_threshold(config.clipping_threshold);
     let weights: Vec<f64> = observations
         .iter()
         .zip(target_propensities.iter())
-        .map(|(obs, &target_p)| {
-            let logging_p = obs.logging_propensity.max(1e-10); // avoid division by zero
-            let w = target_p / logging_p;
-            w.clamp(0.0, clip)
-        })
+        .map(|(obs, &target_p)| clipped_importance_weight(obs.logging_propensity, target_p, clip))
         .collect();
 
     // IPS estimate.
@@ -162,7 +158,7 @@ pub fn ips_estimate(
     let weighted_sum: f64 = observations
         .iter()
         .zip(weights.iter())
-        .map(|(obs, &w)| obs.reward * w)
+        .map(|(obs, &w)| finite_or_zero(obs.reward) * w)
         .sum();
     let estimated_reward = weighted_sum / n_f;
 
@@ -181,7 +177,7 @@ pub fn ips_estimate(
         .iter()
         .zip(weights.iter())
         .map(|(obs, &w)| {
-            let diff = obs.reward.mul_add(w, -mean);
+            let diff = finite_or_zero(obs.reward).mul_add(w, -mean);
             diff * diff
         })
         .sum::<f64>()
@@ -189,7 +185,7 @@ pub fn ips_estimate(
     let std_err = (variance / n_f).sqrt();
     let ci_95 = 1.96 * std_err;
 
-    let reliable = ess >= config.min_effective_sample_size;
+    let reliable = ess >= sanitize_min_effective_sample_size(config.min_effective_sample_size);
 
     OpeResult {
         estimated_reward,
@@ -240,19 +236,11 @@ pub fn dr_estimate(
     }
 
     // Compute clipped importance weights.
-    let clip = if config.clipping_threshold.is_finite() && config.clipping_threshold > 0.0 {
-        config.clipping_threshold
-    } else {
-        100.0
-    };
+    let clip = sanitize_clipping_threshold(config.clipping_threshold);
     let weights: Vec<f64> = observations
         .iter()
         .zip(target_propensities.iter())
-        .map(|(obs, &target_p)| {
-            let logging_p = obs.logging_propensity.max(1e-10);
-            let w = target_p / logging_p;
-            w.clamp(0.0, clip)
-        })
+        .map(|(obs, &target_p)| clipped_importance_weight(obs.logging_propensity, target_p, clip))
         .collect();
 
     // DR estimate.
@@ -264,7 +252,9 @@ pub fn dr_estimate(
         .zip(reward_predictions.iter())
         .map(|((obs, &w), &pred)| {
             // control variate: reward_model + importance_weighted_residual
-            w.mul_add(obs.reward - pred, pred)
+            let reward = finite_or_zero(obs.reward);
+            let prediction = finite_or_zero(pred);
+            w.mul_add(reward - prediction, prediction)
         })
         .sum();
     let estimated_reward = dr_sum / n_f;
@@ -285,7 +275,9 @@ pub fn dr_estimate(
         .zip(weights.iter())
         .zip(reward_predictions.iter())
         .map(|((obs, &w), &pred)| {
-            let term = w.mul_add(obs.reward - pred, pred);
+            let reward = finite_or_zero(obs.reward);
+            let prediction = finite_or_zero(pred);
+            let term = w.mul_add(reward - prediction, prediction);
             let diff = term - mean;
             diff * diff
         })
@@ -294,7 +286,7 @@ pub fn dr_estimate(
     let std_err = (variance / n_f).sqrt();
     let ci_95 = 1.96 * std_err;
 
-    let reliable = ess >= config.min_effective_sample_size;
+    let reliable = ess >= sanitize_min_effective_sample_size(config.min_effective_sample_size);
 
     OpeResult {
         estimated_reward,
@@ -319,6 +311,46 @@ pub fn effective_sample_size(weights: &[f64]) -> f64 {
     } else {
         0.0
     }
+}
+
+fn sanitize_clipping_threshold(threshold: f64) -> f64 {
+    if threshold.is_finite() && threshold > 0.0 {
+        threshold
+    } else {
+        DEFAULT_CLIPPING_THRESHOLD
+    }
+}
+
+fn sanitize_min_effective_sample_size(min_ess: f64) -> f64 {
+    if min_ess.is_finite() && min_ess >= 0.0 {
+        min_ess
+    } else {
+        DEFAULT_MIN_EFFECTIVE_SAMPLE_SIZE
+    }
+}
+
+fn clipped_importance_weight(logging_propensity: f64, target_propensity: f64, clip: f64) -> f64 {
+    let logging_p =
+        if logging_propensity.is_finite() && logging_propensity > LOGGING_PROPENSITY_FLOOR {
+            logging_propensity
+        } else {
+            LOGGING_PROPENSITY_FLOOR
+        };
+    let target_p = if target_propensity.is_finite() && target_propensity > 0.0 {
+        target_propensity
+    } else {
+        0.0
+    };
+    let weight = target_p / logging_p;
+    if weight.is_finite() && weight > 0.0 {
+        weight.min(clip)
+    } else {
+        0.0
+    }
+}
+
+const fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -801,6 +833,49 @@ mod tests {
             (result.estimated_reward - 10.0).abs() < 1e-10,
             "weight at threshold should not be reduced"
         );
+    }
+
+    #[test]
+    fn ips_non_finite_inputs_are_safely_ignored() {
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: f64::NAN,
+            logging_propensity: f64::INFINITY,
+        }];
+        let target_p = vec![f64::NAN];
+        let config = OpeConfig {
+            clipping_threshold: f64::NAN,
+            min_effective_sample_size: f64::NAN,
+        };
+
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!(result.estimated_reward.is_finite());
+        assert!(result.confidence_interval_95.is_finite());
+        assert!(result.estimated_reward.abs() < f64::EPSILON);
+        assert!(result.effective_sample_size.abs() < f64::EPSILON);
+        assert!(!result.reliable);
+    }
+
+    #[test]
+    fn dr_non_finite_inputs_are_safely_ignored() {
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: f64::INFINITY,
+            logging_propensity: f64::NAN,
+        }];
+        let target_p = vec![f64::INFINITY];
+        let predictions = vec![f64::NAN];
+        let config = OpeConfig::default();
+
+        let result = dr_estimate(&obs, &target_p, &predictions, &config);
+        assert!(result.estimated_reward.is_finite());
+        assert!(result.confidence_interval_95.is_finite());
+        assert!(result.estimated_reward.abs() < f64::EPSILON);
+        assert!(result.effective_sample_size.abs() < f64::EPSILON);
     }
 
     // ─── bd-zm66 tests end ───

@@ -414,9 +414,10 @@ impl RefreshWorker {
                 for job in jobs {
                     self.queue.requeue(job.clone());
                 }
-                self.metrics
-                    .docs_failed
-                    .fetch_add(jobs.len() as u64, Ordering::Relaxed);
+                self.metrics.docs_failed.fetch_add(
+                    u64::try_from(jobs.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 return Vec::new();
             }
         };
@@ -470,9 +471,10 @@ impl RefreshWorker {
             });
         }
 
-        self.metrics
-            .docs_embedded
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        self.metrics.docs_embedded.fetch_add(
+            u64::try_from(records.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         self.queue
             .metrics()
             .total_embed_time_us
@@ -1193,4 +1195,148 @@ mod tests {
     }
 
     // ─── bd-qkop tests end ───
+
+    // ─── bd-wt20 tests begin ──────────────────────────────────────────
+
+    #[test]
+    fn refresh_metrics_debug_format() {
+        let m = RefreshMetrics::default();
+        m.cycles.fetch_add(7, Ordering::Relaxed);
+        m.docs_embedded.fetch_add(42, Ordering::Relaxed);
+        let debug = format!("{m:?}");
+        assert!(debug.contains("RefreshMetrics"));
+        assert!(debug.contains("cycles"));
+        assert!(debug.contains("docs_embedded"));
+    }
+
+    #[test]
+    fn config_index_dir_from_new() {
+        let config = RefreshWorkerConfig::new("/data/my-index");
+        assert_eq!(config.index_dir, PathBuf::from("/data/my-index"));
+    }
+
+    #[test]
+    fn config_index_config_override() {
+        let custom = TwoTierConfig {
+            rrf_k: 42.0,
+            ..TwoTierConfig::default()
+        };
+        let config = RefreshWorkerConfig::new("/tmp/idx").with_index_config(custom);
+        assert!((config.index_config.rrf_k - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_concurrent_increments() {
+        let m = Arc::new(RefreshMetrics::default());
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let metrics = m.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        metrics.docs_embedded.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(m.docs_embedded.load(Ordering::Relaxed), 400);
+    }
+
+    #[test]
+    fn incremental_rebuild_updates_existing_doc() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("update-doc");
+            let queue = make_queue(100);
+            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+
+            // Cycle 1: index doc-1 with first text.
+            submit(&queue, "doc-1", "First version of the document");
+            worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(cache.current().doc_count(), 1);
+
+            // Cycle 2: submit doc-1 again with different text (hash changed).
+            // Force a new submission by changing text.
+            queue
+                .submit(EmbeddingRequest {
+                    doc_id: "doc-1".to_owned(),
+                    text: "Second version completely different".to_owned(),
+                    metadata: None,
+                    submitted_at: Instant::now(),
+                })
+                .unwrap();
+            worker.run_cycle(&cx).await.unwrap();
+
+            // Should still have exactly 1 doc (updated, not duplicated).
+            let current = cache.current();
+            assert_eq!(current.doc_count(), 1);
+            let doc_ids = current.doc_ids();
+            assert_eq!(doc_ids.len(), 1);
+            assert_eq!(doc_ids[0], "doc-1");
+        });
+    }
+
+    #[test]
+    fn rebuild_preserves_quality_tier_from_prior_cycle() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("quality-preserve");
+            let queue = make_queue(100);
+
+            // First cycle with quality embedder.
+            let cache = make_cache(&dir, 256);
+            let config =
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
+            let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let quality = Arc::new(StubEmbedder::new("stub-quality", 384));
+            let worker_with_quality =
+                RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone())
+                    .with_quality_embedder(quality);
+
+            submit(&queue, "doc-1", "Test document");
+            worker_with_quality.run_cycle(&cx).await.unwrap();
+            assert!(cache.current().has_quality_index());
+
+            // Second cycle without quality embedder (fast-only worker).
+            let config2 =
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
+            let worker_fast_only = RefreshWorker::new(config2, queue.clone(), fast, cache.clone());
+
+            submit(&queue, "doc-2", "Another document");
+            worker_fast_only.run_cycle(&cx).await.unwrap();
+
+            // Should still have both docs.
+            let current = cache.current();
+            assert_eq!(current.doc_count(), 2);
+        });
+    }
+
+    #[test]
+    fn run_cycle_metrics_timing_nonzero() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("timing");
+            let queue = make_queue(100);
+            submit(&queue, "doc-1", "Timing test");
+
+            let (worker, _cache) = make_worker(queue, &dir, 256);
+            worker.run_cycle(&cx).await.unwrap();
+
+            let snap = worker.metrics().snapshot();
+            // Embed and rebuild should take some nonzero time.
+            assert!(snap.embed_time_us > 0 || snap.rebuild_time_us > 0);
+        });
+    }
+
+    #[test]
+    fn worker_new_without_quality_debug() {
+        let dir = temp_index_dir("no-quality");
+        let queue = make_queue(10);
+        let (worker, _cache) = make_worker(queue, &dir, 256);
+        // Debug uses `finish_non_exhaustive` and includes fast embedder id.
+        let debug = format!("{worker:?}");
+        assert!(debug.contains("RefreshWorker"));
+        assert!(debug.contains("stub-fast"));
+    }
+
+    // ─── bd-wt20 tests end ────────────────────────────────────────────
 }

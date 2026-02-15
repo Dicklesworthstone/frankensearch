@@ -996,5 +996,62 @@ mod tests {
         assert!(dbg.contains("Initial"));
     }
 
+    #[test]
+    fn vector_hit_nan_sorts_below_real() {
+        let real = VectorHit {
+            index: 0,
+            score: -100.0, // very low but real
+            doc_id: "real".into(),
+        };
+        let nan = VectorHit {
+            index: 1,
+            score: f32::NAN,
+            doc_id: "nan".into(),
+        };
+        // NaN maps to NEG_INFINITY, so even -100.0 beats it
+        assert_eq!(real.cmp_by_score(&nan), std::cmp::Ordering::Less);
+        assert_eq!(nan.cmp_by_score(&real), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn vector_hit_negative_scores_descending() {
+        let a = VectorHit {
+            index: 0,
+            score: -0.1,
+            doc_id: "a".into(),
+        };
+        let b = VectorHit {
+            index: 1,
+            score: -0.9,
+            doc_id: "b".into(),
+        };
+        // -0.1 > -0.9, so a comes first (Less in descending order)
+        assert_eq!(a.cmp_by_score(&b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn fused_hit_in_both_sources_tiebreak() {
+        let both = FusedHit {
+            doc_id: "z".into(), // worse doc_id
+            rrf_score: 0.02,
+            lexical_rank: Some(3),
+            semantic_rank: Some(5),
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: true,
+        };
+        let single = FusedHit {
+            doc_id: "a".into(), // better doc_id
+            rrf_score: 0.02,
+            lexical_rank: Some(1),
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        // Same RRF -> in_both_sources=true wins (level 2)
+        assert_eq!(both.cmp_for_ranking(&single), std::cmp::Ordering::Less);
+    }
+
     // ─── bd-ta55 tests end ───
 }

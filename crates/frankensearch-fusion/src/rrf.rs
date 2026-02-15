@@ -830,4 +830,132 @@ mod tests {
             "RRF_PERF_COMPARE optimized_ms={optimized_ms:.3} reference_ms={reference_ms:.3} speedup={speedup:.3} doc_count={doc_count} iterations={iterations}"
         );
     }
+
+    // ─── bd-1o9x tests begin ───
+
+    #[test]
+    fn rrf_config_debug_format() {
+        let config = RrfConfig { k: 42.0 };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("42"));
+        assert!(debug.contains("RrfConfig"));
+    }
+
+    #[test]
+    fn rrf_config_default_k_exact() {
+        let config = RrfConfig::default();
+        assert!((config.k - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rank_contribution_monotonically_decreasing() {
+        let k = 60.0;
+        let mut prev = rank_contribution(k, 0);
+        for r in 1..100 {
+            let current = rank_contribution(k, r);
+            assert!(current < prev, "rank_contribution not decreasing: rank {r}");
+            prev = current;
+        }
+    }
+
+    #[test]
+    fn large_overlapping_docs_stress() {
+        let config = RrfConfig::default();
+        let count = 500;
+        let lexical: Vec<ScoredResult> = (0_u16..count)
+            .map(|i| lexical_hit(&format!("doc-{i}"), 1000.0 - f32::from(i)))
+            .collect();
+        let semantic: Vec<VectorHit> = (0_u16..count)
+            .map(|i| semantic_hit(&format!("doc-{i}"), 1.0 - f32::from(i) / 1000.0))
+            .collect();
+
+        let results = rrf_fuse(&lexical, &semantic, 10, 0, &config);
+        assert_eq!(results.len(), 10);
+        // All should be in both sources
+        assert!(results.iter().all(|r| r.in_both_sources));
+        // Output should be descending by RRF score
+        for w in results.windows(2) {
+            assert!(w[0].rrf_score >= w[1].rrf_score);
+        }
+    }
+
+    #[test]
+    fn duplicate_doc_id_same_source_uses_last_rank() {
+        let config = RrfConfig::default();
+        // Same doc_id appearing twice in lexical results
+        let lexical = vec![
+            lexical_hit("dup", 10.0), // rank 0
+            lexical_hit("other", 8.0),
+            lexical_hit("dup", 5.0), // rank 2 (duplicate)
+        ];
+
+        let results = rrf_fuse(&lexical, &[], 10, 0, &config);
+
+        let dup_hit = results.iter().find(|r| r.doc_id == "dup").unwrap();
+        // HashMap entry: first insertion at rank 0 gives 1/61,
+        // second occurrence at rank 2 adds 1/63 via and_modify
+        let expected = rank_contribution(60.0, 0) + rank_contribution(60.0, 2);
+        assert!(
+            (dup_hit.rrf_score - expected).abs() < 1e-12,
+            "expected {expected}, got {}",
+            dup_hit.rrf_score
+        );
+    }
+
+    #[test]
+    fn candidate_count_multiplier_one() {
+        assert_eq!(candidate_count(10, 5, 1), 15);
+        assert_eq!(candidate_count(0, 10, 1), 10);
+    }
+
+    #[test]
+    fn doc_id_tiebreak_alphabetical() {
+        let config = RrfConfig::default();
+        // Two docs with identical structure but different doc_ids
+        // Same source and rank → same RRF score
+        let semantic = vec![semantic_hit("zebra", 0.9), semantic_hit("alpha", 0.8)];
+        let results = rrf_fuse(&[], &semantic, 10, 0, &config);
+
+        // "zebra" has higher RRF (rank 0), "alpha" lower (rank 1)
+        assert_eq!(results[0].doc_id, "zebra");
+        assert_eq!(results[1].doc_id, "alpha");
+    }
+
+    #[test]
+    fn rank_contribution_very_large_rank() {
+        let score = rank_contribution(60.0, 1_000_000);
+        assert!(score > 0.0);
+        assert!(score.is_finite());
+        assert!(score < 1e-5);
+    }
+
+    #[test]
+    fn multi_source_different_ranks_preserved() {
+        let config = RrfConfig::default();
+        let lexical = vec![
+            lexical_hit("a", 10.0),
+            lexical_hit("shared", 8.0), // rank 1
+        ];
+        let semantic = vec![
+            semantic_hit("shared", 0.9), // rank 0
+            semantic_hit("b", 0.8),
+        ];
+
+        let results = rrf_fuse(&lexical, &semantic, 10, 0, &config);
+        let shared = results.iter().find(|r| r.doc_id == "shared").unwrap();
+        assert_eq!(shared.lexical_rank, Some(1));
+        assert_eq!(shared.semantic_rank, Some(0));
+        assert!(shared.in_both_sources);
+    }
+
+    #[test]
+    fn zero_window_returns_empty() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("a", 10.0)];
+        // limit=0, offset=0 → window=0
+        let results = rrf_fuse(&lexical, &[], 0, 0, &config);
+        assert!(results.is_empty());
+    }
+
+    // ─── bd-1o9x tests end ───
 }

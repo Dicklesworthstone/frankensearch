@@ -220,7 +220,7 @@ pub trait Embedder: Send + Sync {
 #[must_use]
 pub fn l2_normalize(vec: &[f32]) -> Vec<f32> {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
-    if norm_sq < f32::EPSILON {
+    if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
         return vec![0.0; vec.len()];
     }
     let inv_norm = 1.0 / norm_sq.sqrt();
@@ -236,14 +236,18 @@ pub fn l2_normalize(vec: &[f32]) -> Vec<f32> {
 /// Panics in debug mode if the vectors have different lengths.
 #[must_use]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vectors must have same dimension");
+    // Runtime length check — debug_assert is stripped in release builds,
+    // and zip would silently truncate mismatched vectors.
+    if a.len() != b.len() {
+        return 0.0;
+    }
 
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
 
     let denom = norm_a * norm_b;
-    if denom < f32::EPSILON {
+    if !denom.is_finite() || denom < f32::EPSILON {
         return 0.0;
     }
     dot / denom
@@ -638,5 +642,12 @@ mod tests {
     fn truncate_embedding_noop_when_larger() {
         let v = vec![1.0, 2.0];
         assert_eq!(truncate_embedding(&v, 10), v);
+    }
+
+    #[test]
+    fn model_category_default_semantic_flag() {
+        assert!(!ModelCategory::HashEmbedder.default_semantic_flag());
+        assert!(ModelCategory::StaticEmbedder.default_semantic_flag());
+        assert!(ModelCategory::TransformerEmbedder.default_semantic_flag());
     }
 }

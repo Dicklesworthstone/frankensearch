@@ -1196,4 +1196,128 @@ mod tests {
             assert_eq!(choice, back);
         }
     }
+
+    // ─── bd-3048 tests begin ──────────────────────────────────────────
+
+    #[test]
+    fn corpus_slice_full_matches_any_doc_id() {
+        assert!(CorpusSlice::Full.matches_doc_id("test-rust-001"));
+        assert!(CorpusSlice::Full.matches_doc_id("test-ml-999"));
+        assert!(CorpusSlice::Full.matches_doc_id("completely-random-id"));
+        assert!(CorpusSlice::Full.matches_doc_id(""));
+    }
+
+    #[test]
+    fn corpus_slice_full_id_prefixes_empty() {
+        assert!(CorpusSlice::Full.id_prefixes().is_empty());
+    }
+
+    #[test]
+    fn corpus_slice_no_cross_match() {
+        assert!(!CorpusSlice::Rust.matches_doc_id("test-ml-001"));
+        assert!(!CorpusSlice::Ml.matches_doc_id("test-cooking-001"));
+        assert!(!CorpusSlice::Cooking.matches_doc_id("test-sysadmin-001"));
+        assert!(!CorpusSlice::Sysadmin.matches_doc_id("test-rust-001"));
+        assert!(!CorpusSlice::Mixed.matches_doc_id("test-code-001"));
+    }
+
+    #[test]
+    fn risk_level_ordering() {
+        assert!(RiskLevel::Low < RiskLevel::Medium);
+        assert!(RiskLevel::Medium < RiskLevel::High);
+        assert!(RiskLevel::Low < RiskLevel::High);
+    }
+
+    #[test]
+    fn calibrator_choice_hash_in_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(CalibratorChoice::Identity);
+        set.insert(CalibratorChoice::Temperature);
+        set.insert(CalibratorChoice::Platt);
+        set.insert(CalibratorChoice::Isotonic);
+        assert_eq!(set.len(), 4);
+        // Inserting duplicate should not increase size.
+        set.insert(CalibratorChoice::Platt);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn query_slice_default_values() {
+        let qs = QuerySlice::default();
+        assert_eq!(qs.classes.len(), 3);
+        assert!(!qs.include_negated);
+        assert_eq!(qs.min_per_class, 2);
+    }
+
+    #[test]
+    fn feature_toggles_active_count_circuit_breaker_off() {
+        let toggles = FeatureToggles {
+            circuit_breaker: false,
+            ..FeatureToggles::default()
+        };
+        // circuit_breaker defaults to true, so turning it off is 1 non-default.
+        assert_eq!(toggles.active_count(), 1);
+    }
+
+    #[test]
+    fn feature_toggles_active_count_all_toggled() {
+        let toggles = FeatureToggles {
+            explain: true,
+            mmr: true,
+            negation_queries: true,
+            prf: true,
+            adaptive_fusion: true,
+            calibration: CalibratorChoice::Platt,
+            conformal: true,
+            circuit_breaker: true, // default, so not counted
+            feedback: true,
+        };
+        // 8 non-default: explain, mmr, negation, prf, adaptive, calibration, conformal, feedback
+        assert_eq!(toggles.active_count(), 8);
+    }
+
+    #[test]
+    fn lanes_at_risk_low_returns_all() {
+        let all = lanes_at_risk(RiskLevel::Low);
+        assert_eq!(all.len(), lane_catalog().len());
+    }
+
+    #[test]
+    fn lanes_at_risk_medium_excludes_low() {
+        let medium_plus = lanes_at_risk(RiskLevel::Medium);
+        for lane in &medium_plus {
+            assert!(
+                lane.risk >= RiskLevel::Medium,
+                "lane {} has risk {:?} but should be >= Medium",
+                lane.id,
+                lane.risk
+            );
+        }
+        assert!(medium_plus.len() < lane_catalog().len());
+    }
+
+    #[test]
+    fn expected_phase_serde_roundtrip() {
+        for phase in [
+            ExpectedPhase::InitialOnly,
+            ExpectedPhase::InitialThenRefined,
+            ExpectedPhase::InitialThenMaybeRefined,
+        ] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let back: ExpectedPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(phase, back);
+        }
+    }
+
+    #[test]
+    fn risk_level_serde_roundtrip() {
+        for risk in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+            let json = serde_json::to_string(&risk).unwrap();
+            let back: RiskLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(risk, back);
+        }
+    }
+
+    // ─── bd-3048 tests end ────────────────────────────────────────────
 }

@@ -393,4 +393,122 @@ mod tests {
         assert!(result.contains("code line 1"));
         assert!(result.contains("code line 2"));
     }
+
+    // ─── bd-1p4b tests begin ───
+
+    #[test]
+    fn default_config_exact_values() {
+        let canon = DefaultCanonicalizer::default();
+        assert_eq!(canon.max_length, 2000);
+        assert_eq!(canon.code_head_lines, 20);
+        assert_eq!(canon.code_tail_lines, 10);
+    }
+
+    #[test]
+    fn multiple_code_blocks_independently_collapsed() {
+        let mut input = String::from("intro\n```\n");
+        for i in 0..5 {
+            let _ = writeln!(input, "block1 line {i}");
+        }
+        input.push_str("```\nmiddle text\n```\n");
+        for i in 0..5 {
+            let _ = writeln!(input, "block2 line {i}");
+        }
+        input.push_str("```\nend");
+
+        let canon = DefaultCanonicalizer::default();
+        let result = canon.canonicalize(&input);
+        assert!(result.contains("block1 line 0"));
+        assert!(result.contains("block2 line 0"));
+        assert!(result.contains("middle text"));
+    }
+
+    #[test]
+    fn nested_markdown_bold_inside_link() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "See [**important** docs](https://example.com) here";
+        let result = canon.canonicalize(input);
+        // Link text is collected raw (bold markers preserved inside links)
+        assert!(result.contains("important"));
+        assert!(result.contains("docs"));
+        assert!(!result.contains("https://"));
+    }
+
+    #[test]
+    fn all_heading_levels_stripped() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6";
+        let result = canon.canonicalize(input);
+        assert!(result.contains("H1"));
+        assert!(result.contains("H6"));
+        assert!(!result.starts_with('#'));
+        // No heading markers should remain at line starts
+        for line in result.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                assert!(!trimmed.starts_with("# "));
+            }
+        }
+    }
+
+    #[test]
+    fn language_tagged_code_block() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "text\n```rust\nfn main() {}\n```\nmore";
+        let result = canon.canonicalize(input);
+        assert!(result.contains("fn main()"));
+        assert!(result.contains("more"));
+    }
+
+    #[test]
+    fn http_url_lines_filtered() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "text\nhttp://example.com\nhttps://other.com\nmore text";
+        let result = canon.canonicalize(input);
+        assert!(result.contains("text"));
+        assert!(result.contains("more text"));
+        assert!(!result.contains("http://example.com"));
+        assert!(!result.contains("https://other.com"));
+    }
+
+    #[test]
+    fn blank_lines_preserved_for_paragraph_structure() {
+        let canon = DefaultCanonicalizer::default();
+        let input = "paragraph one\n\nparagraph two";
+        let result = canon.canonicalize(input);
+        assert!(result.contains("paragraph one\n\nparagraph two"));
+    }
+
+    #[test]
+    fn query_truncation_respects_max_length() {
+        let canon = DefaultCanonicalizer {
+            max_length: 10,
+            ..Default::default()
+        };
+        let result = canon.canonicalize_query("a very long query that should be truncated");
+        assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn canonicalizer_trait_is_object_safe() {
+        let canon: Box<dyn Canonicalizer> = Box::new(DefaultCanonicalizer::default());
+        let result = canon.canonicalize("## Hello **world**");
+        assert!(result.contains("Hello"));
+        assert!(result.contains("world"));
+        assert!(!result.contains("##"));
+    }
+
+    #[test]
+    fn large_document_pipeline_completes() {
+        let canon = DefaultCanonicalizer::default();
+        let mut input = String::new();
+        for i in 0..500 {
+            let _ = writeln!(input, "Line {i} with some content for testing");
+        }
+        let result = canon.canonicalize(&input);
+        assert!(result.len() <= canon.max_length);
+        assert!(!result.is_empty());
+    }
+
+    // ─── bd-1p4b tests end ───
 }

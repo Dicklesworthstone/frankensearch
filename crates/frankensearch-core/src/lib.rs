@@ -122,6 +122,7 @@ pub use repair::{
 };
 pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, TimeTravelResult};
 
+pub use asupersync::Cx;
 pub use query_class::QueryClass;
 pub use traits::{
     Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,

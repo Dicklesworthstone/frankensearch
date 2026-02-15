@@ -138,7 +138,9 @@ impl HashEmbedder {
 
         for token in tokens {
             let hash = fnv1a_hash(token.as_bytes());
-            let mut state = seed ^ hash;
+            // xorshift64 has a fixed point at zero — if seed ^ hash == 0,
+            // the state stays zero forever, making all signs +1.0.
+            let mut state = (seed ^ hash) | 1;
 
             for dim in &mut embedding {
                 // Advance xorshift64 state for each dimension
@@ -435,6 +437,21 @@ mod tests {
     }
 
     // ── JL Orthogonality ───────────────────────────────────────────────
+
+    #[test]
+    fn case_sensitivity_produces_different_embeddings() {
+        let embedder = HashEmbedder::default_384();
+        let lower = embedder.embed_sync("hello world");
+        let upper = embedder.embed_sync("Hello World");
+        // Case matters: different tokens → different hash values → different embeddings
+        assert_ne!(lower, upper);
+
+        // Also verify with JL projection variant
+        let jl = HashEmbedder::jl_384(42);
+        let jl_lower = jl.embed_sync("hello world");
+        let jl_upper = jl.embed_sync("Hello World");
+        assert_ne!(jl_lower, jl_upper);
+    }
 
     #[test]
     fn jl_random_pairs_approximately_orthogonal() {

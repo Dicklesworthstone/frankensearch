@@ -1549,4 +1549,123 @@ mod tests {
         assert_eq!(hits[0].doc_id, "doc-a");
         assert_eq!(hits[1].doc_id, "doc-b");
     }
+
+    // ─── bd-2k3d tests begin ──────────────────────────────────────────
+
+    #[test]
+    fn search_params_debug_clone_copy() {
+        let params = SearchParams {
+            parallel_threshold: 100,
+            parallel_chunk_size: 32,
+            parallel_enabled: true,
+        };
+        let debug = format!("{params:?}");
+        assert!(debug.contains("SearchParams"));
+        assert!(debug.contains("100"));
+
+        let copied: SearchParams = params;
+        assert_eq!(copied.parallel_threshold, 100);
+        assert_eq!(copied.parallel_chunk_size, 32);
+
+        let cloned = params;
+        assert!(cloned.parallel_enabled);
+    }
+
+    #[test]
+    fn compare_best_first_higher_score_wins() {
+        let a = HeapEntry::new(0, 0.9);
+        let b = HeapEntry::new(1, 0.5);
+        assert_eq!(compare_best_first(&a, &b), Ordering::Less);
+        assert_eq!(compare_best_first(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_best_first_equal_scores_tiebreak_by_index() {
+        let a = HeapEntry::new(2, 0.7);
+        let b = HeapEntry::new(5, 0.7);
+        assert_eq!(compare_best_first(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn candidate_is_better_with_nan() {
+        let good = HeapEntry::new(0, 0.5);
+        let nan_entry = HeapEntry::new(1, f32::NAN);
+        assert!(candidate_is_better(good, nan_entry));
+        assert!(!candidate_is_better(nan_entry, good));
+    }
+
+    #[test]
+    fn candidate_is_better_equal_scores_lower_index_wins() {
+        let a = HeapEntry::new(3, 0.8);
+        let b = HeapEntry::new(7, 0.8);
+        assert!(candidate_is_better(a, b));
+        assert!(!candidate_is_better(b, a));
+    }
+
+    #[test]
+    fn score_key_maps_nan_to_neg_infinity() {
+        assert_eq!(score_key(f32::NAN).to_bits(), f32::NEG_INFINITY.to_bits());
+        assert!((score_key(0.5) - 0.5).abs() < f32::EPSILON);
+        assert!((score_key(-0.3) - (-0.3)).abs() < f32::EPSILON);
+        assert!((score_key(0.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn merge_partial_heaps_empty_list() {
+        let merged = merge_partial_heaps(vec![], 10);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_partial_heaps_single_heap() {
+        let mut h = BinaryHeap::new();
+        h.push(HeapEntry::new(0, 0.9));
+        h.push(HeapEntry::new(1, 0.5));
+        let merged = merge_partial_heaps(vec![h], 10);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn search_f32_quantization_index() {
+        let path = temp_index_path("f32-quant-search");
+        let dim = 4;
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", dim, Quantization::F32).unwrap();
+        writer.write_record("doc-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.write_record("doc-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        writer.write_record("doc-c", &[0.5, 0.5, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.quantization(), Quantization::F32);
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let hits = index.search_top_k(&query, 2, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "doc-a");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn search_f32_with_filter() {
+        let path = temp_index_path("f32-filter");
+        let dim = 4;
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", dim, Quantization::F32).unwrap();
+        writer.write_record("doc-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.write_record("doc-b", &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let filter = PredicateFilter::new("only-b", |doc_id: &str| doc_id == "doc-b");
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let hits = index.search_top_k(&query, 10, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-b");
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── bd-2k3d tests end ────────────────────────────────────────────
 }
