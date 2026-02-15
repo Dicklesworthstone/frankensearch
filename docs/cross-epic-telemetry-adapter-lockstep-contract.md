@@ -218,6 +218,78 @@ Before default rollout, document:
 | `mcp_agent_mail_rust` (`/dp/mcp_agent_mail_rust`) | Preserve thread/message retrieval telemetry correctness for agent workflows. | Contract sanity + adapter conformance + deterministic replay validation. |
 | `frankenterm` (`/dp/frankenterm`) | Preserve interactive session telemetry and degradation transitions. | Contract sanity + adapter conformance + interactive canary verification. |
 
+### Host-specific adapter playbooks (bd-2yu.5.9)
+
+Use these deterministic commands when collecting host evidence bundles. Run from `/data/projects/frankensearch`.
+
+| Host | Dry-run smoke (fast contract path) | Live lane (full evidence path) | Host repo migration stage |
+|---|---|---|---|
+| `cass` | `scripts/e2e/telemetry_adapter_cass.sh --mode all --dry-run` | `scripts/e2e/telemetry_adapter_cass.sh --mode all --execution live` | `/data/projects/coding_agent_session_search` via `e2e.cass_host_repo_migration_check` |
+| `xf` | `scripts/e2e/telemetry_adapter_xf.sh --mode all --dry-run` | `scripts/e2e/telemetry_adapter_xf.sh --mode all --execution live` | `/data/projects/xf` via `e2e.xf_host_repo_migration_check` |
+| `mcp_agent_mail_rust` | `scripts/e2e/telemetry_adapter_agent_mail.sh --mode all --dry-run` | `scripts/e2e/telemetry_adapter_agent_mail.sh --mode all --execution live` | `/data/projects/mcp_agent_mail_rust` via `e2e.mcp_agent_mail_host_repo_migration_check` |
+
+For all live lanes:
+
+- all cargo-heavy stages are offloaded with `rch exec -- ...` by script contract,
+- verify `manifest.json`, `summary.json`, `summary.md`, `structured_events.jsonl`, `replay_command.txt`, and `terminal_transcript.txt` are present in `test_logs/telemetry_adapters/<run-id>/`,
+- archive the run directory as the acceptance artifact bundle.
+
+### Interrupted-run verification matrix (required for finalization contract confidence)
+
+Use these commands to verify deterministic interruption behavior. Each lane intentionally receives `TERM` during a live unit stage and should exit with code `143`.
+
+| Host | Interruption command |
+|---|---|
+| `cass` | `scripts/e2e/telemetry_adapter_cass.sh --mode unit --execution live > /tmp/telemetry_interrupt_cass.out 2>&1 & pid=$!; sleep 2; kill -TERM "$pid"; wait "$pid" || true` |
+| `xf` | `scripts/e2e/telemetry_adapter_xf.sh --mode unit --execution live > /tmp/telemetry_interrupt_xf.out 2>&1 & pid=$!; sleep 2; kill -TERM "$pid"; wait "$pid" || true` |
+| `mcp_agent_mail_rust` | `scripts/e2e/telemetry_adapter_agent_mail.sh --mode unit --execution live > /tmp/telemetry_interrupt_agent_mail.out 2>&1 & pid=$!; sleep 2; kill -TERM "$pid"; wait "$pid" || true` |
+
+Expected artifact invariants for each interrupted run directory:
+
+- `summary.json` and `manifest.json` both report:
+  - `status=fail`
+  - `reason_code=telemetry_adapter.session.interrupted`
+  - non-empty `active_stage`
+  - `stage_started_count == stage_completed_count + 1`
+- `structured_events.jsonl` includes both:
+  - `stage=session.interrupted` with `reason_code=telemetry_adapter.session.interrupted`
+  - `stage=session.finalize` with `status=fail` and matching reason code
+- `summary.json` and `manifest.json` agree on `status`, `reason_code`, `active_stage`, and stage counts.
+
+Quick machine checks (replace `<run-dir>` with the emitted directory):
+
+```bash
+jq -e '.status=="fail" and .reason_code=="telemetry_adapter.session.interrupted" and (.active_stage|length>0) and (.stage_started_count == (.stage_completed_count + 1))' <run-dir>/summary.json
+jq -e '.status=="fail" and .reason_code=="telemetry_adapter.session.interrupted" and (.active_stage|length>0) and (.stage_started_count == (.stage_completed_count + 1))' <run-dir>/manifest.json
+jq -e -s '.[0].status==.[1].status and .[0].reason_code==.[1].reason_code and .[0].active_stage==.[1].active_stage and .[0].stage_started_count==.[1].stage_started_count and .[0].stage_completed_count==.[1].stage_completed_count' <run-dir>/summary.json <run-dir>/manifest.json
+```
+
+### Host attribution checks (required before rollout)
+
+Each host lane must preserve the identity contract:
+
+- `adapter_id`
+- `adapter_version`
+- `host_project`
+- `telemetry_schema_version`
+- `redaction_policy_version`
+
+Deterministic unit checks per host (all already wired in script unit lanes):
+
+- `cass`: `host_adapter::tests::hint_resolves_cass_aliases`, `host_adapter::tests::hint_resolves_cass_adapter_style_names`
+- `xf`: `host_adapter::tests::hint_resolves_xf`, `host_adapter::tests::hint_resolves_xf_adapter_style_names`
+- `mcp_agent_mail_rust`: `host_adapter::tests::hint_resolves_mcp_agent_mail_aliases`, `host_adapter::tests::hint_resolves_mcp_agent_mail_adapter_style_names`, `host_adapter::tests::hint_resolves_mcp_agent_mail_when_phrase_is_embedded`
+
+### Reason-code troubleshooting matrix
+
+| Reason code | Meaning | Immediate replay action | Typical remediation |
+|---|---|---|---|
+| `telemetry_adapter.lane.passed` | Lane completed successfully | Re-run `replay_command.txt` only if artifact integrity is in doubt | None |
+| `telemetry_adapter.stage.skipped_dry_run` | Dry-run stage intentionally skipped command execution | Re-run same command with `--execution live` for real compile/test evidence | Use live lane for performance/latency evidence |
+| `telemetry_adapter.stage.failed` | A lane stage command failed | Open `terminal_transcript.txt`, identify failing stage id, re-run from `replay_command.txt` | Fix command/environment issue, then re-run lane |
+| `telemetry_adapter.session.interrupted` | Process received `INT`/`TERM`/`HUP` mid-stage | Re-run with `timeout -s TERM ...` only for interruption repro; otherwise run lane cleanly | Stabilize runner/worker availability; ensure no manual interruption |
+| `telemetry_adapter.session.failed` | Session-level failure without a more specific reason | Re-run full lane from `replay_command.txt` and inspect `structured_events.jsonl` ordering | Add missing stage context or promote specific failure reason in script logic |
+
 ### Future host template
 
 For any new host:

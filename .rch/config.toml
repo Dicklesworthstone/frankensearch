@@ -8,11 +8,12 @@
 # synced to the worker filesystem. Workers only sync the project directory
 # but Cargo.toml references paths outside it.
 #
-# WORKAROUND: Before offloading builds, agents should run:
-#   scripts/rch-ensure-deps.sh
-# on the worker (via rch exec) to clone sibling deps. Or use the compound
-# command pattern:
-#   rch exec -- bash -c 'cd /path/to/frankensearch && scripts/rch-ensure-deps.sh && cargo check --workspace'
+# WORKAROUND: Before offloading builds, bootstrap workers once:
+#   scripts/rch-ensure-deps.sh --all-workers
+# Verify worker readiness:
+#   scripts/rch-ensure-deps.sh --all-workers --check
+# This clones pinned sibling deps into:
+#   /tmp/rch/frankensearch/{asupersync,frankensqlite,fast_cmaes}
 #
 # FUTURE FIX: When rch adds transfer.extra_sync_dirs support, uncomment:
 # [transfer]

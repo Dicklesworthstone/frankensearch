@@ -632,14 +632,20 @@ rch workers only sync the project directory — sibling path dependencies (`asup
 # Check if deps are available (exit 1 if missing)
 scripts/rch-ensure-deps.sh --check
 
-# Auto-fix: clone missing deps and rewrite paths
+# Auto-fix local sibling deps
 scripts/rch-ensure-deps.sh
 
 # Force refresh to pinned commits
 scripts/rch-ensure-deps.sh --force
+
+# Bootstrap deps on every configured rch worker
+scripts/rch-ensure-deps.sh --all-workers
+
+# Verify worker bootstrap (exit 1 if any worker is missing deps)
+scripts/rch-ensure-deps.sh --all-workers --check
 ```
 
-On the dev machine this is a no-op (deps are at `/data/projects/`). On workers, it clones the deps as siblings and rewrites absolute paths in Cargo.toml files. The pinned commit refs match `.github/workflows/ci.yml`.
+On the dev machine this is usually a no-op (deps are already at `/data/projects/`). In worker mode (`--all-workers` or `--worker`), it SSHes to workers and clones pinned sibling deps into `/tmp/rch/frankensearch/{asupersync,frankensqlite,fast_cmaes}` so path dependencies resolve during `rch exec -- cargo ...`. The pinned commit refs match `.github/workflows/ci.yml`.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
