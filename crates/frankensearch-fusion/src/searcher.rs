@@ -1953,9 +1953,15 @@ mod tests {
 
             let mut phase_count = 0;
             let err = searcher
-                .search(&cx, "test", 5, |_| None, |_| {
-                    phase_count += 1;
-                })
+                .search(
+                    &cx,
+                    "test",
+                    5,
+                    |_| None,
+                    |_| {
+                        phase_count += 1;
+                    },
+                )
                 .await
                 .expect_err("semantic-only fast embed failure should return an error");
 

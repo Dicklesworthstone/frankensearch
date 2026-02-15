@@ -376,30 +376,7 @@ impl VectorIndex {
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             if is_wal_index(winner.index) {
-                // WAL entry — resolve doc_id from in-memory WAL state.
-                let wal_idx = from_wal_index(winner.index);
-                let entry = self.wal_entries.get(wal_idx).ok_or_else(|| {
-                    SearchError::IndexCorrupted {
-                        path: PathBuf::new(),
-                        detail: format!(
-                            "WAL index {} out of bounds (wal_entries.len() = {})",
-                            wal_idx,
-                            self.wal_entries.len()
-                        ),
-                    }
-                })?;
-                let virtual_index = self.record_count().saturating_add(wal_idx);
-                let index_u32 =
-                    u32::try_from(virtual_index).map_err(|_| SearchError::InvalidConfig {
-                        field: "index".to_owned(),
-                        value: virtual_index.to_string(),
-                        reason: "WAL entry index exceeds u32 range".to_owned(),
-                    })?;
-                hits.push(VectorHit {
-                    index: index_u32,
-                    score: winner.score,
-                    doc_id: entry.doc_id.clone(),
-                });
+                hits.push(self.resolve_wal_hit(&winner)?);
             } else {
                 // Main index entry.
                 if self.is_deleted(winner.index) {
@@ -421,6 +398,47 @@ impl VectorIndex {
         }
 
         Ok(hits)
+    }
+
+    fn resolve_wal_hit(&self, winner: &HeapEntry) -> SearchResult<VectorHit> {
+        if !is_wal_index(winner.index) {
+            return Err(SearchError::InvalidConfig {
+                field: "index".to_owned(),
+                value: winner.index.to_string(),
+                reason: "winner index is not WAL-encoded".to_owned(),
+            });
+        }
+
+        let wal_idx = from_wal_index(winner.index);
+        let entry = self
+            .wal_entries
+            .get(wal_idx)
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: PathBuf::new(),
+                detail: format!(
+                    "WAL index {} out of bounds (wal_entries.len() = {})",
+                    wal_idx,
+                    self.wal_entries.len()
+                ),
+            })?;
+        let virtual_index =
+            self.record_count()
+                .checked_add(wal_idx)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "index".to_owned(),
+                    value: wal_idx.to_string(),
+                    reason: "WAL virtual index overflow".to_owned(),
+                })?;
+        let index_u32 = u32::try_from(virtual_index).map_err(|_| SearchError::InvalidConfig {
+            field: "index".to_owned(),
+            value: virtual_index.to_string(),
+            reason: "WAL entry index exceeds u32 range".to_owned(),
+        })?;
+        Ok(VectorHit {
+            index: index_u32,
+            score: winner.score,
+            doc_id: entry.doc_id.clone(),
+        })
     }
 
     fn score_f16(&self, index: usize, query: &[f32], scratch: &mut [f16]) -> SearchResult<f32> {
@@ -1316,6 +1334,19 @@ mod tests {
         );
         assert!(hits[0].score >= hits[1].score);
         assert!(hits[1].score >= hits[2].score);
+    }
+
+    #[test]
+    fn wal_index_marker_out_of_bounds_returns_error() {
+        let path = temp_index_path("wal-oob-index-marker");
+        write_index(&path, &[("main-a", vec![1.0, 0.0, 0.0, 0.0])]).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let fabricated = HeapEntry::new(to_wal_index(42), 1.0);
+        let err = index
+            .resolve_wal_hit(&fabricated)
+            .expect_err("fabricated WAL marker should fail bounds check");
+        assert!(matches!(err, SearchError::IndexCorrupted { .. }));
     }
 
     #[test]

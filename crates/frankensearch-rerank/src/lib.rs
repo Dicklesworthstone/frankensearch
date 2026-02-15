@@ -327,17 +327,28 @@ impl Reranker for FlashRankReranker {
                 });
             }
 
-            // Build RerankScore results with original rank tracking
-            let mut results: Vec<RerankScore> = documents
-                .iter()
-                .enumerate()
-                .zip(all_scores)
-                .map(|((rank, doc), score)| RerankScore {
+            // Build RerankScore results with original rank tracking.
+            // Use index lookup (not zip) so score/doc cardinality mismatches
+            // can never be silently truncated if this block is modified later.
+            let mut results = Vec::with_capacity(documents.len());
+            for (rank, doc) in documents.iter().enumerate() {
+                let Some(&score) = all_scores.get(rank) else {
+                    return Err(SearchError::RerankFailed {
+                        model: self.name.clone(),
+                        source: format!(
+                            "missing score at rank {rank} ({} scores for {} documents)",
+                            all_scores.len(),
+                            documents.len()
+                        )
+                        .into(),
+                    });
+                };
+                results.push(RerankScore {
                     doc_id: doc.doc_id.clone(),
                     score,
                     original_rank: rank,
-                })
-                .collect();
+                });
+            }
 
             // Sort by descending cross-encoder score (NaN-safe)
             results.sort_by(|a, b| {
