@@ -13,6 +13,8 @@
 //! 5. **Status reporting** — Machine-readable status for CLI `fsfs status` command.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -953,52 +955,85 @@ impl PidFile {
         runtime_dir.join("fsfs.pid")
     }
 
+    /// Maximum retries when racing against stale PID file cleanup.
+    const ACQUIRE_MAX_RETRIES: usize = 2;
+
     /// Attempt to acquire the PID file. Returns `Ok(())` if acquired,
     /// `Err` if another live process holds it.
+    ///
+    /// Uses `O_CREAT|O_EXCL` (via [`OpenOptions::create_new`]) to atomically
+    /// create the PID file, eliminating the TOCTOU race between checking for
+    /// an existing daemon and writing our own PID.
     ///
     /// # Errors
     ///
     /// Returns error if PID file is held by a live process or I/O fails.
     pub fn acquire(&mut self, version: &str) -> std::io::Result<()> {
-        // Check for existing PID file.
-        if let Ok(contents) = read_pid_file(&self.path) {
-            if contents.is_alive() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "fsfs daemon already running (PID {}, started at {})",
-                        contents.pid, contents.started_at_ms
-                    ),
-                ));
-            }
-            // Stale PID file — remove it.
-            warn!(
-                target: "frankensearch.fsfs.lifecycle",
-                pid = contents.pid,
-                "Removing stale PID file (process is dead)"
-            );
-            let _ = std::fs::remove_file(&self.path);
-        }
-
         // Ensure parent directory exists.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Write our PID file.
         let contents = PidFileContents::current(version);
         let json = serde_json::to_string_pretty(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&self.path, json.as_bytes())?;
 
-        self.acquired = true;
-        info!(
-            target: "frankensearch.fsfs.lifecycle",
-            pid = contents.pid,
-            path = %self.path.display(),
-            "PID file acquired"
-        );
-        Ok(())
+        for _ in 0..=Self::ACQUIRE_MAX_RETRIES {
+            // Attempt atomic exclusive creation — only one process can succeed.
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+            {
+                Ok(mut file) => {
+                    file.write_all(json.as_bytes())?;
+                    self.acquired = true;
+                    info!(
+                        target: "frankensearch.fsfs.lifecycle",
+                        pid = contents.pid,
+                        path = %self.path.display(),
+                        "PID file acquired"
+                    );
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // PID file exists — check if the holder is still alive.
+                    match read_pid_file(&self.path) {
+                        Ok(existing) if existing.is_alive() => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse,
+                                format!(
+                                    "fsfs daemon already running (PID {}, started at {})",
+                                    existing.pid, existing.started_at_ms
+                                ),
+                            ));
+                        }
+                        Ok(existing) => {
+                            // Stale PID file — remove and retry.
+                            warn!(
+                                target: "frankensearch.fsfs.lifecycle",
+                                pid = existing.pid,
+                                "Removing stale PID file (process is dead)"
+                            );
+                            let _ = std::fs::remove_file(&self.path);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Removed between our create_new and read. Retry.
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "PID file acquisition failed after {} retries (contention)",
+                Self::ACQUIRE_MAX_RETRIES + 1
+            ),
+        ))
     }
 
     /// Release the PID file (remove it). No-op if not acquired.

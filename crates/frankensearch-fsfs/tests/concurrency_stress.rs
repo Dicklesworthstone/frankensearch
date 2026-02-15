@@ -22,6 +22,7 @@ use frankensearch_fsfs::concurrency::{
     WorkloadBudgetScheduler, WorkloadClass, WorkloadDemand, pipeline_access_matrix, read_sentinel,
     remove_sentinel, try_acquire_sentinel, write_sentinel,
 };
+use frankensearch_fsfs::lifecycle::PidFile;
 
 // ─── Test artifact types ─────────────────────────────────────────────────
 
@@ -532,6 +533,134 @@ fn sentinel_stale_recovery() {
     assert_eq!(recovered.holder, "new_holder");
 
     remove_sentinel(&sentinel_path).expect("cleanup");
+}
+
+#[test]
+fn sentinel_atomic_acquire_has_single_winner_under_race() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let sentinel_path = tmp.path().join("racy.lock");
+    let stale_threshold = Duration::from_mins(5);
+    let thread_count = 32;
+    let start = Arc::new(Barrier::new(thread_count));
+
+    let handles: Vec<_> = (0..thread_count)
+        .map(|i| {
+            let path = sentinel_path.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                let holder = format!("holder_{i}");
+                let attempt =
+                    try_acquire_sentinel(&path, "racy_resource", &holder, stale_threshold);
+                // Contenders can briefly observe a partially-written sentinel JSON
+                // from the winner. Retry once so the race test validates lock
+                // semantics rather than parser timing.
+                let resolved = match attempt {
+                    Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        try_acquire_sentinel(&path, "racy_resource", &holder, stale_threshold)
+                    }
+                    other => other,
+                };
+
+                resolved
+                    .map(|sentinel| sentinel.holder)
+                    .map_err(|err| err.kind())
+            })
+        })
+        .collect();
+
+    let mut winners = Vec::new();
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.join().expect("thread should not panic") {
+            Ok(holder) => winners.push(holder),
+            Err(kind) => errors.push(kind),
+        }
+    }
+
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one contender must create the sentinel"
+    );
+    assert_eq!(
+        errors.len(),
+        thread_count - 1,
+        "all other contenders must fail acquisition"
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|kind| *kind == std::io::ErrorKind::WouldBlock),
+        "all losing contenders should see WouldBlock"
+    );
+
+    if sentinel_path.exists() {
+        remove_sentinel(&sentinel_path).expect("cleanup");
+    }
+}
+
+#[test]
+fn pid_file_atomic_acquire_has_single_winner_under_race() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let pid_path = tmp.path().join("fsfs.pid");
+    let thread_count = 24;
+    let start = Arc::new(Barrier::new(thread_count));
+    let attempts_done = Arc::new(Barrier::new(thread_count + 1));
+    let release = Arc::new(Barrier::new(thread_count + 1));
+
+    let handles: Vec<_> = (0..thread_count)
+        .map(|_| {
+            let path = pid_path.clone();
+            let start = Arc::clone(&start);
+            let attempts_done = Arc::clone(&attempts_done);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                start.wait();
+                let mut pid_file = PidFile::new(path);
+                let first = pid_file.acquire("test-version");
+                let result = match first {
+                    Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        pid_file.acquire("test-version")
+                    }
+                    other => other,
+                };
+                attempts_done.wait();
+                release.wait();
+                result.map_err(|err| err.kind())
+            })
+        })
+        .collect();
+
+    attempts_done.wait();
+    release.wait();
+
+    let mut winners = 0;
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.join().expect("thread should not panic") {
+            Ok(()) => winners += 1,
+            Err(kind) => errors.push(kind),
+        }
+    }
+
+    assert_eq!(
+        winners, 1,
+        "exactly one contender must atomically create the PID file"
+    );
+    assert_eq!(
+        errors.len(),
+        thread_count - 1,
+        "all other contenders should fail while lock holder is alive"
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|kind| *kind == std::io::ErrorKind::AddrInUse),
+        "all losing contenders should see AddrInUse"
+    );
 }
 
 // ─── Workload scheduler concurrent permit lifecycle ───────────────────

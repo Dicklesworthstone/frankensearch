@@ -32,6 +32,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -433,7 +435,7 @@ impl LockSentinel {
     }
 }
 
-/// Write a lock sentinel file to the given path.
+/// Write a lock sentinel file to the given path (unconditional overwrite).
 ///
 /// # Errors
 ///
@@ -442,6 +444,18 @@ pub fn write_sentinel(path: &Path, sentinel: &LockSentinel) -> std::io::Result<(
     let json = serde_json::to_string_pretty(sentinel)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json.as_bytes())
+}
+
+/// Atomically create a sentinel file using `O_CREAT|O_EXCL`.
+///
+/// Returns `Ok(())` if the file was created, `Err(AlreadyExists)` if another
+/// process won the race.
+fn write_sentinel_exclusive(path: &Path, sentinel: &LockSentinel) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(sentinel)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(json.as_bytes())?;
+    Ok(())
 }
 
 /// Read and parse a lock sentinel file.
@@ -468,8 +482,17 @@ pub fn remove_sentinel(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Maximum retries when racing against stale sentinel cleanup. Two is enough:
+/// one for the initial stale removal, one in case a concurrent process also
+/// removed the stale file and won the `create_new` race.
+const SENTINEL_ACQUIRE_MAX_RETRIES: usize = 2;
+
 /// Attempt to acquire a sentinel-based lock. If a stale sentinel exists (dead
 /// PID or exceeds timeout), it is cleaned up and the lock is granted.
+///
+/// Uses `O_CREAT|O_EXCL` (via [`OpenOptions::create_new`]) to atomically
+/// create the sentinel file, eliminating the TOCTOU race between checking
+/// for an existing lock and writing a new one.
 ///
 /// Returns `Ok(LockSentinel)` on success, `Err` if the resource is already
 /// legitimately locked by another process.
@@ -483,47 +506,66 @@ pub fn try_acquire_sentinel(
     holder: &str,
     stale_threshold: Duration,
 ) -> std::io::Result<LockSentinel> {
-    // Check for existing sentinel.
-    match read_sentinel(path) {
-        Ok(existing) => {
-            if !existing.is_holder_alive() {
-                warn!(
-                    pid = existing.pid,
-                    resource = existing.resource,
-                    "Recovering stale lock sentinel (holder PID is dead)"
+    let sentinel = LockSentinel::current(resource, holder);
+
+    for _ in 0..=SENTINEL_ACQUIRE_MAX_RETRIES {
+        // Attempt atomic exclusive creation — only one process can succeed.
+        match write_sentinel_exclusive(path, &sentinel) {
+            Ok(()) => {
+                debug!(
+                    pid = sentinel.pid,
+                    resource, holder, "Lock sentinel acquired"
                 );
-                remove_sentinel(path)?;
-            } else if existing.is_stale(stale_threshold) {
-                warn!(
-                    pid = existing.pid,
-                    age_ms = existing.created_at_ms,
-                    resource = existing.resource,
-                    "Recovering stale lock sentinel (exceeded timeout)"
-                );
-                remove_sentinel(path)?;
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    format!(
-                        "Resource '{}' is locked by PID {} ({})",
-                        existing.resource, existing.pid, existing.holder
-                    ),
-                ));
+                return Ok(sentinel);
             }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // File exists — check if the holder is alive and not stale.
+                match read_sentinel(path) {
+                    Ok(existing) if !existing.is_holder_alive() => {
+                        warn!(
+                            pid = existing.pid,
+                            resource = existing.resource,
+                            "Recovering stale lock sentinel (holder PID is dead)"
+                        );
+                        remove_sentinel(path)?;
+                    }
+                    Ok(existing) if existing.is_stale(stale_threshold) => {
+                        warn!(
+                            pid = existing.pid,
+                            age_ms = existing.created_at_ms,
+                            resource = existing.resource,
+                            "Recovering stale lock sentinel (exceeded timeout)"
+                        );
+                        remove_sentinel(path)?;
+                    }
+                    Ok(existing) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "Resource '{}' is locked by PID {} ({})",
+                                existing.resource, existing.pid, existing.holder
+                            ),
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Sentinel was removed between our create_new and read
+                        // (another process cleaned it up). Retry creation.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // No sentinel — proceed.
-        }
-        Err(e) => return Err(e),
     }
 
-    let sentinel = LockSentinel::current(resource, holder);
-    write_sentinel(path, &sentinel)?;
-    debug!(
-        pid = sentinel.pid,
-        resource, holder, "Lock sentinel acquired"
-    );
-    Ok(sentinel)
+    // Exhausted retries — another process is actively contending.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "Resource '{resource}' acquisition failed after {} retries (contention)",
+            SENTINEL_ACQUIRE_MAX_RETRIES + 1
+        ),
+    ))
 }
 
 // ─── Pipeline Access Model ──────────────────────────────────────────────────
