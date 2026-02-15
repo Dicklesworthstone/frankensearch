@@ -49,6 +49,11 @@ a.out
 
 # Codex build artifacts
 target_codex/
+target_*/
+target-codex*/
+
+# Compiler crash reports
+rustc-ice-*.txt
 
 # Agent coordination config
 .agent-mail.yaml
