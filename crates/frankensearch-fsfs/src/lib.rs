@@ -24,6 +24,7 @@ pub mod pressure;
 pub mod pressure_sensing;
 pub mod profiling;
 pub mod query_execution;
+pub mod query_latency_optimization;
 pub mod query_planning;
 pub mod ranking_priors;
 pub mod redaction;

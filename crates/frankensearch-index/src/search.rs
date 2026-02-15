@@ -156,43 +156,21 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
         chunk_size: usize,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        let partial_heaps: SearchResult<Vec<BinaryHeap<HeapEntry>>> = if filter.is_some() {
-            // Pre-filter indices on the main thread (doc_id resolution is cheap),
-            // then scatter the surviving indices across Rayon tasks.
-            let filtered_indices = self.collect_filtered_indices(filter)?;
-            if filtered_indices.is_empty() {
-                return Ok(BinaryHeap::new());
-            }
-            filtered_indices
-                .par_chunks(chunk_size)
-                .map(|chunk| self.scan_indices_chunk(chunk, query, limit))
-                .collect()
-        } else {
-            let chunk_count = self.record_count().div_ceil(chunk_size);
-            (0..chunk_count)
-                .into_par_iter()
-                .map(|chunk_index| {
-                    let start = chunk_index * chunk_size;
-                    let end = (start + chunk_size).min(self.record_count());
+        let chunk_count = self.record_count().div_ceil(chunk_size);
+        let partial_heaps: SearchResult<Vec<BinaryHeap<HeapEntry>>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_index| {
+                let start = chunk_index * chunk_size;
+                let end = (start + chunk_size).min(self.record_count());
+                if let Some(active_filter) = filter {
+                    self.scan_range_chunk_filtered(start, end, query, limit, active_filter)
+                } else {
                     self.scan_range_chunk(start, end, query, limit)
-                })
-                .collect()
-        };
+                }
+            })
+            .collect();
 
         Ok(merge_partial_heaps(partial_heaps?, limit))
-    }
-
-    fn collect_filtered_indices(
-        &self,
-        filter: Option<&dyn SearchFilter>,
-    ) -> SearchResult<Vec<usize>> {
-        let mut indices = Vec::new();
-        for index in 0..self.record_count() {
-            if self.passes_search_filter(filter, index)? {
-                indices.push(index);
-            }
-        }
-        Ok(indices)
     }
 
     fn scan_range_chunk(
@@ -228,18 +206,20 @@ impl VectorIndex {
         Ok(heap)
     }
 
-    fn scan_indices_chunk(
+    fn scan_range_chunk_filtered(
         &self,
-        indices: &[usize],
+        start: usize,
+        end: usize,
         query: &[f32],
         limit: usize,
+        filter: &dyn SearchFilter,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         match self.quantization() {
             Quantization::F16 => {
                 let mut scratch = vec![f16::from_f32(0.0); self.dimension()];
-                for &index in indices {
-                    if self.is_deleted(index) {
+                for index in start..end {
+                    if !self.passes_search_filter(Some(filter), index)? {
                         continue;
                     }
                     let score = self.score_f16(index, query, &mut scratch)?;
@@ -248,8 +228,8 @@ impl VectorIndex {
             }
             Quantization::F32 => {
                 let mut scratch = vec![0.0_f32; self.dimension()];
-                for &index in indices {
-                    if self.is_deleted(index) {
+                for index in start..end {
+                    if !self.passes_search_filter(Some(filter), index)? {
                         continue;
                     }
                     let score = self.score_f32(index, query, &mut scratch)?;
@@ -762,6 +742,51 @@ mod tests {
             .expect("sequential search");
         let parallel = index
             .search_top_k_internal(&query, 10, None, 1, 4, true)
+            .expect("parallel search");
+
+        assert_eq!(sequential.len(), parallel.len());
+        for (left, right) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(left.doc_id, right.doc_id);
+            assert!((left.score - right.score).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn parallel_and_sequential_paths_match_with_filter() {
+        let path = temp_index_path("parallel-match-filter");
+        let mut rows = Vec::new();
+        for i in 0..96 {
+            let rank = f32::from(u16::try_from(i).expect("test index must fit in u16"));
+            rows.push((
+                format!("doc-{i:03}"),
+                vec![rank, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ));
+        }
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vec)| (doc_id.as_str(), vec.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let filter = PredicateFilter::new("even-docs", |doc_id| {
+            let suffix = doc_id.strip_prefix("doc-").unwrap_or_default();
+            suffix.parse::<u32>().is_ok_and(|v| v % 2 == 0)
+        });
+
+        let sequential = index
+            .search_top_k_internal(
+                &query,
+                15,
+                Some(&filter),
+                usize::MAX,
+                PARALLEL_CHUNK_SIZE,
+                true,
+            )
+            .expect("sequential search");
+        let parallel = index
+            .search_top_k_internal(&query, 15, Some(&filter), 1, 8, true)
             .expect("parallel search");
 
         assert_eq!(sequential.len(), parallel.len());

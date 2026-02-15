@@ -94,24 +94,21 @@ impl QueryPhase {
     #[must_use]
     pub const fn default_budget_us(self) -> u64 {
         match self {
-            Self::Canonicalize => 200,        // 0.2ms
-            Self::Classify => 100,            // 0.1ms
-            Self::FastEmbed => 800,           // 0.8ms (potion ~0.57ms + overhead)
-            Self::LexicalRetrieve => 5_000,   // 5ms (Tantivy BM25)
-            Self::FastVectorSearch => 5_000,  // 5ms (FSVI sequential/parallel scan)
-            Self::Fuse => 500,                // 0.5ms (RRF HashMap + sort)
-            Self::QualityEmbed => 130_000,    // 130ms (MiniLM-L6-v2)
+            Self::Canonicalize => 200,                               // 0.2ms
+            Self::Classify => 100,                                   // 0.1ms
+            Self::FastEmbed => 800, // 0.8ms (potion ~0.57ms + overhead)
+            Self::LexicalRetrieve | Self::FastVectorSearch => 5_000, // 5ms each
+            Self::Fuse | Self::Blend | Self::Serialize => 500, // 0.5ms each
+            Self::QualityEmbed => 130_000, // 130ms (MiniLM-L6-v2)
             Self::QualityVectorSearch => 2_000, // 2ms
-            Self::Blend => 500,               // 0.5ms
-            Self::Rerank => 25_000,           // 25ms (cross-encoder)
-            Self::Explain => 1_000,           // 1ms
-            Self::Serialize => 500,           // 0.5ms
+            Self::Rerank => 25_000, // 25ms (cross-encoder)
+            Self::Explain => 1_000, // 1ms
         }
     }
 }
 
 /// One phase's timing observation within a query execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseObservation {
     pub phase: QueryPhase,
     /// Wall-clock time in microseconds.
@@ -153,7 +150,7 @@ impl PhaseObservation {
 }
 
 /// Complete latency decomposition for one query execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyDecomposition {
     pub schema_version: String,
     /// Observations for each phase (ordered by execution sequence).
@@ -172,8 +169,16 @@ impl LatencyDecomposition {
     /// Build a decomposition from phase observations.
     #[must_use]
     pub fn new(phases: Vec<PhaseObservation>, result_count: usize, index_size: usize) -> Self {
-        let total_us = phases.iter().filter(|p| !p.skipped).map(|p| p.actual_us).sum();
-        let total_budget_us = phases.iter().filter(|p| !p.skipped).map(|p| p.budget_us).sum();
+        let total_us = phases
+            .iter()
+            .filter(|p| !p.skipped)
+            .map(|p| p.actual_us)
+            .sum();
+        let total_budget_us = phases
+            .iter()
+            .filter(|p| !p.skipped)
+            .map(|p| p.budget_us)
+            .sum();
         Self {
             schema_version: QUERY_LATENCY_OPT_SCHEMA_VERSION.to_owned(),
             phases,
@@ -187,12 +192,9 @@ impl LatencyDecomposition {
     /// Phases that exceeded their budget, sorted by overshoot descending.
     #[must_use]
     pub fn over_budget_phases(&self) -> Vec<&PhaseObservation> {
-        let mut over: Vec<&PhaseObservation> = self
-            .phases
-            .iter()
-            .filter(|p| p.over_budget())
-            .collect();
-        over.sort_by(|a, b| b.overshoot_us().cmp(&a.overshoot_us()));
+        let mut over: Vec<&PhaseObservation> =
+            self.phases.iter().filter(|p| p.over_budget()).collect();
+        over.sort_by_key(|o| std::cmp::Reverse(o.overshoot_us()));
         over
     }
 
@@ -534,7 +536,6 @@ impl VerificationProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiling::OpportunityMatrix;
 
     // --- Phase metadata tests ---
 
@@ -891,7 +892,11 @@ mod tests {
     fn protocol_has_required_corpus_ids() {
         let protocol = VerificationProtocol::default_protocol();
         assert!(protocol.required_corpus_ids.len() >= 3);
-        assert!(protocol.required_corpus_ids.contains(&"golden_100".to_string()));
+        assert!(
+            protocol
+                .required_corpus_ids
+                .contains(&"golden_100".to_string())
+        );
     }
 
     // --- Serde roundtrip tests ---
@@ -925,5 +930,333 @@ mod tests {
             let decoded: QueryPhase = serde_json::from_str(&json).unwrap();
             assert_eq!(*phase, decoded);
         }
+    }
+
+    // --- PhaseObservation edge cases ---
+
+    #[test]
+    fn observation_zero_budget_utilization_is_zero() {
+        let obs = PhaseObservation {
+            phase: QueryPhase::Fuse,
+            actual_us: 500,
+            budget_us: 0,
+            skipped: false,
+        };
+        assert!((obs.utilization() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn observation_skipped_not_over_budget_despite_high_actual() {
+        let obs = PhaseObservation {
+            phase: QueryPhase::QualityEmbed,
+            actual_us: 999_999,
+            budget_us: 100,
+            skipped: true,
+        };
+        assert!(!obs.over_budget());
+        assert_eq!(obs.overshoot_us(), 0);
+        assert!((obs.utilization() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn observation_exact_budget_is_not_over() {
+        let obs = PhaseObservation {
+            phase: QueryPhase::Fuse,
+            actual_us: 500,
+            budget_us: 500,
+            skipped: false,
+        };
+        assert!(!obs.over_budget());
+        assert_eq!(obs.overshoot_us(), 0);
+        assert!((obs.utilization() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn observation_one_over_budget() {
+        let obs = PhaseObservation {
+            phase: QueryPhase::Fuse,
+            actual_us: 501,
+            budget_us: 500,
+            skipped: false,
+        };
+        assert!(obs.over_budget());
+        assert_eq!(obs.overshoot_us(), 1);
+    }
+
+    #[test]
+    fn observation_zero_actual_zero_budget_skipped() {
+        let obs = PhaseObservation {
+            phase: QueryPhase::Rerank,
+            actual_us: 0,
+            budget_us: 0,
+            skipped: true,
+        };
+        assert!(!obs.over_budget());
+        assert_eq!(obs.overshoot_us(), 0);
+        assert!((obs.utilization() - 0.0).abs() < 1e-9);
+    }
+
+    // --- LatencyDecomposition edge cases ---
+
+    #[test]
+    fn empty_decomposition() {
+        let d = LatencyDecomposition::new(vec![], 0, 0);
+        assert_eq!(d.total_us, 0);
+        assert_eq!(d.total_budget_us, 0);
+        assert!(d.over_budget_phases().is_empty());
+        assert_eq!(d.initial_path_us(), 0);
+        assert_eq!(d.refinement_path_us(), 0);
+        assert!(d.met_budget());
+        assert_eq!(d.verdict_reason_code(), "query.latency.on_budget");
+    }
+
+    #[test]
+    fn all_skipped_decomposition() {
+        let d = LatencyDecomposition::new(
+            vec![
+                PhaseObservation {
+                    phase: QueryPhase::Canonicalize,
+                    actual_us: 0,
+                    budget_us: 200,
+                    skipped: true,
+                },
+                PhaseObservation {
+                    phase: QueryPhase::QualityEmbed,
+                    actual_us: 0,
+                    budget_us: 130_000,
+                    skipped: true,
+                },
+            ],
+            0,
+            100,
+        );
+        assert_eq!(d.total_us, 0);
+        assert_eq!(d.total_budget_us, 0);
+        assert!(d.met_budget());
+    }
+
+    #[test]
+    fn multiple_over_budget_verdict() {
+        let d = LatencyDecomposition::new(
+            vec![
+                PhaseObservation {
+                    phase: QueryPhase::FastVectorSearch,
+                    actual_us: 8_000,
+                    budget_us: 5_000,
+                    skipped: false,
+                },
+                PhaseObservation {
+                    phase: QueryPhase::LexicalRetrieve,
+                    actual_us: 7_000,
+                    budget_us: 5_000,
+                    skipped: false,
+                },
+            ],
+            5,
+            100,
+        );
+        assert_eq!(
+            d.verdict_reason_code(),
+            "query.latency.multiple_phases_over_budget"
+        );
+        assert!(!d.met_budget());
+        let over = d.over_budget_phases();
+        assert_eq!(over.len(), 2);
+        // Sorted by overshoot descending: FastVectorSearch (3000) > LexicalRetrieve (2000).
+        assert_eq!(over[0].phase, QueryPhase::FastVectorSearch);
+        assert_eq!(over[1].phase, QueryPhase::LexicalRetrieve);
+    }
+
+    #[test]
+    fn decomposition_schema_version_matches_constant() {
+        let d = LatencyDecomposition::new(vec![], 0, 0);
+        assert_eq!(d.schema_version, QUERY_LATENCY_OPT_SCHEMA_VERSION);
+    }
+
+    // --- Phase path classification edge cases ---
+
+    #[test]
+    fn explain_and_serialize_are_neither_initial_nor_refinement() {
+        assert!(!QueryPhase::Explain.is_initial_path());
+        assert!(!QueryPhase::Explain.is_refinement_path());
+        assert!(!QueryPhase::Serialize.is_initial_path());
+        assert!(!QueryPhase::Serialize.is_refinement_path());
+    }
+
+    #[test]
+    fn every_phase_is_covered_by_at_least_one_category() {
+        // Phases are initial, refinement, or "other" (Explain/Serialize).
+        let other_phases = [QueryPhase::Explain, QueryPhase::Serialize];
+        for phase in QueryPhase::ALL {
+            assert!(
+                phase.is_initial_path()
+                    || phase.is_refinement_path()
+                    || other_phases.contains(phase),
+                "phase {phase:?} is uncategorized"
+            );
+        }
+    }
+
+    #[test]
+    fn refinement_path_budget_sum() {
+        let refinement_budget_us: u64 = QueryPhase::ALL
+            .iter()
+            .filter(|p| p.is_refinement_path())
+            .map(|p| p.default_budget_us())
+            .sum();
+        // QualityEmbed(130000) + QualityVectorSearch(2000) + Blend(500) + Rerank(25000) = 157500
+        assert_eq!(refinement_budget_us, 157_500);
+    }
+
+    #[test]
+    fn total_budget_sum_matches_all_phases() {
+        let total: u64 = QueryPhase::ALL.iter().map(|p| p.default_budget_us()).sum();
+        // Sum all budgets from the match arms.
+        let expected =
+            200 + 100 + 800 + 5_000 + 5_000 + 500 + 130_000 + 2_000 + 500 + 25_000 + 1_000 + 500;
+        assert_eq!(total, expected);
+    }
+
+    // --- VerificationResult edge cases ---
+
+    #[test]
+    fn verification_result_empty_assertions_passes() {
+        let result = VerificationResult::from_assertions("test.lever", vec![]);
+        assert!(result.passed);
+        assert_eq!(result.failure_count(), 0);
+        assert_eq!(result.reason_code, "opt.verify.passed");
+    }
+
+    #[test]
+    fn verification_result_all_failures() {
+        let result = VerificationResult::from_assertions(
+            "test.lever",
+            vec![
+                CorrectnessAssertion {
+                    lever_id: "test.lever".into(),
+                    proof_kind: CorrectnessProofKind::BitIdentical,
+                    test_corpus_ids: vec!["c1".into()],
+                    assertion: "a1".into(),
+                    passed: false,
+                    reason_code: "opt.assert.failed".into(),
+                },
+                CorrectnessAssertion {
+                    lever_id: "test.lever".into(),
+                    proof_kind: CorrectnessProofKind::RankPreserving,
+                    test_corpus_ids: vec!["c2".into()],
+                    assertion: "a2".into(),
+                    passed: false,
+                    reason_code: "opt.assert.failed".into(),
+                },
+            ],
+        );
+        assert!(!result.passed);
+        assert_eq!(result.failure_count(), 2);
+    }
+
+    #[test]
+    fn verification_result_schema_version() {
+        let result = VerificationResult::from_assertions("x", vec![]);
+        assert_eq!(result.schema_version, QUERY_LATENCY_OPT_SCHEMA_VERSION);
+    }
+
+    // --- VerificationProtocol edge cases ---
+
+    #[test]
+    fn default_protocol_schema_version_matches_constant() {
+        let protocol = VerificationProtocol::default_protocol();
+        assert_eq!(protocol.schema_version, QUERY_LATENCY_OPT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn default_protocol_lever_ids_match_catalog_exactly() {
+        let protocol = VerificationProtocol::default_protocol();
+        let catalog = query_path_lever_catalog();
+        assert_eq!(
+            protocol.required_lever_ids.len(),
+            catalog.len(),
+            "protocol lever count should match catalog"
+        );
+    }
+
+    #[test]
+    fn default_protocol_epsilon_is_parseable() {
+        let protocol = VerificationProtocol::default_protocol();
+        let eps: f64 = protocol
+            .score_epsilon_str
+            .parse()
+            .expect("epsilon should be parseable as f64");
+        assert!(eps > 0.0 && eps < 1.0);
+    }
+
+    // --- Lever catalog edge cases ---
+
+    #[test]
+    fn lever_catalog_descriptions_nonempty() {
+        for lever in query_path_lever_catalog() {
+            assert!(
+                !lever.description.is_empty(),
+                "lever '{}' has empty description",
+                lever.id
+            );
+        }
+    }
+
+    #[test]
+    fn lever_ids_match_matrix_candidate_ids() {
+        let matrix = query_path_opportunity_matrix();
+        let catalog = query_path_lever_catalog();
+        let matrix_ids: std::collections::BTreeSet<&str> =
+            matrix.candidates.iter().map(|c| c.id.as_str()).collect();
+        let catalog_ids: std::collections::BTreeSet<&str> =
+            catalog.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(
+            matrix_ids, catalog_ids,
+            "matrix and catalog IDs should match exactly"
+        );
+    }
+
+    // --- Serde edge cases ---
+
+    #[test]
+    fn correctness_proof_kind_serde_roundtrip() {
+        let kinds = [
+            CorrectnessProofKind::BitIdentical,
+            CorrectnessProofKind::NumericallyEquivalent,
+            CorrectnessProofKind::RankPreserving,
+        ];
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let decoded: CorrectnessProofKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*kind, decoded);
+        }
+    }
+
+    #[test]
+    fn optimization_mechanism_serde_roundtrip() {
+        let mechanisms = [
+            OptimizationMechanism::AllocationReduction,
+            OptimizationMechanism::BufferReuse,
+            OptimizationMechanism::CacheLocality,
+            OptimizationMechanism::AlgorithmReplacement,
+            OptimizationMechanism::Parallelism,
+            OptimizationMechanism::DataMovement,
+            OptimizationMechanism::Precomputation,
+        ];
+        for mechanism in &mechanisms {
+            let json = serde_json::to_string(mechanism).unwrap();
+            let decoded: OptimizationMechanism = serde_json::from_str(&json).unwrap();
+            assert_eq!(*mechanism, decoded);
+        }
+    }
+
+    #[test]
+    fn verification_protocol_serde_roundtrip() {
+        let protocol = VerificationProtocol::default_protocol();
+        let json = serde_json::to_string(&protocol).unwrap();
+        let decoded: VerificationProtocol = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.schema_version, protocol.schema_version);
+        assert_eq!(decoded.required_corpus_ids, protocol.required_corpus_ids);
+        assert_eq!(decoded.required_lever_ids, protocol.required_lever_ids);
     }
 }

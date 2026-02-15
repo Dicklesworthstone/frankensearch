@@ -114,14 +114,15 @@ pub fn rrf_fuse(
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
-    let capacity = lexical.len() + semantic.len();
-    let mut hits: HashMap<String, FusedHit> = HashMap::with_capacity(capacity);
+    // Adjusted for typical ~50% overlap to reduce over-allocation.
+    let capacity = (lexical.len() + semantic.len()) * 3 / 4;
+    let mut hits: HashMap<&str, FusedHit> = HashMap::with_capacity(capacity);
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
         let rrf_contribution = rank_contribution(k, rank);
 
-        hits.entry(result.doc_id.clone())
+        hits.entry(result.doc_id.as_str())
             .and_modify(|hit| {
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
@@ -143,7 +144,7 @@ pub fn rrf_fuse(
     for (rank, hit) in semantic.iter().enumerate() {
         let rrf_contribution = rank_contribution(k, rank);
 
-        hits.entry(hit.doc_id.clone())
+        hits.entry(hit.doc_id.as_str())
             .and_modify(|fh| {
                 fh.rrf_score += rrf_contribution;
                 fh.semantic_rank = Some(rank);
@@ -168,6 +169,28 @@ pub fn rrf_fuse(
     let overlap_count = results.iter().filter(|h| h.in_both_sources).count();
     let fused_count = results.len();
 
+    // Ranking window needed for pagination. For small windows this avoids
+    // sorting every fused hit while preserving deterministic output order.
+    let window = limit.saturating_add(offset);
+    if window == 0 {
+        debug!(
+            target: "frankensearch.rrf",
+            fused_count,
+            overlap_count,
+            output_count = 0,
+            "rrf fusion complete"
+        );
+        return Vec::new();
+    }
+    if window < results.len() {
+        let nth_index = window.saturating_sub(1);
+        results.select_nth_unstable_by(nth_index, FusedHit::cmp_for_ranking);
+        results.truncate(window);
+    }
+
+    // Sort only the requested ranking window.
+    results.sort_by(FusedHit::cmp_for_ranking);
+
     // Apply offset and limit.
     let output: Vec<FusedHit> = results.into_iter().skip(offset).take(limit).collect();
 
@@ -184,6 +207,8 @@ pub fn rrf_fuse(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::hint::black_box;
     use std::time::Instant;
 
     use super::*;
@@ -583,11 +608,112 @@ mod tests {
         (lexical, semantic)
     }
 
+    fn rrf_fuse_reference_full_sort(
+        lexical: &[ScoredResult],
+        semantic: &[VectorHit],
+        limit: usize,
+        offset: usize,
+        config: &RrfConfig,
+    ) -> Vec<FusedHit> {
+        let k = sanitize_rrf_k(config.k);
+        let capacity = lexical.len() + semantic.len();
+        let mut hits: HashMap<String, FusedHit> = HashMap::with_capacity(capacity);
+
+        for (rank, result) in lexical.iter().enumerate() {
+            let rrf_contribution = rank_contribution(k, rank);
+
+            hits.entry(result.doc_id.clone())
+                .and_modify(|hit| {
+                    hit.rrf_score += rrf_contribution;
+                    hit.lexical_rank = Some(rank);
+                    hit.lexical_score = Some(result.score);
+                    hit.in_both_sources = true;
+                })
+                .or_insert_with(|| FusedHit {
+                    doc_id: result.doc_id.clone(),
+                    rrf_score: rrf_contribution,
+                    lexical_rank: Some(rank),
+                    semantic_rank: None,
+                    lexical_score: Some(result.score),
+                    semantic_score: None,
+                    in_both_sources: false,
+                });
+        }
+
+        for (rank, hit) in semantic.iter().enumerate() {
+            let rrf_contribution = rank_contribution(k, rank);
+
+            hits.entry(hit.doc_id.clone())
+                .and_modify(|fh| {
+                    fh.rrf_score += rrf_contribution;
+                    fh.semantic_rank = Some(rank);
+                    fh.semantic_score = Some(hit.score);
+                    fh.in_both_sources = true;
+                })
+                .or_insert_with(|| FusedHit {
+                    doc_id: hit.doc_id.clone(),
+                    rrf_score: rrf_contribution,
+                    lexical_rank: None,
+                    semantic_rank: Some(rank),
+                    lexical_score: None,
+                    semantic_score: Some(hit.score),
+                    in_both_sources: false,
+                });
+        }
+
+        let mut results: Vec<FusedHit> = hits.into_values().collect();
+        results.sort_by(FusedHit::cmp_for_ranking);
+        results.into_iter().skip(offset).take(limit).collect()
+    }
+
+    #[test]
+    fn ranking_window_selection_matches_full_sort_reference() {
+        let config = RrfConfig::default();
+        let (lexical, semantic) = large_lexical_semantic_fixture(6_000);
+        let windows = [
+            (0_usize, 0_usize),
+            (25, 0),
+            (50, 10),
+            (100, 250),
+            (256, 800),
+            (512, 2_000),
+            (128, 10_000),
+        ];
+
+        for (limit, offset) in windows {
+            let actual = rrf_fuse(&lexical, &semantic, limit, offset, &config);
+            let expected =
+                rrf_fuse_reference_full_sort(&lexical, &semantic, limit, offset, &config);
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "window mismatch for limit={limit} offset={offset}"
+            );
+
+            for (actual_hit, expected_hit) in actual.iter().zip(&expected) {
+                assert_eq!(actual_hit.doc_id, expected_hit.doc_id);
+                assert!((actual_hit.rrf_score - expected_hit.rrf_score).abs() < 1e-12);
+                assert_eq!(actual_hit.lexical_rank, expected_hit.lexical_rank);
+                assert_eq!(actual_hit.semantic_rank, expected_hit.semantic_rank);
+                assert_eq!(actual_hit.lexical_score, expected_hit.lexical_score);
+                assert_eq!(actual_hit.semantic_score, expected_hit.semantic_score);
+                assert_eq!(actual_hit.in_both_sources, expected_hit.in_both_sources);
+            }
+        }
+    }
+
     #[test]
     #[ignore = "Perf probe for optimization loop: run explicitly with --ignored"]
     fn perf_probe_rrf_large_candidates() {
-        let doc_count = 20_000;
-        let iterations = 60;
+        let doc_count = std::env::var("RRF_PERF_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8_000);
+        let iterations = std::env::var("RRF_PERF_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20);
         let (lexical, semantic) = large_lexical_semantic_fixture(doc_count);
         let config = RrfConfig::default();
 
@@ -606,5 +732,55 @@ mod tests {
             iterations
         );
         assert!(checksum.is_finite());
+    }
+
+    #[test]
+    #[ignore = "Perf probe for optimization loop: run explicitly with --ignored"]
+    fn perf_probe_rrf_window_selection_vs_full_sort_reference() {
+        let doc_count = std::env::var("RRF_PERF_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8_000);
+        let iterations = std::env::var("RRF_PERF_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20);
+        let limit = 100;
+        let offset = 0;
+
+        let (lexical, semantic) = large_lexical_semantic_fixture(doc_count);
+        let config = RrfConfig::default();
+
+        let optimized_started = Instant::now();
+        let mut optimized_checksum = 0.0_f64;
+        for _ in 0..iterations {
+            let output = black_box(rrf_fuse(&lexical, &semantic, limit, offset, &config));
+            optimized_checksum += output.iter().map(|hit| hit.rrf_score).sum::<f64>();
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        let reference_started = Instant::now();
+        let mut reference_checksum = 0.0_f64;
+        for _ in 0..iterations {
+            let output = black_box(rrf_fuse_reference_full_sort(
+                &lexical, &semantic, limit, offset, &config,
+            ));
+            reference_checksum += output.iter().map(|hit| hit.rrf_score).sum::<f64>();
+        }
+        let reference_elapsed = reference_started.elapsed();
+
+        assert!((optimized_checksum - reference_checksum).abs() < 1e-8);
+
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1_000.0;
+        let reference_ms = reference_elapsed.as_secs_f64() * 1_000.0;
+        let speedup = if optimized_ms > 0.0 {
+            reference_ms / optimized_ms
+        } else {
+            1.0
+        };
+
+        eprintln!(
+            "RRF_PERF_COMPARE optimized_ms={optimized_ms:.3} reference_ms={reference_ms:.3} speedup={speedup:.3} doc_count={doc_count} iterations={iterations}"
+        );
     }
 }

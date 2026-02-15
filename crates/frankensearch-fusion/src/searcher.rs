@@ -758,6 +758,14 @@ impl TwoTierSearcher {
             .iter()
             .map(|result| (result.doc_id.as_str(), result))
             .collect();
+        let fast_scores_by_doc: HashMap<&str, f32> = fast_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+        let quality_scores_by_doc: HashMap<&str, f32> = quality_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
 
         // Convert blended to scored results.
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
@@ -766,14 +774,8 @@ impl TwoTierSearcher {
             .take(k)
             .map(|hit| {
                 let initial = initial_by_doc.get(hit.doc_id.as_str()).copied();
-                let fast_score = fast_hits
-                    .iter()
-                    .find(|h| h.doc_id == hit.doc_id)
-                    .map(|h| h.score);
-                let quality_score = quality_hits
-                    .iter()
-                    .find(|h| h.doc_id == hit.doc_id)
-                    .map(|h| h.score);
+                let fast_score = fast_scores_by_doc.get(hit.doc_id.as_str()).copied();
+                let quality_score = quality_scores_by_doc.get(hit.doc_id.as_str()).copied();
                 let source = if quality_score.is_some() {
                     ScoreSource::SemanticQuality
                 } else {
@@ -2942,5 +2944,151 @@ mod tests {
                 "different query should be a cache miss"
             );
         });
+    }
+
+    fn phase2_lookup_checksum_linear(
+        blended: &[VectorHit],
+        fast_hits: &[VectorHit],
+        quality_hits: &[VectorHit],
+    ) -> f32 {
+        blended.iter().fold(0.0_f32, |acc, hit| {
+            let fast_score = fast_hits
+                .iter()
+                .find(|h| h.doc_id == hit.doc_id)
+                .map_or(0.0_f32, |h| h.score);
+            let quality_score = quality_hits
+                .iter()
+                .find(|h| h.doc_id == hit.doc_id)
+                .map_or(0.0_f32, |h| h.score);
+            acc + fast_score + quality_score + hit.score
+        })
+    }
+
+    fn phase2_lookup_checksum_mapped(
+        blended: &[VectorHit],
+        fast_scores_by_doc: &HashMap<&str, f32>,
+        quality_scores_by_doc: &HashMap<&str, f32>,
+    ) -> f32 {
+        blended.iter().fold(0.0_f32, |acc, hit| {
+            let fast_score = fast_scores_by_doc
+                .get(hit.doc_id.as_str())
+                .copied()
+                .unwrap_or(0.0_f32);
+            let quality_score = quality_scores_by_doc
+                .get(hit.doc_id.as_str())
+                .copied()
+                .unwrap_or(0.0_f32);
+            acc + fast_score + quality_score + hit.score
+        })
+    }
+
+    fn build_phase2_lookup_fixture(
+        doc_count: usize,
+    ) -> (Vec<VectorHit>, Vec<VectorHit>, Vec<VectorHit>) {
+        let fast_hits: Vec<VectorHit> = (0..doc_count)
+            .map(|idx| VectorHit {
+                index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
+                score: idx as f32 * 0.001_f32,
+                doc_id: format!("doc-{idx}"),
+            })
+            .collect();
+        let quality_hits: Vec<VectorHit> = (0..doc_count)
+            .step_by(3)
+            .map(|idx| VectorHit {
+                index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
+                score: idx as f32 * 0.002_f32,
+                doc_id: format!("doc-{idx}"),
+            })
+            .collect();
+        let blended: Vec<VectorHit> = (0..doc_count)
+            .map(|idx| VectorHit {
+                index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
+                doc_id: format!("doc-{idx}"),
+                score: idx as f32 * 0.0005_f32,
+            })
+            .collect();
+        (fast_hits, quality_hits, blended)
+    }
+
+    #[test]
+    fn phase2_lookup_maps_match_linear_scan_oracle() {
+        let (fast_hits, quality_hits, blended) = build_phase2_lookup_fixture(10_000);
+        let fast_scores_by_doc: HashMap<&str, f32> = fast_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+        let quality_scores_by_doc: HashMap<&str, f32> = quality_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+
+        let linear = phase2_lookup_checksum_linear(&blended, &fast_hits, &quality_hits);
+        let mapped =
+            phase2_lookup_checksum_mapped(&blended, &fast_scores_by_doc, &quality_scores_by_doc);
+
+        let diff = (linear - mapped).abs();
+        assert!(
+            diff <= 0.0001_f32,
+            "mapped lookup diverged from linear oracle: diff={diff}"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe"]
+    fn perf_probe_phase2_lookup_map_vs_linear_scan() {
+        let doc_count = std::env::var("PHASE2_LOOKUP_PERF_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(30_000);
+        let iterations = std::env::var("PHASE2_LOOKUP_PERF_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(80);
+
+        let (fast_hits, quality_hits, blended) = build_phase2_lookup_fixture(doc_count);
+        let fast_scores_by_doc: HashMap<&str, f32> = fast_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+        let quality_scores_by_doc: HashMap<&str, f32> = quality_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+
+        let mut linear_checksum = 0.0_f32;
+        let linear_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            linear_checksum += std::hint::black_box(phase2_lookup_checksum_linear(
+                &blended,
+                &fast_hits,
+                &quality_hits,
+            ));
+        }
+        let linear_ms = linear_start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut mapped_checksum = 0.0_f32;
+        let mapped_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            mapped_checksum += std::hint::black_box(phase2_lookup_checksum_mapped(
+                &blended,
+                &fast_scores_by_doc,
+                &quality_scores_by_doc,
+            ));
+        }
+        let mapped_ms = mapped_start.elapsed().as_secs_f64() * 1000.0;
+
+        let checksum_diff = (linear_checksum - mapped_checksum).abs();
+        assert!(
+            checksum_diff <= 0.01_f32,
+            "lookup checksum mismatch: linear={linear_checksum} mapped={mapped_checksum}"
+        );
+        println!(
+            "PHASE2_LOOKUP_PERF map_ms={mapped_ms:.3} linear_ms={linear_ms:.3} speedup={:.3} doc_count={doc_count} iterations={iterations}",
+            if mapped_ms > 0.0 {
+                linear_ms / mapped_ms
+            } else {
+                f64::INFINITY
+            }
+        );
     }
 }

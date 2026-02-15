@@ -66,12 +66,12 @@ pub fn blend_two_tier(
     min_max_normalize(&mut fast_scores);
     min_max_normalize(&mut quality_scores);
 
-    let mut merged: HashMap<String, ScorePair> =
+    let mut merged: HashMap<&str, ScorePair> =
         HashMap::with_capacity(fast_results.len() + quality_results.len());
 
     for (hit, normalized) in fast_results.iter().zip(fast_scores.into_iter()) {
         let entry = merged
-            .entry(hit.doc_id.clone())
+            .entry(hit.doc_id.as_str())
             .or_insert_with(|| ScorePair {
                 index: hit.index,
                 ..ScorePair::default()
@@ -81,7 +81,7 @@ pub fn blend_two_tier(
 
     for (hit, normalized) in quality_results.iter().zip(quality_scores.into_iter()) {
         let entry = merged
-            .entry(hit.doc_id.clone())
+            .entry(hit.doc_id.as_str())
             .or_insert_with(|| ScorePair {
                 index: hit.index,
                 ..ScorePair::default()
@@ -96,7 +96,7 @@ pub fn blend_two_tier(
             VectorHit {
                 index: pair.index,
                 score: sanitize_score(score),
-                doc_id,
+                doc_id: doc_id.to_owned(),
             }
         })
         .collect();
@@ -124,8 +124,8 @@ pub fn blend_two_tier(
 /// - `stable`: rank unchanged
 #[must_use]
 pub fn compute_rank_changes(initial: &[VectorHit], refined: &[VectorHit]) -> RankChanges {
-    let initial_rank = build_rank_map(initial);
-    let refined_rank = build_rank_map(refined);
+    let initial_rank = build_borrowed_rank_map(initial);
+    let refined_rank = build_borrowed_rank_map(refined);
 
     let mut promoted = 0;
     let mut demoted = 0;
@@ -163,30 +163,27 @@ pub fn compute_rank_changes(initial: &[VectorHit], refined: &[VectorHit]) -> Ran
 /// Returns `None` when fewer than two common documents exist.
 #[must_use]
 pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> {
-    let initial_rank = build_rank_map(initial);
-    let refined_rank = build_rank_map(refined);
+    let refined_rank = build_borrowed_rank_map(refined);
 
-    // Collect common documents in initial-rank order (iteration order preserves it).
-    let mut seen = HashSet::new();
-    let mut common = Vec::new();
+    // Collect refined ranks for common documents in initial-rank order.
+    // Dedup by doc_id so repeated docs in `initial` contribute once.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(initial.len());
+    let mut refined_ranks = Vec::with_capacity(initial.len().min(refined_rank.len()));
     for hit in initial {
-        if refined_rank.contains_key(&hit.doc_id) && seen.insert(hit.doc_id.clone()) {
-            common.push(hit.doc_id.clone());
+        let doc_id = hit.doc_id.as_str();
+        if let Some(&rank) = refined_rank.get(doc_id)
+            && seen.insert(doc_id)
+        {
+            refined_ranks.push(rank);
         }
     }
 
-    let n = common.len();
+    let n = refined_ranks.len();
     if n < 2 {
         return None;
     }
 
-    // Build array of refined ranks in initial-rank order.
     // An inversion in this array corresponds to a discordant pair.
-    let mut refined_ranks: Vec<usize> = common
-        .iter()
-        .map(|doc_id| refined_rank[doc_id])
-        .collect();
-
     let discordant = merge_sort_inversions(&mut refined_ranks);
 
     let n_u64 = u64::try_from(n).ok()?;
@@ -209,37 +206,50 @@ pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> 
 /// An inversion is a pair `(i, j)` where `i < j` but `arr[i] > arr[j]`.
 /// The slice is sorted in place as a side effect.
 fn merge_sort_inversions(arr: &mut [usize]) -> u64 {
+    if arr.len() <= 1 {
+        return 0;
+    }
+    let mut scratch = vec![0_usize; arr.len()];
+    merge_sort_inversions_with_scratch(arr, &mut scratch)
+}
+
+fn merge_sort_inversions_with_scratch(arr: &mut [usize], scratch: &mut [usize]) -> u64 {
     let n = arr.len();
     if n <= 1 {
         return 0;
     }
     let mid = n / 2;
-    let mut left = arr[..mid].to_vec();
-    let mut right = arr[mid..].to_vec();
+    let (left, right) = arr.split_at_mut(mid);
+    let (scratch_left, scratch_right) = scratch.split_at_mut(mid);
 
-    let mut count = merge_sort_inversions(&mut left);
-    count += merge_sort_inversions(&mut right);
+    let mut count = merge_sort_inversions_with_scratch(left, scratch_left);
+    count = count.saturating_add(merge_sort_inversions_with_scratch(right, scratch_right));
 
-    let (mut i, mut j, mut k) = (0, 0, 0);
+    let (mut i, mut j, mut out) = (0_usize, 0_usize, 0_usize);
     while i < left.len() && j < right.len() {
         if left[i] <= right[j] {
-            arr[k] = left[i];
+            scratch[out] = left[i];
             i += 1;
         } else {
-            arr[k] = right[j];
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                count += (left.len() - i) as u64;
-            }
+            scratch[out] = right[j];
+            let remaining_left = left.len().saturating_sub(i);
+            let remaining_left_u64 = u64::try_from(remaining_left).unwrap_or(u64::MAX);
+            count = count.saturating_add(remaining_left_u64);
             j += 1;
         }
-        k += 1;
+        out += 1;
     }
 
-    arr[k..k + left.len() - i].copy_from_slice(&left[i..]);
-    k += left.len() - i;
-    arr[k..].copy_from_slice(&right[j..]);
+    if i < left.len() {
+        let left_remaining = left.len() - i;
+        scratch[out..out + left_remaining].copy_from_slice(&left[i..]);
+        out += left_remaining;
+    }
+    if j < right.len() {
+        scratch[out..n].copy_from_slice(&right[j..]);
+    }
 
+    arr.copy_from_slice(&scratch[..n]);
     count
 }
 
@@ -259,10 +269,10 @@ const fn sanitize_score(score: f32) -> f32 {
     }
 }
 
-fn build_rank_map(hits: &[VectorHit]) -> HashMap<String, usize> {
+fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
     let mut ranks = HashMap::with_capacity(hits.len());
     for (rank, hit) in hits.iter().enumerate() {
-        ranks.entry(hit.doc_id.clone()).or_insert(rank);
+        ranks.entry(hit.doc_id.as_str()).or_insert(rank);
     }
     ranks
 }
@@ -466,9 +476,174 @@ mod tests {
     }
 
     #[test]
+    fn kendall_tau_partial_overlap() {
+        // initial: a(0), b(1), c(2), d(3)
+        // refined: c(0), x(1), a(2), d(3)
+        // common (initial order): a, c, d
+        // refined ranks of common: a→2, c→0, d→3  →  [2, 0, 3]
+        // inversions in [2, 0, 3]: (2,0) → 1 inversion
+        // total_pairs = 3, concordant = 2, discordant = 1
+        // tau = (2 - 1) / 3 = 1/3
+        let initial = vec![
+            hit("a", 1.0, 0),
+            hit("b", 0.9, 1),
+            hit("c", 0.8, 2),
+            hit("d", 0.7, 3),
+        ];
+        let refined = vec![
+            hit("c", 1.0, 2),
+            hit("x", 0.9, 4),
+            hit("a", 0.8, 0),
+            hit("d", 0.7, 3),
+        ];
+        let tau = kendall_tau(&initial, &refined).expect("tau for partial overlap");
+        assert!((tau - 1.0 / 3.0).abs() < 1e-10, "expected 1/3, got {tau}");
+    }
+
+    #[test]
+    fn kendall_tau_two_elements() {
+        let initial = vec![hit("a", 1.0, 0), hit("b", 0.5, 1)];
+        let refined = vec![hit("b", 1.0, 1), hit("a", 0.5, 0)];
+        let tau = kendall_tau(&initial, &refined).expect("tau for 2 elements");
+        assert!(
+            (tau + 1.0).abs() <= f64::EPSILON,
+            "swapped pair should give tau=-1.0, got {tau}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_medium_sorted() {
+        // Already sorted: 100 docs in same order → tau = 1.0
+        let n = 100;
+        let initial: Vec<VectorHit> = (0..n)
+            .map(|i| hit(&format!("doc-{i:04}"), 1.0, 0))
+            .collect();
+        let refined: Vec<VectorHit> = (0..n)
+            .map(|i| hit(&format!("doc-{i:04}"), 0.5, 0))
+            .collect();
+        let tau = kendall_tau(&initial, &refined).expect("tau for 100 identical order");
+        assert!(
+            (tau - 1.0).abs() <= f64::EPSILON,
+            "same ordering should give tau=1.0, got {tau}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_medium_reversed() {
+        // Fully reversed: 100 docs → tau = -1.0
+        let n = 100;
+        let initial: Vec<VectorHit> = (0..n)
+            .map(|i| hit(&format!("doc-{i:04}"), 1.0, 0))
+            .collect();
+        let refined: Vec<VectorHit> = (0..n)
+            .rev()
+            .map(|i| hit(&format!("doc-{i:04}"), 0.5, 0))
+            .collect();
+        let tau = kendall_tau(&initial, &refined).expect("tau for 100 reversed");
+        assert!(
+            (tau + 1.0).abs() <= f64::EPSILON,
+            "reverse ordering should give tau=-1.0, got {tau}"
+        );
+    }
+
+    fn shuffle_deterministic(values: &mut [usize], seed: u64) {
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        for i in (1..values.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+
+            let modulus = u64::try_from(i + 1).expect("modulus fits into u64");
+            let j_u64 = state % modulus;
+            let j = usize::try_from(j_u64).expect("index fits into usize");
+            values.swap(i, j);
+        }
+    }
+
+    fn naive_tau_from_refined_ranks(ranks: &[usize]) -> f64 {
+        let n = ranks.len();
+        let mut discordant = 0_u64;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if ranks[i] > ranks[j] {
+                    discordant += 1;
+                }
+            }
+        }
+
+        let n_u64 = u64::try_from(n).expect("length fits into u64");
+        let total_pairs = n_u64.saturating_mul(n_u64.saturating_sub(1)) / 2;
+        let concordant = total_pairs.saturating_sub(discordant);
+
+        let concordant_f64 = f64::from(u32::try_from(concordant).expect("fits into u32"));
+        let discordant_f64 = f64::from(u32::try_from(discordant).expect("fits into u32"));
+        let total_pairs_f64 = f64::from(u32::try_from(total_pairs).expect("fits into u32"));
+        (concordant_f64 - discordant_f64) / total_pairs_f64
+    }
+
+    #[test]
+    fn kendall_tau_matches_naive_for_deterministic_permutations() {
+        let sizes = [2_usize, 3, 5, 8, 16, 32];
+
+        for &n in &sizes {
+            let initial: Vec<VectorHit> = (0..n)
+                .map(|i| hit(&format!("doc-{i:04}"), 1.0, 0))
+                .collect();
+
+            for seed in 0_u64..12 {
+                let mut order: Vec<usize> = (0..n).collect();
+                let n_u64 = u64::try_from(n).expect("size fits into u64");
+                shuffle_deterministic(&mut order, seed.wrapping_add(n_u64));
+
+                let refined: Vec<VectorHit> = order
+                    .iter()
+                    .map(|&idx| hit(&format!("doc-{idx:04}"), 0.5, 0))
+                    .collect();
+
+                let mut refined_rank_by_initial_index = vec![0_usize; n];
+                for (rank, &idx) in order.iter().enumerate() {
+                    refined_rank_by_initial_index[idx] = rank;
+                }
+
+                let expected = naive_tau_from_refined_ranks(&refined_rank_by_initial_index);
+                let actual =
+                    kendall_tau(&initial, &refined).expect("tau for deterministic permutation");
+
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "n={n}, seed={seed}, expected={expected}, actual={actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_sort_inversions_counts_correctly() {
+        use super::merge_sort_inversions;
+
+        // [2, 0, 3] → 1 inversion: (2, 0)
+        let mut arr = vec![2, 0, 3];
+        assert_eq!(merge_sort_inversions(&mut arr), 1);
+        assert_eq!(arr, [0, 2, 3]); // sorted as side effect
+
+        // [3, 2, 1, 0] → 6 inversions (fully reversed, n=4)
+        let mut arr = vec![3, 2, 1, 0];
+        assert_eq!(merge_sort_inversions(&mut arr), 6);
+
+        // [0, 1, 2, 3] → 0 inversions (already sorted)
+        let mut arr = vec![0, 1, 2, 3];
+        assert_eq!(merge_sort_inversions(&mut arr), 0);
+
+        // empty and single
+        assert_eq!(merge_sort_inversions(&mut []), 0);
+        assert_eq!(merge_sort_inversions(&mut [42]), 0);
+    }
+
+    #[test]
     #[ignore = "perf-only stress harness for optimization baseline/profile runs"]
     fn kendall_tau_stress_reverse_large() {
-        let n: usize = 2_048;
+        let n: usize = 4_096;
+        let iterations: usize = 24;
         let initial: Vec<VectorHit> = (0..n)
             .map(|i| hit(&format!("doc-{i:05}"), 1.0, 0))
             .collect();
@@ -477,10 +652,12 @@ mod tests {
             .map(|i| hit(&format!("doc-{i:05}"), 1.0, 0))
             .collect();
 
-        let tau = kendall_tau(&initial, &refined).expect("tau should exist for large overlap");
-        assert!(
-            (tau + 1.0).abs() <= f64::EPSILON,
-            "reverse ordering should produce tau=-1.0, got {tau}"
-        );
+        for _ in 0..iterations {
+            let tau = kendall_tau(&initial, &refined).expect("tau should exist for large overlap");
+            assert!(
+                (tau + 1.0).abs() <= f64::EPSILON,
+                "reverse ordering should produce tau=-1.0, got {tau}"
+            );
+        }
     }
 }

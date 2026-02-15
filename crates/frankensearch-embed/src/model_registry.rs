@@ -387,18 +387,24 @@ fn embedder_is_available(entry: &RegisteredEmbedder, data_dir: &Path) -> bool {
     if !entry.requires_model_files {
         return true;
     }
-    model_candidates(data_dir, embedder_dir_name(entry), entry.huggingface_id)
-        .iter()
-        .any(|dir| has_embedder_files(entry.id, dir))
+    any_model_candidate_matches(
+        data_dir,
+        embedder_dir_name(entry),
+        entry.huggingface_id,
+        |dir| has_embedder_files(entry.id, dir),
+    )
 }
 
 fn reranker_is_available(entry: &RegisteredReranker, data_dir: &Path) -> bool {
     if !entry.requires_model_files {
         return true;
     }
-    model_candidates(data_dir, reranker_dir_name(entry), entry.huggingface_id)
-        .iter()
-        .any(|dir| has_reranker_files(dir))
+    any_model_candidate_matches(
+        data_dir,
+        reranker_dir_name(entry),
+        entry.huggingface_id,
+        has_reranker_files,
+    )
 }
 
 fn embedder_dir_name(entry: &RegisteredEmbedder) -> &'static str {
@@ -485,6 +491,39 @@ fn model_candidates(data_dir: &Path, model_dir: &str, huggingface_id: &str) -> V
     out
 }
 
+fn any_model_candidate_matches(
+    data_dir: &Path,
+    model_dir: &str,
+    huggingface_id: &str,
+    mut matches: impl FnMut(&Path) -> bool,
+) -> bool {
+    if matches(data_dir) {
+        return true;
+    }
+
+    for variant in model_directory_variants(model_dir) {
+        if matches(&data_dir.join(&variant)) {
+            return true;
+        }
+    }
+
+    if huggingface_id != NO_HUGGINGFACE_ID {
+        let hub_root = data_dir
+            .join("huggingface/hub")
+            .join(format!("models--{}", huggingface_id.replace('/', "--")))
+            .join("snapshots");
+        if let Ok(entries) = fs::read_dir(hub_root) {
+            for entry in entries.flatten() {
+                if matches(&entry.path()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn push_candidate(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, path: PathBuf) {
     if seen.insert(path.clone()) {
         paths.push(path);
@@ -493,6 +532,8 @@ fn push_candidate(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, path: 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn touch_model_files(root: &Path, model_dir: &str, files: &[&str]) {
@@ -705,5 +746,469 @@ mod tests {
                 .map(|entry| entry.id)
                 .any(|id| id == "flashrank-nano")
         );
+    }
+
+    // --- Preference rank tests ---
+
+    #[test]
+    fn preference_rank_orders_minilm_highest() {
+        assert!(
+            embedder_preference_rank("minilm-384")
+                > embedder_preference_rank("snowflake-arctic-s-384")
+        );
+        assert!(
+            embedder_preference_rank("snowflake-arctic-s-384")
+                > embedder_preference_rank("nomic-embed-768")
+        );
+        assert!(
+            embedder_preference_rank("nomic-embed-768")
+                > embedder_preference_rank("potion-retrieval-32m-512")
+        );
+        assert!(
+            embedder_preference_rank("potion-retrieval-32m-512")
+                > embedder_preference_rank("potion-multilingual-128m-256")
+        );
+        assert!(
+            embedder_preference_rank("potion-multilingual-128m-256")
+                > embedder_preference_rank("fnv1a-384")
+        );
+    }
+
+    #[test]
+    fn preference_rank_unknown_id_is_zero() {
+        assert_eq!(embedder_preference_rank("nonexistent-model"), 0);
+        assert_eq!(embedder_preference_rank(""), 0);
+    }
+
+    #[test]
+    fn preference_rank_hash_is_minimal_among_known() {
+        assert_eq!(embedder_preference_rank("fnv1a-384"), 1);
+        // Hash is above unknown but below all real embedders.
+        assert!(embedder_preference_rank("fnv1a-384") > embedder_preference_rank("unknown"));
+    }
+
+    // --- Directory name mapping tests ---
+
+    #[test]
+    fn embedder_dir_names_are_correct() {
+        for entry in registered_embedders() {
+            let dir = embedder_dir_name(entry);
+            assert!(!dir.is_empty(), "empty dir for {}", entry.id);
+            if entry.id == "fnv1a-384" {
+                assert_eq!(dir, "hash-fallback");
+            } else {
+                assert_ne!(dir, "unknown-model", "unmapped dir for {}", entry.id);
+            }
+        }
+    }
+
+    #[test]
+    fn reranker_dir_names_are_correct() {
+        for entry in registered_rerankers() {
+            let dir = reranker_dir_name(entry);
+            assert!(!dir.is_empty(), "empty dir for {}", entry.id);
+            assert_ne!(dir, "unknown-reranker", "unmapped dir for {}", entry.id);
+        }
+    }
+
+    #[test]
+    fn embedder_dir_name_unknown_fallback() {
+        let fake = RegisteredEmbedder {
+            name: "fake",
+            id: "fake-999",
+            dimension: 1,
+            is_semantic: false,
+            description: "test",
+            requires_model_files: false,
+            release_date: "2020-01-01",
+            huggingface_id: "builtin",
+            size_bytes: 0,
+            is_baseline: false,
+        };
+        assert_eq!(embedder_dir_name(&fake), "unknown-model");
+    }
+
+    #[test]
+    fn reranker_dir_name_unknown_fallback() {
+        let fake = RegisteredReranker {
+            name: "fake",
+            id: "fake-999",
+            description: "test",
+            requires_model_files: false,
+            release_date: "2020-01-01",
+            huggingface_id: "builtin",
+            size_bytes: 0,
+            is_baseline: false,
+        };
+        assert_eq!(reranker_dir_name(&fake), "unknown-reranker");
+    }
+
+    // --- Model directory variants tests ---
+
+    #[test]
+    fn model_directory_variants_non_potion_returns_single() {
+        let variants = model_directory_variants("all-MiniLM-L6-v2");
+        assert_eq!(variants, vec!["all-MiniLM-L6-v2"]);
+    }
+
+    #[test]
+    fn model_directory_variants_potion_base_includes_both() {
+        let variants = model_directory_variants("potion-base-128M");
+        assert!(variants.contains(&"potion-base-128M".to_owned()));
+        assert!(variants.contains(&"potion-multilingual-128M".to_owned()));
+    }
+
+    #[test]
+    fn model_directory_variants_are_sorted_and_deduped() {
+        let variants = model_directory_variants("potion-multilingual-128M");
+        let mut sorted = variants.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(variants, sorted);
+    }
+
+    // --- Registry static invariant tests ---
+
+    #[test]
+    fn embedder_ids_are_unique() {
+        let ids: Vec<&str> = registered_embedders().iter().map(|e| e.id).collect();
+        let mut deduped = ids.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(ids.len(), deduped.len(), "duplicate embedder IDs");
+    }
+
+    #[test]
+    fn embedder_names_are_unique() {
+        let names: Vec<&str> = registered_embedders().iter().map(|e| e.name).collect();
+        let mut deduped = names.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(names.len(), deduped.len(), "duplicate embedder names");
+    }
+
+    #[test]
+    fn reranker_ids_are_unique() {
+        let ids: Vec<&str> = registered_rerankers().iter().map(|e| e.id).collect();
+        let mut deduped = ids.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(ids.len(), deduped.len(), "duplicate reranker IDs");
+    }
+
+    #[test]
+    fn reranker_names_are_unique() {
+        let names: Vec<&str> = registered_rerankers().iter().map(|e| e.name).collect();
+        let mut deduped = names.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(names.len(), deduped.len(), "duplicate reranker names");
+    }
+
+    #[test]
+    fn all_embedders_have_descriptions() {
+        for entry in registered_embedders() {
+            assert!(
+                !entry.description.is_empty(),
+                "empty description for {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn all_rerankers_have_descriptions() {
+        for entry in registered_rerankers() {
+            assert!(
+                !entry.description.is_empty(),
+                "empty description for {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn all_embedders_have_positive_dimensions() {
+        for entry in registered_embedders() {
+            assert!(entry.dimension > 0, "zero dimension for {}", entry.id);
+        }
+    }
+
+    #[test]
+    fn at_least_one_baseline_embedder_exists() {
+        assert!(
+            registered_embedders().iter().any(|e| e.is_baseline),
+            "no baseline embedder"
+        );
+    }
+
+    #[test]
+    fn at_least_one_baseline_reranker_exists() {
+        assert!(
+            registered_rerankers().iter().any(|e| e.is_baseline),
+            "no baseline reranker"
+        );
+    }
+
+    #[test]
+    fn hash_embedder_does_not_require_model_files() {
+        let hash = registered_embedders()
+            .iter()
+            .find(|e| e.id == "fnv1a-384")
+            .expect("hash embedder not found");
+        assert!(!hash.requires_model_files);
+        assert!(!hash.is_semantic);
+        assert_eq!(hash.size_bytes, 0);
+    }
+
+    // --- best_available / bakeoff / reranker edge cases ---
+
+    #[test]
+    fn best_available_falls_back_to_hash_when_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = EmbedderRegistry::new(temp.path());
+        assert_eq!(registry.best_available().id, "fnv1a-384");
+    }
+
+    #[test]
+    fn bakeoff_eligible_empty_with_no_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry.bakeoff_eligible().is_empty(),
+            "bakeoff should be empty with no models on disk"
+        );
+    }
+
+    #[test]
+    fn available_rerankers_empty_with_no_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry.available_rerankers().is_empty(),
+            "all rerankers require model files, so empty dir => no rerankers"
+        );
+    }
+
+    #[test]
+    fn bakeoff_excludes_hash_embedder() {
+        // Even if hash is "available", it is not semantic so never bakeoff-eligible.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = EmbedderRegistry::new(temp.path());
+        let eligible_ids: Vec<_> = registry.bakeoff_eligible().iter().map(|e| e.id).collect();
+        assert!(!eligible_ids.contains(&"fnv1a-384"));
+    }
+
+    // --- Potion retrieval availability ---
+
+    #[test]
+    fn availability_detects_potion_retrieval() {
+        let temp = tempfile::tempdir().unwrap();
+        touch_model_files(
+            temp.path(),
+            "potion-retrieval-32M",
+            &[TOKENIZER_JSON, MODEL_SAFETENSORS],
+        );
+        let registry = EmbedderRegistry::new(temp.path());
+        assert!(
+            registry
+                .available()
+                .iter()
+                .any(|e| e.id == "potion-retrieval-32m-512")
+        );
+    }
+
+    // --- push_candidate dedup ---
+
+    #[test]
+    fn push_candidate_deduplicates() {
+        let mut paths = Vec::new();
+        let mut seen = BTreeSet::new();
+        let p = PathBuf::from("/test/path");
+        push_candidate(&mut paths, &mut seen, p.clone());
+        push_candidate(&mut paths, &mut seen, p.clone());
+        push_candidate(&mut paths, &mut seen, p);
+        assert_eq!(paths.len(), 1);
+    }
+
+    // --- get case-insensitive lookup ---
+
+    #[test]
+    fn get_is_case_insensitive() {
+        let registry = EmbedderRegistry::new("unused");
+        assert!(registry.get("MINILM").is_some());
+        assert!(registry.get("MiniLM").is_some());
+        assert!(registry.get("MINILM-384").is_some());
+    }
+
+    // --- has_any_file / has_all_files edge cases ---
+
+    #[test]
+    fn has_any_file_returns_false_for_empty_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!has_any_file(
+            temp.path(),
+            &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY]
+        ));
+    }
+
+    #[test]
+    fn has_all_files_returns_true_for_empty_list() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(has_all_files(temp.path(), &[]));
+    }
+
+    // --- BAKEOFF_CUTOFF_DATE validity ---
+
+    #[test]
+    fn bakeoff_cutoff_date_is_valid_iso8601() {
+        assert_eq!(BAKEOFF_CUTOFF_DATE.len(), 10);
+        assert_eq!(&BAKEOFF_CUTOFF_DATE[4..5], "-");
+        assert_eq!(&BAKEOFF_CUTOFF_DATE[7..8], "-");
+    }
+
+    // --- model_candidates with builtin huggingface_id ---
+
+    #[test]
+    fn model_candidates_skip_huggingface_for_builtin() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidates = model_candidates(temp.path(), "hash-fallback", NO_HUGGINGFACE_ID);
+        // Should only have data_dir root + model_dir variant, no huggingface paths.
+        for c in &candidates {
+            assert!(
+                !c.to_string_lossy().contains("huggingface"),
+                "builtin should not probe huggingface: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn availability_checks_match_reference_candidate_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        touch_model_files(
+            temp.path(),
+            "all-MiniLM-L6-v2",
+            &[
+                MODEL_ONNX_SUBDIR,
+                TOKENIZER_JSON,
+                CONFIG_JSON,
+                SPECIAL_TOKENS_JSON,
+                TOKENIZER_CONFIG_JSON,
+            ],
+        );
+        touch_model_files(
+            temp.path(),
+            "flashrank",
+            &[MODEL_ONNX_SUBDIR, TOKENIZER_JSON],
+        );
+        touch_model_files(
+            temp.path(),
+            "huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5/snapshots/snap-a",
+            &[MODEL_ONNX_SUBDIR, TOKENIZER_JSON],
+        );
+
+        for entry in registered_embedders() {
+            let expected = if entry.requires_model_files {
+                model_candidates(temp.path(), embedder_dir_name(entry), entry.huggingface_id)
+                    .iter()
+                    .any(|dir| has_embedder_files(entry.id, dir))
+            } else {
+                true
+            };
+            let actual = embedder_is_available(entry, temp.path());
+            assert_eq!(
+                actual, expected,
+                "embedder availability mismatch for {}",
+                entry.id
+            );
+        }
+
+        for entry in registered_rerankers() {
+            let expected = if entry.requires_model_files {
+                model_candidates(temp.path(), reranker_dir_name(entry), entry.huggingface_id)
+                    .iter()
+                    .any(|dir| has_reranker_files(dir))
+            } else {
+                true
+            };
+            let actual = reranker_is_available(entry, temp.path());
+            assert_eq!(
+                actual, expected,
+                "reranker availability mismatch for {}",
+                entry.id
+            );
+        }
+    }
+
+    // --- Registry counts ---
+
+    #[test]
+    fn registered_embedder_count() {
+        assert_eq!(registered_embedders().len(), 6);
+    }
+
+    #[test]
+    fn registered_reranker_count() {
+        assert_eq!(registered_rerankers().len(), 5);
+    }
+
+    // --- data_dir accessor ---
+
+    #[test]
+    fn data_dir_returns_configured_path() {
+        let registry = EmbedderRegistry::new("/my/custom/path");
+        assert_eq!(registry.data_dir(), Path::new("/my/custom/path"));
+    }
+
+    #[test]
+    #[ignore = "Perf probe for optimization loop: run explicitly with --ignored"]
+    fn perf_probe_available_many_hf_snapshots() {
+        let snapshot_count = std::env::var("MODEL_REGISTRY_PERF_SNAPSHOTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(800);
+        let iterations = std::env::var("MODEL_REGISTRY_PERF_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(120);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hf_snapshots_root = temp.path().join(
+            "huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots",
+        );
+        std::fs::create_dir_all(&hf_snapshots_root).expect("create hf root");
+        for i in 0..snapshot_count {
+            let dir = hf_snapshots_root.join(format!("snap-{i:04}"));
+            std::fs::create_dir_all(&dir).expect("create snapshot");
+        }
+
+        // Keep valid files in the final snapshot to force worst-case scan.
+        let valid_snapshot = hf_snapshots_root.join(format!("snap-{:04}", snapshot_count - 1));
+        for file in [
+            MODEL_ONNX_SUBDIR,
+            TOKENIZER_JSON,
+            CONFIG_JSON,
+            SPECIAL_TOKENS_JSON,
+            TOKENIZER_CONFIG_JSON,
+        ] {
+            let path = valid_snapshot.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create model parent");
+            }
+            std::fs::write(path, b"stub").expect("write model file");
+        }
+
+        let registry = EmbedderRegistry::new(temp.path());
+        let started = Instant::now();
+        let mut checksum = 0_usize;
+        for _ in 0..iterations {
+            checksum = checksum.saturating_add(registry.available().len());
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        eprintln!(
+            "MODEL_REGISTRY_PERF elapsed_ms={elapsed_ms:.3} snapshots={snapshot_count} iterations={iterations} checksum={checksum}"
+        );
+        assert!(checksum > 0);
     }
 }
