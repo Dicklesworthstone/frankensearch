@@ -534,6 +534,7 @@ The workflow emits machine-readable artifacts:
 
 - `interaction_gate_policy.json`
 - `interaction_lane_ownership.json`
+- `composition_matrix_gate_summary.json`
 - `interaction_failure_summary.json` (failure only)
 - interaction logs: `interaction_unit.log`, `interaction_e2e_high_risk.log`, `interaction_e2e_failure_path.log`
 
@@ -556,6 +557,16 @@ The canonical lane ownership artifact (`interaction_lane_ownership.json`) must i
 | `kitchen_sink` | `fusion-composition-owner` | `bd-11n`, `bd-z3j`, `bd-2n6`, `bd-3st`, `bd-21g`, `bd-22k`, `bd-2yj`, `bd-1do`, `bd-2tv` | `composition-owner` |
 | `baseline` | `fusion-composition-owner` | `bd-3un.52` | `composition-owner` |
 
+### Composition Matrix Policy Extension (`bd-1pkl`)
+
+Interaction-matrix CI also acts as the policy gate for advanced ranking/control beads:
+
+1. matrix linkage must explicitly reference `bd-3un.52` (or a declared successor);
+2. fallback semantics must include deterministic `ON_EXHAUSTION` behavior;
+3. interaction-test plan must name deterministic coverage lanes.
+
+These checks are summarized in `composition_matrix_gate_summary.json`.
+
 ### Standardized Failure Summary Contract
 
 When the interaction gate fails, `interaction_failure_summary.json` must include:
@@ -565,7 +576,7 @@ When the interaction gate fails, `interaction_failure_summary.json` must include
 - `workflow`: `interaction-matrix-gate`
 - `run_url`
 - `replay_command`
-- `required_artifacts` (must include logs and `interaction_lane_ownership.json`)
+- `required_artifacts` (must include logs, `interaction_lane_ownership.json`, and `composition_matrix_gate_summary.json`)
 - `escalation_playbook` (this section)
 - `escalation_metadata.thread_id` (`bd-3un.52.6`)
 

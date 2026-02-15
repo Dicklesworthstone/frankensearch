@@ -102,6 +102,7 @@ jobs:
               ],
               required_failure_artifacts: [
                 "interaction_lane_ownership.json",
+                "composition_matrix_gate_summary.json",
                 "interaction_failure_summary.json"
               ]
             }
@@ -129,6 +130,27 @@ jobs:
             }
           ' > ci_artifacts/interaction_lane_ownership.json
 
+          jq -n --arg ts "${now}" '
+            {
+              schema: "composition-matrix-gate-summary-v1",
+              generated_at: $ts,
+              bead: "bd-1pkl",
+              matrix_anchor: "bd-3un.52",
+              required_fields: [
+                "MATRIX_LINK",
+                "FALLBACK_SEMANTICS",
+                "INTERACTION_TEST_PLAN"
+              ],
+              fallback_contract: "ON_EXHAUSTION",
+              required_interaction_tests: [
+                "interaction_unit",
+                "interaction_high_risk_lanes_emit_replay_ready_artifacts",
+                "interaction_failure_path_includes_replay_command_and_lane_context"
+              ],
+              ownership_artifact: "interaction_lane_ownership.json"
+            }
+          ' > ci_artifacts/composition_matrix_gate_summary.json
+
       - name: Emit standardized failure summary payload
         if: failure()
         shell: bash
@@ -155,7 +177,8 @@ jobs:
                 "interaction_unit.log",
                 "interaction_e2e_high_risk.log",
                 "interaction_e2e_failure_path.log",
-                "interaction_lane_ownership.json"
+                "interaction_lane_ownership.json",
+                "composition_matrix_gate_summary.json"
               ],
               escalation_playbook: $playbook,
               escalation_metadata: {
@@ -173,6 +196,7 @@ jobs:
             echo "- Replay command: \`cargo test -p frankensearch-fusion --test interaction_integration -- --nocapture\`"
             echo "- Escalation playbook: [Interaction Matrix CI Gate](${PLAYBOOK_URL})"
             echo "- Required metadata artifact: \`interaction_lane_ownership.json\`"
+            echo "- Composition policy artifact: \`composition_matrix_gate_summary.json\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload interaction matrix artifacts
