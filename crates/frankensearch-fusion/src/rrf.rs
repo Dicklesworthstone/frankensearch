@@ -165,9 +165,6 @@ pub fn rrf_fuse(
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
-                // Only mark as in_both_sources if the OTHER source contributed.
-                // Same-source duplicates should not set this flag.
-                hit.in_both_sources = hit.in_both_sources || hit.semantic_rank.is_some();
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: result.doc_id.as_str(),
@@ -189,8 +186,6 @@ pub fn rrf_fuse(
                 fh.rrf_score += rrf_contribution;
                 fh.semantic_rank = Some(rank);
                 fh.semantic_score = Some(hit.score);
-                // Only mark as in_both_sources if the OTHER source contributed.
-                fh.in_both_sources = fh.in_both_sources || fh.lexical_rank.is_some();
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: hit.doc_id.as_str(),
@@ -204,6 +199,9 @@ pub fn rrf_fuse(
     }
 
     let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
+    for hit in &mut results {
+        hit.in_both_sources = hit.lexical_rank.is_some() && hit.semantic_rank.is_some();
+    }
 
     let overlap_count = tracing::enabled!(target: "frankensearch.rrf", Level::DEBUG)
         .then(|| results.iter().filter(|h| h.in_both_sources).count());
@@ -640,6 +638,20 @@ mod tests {
         assert!(!results[0].in_both_sources);
     }
 
+    #[test]
+    fn duplicate_doc_in_single_source_does_not_set_in_both_sources() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("dup", 1.0), lexical_hit("dup", 0.5)];
+
+        let results = rrf_fuse(&lexical, &[], 10, 0, &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "dup");
+        assert!(!results[0].in_both_sources);
+        assert!(results[0].lexical_rank.is_some());
+        assert!(results[0].semantic_rank.is_none());
+    }
+
     fn large_lexical_semantic_fixture(doc_count: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
         let mut lexical = Vec::with_capacity(doc_count);
         let mut semantic = Vec::with_capacity(doc_count);
@@ -677,7 +689,6 @@ mod tests {
                     hit.rrf_score += rrf_contribution;
                     hit.lexical_rank = Some(rank);
                     hit.lexical_score = Some(result.score);
-                    hit.in_both_sources = true;
                 })
                 .or_insert_with(|| FusedHit {
                     doc_id: result.doc_id.clone(),
@@ -698,7 +709,6 @@ mod tests {
                     fh.rrf_score += rrf_contribution;
                     fh.semantic_rank = Some(rank);
                     fh.semantic_score = Some(hit.score);
-                    fh.in_both_sources = true;
                 })
                 .or_insert_with(|| FusedHit {
                     doc_id: hit.doc_id.clone(),
@@ -712,6 +722,9 @@ mod tests {
         }
 
         let mut results: Vec<FusedHit> = hits.into_values().collect();
+        for hit in &mut results {
+            hit.in_both_sources = hit.lexical_rank.is_some() && hit.semantic_rank.is_some();
+        }
         results.sort_by(FusedHit::cmp_for_ranking);
         results.into_iter().skip(offset).take(limit).collect()
     }
