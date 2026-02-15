@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankensearch_core::{
@@ -181,6 +181,7 @@ struct EventSpec<'a> {
     reason_code: Option<&'a str>,
     context: Option<String>,
     metrics: Option<BTreeMap<String, f64>>,
+    oracle_id: Option<&'a str>,
 }
 
 fn make_event(seq: u64, spec: EventSpec<'_>) -> E2eEnvelope<EventBody> {
@@ -198,7 +199,7 @@ fn make_event(seq: u64, spec: EventSpec<'_>) -> E2eEnvelope<EventBody> {
             },
             severity: spec.severity,
             lane_id: spec.lane_id.map(std::borrow::ToOwned::to_owned),
-            oracle_id: None,
+            oracle_id: spec.oracle_id.map(std::borrow::ToOwned::to_owned),
             outcome: spec.outcome,
             reason_code: spec.reason_code.map(std::borrow::ToOwned::to_owned),
             context: spec.context,
@@ -297,6 +298,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: None,
             context: Some("begin ops PTY + snapshot scenario".to_owned()),
             metrics: None,
+            oracle_id: None,
         },
     ));
     event_seq = event_seq.saturating_add(1);
@@ -331,6 +333,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: Some(OPS_REASON_DISCOVERY),
             context: Some("fleet snapshot loaded for discovery triage".to_owned()),
             metrics: Some(discovery_metrics),
+            oracle_id: None,
         },
     ));
     event_seq = event_seq.saturating_add(1);
@@ -352,6 +355,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: Some(OPS_REASON_TRIAGE),
             context: Some("timeline triage navigation from fleet view".to_owned()),
             metrics: None,
+            oracle_id: None,
         },
     ));
     event_seq = event_seq.saturating_add(1);
@@ -389,6 +393,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: Some(OPS_REASON_DRILLDOWN),
             context: Some("project drilldown under degraded control-plane health".to_owned()),
             metrics: None,
+            oracle_id: None,
         },
     ));
     event_seq = event_seq.saturating_add(1);
@@ -429,6 +434,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: Some(OPS_REASON_RECOVERY),
             context: Some("fleet recovered after degraded control-plane interval".to_owned()),
             metrics: None,
+            oracle_id: None,
         },
     ));
     event_seq = event_seq.saturating_add(1);
@@ -624,6 +630,7 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             reason_code: Some(end_reason),
             context: Some("ops PTY + snapshot scenario finished".to_owned()),
             metrics: None,
+            oracle_id: None,
         },
     ));
 
@@ -805,4 +812,346 @@ fn ops_failure_bundle_includes_transcript_snapshot_diff_and_replay_entrypoint() 
         end_event.body.reason_code.as_deref(),
         Some(OPS_REASON_DIFF_FAIL)
     );
+}
+
+// ─── Unit Tests for Artifact Helpers and Edge Cases ────────────────────────
+
+#[test]
+fn ops_event_factory_produces_valid_envelope_with_all_fields() {
+    let metrics = {
+        let mut m = BTreeMap::new();
+        m.insert("latency_ms".to_owned(), 42.5);
+        m.insert("count".to_owned(), 7.0);
+        m
+    };
+    let event = make_event(
+        99,
+        EventSpec {
+            event_type: E2eEventType::PhaseTransition,
+            severity: E2eSeverity::Warn,
+            lane_id: Some("ops.unit_test"),
+            outcome: Some(E2eOutcome::Pass),
+            reason_code: Some("e2e.ops.unit_test_pass"),
+            context: Some("unit test context string".to_owned()),
+            metrics: Some(metrics),
+            oracle_id: None,
+        },
+    );
+    assert_eq!(event.v, 1);
+    assert_eq!(event.schema, E2E_SCHEMA_EVENT);
+    assert_eq!(event.run_id, OPS_RUN_ID);
+    assert_eq!(event.body.event_type, E2eEventType::PhaseTransition);
+    assert_eq!(event.body.severity, E2eSeverity::Warn);
+    assert_eq!(event.body.lane_id.as_deref(), Some("ops.unit_test"));
+    assert_eq!(event.body.outcome, Some(E2eOutcome::Pass));
+    assert_eq!(
+        event.body.reason_code.as_deref(),
+        Some("e2e.ops.unit_test_pass")
+    );
+    assert_eq!(
+        event.body.context.as_deref(),
+        Some("unit test context string")
+    );
+    assert_eq!(
+        event
+            .body
+            .metrics
+            .as_ref()
+            .and_then(|m| m.get("latency_ms")),
+        Some(&42.5)
+    );
+    validate_event_envelope(&event).expect("fully-specified event should validate");
+}
+
+#[test]
+fn ops_event_factory_minimal_event_validates() {
+    let event = make_event(
+        0,
+        EventSpec {
+            event_type: E2eEventType::E2eStart,
+            severity: E2eSeverity::Info,
+            lane_id: Some("ops.minimal"),
+            outcome: None,
+            reason_code: None,
+            context: None,
+            metrics: None,
+            oracle_id: None,
+        },
+    );
+    assert_eq!(event.body.outcome, None);
+    assert_eq!(event.body.reason_code, None);
+    assert_eq!(event.body.context, None);
+    assert_eq!(event.body.metrics, None);
+    validate_event_envelope(&event).expect("minimal event should validate");
+}
+
+#[test]
+fn ops_evidence_jsonl_handles_empty_lifecycle_events() {
+    let empty_snapshot = FleetSnapshot::default();
+    let (jsonl, line_count) = render_evidence_jsonl(&empty_snapshot);
+    // Empty snapshot has no lifecycle events, so JSONL should be empty
+    assert_eq!(line_count, 0);
+    assert!(
+        jsonl.is_empty(),
+        "empty fleet should produce empty evidence JSONL"
+    );
+}
+
+#[test]
+fn ops_replay_command_normalization_preserves_test_name() {
+    let cmd = replay_command_for("my_specific_test_name");
+    assert!(
+        cmd.contains("my_specific_test_name"),
+        "normalized replay command should preserve exact test name"
+    );
+    assert!(
+        cmd.contains("cargo test -p frankensearch-ops"),
+        "replay command should target ops crate"
+    );
+    assert!(
+        cmd.contains("--exact"),
+        "replay command should use --exact for deterministic selection"
+    );
+    // Verify no double spaces (normalization contract)
+    assert!(
+        !cmd.contains("  "),
+        "normalized replay command should not contain consecutive spaces"
+    );
+}
+
+#[test]
+fn ops_env_json_payload_is_valid_json_with_suite_field() {
+    let payload = ops_env_json_payload();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("env.json payload should be valid JSON");
+    assert_eq!(
+        parsed.get("suite").and_then(|v| v.as_str()),
+        Some("ops"),
+        "env.json must contain suite=ops"
+    );
+    assert!(
+        parsed.get("schema").is_some(),
+        "env.json must contain schema field"
+    );
+}
+
+#[test]
+fn ops_repro_lock_payload_reflects_exit_status() {
+    let pass_lock = ops_repro_lock_payload(ExitStatus::Pass);
+    assert!(pass_lock.contains("exit_status=pass"));
+    assert!(pass_lock.contains(&format!("run_id={OPS_RUN_ID}")));
+    assert!(pass_lock.contains(&format!("seed={OPS_SEED}")));
+
+    let fail_lock = ops_repro_lock_payload(ExitStatus::Fail);
+    assert!(fail_lock.contains("exit_status=fail"));
+
+    let error_lock = ops_repro_lock_payload(ExitStatus::Error);
+    assert!(error_lock.contains("exit_status=error"));
+}
+
+#[test]
+fn ops_to_jsonl_produces_one_line_per_item_without_trailing_newline() {
+    let items = vec![
+        serde_json::json!({"a": 1}),
+        serde_json::json!({"b": 2}),
+        serde_json::json!({"c": 3}),
+    ];
+    let jsonl = to_jsonl(&items);
+    let lines: Vec<&str> = jsonl.split('\n').collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "JSONL should have exactly one line per item"
+    );
+    for line in &lines {
+        serde_json::from_str::<serde_json::Value>(line)
+            .expect("each JSONL line should be valid JSON");
+    }
+}
+
+#[test]
+fn ops_to_jsonl_handles_single_item() {
+    let items = vec![serde_json::json!({"only": true})];
+    let jsonl = to_jsonl(&items);
+    assert!(
+        !jsonl.contains('\n'),
+        "single-item JSONL should have no newlines"
+    );
+    serde_json::from_str::<serde_json::Value>(&jsonl).expect("single-line JSONL should parse");
+}
+
+#[test]
+fn ops_to_jsonl_handles_empty_list() {
+    let items: Vec<serde_json::Value> = vec![];
+    let jsonl = to_jsonl(&items);
+    assert!(jsonl.is_empty(), "empty list should produce empty string");
+}
+
+#[test]
+fn ops_fnv1a64_is_deterministic_and_distribution_sensitive() {
+    let hash1 = fnv1a64(b"hello world");
+    let hash2 = fnv1a64(b"hello world");
+    assert_eq!(hash1, hash2, "same input must produce same hash");
+
+    let hash3 = fnv1a64(b"hello worlD");
+    assert_ne!(hash1, hash3, "single-bit change should change hash");
+
+    let hash_empty = fnv1a64(b"");
+    assert_ne!(hash_empty, 0, "empty input should produce non-zero hash");
+}
+
+#[test]
+fn ops_snapshot_capture_metadata_is_complete() {
+    let source = MockDataSource::sample();
+    let mut app = OpsApp::new(Box::new(source));
+    app.refresh_data();
+
+    let snap = capture_snapshot(&mut app, "test.unit", 80, 24);
+    assert_eq!(snap.label, "test.unit");
+    assert_eq!(snap.width, 80);
+    assert_eq!(snap.height, 24);
+    assert!(!snap.checksum.is_empty(), "checksum should be non-empty");
+    assert_eq!(
+        snap.checksum.len(),
+        16,
+        "FNV-1a64 checksum should be 16 hex chars"
+    );
+    // Verify determinism: same render should produce same checksum
+    let snap2 = capture_snapshot(&mut app, "test.unit", 80, 24);
+    assert_eq!(
+        snap.checksum, snap2.checksum,
+        "repeated render should be deterministic"
+    );
+}
+
+#[test]
+fn ops_pass_scenario_excludes_failure_only_artifacts() {
+    let output = run_ops_scenario("ops_pass_scenario_excludes_failure_only_artifacts", false);
+    let artifact_files: Vec<&str> = output
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect();
+    // Pass runs should NOT include snapshot_diff
+    assert!(
+        !artifact_files.contains(&"ops_snapshot_diff.json"),
+        "pass scenario should not include snapshot diff artifact"
+    );
+    assert!(output.snapshot_diff.is_none());
+    // But should include core mandatory artifacts
+    assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
+}
+
+#[test]
+fn ops_artifact_entries_are_sorted_alphabetically() {
+    let output = run_ops_scenario("ops_artifact_entries_are_sorted_alphabetically", false);
+    let file_names: Vec<&str> = output
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect();
+    let mut sorted = file_names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        file_names, sorted,
+        "artifact entries must be sorted alphabetically for stable manifest diffs"
+    );
+}
+
+#[test]
+fn ops_artifact_checksums_are_sha256_prefixed() {
+    let output = run_ops_scenario("ops_artifact_checksums_are_sha256_prefixed", false);
+    for artifact in &output.manifest.body.artifacts {
+        assert!(
+            artifact.checksum.starts_with("sha256:"),
+            "artifact '{}' checksum should be sha256-prefixed, got: {}",
+            artifact.file,
+            artifact.checksum
+        );
+        // sha256: prefix (7 chars) + 64 hex chars = 71 total
+        assert_eq!(
+            artifact.checksum.len(),
+            71,
+            "artifact '{}' checksum should be exactly 71 chars (sha256: + 64 hex)",
+            artifact.file
+        );
+    }
+}
+
+#[test]
+fn ops_manifest_envelope_has_correct_schema_and_version() {
+    let output = run_ops_scenario(
+        "ops_manifest_envelope_has_correct_schema_and_version",
+        false,
+    );
+    assert_eq!(output.manifest.v, 1);
+    assert_eq!(output.manifest.schema, E2E_SCHEMA_MANIFEST);
+    assert_eq!(output.manifest.run_id, OPS_RUN_ID);
+    assert_eq!(
+        output.manifest.body.determinism_tier,
+        DeterminismTier::BitExact
+    );
+    assert_eq!(output.manifest.body.clock_mode, ClockMode::Simulated);
+}
+
+#[test]
+fn ops_event_stream_has_start_and_end_bookends() {
+    let output = run_ops_scenario("ops_event_stream_has_start_and_end_bookends", false);
+    let first = output.events.first().expect("events should not be empty");
+    let last = output.events.last().expect("events should not be empty");
+    assert_eq!(
+        first.body.event_type,
+        E2eEventType::E2eStart,
+        "first event should be E2eStart"
+    );
+    assert_eq!(
+        last.body.event_type,
+        E2eEventType::E2eEnd,
+        "last event should be E2eEnd"
+    );
+}
+
+#[test]
+fn ops_event_correlation_ids_are_unique() {
+    let output = run_ops_scenario("ops_event_correlation_ids_are_unique", false);
+    let event_ids: Vec<&str> = output
+        .events
+        .iter()
+        .map(|e| e.body.correlation.event_id.as_str())
+        .collect();
+    let unique: BTreeSet<&str> = event_ids.iter().copied().collect();
+    assert_eq!(
+        event_ids.len(),
+        unique.len(),
+        "all event correlation IDs must be unique"
+    );
+}
+
+#[test]
+fn ops_jsonl_line_counts_match_actual_lines() {
+    let output = run_ops_scenario("ops_jsonl_line_counts_match_actual_lines", false);
+    for artifact in &output.manifest.body.artifacts {
+        if std::path::Path::new(&artifact.file)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        {
+            assert!(
+                artifact.line_count.is_some(),
+                "JSONL artifact '{}' must include line_count",
+                artifact.file
+            );
+        } else {
+            assert!(
+                artifact.line_count.is_none(),
+                "non-JSONL artifact '{}' must not include line_count",
+                artifact.file
+            );
+        }
+    }
 }

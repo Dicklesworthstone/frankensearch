@@ -1308,4 +1308,467 @@ mod tests {
             "unknown filter should include events for real projects named unknown"
         );
     }
+
+    // ─── bd-u944 tests begin ───
+
+    // --- SeverityFilter ---
+
+    #[test]
+    fn severity_filter_next_cycles() {
+        assert_eq!(SeverityFilter::All.next(), SeverityFilter::Info);
+        assert_eq!(SeverityFilter::Info.next(), SeverityFilter::Warn);
+        assert_eq!(SeverityFilter::Warn.next(), SeverityFilter::Critical);
+        assert_eq!(SeverityFilter::Critical.next(), SeverityFilter::All);
+    }
+
+    #[test]
+    fn severity_filter_label_all_variants() {
+        assert_eq!(SeverityFilter::All.label(), "all");
+        assert_eq!(SeverityFilter::Info.label(), "info");
+        assert_eq!(SeverityFilter::Warn.label(), "warn");
+        assert_eq!(SeverityFilter::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn severity_filter_allows_all_passes_everything() {
+        assert!(SeverityFilter::All.allows(EventSeverity::Info));
+        assert!(SeverityFilter::All.allows(EventSeverity::Warn));
+        assert!(SeverityFilter::All.allows(EventSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_info_only_passes_info() {
+        assert!(SeverityFilter::Info.allows(EventSeverity::Info));
+        assert!(!SeverityFilter::Info.allows(EventSeverity::Warn));
+        assert!(!SeverityFilter::Info.allows(EventSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_warn_only_passes_warn() {
+        assert!(!SeverityFilter::Warn.allows(EventSeverity::Info));
+        assert!(SeverityFilter::Warn.allows(EventSeverity::Warn));
+        assert!(!SeverityFilter::Warn.allows(EventSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_critical_only_passes_critical() {
+        assert!(!SeverityFilter::Critical.allows(EventSeverity::Info));
+        assert!(!SeverityFilter::Critical.allows(EventSeverity::Warn));
+        assert!(SeverityFilter::Critical.allows(EventSeverity::Critical));
+    }
+
+    // --- EventSeverity ---
+
+    #[test]
+    fn event_severity_labels() {
+        assert_eq!(EventSeverity::Info.label(), "info");
+        assert_eq!(EventSeverity::Warn.label(), "warn");
+        assert_eq!(EventSeverity::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn event_severity_colors() {
+        assert_eq!(EventSeverity::Info.color(), Color::Gray);
+        assert_eq!(EventSeverity::Warn.color(), Color::Yellow);
+        assert_eq!(EventSeverity::Critical.color(), Color::Red);
+    }
+
+    // --- host_bucket ---
+
+    #[test]
+    fn host_bucket_colon_separator() {
+        assert_eq!(ActionTimelineScreen::host_bucket("host-a:inst-1"), "host-a");
+    }
+
+    #[test]
+    fn host_bucket_dash_separator() {
+        assert_eq!(ActionTimelineScreen::host_bucket("server-123"), "server");
+    }
+
+    #[test]
+    fn host_bucket_no_separator() {
+        assert_eq!(
+            ActionTimelineScreen::host_bucket("standalone"),
+            "standalone"
+        );
+    }
+
+    #[test]
+    fn host_bucket_colon_takes_priority_over_dash() {
+        assert_eq!(
+            ActionTimelineScreen::host_bucket("my-host:my-inst"),
+            "my-host"
+        );
+    }
+
+    // --- event_severity ---
+
+    #[test]
+    fn event_severity_stopped_is_critical() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stopped,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 100,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn event_severity_stale_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stale,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 100,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_degraded_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Degraded,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 100,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_recovering_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Degraded,
+            to: LifecycleState::Recovering,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 100,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_collision_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 50,
+            attribution_collision: true,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_healthy_no_collision_is_info() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 100,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            ActionTimelineScreen::event_severity(&event),
+            EventSeverity::Info
+        );
+    }
+
+    // --- timeline_summary ---
+
+    #[test]
+    fn timeline_summary_empty() {
+        assert_eq!(
+            ActionTimelineScreen::timeline_summary(&[]),
+            "no lifecycle events"
+        );
+    }
+
+    #[test]
+    fn timeline_summary_with_data() {
+        let events = vec![
+            LifecycleEvent {
+                instance_id: "a:1".to_owned(),
+                from: LifecycleState::Started,
+                to: LifecycleState::Healthy,
+                reason_code: "test".to_owned(),
+                at_ms: 1000,
+                attribution_confidence_score: 90,
+                attribution_collision: false,
+            },
+            LifecycleEvent {
+                instance_id: "b:2".to_owned(),
+                from: LifecycleState::Healthy,
+                to: LifecycleState::Stale,
+                reason_code: "test".to_owned(),
+                at_ms: 900,
+                attribution_confidence_score: 70,
+                attribution_collision: true,
+            },
+        ];
+        let summary = ActionTimelineScreen::timeline_summary(&events);
+        assert!(summary.contains("2 events"));
+        assert!(summary.contains("1 attribution collision"));
+    }
+
+    // --- rolling_counter_summary ---
+
+    #[test]
+    fn rolling_counter_summary_empty() {
+        let summary = ActionTimelineScreen::rolling_counter_summary(&[]);
+        assert!(summary.contains("windows:"));
+    }
+
+    // --- filter_summary ---
+
+    #[test]
+    fn filter_summary_default_all() {
+        let screen = ActionTimelineScreen::new();
+        let summary = screen.filter_summary();
+        assert!(summary.contains("project=all"));
+        assert!(summary.contains("severity=all"));
+        assert!(summary.contains("reason=all"));
+        assert!(summary.contains("host=all"));
+    }
+
+    // --- selected accessors ---
+
+    #[test]
+    fn selected_project_with_data() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        // First event (row 0, sorted desc by timestamp) is host-a:inst-a → proj-a
+        assert_eq!(screen.selected_project().as_deref(), Some("proj-a"));
+    }
+
+    #[test]
+    fn selected_project_empty_state() {
+        let screen = ActionTimelineScreen::new();
+        assert!(screen.selected_project().is_none());
+    }
+
+    #[test]
+    fn selected_reason_code_with_data() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        assert_eq!(
+            screen.selected_reason_code().as_deref(),
+            Some("lifecycle.discovery.heartbeat")
+        );
+    }
+
+    #[test]
+    fn selected_host_with_data() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        assert_eq!(screen.selected_host().as_deref(), Some("host-a"));
+    }
+
+    // --- event_count ---
+
+    #[test]
+    fn event_count_with_data() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        assert_eq!(screen.event_count(), 3);
+    }
+
+    #[test]
+    fn event_count_empty() {
+        let screen = ActionTimelineScreen::new();
+        assert_eq!(screen.event_count(), 0);
+    }
+
+    // --- selected_context_summary ---
+
+    #[test]
+    fn selected_context_summary_none_when_empty() {
+        let screen = ActionTimelineScreen::new();
+        assert_eq!(screen.selected_context_summary(), "focus: none");
+    }
+
+    // --- Default impl ---
+
+    #[test]
+    fn default_matches_new() {
+        let default_screen = ActionTimelineScreen::default();
+        let new_screen = ActionTimelineScreen::new();
+        assert_eq!(default_screen.id(), new_screen.id());
+        assert_eq!(default_screen.selected_row, new_screen.selected_row);
+    }
+
+    // --- as_any downcast ---
+
+    #[test]
+    fn as_any_downcast() {
+        let screen = ActionTimelineScreen::new();
+        let any_ref: &dyn Any = screen.as_any();
+        assert!(any_ref.downcast_ref::<ActionTimelineScreen>().is_some());
+    }
+
+    // --- reset_filters ---
+
+    #[test]
+    fn reset_filters_restores_all() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        screen.project_filter_index = 1;
+        screen.reason_filter_index = 1;
+        screen.host_filter_index = 1;
+        screen.severity_filter = SeverityFilter::Critical;
+
+        screen.reset_filters();
+
+        assert_eq!(screen.project_filter_index, 0);
+        assert_eq!(screen.reason_filter_index, 0);
+        assert_eq!(screen.host_filter_index, 0);
+        assert_eq!(screen.severity_filter, SeverityFilter::All);
+    }
+
+    // --- k/j navigation ---
+
+    #[test]
+    fn k_key_navigates_up() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 1;
+        let ctx = screen_context();
+
+        let k = InputEvent::Key(
+            crossterm::event::KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&k, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn j_key_navigates_down() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let j = InputEvent::Key(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&j, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+    }
+
+    // --- unrecognized key ---
+
+    #[test]
+    fn unrecognized_key_returns_ignored() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let z = InputEvent::Key(
+            crossterm::event::KeyCode::Char('z'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&z, &ctx), ScreenAction::Ignored);
+    }
+
+    // --- severity cycle key ---
+
+    #[test]
+    fn s_key_cycles_severity_filter() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let s = InputEvent::Key(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&s, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.severity_filter, SeverityFilter::Info);
+    }
+
+    // --- reason cycle key ---
+
+    #[test]
+    fn r_key_cycles_reason_filter() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let r = InputEvent::Key(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&r, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.reason_filter_index, 1);
+    }
+
+    // --- host cycle key ---
+
+    #[test]
+    fn h_key_cycles_host_filter() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let h = InputEvent::Key(
+            crossterm::event::KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&h, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.host_filter_index, 1);
+    }
+
+    // --- x key resets ---
+
+    #[test]
+    fn x_key_resets_filters() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        screen.project_filter_index = 1;
+        screen.severity_filter = SeverityFilter::Warn;
+
+        let x = InputEvent::Key(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&x, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.project_filter_index, 0);
+        assert_eq!(screen.severity_filter, SeverityFilter::All);
+    }
+
+    // ─── bd-u944 tests end ───
 }

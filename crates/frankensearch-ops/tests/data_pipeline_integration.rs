@@ -93,6 +93,56 @@ fn temp_ops_db_path(test_name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn apply_pipeline_batches_empty_input_is_noop() {
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+    let result =
+        apply_pipeline_batches(&storage, &[], 8_192).expect("empty batch replay should succeed");
+
+    assert_eq!(result, SloMaterializationResult::default());
+    let metrics = storage.ingestion_metrics();
+    assert_eq!(metrics.total_batches, 0);
+    assert_eq!(metrics.total_inserted, 0);
+    assert_eq!(metrics.pending_events, 0);
+}
+
+#[test]
+fn apply_pipeline_batches_rejects_now_ms_overflow() {
+    let simulator =
+        TelemetrySimulator::new(pipeline_config(8_181)).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    assert!(!run.batches.is_empty(), "expected at least one batch");
+
+    let mut mutated_batches = run.batches;
+    mutated_batches[0].now_ms = (i64::MAX as u64).saturating_add(1);
+
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+    let err = apply_pipeline_batches(&storage, &mutated_batches, 8_192)
+        .expect_err("overflowed now_ms should fail");
+
+    assert!(
+        matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "now_ms"),
+        "expected InvalidConfig(now_ms), got {err:?}"
+    );
+}
+
+#[test]
+fn apply_pipeline_rejects_zero_backpressure_threshold() {
+    let simulator = TelemetrySimulator::new(pipeline_config(222)).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    assert!(
+        run.total_search_events() > 0,
+        "expected simulator to emit search events"
+    );
+
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+    let err = apply_pipeline(&storage, &run, 0).expect_err("zero threshold should fail validation");
+    assert!(
+        matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "backpressure_threshold"),
+        "expected InvalidConfig(backpressure_threshold), got {err:?}"
+    );
+}
+
+#[test]
 fn pipeline_ingest_to_aggregation_materializes_expected_views() {
     let simulator = TelemetrySimulator::new(pipeline_config(21)).expect("config should validate");
     let run = simulator.generate().expect("generation should succeed");
@@ -495,5 +545,90 @@ fn pipeline_recovers_after_restart_with_telemetry_gap() {
     assert!(
         !fleet_rollups.is_empty(),
         "expected fleet rollups after restart + telemetry gap replay"
+    );
+}
+
+#[test]
+fn pipeline_restart_with_empty_late_segment_is_noop() {
+    let config = TelemetrySimulatorConfig {
+        seed: 7_707,
+        ticks: 8,
+        projects: vec![SimulatedProject {
+            project_key: "cass".to_owned(),
+            host_name: "cass-restart".to_owned(),
+            instance_count: 2,
+            workload: WorkloadProfile::Restarting,
+        }],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let simulator = TelemetrySimulator::new(config).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    assert!(
+        !run.batches.is_empty(),
+        "expected at least one replay batch"
+    );
+
+    let early = &run.batches[..];
+    let late = &run.batches[run.batches.len()..];
+    assert!(
+        late.is_empty(),
+        "late segment should be intentionally empty"
+    );
+
+    let storage_path = temp_ops_db_path("restart-empty-late");
+    let storage_config = OpsStorageConfig {
+        db_path: storage_path,
+        busy_timeout_ms: 25,
+        ..OpsStorageConfig::default()
+    };
+
+    let storage_before_restart =
+        OpsStorage::open(storage_config.clone()).expect("storage before restart should open");
+    let _ = apply_pipeline_batches(&storage_before_restart, early, 8_192)
+        .expect("initial replay should succeed");
+    let metrics_before = storage_before_restart.ingestion_metrics();
+    assert!(
+        metrics_before.total_inserted > 0,
+        "expected initial replay to insert records"
+    );
+    drop(storage_before_restart);
+
+    let storage_after_restart =
+        OpsStorage::open(storage_config).expect("storage after restart should open");
+    let metrics_after_restart_before = storage_after_restart.ingestion_metrics();
+    let replay_result = apply_pipeline_batches(&storage_after_restart, late, 8_192)
+        .expect("empty late replay should be a no-op");
+    assert_eq!(replay_result, SloMaterializationResult::default());
+
+    let metrics_after = storage_after_restart.ingestion_metrics();
+    assert_eq!(
+        metrics_after.total_inserted,
+        metrics_after_restart_before.total_inserted
+    );
+    assert_eq!(
+        metrics_after.total_batches,
+        metrics_after_restart_before.total_batches
+    );
+    assert_eq!(
+        metrics_after.pending_events,
+        metrics_after_restart_before.pending_events
+    );
+
+    for (project_key, instance_id) in run.instance_pairs() {
+        let summary = storage_after_restart
+            .latest_search_summary(&project_key, &instance_id, SummaryWindow::OneMinute)
+            .expect("summary query should succeed");
+        assert!(
+            summary.is_some(),
+            "expected existing summaries to remain for {project_key}/{instance_id}"
+        );
+    }
+
+    let fleet_rollups = storage_after_restart
+        .query_slo_rollups_for_scope(SloScope::Fleet, "__fleet__", 16)
+        .expect("fleet rollup query should succeed");
+    assert!(
+        !fleet_rollups.is_empty(),
+        "expected prior rollups to persist after empty late replay"
     );
 }

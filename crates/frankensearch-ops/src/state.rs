@@ -2037,7 +2037,7 @@ mod tests {
             attribution_collision: false,
         }];
         let snap = FleetSnapshot {
-            lifecycle_events: events.clone(),
+            lifecycle_events: events,
             ..FleetSnapshot::default()
         };
         assert_eq!(snap.lifecycle_events().len(), 1);
@@ -2183,10 +2183,10 @@ mod tests {
     fn app_state_connection_status_reflects_stale() {
         let mut state = AppState::new();
         let mut lifecycle = HashMap::new();
-        let mut stale = InstanceLifecycle::new(10);
-        stale.apply_signal(LifecycleSignal::Heartbeat, 20, None);
-        stale.mark_stale_if_heartbeat_gap(10_000, 5_000);
-        lifecycle.insert("inst-s".to_string(), stale);
+        let mut stale_lc = InstanceLifecycle::new(10);
+        stale_lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        stale_lc.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        lifecycle.insert("inst-s".to_string(), stale_lc);
 
         let snap = FleetSnapshot {
             instances: vec![InstanceInfo {

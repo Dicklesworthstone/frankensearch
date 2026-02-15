@@ -367,6 +367,368 @@ fn run_soak_pipeline(
 // ─── Soak Tests ─────────────────────────────────────────────────────────────
 
 #[test]
+fn drift_report_flags_monotonic_pending_and_anomaly_growth() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 100,
+            total_batches: 4,
+            total_write_latency_us: 40_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 10,
+            high_watermark_pending: 10,
+            open_anomalies: 1,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 180,
+            total_batches: 8,
+            total_write_latency_us: 96_000,
+            backpressured_batches: 1,
+            _total_deduplicated: 2,
+            total_failed_records: 0,
+            pending_events: 20,
+            high_watermark_pending: 20,
+            open_anomalies: 2,
+        },
+        SoakCheckpoint {
+            _tick_index: 2,
+            total_inserted: 260,
+            total_batches: 12,
+            total_write_latency_us: 180_000,
+            backpressured_batches: 2,
+            _total_deduplicated: 4,
+            total_failed_records: 0,
+            pending_events: 30,
+            high_watermark_pending: 30,
+            open_anomalies: 3,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert!(report.monotonic_pending_growth);
+    assert!(report.monotonic_anomaly_growth);
+    assert_eq!(report.max_pending_events, 30);
+    assert_eq!(report.max_open_anomalies, 3);
+}
+
+#[test]
+fn drift_report_computes_latency_drift_and_throughput_deltas() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 50,
+            total_batches: 5,
+            total_write_latency_us: 100_000, // 20_000 avg
+            backpressured_batches: 1,
+            _total_deduplicated: 1,
+            total_failed_records: 0,
+            pending_events: 2,
+            high_watermark_pending: 3,
+            open_anomalies: 0,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 120,
+            total_batches: 10,
+            total_write_latency_us: 300_000, // 30_000 avg
+            backpressured_batches: 2,
+            _total_deduplicated: 2,
+            total_failed_records: 0,
+            pending_events: 1,
+            high_watermark_pending: 3,
+            open_anomalies: 1,
+        },
+        SoakCheckpoint {
+            _tick_index: 2,
+            total_inserted: 200,
+            total_batches: 15,
+            total_write_latency_us: 600_000, // 40_000 avg
+            backpressured_batches: 4,
+            _total_deduplicated: 3,
+            total_failed_records: 1,
+            pending_events: 0,
+            high_watermark_pending: 3,
+            open_anomalies: 1,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert_eq!(report.checkpoint_count, 3);
+    assert_eq!(report.total_events, 200);
+    assert_eq!(report.total_batches, 15);
+    assert_eq!(report.total_backpressured, 4);
+    assert_eq!(report.total_failed, 1);
+    assert_eq!(report.throughput_deltas, vec![70, 80]);
+    assert!(report.first_avg_latency_us > 0.0);
+    assert!(report.last_avg_latency_us > report.first_avg_latency_us);
+    assert!(report.latency_drift_pct > 0.0);
+}
+
+#[test]
+fn drift_report_handles_zero_batch_checkpoints_without_divide_by_zero() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 0,
+            total_batches: 0,
+            total_write_latency_us: 0,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 0,
+            high_watermark_pending: 0,
+            open_anomalies: 0,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 0,
+            total_batches: 0,
+            total_write_latency_us: 0,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 0,
+            high_watermark_pending: 0,
+            open_anomalies: 0,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert!(
+        report.first_avg_latency_us.abs() <= f64::EPSILON,
+        "expected zero first_avg_latency_us, got {}",
+        report.first_avg_latency_us
+    );
+    assert!(
+        report.last_avg_latency_us.abs() <= f64::EPSILON,
+        "expected zero last_avg_latency_us, got {}",
+        report.last_avg_latency_us
+    );
+    assert!(
+        report.latency_drift_pct.abs() <= f64::EPSILON,
+        "expected zero latency_drift_pct, got {}",
+        report.latency_drift_pct
+    );
+}
+
+#[test]
+fn drift_report_empty_checkpoints_defaults_to_zero_metrics() {
+    let report = DriftReport::from_checkpoints(&[]);
+    assert_eq!(report.checkpoint_count, 0);
+    assert_eq!(report.total_events, 0);
+    assert_eq!(report.total_batches, 0);
+    assert!(
+        report.first_avg_latency_us.abs() <= f64::EPSILON,
+        "expected zero first_avg_latency_us for empty checkpoints, got {}",
+        report.first_avg_latency_us
+    );
+    assert!(
+        report.last_avg_latency_us.abs() <= f64::EPSILON,
+        "expected zero last_avg_latency_us for empty checkpoints, got {}",
+        report.last_avg_latency_us
+    );
+    assert!(
+        report.latency_drift_pct.abs() <= f64::EPSILON,
+        "expected zero latency_drift_pct for empty checkpoints, got {}",
+        report.latency_drift_pct
+    );
+    assert_eq!(report.max_pending_events, 0);
+    assert_eq!(report.max_open_anomalies, 0);
+    assert!(!report.monotonic_pending_growth);
+    assert!(!report.monotonic_anomaly_growth);
+    assert!(report.throughput_deltas.is_empty());
+}
+
+#[test]
+fn drift_report_monotonic_flags_require_at_least_three_checkpoints() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 10,
+            total_batches: 1,
+            total_write_latency_us: 1_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 1,
+            high_watermark_pending: 1,
+            open_anomalies: 1,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 20,
+            total_batches: 2,
+            total_write_latency_us: 2_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 2,
+            high_watermark_pending: 2,
+            open_anomalies: 2,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert!(!report.monotonic_pending_growth);
+    assert!(!report.monotonic_anomaly_growth);
+}
+
+#[test]
+fn drift_report_throughput_deltas_saturate_when_total_inserted_decreases() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 100,
+            total_batches: 10,
+            total_write_latency_us: 200_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 5,
+            high_watermark_pending: 8,
+            open_anomalies: 1,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 90, // non-monotonic to exercise saturating_sub
+            total_batches: 12,
+            total_write_latency_us: 250_000,
+            backpressured_batches: 1,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 4,
+            high_watermark_pending: 8,
+            open_anomalies: 1,
+        },
+        SoakCheckpoint {
+            _tick_index: 2,
+            total_inserted: 120,
+            total_batches: 14,
+            total_write_latency_us: 290_000,
+            backpressured_batches: 2,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 3,
+            high_watermark_pending: 8,
+            open_anomalies: 1,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert_eq!(report.throughput_deltas, vec![0, 30]);
+}
+
+#[test]
+fn drift_report_monotonic_flags_require_positive_terminal_counts() {
+    let checkpoints = vec![
+        SoakCheckpoint {
+            _tick_index: 0,
+            total_inserted: 10,
+            total_batches: 1,
+            total_write_latency_us: 1_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 0,
+            high_watermark_pending: 0,
+            open_anomalies: 0,
+        },
+        SoakCheckpoint {
+            _tick_index: 1,
+            total_inserted: 20,
+            total_batches: 2,
+            total_write_latency_us: 2_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 0,
+            high_watermark_pending: 0,
+            open_anomalies: 0,
+        },
+        SoakCheckpoint {
+            _tick_index: 2,
+            total_inserted: 30,
+            total_batches: 3,
+            total_write_latency_us: 3_000,
+            backpressured_batches: 0,
+            _total_deduplicated: 0,
+            total_failed_records: 0,
+            pending_events: 0,
+            high_watermark_pending: 0,
+            open_anomalies: 0,
+        },
+    ];
+
+    let report = DriftReport::from_checkpoints(&checkpoints);
+    assert!(!report.monotonic_pending_growth);
+    assert!(!report.monotonic_anomaly_growth);
+}
+
+#[test]
+fn run_soak_pipeline_captures_final_checkpoint_even_with_large_interval() {
+    let config = TelemetrySimulatorConfig {
+        seed: 0xDEAD_BEEF_1001,
+        ticks: 6,
+        projects: vec![SimulatedProject {
+            project_key: "checkpoint-test".to_owned(),
+            host_name: "checkpoint-test".to_owned(),
+            instance_count: 1,
+            workload: WorkloadProfile::Steady,
+        }],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let sim = TelemetrySimulator::new(config).expect("config should validate");
+    let run = sim.generate().expect("generation should succeed");
+    assert!(!run.batches.is_empty(), "expected non-empty run");
+
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+    let checkpoints = run_soak_pipeline(&storage, &run, 1_000, 16_384)
+        .expect("pipeline should succeed with large checkpoint interval");
+
+    let expected_checkpoint_count = if run.batches.len() == 1 { 1 } else { 2 };
+    assert_eq!(checkpoints.len(), expected_checkpoint_count);
+
+    let metrics = storage.ingestion_metrics();
+    assert_eq!(
+        checkpoints.last().map_or(0, |c| c.total_inserted),
+        metrics.total_inserted,
+        "final checkpoint should reflect final ingested event count"
+    );
+}
+
+#[test]
+fn run_soak_pipeline_surfaces_queue_full_error_when_threshold_is_zero() {
+    let config = TelemetrySimulatorConfig {
+        seed: 0xDEAD_BEEF_1002,
+        ticks: 8,
+        projects: vec![SimulatedProject {
+            project_key: "queuefull-test".to_owned(),
+            host_name: "queuefull-test".to_owned(),
+            instance_count: 3,
+            workload: WorkloadProfile::Burst,
+        }],
+        ..TelemetrySimulatorConfig::default()
+    };
+    let sim = TelemetrySimulator::new(config).expect("config should validate");
+    let run = sim.generate().expect("generation should succeed");
+    assert!(
+        run.total_search_events() > 0,
+        "expected burst profile to generate search events"
+    );
+
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+    let err =
+        run_soak_pipeline(&storage, &run, 1, 0).expect_err("zero threshold should fail validation");
+    assert!(
+        matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "backpressure_threshold"),
+        "expected InvalidConfig(backpressure_threshold), got {err:?}"
+    );
+}
+
+#[test]
 #[ignore = "Soak test: ~120 ticks, run with --ignored --nocapture"]
 fn soak_short_deterministic_replay() {
     // Verify deterministic generation: two runs with the same seed produce
@@ -449,8 +811,9 @@ fn soak_short_no_leak_or_drift() {
     // ingest at least some events.
     if report.throughput_deltas.len() >= 2 {
         let zero_deltas = report.throughput_deltas.iter().filter(|&&d| d == 0).count();
-        assert!(
-            zero_deltas == 0,
+        assert_eq!(
+            zero_deltas,
+            0,
             "throughput collapse: {zero_deltas}/{} checkpoint intervals had zero events ingested",
             report.throughput_deltas.len(),
         );
@@ -516,8 +879,8 @@ fn soak_extended_stability_under_sustained_load() {
     // Throughput: no zero-event intervals.
     if report.throughput_deltas.len() >= 2 {
         let zero_count = report.throughput_deltas.iter().filter(|&&d| d == 0).count();
-        assert!(
-            zero_count == 0,
+        assert_eq!(
+            zero_count, 0,
             "throughput collapse in 24-min soak: {zero_count} zero intervals"
         );
     }
@@ -703,8 +1066,8 @@ fn soak_embedding_wave_queue_stability() {
     // The wave pattern should produce throughput variability but no collapse.
     if report.throughput_deltas.len() >= 2 {
         let zero_count = report.throughput_deltas.iter().filter(|&&d| d == 0).count();
-        assert!(
-            zero_count == 0,
+        assert_eq!(
+            zero_count, 0,
             "throughput collapse during embedding wave: {zero_count} zero intervals"
         );
     }

@@ -5154,8 +5154,8 @@ mod tests {
 
     #[test]
     fn optional_f64_some_is_float() {
-        match super::optional_f64(Some(3.14_f64)) {
-            SqliteValue::Float(v) => assert!((v - 3.14_f64).abs() < f64::EPSILON),
+        match super::optional_f64(Some(2.72_f64)) {
+            SqliteValue::Float(v) => assert!((v - 2.72_f64).abs() < f64::EPSILON),
             other => panic!("expected Float, got {other:?}"),
         }
     }

@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn signal_kind_ord() {
-        let mut kinds = vec![
+        let mut kinds = [
             DiscoverySignalKind::Heartbeat,
             DiscoverySignalKind::Process,
             DiscoverySignalKind::Socket,
@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn static_source_returns_sightings() {
         let sightings = vec![process_sighting(10, "cass", "host-a", 42)];
-        let mut source = StaticDiscoverySource::new(sightings.clone());
+        let mut source = StaticDiscoverySource::new(sightings);
         let collected = source.collect(100);
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].source, DiscoverySignalKind::Process);

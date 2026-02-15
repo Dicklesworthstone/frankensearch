@@ -1931,7 +1931,7 @@ mod tests {
         let p95 = HistoricalAnalyticsScreen::percentile(&values, 95);
         let p100 = HistoricalAnalyticsScreen::percentile(&values, 100);
         assert_eq!(p0, 10);
-        assert!(p50 >= 50 && p50 <= 60);
+        assert!((50..=60).contains(&p50));
         assert!(p95 >= 90);
         assert_eq!(p100, 100);
     }
@@ -2011,7 +2011,7 @@ mod tests {
             severity: EventSeverity::Info,
             reason_code: "test".into(),
             confidence: 90,
-            replay_handle: "".into(),
+            replay_handle: String::new(),
         };
         let normalized = HistoricalAnalyticsScreen::normalize_replay_handle(&row);
         assert!(normalized.starts_with("replay://"));
@@ -2102,7 +2102,7 @@ mod tests {
             severity: EventSeverity::Info,
             reason_code: "test".into(),
             confidence: 50,
-            replay_handle: "".into(),
+            replay_handle: String::new(),
         };
         let fallback = HistoricalAnalyticsScreen::fallback_replay_handle(&row);
         assert_eq!(fallback, "replay://myproj/h1/h1:abc/42");
