@@ -624,6 +624,23 @@ rch queue                     # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
+### Sibling Dependency Bootstrap (bd-1pgv)
+
+rch workers only sync the project directory — sibling path dependencies (`asupersync`, `frankensqlite`, `fast_cmaes`) referenced in Cargo.toml are **not** available on workers by default. Before offloading builds, ensure deps are set up:
+
+```bash
+# Check if deps are available (exit 1 if missing)
+scripts/rch-ensure-deps.sh --check
+
+# Auto-fix: clone missing deps and rewrite paths
+scripts/rch-ensure-deps.sh
+
+# Force refresh to pinned commits
+scripts/rch-ensure-deps.sh --force
+```
+
+On the dev machine this is a no-op (deps are at `/data/projects/`). On workers, it clones the deps as siblings and rewrites absolute paths in Cargo.toml files. The pinned commit refs match `.github/workflows/ci.yml`.
+
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
