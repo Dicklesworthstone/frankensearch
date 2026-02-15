@@ -7,18 +7,18 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{
-    SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
-    TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
+    SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult, TelemetryEnvelope,
+    TelemetryEvent, TelemetryQueryClass, TELEMETRY_SCHEMA_VERSION,
 };
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Current schema version for the ops telemetry database.
 pub const OPS_SCHEMA_VERSION: i64 = 2;
@@ -454,6 +454,49 @@ pub struct ResourceSampleRecord {
 }
 
 impl ResourceSampleRecord {
+    /// Build a storage row from a canonical `resource` telemetry envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the envelope is not schema-v1,
+    /// is not a `resource` event, has an invalid RFC3339 timestamp, or maps to
+    /// an invalid row payload.
+    pub fn from_resource_envelope(envelope: &TelemetryEnvelope) -> SearchResult<Self> {
+        if envelope.v != TELEMETRY_SCHEMA_VERSION {
+            return Err(SearchError::InvalidConfig {
+                field: "telemetry_envelope.v".to_owned(),
+                value: envelope.v.to_string(),
+                reason: format!(
+                    "must be {TELEMETRY_SCHEMA_VERSION} for ops resource-sample ingestion"
+                ),
+            });
+        }
+
+        let TelemetryEvent::Resource {
+            instance, sample, ..
+        } = &envelope.event
+        else {
+            return Err(SearchError::InvalidConfig {
+                field: "telemetry_envelope.event.type".to_owned(),
+                value: telemetry_event_kind(&envelope.event).to_owned(),
+                reason: "ops resource-sample ingestion requires event.type=resource".to_owned(),
+            });
+        };
+
+        let record = Self {
+            project_key: instance.project_key.clone(),
+            instance_id: instance.instance_id.clone(),
+            cpu_pct: Some(sample.cpu_pct),
+            rss_bytes: Some(sample.rss_bytes),
+            io_read_bytes: Some(sample.io_read_bytes),
+            io_write_bytes: Some(sample.io_write_bytes),
+            queue_depth: None,
+            ts_ms: parse_rfc3339_timestamp_ms(&envelope.ts)?,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
     fn validate(&self) -> SearchResult<()> {
         ensure_non_empty(&self.project_key, "project_key")?;
         ensure_non_empty(&self.instance_id, "instance_id")?;
@@ -3296,16 +3339,17 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
-        EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
+        bootstrap, current_version, evidence_link_id, ops_error, EvidenceLinkRecord,
         OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
-        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
-        evidence_link_id, ops_error,
+        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow,
+        OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
-        SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
-        TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
-        TelemetryQueryClass, TelemetrySearchMetrics, TelemetrySearchQuery, TelemetrySearchResults,
+        SearchEventPhase as TelemetrySearchEventPhase, TelemetryCorrelation, TelemetryEnvelope,
+        TelemetryEvent, TelemetryInstance, TelemetryQueryClass, TelemetryResourceSample,
+        TelemetrySearchMetrics, TelemetrySearchQuery, TelemetrySearchResults,
+        TELEMETRY_SCHEMA_VERSION,
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
@@ -3503,6 +3547,25 @@ mod tests {
                 metrics: TelemetrySearchMetrics {
                     latency_us: 1_200,
                     memory_bytes: Some(8_192),
+                },
+            },
+        )
+    }
+
+    fn sample_resource_envelope() -> TelemetryEnvelope {
+        TelemetryEnvelope::new(
+            "2026-02-15T17:05:00Z",
+            TelemetryEvent::Resource {
+                instance: sample_telemetry_instance(),
+                correlation: sample_telemetry_correlation("event-resource-a"),
+                sample: TelemetryResourceSample {
+                    cpu_pct: 55.5,
+                    rss_bytes: 65_536,
+                    io_read_bytes: 1_024,
+                    io_write_bytes: 2_048,
+                    interval_ms: 1_000,
+                    load_avg_1m: Some(0.75),
+                    pressure_profile: None,
                 },
             },
         )
@@ -3908,11 +3971,9 @@ mod tests {
             .query_open_anomalies_for_scope(SloScope::Project, "project-a", 20)
             .expect("open anomaly query should succeed");
         assert!(!open_project_anomalies.is_empty());
-        assert!(
-            open_project_anomalies
-                .iter()
-                .all(|row| row.reason_code.starts_with("anomaly."))
-        );
+        assert!(open_project_anomalies
+            .iter()
+            .all(|row| row.reason_code.starts_with("anomaly.")));
 
         let timeline = storage
             .query_anomaly_timeline(Some("project-a"), 20)
@@ -5513,6 +5574,67 @@ mod tests {
         envelope.v = TELEMETRY_SCHEMA_VERSION.saturating_add(1);
 
         let err = SearchEventRecord::from_search_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig { field, .. } = err else {
+            panic!("expected InvalidConfig for schema mismatch");
+        };
+        assert_eq!(field, "telemetry_envelope.v");
+    }
+
+    #[test]
+    fn resource_sample_record_from_resource_envelope_maps_fields() {
+        let envelope = sample_resource_envelope();
+        let record = ResourceSampleRecord::from_resource_envelope(&envelope)
+            .expect("resource envelope should map to storage record");
+
+        assert_eq!(record.project_key, "project-a");
+        assert_eq!(record.instance_id, "instance-a");
+        assert_eq!(record.cpu_pct, Some(55.5));
+        assert_eq!(record.rss_bytes, Some(65_536));
+        assert_eq!(record.io_read_bytes, Some(1_024));
+        assert_eq!(record.io_write_bytes, Some(2_048));
+        assert_eq!(record.queue_depth, None);
+        assert_eq!(
+            record.ts_ms,
+            super::parse_rfc3339_timestamp_ms("2026-02-15T17:05:00Z")
+                .expect("timestamp should parse in test fixture")
+        );
+    }
+
+    #[test]
+    fn resource_sample_record_from_resource_envelope_rejects_non_resource_event() {
+        let envelope = sample_search_envelope(TelemetrySearchEventPhase::Initial);
+        let err = ResourceSampleRecord::from_resource_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = err
+        else {
+            panic!("expected InvalidConfig for non-resource event");
+        };
+        assert_eq!(field, "telemetry_envelope.event.type");
+        assert_eq!(value, "search");
+        assert!(reason.contains("event.type=resource"));
+    }
+
+    #[test]
+    fn resource_sample_record_from_resource_envelope_rejects_invalid_timestamp() {
+        let mut envelope = sample_resource_envelope();
+        envelope.ts = "not-a-timestamp".to_owned();
+
+        let err = ResourceSampleRecord::from_resource_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig { field, .. } = err else {
+            panic!("expected InvalidConfig for invalid RFC3339 timestamp");
+        };
+        assert_eq!(field, "telemetry_envelope.ts");
+    }
+
+    #[test]
+    fn resource_sample_record_from_resource_envelope_rejects_schema_mismatch() {
+        let mut envelope = sample_resource_envelope();
+        envelope.v = TELEMETRY_SCHEMA_VERSION.saturating_add(1);
+
+        let err = ResourceSampleRecord::from_resource_envelope(&envelope).unwrap_err();
         let SearchError::InvalidConfig { field, .. } = err else {
             panic!("expected InvalidConfig for schema mismatch");
         };

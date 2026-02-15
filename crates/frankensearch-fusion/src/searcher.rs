@@ -13,8 +13,8 @@
 //!    and `fast_only` is false).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -51,6 +51,12 @@ use crate::blend::{
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+struct CpuJiffiesSnapshot {
+    process_jiffies: u64,
+    total_jiffies: u64,
+}
 
 #[allow(
     clippy::cast_possible_truncation,
@@ -99,6 +105,7 @@ pub struct TwoTierSearcher {
     config: TwoTierConfig,
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
     embedding_cache_capacity: Option<usize>,
+    resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
 }
 
 impl TwoTierSearcher {
@@ -121,6 +128,7 @@ impl TwoTierSearcher {
             canonicalizer: Box::new(DefaultCanonicalizer::default()),
             config,
             embedding_cache_capacity: None,
+            resource_cpu_state: Mutex::new(None),
         }
     }
 
@@ -1176,22 +1184,12 @@ impl TwoTierSearcher {
             root_request_id: root_request_id.to_owned(),
             parent_event_id,
         };
+        let sample = self.collect_resource_sample();
         let envelope = self.runtime_metrics_collector.emit_resource(
             telemetry_timestamp_now(),
             telemetry_instance,
             telemetry_correlation,
-            ResourceCollectorSample {
-                cpu_pct: 0.0,
-                rss_bytes: 0,
-                io_read_bytes: 0,
-                io_write_bytes: 0,
-                interval_ms: self
-                    .runtime_metrics_collector
-                    .config()
-                    .collection_interval_ms,
-                load_avg_1m: None,
-                pressure_profile: None,
-            },
+            sample,
         );
 
         if let Err(err) = host_adapter.emit_telemetry(&envelope) {
@@ -1200,6 +1198,58 @@ impl TwoTierSearcher {
         }
 
         Some(event_id)
+    }
+
+    fn collect_resource_sample(&self) -> ResourceCollectorSample {
+        let interval_ms = self
+            .runtime_metrics_collector
+            .config()
+            .collection_interval_ms;
+        let process_jiffies = read_proc_process_jiffies();
+        let total_jiffies = read_proc_total_jiffies();
+        let cpu_pct = self.update_cpu_pct_estimate(process_jiffies, total_jiffies);
+        let rss_bytes = read_proc_status_rss_bytes().unwrap_or(0);
+        let (io_read_bytes, io_write_bytes) = read_proc_io_bytes().unwrap_or((0, 0));
+        let load_avg_1m = read_proc_load_avg_1m();
+
+        ResourceCollectorSample {
+            cpu_pct,
+            rss_bytes,
+            io_read_bytes,
+            io_write_bytes,
+            interval_ms,
+            load_avg_1m,
+            pressure_profile: None,
+        }
+    }
+
+    fn update_cpu_pct_estimate(
+        &self,
+        process_jiffies: Option<u64>,
+        total_jiffies: Option<u64>,
+    ) -> f64 {
+        let Some(process_jiffies) = process_jiffies else {
+            return 0.0;
+        };
+        let Some(total_jiffies) = total_jiffies else {
+            return 0.0;
+        };
+
+        let current = CpuJiffiesSnapshot {
+            process_jiffies,
+            total_jiffies,
+        };
+        let mut cpu_state = self
+            .resource_cpu_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cpu_pct = cpu_pct_from_jiffies(
+            *cpu_state,
+            current,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        );
+        *cpu_state = Some(current);
+        cpu_pct
     }
 
     fn emit_phase_health_telemetry(
@@ -1334,6 +1384,140 @@ fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryIn
         project_key: identity.host_project,
         host_name,
         pid: Some(std::process::id()),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cpu_pct_from_jiffies(
+    previous: Option<CpuJiffiesSnapshot>,
+    current: CpuJiffiesSnapshot,
+    available_cores: usize,
+) -> f64 {
+    let Some(previous) = previous else {
+        return 0.0;
+    };
+
+    let process_delta = current
+        .process_jiffies
+        .saturating_sub(previous.process_jiffies);
+    let total_delta = current.total_jiffies.saturating_sub(previous.total_jiffies);
+    if process_delta == 0 || total_delta == 0 || available_cores == 0 {
+        return 0.0;
+    }
+
+    let raw = (process_delta as f64 / total_delta as f64) * available_cores as f64 * 100.0;
+    raw.clamp(0.0, 100.0)
+}
+
+fn read_proc_total_jiffies() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/stat").ok()?;
+        return parse_proc_total_jiffies(raw.as_str());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn read_proc_process_jiffies() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/self/stat").ok()?;
+        return parse_proc_process_jiffies(raw.as_str());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn read_proc_status_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/self/status").ok()?;
+        return parse_proc_status_rss_bytes(raw.as_str());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn read_proc_io_bytes() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/self/io").ok()?;
+        return parse_proc_io_bytes(raw.as_str());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn read_proc_load_avg_1m() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+        return parse_proc_load_avg_1m(raw.as_str());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn parse_proc_total_jiffies(raw: &str) -> Option<u64> {
+    let cpu_line = raw.lines().find(|line| line.starts_with("cpu "))?;
+    let mut total_jiffies = 0_u64;
+    for token in cpu_line.split_whitespace().skip(1) {
+        let value = token.parse::<u64>().ok()?;
+        total_jiffies = total_jiffies.checked_add(value)?;
+    }
+    Some(total_jiffies)
+}
+
+fn parse_proc_process_jiffies(raw: &str) -> Option<u64> {
+    let close_paren = raw.rfind(')')?;
+    let stats_after_comm = raw.get(close_paren + 2..)?;
+    let mut stats = stats_after_comm.split_whitespace();
+    let utime = stats.nth(11)?.parse::<u64>().ok()?;
+    let stime = stats.next()?.parse::<u64>().ok()?;
+    utime.checked_add(stime)
+}
+
+fn parse_proc_status_rss_bytes(raw: &str) -> Option<u64> {
+    let line = raw
+        .lines()
+        .find(|line| line.trim_start().starts_with("VmRSS:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    kib.checked_mul(1024)
+}
+
+fn parse_proc_io_bytes(raw: &str) -> Option<(u64, u64)> {
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+    for line in raw.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let parsed = value.trim().parse::<u64>().ok()?;
+            match key.trim() {
+                "read_bytes" => read_bytes = Some(parsed),
+                "write_bytes" => write_bytes = Some(parsed),
+                _ => {}
+            }
+        }
+    }
+    Some((read_bytes?, write_bytes?))
+}
+
+fn parse_proc_load_avg_1m(raw: &str) -> Option<f64> {
+    let value = raw.split_whitespace().next()?.parse::<f64>().ok()?;
+    if value.is_finite() && value >= 0.0 {
+        Some(value)
+    } else {
+        None
     }
 }
 
@@ -3618,6 +3802,65 @@ mod tests {
             OffsetDateTime::parse(TELEMETRY_TIMESTAMP_FALLBACK_RFC3339, &Rfc3339).is_ok(),
             "fallback timestamp must remain RFC3339"
         );
+    }
+
+    #[test]
+    fn cpu_pct_from_jiffies_first_sample_returns_zero() {
+        let current = CpuJiffiesSnapshot {
+            process_jiffies: 500,
+            total_jiffies: 10_000,
+        };
+        assert!(
+            (cpu_pct_from_jiffies(None, current, 8) - 0.0).abs() < f64::EPSILON,
+            "first sample should not report synthetic CPU utilization"
+        );
+    }
+
+    #[test]
+    fn cpu_pct_from_jiffies_clamps_to_conformance_range() {
+        let previous = CpuJiffiesSnapshot {
+            process_jiffies: 100,
+            total_jiffies: 1_000,
+        };
+        let current = CpuJiffiesSnapshot {
+            process_jiffies: 200,
+            total_jiffies: 1_100,
+        };
+        let cpu_pct = cpu_pct_from_jiffies(Some(previous), current, 4);
+        assert!(
+            (cpu_pct - 100.0).abs() < f64::EPSILON,
+            "high deltas should clamp at 100%"
+        );
+    }
+
+    #[test]
+    fn parse_proc_total_jiffies_extracts_aggregate_sum() {
+        let fixture = "cpu  10 20 30 40 50 60 70 80 90 100\ncpu0 1 2 3 4\n";
+        assert_eq!(parse_proc_total_jiffies(fixture), Some(550));
+    }
+
+    #[test]
+    fn parse_proc_process_jiffies_handles_command_with_spaces() {
+        let fixture = "1234 (two tier worker) S 1 2 3 4 5 6 7 8 9 10 200 300 0 0 0 0 0 0 0";
+        assert_eq!(parse_proc_process_jiffies(fixture), Some(500));
+    }
+
+    #[test]
+    fn parse_proc_status_rss_bytes_extracts_vm_rss() {
+        let fixture = "Name:\tproc\nVmRSS:\t   4096 kB\nThreads:\t8\n";
+        assert_eq!(parse_proc_status_rss_bytes(fixture), Some(4_194_304));
+    }
+
+    #[test]
+    fn parse_proc_io_bytes_extracts_read_and_write_bytes() {
+        let fixture = "rchar: 1\nwchar: 2\nread_bytes: 333\nwrite_bytes: 444\n";
+        assert_eq!(parse_proc_io_bytes(fixture), Some((333, 444)));
+    }
+
+    #[test]
+    fn parse_proc_load_avg_1m_extracts_first_value() {
+        let fixture = "1.42 0.99 0.55 2/321 9999\n";
+        assert_eq!(parse_proc_load_avg_1m(fixture), Some(1.42));
     }
 
     #[test]

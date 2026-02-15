@@ -123,6 +123,39 @@ telemetry_adapter_record_command_header() {
   } >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
 }
 
+telemetry_adapter_classify_stage_failure_reason() {
+  local exit_code="$1"
+  local transcript_tail
+  transcript_tail="$(tail -n 200 "$TELEMETRY_ADAPTER_TRANSCRIPT_TXT" 2>/dev/null || true)"
+
+  if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]]; then
+    printf "%s" "telemetry_adapter.stage.timeout"
+    return 0
+  fi
+
+  if grep -Fq "failed to load manifest for dependency" <<<"$transcript_tail"; then
+    printf "%s" "telemetry_adapter.stage.remote_path_dependency_missing"
+    return 0
+  fi
+
+  if grep -Fq "failed to select a version for the requirement" <<<"$transcript_tail"; then
+    printf "%s" "telemetry_adapter.stage.remote_dependency_resolution_failed"
+    return 0
+  fi
+
+  if grep -Fq "does not contain this feature" <<<"$transcript_tail"; then
+    printf "%s" "telemetry_adapter.stage.invalid_feature_flag"
+    return 0
+  fi
+
+  if grep -Fq "no such command: \`+nightly\`" <<<"$transcript_tail"; then
+    printf "%s" "telemetry_adapter.stage.invalid_toolchain_invocation"
+    return 0
+  fi
+
+  printf "%s" "telemetry_adapter.stage.failed"
+}
+
 telemetry_adapter_run_rch_cargo() {
   local stage="$1"
   local repo="$2"
@@ -134,6 +167,7 @@ telemetry_adapter_run_rch_cargo() {
   local exit_code
   local timeout_seconds="${TELEMETRY_ADAPTER_RCH_TIMEOUT_SECS}"
   local timeout_reason=""
+  local failure_reason=""
   local -a stage_cmd
 
   TELEMETRY_ADAPTER_ACTIVE_STAGE="$stage"
@@ -206,14 +240,15 @@ telemetry_adapter_run_rch_cargo() {
 
   TELEMETRY_ADAPTER_LAST_FAILURE_STAGE="$stage"
   TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE="$exit_code"
+  failure_reason="$(telemetry_adapter_classify_stage_failure_reason "$exit_code")"
   TELEMETRY_ADAPTER_RUN_STATUS="fail"
-  TELEMETRY_ADAPTER_RUN_REASON_CODE="telemetry_adapter.stage.failed"
-  TELEMETRY_ADAPTER_RUN_MESSAGE="stage ${stage} failed (exit_code=${exit_code}, duration_s=${duration_s})"
+  TELEMETRY_ADAPTER_RUN_REASON_CODE="$failure_reason"
+  TELEMETRY_ADAPTER_RUN_MESSAGE="stage ${stage} failed (reason_code=${failure_reason}, exit_code=${exit_code}, duration_s=${duration_s})"
   telemetry_adapter_emit_event \
     "$stage" \
     "fail" \
-    "telemetry_adapter.stage.failed" \
-    "exit_code=${exit_code} duration_s=${duration_s}"
+    "$failure_reason" \
+    "reason_code=${failure_reason} exit_code=${exit_code} duration_s=${duration_s}"
   telemetry_adapter_mark_stage_completed
   TELEMETRY_ADAPTER_ACTIVE_STAGE=""
   return "$exit_code"
