@@ -349,10 +349,7 @@ impl LiveIngestPipeline {
         }
     }
 
-    fn resolve_paths(
-        &self,
-        file_key: &str,
-    ) -> frankensearch_core::SearchResult<(PathBuf, String)> {
+    fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
         let abs_path = if Path::new(file_key).is_absolute() {
             PathBuf::from(file_key)
         } else {
@@ -361,9 +358,7 @@ impl LiveIngestPipeline {
         // Resolve symlinks / ".." components, then verify the result stays
         // inside target_root.  Without this check, a file_key containing
         // "../" can escape the project boundary (path traversal).
-        let canonical = abs_path
-            .canonicalize()
-            .unwrap_or_else(|_| abs_path.clone());
+        let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
         if !canonical.starts_with(&self.target_root) {
             return Err(frankensearch_core::SearchError::InvalidConfig {
                 field: "file_key".into(),

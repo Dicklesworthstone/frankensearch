@@ -391,8 +391,7 @@ impl TwoTierIndexBuilder {
                     .to_owned(),
             });
         }
-        self.quality_records
-            .push((doc_id, embedding.to_vec()));
+        self.quality_records.push((doc_id, embedding.to_vec()));
         Ok(())
     }
 
