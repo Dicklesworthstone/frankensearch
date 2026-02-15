@@ -614,4 +614,334 @@ mod tests {
         assert!(!is_wal_index(pos));
         assert_eq!(from_wal_index(tagged), pos);
     }
+
+    // ─── bd-vbzm tests begin ───
+
+    #[test]
+    fn wal_config_default_values() {
+        let config = WalConfig::default();
+        assert_eq!(config.compaction_threshold, 1000);
+        assert!((config.compaction_ratio - 0.10).abs() < f64::EPSILON);
+        assert!(config.fsync_on_write);
+    }
+
+    #[test]
+    fn wal_config_debug_clone() {
+        let config = WalConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.compaction_threshold, config.compaction_threshold);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("WalConfig"));
+    }
+
+    #[test]
+    fn compaction_stats_debug_clone() {
+        let stats = CompactionStats {
+            main_records_before: 100,
+            wal_records: 10,
+            total_records_after: 110,
+            elapsed_ms: 42.5,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.main_records_before, 100);
+        assert_eq!(cloned.wal_records, 10);
+        assert_eq!(cloned.total_records_after, 110);
+        assert!((cloned.elapsed_ms - 42.5).abs() < f64::EPSILON);
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("CompactionStats"));
+    }
+
+    #[test]
+    fn wal_too_small_returns_empty() {
+        let path = temp_wal_path("too-small");
+        std::fs::write(path.as_path(), &[0u8; 10]).unwrap();
+        let loaded = read_wal(&path, 4, Quantization::F16).unwrap();
+        assert!(loaded.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bad_magic_bytes_is_error() {
+        let path = temp_wal_path("bad-magic");
+        let mut header = vec![0xDE, 0xAD, 0xBE, 0xEF]; // wrong magic
+        header.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        header.extend_from_slice(&4_u32.to_le_bytes());
+        header.push(Quantization::F16 as u8);
+        header.extend_from_slice(&[0u8; 5]);
+        let crc = crc32_of(&header);
+        header.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+
+        let result = read_wal(&path, 4, Quantization::F16);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("magic"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn version_mismatch_is_error() {
+        let path = temp_wal_path("version-mismatch");
+        let mut header = Vec::new();
+        header.extend_from_slice(&WAL_MAGIC);
+        header.extend_from_slice(&99_u16.to_le_bytes()); // wrong version
+        header.extend_from_slice(&4_u32.to_le_bytes());
+        header.push(Quantization::F16 as u8);
+        header.extend_from_slice(&[0u8; 5]);
+        let crc = crc32_of(&header);
+        header.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+
+        let result = read_wal(&path, 4, Quantization::F16);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("version"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn quantization_mismatch_is_error() {
+        let path = temp_wal_path("quant-mismatch");
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-0", 1.0, 4)],
+            4,
+            Quantization::F16,
+            false,
+        )
+        .unwrap();
+
+        let result = read_wal(&path, 4, Quantization::F32);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("quantization"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn header_crc_mismatch_is_error() {
+        let path = temp_wal_path("header-crc");
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-0", 1.0, 4)],
+            4,
+            Quantization::F16,
+            false,
+        )
+        .unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        // Corrupt header CRC (bytes 16-19)
+        data[16] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_wal(&path, 4, Quantization::F16);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("CRC"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_batch_roundtrip() {
+        let path = temp_wal_path("empty-batch");
+        let dim = 4;
+        append_wal_batch(&path, &[], dim, Quantization::F16, false).unwrap();
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert!(loaded.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wal_entry_doc_id_hash_matches_fnv1a() {
+        let entry = make_entry("hello", 1.0, 4);
+        assert_eq!(entry.doc_id_hash, crate::fnv1a_hash(b"hello"));
+    }
+
+    #[test]
+    fn wal_entry_clone() {
+        let entry = make_entry("test-doc", 0.5, 8);
+        #[allow(clippy::redundant_clone)]
+        let cloned = entry.clone();
+        assert_eq!(cloned.doc_id, "test-doc");
+        assert_eq!(cloned.embedding.len(), 8);
+        assert!((cloned.embedding[0] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn index_tagging_zero() {
+        let tagged = to_wal_index(0);
+        assert!(is_wal_index(tagged));
+        assert_eq!(from_wal_index(tagged), 0);
+    }
+
+    #[test]
+    fn index_tagging_large_value() {
+        let pos = (1_usize << (usize::BITS - 2)) - 1;
+        let tagged = to_wal_index(pos);
+        assert!(is_wal_index(tagged));
+        assert_eq!(from_wal_index(tagged), pos);
+    }
+
+    #[test]
+    fn is_wal_index_false_for_normal_values() {
+        assert!(!is_wal_index(0));
+        assert!(!is_wal_index(1));
+        assert!(!is_wal_index(usize::MAX >> 1));
+    }
+
+    #[test]
+    fn crc32_of_empty() {
+        let crc = crc32_of(&[]);
+        assert_eq!(crc, 0); // CRC32 of empty is 0
+    }
+
+    #[test]
+    fn crc32_of_known_data() {
+        let crc = crc32_of(b"hello");
+        assert_ne!(crc, 0);
+        // Same input should produce same CRC
+        assert_eq!(crc, crc32_of(b"hello"));
+    }
+
+    #[test]
+    fn wal_corrupted_produces_index_corrupted_error() {
+        let err = wal_corrupted(Path::new("/test/path.fsvi.wal"), "test detail");
+        match err {
+            SearchError::IndexCorrupted { path, detail } => {
+                assert_eq!(path, Path::new("/test/path.fsvi.wal"));
+                assert_eq!(detail, "test detail");
+            }
+            other => panic!("expected IndexCorrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_path_for_various_inputs() {
+        let wal = wal_path_for(Path::new("index.fsvi"));
+        assert_eq!(wal, PathBuf::from("index.fsvi.wal"));
+
+        let wal = wal_path_for(Path::new("/abs/path/data.fsvi"));
+        assert_eq!(wal, PathBuf::from("/abs/path/data.fsvi.wal"));
+    }
+
+    #[test]
+    fn append_with_fsync_succeeds() {
+        let path = temp_wal_path("fsync-test");
+        let dim = 4;
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-sync", 1.0, dim)],
+            dim,
+            Quantization::F16,
+            true,
+        )
+        .unwrap();
+
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].doc_id, "doc-sync");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_preserves_existing_header() {
+        let path = temp_wal_path("preserve-header");
+        let dim = 4;
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-0", 1.0, dim)],
+            dim,
+            Quantization::F16,
+            false,
+        )
+        .unwrap();
+
+        let data_after_first = std::fs::read(&path).unwrap();
+        let header_bytes = &data_after_first[..WAL_HEADER_SIZE];
+
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-1", 2.0, dim)],
+            dim,
+            Quantization::F16,
+            false,
+        )
+        .unwrap();
+
+        let data_after_second = std::fs::read(&path).unwrap();
+        // Header should be unchanged
+        assert_eq!(&data_after_second[..WAL_HEADER_SIZE], header_bytes);
+        // File should be larger
+        assert!(data_after_second.len() > data_after_first.len());
+
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(loaded.len(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bad_batch_magic_discards_batch() {
+        let path = temp_wal_path("bad-batch-magic");
+        let dim = 4;
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-good", 1.0, dim)],
+            dim,
+            Quantization::F16,
+            false,
+        )
+        .unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        // Append a batch with wrong magic
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // bad batch magic
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].doc_id, "doc-good");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn f16_quantization_has_limited_precision() {
+        let path = temp_wal_path("f16-precision");
+        let dim = 2;
+        let entries = vec![WalEntry {
+            doc_id: "precise".to_owned(),
+            doc_id_hash: crate::fnv1a_hash(b"precise"),
+            embedding: vec![0.123_456, -0.987_654],
+        }];
+
+        append_wal_batch(&path, &entries, dim, Quantization::F16, false).unwrap();
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(loaded.len(), 1);
+        // F16 has ~3 decimal digits of precision
+        assert!((loaded[0].embedding[0] - 0.123_456).abs() < 0.001);
+        assert!((loaded[0].embedding[1] + 0.987_654).abs() < 0.001);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn f32_quantization_exact_roundtrip() {
+        let path = temp_wal_path("f32-exact");
+        let dim = 3;
+        let val = std::f32::consts::PI;
+        let entries = vec![WalEntry {
+            doc_id: "pi-doc".to_owned(),
+            doc_id_hash: crate::fnv1a_hash(b"pi-doc"),
+            embedding: vec![val, -val, 0.0],
+        }];
+
+        append_wal_batch(&path, &entries, dim, Quantization::F32, false).unwrap();
+        let loaded = read_wal(&path, dim, Quantization::F32).unwrap();
+        assert!((loaded[0].embedding[0] - val).abs() < f32::EPSILON);
+        assert!((loaded[0].embedding[1] + val).abs() < f32::EPSILON);
+        assert!(loaded[0].embedding[2].abs() < f32::EPSILON);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── bd-vbzm tests end ───
 }

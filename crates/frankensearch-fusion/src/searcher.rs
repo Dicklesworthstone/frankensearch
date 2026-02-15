@@ -3235,9 +3235,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.doc_id, "my-doc");
-        assert_eq!(r.score, 0.95);
+        assert!((r.score - 0.95).abs() < f32::EPSILON);
         assert_eq!(r.source, ScoreSource::SemanticFast);
-        assert_eq!(r.fast_score, Some(0.95));
+        assert!(r.fast_score.is_some_and(|s| (s - 0.95).abs() < f32::EPSILON));
         assert!(r.quality_score.is_none());
         assert!(r.lexical_score.is_none());
         assert!(r.rerank_score.is_none());
@@ -3473,9 +3473,6 @@ mod tests {
 
     #[test]
     fn builder_with_reranker_shows_in_debug() {
-        let index = build_test_index(4);
-        let fast = Arc::new(StubEmbedder::new("fast", 4));
-
         struct DummyReranker;
         impl Reranker for DummyReranker {
             fn rerank<'a>(
@@ -3493,6 +3490,8 @@ mod tests {
                 "dummy-reranker"
             }
         }
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_reranker(Arc::new(DummyReranker));
         let debug = format!("{searcher:?}");

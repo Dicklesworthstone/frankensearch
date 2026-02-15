@@ -657,4 +657,218 @@ mod tests {
             .expect("remaining rows query should execute");
         assert!(remaining.is_empty(), "tombstone cleanup should remove row");
     }
+
+    // ─── bd-1vl1 tests begin ───
+
+    #[test]
+    fn ingestion_class_debug_clone_copy_eq() {
+        use super::CatalogIngestionClass;
+        let a = CatalogIngestionClass::FullSemanticLexical;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("FullSemanticLexical"));
+    }
+
+    #[test]
+    fn pipeline_status_debug_clone_copy_eq() {
+        use super::CatalogPipelineStatus;
+        let a = CatalogPipelineStatus::Embedding;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(a, CatalogPipelineStatus::Indexed);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("Embedding"));
+    }
+
+    #[test]
+    fn change_kind_debug_clone_copy_eq() {
+        use super::CatalogChangeKind;
+        let a = CatalogChangeKind::Tombstone;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(a, CatalogChangeKind::Upsert);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("Tombstone"));
+    }
+
+    #[test]
+    fn replay_decision_debug_clone_copy_eq() {
+        let a = ReplayDecision::ApplyNext { next_checkpoint: 5 };
+        let b = a;
+        assert_eq!(a, b);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("ApplyNext"));
+
+        let dup = ReplayDecision::Duplicate { checkpoint: 3 };
+        assert_ne!(a, dup);
+        let debug_dup = format!("{dup:?}");
+        assert!(debug_dup.contains("Duplicate"));
+
+        let gap = ReplayDecision::Gap {
+            checkpoint: 1,
+            expected_next: 2,
+            observed: 5,
+        };
+        let debug_gap = format!("{gap:?}");
+        assert!(debug_gap.contains("Gap"));
+    }
+
+    #[test]
+    fn ingestion_class_from_config_all_variants() {
+        use super::CatalogIngestionClass;
+        use crate::config::IngestionClass;
+
+        assert_eq!(
+            CatalogIngestionClass::from(IngestionClass::FullSemanticLexical),
+            CatalogIngestionClass::FullSemanticLexical
+        );
+        assert_eq!(
+            CatalogIngestionClass::from(IngestionClass::LexicalOnly),
+            CatalogIngestionClass::LexicalOnly
+        );
+        assert_eq!(
+            CatalogIngestionClass::from(IngestionClass::MetadataOnly),
+            CatalogIngestionClass::MetadataOnly
+        );
+        assert_eq!(
+            CatalogIngestionClass::from(IngestionClass::Skip),
+            CatalogIngestionClass::Skip
+        );
+    }
+
+    #[test]
+    fn row_i64_unexpected_type_is_error() {
+        use super::row_i64;
+
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let rows = conn
+            .query("SELECT 'not_an_integer';")
+            .expect("text query should succeed");
+        let row = &rows[0];
+        let err = row_i64(row, 0, "test_field").expect_err("text should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unexpected type") || msg.contains("test_field"));
+    }
+
+    #[test]
+    fn row_i64_missing_column_is_error() {
+        use super::row_i64;
+
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let rows = conn.query("SELECT 1;").expect("query should succeed");
+        let row = &rows[0];
+        // Column index 5 doesn't exist (only column 0 present)
+        let err = row_i64(row, 5, "missing_col").expect_err("missing column should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("missing") || msg.contains("missing_col"));
+    }
+
+    #[test]
+    fn row_i64_valid_integer() {
+        use super::row_i64;
+
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let rows = conn.query("SELECT 42;").expect("query should succeed");
+        let row = &rows[0];
+        let value = row_i64(row, 0, "version").expect("integer should succeed");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn catalog_error_helper_produces_subsystem_error() {
+        let source = std::io::Error::other("test error");
+        let err = catalog_error(source);
+        match err {
+            frankensearch_core::SearchError::SubsystemError {
+                subsystem, source, ..
+            } => {
+                assert_eq!(subsystem, "fsfs_catalog");
+                assert!(source.to_string().contains("test error"));
+            }
+            other => panic!("expected SubsystemError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_version_constant_is_positive() {
+        assert!(CATALOG_SCHEMA_VERSION >= 1);
+    }
+
+    #[test]
+    fn index_name_constants_are_non_empty() {
+        let names = [
+            INDEX_CATALOG_DIRTY_LOOKUP,
+            INDEX_CATALOG_REVISIONS,
+            INDEX_CATALOG_CLEANUP,
+            INDEX_CATALOG_CONTENT_HASH,
+            INDEX_CHANGELOG_REPLAY,
+            INDEX_CHANGELOG_FILE_REVISION,
+            INDEX_CHANGELOG_PENDING_APPLY,
+        ];
+        for name in names {
+            assert!(!name.is_empty());
+            assert!(name.starts_with("idx_"));
+        }
+    }
+
+    #[test]
+    fn sql_constants_contain_expected_keywords() {
+        assert!(DIRTY_CATALOG_LOOKUP_SQL.contains("fsfs_catalog_files"));
+        assert!(DIRTY_CATALOG_LOOKUP_SQL.contains("pipeline_status"));
+        assert!(DIRTY_CATALOG_LOOKUP_SQL.contains("LIMIT"));
+
+        assert!(CHANGELOG_REPLAY_BATCH_SQL.contains("fsfs_catalog_changelog"));
+        assert!(CHANGELOG_REPLAY_BATCH_SQL.contains("stream_seq"));
+
+        assert!(CLEANUP_TOMBSTONES_SQL.contains("DELETE"));
+        assert!(CLEANUP_TOMBSTONES_SQL.contains("tombstoned"));
+    }
+
+    #[test]
+    fn replay_classifier_gap_with_seq_two_above() {
+        let result = classify_replay_sequence(10, 12);
+        assert_eq!(
+            result,
+            ReplayDecision::Gap {
+                checkpoint: 10,
+                expected_next: 11,
+                observed: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_classifier_negative_sequences() {
+        assert_eq!(
+            classify_replay_sequence(-5, -4),
+            ReplayDecision::ApplyNext {
+                next_checkpoint: -4
+            }
+        );
+        assert_eq!(
+            classify_replay_sequence(-5, -5),
+            ReplayDecision::Duplicate { checkpoint: -5 }
+        );
+        assert_eq!(
+            classify_replay_sequence(-5, -3),
+            ReplayDecision::Gap {
+                checkpoint: -5,
+                expected_next: -4,
+                observed: -3,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_classifier_zero_zero_is_duplicate() {
+        assert_eq!(
+            classify_replay_sequence(0, 0),
+            ReplayDecision::Duplicate { checkpoint: 0 }
+        );
+    }
+
+    // ─── bd-1vl1 tests end ───
 }

@@ -38,7 +38,7 @@ frankensearch-ops = { path = "crates/frankensearch-ops" }
 
 # Async runtime (structured concurrency, NO tokio)
 # test-internals enables LabRuntime for deterministic testing
-asupersync = { path = "/dp/asupersync", features = ["proc-macros", "test-internals"] }
+asupersync = { path = "../asupersync", features = ["proc-macros", "test-internals"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
