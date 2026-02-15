@@ -682,6 +682,156 @@ mod tests {
         assert!(ranked[1].ice_score_per_mille >= ranked[2].ice_score_per_mille);
     }
 
+    // ── ICE score edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn ice_score_effort_zero_treated_as_one() {
+        let candidate = OpportunityCandidate {
+            id: "test".into(),
+            summary: "zero-effort candidate".into(),
+            impact: 80,
+            confidence: 90,
+            effort: 0,
+        };
+        // effort=0 should be treated as 1 to avoid division by zero
+        assert_eq!(
+            candidate.ice_score_per_mille(),
+            80 * 90 * 1_000 // = 7_200_000
+        );
+    }
+
+    #[test]
+    fn ice_score_zero_impact_yields_zero() {
+        let candidate = OpportunityCandidate {
+            id: "no-impact".into(),
+            summary: "no impact".into(),
+            impact: 0,
+            confidence: 100,
+            effort: 10,
+        };
+        assert_eq!(candidate.ice_score_per_mille(), 0);
+    }
+
+    #[test]
+    fn ice_score_zero_confidence_yields_zero() {
+        let candidate = OpportunityCandidate {
+            id: "no-confidence".into(),
+            summary: "no confidence".into(),
+            impact: 100,
+            confidence: 0,
+            effort: 10,
+        };
+        assert_eq!(candidate.ice_score_per_mille(), 0);
+    }
+
+    // ── LeverSnapshot changed_levers edge cases ─────────────────────
+
+    #[test]
+    fn lever_added_in_candidate_is_detected_as_change() {
+        let baseline = LeverSnapshot::from_pairs([("a", "1")]);
+        let candidate = LeverSnapshot::from_pairs([("a", "1"), ("b", "2")]);
+        let validation = OneLeverIterationProtocol::validate(&baseline, &candidate);
+        assert!(validation.accepted);
+        assert_eq!(validation.changed_levers, vec!["b"]);
+        assert_eq!(validation.reason_code, ITERATION_REASON_ACCEPTED);
+    }
+
+    #[test]
+    fn lever_removed_in_candidate_is_detected_as_change() {
+        let baseline = LeverSnapshot::from_pairs([("a", "1"), ("b", "2")]);
+        let candidate = LeverSnapshot::from_pairs([("a", "1")]);
+        let validation = OneLeverIterationProtocol::validate(&baseline, &candidate);
+        assert!(validation.accepted);
+        assert_eq!(validation.changed_levers, vec!["b"]);
+        assert_eq!(validation.reason_code, ITERATION_REASON_ACCEPTED);
+    }
+
+    #[test]
+    fn both_empty_snapshots_are_no_change() {
+        let empty_a = LeverSnapshot::from_pairs(std::iter::empty::<(&str, &str)>());
+        let empty_b = LeverSnapshot::from_pairs(std::iter::empty::<(&str, &str)>());
+        let validation = OneLeverIterationProtocol::validate(&empty_a, &empty_b);
+        assert!(!validation.accepted);
+        assert_eq!(validation.reason_code, ITERATION_REASON_NO_CHANGE);
+    }
+
+    // ── ProfileWorkflow edge cases ──────────────────────────────────
+
+    #[test]
+    fn profile_workflow_empty_dataset_defaults_to_small() {
+        let workflow = ProfileWorkflow::for_dataset_profile("");
+        assert_eq!(workflow.dataset_profile, "small");
+    }
+
+    #[test]
+    fn profile_workflow_whitespace_dataset_defaults_to_small() {
+        let workflow = ProfileWorkflow::for_dataset_profile("   ");
+        assert_eq!(workflow.dataset_profile, "small");
+    }
+
+    #[test]
+    fn artifact_manifest_prefixes_run_id() {
+        let workflow = ProfileWorkflow::for_dataset_profile("tiny");
+        let artifacts = workflow.artifact_manifest("run-42");
+        assert_eq!(artifacts.len(), 3);
+        for artifact in &artifacts {
+            assert!(
+                artifact.artifact_path.starts_with("run-42/"),
+                "artifact path should start with run id: {}",
+                artifact.artifact_path
+            );
+            assert!(
+                artifact.replay_command.contains("--run-id run-42"),
+                "replay command should reference run id: {}",
+                artifact.replay_command
+            );
+        }
+    }
+
+    // ── ProfileKind Display ─────────────────────────────────────────
+
+    #[test]
+    fn profile_kind_display_format() {
+        assert_eq!(ProfileKind::Flamegraph.to_string(), "flamegraph");
+        assert_eq!(ProfileKind::Heap.to_string(), "heap");
+        assert_eq!(ProfileKind::Syscall.to_string(), "syscall");
+    }
+
+    // ── OpportunityMatrix edge cases ────────────────────────────────
+
+    #[test]
+    fn empty_matrix_ranked_returns_empty() {
+        let matrix = OpportunityMatrix::new(vec![]);
+        assert!(matrix.ranked().is_empty());
+    }
+
+    #[test]
+    fn ranking_tiebreak_by_id_when_scores_equal() {
+        let matrix = OpportunityMatrix::new(vec![
+            OpportunityCandidate {
+                id: "z-last".into(),
+                summary: "z".into(),
+                impact: 50,
+                confidence: 50,
+                effort: 25,
+            },
+            OpportunityCandidate {
+                id: "a-first".into(),
+                summary: "a".into(),
+                impact: 50,
+                confidence: 50,
+                effort: 25,
+            },
+        ]);
+        let ranked = matrix.ranked();
+        assert_eq!(ranked[0].candidate.id, "a-first");
+        assert_eq!(ranked[1].candidate.id, "z-last");
+        assert_eq!(ranked[0].rank, 1);
+        assert_eq!(ranked[1].rank, 2);
+    }
+
+    // ── Original tests continue ─────────────────────────────────────
+
     #[test]
     fn one_lever_protocol_accepts_exactly_one_change() {
         let baseline = LeverSnapshot::from_pairs([

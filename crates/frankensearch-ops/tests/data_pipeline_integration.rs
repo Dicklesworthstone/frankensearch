@@ -144,6 +144,75 @@ fn pipeline_ingest_to_aggregation_materializes_expected_views() {
 }
 
 #[test]
+fn pipeline_discovery_attribution_aligns_with_storage_rollups_and_anomalies() {
+    let simulator =
+        TelemetrySimulator::new(pipeline_config(3_137)).expect("config should validate");
+    let run = simulator.generate().expect("generation should succeed");
+    let storage = OpsStorage::open_in_memory().expect("storage should open");
+
+    let mut discovered_projects = BTreeSet::new();
+    let mut discovered_pairs = BTreeSet::new();
+    for batch in &run.batches {
+        for discovered in &batch.discovered_instances {
+            if let Some(project_key_hint) = discovered.project_key_hint.as_ref() {
+                discovered_projects.insert(project_key_hint.clone());
+                discovered_pairs.insert((project_key_hint.clone(), discovered.instance_id.clone()));
+            }
+        }
+    }
+
+    assert!(
+        !discovered_pairs.is_empty(),
+        "simulator should emit at least one discovered project/instance pair"
+    );
+    assert_eq!(
+        discovered_pairs,
+        run.instance_pairs(),
+        "discovery and telemetry views should agree on project/instance attribution"
+    );
+
+    let _ = apply_pipeline(&storage, &run, 8_192).expect("pipeline should succeed");
+
+    for project_key in &discovered_projects {
+        let project_rollups = storage
+            .query_slo_rollups_for_scope(SloScope::Project, project_key, 32)
+            .expect("project rollup query should succeed");
+        assert!(
+            !project_rollups.is_empty(),
+            "expected project rollups for discovered project {project_key}"
+        );
+        assert!(
+            project_rollups
+                .iter()
+                .all(|row| row.scope == SloScope::Project && row.scope_key == *project_key),
+            "rollups should remain scoped to discovered project {project_key}"
+        );
+    }
+
+    for (project_key, instance_id) in &discovered_pairs {
+        let summary = storage
+            .latest_search_summary(project_key, instance_id, SummaryWindow::OneMinute)
+            .expect("summary query should succeed");
+        assert!(
+            summary.is_some(),
+            "expected one-minute summary for discovered pair {project_key}/{instance_id}"
+        );
+    }
+
+    let anomalies = storage
+        .query_anomaly_timeline(None, 256)
+        .expect("anomaly timeline query should succeed");
+    for anomaly in &anomalies {
+        if let Some(project_key) = anomaly.project_key.as_ref() {
+            assert!(
+                discovered_projects.contains(project_key),
+                "anomaly project {project_key} should be present in discovered attribution set"
+            );
+        }
+    }
+}
+
+#[test]
 fn pipeline_replay_is_deterministic_for_same_seed() {
     let config = pipeline_config(55);
     let run_a = TelemetrySimulator::new(config.clone())

@@ -85,6 +85,9 @@ impl EventSeverity {
 pub struct ActionTimelineScreen {
     id: ScreenId,
     state: AppState,
+    project_filter_values: Vec<String>,
+    reason_filter_values: Vec<String>,
+    host_filter_values: Vec<String>,
     selected_row: usize,
     project_filter_index: usize,
     reason_filter_index: usize,
@@ -102,6 +105,9 @@ impl ActionTimelineScreen {
         Self {
             id: ScreenId::new("ops.timeline"),
             state: AppState::new(),
+            project_filter_values: vec!["all".to_owned()],
+            reason_filter_values: vec!["all".to_owned()],
+            host_filter_values: vec!["all".to_owned()],
             selected_row: 0,
             project_filter_index: 0,
             reason_filter_index: 0,
@@ -133,6 +139,7 @@ impl ActionTimelineScreen {
         let focused = self.selected_event_key();
         let (project_filter, reason_filter, host_filter) = self.selected_filter_values();
         self.state = state.clone();
+        self.rebuild_filter_values();
         self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_event(focused);
@@ -226,7 +233,7 @@ impl ActionTimelineScreen {
         EventSeverity::Info
     }
 
-    fn project_filters(&self) -> Vec<String> {
+    fn rebuild_filter_values(&mut self) {
         let mut values = vec!["all".to_owned()];
         let mut projects: BTreeSet<_> = self
             .state
@@ -241,10 +248,8 @@ impl ActionTimelineScreen {
                 .to_owned()
         }));
         values.extend(projects);
-        values
-    }
+        self.project_filter_values = values;
 
-    fn reason_filters(&self) -> Vec<String> {
         let mut values = vec!["all".to_owned()];
         let reasons: BTreeSet<_> = self
             .state
@@ -254,10 +259,8 @@ impl ActionTimelineScreen {
             .map(|event| event.reason_code.clone())
             .collect();
         values.extend(reasons);
-        values
-    }
+        self.reason_filter_values = values;
 
-    fn host_filters(&self) -> Vec<String> {
         let mut values = vec!["all".to_owned()];
         let hosts: BTreeSet<_> = self
             .state
@@ -267,7 +270,19 @@ impl ActionTimelineScreen {
             .map(|event| Self::host_bucket(&event.instance_id))
             .collect();
         values.extend(hosts);
-        values
+        self.host_filter_values = values;
+    }
+
+    fn project_filters(&self) -> &[String] {
+        &self.project_filter_values
+    }
+
+    fn reason_filters(&self) -> &[String] {
+        &self.reason_filter_values
+    }
+
+    fn host_filters(&self) -> &[String] {
+        &self.host_filter_values
     }
 
     fn selected_filter_values(&self) -> (String, String, String) {
@@ -1078,6 +1093,136 @@ mod tests {
             .get(screen.project_filter_index)
             .cloned();
         assert_eq!(selected_project.as_deref(), Some("proj-b"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn timeline_update_state_preserves_reason_and_host_filter_values_when_new_options_are_inserted()
+    {
+        let mut screen = ActionTimelineScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(crate::state::FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "host-a:inst-a".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(10),
+                    healthy: true,
+                    doc_count: 10,
+                    pending_jobs: 1,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-b:inst-b".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(11),
+                    healthy: false,
+                    doc_count: 20,
+                    pending_jobs: 2,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:inst-a".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.heartbeat".to_owned(),
+                    at_ms: 1_000_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:inst-b".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 970_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+            ],
+            ..crate::state::FleetSnapshot::default()
+        });
+        screen.update_state(&state);
+
+        screen.reason_filter_index = screen
+            .reason_filters()
+            .iter()
+            .position(|value| value == "lifecycle.heartbeat_gap")
+            .expect("reason filter should exist");
+        screen.host_filter_index = screen
+            .host_filters()
+            .iter()
+            .position(|value| value == "host-b")
+            .expect("host filter should exist");
+
+        state.update_fleet(crate::state::FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "host-a:inst-a".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(10),
+                    healthy: true,
+                    doc_count: 10,
+                    pending_jobs: 1,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-b:inst-b".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(11),
+                    healthy: false,
+                    doc_count: 20,
+                    pending_jobs: 2,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-aa:inst-c".to_owned(),
+                    project: "proj-c".to_owned(),
+                    pid: Some(12),
+                    healthy: true,
+                    doc_count: 8,
+                    pending_jobs: 0,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:inst-a".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.heartbeat".to_owned(),
+                    at_ms: 1_000_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:inst-b".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 970_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+                LifecycleEvent {
+                    instance_id: "host-aa:inst-c".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.anomaly.alpha".to_owned(),
+                    at_ms: 950_000,
+                    attribution_confidence_score: 88,
+                    attribution_collision: false,
+                },
+            ],
+            ..crate::state::FleetSnapshot::default()
+        });
+
+        screen.update_state(&state);
+
+        let selected_reason = screen
+            .reason_filters()
+            .get(screen.reason_filter_index)
+            .cloned();
+        let selected_host = screen.host_filters().get(screen.host_filter_index).cloned();
+        assert_eq!(selected_reason.as_deref(), Some("lifecycle.heartbeat_gap"));
+        assert_eq!(selected_host.as_deref(), Some("host-b"));
     }
 
     #[test]

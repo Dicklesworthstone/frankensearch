@@ -1186,23 +1186,25 @@ impl FsfsShowcasePortingSpec {
                             Some(InteractionSurfaceKind::Search),
                             false,
                         ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::ToggleExplainability,
-                            "search.toggle_explain",
-                            Some(InteractionSurfaceKind::Search),
-                            false,
-                        ),
                     ],
                 ),
                 FsfsShowcaseSurfaceMapping::new(
                     InteractionSurfaceKind::Results,
                     FsfsScreen::Search,
-                    vec![PaletteIntentRoute::new(
-                        PaletteIntent::NavigateSurface,
-                        "nav.fsfs.search",
-                        Some(InteractionSurfaceKind::Results),
-                        false,
-                    )],
+                    vec![
+                        PaletteIntentRoute::new(
+                            PaletteIntent::NavigateSurface,
+                            "nav.fsfs.search",
+                            Some(InteractionSurfaceKind::Results),
+                            false,
+                        ),
+                        PaletteIntentRoute::new(
+                            PaletteIntent::ToggleExplainability,
+                            "explain.toggle_panel",
+                            Some(InteractionSurfaceKind::Explainability),
+                            true,
+                        ),
+                    ],
                 ),
                 FsfsShowcaseSurfaceMapping::new(
                     InteractionSurfaceKind::Operations,
@@ -1517,7 +1519,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ContextRetentionPolicy, FsfsCardPrimitive, FsfsScreen, FsfsTuiShellModel,
+        ContextRetentionPolicy, FsfsCardPrimitive, FsfsScreen, FsfsTuiShellModel, PaletteIntent,
         REPLAY_TRACE_ACTION_ID, TuiAdapterSettings, TuiKeyBindingScope, TuiLatencyBoundary,
         TuiLatencyBudgetHook, TuiModelValidationError, TuiNavigationModel, TuiPaletteActionSpec,
         TuiPaletteCategory, TuiPaletteIntent, TuiStateSerializationPoint,
@@ -1904,6 +1906,42 @@ mod tests {
         for required_surface in InteractionSurfaceKind::all() {
             assert!(mapped_surfaces.contains(&required_surface));
         }
+    }
+
+    #[test]
+    fn showcase_results_mapping_routes_toggle_explainability_to_panel() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let spec = shell.showcase_porting_spec();
+        let results_mapping = spec
+            .mappings
+            .iter()
+            .find(|mapping| mapping.surface == InteractionSurfaceKind::Results)
+            .expect("results mapping should exist");
+
+        assert!(results_mapping.palette_routes.iter().any(|route| {
+            route.intent == PaletteIntent::ToggleExplainability
+                && route.action_id == "explain.toggle_panel"
+                && route.target_surface == Some(InteractionSurfaceKind::Explainability)
+                && route.cross_screen_semantics
+        }));
+    }
+
+    #[test]
+    fn showcase_search_mapping_does_not_rebind_toggle_explainability() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let spec = shell.showcase_porting_spec();
+        let search_mapping = spec
+            .mappings
+            .iter()
+            .find(|mapping| mapping.surface == InteractionSurfaceKind::Search)
+            .expect("search mapping should exist");
+
+        assert!(
+            !search_mapping
+                .palette_routes
+                .iter()
+                .any(|route| route.intent == PaletteIntent::ToggleExplainability)
+        );
     }
 
     #[test]

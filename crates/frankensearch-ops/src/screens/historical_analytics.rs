@@ -89,6 +89,21 @@ struct SnapshotExportPayload {
     replay_handle: String,
 }
 
+impl SnapshotExportPayload {
+    fn from_row(row: &EvidenceRow, compact_export: bool) -> Self {
+        Self {
+            mode: SnapshotExportMode::from_compact(compact_export),
+            project: row.project.clone(),
+            host: row.host.clone(),
+            instance_id: row.instance_id.clone(),
+            ts_ms: row.ts_ms,
+            reason_code: row.reason_code.clone(),
+            confidence: row.confidence,
+            replay_handle: HistoricalAnalyticsScreen::normalize_replay_handle(row),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplayTarget {
     project: String,
@@ -120,6 +135,9 @@ pub struct HistoricalAnalyticsScreen {
     state: AppState,
     project_lookup: BTreeMap<String, String>,
     evidence_rows: Vec<EvidenceRow>,
+    project_filter_values: Vec<String>,
+    reason_filter_values: Vec<String>,
+    host_filter_values: Vec<String>,
     selected_row: usize,
     project_filter_index: usize,
     reason_filter_index: usize,
@@ -139,6 +157,9 @@ impl HistoricalAnalyticsScreen {
             state: AppState::new(),
             project_lookup: BTreeMap::new(),
             evidence_rows: Vec::new(),
+            project_filter_values: vec!["all".to_owned()],
+            reason_filter_values: vec!["all".to_owned()],
+            host_filter_values: vec!["all".to_owned()],
             selected_row: 0,
             project_filter_index: 0,
             reason_filter_index: 0,
@@ -182,6 +203,27 @@ impl HistoricalAnalyticsScreen {
         let rows = self.filtered_evidence_rows();
         let row = rows.get(self.selected_row)?;
         self.project_lookup.get(&row.instance_id).cloned()
+    }
+
+    /// Apply a project filter by value, defaulting to `all` when absent.
+    pub fn set_project_filter(&mut self, project: &str) {
+        let focused = self.selected_evidence_key();
+        self.project_filter_index = self
+            .project_filters()
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(project))
+            .unwrap_or(0);
+        self.clamp_filter_indices();
+        self.restore_selected_row(focused);
+    }
+
+    /// Active project filter label, if not `all`.
+    #[must_use]
+    pub fn active_project_filter(&self) -> Option<String> {
+        self.project_filters()
+            .get(self.project_filter_index)
+            .filter(|value| value.as_str() != "all")
+            .cloned()
     }
 
     fn selected_replay_target_for_rows(&self, rows: &[EvidenceRow]) -> Option<ReplayTarget> {
@@ -257,6 +299,7 @@ impl HistoricalAnalyticsScreen {
         });
         self.project_lookup = project_lookup;
         self.evidence_rows = rows;
+        self.rebuild_filter_values();
     }
 
     fn all_evidence_rows(&self) -> &[EvidenceRow] {
@@ -301,37 +344,46 @@ impl HistoricalAnalyticsScreen {
             .collect()
     }
 
-    fn project_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
+    fn rebuild_filter_values(&mut self) {
         let projects: BTreeSet<_> = self
             .all_evidence_rows()
             .iter()
             .map(|row| row.project.clone())
             .collect();
-        values.extend(projects);
-        values
-    }
-
-    fn reason_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
         let reasons: BTreeSet<_> = self
             .all_evidence_rows()
             .iter()
             .map(|row| row.reason_code.clone())
             .collect();
-        values.extend(reasons);
-        values
-    }
-
-    fn host_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
         let hosts: BTreeSet<_> = self
             .all_evidence_rows()
             .iter()
             .map(|row| row.host.clone())
             .collect();
-        values.extend(hosts);
-        values
+
+        self.project_filter_values.clear();
+        self.project_filter_values.push("all".to_owned());
+        self.project_filter_values.extend(projects);
+
+        self.reason_filter_values.clear();
+        self.reason_filter_values.push("all".to_owned());
+        self.reason_filter_values.extend(reasons);
+
+        self.host_filter_values.clear();
+        self.host_filter_values.push("all".to_owned());
+        self.host_filter_values.extend(hosts);
+    }
+
+    fn project_filters(&self) -> &[String] {
+        &self.project_filter_values
+    }
+
+    fn reason_filters(&self) -> &[String] {
+        &self.reason_filter_values
+    }
+
+    fn host_filters(&self) -> &[String] {
+        &self.host_filter_values
     }
 
     fn selected_filter_values(&self) -> (String, String, String) {
@@ -633,16 +685,7 @@ impl HistoricalAnalyticsScreen {
         rows: &[EvidenceRow],
     ) -> Option<SnapshotExportPayload> {
         let row = rows.get(self.selected_row)?;
-        Some(SnapshotExportPayload {
-            mode: SnapshotExportMode::from_compact(self.compact_export),
-            project: row.project.clone(),
-            host: row.host.clone(),
-            instance_id: row.instance_id.clone(),
-            ts_ms: row.ts_ms,
-            reason_code: row.reason_code.clone(),
-            confidence: row.confidence,
-            replay_handle: Self::normalize_replay_handle(row),
-        })
+        Some(SnapshotExportPayload::from_row(row, self.compact_export))
     }
 
     fn normalize_replay_handle(row: &EvidenceRow) -> String {
@@ -1260,6 +1303,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_snapshot_payload_handles_filtered_zero_rows() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+
+        screen.project_filter_index = screen
+            .project_filters()
+            .iter()
+            .position(|value| value == "alpha")
+            .expect("alpha project filter should exist");
+        screen.reason_filter_index = screen
+            .reason_filters()
+            .iter()
+            .position(|value| value == "lifecycle.heartbeat_gap")
+            .expect("heartbeat-gap reason filter should exist");
+        screen.clamp_filter_indices();
+
+        assert_eq!(screen.evidence_count(), 0);
+        assert!(screen.selected_snapshot_payload().is_none());
+        assert!(screen.selected_replay_target().is_none());
+        assert_eq!(
+            screen.export_snapshot_line(),
+            "snapshot: no evidence row selected"
+        );
+    }
+
+    #[test]
     fn selected_snapshot_payload_normalizes_missing_replay_handle() {
         let mut screen = HistoricalAnalyticsScreen::new();
         screen.update_state(&sample_state());
@@ -1490,5 +1559,135 @@ mod tests {
             .get(screen.project_filter_index)
             .cloned();
         assert_eq!(selected_project.as_deref(), Some("proj-b"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_update_state_preserves_reason_and_host_filter_values_when_new_options_are_inserted()
+     {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot {
+            instances: vec![
+                InstanceInfo {
+                    id: "host-a:alpha-1".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(11),
+                    healthy: true,
+                    doc_count: 140,
+                    pending_jobs: 1,
+                },
+                InstanceInfo {
+                    id: "host-b:beta-1".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(12),
+                    healthy: false,
+                    doc_count: 90,
+                    pending_jobs: 4,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:alpha-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 12_000,
+                    attribution_confidence_score: 95,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:beta-1".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 10_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+        screen.update_state(&state);
+
+        screen.reason_filter_index = screen
+            .reason_filters()
+            .iter()
+            .position(|value| value == "lifecycle.heartbeat_gap")
+            .expect("reason filter should exist");
+        screen.host_filter_index = screen
+            .host_filters()
+            .iter()
+            .position(|value| value == "host-b")
+            .expect("host filter should exist");
+
+        state.update_fleet(FleetSnapshot {
+            instances: vec![
+                InstanceInfo {
+                    id: "host-a:alpha-1".to_owned(),
+                    project: "proj-a".to_owned(),
+                    pid: Some(11),
+                    healthy: true,
+                    doc_count: 140,
+                    pending_jobs: 1,
+                },
+                InstanceInfo {
+                    id: "host-b:beta-1".to_owned(),
+                    project: "proj-b".to_owned(),
+                    pid: Some(12),
+                    healthy: false,
+                    doc_count: 90,
+                    pending_jobs: 4,
+                },
+                InstanceInfo {
+                    id: "host-aa:gamma-1".to_owned(),
+                    project: "proj-c".to_owned(),
+                    pid: Some(13),
+                    healthy: true,
+                    doc_count: 20,
+                    pending_jobs: 0,
+                },
+            ],
+            lifecycle_events: vec![
+                LifecycleEvent {
+                    instance_id: "host-a:alpha-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 12_000,
+                    attribution_confidence_score: 95,
+                    attribution_collision: false,
+                },
+                LifecycleEvent {
+                    instance_id: "host-b:beta-1".to_owned(),
+                    from: LifecycleState::Healthy,
+                    to: LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 10_000,
+                    attribution_confidence_score: 70,
+                    attribution_collision: true,
+                },
+                LifecycleEvent {
+                    instance_id: "host-aa:gamma-1".to_owned(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: "lifecycle.anomaly.alpha".to_owned(),
+                    at_ms: 9_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+
+        screen.update_state(&state);
+
+        let selected_reason = screen
+            .reason_filters()
+            .get(screen.reason_filter_index)
+            .cloned();
+        let selected_host = screen.host_filters().get(screen.host_filter_index).cloned();
+        assert_eq!(selected_reason.as_deref(), Some("lifecycle.heartbeat_gap"));
+        assert_eq!(selected_host.as_deref(), Some("host-b"));
     }
 }

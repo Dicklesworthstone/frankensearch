@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use frankensearch_core::metrics_eval::{BootstrapComparison, bootstrap_compare};
+use frankensearch_core::metrics_eval::{
+    BootstrapComparison, RunStabilityVerdict, bootstrap_compare, trim_outliers,
+    verify_run_stability,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const GOLDEN_SCHEMA_VERSION: &str = "fsfs-benchmark-golden-v1";
@@ -19,6 +22,14 @@ const REGRESSION_SCALE: u64 = 100;
 const BOOTSTRAP_CONFIDENCE: f64 = 0.95;
 const BOOTSTRAP_RESAMPLES: usize = 2000;
 const BOOTSTRAP_SEED: u64 = 0xBE0C_5EED;
+
+/// Run-stability pre-gate parameters (bd-2vig).
+/// Maximum coefficient of variation allowed before rejecting a benchmark run.
+const STABILITY_MAX_CV: f64 = 0.15;
+/// Minimum sample count required after outlier trimming.
+const STABILITY_MIN_SAMPLES: usize = 5;
+/// IQR factor for outlier detection/trimming before bootstrap comparison.
+const OUTLIER_IQR_FACTOR: f64 = 1.5;
 
 #[inline]
 fn metric_u64_to_f64(value: u64) -> f64 {
@@ -124,6 +135,8 @@ struct BenchmarkArtifactManifest {
     dataset_profile: String,
     dataset_version: String,
     dataset_sha256: String,
+    matrix_sha256: String,
+    samples_sha256: String,
     comparator_count: usize,
     sample_count: usize,
     replay_command: String,
@@ -164,6 +177,11 @@ struct StatisticalRegressionResult {
     /// True when the difference is both statistically significant AND
     /// in the regression direction (worse performance).
     is_regression: bool,
+    /// Run-stability verdict for the sample set (bd-2vig).
+    /// `None` when the stability pre-gate was not applied.
+    stability: Option<RunStabilityVerdict>,
+    /// Number of outliers trimmed before bootstrap comparison (bd-2vig).
+    outliers_trimmed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,18 +369,73 @@ fn evaluate_regressions_statistical(
     dataset: &GoldenDataset,
     sample_sets: &[BenchmarkSampleSet],
 ) -> Vec<StatisticalRegressionResult> {
+    evaluate_regressions_statistical_inner(dataset, sample_sets, false)
+}
+
+/// Evaluate regressions with run-stability pre-gate and outlier trimming (bd-2vig).
+///
+/// Before bootstrap comparison:
+/// 1. **Outlier trimming**: removes IQR outliers from measurement iterations,
+///    producing cleaner data for the bootstrap comparison.
+/// 2. **Stability pre-gate**: verifies that trimmed measurements have acceptable
+///    CV and sufficient sample count. Unstable runs are still reported but
+///    `is_regression` is forced to `false` (unreliable data cannot confirm regression).
+fn evaluate_regressions_statistical_gated(
+    dataset: &GoldenDataset,
+    sample_sets: &[BenchmarkSampleSet],
+) -> Vec<StatisticalRegressionResult> {
+    evaluate_regressions_statistical_inner(dataset, sample_sets, true)
+}
+
+fn evaluate_regressions_statistical_inner(
+    dataset: &GoldenDataset,
+    sample_sets: &[BenchmarkSampleSet],
+    apply_stability_gate: bool,
+) -> Vec<StatisticalRegressionResult> {
     sample_sets
         .iter()
         .filter_map(|sample_set| {
             if sample_set.iterations.is_empty() {
                 return None;
             }
+
+            // bd-2vig: optionally trim outliers and check stability before comparison.
+            let (effective_iterations, stability, outliers_trimmed) = if apply_stability_gate {
+                let trimmed = trim_outliers(&sample_set.iterations, OUTLIER_IQR_FACTOR);
+                let outlier_count = sample_set.iterations.len().saturating_sub(trimmed.len());
+                if trimmed.is_empty() {
+                    // Preserve this metric in regression output instead of silently
+                    // dropping it when trimming removes all samples.
+                    let verdict = RunStabilityVerdict {
+                        stable: false,
+                        cv: None,
+                        effective_sample_count: 0,
+                        outlier_count,
+                        reason: format!(
+                            "all samples trimmed as outliers: 0 remaining from {}",
+                            sample_set.iterations.len()
+                        ),
+                    };
+                    (sample_set.iterations.clone(), Some(verdict), outlier_count)
+                } else {
+                    let verdict =
+                        verify_run_stability(&trimmed, STABILITY_MAX_CV, STABILITY_MIN_SAMPLES);
+                    (trimmed, Some(verdict), outlier_count)
+                }
+            } else {
+                (sample_set.iterations.clone(), None, 0)
+            };
+
+            if effective_iterations.is_empty() {
+                return None;
+            }
+
             let baseline_scalar = baseline_value(dataset, sample_set.metric);
-            let n = sample_set.iterations.len();
+            let n = effective_iterations.len();
             let baseline_samples: Vec<f64> = vec![metric_u64_to_f64(baseline_scalar); n];
 
             let comparison = bootstrap_compare(
-                &sample_set.iterations,
+                &effective_iterations,
                 &baseline_samples,
                 BOOTSTRAP_CONFIDENCE,
                 BOOTSTRAP_RESAMPLES,
@@ -377,29 +450,36 @@ fn evaluate_regressions_statistical(
                 _ => comparison.mean_diff > 0.0,
             };
 
-            let is_regression = comparison.significant && is_regression_direction;
+            // bd-2vig: if stability gate is active and run is unstable,
+            // suppress regression flag — noisy data cannot confirm a regression.
+            let run_is_stable = stability.as_ref().is_none_or(|v| v.stable);
+            let is_regression = comparison.significant && is_regression_direction && run_is_stable;
 
             Some(StatisticalRegressionResult {
                 metric: sample_set.metric,
                 comparison,
                 is_regression,
+                stability,
+                outliers_trimmed,
             })
         })
         .collect()
 }
 
 fn sha256_hex_for_file(path: &Path) -> String {
-    let output = Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .expect("invoke sha256sum");
-    assert!(output.status.success(), "sha256sum command failed");
-    let stdout = String::from_utf8(output.stdout).expect("decode sha256sum output");
-    stdout
-        .split_whitespace()
-        .next()
-        .expect("parse sha256sum digest")
-        .to_owned()
+    let mut file = fs::File::open(path).expect("open file for sha256");
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = file.read(&mut buffer).expect("read file for sha256");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    format!("{:x}", hasher.finalize())
 }
 
 fn sample_payload(case: &BenchmarkCase, dataset: &GoldenDataset) -> serde_json::Value {
@@ -443,28 +523,10 @@ fn write_artifact_bundle(
     let dataset_path = fixture_dir().join(format!("{}.json", dataset.profile));
     let dataset_sha256 = sha256_hex_for_file(&dataset_path);
 
-    let manifest = BenchmarkArtifactManifest {
-        schema_version: ARTIFACT_SCHEMA_VERSION.to_owned(),
-        matrix_version: matrix.matrix_version.clone(),
-        dataset_profile: dataset.profile.clone(),
-        dataset_version: dataset.dataset_version.clone(),
-        dataset_sha256,
-        comparator_count: matrix.comparators.len(),
-        sample_count: matrix.cases.len(),
-        replay_command:
-            "cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture"
-                .to_string(),
-    };
-
     let manifest_path = out_dir.join("benchmark_manifest.json");
     let matrix_path = out_dir.join("benchmark_matrix.json");
     let samples_path = out_dir.join("samples.jsonl");
 
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
-    )
-    .expect("write manifest artifact");
     fs::write(
         &matrix_path,
         serde_json::to_vec_pretty(matrix).expect("serialize matrix"),
@@ -477,6 +539,27 @@ fn write_artifact_bundle(
         let encoded = serde_json::to_string(&payload).expect("encode sample line");
         writeln!(samples, "{encoded}").expect("write sample line");
     }
+
+    let manifest = BenchmarkArtifactManifest {
+        schema_version: ARTIFACT_SCHEMA_VERSION.to_owned(),
+        matrix_version: matrix.matrix_version.clone(),
+        dataset_profile: dataset.profile.clone(),
+        dataset_version: dataset.dataset_version.clone(),
+        dataset_sha256,
+        matrix_sha256: sha256_hex_for_file(&matrix_path),
+        samples_sha256: sha256_hex_for_file(&samples_path),
+        comparator_count: matrix.comparators.len(),
+        sample_count: matrix.cases.len(),
+        replay_command:
+            "cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture"
+                .to_string(),
+    };
+
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest artifact");
 
     ArtifactBundle {
         manifest_path,
@@ -648,6 +731,16 @@ fn artifact_capture_supports_later_statistical_comparison() {
     assert_eq!(manifest.dataset_version, "2026-02-14");
     assert_eq!(manifest.comparator_count, 9);
     assert_eq!(manifest.sample_count, 4);
+    assert_eq!(
+        manifest.matrix_sha256,
+        sha256_hex_for_file(&bundle.matrix_path),
+        "manifest must carry deterministic matrix hash"
+    );
+    assert_eq!(
+        manifest.samples_sha256,
+        sha256_hex_for_file(&bundle.samples_path),
+        "manifest must carry deterministic sample bundle hash"
+    );
     assert!(
         manifest
             .replay_command
@@ -657,6 +750,45 @@ fn artifact_capture_supports_later_statistical_comparison() {
     let sample_lines = fs::read_to_string(&bundle.samples_path).expect("read samples");
     let non_empty_count = sample_lines.lines().filter(|line| !line.is_empty()).count();
     assert_eq!(non_empty_count, 4);
+}
+
+#[test]
+fn artifact_hashes_are_stable_across_repeated_bundle_generation() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let temp_a = TempDir::new().expect("create temp dir A");
+    let temp_b = TempDir::new().expect("create temp dir B");
+
+    let bundle_a = write_artifact_bundle(temp_a.path(), &matrix, &dataset);
+    let bundle_b = write_artifact_bundle(temp_b.path(), &matrix, &dataset);
+
+    let first_manifest_json = fs::read_to_string(&bundle_a.manifest_path).expect("read manifest A");
+    let second_manifest_json =
+        fs::read_to_string(&bundle_b.manifest_path).expect("read manifest B");
+    let manifest_a: BenchmarkArtifactManifest =
+        serde_json::from_str(&first_manifest_json).expect("parse manifest A");
+    let manifest_b: BenchmarkArtifactManifest =
+        serde_json::from_str(&second_manifest_json).expect("parse manifest B");
+
+    assert_eq!(manifest_a.dataset_sha256, manifest_b.dataset_sha256);
+    assert_eq!(manifest_a.matrix_sha256, manifest_b.matrix_sha256);
+    assert_eq!(manifest_a.samples_sha256, manifest_b.samples_sha256);
+    assert_eq!(
+        manifest_a.matrix_sha256,
+        sha256_hex_for_file(&bundle_a.matrix_path)
+    );
+    assert_eq!(
+        manifest_a.samples_sha256,
+        sha256_hex_for_file(&bundle_a.samples_path)
+    );
+    assert_eq!(
+        manifest_b.matrix_sha256,
+        sha256_hex_for_file(&bundle_b.matrix_path)
+    );
+    assert_eq!(
+        manifest_b.samples_sha256,
+        sha256_hex_for_file(&bundle_b.samples_path)
+    );
 }
 
 // ── Bootstrap statistical regression detection (bd-2hz.9.8) ───────
@@ -838,4 +970,173 @@ fn sample_set_serde_roundtrip() {
     let json = serde_json::to_string(&sample_set).expect("serialize sample set");
     let back: BenchmarkSampleSet = serde_json::from_str(&json).expect("deserialize sample set");
     assert_eq!(sample_set, back);
+}
+
+// ── Run-stability pre-gate and outlier trimming (bd-2vig) ──────────
+
+#[test]
+fn gated_regression_trims_outliers_before_comparison() {
+    let dataset = load_golden_dataset("small");
+    // Baseline p95 is 25ms. Inject a single extreme outlier (500ms) among
+    // otherwise-stable measurements near baseline. Without trimming, the
+    // outlier inflates the mean and could cause a false regression signal.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![26.0, 25.0, 24.0, 25.5, 500.0, 26.5, 24.5, 25.0, 25.5, 26.0],
+    }];
+
+    let results = evaluate_regressions_statistical_gated(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    assert!(
+        result.outliers_trimmed > 0,
+        "the 500ms outlier should be trimmed"
+    );
+    assert!(
+        !result.is_regression,
+        "stable measurements near baseline should not regress after outlier trimming"
+    );
+    assert!(
+        result.stability.as_ref().is_some_and(|v| v.stable),
+        "trimmed run should be stable"
+    );
+}
+
+#[test]
+fn gated_regression_suppresses_flag_when_run_is_unstable() {
+    let dataset = load_golden_dataset("small");
+    // Highly noisy measurements with CV >> 15%. Even though the mean is
+    // higher than baseline (suggesting regression), the instability gate
+    // should suppress the regression flag.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![10.0, 80.0, 15.0, 75.0, 12.0, 85.0, 20.0, 70.0],
+    }];
+
+    let results = evaluate_regressions_statistical_gated(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    let stability = result
+        .stability
+        .as_ref()
+        .expect("stability verdict should be present");
+    assert!(
+        !stability.stable,
+        "highly variable measurements should fail stability check"
+    );
+    assert!(
+        !result.is_regression,
+        "unstable runs should not flag regressions (unreliable data)"
+    );
+}
+
+#[test]
+fn gated_regression_still_detects_genuine_regression_when_stable() {
+    let dataset = load_golden_dataset("small");
+    // Consistent measurements significantly above baseline (25ms → ~40ms).
+    // Low noise, no outliers — should pass stability gate AND flag regression.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![39.0, 41.0, 40.0, 38.0, 42.0, 40.5, 39.5, 41.5],
+    }];
+
+    let results = evaluate_regressions_statistical_gated(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    let stability = result
+        .stability
+        .as_ref()
+        .expect("stability verdict should be present");
+    assert!(stability.stable, "consistent measurements should be stable");
+    assert!(
+        result.is_regression,
+        "genuine regression with stable data should still be flagged"
+    );
+    assert_eq!(
+        result.outliers_trimmed, 0,
+        "clean data should have no outliers trimmed"
+    );
+}
+
+#[test]
+fn gated_regression_ungated_path_has_no_stability_or_outlier_info() {
+    let dataset = load_golden_dataset("small");
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP95Ms,
+        iterations: vec![35.0, 38.0, 32.0, 36.0, 34.0, 37.0, 33.0, 35.0],
+    }];
+
+    let results = evaluate_regressions_statistical(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    assert!(
+        result.stability.is_none(),
+        "ungated path should not produce stability verdict"
+    );
+    assert_eq!(
+        result.outliers_trimmed, 0,
+        "ungated path should not trim outliers"
+    );
+}
+
+#[test]
+fn gated_regression_throughput_drop_with_outlier_trimming() {
+    let dataset = load_golden_dataset("small");
+    // Baseline throughput is 350 docs/s. Inject one high outlier (1000) that
+    // would mask a real throughput drop if not trimmed.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::IndexingThroughputDocsPerSecond,
+        iterations: vec![
+            200.0, 210.0, 195.0, 205.0, 1000.0, 198.0, 208.0, 202.0, 190.0, 195.0,
+        ],
+    }];
+
+    let results = evaluate_regressions_statistical_gated(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+
+    assert!(
+        result.outliers_trimmed > 0,
+        "1000 docs/s outlier should be trimmed"
+    );
+    assert!(
+        result.is_regression,
+        "throughput drop should be flagged after outlier removal"
+    );
+    assert!(
+        result.comparison.mean_diff < 0.0,
+        "measured throughput (after trimming) should be lower than baseline"
+    );
+}
+
+#[test]
+fn gated_regression_insufficient_samples_after_trimming() {
+    let dataset = load_golden_dataset("small");
+    // Only 4 samples, and after IQR trimming (which needs >=4 to apply),
+    // if outliers are removed we might drop below STABILITY_MIN_SAMPLES.
+    // Use wildly different values to force heavy outlier removal.
+    let sample_sets = vec![BenchmarkSampleSet {
+        metric: ComparatorMetric::SearchLatencyP50Ms,
+        iterations: vec![10.0, 10.0, 500.0, 500.0],
+    }];
+
+    let results = evaluate_regressions_statistical_gated(&dataset, &sample_sets);
+    assert_eq!(results.len(), 1, "gated path should report this metric");
+    let result = &results[0];
+    let stability = result
+        .stability
+        .as_ref()
+        .expect("stability verdict should be present");
+    assert!(
+        !stability.stable,
+        "insufficient stable samples should fail stability gate"
+    );
+    assert!(
+        !result.is_regression,
+        "unstable run should not flag regression"
+    );
 }

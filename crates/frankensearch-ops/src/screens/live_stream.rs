@@ -137,6 +137,26 @@ impl LiveSearchStreamScreen {
         self.clamp_selected_row();
     }
 
+    /// Apply a project filter by value, defaulting to `all` when absent.
+    pub fn set_project_filter(&mut self, project: &str) {
+        self.project_filter_index = self
+            .project_filters()
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(project))
+            .unwrap_or(0);
+        self.clamp_filter_index();
+        self.clamp_selected_row();
+    }
+
+    /// Active project filter label, if not `all`.
+    #[must_use]
+    pub fn active_project_filter(&self) -> Option<String> {
+        self.project_filters()
+            .get(self.project_filter_index)
+            .filter(|value| value.as_str() != "all")
+            .cloned()
+    }
+
     fn row_data(&self) -> Vec<StreamRowData> {
         let fleet = self.state.fleet();
         let project_filters = self.project_filters();
@@ -819,5 +839,208 @@ mod tests {
         assert!(summary.contains("focus: "));
         assert!(summary.contains("corr="));
         assert!(summary.contains("marker="));
+    }
+
+    // --- StreamSeverity ---
+
+    #[test]
+    fn severity_label_covers_all_variants() {
+        assert_eq!(StreamSeverity::Info.label(), "info");
+        assert_eq!(StreamSeverity::Warn.label(), "warn");
+        assert_eq!(StreamSeverity::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn severity_color_distinct_per_variant() {
+        let info_color = StreamSeverity::Info.color();
+        let warn_color = StreamSeverity::Warn.color();
+        let crit_color = StreamSeverity::Critical.color();
+        assert_ne!(info_color, warn_color);
+        assert_ne!(warn_color, crit_color);
+        assert_ne!(info_color, crit_color);
+    }
+
+    // --- StreamSeverityFilter ---
+
+    #[test]
+    fn severity_filter_cycles_through_all_states() {
+        let start = StreamSeverityFilter::All;
+        let step1 = start.next();
+        let step2 = step1.next();
+        let step3 = step2.next();
+        let step4 = step3.next();
+        assert_eq!(step1, StreamSeverityFilter::Info);
+        assert_eq!(step2, StreamSeverityFilter::Warn);
+        assert_eq!(step3, StreamSeverityFilter::Critical);
+        assert_eq!(step4, StreamSeverityFilter::All);
+    }
+
+    #[test]
+    fn severity_filter_labels_cover_all_variants() {
+        assert_eq!(StreamSeverityFilter::All.label(), "all");
+        assert_eq!(StreamSeverityFilter::Info.label(), "info");
+        assert_eq!(StreamSeverityFilter::Warn.label(), "warn");
+        assert_eq!(StreamSeverityFilter::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn severity_filter_all_allows_every_severity() {
+        assert!(StreamSeverityFilter::All.allows(StreamSeverity::Info));
+        assert!(StreamSeverityFilter::All.allows(StreamSeverity::Warn));
+        assert!(StreamSeverityFilter::All.allows(StreamSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_info_allows_only_info() {
+        assert!(StreamSeverityFilter::Info.allows(StreamSeverity::Info));
+        assert!(!StreamSeverityFilter::Info.allows(StreamSeverity::Warn));
+        assert!(!StreamSeverityFilter::Info.allows(StreamSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_warn_allows_only_warn() {
+        assert!(!StreamSeverityFilter::Warn.allows(StreamSeverity::Info));
+        assert!(StreamSeverityFilter::Warn.allows(StreamSeverity::Warn));
+        assert!(!StreamSeverityFilter::Warn.allows(StreamSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_critical_allows_only_critical() {
+        assert!(!StreamSeverityFilter::Critical.allows(StreamSeverity::Info));
+        assert!(!StreamSeverityFilter::Critical.allows(StreamSeverity::Warn));
+        assert!(StreamSeverityFilter::Critical.allows(StreamSeverity::Critical));
+    }
+
+    // --- severity_rank ---
+
+    #[test]
+    fn severity_rank_ordering() {
+        assert!(severity_rank(StreamSeverity::Info) < severity_rank(StreamSeverity::Warn));
+        assert!(severity_rank(StreamSeverity::Warn) < severity_rank(StreamSeverity::Critical));
+    }
+
+    // --- host_bucket ---
+
+    #[test]
+    fn host_bucket_splits_on_colon() {
+        assert_eq!(LiveSearchStreamScreen::host_bucket("host:instance"), "host");
+    }
+
+    #[test]
+    fn host_bucket_splits_on_dash_when_no_colon() {
+        assert_eq!(LiveSearchStreamScreen::host_bucket("host-instance"), "host");
+    }
+
+    #[test]
+    fn host_bucket_returns_full_id_when_no_separator() {
+        assert_eq!(
+            LiveSearchStreamScreen::host_bucket("singleword"),
+            "singleword"
+        );
+    }
+
+    #[test]
+    fn host_bucket_prefers_colon_over_dash() {
+        assert_eq!(
+            LiveSearchStreamScreen::host_bucket("host:part-suffix"),
+            "host"
+        );
+    }
+
+    #[test]
+    fn host_bucket_empty_string() {
+        assert_eq!(LiveSearchStreamScreen::host_bucket(""), "");
+    }
+
+    // --- correlation_id ---
+
+    #[test]
+    fn correlation_id_is_deterministic() {
+        let id1 = LiveSearchStreamScreen::correlation_id("inst-a", 10, 1000, 2000, 4096);
+        let id2 = LiveSearchStreamScreen::correlation_id("inst-a", 10, 1000, 2000, 4096);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn correlation_id_differs_for_different_inputs() {
+        let id1 = LiveSearchStreamScreen::correlation_id("inst-a", 10, 1000, 2000, 4096);
+        let id2 = LiveSearchStreamScreen::correlation_id("inst-b", 10, 1000, 2000, 4096);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn correlation_id_is_hex_formatted() {
+        let id = LiveSearchStreamScreen::correlation_id("test", 0, 0, 0, 0);
+        assert_eq!(id.len(), 16, "correlation id should be 16 hex chars");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "should be valid hex: {id}"
+        );
+    }
+
+    // --- set_project_filter / active_project_filter ---
+
+    #[test]
+    fn set_project_filter_by_name() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("proj-a");
+        assert_eq!(screen.active_project_filter(), Some("proj-a".to_owned()));
+    }
+
+    #[test]
+    fn set_project_filter_case_insensitive() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("PROJ-A");
+        assert_eq!(screen.active_project_filter(), Some("proj-a".to_owned()));
+    }
+
+    #[test]
+    fn set_project_filter_unknown_defaults_to_all() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("nonexistent");
+        assert_eq!(screen.active_project_filter(), None);
+    }
+
+    #[test]
+    fn active_project_filter_none_when_all() {
+        let screen = LiveSearchStreamScreen::new();
+        assert_eq!(screen.active_project_filter(), None);
+    }
+
+    // --- empty state ---
+
+    #[test]
+    fn empty_state_has_no_rows() {
+        let screen = LiveSearchStreamScreen::new();
+        assert_eq!(screen.row_data().len(), 0);
+    }
+
+    #[test]
+    fn empty_state_context_summary_says_none() {
+        let screen = LiveSearchStreamScreen::new();
+        assert_eq!(screen.selected_context_summary(), "focus: none");
+    }
+
+    // --- stream_health_summary ---
+
+    #[test]
+    fn stream_health_summary_contains_throughput() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        let summary = screen.stream_health_summary();
+        assert!(summary.contains("throughput="));
+        assert!(summary.contains("eps"));
+    }
+
+    // --- Default trait ---
+
+    #[test]
+    fn default_matches_new() {
+        let screen = LiveSearchStreamScreen::default();
+        assert_eq!(screen.id(), &ScreenId::new("ops.live_stream"));
+        assert_eq!(screen.selected_row, 0);
     }
 }

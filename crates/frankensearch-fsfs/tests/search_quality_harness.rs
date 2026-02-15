@@ -690,9 +690,11 @@ fn quality_harness_reports_metrics_by_query_slice() {
             .collect();
         let expected: Vec<&str> = record.expected_doc_ids.iter().map(String::as_str).collect();
 
-        k_short_ndcg.push(ndcg_at_k(&truncated, &expected, COMPARE_K));
+        // Compare both profiles on the same metric definition (TOP_K).
+        // The truncated profile simply has fewer retrieved candidates.
+        k_short_ndcg.push(ndcg_at_k(&truncated, &expected, TOP_K));
         k_short_mrr.push(mrr(&truncated, &expected));
-        k_short_recall.push(recall_at_k(&truncated, &expected, COMPARE_K));
+        k_short_recall.push(recall_at_k(&truncated, &expected, TOP_K));
 
         k_full_ndcg.push(record.ndcg_at_10);
         k_full_mrr.push(record.mrr);
@@ -717,36 +719,35 @@ fn quality_harness_reports_metrics_by_query_slice() {
         },
     ];
 
-    let profile_comparison = quality_comparison(
+    let comparison = quality_comparison(
         &samples,
         BOOTSTRAP_CONFIDENCE,
         BOOTSTRAP_RESAMPLES,
         BOOTSTRAP_SEED,
     )
-    .map(|cmp| {
-        let tsv_report = cmp.render_tsv_report();
-        ProfileComparisonSummary {
-            profile_a: format!("full@{TOP_K}"),
-            profile_b: format!("truncated@{COMPARE_K}"),
-            query_count: cmp.query_count,
-            confidence: cmp.confidence,
-            n_resamples: cmp.n_resamples,
-            metrics: cmp
-                .metrics
-                .iter()
-                .map(|m| ProfileMetricComparison {
-                    metric: m.metric.to_string(),
-                    mean_a: m.comparison.mean_a,
-                    mean_b: m.comparison.mean_b,
-                    mean_diff: m.comparison.mean_diff,
-                    ci_lower: m.comparison.ci_lower,
-                    ci_upper: m.comparison.ci_upper,
-                    p_value: m.comparison.p_value,
-                    significant: m.comparison.significant,
-                })
-                .collect(),
-            tsv_report,
-        }
+    .expect("quality comparison samples must be non-empty and aligned");
+    let tsv_report = comparison.render_tsv_report();
+    let profile_comparison = Some(ProfileComparisonSummary {
+        profile_a: format!("full@{TOP_K}"),
+        profile_b: format!("truncated@{COMPARE_K}"),
+        query_count: comparison.query_count,
+        confidence: comparison.confidence,
+        n_resamples: comparison.n_resamples,
+        metrics: comparison
+            .metrics
+            .iter()
+            .map(|metric| ProfileMetricComparison {
+                metric: metric.metric.to_string(),
+                mean_a: metric.comparison.mean_a,
+                mean_b: metric.comparison.mean_b,
+                mean_diff: metric.comparison.mean_diff,
+                ci_lower: metric.comparison.ci_lower,
+                ci_upper: metric.comparison.ci_upper,
+                p_value: metric.comparison.p_value,
+                significant: metric.comparison.significant,
+            })
+            .collect(),
+        tsv_report,
     });
 
     let per_slice_summary: BTreeMap<String, MetricSummary> = per_slice

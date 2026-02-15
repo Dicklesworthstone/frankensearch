@@ -52,6 +52,11 @@ Required policy:
 - tolerance policy MUST be explicit (`metric`, `max_delta`, window)
 - seed/config/artifact metadata MUST still be captured
 
+Benchmark reproducibility anchor for this tier:
+- `crates/frankensearch-fsfs/tests/benchmark_baseline_matrix.rs` MUST be treated as the canonical statistical reproducibility lane.
+- Each run MUST preserve the emitted artifact bundle (`benchmark_manifest.json`, `benchmark_matrix.json`, `samples.jsonl`) and replay command (`cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture`).
+- The manifest MUST carry stable digest fields for dataset and generated artifacts (`dataset_sha256`, `matrix_sha256`, `samples_sha256`).
+
 ## Non-Determinism Sources and Required Mitigations
 
 `fsfs` MUST define and enforce mitigations for:
@@ -96,6 +101,8 @@ Minimum deterministic validation requirements:
   repeat identical scenarios at least twice and assert stable outputs/artifacts
 - E2E:
   replay bundle execution from manifest and verify deterministic pass/fail with diagnostics
+
+For benchmark-focused Tier-3 checks, replay validation MUST include hash equality checks for the generated matrix and sample artifacts against manifest digests so benchmark claims remain auditable.
 
 All determinism checks MUST emit machine-readable result artifacts with:
 - scenario id

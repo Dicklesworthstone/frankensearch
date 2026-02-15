@@ -473,6 +473,94 @@ mod tests {
         );
     }
 
+    // ── Replay classifier edge cases ──────────────────────────────────
+
+    #[test]
+    fn replay_classifier_earlier_sequence_is_duplicate() {
+        assert_eq!(
+            classify_replay_sequence(100, 50),
+            ReplayDecision::Duplicate { checkpoint: 100 }
+        );
+    }
+
+    #[test]
+    fn replay_classifier_zero_checkpoint_and_seq_one() {
+        assert_eq!(
+            classify_replay_sequence(0, 1),
+            ReplayDecision::ApplyNext { next_checkpoint: 1 }
+        );
+    }
+
+    #[test]
+    fn replay_classifier_i64_max_checkpoint_saturates() {
+        // saturating_add(1) on i64::MAX stays at i64::MAX
+        // incoming = i64::MAX is the expected_next, so it should be ApplyNext
+        assert_eq!(
+            classify_replay_sequence(i64::MAX - 1, i64::MAX),
+            ReplayDecision::ApplyNext {
+                next_checkpoint: i64::MAX
+            }
+        );
+    }
+
+    // ── Enum as_str round-trips ─────────────────────────────────────
+
+    #[test]
+    fn ingestion_class_as_str_covers_all_variants() {
+        use super::{CatalogChangeKind, CatalogIngestionClass, CatalogPipelineStatus};
+
+        let classes = [
+            (
+                CatalogIngestionClass::FullSemanticLexical,
+                "full_semantic_lexical",
+            ),
+            (CatalogIngestionClass::LexicalOnly, "lexical_only"),
+            (CatalogIngestionClass::MetadataOnly, "metadata_only"),
+            (CatalogIngestionClass::Skip, "skip"),
+        ];
+        for (variant, expected) in classes {
+            assert_eq!(variant.as_str(), expected);
+        }
+
+        let statuses = [
+            (CatalogPipelineStatus::Discovered, "discovered"),
+            (CatalogPipelineStatus::Queued, "queued"),
+            (CatalogPipelineStatus::Embedding, "embedding"),
+            (CatalogPipelineStatus::Indexed, "indexed"),
+            (CatalogPipelineStatus::Failed, "failed"),
+            (CatalogPipelineStatus::Skipped, "skipped"),
+            (CatalogPipelineStatus::Tombstoned, "tombstoned"),
+        ];
+        for (variant, expected) in statuses {
+            assert_eq!(variant.as_str(), expected);
+        }
+
+        let kinds = [
+            (CatalogChangeKind::Upsert, "upsert"),
+            (CatalogChangeKind::Reclassified, "reclassified"),
+            (CatalogChangeKind::Status, "status"),
+            (CatalogChangeKind::Tombstone, "tombstone"),
+        ];
+        for (variant, expected) in kinds {
+            assert_eq!(variant.as_str(), expected);
+        }
+    }
+
+    // ── Schema version edge cases ───────────────────────────────────
+
+    #[test]
+    fn current_version_errors_when_table_has_no_rows() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fsfs_catalog_schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .expect("create table");
+        let error = current_catalog_schema_version(&conn).expect_err("should error with no rows");
+        assert!(error.to_string().contains("no rows"));
+    }
+
+    // ── Original tests continue ─────────────────────────────────────
+
     #[test]
     fn incremental_workload_queries_execute_and_have_index_support() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");

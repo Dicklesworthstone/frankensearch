@@ -505,6 +505,54 @@ fn scenario_insufficient_samples_watch() -> SimulationScenario {
     }
 }
 
+fn scenario_long_run_soak_fault_injection() -> SimulationScenario {
+    let mut pressure_events = Vec::new();
+    let mut degradation_events = Vec::new();
+
+    // 180 ticks (~3 minutes at 1Hz): mostly healthy with periodic injected
+    // starvation and partial-failure windows.
+    for i in 0_u64..180 {
+        let minute_phase = i % 60;
+        let emergency_burst = i % 45 < 3; // 3-second starvation burst every 45s
+        let quality_fault = (10..=11).contains(&minute_phase); // 2-second partial failure
+        let hard_pause_fault = i % 90 == 30; // operator hard-pause fault injection
+
+        let pressure_state = if emergency_burst {
+            PressureState::Emergency
+        } else {
+            PressureState::Normal
+        };
+        let signal = if emergency_burst {
+            PressureSignalInput::new(145.0, 72.0, 68.0, 112.0)
+        } else {
+            PressureSignalInput::new(38.0, 32.0, 24.0, 30.0)
+        };
+
+        pressure_events.push(PressureEvent {
+            timestamp_ms: i * 1000,
+            signal,
+        });
+        degradation_events.push(DegradationEvent {
+            timestamp_ms: i * 1000,
+            pressure_state,
+            quality_circuit_open: quality_fault,
+            hard_pause_requested: hard_pause_fault,
+        });
+    }
+
+    SimulationScenario {
+        name: "long_run_soak_fault_injection".to_owned(),
+        description: "Sustained run with periodic pressure starvation, quality-circuit faults, and hard-pause injections".to_owned(),
+        seed: 2026,
+        pressure_config: PressureControllerConfig::default(),
+        degradation_config: DegradationControllerConfig::default(),
+        calibration_config: CalibrationGuardConfig::default(),
+        pressure_events,
+        degradation_events,
+        calibration_events: Vec::new(),
+    }
+}
+
 // ─── Simulation runner ──────────────────────────────────────────────────
 
 fn run_pressure_simulation(
@@ -1420,6 +1468,95 @@ fn scenario_watch_state_protects_against_premature_breach() {
 }
 
 #[test]
+#[allow(clippy::cast_precision_loss)]
+fn scenario_long_run_soak_fault_injection_stays_within_drift_thresholds() {
+    let scenario = scenario_long_run_soak_fault_injection();
+    let trace = run_full_simulation(&scenario);
+
+    assert_eq!(
+        trace.degradation_trace.len(),
+        scenario.degradation_events.len(),
+        "degradation trace should cover full soak horizon"
+    );
+    assert!(
+        trace.degradation_trace.len() >= 180,
+        "expected sustained soak horizon"
+    );
+
+    let total_ticks = trace.degradation_trace.len() as f64;
+    let degraded_ticks = trace
+        .degradation_trace
+        .iter()
+        .filter(|record| record.to != DegradationStage::Full)
+        .count() as f64;
+    let degraded_ratio = degraded_ticks / total_ticks;
+    let degraded_ratio_threshold = 0.70_f64;
+
+    let emergency_ticks = trace
+        .pressure_trace
+        .iter()
+        .filter(|record| record.to == PressureState::Emergency)
+        .count() as f64;
+    let emergency_ratio = emergency_ticks / (trace.pressure_trace.len() as f64);
+    let emergency_ratio_threshold = 0.35_f64;
+
+    let mut current_non_full_streak = 0_usize;
+    let mut max_non_full_streak = 0_usize;
+    for record in &trace.degradation_trace {
+        if record.to == DegradationStage::Full {
+            current_non_full_streak = 0;
+        } else {
+            current_non_full_streak = current_non_full_streak.saturating_add(1);
+            max_non_full_streak = max_non_full_streak.max(current_non_full_streak);
+        }
+    }
+    let non_full_streak_threshold = 35_usize;
+
+    let mut threshold_alerts = Vec::new();
+    if degraded_ratio > degraded_ratio_threshold {
+        threshold_alerts.push("soak.degradation_ratio_threshold_exceeded");
+    }
+    if emergency_ratio > emergency_ratio_threshold {
+        threshold_alerts.push("soak.emergency_ratio_threshold_exceeded");
+    }
+    if max_non_full_streak > non_full_streak_threshold {
+        threshold_alerts.push("soak.recovery_drift_threshold_exceeded");
+    }
+    assert!(
+        threshold_alerts.is_empty(),
+        "soak/fault threshold alerts triggered: {threshold_alerts:?} (degraded_ratio={degraded_ratio:.3}, emergency_ratio={emergency_ratio:.3}, max_non_full_streak={max_non_full_streak})"
+    );
+
+    assert!(
+        trace.degradation_trace.iter().any(
+            |record| record.changed && record.trigger == DegradationTrigger::PressureEscalation
+        ),
+        "expected pressure-starvation fault class to trigger escalation"
+    );
+    assert!(
+        trace.degradation_trace.iter().any(
+            |record| record.changed && record.trigger == DegradationTrigger::QualityCircuitOpen
+        ),
+        "expected quality-circuit partial-failure fault class"
+    );
+    assert!(
+        trace
+            .degradation_trace
+            .iter()
+            .any(|record| record.changed && record.trigger == DegradationTrigger::HardPause),
+        "expected hard-pause partial-failure fault class"
+    );
+
+    for oracle in &trace.oracle_results {
+        assert!(
+            oracle.passed,
+            "Oracle {} failed: {}",
+            oracle.oracle_name, oracle.detail
+        );
+    }
+}
+
+#[test]
 fn all_scenarios_are_deterministic() {
     let scenarios = vec![
         scenario_gradual_ramp_up(),
@@ -1430,6 +1567,7 @@ fn all_scenarios_are_deterministic() {
         scenario_quality_circuit_breaker(),
         scenario_multi_profile_comparison(),
         scenario_insufficient_samples_watch(),
+        scenario_long_run_soak_fault_injection(),
     ];
 
     for scenario in &scenarios {

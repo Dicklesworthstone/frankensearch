@@ -328,9 +328,6 @@ impl VectorIndex {
             crate::Quantization::F16 => {
                 let mut scratch = vec![f16::from_f32(0.0); search_dims];
                 for index in 0..self.record_count() {
-                    if self.is_deleted(index) {
-                        continue;
-                    }
                     if !self.passes_mrl_filter(filter, index)? {
                         continue;
                     }
@@ -346,9 +343,6 @@ impl VectorIndex {
             crate::Quantization::F32 => {
                 let mut scratch = vec![0.0_f32; search_dims];
                 for index in 0..self.record_count() {
-                    if self.is_deleted(index) {
-                        continue;
-                    }
                     if !self.passes_mrl_filter(filter, index)? {
                         continue;
                     }
@@ -375,10 +369,14 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<()> {
         for (idx, entry) in self.wal_entries.iter().enumerate() {
-            if let Some(f) = filter
-                && !f.matches(&entry.doc_id, None)
-            {
-                continue;
+            if let Some(f) = filter {
+                if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
+                    if !matches {
+                        continue;
+                    }
+                } else if !f.matches(&entry.doc_id, None) {
+                    continue;
+                }
             }
             // WAL embeddings are f32 in memory — truncate to search_dims.
             let truncated_emb = &entry.embedding[..search_dims.min(entry.embedding.len())];
@@ -506,12 +504,16 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
         index: usize,
     ) -> SearchResult<bool> {
-        if self.is_deleted(index) {
+        let entry = self.record_at(index)?;
+        if super::is_tombstoned_flags(entry.flags) {
             return Ok(false);
         }
         let Some(f) = filter else {
             return Ok(true);
         };
+        if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
+            return Ok(matches);
+        }
         let doc_id = self.doc_id_at(index)?;
         Ok(f.matches(doc_id, None))
     }
@@ -954,6 +956,43 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.doc_id != "doc-a"));
         assert_eq!(hits[0].doc_id, "doc-b");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrl_bitset_filter_skips_doc_id_decode_for_non_matching_records() {
+        let dim = 16;
+        let path = temp_index_path("bitset-hash-fast-path");
+
+        let rows = [("doc-a", vec![1.0; dim]), ("doc-b", vec![0.2; dim])];
+        write_index(&path, &rows).expect("write index");
+
+        let inspect = VectorIndex::open(&path).expect("open");
+        let bad_idx = inspect
+            .find_index_by_doc_hash(super::super::fnv1a_hash(b"doc-b"))
+            .expect("doc-b index");
+        let record = inspect.record_at(bad_idx).expect("record");
+        let bad_offset =
+            inspect.strings_offset + usize::try_from(record.doc_id_offset).expect("offset");
+        drop(inspect);
+
+        let mut bytes = std::fs::read(&path).expect("read bytes");
+        bytes[bad_offset] = 0xFF;
+        std::fs::write(&path, bytes).expect("write corrupt bytes");
+
+        let index = VectorIndex::open(&path).expect("open");
+        let config = MrlConfig {
+            search_dims: 8,
+            ..MrlConfig::default()
+        };
+        let filter = frankensearch_core::BitsetFilter::from_doc_ids(["doc-a"]);
+        let hits = index
+            .mrl_search(&vec![1.0; dim], 10, &config, Some(&filter))
+            .expect("mrl search should ignore corrupted filtered-out doc_id");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-a");
 
         std::fs::remove_file(&path).ok();
     }

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::discovery::{DiscoveredInstance, DiscoveryStatus};
 use frankensearch_core::host_adapter::resolve_host_project_attribution;
-use frankensearch_core::{LifecycleSeverity, LifecycleState};
+pub use frankensearch_core::{LifecycleSeverity, LifecycleState};
 use serde::{Deserialize, Serialize};
 
 // ─── Instance Info ───────────────────────────────────────────────────────────

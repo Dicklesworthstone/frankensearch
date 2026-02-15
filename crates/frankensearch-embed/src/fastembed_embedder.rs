@@ -504,4 +504,93 @@ mod tests {
         let selected = select_model_file(temp.path()).unwrap();
         assert!(selected.ends_with(MODEL_ONNX_SUBDIR));
     }
+
+    #[test]
+    fn has_required_files_rejects_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!has_required_files(temp.path()));
+    }
+
+    #[test]
+    fn has_required_files_rejects_model_without_tokenizer() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("onnx")).unwrap();
+        std::fs::write(temp.path().join("onnx/model.onnx"), b"stub").unwrap();
+        // Missing tokenizer.json, config.json, etc.
+        assert!(!has_required_files(temp.path()));
+    }
+
+    #[test]
+    fn has_required_files_rejects_tokenizer_without_model() {
+        let temp = tempfile::tempdir().unwrap();
+        // All non-model files present, but no model.onnx
+        std::fs::write(temp.path().join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("config.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("special_tokens_map.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("tokenizer_config.json"), "{}").unwrap();
+        assert!(!has_required_files(temp.path()));
+    }
+
+    #[test]
+    fn select_model_file_returns_none_for_empty_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(select_model_file(temp.path()).is_none());
+    }
+
+    #[test]
+    fn select_model_file_falls_back_to_legacy() {
+        let temp = tempfile::tempdir().unwrap();
+        // Only legacy model.onnx, no onnx/ subdir
+        std::fs::write(temp.path().join("model.onnx"), b"legacy").unwrap();
+        let selected = select_model_file(temp.path()).unwrap();
+        assert!(selected.ends_with(MODEL_ONNX_LEGACY));
+    }
+
+    #[test]
+    fn read_required_returns_error_for_missing_file() {
+        let path = PathBuf::from("/nonexistent/path/model.onnx");
+        let err = read_required(&path).unwrap_err();
+        assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
+    }
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert_eq!(DEFAULT_MODEL_NAME, "all-MiniLM-L6-v2");
+        assert_eq!(DEFAULT_DIMENSION, 384);
+        assert!(DEFAULT_HF_ID.contains("MiniLM"));
+    }
+
+    #[test]
+    fn map_lock_error_preserves_phase_string() {
+        let err = map_lock_error("test-model", "test.phase", LockError::Cancelled);
+        match err {
+            SearchError::Cancelled { phase, .. } => {
+                assert_eq!(phase, "test.phase");
+            }
+            _ => panic!("expected Cancelled variant"),
+        }
+    }
+
+    #[test]
+    fn map_lock_error_preserves_model_string() {
+        let err = map_lock_error("custom-model", "embed", LockError::Poisoned);
+        match err {
+            SearchError::EmbeddingFailed { model, .. } => {
+                assert_eq!(model, "custom-model");
+            }
+            _ => panic!("expected EmbeddingFailed variant"),
+        }
+    }
+
+    #[test]
+    fn resolve_model_dir_error_message_includes_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_model_dir(temp.path(), "my-model").unwrap_err();
+        match err {
+            SearchError::ModelNotFound { name } => {
+                assert!(name.contains("my-model"), "error should include model name");
+            }
+            _ => panic!("expected ModelNotFound variant"),
+        }
+    }
 }

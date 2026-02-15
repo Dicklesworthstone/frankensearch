@@ -320,8 +320,8 @@ fn assert_binary_chaos_result(
                 .reason_codes
                 .iter()
                 .any(|code| code == expected_code),
-            "expected sentinel reason code {expected_code} for {scenario_id}, got {:?}",
-            result.sentinel.reason_codes
+            "expected sentinel reason code {expected_code} for {scenario_id}, got {reason_codes:?}",
+            reason_codes = result.sentinel.reason_codes
         );
     }
 
@@ -334,14 +334,12 @@ fn assert_binary_chaos_result(
         manifest_reason_codes
             .iter()
             .all(|code| code.starts_with("index.plan.")),
-        "manifest reason codes must remain canonical index plan codes, got {:?}",
-        manifest_reason_codes
+        "manifest reason codes must remain canonical index plan codes, got {manifest_reason_codes:?}"
     );
     if expect_manifest_empty {
         assert!(
             result.lexical_manifest.is_empty(),
-            "expected empty manifest for {scenario_id}, got {:?}",
-            manifest_reason_codes
+            "expected empty manifest for {scenario_id}, got {manifest_reason_codes:?}"
         );
     }
     if let Some(expected_reason_code) = expected_manifest_reason {
@@ -353,8 +351,7 @@ fn assert_binary_chaos_result(
             manifest_reason_codes
                 .iter()
                 .all(|code| *code == expected_reason_code),
-            "expected manifest reason code {expected_reason_code} for {scenario_id}, got {:?}",
-            manifest_reason_codes
+            "expected manifest reason code {expected_reason_code} for {scenario_id}, got {manifest_reason_codes:?}"
         );
     }
     assert_eq!(result.bundle.scenario.id, scenario_id);
@@ -455,7 +452,7 @@ fn scenario_cli_chaos_mount_boundary_binary_run() {
         "cli-chaos-mount-boundary",
         CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY,
         1,
-        &["discovery.root.rejected"],
+        &["discovery.root.rejected", "discovery.file.excluded_pattern"],
         true,
         None,
         true,

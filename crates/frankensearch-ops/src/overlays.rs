@@ -355,4 +355,78 @@ mod tests {
             let _request = OverlayRequest::new(kind, "Test");
         }
     }
+
+    #[test]
+    fn centered_rect_full_area() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = centered_rect(100, 100, area);
+        // 100% should produce the full area
+        assert_eq!(popup.width, area.width);
+        assert_eq!(popup.height, area.height);
+    }
+
+    #[test]
+    fn centered_rect_small_area_does_not_panic() {
+        let area = Rect::new(0, 0, 3, 3);
+        let popup = centered_rect(50, 50, area);
+        assert!(popup.width <= area.width);
+        assert!(popup.height <= area.height);
+    }
+
+    #[test]
+    fn centered_rect_zero_area_does_not_panic() {
+        let area = Rect::new(0, 0, 0, 0);
+        let popup = centered_rect(50, 50, area);
+        assert_eq!(popup.width, 0);
+        assert_eq!(popup.height, 0);
+    }
+
+    #[test]
+    fn help_entries_include_quit() {
+        let entries = default_help_entries();
+        assert!(
+            entries.iter().any(|e| e.description.contains("Quit")),
+            "help entries should include a quit shortcut"
+        );
+    }
+
+    #[test]
+    fn help_entries_include_command_palette() {
+        let entries = default_help_entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.description.contains("Command palette")),
+            "help entries should include command palette"
+        );
+    }
+
+    #[test]
+    fn help_entry_keys_are_unique() {
+        let entries = default_help_entries();
+        let keys: Vec<&str> = entries.iter().map(|e| e.key).collect();
+        for (i, key) in keys.iter().enumerate() {
+            for (j, other) in keys.iter().enumerate() {
+                if i != j {
+                    assert_ne!(key, other, "duplicate key: {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alert_request_without_body_defaults_to_none() {
+        let request = OverlayRequest::new(OverlayKind::Alert, "Title Only");
+        assert!(request.body.is_none());
+        assert!(request.actions.is_empty());
+    }
+
+    #[test]
+    fn custom_overlay_preserves_name() {
+        let kind = OverlayKind::Custom("my_custom".into());
+        match &kind {
+            OverlayKind::Custom(name) => assert_eq!(name, "my_custom"),
+            _ => panic!("expected Custom variant"),
+        }
+    }
 }

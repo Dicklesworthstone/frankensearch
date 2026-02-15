@@ -62,7 +62,9 @@ Example group id: `CFG-ER` = config module error coverage lane.
 | `crates/frankensearch-fsfs/src/repro.rs` | `docs/fsfs-determinism-contract.md`, `docs/fsfs-provenance-attestation-contract.md` | `36` tests (`src/repro.rs::tests`) | `REPRO-H`, `REPRO-E`, `REPRO-ER`, `REPRO-C`, `REPRO-D` | Manifest/attestation mismatches must emit deterministic startup action and reason codes. |
 | `crates/frankensearch-fsfs/src/runtime.rs` | `docs/fsfs-dual-mode-contract.md`, `docs/fsfs-determinism-contract.md`, `docs/fsfs-expected-loss-contract.md` | `12` tests (`src/runtime.rs::tests`) | `RUN-H`, `RUN-E`, `RUN-ER`, `RUN-C`, `RUN-D` | Runtime orchestration outputs must preserve stable mode/action/reason fields. |
 | `crates/frankensearch-fsfs/src/shutdown.rs` | `docs/fsfs-determinism-contract.md` | `8` tests (`src/shutdown.rs::tests`) | `SHUT-H`, `SHUT-E`, `SHUT-ER`, `SHUT-C`, `SHUT-D` | Signal-handling transitions must be deterministic with stable shutdown reason semantics. |
-| `crates/frankensearch-fsfs/tests/benchmark_baseline_matrix.rs` | `docs/fsfs-determinism-contract.md` | `3` integration tests | `BENCH-H`, `BENCH-E`, `BENCH-ER`, `BENCH-D` | Benchmark artifacts must include replay command + deterministic manifest identity fields. |
+| `crates/frankensearch-fsfs/tests/benchmark_baseline_matrix.rs` | `docs/fsfs-determinism-contract.md` | `13` integration tests | `BENCH-H`, `BENCH-E`, `BENCH-ER`, `BENCH-D` | Benchmark artifacts must include replay command + deterministic `dataset_sha256`/`matrix_sha256`/`samples_sha256` identity fields. |
+
+`BENCH-*` is the reproducible evidence lane for `bd-2hz.11.5` (demo/benchmark showcase): run `cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture` to emit the artifact bundle (`benchmark_manifest.json`, `benchmark_matrix.json`, `samples.jsonl`) with fixed replay metadata and stable hashes suitable for audit and CI comparison.
 
 ## Contract-to-Group Traceability Index
 

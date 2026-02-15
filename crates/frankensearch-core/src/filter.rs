@@ -24,6 +24,19 @@ pub trait SearchFilter: Send + Sync {
     ///   `None` during vector search; `Some` after fusion or from stored fields.
     fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool;
 
+    /// Optional fast path for hash-addressable filters.
+    ///
+    /// Returns:
+    /// - `Some(result)` when this filter can decide from `doc_id_hash`
+    /// - `None` when a full `doc_id` string is required
+    fn matches_doc_id_hash(
+        &self,
+        _doc_id_hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        None
+    }
+
     /// A short, descriptive name for diagnostics and tracing.
     fn name(&self) -> &str;
 }
@@ -87,6 +100,40 @@ impl SearchFilter for FilterChain {
         match self.mode {
             FilterMode::All => self.filters.iter().all(|f| f.matches(doc_id, metadata)),
             FilterMode::Any => self.filters.iter().any(|f| f.matches(doc_id, metadata)),
+        }
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        doc_id_hash: u64,
+        metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        if self.filters.is_empty() {
+            return Some(true);
+        }
+        match self.mode {
+            FilterMode::All => {
+                let mut has_unknown = false;
+                for filter in &self.filters {
+                    match filter.matches_doc_id_hash(doc_id_hash, metadata) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => has_unknown = true,
+                    }
+                }
+                if has_unknown { None } else { Some(true) }
+            }
+            FilterMode::Any => {
+                let mut has_unknown = false;
+                for filter in &self.filters {
+                    match filter.matches_doc_id_hash(doc_id_hash, metadata) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => has_unknown = true,
+                    }
+                }
+                if has_unknown { None } else { Some(false) }
+            }
         }
     }
 
@@ -246,7 +293,16 @@ impl BitsetFilter {
 
 impl SearchFilter for BitsetFilter {
     fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
-        self.hashes.contains(&fnv1a_hash(doc_id.as_bytes()))
+        self.matches_doc_id_hash(fnv1a_hash(doc_id.as_bytes()), None)
+            .unwrap_or(false)
+    }
+
+    fn matches_doc_id_hash(
+        &self,
+        doc_id_hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
+        Some(self.hashes.contains(&doc_id_hash))
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -427,6 +483,17 @@ mod tests {
         assert!(!filter.matches("doc-y", None));
     }
 
+    #[test]
+    fn bitset_filter_hash_fast_path_matches() {
+        let hash = fnv1a_hash(b"doc-x");
+        let filter = BitsetFilter::from_hashes(HashSet::from([hash]));
+        assert_eq!(filter.matches_doc_id_hash(hash, None), Some(true));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"doc-y"), None),
+            Some(false)
+        );
+    }
+
     // --- PredicateFilter ---
 
     #[test]
@@ -477,6 +544,29 @@ mod tests {
         assert!(chain.matches("doc-a", None));
         assert!(chain.matches("doc-b", None));
         assert!(!chain.matches("doc-c", None));
+    }
+
+    #[test]
+    fn filter_chain_hash_fast_path_all_with_unknown_filter() {
+        let chain = FilterChain::new(FilterMode::All)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])))
+            .with(Box::new(PredicateFilter::new("starts-with-doc", |id| {
+                id.starts_with("doc-")
+            })));
+
+        assert_eq!(chain.matches_doc_id_hash(fnv1a_hash(b"doc-a"), None), None);
+    }
+
+    #[test]
+    fn filter_chain_hash_fast_path_any_short_circuits_true() {
+        let chain = FilterChain::new(FilterMode::Any)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-a"])))
+            .with(Box::new(PredicateFilter::new("is-b", |id| id == "doc-b")));
+
+        assert_eq!(
+            chain.matches_doc_id_hash(fnv1a_hash(b"doc-a"), None),
+            Some(true)
+        );
     }
 
     #[test]

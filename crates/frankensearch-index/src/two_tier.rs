@@ -761,6 +761,184 @@ mod tests {
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
     }
 
+    // ── Error paths ──────────────────────────────────────────────────
+
+    #[test]
+    fn open_returns_index_not_found_when_no_fast_or_fallback() {
+        let dir = temp_index_dir("missing");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let error = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap_err();
+        assert!(
+            matches!(error, SearchError::IndexNotFound { .. }),
+            "expected IndexNotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn quality_scores_dimension_mismatch() {
+        let dir = temp_index_dir("quality-dim");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write fast index");
+        write_index_file(&quality_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0])])
+            .expect("write quality index");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(index.has_quality_index());
+
+        // Query dimension (4) doesn't match quality dimension (6)
+        let error = index
+            .quality_scores_for_indices(&[1.0, 0.0, 0.0, 0.0], &[0])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: 6,
+                    found: 4
+                }
+            ),
+            "expected DimensionMismatch, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn has_quality_for_index_out_of_bounds_returns_false() {
+        let dir = temp_index_dir("oob");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast index");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(!index.has_quality_for_index(999));
+    }
+
+    // ── Builder error paths ─────────────────────────────────────────
+
+    #[test]
+    fn builder_finish_rejects_empty_fast_records() {
+        let dir = temp_index_dir("empty-builder");
+        let builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        let error = builder.finish().unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "fast_records"),
+            "expected InvalidConfig for fast_records, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_inconsistent_quality_dimension() {
+        let dir = temp_index_dir("bad-quality-dim");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("doc-a", &[1.0, 0.0, 0.0])
+            .expect("fast record");
+        builder
+            .add_quality_record("doc-a", &[1.0, 0.0, 0.0, 0.0])
+            .expect("first quality");
+        let error = builder
+            .add_quality_record("doc-b", &[1.0, 0.0])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: 4,
+                    found: 2
+                }
+            ),
+            "expected DimensionMismatch, got {error:?}"
+        );
+    }
+
+    // ── Fast-tier with explicit fast.idx (not fallback) ─────────────
+
+    #[test]
+    fn opens_with_explicit_fast_index() {
+        let dir = temp_index_dir("explicit-fast");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-x", &[0.0, 1.0, 0.0]), ("doc-y", &[0.0, 0.0, 1.0])],
+        )
+        .expect("write fast index");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(index.doc_ids(), &["doc-x".to_owned(), "doc-y".to_owned()]);
+
+        let hits = index.search_fast(&[0.0, 0.0, 1.0], 1).expect("fast search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-y");
+    }
+
+    // ── Accessors ───────────────────────────────────────────────────
+
+    #[test]
+    fn config_accessor_returns_construction_config() {
+        let dir = temp_index_dir("config-acc");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast index");
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 42,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).expect("open");
+        assert_eq!(index.config().hnsw_threshold, 42);
+    }
+
+    // ── Quality alignment: unmatched doc_ids ────────────────────────
+
+    #[test]
+    fn quality_index_with_extra_doc_ids_still_opens() {
+        let dir = temp_index_dir("quality-extra");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
+        // Quality has a doc_id not in fast — should trigger warning but still open
+        write_index_file(
+            &quality_path,
+            &[
+                ("doc-a", &[1.0, 0.0]),
+                ("doc-z", &[0.0, 1.0]), // extra
+            ],
+        )
+        .expect("write quality");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        assert!(index.has_quality_index());
+        assert!(index.has_quality_for_index(0)); // doc-a matched
+        assert_eq!(index.doc_count(), 1); // only fast-tier docs counted
+    }
+
+    // ── Builder: fast+quality via add_record convenience ────────────
+
+    #[test]
+    fn builder_add_record_with_none_quality_skips_quality_tier() {
+        let dir = temp_index_dir("add-record-no-quality");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0], None)
+            .expect("add doc-a");
+        builder
+            .add_record("doc-b", &[0.0, 1.0], None)
+            .expect("add doc-b");
+
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.doc_count(), 2);
+        assert!(!index.has_quality_index());
+    }
+
     #[cfg(feature = "ann")]
     #[test]
     fn ann_sidecar_rebuilds_when_config_changes() {

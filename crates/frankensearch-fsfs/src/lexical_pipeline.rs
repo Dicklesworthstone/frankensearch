@@ -691,6 +691,236 @@ mod tests {
         assert!(matches!(action, LexicalAction::Delete { .. }));
     }
 
+    // ── Tokenizer edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn tokenize_empty_string_returns_no_tokens() {
+        assert!(tokenize_lexical("").is_empty());
+    }
+
+    #[test]
+    fn tokenize_only_delimiters_returns_no_tokens() {
+        assert!(tokenize_lexical("   !@# $%^ &*() ").is_empty());
+    }
+
+    #[test]
+    fn tokenize_tracks_line_numbers() {
+        let tokens = tokenize_lexical("first\nsecond\nthird");
+        assert_eq!(tokens[0].line, 1);
+        assert_eq!(tokens[0].text, "first");
+        assert_eq!(tokens[1].line, 2);
+        assert_eq!(tokens[1].text, "second");
+        assert_eq!(tokens[2].line, 3);
+        assert_eq!(tokens[2].text, "third");
+    }
+
+    #[test]
+    fn tokenize_lowercases_output() {
+        let tokens = tokenize_lexical("FooBar BAZZZ");
+        assert_eq!(tokens[0].text, "foobar");
+        assert_eq!(tokens[1].text, "bazzz");
+    }
+
+    #[test]
+    fn tokenize_preserves_path_separators_and_colons() {
+        let tokens = tokenize_lexical("http://example.com:8080/path");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "http://example.com:8080/path");
+    }
+
+    // ── Chunker edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn chunk_empty_text_returns_no_chunks() {
+        let policy = LexicalChunkPolicy::default();
+        assert!(policy.chunk_text("").is_empty());
+    }
+
+    #[test]
+    fn chunk_text_shorter_than_max_returns_single_chunk() {
+        let policy = LexicalChunkPolicy {
+            max_chars: 100,
+            overlap_chars: 10,
+        };
+        let chunks = policy.chunk_text("hello world");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello world");
+        assert_eq!(chunks[0].ordinal, 0);
+    }
+
+    #[test]
+    fn chunk_single_character() {
+        let policy = LexicalChunkPolicy {
+            max_chars: 10,
+            overlap_chars: 3,
+        };
+        let chunks = policy.chunk_text("x");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "x");
+    }
+
+    #[test]
+    fn chunk_multibyte_utf8_does_not_split_codepoints() {
+        let policy = LexicalChunkPolicy {
+            max_chars: 5,
+            overlap_chars: 1,
+        };
+        // Each emoji is 4 bytes
+        let text = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
+        let chunks = policy.chunk_text(text);
+        // Should produce chunks without panicking on char boundaries
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            // Verify each chunk is valid UTF-8 (implicit from String type)
+            assert!(!chunk.text.is_empty());
+        }
+    }
+
+    #[test]
+    fn chunk_ordinals_are_sequential() {
+        let policy = LexicalChunkPolicy {
+            max_chars: 5,
+            overlap_chars: 1,
+        };
+        let chunks = policy.chunk_text("abcdefghijklmnopqrstuvwxyz");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.ordinal, u32::try_from(i).unwrap());
+        }
+    }
+
+    // ── plan_action edge cases ──────────────────────────────────────
+
+    #[test]
+    fn plan_action_rejects_empty_doc_id() {
+        let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        let mutation = LexicalMutation::upsert(
+            "  ",
+            1,
+            IngestionClass::FullSemanticLexical,
+            "some text",
+            "test",
+        );
+        let error = pipeline.plan_action(&mutation).unwrap_err();
+        assert!(
+            matches!(error, frankensearch_core::SearchError::InvalidConfig { ref field, .. } if field == "lexical.doc_id"),
+            "expected InvalidConfig for doc_id, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn plan_action_delete_mutation_produces_delete_action() {
+        let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        let mutation =
+            LexicalMutation::delete("doc-x", 5, IngestionClass::FullSemanticLexical, "removed");
+        let action = pipeline.plan_action(&mutation).expect("plan");
+        assert!(
+            matches!(action, LexicalAction::Delete { ref doc_id, revision: 5, .. } if doc_id == "doc-x")
+        );
+    }
+
+    #[test]
+    fn plan_action_none_text_treated_as_empty() {
+        let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        let mutation = LexicalMutation {
+            doc_id: "doc-none".to_owned(),
+            revision: 1,
+            ingestion_class: IngestionClass::FullSemanticLexical,
+            change: super::LexicalMutationKind::Upsert,
+            text: None,
+            reason: "test".to_owned(),
+        };
+        let action = pipeline.plan_action(&mutation).expect("plan");
+        assert!(
+            matches!(action, LexicalAction::Delete { ref reason, .. } if reason == "empty_text")
+        );
+    }
+
+    // ── Batch stats tracking ────────────────────────────────────────
+
+    #[test]
+    fn batch_stats_track_mixed_mutations() {
+        let mut pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        let mutations = [
+            LexicalMutation::upsert(
+                "doc-a",
+                1,
+                IngestionClass::FullSemanticLexical,
+                "hello world",
+                "add",
+            ),
+            LexicalMutation::upsert(
+                "doc-b",
+                1,
+                IngestionClass::FullSemanticLexical,
+                "foo bar",
+                "add",
+            ),
+            LexicalMutation::delete("doc-a", 2, IngestionClass::FullSemanticLexical, "remove"),
+            LexicalMutation::upsert("doc-c", 1, IngestionClass::Skip, "ignored", "skip class"),
+        ];
+        let stats = pipeline.apply_initial(&mutations).expect("apply");
+        assert_eq!(stats.planned, 4);
+        assert_eq!(stats.upserted, 2);
+        assert_eq!(stats.deleted, 2); // explicit delete + skip-class reclassification
+        assert!(stats.emitted_chunks > 0);
+        assert!(stats.emitted_tokens > 0);
+    }
+
+    // ── meets_contract failure cases ────────────────────────────────
+
+    #[test]
+    fn meets_contract_fails_when_below_throughput() {
+        let targets = LexicalPerformanceTargets::default();
+        assert!(!targets.meets_contract(100, 100, 5)); // initial too low
+        assert!(!targets.meets_contract(100_000, 100, 5)); // incremental too low
+        assert!(!targets.meets_contract(100_000, 100_000, 1000)); // latency too high
+    }
+
+    // ── InMemoryLexicalBackend ──────────────────────────────────────
+
+    #[test]
+    fn in_memory_backend_len_and_is_empty() {
+        let mut pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
+        assert!(pipeline.backend().is_empty());
+        assert_eq!(pipeline.backend().len(), 0);
+
+        let mutations = [LexicalMutation::upsert(
+            "doc-a",
+            1,
+            IngestionClass::FullSemanticLexical,
+            "text",
+            "add",
+        )];
+        pipeline.apply_initial(&mutations).expect("apply");
+        assert!(!pipeline.backend().is_empty());
+        assert_eq!(pipeline.backend().len(), 1);
+    }
+
+    // ── Builder pattern ─────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_builder_applies_custom_policy_and_targets() {
+        let policy = LexicalChunkPolicy {
+            max_chars: 256,
+            overlap_chars: 32,
+        };
+        let targets = LexicalPerformanceTargets {
+            initial_docs_per_second: 50_000,
+            incremental_updates_per_second: 10_000,
+            incremental_p95_latency_ms: 10,
+        };
+        let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default())
+            .with_chunk_policy(policy)
+            .with_performance_targets(targets);
+        assert_eq!(pipeline.chunk_policy().max_chars, 256);
+        assert_eq!(
+            pipeline.performance_targets().initial_docs_per_second,
+            50_000
+        );
+    }
+
+    // ── Original tests continue ─────────────────────────────────────
+
     #[test]
     fn performance_targets_have_expected_defaults() {
         let targets = LexicalPerformanceTargets::default();

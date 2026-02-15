@@ -707,6 +707,369 @@ mod tests {
         );
     }
 
+    // ── Config validation edge cases ──────────────────────────────────
+
+    #[test]
+    fn validate_config_rejects_m_zero() {
+        let config = HnswConfig {
+            m: 0,
+            ..HnswConfig::default()
+        };
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "hnsw_m"),
+            "expected InvalidConfig for hnsw_m, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_m_over_256() {
+        let config = HnswConfig {
+            m: 257,
+            ..HnswConfig::default()
+        };
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "hnsw_m"),
+            "expected InvalidConfig for hnsw_m, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_ef_construction_zero() {
+        let config = HnswConfig {
+            ef_construction: 0,
+            ..HnswConfig::default()
+        };
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "hnsw_ef_construction"),
+            "expected InvalidConfig for ef_construction, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_ef_search_zero() {
+        let config = HnswConfig {
+            ef_search: 0,
+            ..HnswConfig::default()
+        };
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "hnsw_ef_search"),
+            "expected InvalidConfig for ef_search, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_max_layer_zero() {
+        let config = HnswConfig {
+            max_layer: 0,
+            ..HnswConfig::default()
+        };
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "hnsw_max_layer"),
+            "expected InvalidConfig for max_layer, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_accepts_m_256_boundary() {
+        let config = HnswConfig {
+            m: 256,
+            ..HnswConfig::default()
+        };
+        assert!(validate_config(config).is_ok());
+    }
+
+    // ── build_from_parts error paths ────────────────────────────────────
+
+    #[test]
+    fn build_rejects_dimension_zero() {
+        let error =
+            HnswIndex::build_from_parts(vec![], vec![], 0, HnswConfig::default()).unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "dimension"),
+            "expected InvalidConfig for dimension, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_doc_id_vector_count_mismatch() {
+        let error = HnswIndex::build_from_parts(
+            vec!["a".to_owned(), "b".to_owned()],
+            vec![vec![1.0, 0.0]],
+            2,
+            HnswConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "vectors"),
+            "expected InvalidConfig for vectors, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_vector_dimension_mismatch() {
+        let error = HnswIndex::build_from_parts(
+            vec!["a".to_owned()],
+            vec![vec![1.0, 0.0, 0.0]], // 3D but declared 2D
+            2,
+            HnswConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: 2,
+                    found: 3
+                }
+            ),
+            "expected DimensionMismatch, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_nan_in_vector() {
+        let error = HnswIndex::build_from_parts(
+            vec!["a".to_owned()],
+            vec![vec![1.0, f32::NAN]],
+            2,
+            HnswConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, ref reason, .. }
+                     if field == "vector" && reason.contains("finite")),
+            "expected InvalidConfig for non-finite vector, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_infinity_in_vector() {
+        let error = HnswIndex::build_from_parts(
+            vec!["a".to_owned()],
+            vec![vec![f32::INFINITY, 0.0]],
+            2,
+            HnswConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "vector"),
+            "expected InvalidConfig for non-finite vector, got {error:?}"
+        );
+    }
+
+    // ── knn_search_with_stats boundary conditions ───────────────────────
+
+    #[test]
+    fn search_with_k_zero_returns_empty_with_stats() {
+        let path = temp_path("k0", "fsvi");
+        let index = write_index(&path, &[normalized_vector(1, 16)]).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let (hits, stats) = ann
+            .knn_search_with_stats(&normalized_vector(1, 16), 0, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert!(hits.is_empty());
+        assert_eq!(stats.k_requested, 0);
+        assert_eq!(stats.k_returned, 0);
+        assert!(stats.is_approximate);
+        assert!((stats.estimated_recall - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn search_dimension_mismatch_returns_error() {
+        let path = temp_path("dimmis", "fsvi");
+        let index = write_index(&path, &[normalized_vector(1, 16)]).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let error = ann
+            .knn_search_with_stats(&normalized_vector(1, 8), 5, HNSW_DEFAULT_EF_SEARCH)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: 16,
+                    found: 8
+                }
+            ),
+            "expected DimensionMismatch, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn search_stats_fields_are_populated() {
+        let path = temp_path("stats", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..50).map(|i| normalized_vector(i, 32)).collect();
+        let index = write_index(&path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let (hits, stats) = ann
+            .knn_search_with_stats(&normalized_vector(999, 32), 5, 64)
+            .expect("search");
+        assert_eq!(stats.index_size, 50);
+        assert_eq!(stats.dimension, 32);
+        assert_eq!(stats.ef_search, 64);
+        assert_eq!(stats.k_requested, 5);
+        assert_eq!(stats.k_returned, hits.len());
+        assert!(stats.is_approximate);
+        assert!(stats.estimated_recall > 0.0);
+        assert!(stats.estimated_recall <= 1.0);
+    }
+
+    #[test]
+    fn search_k_larger_than_index_returns_all() {
+        let path = temp_path("klarge", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..5).map(|i| normalized_vector(i, 16)).collect();
+        let index = write_index(&path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let hits = ann
+            .knn_search(&normalized_vector(999, 16), 100, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits.len(), 5);
+    }
+
+    // ── Serialization corruption ────────────────────────────────────────
+
+    #[test]
+    fn load_rejects_wrong_magic_bytes() {
+        let path = temp_path("badmagic", "chsw");
+        let mut data = vec![0_u8; 64];
+        data[0..4].copy_from_slice(b"XXXX");
+        fs::write(&path, &data).expect("write");
+        let error = HnswIndex::load(&path).unwrap_err();
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("magic")),
+            "expected IndexCorrupted for magic, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_version() {
+        let path = temp_path("badver", "chsw");
+        let mut data = Vec::new();
+        data.extend_from_slice(&HNSW_MAGIC);
+        data.extend_from_slice(&99_u16.to_le_bytes()); // unsupported version
+        data.extend_from_slice(&[0; 56]); // padding
+        fs::write(&path, &data).expect("write");
+        let error = HnswIndex::load(&path).unwrap_err();
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("version")),
+            "expected IndexCorrupted for version, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_truncated_file() {
+        let path = temp_path("trunc", "chsw");
+        // Write only magic (4 bytes) — not enough for version
+        fs::write(&path, HNSW_MAGIC).expect("write");
+        let error = HnswIndex::load(&path).unwrap_err();
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("EOF")),
+            "expected IndexCorrupted for EOF, got {error:?}"
+        );
+    }
+
+    // ── matches_vector_index edge cases ─────────────────────────────────
+
+    #[test]
+    fn matches_returns_false_for_dimension_mismatch() {
+        let path_a = temp_path("match-a", "fsvi");
+        let path_b = temp_path("match-b", "fsvi");
+        let index_a = write_index(&path_a, &[normalized_vector(1, 16)]).expect("index_a");
+        let index_b = write_index(&path_b, &[normalized_vector(1, 32)]).expect("index_b");
+        let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
+        assert!(!ann.matches_vector_index(&index_b).expect("matches"));
+    }
+
+    #[test]
+    fn matches_returns_false_for_record_count_mismatch() {
+        let path_a = temp_path("match-rc-a", "fsvi");
+        let path_b = temp_path("match-rc-b", "fsvi");
+        let index_a = write_index(
+            &path_a,
+            &[normalized_vector(1, 16), normalized_vector(2, 16)],
+        )
+        .expect("index_a");
+        let index_b = write_index(&path_b, &[normalized_vector(1, 16)]).expect("index_b");
+        let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
+        assert!(!ann.matches_vector_index(&index_b).expect("matches"));
+    }
+
+    // ── normalize_for_dist_dot ──────────────────────────────────────────
+
+    #[test]
+    fn normalize_zero_vector_unchanged() {
+        let zero = vec![0.0_f32; 8];
+        let result = normalize_for_dist_dot(zero.clone());
+        assert_eq!(
+            result, zero,
+            "zero vector should remain zero after normalize"
+        );
+    }
+
+    // ── estimate_recall ─────────────────────────────────────────────────
+
+    #[test]
+    fn estimate_recall_k_zero_returns_one() {
+        assert!((estimate_recall(100, 0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_recall_clamped_between_zero_and_one() {
+        // Very low ef relative to k
+        let low = estimate_recall(1, 1000);
+        assert!((0.0..=1.0).contains(&low), "low recall: {low}");
+
+        // Very high ef relative to k
+        let high = estimate_recall(10_000, 1);
+        assert!((0.0..=1.0).contains(&high), "high recall: {high}");
+    }
+
+    #[test]
+    fn estimate_recall_increases_with_ef() {
+        let r_low = estimate_recall(10, 10);
+        let r_high = estimate_recall(100, 10);
+        assert!(
+            r_high >= r_low,
+            "recall should increase with ef: {r_low} vs {r_high}"
+        );
+    }
+
+    // ── len / is_empty / dimension / config accessors ───────────────────
+
+    #[test]
+    fn accessors_report_correct_values() {
+        let path = temp_path("accessors", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..10).map(|i| normalized_vector(i, 24)).collect();
+        let index = write_index(&path, &vectors).expect("index");
+        let config = HnswConfig {
+            m: 8,
+            ..HnswConfig::default()
+        };
+        let ann = HnswIndex::build_from_vector_index(&index, config).expect("ann");
+        assert_eq!(ann.len(), 10);
+        assert!(!ann.is_empty());
+        assert_eq!(ann.dimension(), 24);
+        assert_eq!(ann.config().m, 8);
+    }
+
+    // ── Debug impl ──────────────────────────────────────────────────────
+
+    #[test]
+    fn debug_impl_does_not_panic() {
+        let path = temp_path("debug", "fsvi");
+        let index = write_index(&path, &[normalized_vector(1, 8)]).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let debug_str = format!("{ann:?}");
+        assert!(debug_str.contains("HnswIndex"));
+        assert!(debug_str.contains("dimension: 8"));
+    }
+
+    // ── Original tests ──────────────────────────────────────────────────
+
     #[test]
     fn scores_are_consistent_with_exact_top_hit() {
         let fsvi_path = temp_path("score", "fsvi");

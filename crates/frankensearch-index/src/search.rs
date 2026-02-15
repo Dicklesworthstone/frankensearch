@@ -128,9 +128,6 @@ impl VectorIndex {
             Quantization::F16 => {
                 let mut scratch = vec![f16::from_f32(0.0); self.dimension()];
                 for index in 0..self.record_count() {
-                    if self.is_deleted(index) {
-                        continue;
-                    }
                     if !self.passes_search_filter(filter, index)? {
                         continue;
                     }
@@ -141,9 +138,6 @@ impl VectorIndex {
             Quantization::F32 => {
                 let mut scratch = vec![0.0_f32; self.dimension()];
                 for index in 0..self.record_count() {
-                    if self.is_deleted(index) {
-                        continue;
-                    }
                     if !self.passes_search_filter(filter, index)? {
                         continue;
                     }
@@ -194,9 +188,6 @@ impl VectorIndex {
     ) -> SearchResult<Vec<usize>> {
         let mut indices = Vec::new();
         for index in 0..self.record_count() {
-            if self.is_deleted(index) {
-                continue;
-            }
             if self.passes_search_filter(filter, index)? {
                 indices.push(index);
             }
@@ -277,10 +268,14 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<()> {
         for (idx, entry) in self.wal_entries.iter().enumerate() {
-            if let Some(f) = filter
-                && !f.matches(&entry.doc_id, None)
-            {
-                continue;
+            if let Some(f) = filter {
+                if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
+                    if !matches {
+                        continue;
+                    }
+                } else if !f.matches(&entry.doc_id, None) {
+                    continue;
+                }
             }
             let score = dot_product_f32_f32(&entry.embedding, query)?;
             insert_candidate(heap, HeapEntry::new(to_wal_index(idx), score), limit);
@@ -407,19 +402,25 @@ impl VectorIndex {
 
     /// Check whether a main-index record passes a `SearchFilter`.
     ///
-    /// Resolves `doc_id` from the string table and calls `filter.matches()`.
-    /// Returns `true` when no filter is set.
+    /// Uses `SearchFilter::matches_doc_id_hash` when available to avoid
+    /// decoding `doc_id` strings in the hot scan loop.
+    /// Falls back to `filter.matches(doc_id, ...)` when hash-only matching
+    /// is not possible.
     fn passes_search_filter(
         &self,
         filter: Option<&dyn SearchFilter>,
         index: usize,
     ) -> SearchResult<bool> {
-        if self.is_deleted(index) {
+        let entry = self.record_at(index)?;
+        if super::is_tombstoned_flags(entry.flags) {
             return Ok(false);
         }
         let Some(f) = filter else {
             return Ok(true);
         };
+        if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
+            return Ok(matches);
+        }
         let doc_id = self.doc_id_at(index)?;
         Ok(f.matches(doc_id, None))
     }
@@ -801,6 +802,38 @@ mod tests {
     }
 
     #[test]
+    fn bitset_filter_skips_doc_id_decode_for_non_matching_records() {
+        let path = temp_index_path("bitset-hash-fast-path");
+        write_index(
+            &path,
+            &[("doc-a", vec![1.0, 0.0]), ("doc-b", vec![0.0, 1.0])],
+        )
+        .expect("write index");
+
+        let inspect = VectorIndex::open(&path).expect("open index");
+        let bad_idx = inspect
+            .find_index_by_doc_hash(super::super::fnv1a_hash(b"doc-b"))
+            .expect("doc-b index");
+        let record = inspect.record_at(bad_idx).expect("record");
+        let bad_offset =
+            inspect.strings_offset + usize::try_from(record.doc_id_offset).expect("offset");
+        drop(inspect);
+
+        let mut bytes = fs::read(&path).expect("read bytes");
+        bytes[bad_offset] = 0xFF;
+        fs::write(&path, bytes).expect("write corrupt bytes");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let filter = frankensearch_core::BitsetFilter::from_doc_ids(["doc-a"]);
+        let hits = index
+            .search_top_k(&[1.0, 0.0], 10, Some(&filter))
+            .expect("search should ignore corrupted filtered-out doc_id");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[test]
     fn limit_zero_or_empty_index_returns_no_hits() {
         let path = temp_index_path("limit-zero");
         let writer = VectorIndex::create_with_revision(&path, "hash", "test", 4, Quantization::F16)
@@ -1048,6 +1081,216 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc-a");
         assert_eq!(hits[1].doc_id, "doc-c");
+    }
+
+    #[test]
+    fn all_records_soft_deleted_returns_empty() {
+        let path = temp_index_path("all-deleted");
+        write_index(
+            &path,
+            &[
+                ("doc-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.8, 0.0, 0.0, 0.0]),
+                ("doc-c", vec![0.5, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+
+        let mut index = VectorIndex::open(&path).expect("open index");
+        let deleted = index
+            .soft_delete_batch(&["doc-a", "doc-b", "doc-c"])
+            .expect("batch delete");
+        assert_eq!(deleted, 3);
+
+        let hits = index
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+            .expect("search");
+        assert!(
+            hits.is_empty(),
+            "search over fully-deleted index should return empty"
+        );
+    }
+
+    #[test]
+    fn dimension_mismatch_returns_error() {
+        let path = temp_index_path("dim-mismatch");
+        write_index(&path, &[("doc-a", vec![1.0, 0.0, 0.0, 0.0])]).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let result = index.search_top_k(&[1.0, 0.0], 5, None);
+        assert!(matches!(
+            result,
+            Err(SearchError::DimensionMismatch {
+                expected: 4,
+                found: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn wal_only_search_returns_wal_entries() {
+        let path = temp_index_path("wal-only");
+        let writer = VectorIndex::create_with_revision(&path, "hash", "test", 4, Quantization::F16)
+            .expect("writer");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open index");
+        assert_eq!(index.record_count(), 0);
+
+        index
+            .append("wal-a", &[1.0, 0.0, 0.0, 0.0])
+            .expect("append wal-a");
+        index
+            .append("wal-b", &[0.5, 0.0, 0.0, 0.0])
+            .expect("append wal-b");
+
+        let hits = index
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "wal-a");
+        assert_eq!(hits[1].doc_id, "wal-b");
+        assert!(hits[0].score >= hits[1].score);
+    }
+
+    #[test]
+    fn wal_entries_can_outrank_main_index() {
+        let path = temp_index_path("wal-outranks-main");
+        write_index(
+            &path,
+            &[
+                ("main-a", vec![0.3, 0.0, 0.0, 0.0]),
+                ("main-b", vec![0.2, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+
+        let mut index = VectorIndex::open(&path).expect("open index");
+        index
+            .append("wal-top", &[1.0, 0.0, 0.0, 0.0])
+            .expect("append wal-top");
+
+        let hits = index
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 3, None)
+            .expect("search");
+
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            hits[0].doc_id, "wal-top",
+            "WAL entry with highest score should rank first"
+        );
+        assert!(hits[0].score >= hits[1].score);
+        assert!(hits[1].score >= hits[2].score);
+    }
+
+    #[test]
+    fn heap_entry_nan_sorted_below_finite_scores() {
+        let nan_entry = HeapEntry::new(0, f32::NAN);
+        let finite_entry = HeapEntry::new(1, 0.5);
+        // candidate_is_better: finite should beat NaN
+        assert!(candidate_is_better(finite_entry, nan_entry));
+        assert!(!candidate_is_better(nan_entry, finite_entry));
+    }
+
+    #[test]
+    fn heap_entry_equal_scores_tiebreak_by_index() {
+        let left = HeapEntry::new(3, 0.5);
+        let right = HeapEntry::new(7, 0.5);
+        // Lower index wins the tiebreak
+        assert!(candidate_is_better(left, right));
+        assert!(!candidate_is_better(right, left));
+    }
+
+    #[test]
+    fn compare_best_first_orders_descending_by_score() {
+        let high = HeapEntry::new(0, 0.9);
+        let low = HeapEntry::new(1, 0.1);
+        assert_eq!(compare_best_first(&high, &low), Ordering::Less);
+        assert_eq!(compare_best_first(&low, &high), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_best_first_nan_ranks_after_finite() {
+        let finite = HeapEntry::new(0, 0.5);
+        let nan = HeapEntry::new(1, f32::NAN);
+        // NaN maps to NEG_INFINITY, so finite ranks before NaN
+        assert_eq!(compare_best_first(&finite, &nan), Ordering::Less);
+        assert_eq!(compare_best_first(&nan, &finite), Ordering::Greater);
+    }
+
+    #[test]
+    fn insert_candidate_with_limit_zero_is_noop() {
+        let mut heap = BinaryHeap::new();
+        insert_candidate(&mut heap, HeapEntry::new(0, 0.9), 0);
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn insert_candidate_evicts_worst_when_full() {
+        let mut heap = BinaryHeap::new();
+        insert_candidate(&mut heap, HeapEntry::new(0, 0.1), 2);
+        insert_candidate(&mut heap, HeapEntry::new(1, 0.5), 2);
+        // Heap is full (limit=2). Insert better candidate.
+        insert_candidate(&mut heap, HeapEntry::new(2, 0.9), 2);
+
+        let entries: Vec<HeapEntry> = heap.into_vec();
+        assert_eq!(entries.len(), 2);
+        let scores: Vec<f32> = entries.iter().map(|e| e.score).collect();
+        assert!(scores.contains(&0.9));
+        assert!(scores.contains(&0.5));
+        assert!(!scores.contains(&0.1));
+    }
+
+    #[test]
+    fn insert_candidate_rejects_worse_when_full() {
+        let mut heap = BinaryHeap::new();
+        insert_candidate(&mut heap, HeapEntry::new(0, 0.5), 2);
+        insert_candidate(&mut heap, HeapEntry::new(1, 0.9), 2);
+        // Heap is full. Insert worse candidate — should be rejected.
+        insert_candidate(&mut heap, HeapEntry::new(2, 0.1), 2);
+
+        let entries: Vec<HeapEntry> = heap.into_vec();
+        assert_eq!(entries.len(), 2);
+        let scores: Vec<f32> = entries.iter().map(|e| e.score).collect();
+        assert!(scores.contains(&0.9));
+        assert!(scores.contains(&0.5));
+    }
+
+    #[test]
+    fn merge_partial_heaps_preserves_top_k() {
+        let mut heap_a = BinaryHeap::new();
+        insert_candidate(&mut heap_a, HeapEntry::new(0, 0.9), 3);
+        insert_candidate(&mut heap_a, HeapEntry::new(1, 0.1), 3);
+
+        let mut heap_b = BinaryHeap::new();
+        insert_candidate(&mut heap_b, HeapEntry::new(2, 0.7), 3);
+        insert_candidate(&mut heap_b, HeapEntry::new(3, 0.5), 3);
+
+        let merged = merge_partial_heaps(vec![heap_a, heap_b], 3);
+        let entries: Vec<HeapEntry> = merged.into_vec();
+        assert_eq!(entries.len(), 3);
+        let scores: Vec<f32> = entries.iter().map(|e| e.score).collect();
+        // Top 3: 0.9, 0.7, 0.5 — the 0.1 should be evicted
+        assert!(scores.contains(&0.9));
+        assert!(scores.contains(&0.7));
+        assert!(scores.contains(&0.5));
+        assert!(!scores.contains(&0.1));
+    }
+
+    #[test]
+    fn parse_parallel_search_env_case_insensitive() {
+        assert!(!parse_parallel_search_env(Some("OFF")));
+        assert!(!parse_parallel_search_env(Some("False")));
+        assert!(!parse_parallel_search_env(Some("NO")));
+        assert!(!parse_parallel_search_env(Some("  off  ")));
+    }
+
+    #[test]
+    fn parse_parallel_search_env_empty_string_enables() {
+        // Empty string is not any of the disable values, so parallel stays enabled.
+        assert!(parse_parallel_search_env(Some("")));
+        assert!(parse_parallel_search_env(Some("  ")));
     }
 
     #[test]

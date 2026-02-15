@@ -832,4 +832,250 @@ mod tests {
             ScreenAction::Navigate(ScreenId::new("ops.custom_timeline"))
         );
     }
+
+    // --- render_bar ---
+
+    #[test]
+    fn render_bar_zero_width_returns_empty() {
+        assert_eq!(ProjectDetailScreen::render_bar(10, 100, 0), "");
+    }
+
+    #[test]
+    fn render_bar_value_zero_all_dashes() {
+        let bar = ProjectDetailScreen::render_bar(0, 100, 10);
+        assert_eq!(bar.len(), 10);
+        assert!(bar.chars().all(|c| c == '-'));
+    }
+
+    #[test]
+    fn render_bar_value_equals_max_all_equals() {
+        let bar = ProjectDetailScreen::render_bar(100, 100, 10);
+        assert_eq!(bar.len(), 10);
+        assert!(bar.chars().all(|c| c == '='));
+    }
+
+    #[test]
+    fn render_bar_value_exceeds_max_clamped_to_full() {
+        let bar = ProjectDetailScreen::render_bar(200, 100, 10);
+        assert_eq!(bar.len(), 10);
+        assert!(bar.chars().all(|c| c == '='));
+    }
+
+    #[test]
+    fn render_bar_max_zero_treated_as_one() {
+        // max_value=0 should use safe_max=1, so value>0 fills fully
+        let bar = ProjectDetailScreen::render_bar(1, 0, 8);
+        assert_eq!(bar.len(), 8);
+        assert!(bar.chars().all(|c| c == '='));
+    }
+
+    #[test]
+    fn render_bar_half_fill() {
+        let bar = ProjectDetailScreen::render_bar(50, 100, 10);
+        assert_eq!(bar.len(), 10);
+        let filled = bar.chars().filter(|&c| c == '=').count();
+        assert_eq!(filled, 5);
+    }
+
+    // --- phase_latency_lines ---
+
+    #[test]
+    fn phase_latency_with_empty_instances() {
+        let fleet = FleetSnapshot::default();
+        let instances: Vec<&InstanceInfo> = vec![];
+        let lines = ProjectDetailScreen::phase_latency_lines(&instances, &fleet);
+        assert!(lines.len() >= 3);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("0us"), "empty should show 0us");
+    }
+
+    // --- anomaly_lines ---
+
+    #[test]
+    fn anomaly_lines_all_healthy_shows_none() {
+        let fleet = FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "healthy-1".to_string(),
+                project: "proj".to_string(),
+                pid: Some(1),
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            ..FleetSnapshot::default()
+        };
+        let instances: Vec<&InstanceInfo> = fleet.instances.iter().collect();
+        let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("none"), "all healthy should show 'none'");
+    }
+
+    #[test]
+    fn anomaly_lines_unhealthy_instance_shows_warning() {
+        let fleet = FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "sick-1".to_string(),
+                project: "proj".to_string(),
+                pid: Some(1),
+                healthy: false,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            ..FleetSnapshot::default()
+        };
+        let instances: Vec<&InstanceInfo> = fleet.instances.iter().collect();
+        let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("WARN sick-1"));
+        assert!(text.contains("unhealthy"));
+    }
+
+    #[test]
+    fn anomaly_lines_high_pending_shows_warning() {
+        let fleet = FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "busy-1".to_string(),
+                project: "proj".to_string(),
+                pid: Some(1),
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 1500,
+            }],
+            ..FleetSnapshot::default()
+        };
+        let instances: Vec<&InstanceInfo> = fleet.instances.iter().collect();
+        let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("pending=1500"));
+    }
+
+    #[test]
+    fn anomaly_lines_high_latency_shows_warning() {
+        let mut fleet = FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "slow-1".to_string(),
+                project: "proj".to_string(),
+                pid: Some(1),
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            ..FleetSnapshot::default()
+        };
+        fleet.search_metrics.insert(
+            "slow-1".to_owned(),
+            SearchMetrics {
+                total_searches: 10,
+                avg_latency_us: 1000,
+                p95_latency_us: 6000,
+                refined_count: 0,
+            },
+        );
+        let instances: Vec<&InstanceInfo> = fleet.instances.iter().collect();
+        let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("p95=6000us"));
+    }
+
+    // --- selected_project ---
+
+    #[test]
+    fn selected_project_none_by_default() {
+        let screen = ProjectDetailScreen::new();
+        assert!(screen.selected_project().is_none());
+    }
+
+    // --- Default impl ---
+
+    #[test]
+    fn default_matches_new() {
+        let screen = ProjectDetailScreen::default();
+        assert_eq!(screen.id(), &ScreenId::new("ops.project"));
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    // --- navigation bounds ---
+
+    #[test]
+    fn up_navigation_stops_at_zero() {
+        let mut screen = ProjectDetailScreen::new();
+        let mut view = ViewState::default();
+        view.set_project_filter("cass");
+        screen.update_state(&sample_state(), &view);
+        let ctx = ScreenContext {
+            active_screen: ScreenId::new("ops.project"),
+            terminal_width: 100,
+            terminal_height: 40,
+            focused: true,
+        };
+
+        let up = InputEvent::Key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn down_navigation_stops_at_last_row() {
+        let mut screen = ProjectDetailScreen::new();
+        let mut view = ViewState::default();
+        view.set_project_filter("cass");
+        screen.update_state(&sample_state(), &view);
+        let ctx = ScreenContext {
+            active_screen: ScreenId::new("ops.project"),
+            terminal_width: 100,
+            terminal_height: 40,
+            focused: true,
+        };
+
+        let down = InputEvent::Key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        // Move to last row
+        assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+        // Try to go past last row
+        assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+    }
+
+    // --- empty project filter ---
+
+    #[test]
+    fn empty_project_shows_no_instances_message() {
+        let mut screen = ProjectDetailScreen::new();
+        let mut view = ViewState::default();
+        view.set_project_filter("nonexistent");
+        screen.update_state(&sample_state(), &view);
+        let summary = screen
+            .summary_lines()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(summary.contains("No visible instances"));
+    }
 }

@@ -215,6 +215,27 @@ impl OpsApp {
                 let id = self.analytics_screen_id.clone();
                 self.shell.navigate_to(&id);
             }
+            "analytics.export_snapshot" => {
+                let id = self.analytics_screen_id.clone();
+                self.shell.navigate_to(&id);
+
+                let toggle_export_mode = frankensearch_tui::InputEvent::Key(
+                    crossterm::event::KeyCode::Char('e'),
+                    crossterm::event::KeyModifiers::NONE,
+                );
+                let _ = self.shell.handle_input(&toggle_export_mode);
+
+                let selected_project = self
+                    .selected_project_from_analytics()
+                    .unwrap_or_else(|| "none selected".to_owned());
+                let body = format!(
+                    "Snapshot mode toggled for Historical Analytics.\nSelected project: {selected_project}\nUse `g` to open project detail and copy replay handles from the evidence table."
+                );
+                self.shell.overlays.push(
+                    OverlayRequest::new(OverlayKind::Alert, "Analytics Snapshot Export")
+                        .with_body(body),
+                );
+            }
             "debug.refresh" => {
                 self.refresh_data();
             }
@@ -343,6 +364,15 @@ impl OpsApp {
             .and_then(|screen| screen.as_any().downcast_ref::<HistoricalAnalyticsScreen>())
     }
 
+    /// Get a reference to the live stream screen (for testing/inspection).
+    #[must_use]
+    pub fn live_stream_screen(&self) -> Option<&LiveSearchStreamScreen> {
+        self.shell
+            .registry
+            .get(&self.live_stream_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<LiveSearchStreamScreen>())
+    }
+
     /// Get a list of all registered palette actions (for help screen).
     #[must_use]
     #[allow(clippy::too_many_lines)]
@@ -380,6 +410,14 @@ impl OpsApp {
                 ActionCategory::Navigation,
             )
             .with_shortcut("6"),
+            Action::new(
+                "analytics.export_snapshot",
+                "Export Analytics Snapshot",
+                ActionCategory::Custom("Analytics".to_string()),
+            )
+            .with_description(
+                "Open analytics, toggle snapshot mode, and show replay/export guidance",
+            ),
             Action::new("debug.refresh", "Force Refresh Data", ActionCategory::Debug)
                 .with_shortcut("F5"),
             Action::new(
@@ -561,6 +599,88 @@ impl OpsApp {
         self.sync_screen_states();
     }
 
+    const fn is_enter_key(event: &frankensearch_tui::InputEvent) -> bool {
+        matches!(
+            event,
+            frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Enter, _)
+        )
+    }
+
+    const fn is_enter_or_g_key(event: &frankensearch_tui::InputEvent) -> bool {
+        matches!(
+            event,
+            frankensearch_tui::InputEvent::Key(
+                crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
+                _
+            )
+        )
+    }
+
+    const fn is_char_key(event: &frankensearch_tui::InputEvent, expected: char) -> bool {
+        matches!(
+            event,
+            frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Char(actual), _)
+            if *actual == expected
+        )
+    }
+
+    fn sync_fleet_to_project_transition(&mut self) {
+        self.view.apply_preset(ViewPreset::ProjectDeepDive);
+        if let Some(project) = self.selected_project_from_fleet() {
+            self.view.set_project_filter(project);
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_alerts_to_project_transition(&mut self) {
+        self.view.apply_preset(ViewPreset::ProjectDeepDive);
+        if let Some(project) = self.selected_project_from_alerts() {
+            self.view.set_project_filter(project);
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_analytics_to_project_transition(&mut self) {
+        self.view.apply_preset(ViewPreset::ProjectDeepDive);
+        if let Some(project) = self.selected_project_from_analytics() {
+            self.view.set_project_filter(project);
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_timeline_to_project_transition(&mut self) {
+        self.view.apply_preset(ViewPreset::ProjectDeepDive);
+        if let Some(project) = self.selected_project_from_timeline() {
+            self.view.set_project_filter(project);
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_timeline_to_analytics_transition(&mut self) {
+        let project = self.selected_project_from_timeline();
+        if let Some(screen) = self.analytics_screen_mut() {
+            screen.set_project_filter(project.as_deref().unwrap_or("all"));
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_timeline_to_live_stream_transition(&mut self) {
+        let project = self.selected_project_from_timeline();
+        if let Some(screen) = self.live_stream_screen_mut() {
+            screen.set_project_filter(project.as_deref().unwrap_or("all"));
+        }
+        self.sync_screen_states();
+    }
+
+    fn sync_project_to_fleet_transition(&mut self) {
+        if self.view.preset == ViewPreset::ProjectDeepDive {
+            self.view.apply_preset(ViewPreset::FleetTriage);
+        } else {
+            self.view.clear_project_filter();
+        }
+        self.sync_screen_states();
+    }
+
     fn sync_project_filter_from_screen_transition(
         &mut self,
         previous_screen: Option<&ScreenId>,
@@ -569,82 +689,44 @@ impl OpsApp {
         let current_screen = self.shell.active_screen.clone();
         let moved_fleet_to_project = previous_screen == Some(&self.fleet_screen_id)
             && current_screen.as_ref() == Some(&self.project_screen_id);
-        if moved_fleet_to_project
-            && matches!(
-                event,
-                frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Enter, _)
-            )
-        {
-            self.view.apply_preset(ViewPreset::ProjectDeepDive);
-            if let Some(project) = self.selected_project_from_fleet() {
-                self.view.set_project_filter(project);
-            }
-            self.sync_screen_states();
+        if moved_fleet_to_project && Self::is_enter_key(event) {
+            self.sync_fleet_to_project_transition();
         }
 
         let moved_alerts_to_project = previous_screen == Some(&self.alerts_screen_id)
             && current_screen.as_ref() == Some(&self.project_screen_id);
-        if moved_alerts_to_project
-            && matches!(
-                event,
-                frankensearch_tui::InputEvent::Key(
-                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
-                    _
-                )
-            )
-        {
-            self.view.apply_preset(ViewPreset::ProjectDeepDive);
-            if let Some(project) = self.selected_project_from_alerts() {
-                self.view.set_project_filter(project);
-            }
-            self.sync_screen_states();
+        if moved_alerts_to_project && Self::is_enter_or_g_key(event) {
+            self.sync_alerts_to_project_transition();
         }
 
         let moved_analytics_to_project = previous_screen == Some(&self.analytics_screen_id)
             && current_screen.as_ref() == Some(&self.project_screen_id);
-        if moved_analytics_to_project
-            && matches!(
-                event,
-                frankensearch_tui::InputEvent::Key(
-                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
-                    _
-                )
-            )
-        {
-            self.view.apply_preset(ViewPreset::ProjectDeepDive);
-            if let Some(project) = self.selected_project_from_analytics() {
-                self.view.set_project_filter(project);
-            }
-            self.sync_screen_states();
+        if moved_analytics_to_project && Self::is_enter_or_g_key(event) {
+            self.sync_analytics_to_project_transition();
         }
 
         let moved_timeline_to_project = previous_screen == Some(&self.timeline_screen_id)
             && current_screen.as_ref() == Some(&self.project_screen_id);
-        if moved_timeline_to_project
-            && matches!(
-                event,
-                frankensearch_tui::InputEvent::Key(
-                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
-                    _
-                )
-            )
-        {
-            self.view.apply_preset(ViewPreset::ProjectDeepDive);
-            if let Some(project) = self.selected_project_from_timeline() {
-                self.view.set_project_filter(project);
-            }
-            self.sync_screen_states();
+        if moved_timeline_to_project && Self::is_enter_or_g_key(event) {
+            self.sync_timeline_to_project_transition();
+        }
+
+        let moved_timeline_to_analytics = previous_screen == Some(&self.timeline_screen_id)
+            && current_screen.as_ref() == Some(&self.analytics_screen_id);
+        if moved_timeline_to_analytics && Self::is_char_key(event, 'a') {
+            self.sync_timeline_to_analytics_transition();
+        }
+
+        let moved_timeline_to_live_stream = previous_screen == Some(&self.timeline_screen_id)
+            && current_screen.as_ref() == Some(&self.live_stream_screen_id);
+        if moved_timeline_to_live_stream && Self::is_char_key(event, 'l') {
+            self.sync_timeline_to_live_stream_transition();
         }
 
         let moved_project_to_fleet = previous_screen == Some(&self.project_screen_id)
             && current_screen.as_ref() == Some(&self.fleet_screen_id);
         if moved_project_to_fleet {
-            if self.view.preset == ViewPreset::ProjectDeepDive {
-                self.view.apply_preset(ViewPreset::FleetTriage);
-            } else {
-                self.view.clear_project_filter();
-            }
-            self.sync_screen_states();
+            self.sync_project_to_fleet_transition();
         }
     }
 
@@ -885,6 +967,7 @@ mod tests {
         assert!(actions.iter().any(|a| a.id == "nav.project"));
         assert!(actions.iter().any(|a| a.id == "nav.alerts"));
         assert!(actions.iter().any(|a| a.id == "nav.analytics"));
+        assert!(actions.iter().any(|a| a.id == "analytics.export_snapshot"));
     }
 
     #[test]
@@ -1066,6 +1149,26 @@ mod tests {
     }
 
     #[test]
+    fn analytics_export_snapshot_action_opens_overlay_and_analytics_screen() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.dispatch_palette_action("analytics.export_snapshot");
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
+        let overlay = app.shell.overlays.top().expect("overlay should be visible");
+        assert_eq!(overlay.kind, OverlayKind::Alert);
+        assert_eq!(overlay.title, "Analytics Snapshot Export");
+        let body = overlay
+            .body
+            .as_deref()
+            .expect("analytics export overlay should include body");
+        assert!(body.contains("Snapshot mode toggled"));
+        assert!(body.contains("Selected project"));
+    }
+
+    #[test]
     fn g_from_alerts_opens_project_detail_with_project_context() {
         let discovered = vec![DiscoveredInstance {
             instance_id: "host-a:cass-001".to_string(),
@@ -1156,6 +1259,222 @@ mod tests {
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
         assert!(app.view.project_filter.is_some());
         assert_eq!(app.view.preset, crate::presets::ViewPreset::ProjectDeepDive);
+    }
+
+    #[test]
+    fn a_from_timeline_opens_analytics_with_project_context() {
+        let discovered = vec![DiscoveredInstance {
+            instance_id: "host-a:cass-004".to_string(),
+            project_key_hint: Some("cass".to_string()),
+            host_name: Some("cass-host".to_string()),
+            pid: Some(4545),
+            version: Some("0.1.0".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["instance:host-a:cass-004".to_string()],
+        }];
+        let mut app = OpsApp::new(Box::new(MockDataSource::from_discovery(&discovered)));
+        app.refresh_data();
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
+        let expected_project = app.selected_project_from_timeline();
+
+        let goto_analytics = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_analytics);
+        assert!(!quit);
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_project_filter)
+                .as_deref(),
+            expected_project.as_deref()
+        );
+    }
+
+    #[test]
+    fn l_from_timeline_opens_live_stream_with_project_context() {
+        let discovered = vec![DiscoveredInstance {
+            instance_id: "host-a:cass-005".to_string(),
+            project_key_hint: Some("cass".to_string()),
+            host_name: Some("cass-host".to_string()),
+            pid: Some(4646),
+            version: Some("0.1.0".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["instance:host-a:cass-005".to_string()],
+        }];
+        let mut app = OpsApp::new(Box::new(MockDataSource::from_discovery(&discovered)));
+        app.refresh_data();
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
+        let expected_project = app.selected_project_from_timeline();
+
+        let goto_stream = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_stream);
+        assert!(!quit);
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.live_stream"))
+        );
+        assert_eq!(
+            app.live_stream_screen()
+                .and_then(LiveSearchStreamScreen::active_project_filter)
+                .as_deref(),
+            expected_project.as_deref()
+        );
+    }
+
+    #[test]
+    fn a_from_timeline_with_unattributed_row_resets_analytics_project_filter_to_all() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::empty()));
+        app.state.update_fleet(FleetSnapshot {
+            instances: vec![crate::state::InstanceInfo {
+                id: "known-001".to_owned(),
+                project: "known".to_owned(),
+                pid: Some(1),
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            lifecycle_events: vec![
+                crate::state::LifecycleEvent {
+                    instance_id: "orphan-001".to_owned(),
+                    from: crate::state::LifecycleState::Started,
+                    to: crate::state::LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.orphan".to_owned(),
+                    at_ms: 2_000,
+                    attribution_confidence_score: 50,
+                    attribution_collision: false,
+                },
+                crate::state::LifecycleEvent {
+                    instance_id: "known-001".to_owned(),
+                    from: crate::state::LifecycleState::Started,
+                    to: crate::state::LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.known".to_owned(),
+                    at_ms: 1_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+        app.sync_screen_states();
+
+        if let Some(screen) = app.analytics_screen_mut() {
+            screen.set_project_filter("known");
+        }
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_project_filter)
+                .as_deref(),
+            Some("known")
+        );
+
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
+        assert!(
+            app.selected_project_from_timeline().is_none(),
+            "top timeline row should be unattributed in this test"
+        );
+
+        let goto_analytics = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_analytics);
+        assert!(!quit);
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_project_filter),
+            None
+        );
+    }
+
+    #[test]
+    fn l_from_timeline_with_unattributed_row_resets_live_stream_project_filter_to_all() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::empty()));
+        app.state.update_fleet(FleetSnapshot {
+            instances: vec![crate::state::InstanceInfo {
+                id: "known-001".to_owned(),
+                project: "known".to_owned(),
+                pid: Some(1),
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            lifecycle_events: vec![
+                crate::state::LifecycleEvent {
+                    instance_id: "orphan-001".to_owned(),
+                    from: crate::state::LifecycleState::Started,
+                    to: crate::state::LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.orphan".to_owned(),
+                    at_ms: 2_000,
+                    attribution_confidence_score: 50,
+                    attribution_collision: false,
+                },
+                crate::state::LifecycleEvent {
+                    instance_id: "known-001".to_owned(),
+                    from: crate::state::LifecycleState::Started,
+                    to: crate::state::LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.known".to_owned(),
+                    at_ms: 1_000,
+                    attribution_confidence_score: 90,
+                    attribution_collision: false,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+        app.sync_screen_states();
+
+        if let Some(screen) = app.live_stream_screen_mut() {
+            screen.set_project_filter("known");
+        }
+        assert_eq!(
+            app.live_stream_screen()
+                .and_then(LiveSearchStreamScreen::active_project_filter)
+                .as_deref(),
+            Some("known")
+        );
+
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
+        assert!(
+            app.selected_project_from_timeline().is_none(),
+            "top timeline row should be unattributed in this test"
+        );
+
+        let goto_live_stream = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_live_stream);
+        assert!(!quit);
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.live_stream"))
+        );
+        assert_eq!(
+            app.live_stream_screen()
+                .and_then(LiveSearchStreamScreen::active_project_filter),
+            None
+        );
     }
 
     #[test]

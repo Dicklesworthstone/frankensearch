@@ -41,6 +41,7 @@ ignore = "0.4"
 asupersync = { workspace = true }
 tempfile = "3"
 proptest = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

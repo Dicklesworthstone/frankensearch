@@ -343,7 +343,7 @@ Status legend:
 | fsfs privacy/redaction suite (`bd-2hz.10.9`) | `pending` | Privacy leak-detection e2e lane | Must emit canonical bundle with structured redaction evidence in `structured_events.jsonl` | Add deterministic redaction outcome fields + replay-safe scrubbed transcript pathing. |
 | Upgrade/migration compatibility suite (`bd-2hz.11.6`) | `pending` | Upgrade matrix + migration soak verification lane | Must emit canonical bundle with migration matrix report, quality-regression report, and replay command | Add adapters for version-path metadata (`N-2->N`, `N-1->N`, rollback) and stable migration failure reason codes. |
 | Performance regression gate suite (`bd-2hz.9.6`) | `in_progress` | CI quality lane + benchmark comparison artifacts | Must emit policy/result artifacts (`perf_regression_gate_policy.json`, `perf_regression_gate_result.json`) and replay command | Promote to adopted after benchmark harness inputs are wired for all required lanes. |
-| Ops PTY + snapshot suite (`bd-2yu.8.3`) | `pending` | Ops/control-plane PTY snapshot lane | Must emit canonical bundle with `terminal_transcript.txt`, snapshot diffs, and artifact checksums | Add PTY snapshot metadata adapter and enforce transcript-on-failure requirement. |
+| Ops PTY + snapshot suite (`bd-2yu.8.3`) | `in_progress` | `crates/frankensearch-ops/tests/ops_pty_snapshot_e2e.rs` | Emits canonical `manifest.json` + `structured_events.jsonl` + failure-required `artifacts_index.json` / `replay_command.txt` / `terminal_transcript.txt`, plus ops snapshot/evidence/replay payloads | PTY snapshot matrix + failure snapshot-diff lane now validates canonical bundle; expand scenario matrix as remaining ops lanes land. |
 
 ### Canonical Field Mapping Rules
 

@@ -184,6 +184,8 @@ pub fn rrf_fuse(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn lexical_hit(doc_id: &str, score: f32) -> ScoredResult {
@@ -561,5 +563,48 @@ mod tests {
         assert_eq!(results[0].lexical_rank, Some(0));
         assert_eq!(results[0].semantic_rank, None);
         assert!(!results[0].in_both_sources);
+    }
+
+    fn large_lexical_semantic_fixture(doc_count: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
+        let mut lexical = Vec::with_capacity(doc_count);
+        let mut semantic = Vec::with_capacity(doc_count);
+
+        for index in 0..doc_count {
+            let shared_bucket = index % (doc_count / 2).max(1);
+            let doc_id = format!("doc-{shared_bucket}");
+
+            let lexical_rank = f32::from(u16::try_from(index % 512).unwrap_or(u16::MAX));
+            let semantic_rank = f32::from(u16::try_from(index % 256).unwrap_or(u16::MAX));
+
+            lexical.push(lexical_hit(&doc_id, 1000.0 - lexical_rank));
+            semantic.push(semantic_hit(&doc_id, 1.0 - (semantic_rank / 1024.0)));
+        }
+
+        (lexical, semantic)
+    }
+
+    #[test]
+    #[ignore = "Perf probe for optimization loop: run explicitly with --ignored"]
+    fn perf_probe_rrf_large_candidates() {
+        let doc_count = 20_000;
+        let iterations = 60;
+        let (lexical, semantic) = large_lexical_semantic_fixture(doc_count);
+        let config = RrfConfig::default();
+
+        let started = Instant::now();
+        let mut checksum = 0.0_f64;
+        for _ in 0..iterations {
+            let output = rrf_fuse(&lexical, &semantic, 100, 0, &config);
+            checksum += output.iter().map(|hit| hit.rrf_score).sum::<f64>();
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "RRF_PERF baseline_or_candidate elapsed_ms={} doc_count={} iterations={} checksum={checksum}",
+            elapsed.as_millis(),
+            doc_count,
+            iterations
+        );
+        assert!(checksum.is_finite());
     }
 }

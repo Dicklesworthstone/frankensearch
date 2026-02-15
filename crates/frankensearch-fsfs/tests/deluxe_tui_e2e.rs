@@ -219,6 +219,20 @@ fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
         .join("\n")
 }
 
+fn canonical_deluxe_tui_artifact_payload(artifact: &DeluxeTuiE2eArtifact) -> serde_json::Value {
+    let replayed = replay_roundtrip_events(&artifact.replay_json);
+    serde_json::json!({
+        "scenario": artifact.scenario,
+        "viewport_height": artifact.viewport_height,
+        "mode": artifact.mode,
+        "action_trace": artifact.action_trace,
+        "snapshots": artifact.snapshots,
+        "replay_command": artifact.replay_command,
+        "replay_event_count": replayed.len(),
+        "replay_fingerprint": format!("{:016x}", replay_fingerprint(&replayed)),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_deluxe_tui_unified_bundle(
     scenario: &str,
@@ -415,8 +429,9 @@ fn build_deluxe_tui_unified_bundle(
         ));
     }
 
-    let artifact_json =
-        serde_json::to_string(artifact).expect("deluxe tui artifact should serialize");
+    let canonical_artifact_payload = canonical_deluxe_tui_artifact_payload(artifact);
+    let canonical_artifact_json = serde_json::to_string(&canonical_artifact_payload)
+        .expect("deluxe tui artifact payload should serialize");
     let replay_failure_json = failure
         .map(|item| serde_json::to_string(item).expect("replay failure artifact should serialize"));
     let structured_events_jsonl = render_events_jsonl(&events);
@@ -436,7 +451,7 @@ fn build_deluxe_tui_unified_bundle(
         },
         ArtifactEmissionInput {
             file: DELUXE_TUI_ARTIFACT_FILE,
-            bytes: artifact_json.as_bytes(),
+            bytes: canonical_artifact_json.as_bytes(),
             line_count: None,
         },
     ];
@@ -467,7 +482,10 @@ fn build_deluxe_tui_unified_bundle(
             suite: Suite::Fsfs,
             determinism_tier: DeterminismTier::BitExact,
             seed: 73,
-            config_hash: format!("tui.replay.{}", sha256_checksum(artifact_json.as_bytes())),
+            config_hash: format!(
+                "tui.replay.{}",
+                sha256_checksum(canonical_artifact_json.as_bytes())
+            ),
             index_version: Some("fsfs-deluxe-tui-e2e-v1".to_owned()),
             model_versions: vec![
                 ModelVersion {
@@ -809,12 +827,13 @@ fn scenario_tui_replay_failures_emit_reproducible_artifacts() {
     assert_eq!(failure_bundle, failure_bundle_again);
     assert_deluxe_tui_unified_bundle_is_valid(&failure_bundle, DELUXE_TUI_REASON_REPLAY_MISMATCH);
 
-    let artifact_files: Vec<&str> = failure_bundle
-        .manifest
-        .body
-        .artifacts
-        .iter()
-        .map(|item| item.file.as_str())
-        .collect();
-    assert!(artifact_files.contains(&DELUXE_TUI_REPLAY_FAILURE_FILE));
+    assert!(
+        failure_bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .map(|item| item.file.as_str())
+            .any(|file| file == DELUXE_TUI_REPLAY_FAILURE_FILE)
+    );
 }

@@ -157,12 +157,16 @@ pub fn compute_rank_changes(initial: &[VectorHit], refined: &[VectorHit]) -> Ran
 
 /// Compute Kendall's tau rank correlation between two rankings.
 ///
+/// Uses merge-sort-based inversion counting for O(n log n) performance
+/// instead of the naive O(n^2) pairwise comparison.
+///
 /// Returns `None` when fewer than two common documents exist.
 #[must_use]
 pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> {
     let initial_rank = build_rank_map(initial);
     let refined_rank = build_rank_map(refined);
 
+    // Collect common documents in initial-rank order (iteration order preserves it).
     let mut seen = HashSet::new();
     let mut common = Vec::new();
     for hit in initial {
@@ -176,35 +180,67 @@ pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> 
         return None;
     }
 
-    let mut concordant = 0_u64;
-    let mut discordant = 0_u64;
+    // Build array of refined ranks in initial-rank order.
+    // An inversion in this array corresponds to a discordant pair.
+    let mut refined_ranks: Vec<usize> = common
+        .iter()
+        .map(|doc_id| refined_rank[doc_id])
+        .collect();
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let doc_i = &common[i];
-            let doc_j = &common[j];
+    let discordant = merge_sort_inversions(&mut refined_ranks);
 
-            let initial_order = initial_rank[doc_i].cmp(&initial_rank[doc_j]);
-            let refined_order = refined_rank[doc_i].cmp(&refined_rank[doc_j]);
-
-            if initial_order == refined_order {
-                concordant += 1;
-            } else {
-                discordant += 1;
-            }
-        }
-    }
-
-    let total_pairs_u32 = u32::try_from(n.saturating_mul(n.saturating_sub(1)) / 2).ok()?;
-    if total_pairs_u32 == 0 {
+    let n_u64 = u64::try_from(n).ok()?;
+    let total_pairs = n_u64.checked_mul(n_u64 - 1)? / 2;
+    if total_pairs == 0 {
         return None;
     }
 
-    let concordant_u32 = u32::try_from(concordant).ok()?;
-    let discordant_u32 = u32::try_from(discordant).ok()?;
-    let numerator = f64::from(concordant_u32) - f64::from(discordant_u32);
-    let denominator = f64::from(total_pairs_u32);
+    let concordant = total_pairs.saturating_sub(discordant);
+
+    #[allow(clippy::cast_precision_loss)]
+    let numerator = concordant as f64 - discordant as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let denominator = total_pairs as f64;
     Some(numerator / denominator)
+}
+
+/// Count inversions in a slice using merge sort. O(n log n).
+///
+/// An inversion is a pair `(i, j)` where `i < j` but `arr[i] > arr[j]`.
+/// The slice is sorted in place as a side effect.
+fn merge_sort_inversions(arr: &mut [usize]) -> u64 {
+    let n = arr.len();
+    if n <= 1 {
+        return 0;
+    }
+    let mid = n / 2;
+    let mut left = arr[..mid].to_vec();
+    let mut right = arr[mid..].to_vec();
+
+    let mut count = merge_sort_inversions(&mut left);
+    count += merge_sort_inversions(&mut right);
+
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while i < left.len() && j < right.len() {
+        if left[i] <= right[j] {
+            arr[k] = left[i];
+            i += 1;
+        } else {
+            arr[k] = right[j];
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                count += (left.len() - i) as u64;
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+
+    arr[k..k + left.len() - i].copy_from_slice(&left[i..]);
+    k += left.len() - i;
+    arr[k..].copy_from_slice(&right[j..]);
+
+    count
 }
 
 const fn sanitize_blend_factor(blend_factor: f32) -> f32 {
@@ -427,5 +463,24 @@ mod tests {
         assert_eq!(changes.stable, 0);
         assert_eq!(changes.promoted, 0);
         assert_eq!(changes.demoted, 0);
+    }
+
+    #[test]
+    #[ignore = "perf-only stress harness for optimization baseline/profile runs"]
+    fn kendall_tau_stress_reverse_large() {
+        let n: usize = 2_048;
+        let initial: Vec<VectorHit> = (0..n)
+            .map(|i| hit(&format!("doc-{i:05}"), 1.0, 0))
+            .collect();
+        let refined: Vec<VectorHit> = (0..n)
+            .rev()
+            .map(|i| hit(&format!("doc-{i:05}"), 1.0, 0))
+            .collect();
+
+        let tau = kendall_tau(&initial, &refined).expect("tau should exist for large overlap");
+        assert!(
+            (tau + 1.0).abs() <= f64::EPSILON,
+            "reverse ordering should produce tau=-1.0, got {tau}"
+        );
     }
 }

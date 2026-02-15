@@ -8,7 +8,8 @@ use frankensearch_core::{
     E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, EvidenceEventType, ExitStatus,
     ExplainedSource, ExplanationPhase, HitExplanation, ManifestBody, ModelVersion, PipelineState,
     Platform, ReplayBody, ReplayEventType, ScoreComponent, Severity, Suite, build_artifact_entries,
-    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
+    render_artifacts_index, sha256_checksum, validate_envelope, validate_event_envelope,
+    validate_manifest_envelope,
 };
 use frankensearch_fsfs::interaction_primitives::{
     InteractionBudget, InteractionCycleTiming, LatencyPhase, PhaseTiming, SearchInteractionState,
@@ -164,7 +165,10 @@ fn build_privacy_unified_bundle(
     };
 
     let mut metrics = BTreeMap::new();
-    metrics.insert("finding_count".to_owned(), usize_to_f64(lane_meta.finding_count));
+    metrics.insert(
+        "finding_count".to_owned(),
+        usize_to_f64(lane_meta.finding_count),
+    );
 
     let event_bodies = [
         EventBody {
@@ -371,6 +375,9 @@ fn assert_privacy_unified_bundle_is_valid(bundle: &PrivacyUnifiedE2eBundle) {
     validate_manifest_envelope(&bundle.manifest).expect("manifest envelope should validate");
     for event in &bundle.events {
         validate_event_envelope(event).expect("event envelope should validate");
+    }
+    for replay in &bundle.replay {
+        validate_envelope(replay, E2E_SCHEMA_REPLAY).expect("replay envelope should validate");
     }
 }
 

@@ -1325,4 +1325,711 @@ mod tests {
         assert_eq!(report.backpressured_batches, 0);
         assert!(report.avg_write_latency_us >= 0.0);
     }
+
+    // --- DeterministicRng ---
+
+    #[test]
+    fn rng_seed_zero_uses_fallback_state() {
+        let mut rng = DeterministicRng::new(0);
+        let first = rng.next_u64();
+        // seed=0 triggers fallback constant, so should produce non-zero output
+        assert_ne!(first, 0);
+    }
+
+    #[test]
+    fn rng_is_deterministic_across_calls() {
+        let mut rng_a = DeterministicRng::new(42);
+        let mut rng_b = DeterministicRng::new(42);
+        for _ in 0..100 {
+            assert_eq!(rng_a.next_u64(), rng_b.next_u64());
+        }
+    }
+
+    #[test]
+    fn rng_next_bounded_zero_returns_zero() {
+        let mut rng = DeterministicRng::new(99);
+        assert_eq!(rng.next_bounded(0), 0);
+    }
+
+    #[test]
+    fn rng_next_bounded_values_within_range() {
+        let mut rng = DeterministicRng::new(77);
+        for _ in 0..200 {
+            let val = rng.next_bounded(10);
+            assert!(val < 10, "bounded value {val} should be < 10");
+        }
+    }
+
+    #[test]
+    fn rng_next_bounded_one_always_returns_zero() {
+        let mut rng = DeterministicRng::new(123);
+        for _ in 0..50 {
+            assert_eq!(rng.next_bounded(1), 0);
+        }
+    }
+
+    // --- stable_u64_hash / fnv helpers ---
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        let h1 = stable_u64_hash("hello");
+        let h2 = stable_u64_hash("hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_different_inputs_differ() {
+        assert_ne!(stable_u64_hash("hello"), stable_u64_hash("world"));
+    }
+
+    #[test]
+    fn stable_hash_empty_string_returns_offset() {
+        // With no bytes to fold in, the hash should equal the FNV offset basis
+        let h = stable_u64_hash("");
+        assert_eq!(h, 0xcbf2_9ce4_8422_2325);
+    }
+
+    // --- expand_instance_specs ---
+
+    #[test]
+    fn expand_instance_specs_counts_and_sorts() {
+        let config = TelemetrySimulatorConfig {
+            seed: 1,
+            start_ms: 0,
+            tick_interval_ms: 1000,
+            ticks: 1,
+            projects: vec![
+                SimulatedProject {
+                    project_key: "b_proj".to_owned(),
+                    host_name: "b-host".to_owned(),
+                    instance_count: 2,
+                    workload: WorkloadProfile::Steady,
+                },
+                SimulatedProject {
+                    project_key: "a_proj".to_owned(),
+                    host_name: "a-host".to_owned(),
+                    instance_count: 3,
+                    workload: WorkloadProfile::Burst,
+                },
+            ],
+        };
+        let specs = expand_instance_specs(&config);
+        assert_eq!(specs.len(), 5);
+        // Sorted by instance_id
+        for i in 1..specs.len() {
+            assert!(
+                specs[i - 1].instance_id <= specs[i].instance_id,
+                "specs should be sorted by instance_id"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_instance_specs_instance_id_format() {
+        let config = TelemetrySimulatorConfig {
+            seed: 1,
+            start_ms: 0,
+            tick_interval_ms: 1000,
+            ticks: 1,
+            projects: vec![SimulatedProject {
+                project_key: "proj".to_owned(),
+                host_name: "host".to_owned(),
+                instance_count: 1,
+                workload: WorkloadProfile::Steady,
+            }],
+        };
+        let specs = expand_instance_specs(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].instance_id, "proj-01");
+        assert_eq!(specs[0].instance_index, 1);
+        assert_eq!(specs[0].host_name, "host-1");
+    }
+
+    // --- event_count_for_tick ---
+
+    #[test]
+    fn event_count_steady_baseline_is_at_least_one() {
+        let mut rng = DeterministicRng::new(42);
+        for tick in 0..20 {
+            let count = event_count_for_tick(WorkloadProfile::Steady, tick, false, &mut rng);
+            assert!(count >= 1, "event count must be >= 1, got {count}");
+        }
+    }
+
+    #[test]
+    fn event_count_burst_bonus_on_every_fourth_tick() {
+        let mut rng_burst = DeterministicRng::new(42);
+        let mut rng_base = DeterministicRng::new(42);
+        let count_burst = event_count_for_tick(WorkloadProfile::Burst, 4, false, &mut rng_burst);
+        let count_base = event_count_for_tick(WorkloadProfile::Burst, 5, false, &mut rng_base);
+        // tick 4 (4%4==0) gets +8 bonus; tick 5 does not
+        assert!(
+            count_burst > count_base,
+            "burst tick should have more events: {count_burst} vs {count_base}"
+        );
+    }
+
+    #[test]
+    fn event_count_restart_penalty_reduces_count() {
+        let mut rng_a = DeterministicRng::new(42);
+        let mut rng_b = DeterministicRng::new(42);
+        let normal = event_count_for_tick(WorkloadProfile::Restarting, 3, false, &mut rng_a);
+        let restart = event_count_for_tick(WorkloadProfile::Restarting, 3, true, &mut rng_b);
+        assert!(
+            restart <= normal,
+            "restart tick should have fewer or equal events: restart={restart} vs normal={normal}"
+        );
+    }
+
+    // --- result_count_for_query_class ---
+
+    #[test]
+    fn result_count_empty_is_zero() {
+        assert_eq!(result_count_for_query_class(QueryClass::Empty), 0);
+    }
+
+    #[test]
+    fn result_count_natural_language_is_largest() {
+        let empty = result_count_for_query_class(QueryClass::Empty);
+        let ident = result_count_for_query_class(QueryClass::Identifier);
+        let short = result_count_for_query_class(QueryClass::ShortKeyword);
+        let nl = result_count_for_query_class(QueryClass::NaturalLanguage);
+        assert!(nl > short);
+        assert!(short > ident);
+        assert!(ident > empty);
+    }
+
+    // --- phase_label ---
+
+    #[test]
+    fn phase_label_covers_all_variants() {
+        let initial = SearchPhase::Initial {
+            results: vec![],
+            latency: Duration::ZERO,
+            metrics: PhaseMetrics {
+                embedder_id: String::new(),
+                vectors_searched: 0,
+                lexical_candidates: 0,
+                fused_count: 0,
+            },
+        };
+        let refined = SearchPhase::Refined {
+            results: vec![],
+            latency: Duration::ZERO,
+            metrics: PhaseMetrics {
+                embedder_id: String::new(),
+                vectors_searched: 0,
+                lexical_candidates: 0,
+                fused_count: 0,
+            },
+            rank_changes: RankChanges {
+                promoted: 0,
+                demoted: 0,
+                stable: 0,
+            },
+        };
+        let failed = SearchPhase::RefinementFailed {
+            initial_results: vec![],
+            error: SearchError::SearchTimeout {
+                elapsed_ms: 100,
+                budget_ms: 50,
+            },
+            latency: Duration::ZERO,
+        };
+
+        assert_eq!(phase_label(&initial), "initial");
+        assert_eq!(phase_label(&refined), "refined");
+        assert_eq!(phase_label(&failed), "failed");
+    }
+
+    // --- failure_kind_for_phase ---
+
+    #[test]
+    fn failure_kind_none_for_initial_and_refined() {
+        let initial = SearchPhase::Initial {
+            results: vec![],
+            latency: Duration::ZERO,
+            metrics: PhaseMetrics {
+                embedder_id: String::new(),
+                vectors_searched: 0,
+                lexical_candidates: 0,
+                fused_count: 0,
+            },
+        };
+        assert!(failure_kind_for_phase(&initial).is_none());
+    }
+
+    #[test]
+    fn failure_kind_some_for_refinement_failed() {
+        let failed = SearchPhase::RefinementFailed {
+            initial_results: vec![],
+            error: SearchError::SearchTimeout {
+                elapsed_ms: 100,
+                budget_ms: 50,
+            },
+            latency: Duration::ZERO,
+        };
+        assert_eq!(failure_kind_for_phase(&failed), Some("search_timeout"));
+    }
+
+    // --- search_error_kind ---
+
+    #[test]
+    fn search_error_kind_covers_representative_variants() {
+        assert_eq!(
+            search_error_kind(&SearchError::SearchTimeout {
+                elapsed_ms: 1,
+                budget_ms: 1,
+            }),
+            "search_timeout"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::ModelNotFound {
+                name: String::new()
+            }),
+            "model_not_found"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::DimensionMismatch {
+                expected: 0,
+                found: 0,
+            }),
+            "dimension_mismatch"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::DurabilityDisabled),
+            "durability_disabled"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::QueueFull {
+                pending: 0,
+                capacity: 0
+            }),
+            "queue_full"
+        );
+    }
+
+    // --- phase_to_record_fields ---
+
+    #[test]
+    fn phase_to_record_fields_initial_has_result_count() {
+        let phase = SearchPhase::Initial {
+            results: vec![
+                ScoredResult {
+                    doc_id: "a".to_owned(),
+                    score: 1.0,
+                    source: ScoreSource::SemanticFast,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: None,
+                    rerank_score: None,
+                    metadata: None,
+                },
+                ScoredResult {
+                    doc_id: "b".to_owned(),
+                    score: 0.5,
+                    source: ScoreSource::SemanticFast,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: None,
+                    rerank_score: None,
+                    metadata: None,
+                },
+            ],
+            latency: Duration::from_micros(500),
+            metrics: PhaseMetrics {
+                embedder_id: String::new(),
+                vectors_searched: 0,
+                lexical_candidates: 0,
+                fused_count: 0,
+            },
+        };
+        let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);
+        assert_eq!(record_phase, SearchEventPhase::Initial);
+        assert_eq!(latency_us, 500);
+        assert_eq!(result_count, Some(2));
+    }
+
+    #[test]
+    fn phase_to_record_fields_failed_has_no_result_count() {
+        let phase = SearchPhase::RefinementFailed {
+            initial_results: vec![],
+            error: SearchError::SearchTimeout {
+                elapsed_ms: 10,
+                budget_ms: 5,
+            },
+            latency: Duration::from_micros(999),
+        };
+        let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);
+        assert_eq!(record_phase, SearchEventPhase::Failed);
+        assert_eq!(latency_us, 999);
+        assert_eq!(result_count, None);
+    }
+
+    // --- build_results ---
+
+    #[test]
+    fn build_results_returns_correct_count() {
+        let results = build_results("inst-01", 0, 0, 5, ScoreSource::Hybrid);
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn build_results_scores_decrease_with_rank() {
+        let results = build_results("inst-01", 0, 0, 4, ScoreSource::SemanticFast);
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score >= results[i].score,
+                "scores should decrease: {} vs {}",
+                results[i - 1].score,
+                results[i].score,
+            );
+        }
+    }
+
+    #[test]
+    fn build_results_zero_count_returns_empty() {
+        let results = build_results("inst-01", 0, 0, 0, ScoreSource::Hybrid);
+        assert!(results.is_empty());
+    }
+
+    // --- derive_skip_reason ---
+
+    #[test]
+    fn derive_skip_reason_empty_query_returns_empty_commit() {
+        let mut rng = DeterministicRng::new(42);
+        let reason = derive_skip_reason(
+            WorkloadProfile::Steady,
+            QueryClass::Empty,
+            0,
+            false,
+            &mut rng,
+        );
+        assert_eq!(reason, Some(SkipReason::EmptyCommit));
+    }
+
+    #[test]
+    fn derive_skip_reason_steady_non_empty_returns_none() {
+        // Steady workload with non-empty query and no restart should always return None
+        let mut rng = DeterministicRng::new(42);
+        for tick in 0..20 {
+            let reason = derive_skip_reason(
+                WorkloadProfile::Steady,
+                QueryClass::NaturalLanguage,
+                tick,
+                false,
+                &mut rng,
+            );
+            assert_eq!(
+                reason, None,
+                "steady non-empty non-restart should have no skip reason at tick {tick}"
+            );
+        }
+    }
+
+    // --- p95_from_run ---
+
+    #[test]
+    fn p95_empty_run_returns_zero() {
+        let run = SimulationRun {
+            seed: 0,
+            config: TelemetrySimulatorConfig::default(),
+            batches: vec![],
+        };
+        assert_eq!(p95_from_run(&run), 0);
+    }
+
+    #[test]
+    fn p95_single_event_returns_its_latency() {
+        let run = SimulationRun {
+            seed: 0,
+            config: TelemetrySimulatorConfig::default(),
+            batches: vec![SimulationBatch {
+                tick_index: 0,
+                now_ms: 0,
+                discovered_instances: vec![],
+                search_events: vec![SimulatedSearchEvent {
+                    record: SearchEventRecord {
+                        event_id: "e1".to_owned(),
+                        project_key: "p".to_owned(),
+                        instance_id: "i".to_owned(),
+                        correlation_id: "c".to_owned(),
+                        query_hash: None,
+                        query_class: None,
+                        phase: SearchEventPhase::Initial,
+                        latency_us: 42,
+                        result_count: Some(1),
+                        memory_bytes: None,
+                        ts_ms: 0,
+                    },
+                    query: "test".to_owned(),
+                    query_class: QueryClass::ShortKeyword,
+                    phase_label: "initial".to_owned(),
+                    skip_reason: None,
+                    failure_kind: None,
+                }],
+                resource_samples: vec![],
+            }],
+        };
+        assert_eq!(p95_from_run(&run), 42);
+    }
+
+    // --- ratio_per_second ---
+
+    #[test]
+    fn ratio_per_second_zero_duration_returns_zero() {
+        assert!((ratio_per_second(100, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ratio_per_second_normal_calculation() {
+        let rate = ratio_per_second(10, 2000);
+        // 10 events / 2 seconds = 5 events/sec
+        assert!((rate - 5.0).abs() < 0.01);
+    }
+
+    // --- average_u64 ---
+
+    #[test]
+    fn average_u64_zero_count_returns_zero() {
+        assert!((average_u64(100, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn average_u64_normal_calculation() {
+        let avg = average_u64(300, 3);
+        assert!((avg - 100.0).abs() < 0.01);
+    }
+
+    // --- u64_to_i64 ---
+
+    #[test]
+    fn u64_to_i64_valid_value() {
+        assert_eq!(u64_to_i64(42).unwrap(), 42_i64);
+    }
+
+    #[test]
+    fn u64_to_i64_overflow_returns_error() {
+        let err = u64_to_i64(u64::MAX).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    // --- SimulatedProject::validate ---
+
+    #[test]
+    fn project_validate_rejects_empty_project_key() {
+        let project = SimulatedProject {
+            project_key: "  ".to_owned(),
+            host_name: "host".to_owned(),
+            instance_count: 1,
+            workload: WorkloadProfile::Steady,
+        };
+        let err = project.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { field, .. } if field == "project_key"));
+    }
+
+    #[test]
+    fn project_validate_rejects_empty_host_name() {
+        let project = SimulatedProject {
+            project_key: "proj".to_owned(),
+            host_name: String::new(),
+            instance_count: 1,
+            workload: WorkloadProfile::Steady,
+        };
+        let err = project.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { field, .. } if field == "host_name"));
+    }
+
+    #[test]
+    fn project_validate_rejects_zero_instance_count() {
+        let project = SimulatedProject {
+            project_key: "proj".to_owned(),
+            host_name: "host".to_owned(),
+            instance_count: 0,
+            workload: WorkloadProfile::Steady,
+        };
+        let err = project.validate().unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidConfig { field, .. } if field == "instance_count")
+        );
+    }
+
+    // --- TelemetrySimulatorConfig::validate ---
+
+    #[test]
+    fn config_validate_rejects_zero_tick_interval() {
+        let config = TelemetrySimulatorConfig {
+            tick_interval_ms: 0,
+            ..TelemetrySimulatorConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidConfig { field, .. } if field == "tick_interval_ms")
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_ticks() {
+        let config = TelemetrySimulatorConfig {
+            ticks: 0,
+            ..TelemetrySimulatorConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { field, .. } if field == "ticks"));
+    }
+
+    #[test]
+    fn config_validate_rejects_empty_projects() {
+        let config = TelemetrySimulatorConfig {
+            projects: vec![],
+            ..TelemetrySimulatorConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { field, .. } if field == "projects"));
+    }
+
+    #[test]
+    fn config_validate_propagates_project_error() {
+        let config = TelemetrySimulatorConfig {
+            projects: vec![SimulatedProject {
+                project_key: String::new(),
+                host_name: "h".to_owned(),
+                instance_count: 1,
+                workload: WorkloadProfile::Steady,
+            }],
+            ..TelemetrySimulatorConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { field, .. } if field == "project_key"));
+    }
+
+    // --- SimulationRun accessors ---
+
+    #[test]
+    fn empty_run_has_zero_totals() {
+        let run = SimulationRun {
+            seed: 0,
+            config: TelemetrySimulatorConfig::default(),
+            batches: vec![],
+        };
+        assert_eq!(run.total_search_events(), 0);
+        assert_eq!(run.total_resource_samples(), 0);
+        assert!(run.instance_pairs().is_empty());
+    }
+
+    // --- cpu_pct_for_tick is clamped ---
+
+    #[test]
+    fn cpu_pct_is_clamped_to_100() {
+        let mut rng = DeterministicRng::new(42);
+        // High event count should not push cpu_pct above 100
+        for _ in 0..50 {
+            let pct = cpu_pct_for_tick(WorkloadProfile::Burst, 1000, 0, &mut rng);
+            assert!(pct <= 100.0, "cpu_pct should be <= 100.0, got {pct}");
+            assert!(pct >= 0.0, "cpu_pct should be >= 0.0, got {pct}");
+        }
+    }
+
+    // --- memory_bytes_for_event ---
+
+    #[test]
+    fn memory_bytes_positive_for_all_workloads() {
+        let workloads = [
+            WorkloadProfile::Steady,
+            WorkloadProfile::Burst,
+            WorkloadProfile::EmbeddingWave,
+            WorkloadProfile::Restarting,
+        ];
+        let classes = [
+            QueryClass::Empty,
+            QueryClass::Identifier,
+            QueryClass::ShortKeyword,
+            QueryClass::NaturalLanguage,
+        ];
+        for workload in &workloads {
+            for class in &classes {
+                let mut rng = DeterministicRng::new(42);
+                let bytes = memory_bytes_for_event(*workload, *class, &mut rng);
+                assert!(
+                    bytes > 0,
+                    "memory_bytes should be positive for {workload:?}/{class:?}"
+                );
+            }
+        }
+    }
+
+    // --- WorkloadProfile serde ---
+
+    #[test]
+    fn workload_profile_serde_roundtrip() {
+        let profiles = [
+            WorkloadProfile::Steady,
+            WorkloadProfile::Burst,
+            WorkloadProfile::EmbeddingWave,
+            WorkloadProfile::Restarting,
+        ];
+        for profile in &profiles {
+            let json = serde_json::to_string(profile).unwrap();
+            let back: WorkloadProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(*profile, back);
+        }
+    }
+
+    // --- TelemetrySimulatorConfig default is valid ---
+
+    #[test]
+    fn default_config_passes_validation() {
+        let config = TelemetrySimulatorConfig::default();
+        config.validate().expect("default config should validate");
+    }
+
+    // --- stable_pid ---
+
+    #[test]
+    fn stable_pid_is_at_least_10000() {
+        let pid = stable_pid("test_project", 1);
+        assert!(pid >= 10_000, "pid should be >= 10000, got {pid}");
+    }
+
+    #[test]
+    fn stable_pid_is_deterministic() {
+        assert_eq!(stable_pid("proj", 1), stable_pid("proj", 1));
+        assert_ne!(stable_pid("proj", 1), stable_pid("proj", 2));
+    }
+
+    // --- TelemetrySimulator::new rejects invalid config ---
+
+    #[test]
+    fn simulator_new_rejects_invalid_config() {
+        let config = TelemetrySimulatorConfig {
+            ticks: 0,
+            ..TelemetrySimulatorConfig::default()
+        };
+        assert!(TelemetrySimulator::new(config).is_err());
+    }
+
+    // --- SimulationRun::signature changes with content ---
+
+    #[test]
+    fn signature_differs_for_different_seeds() {
+        let config_a = TelemetrySimulatorConfig {
+            seed: 100,
+            ticks: 3,
+            ..TelemetrySimulatorConfig::default()
+        };
+        let config_b = TelemetrySimulatorConfig {
+            seed: 200,
+            ticks: 3,
+            ..TelemetrySimulatorConfig::default()
+        };
+        let run_a = TelemetrySimulator::new(config_a)
+            .unwrap()
+            .generate()
+            .unwrap();
+        let run_b = TelemetrySimulator::new(config_b)
+            .unwrap()
+            .generate()
+            .unwrap();
+        assert_ne!(run_a.signature(), run_b.signature());
+    }
 }
