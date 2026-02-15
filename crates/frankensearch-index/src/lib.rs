@@ -3254,12 +3254,8 @@ mod tests {
         writer.finish().unwrap();
 
         let mut index = VectorIndex::open(&path).unwrap();
-        index
-            .append("wal-a", &[0.0, 1.0, 0.0, 0.0])
-            .unwrap();
-        index
-            .append("wal-b", &[0.0, 0.0, 1.0, 0.0])
-            .unwrap();
+        index.append("wal-a", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        index.append("wal-b", &[0.0, 0.0, 1.0, 0.0]).unwrap();
         assert_eq!(index.wal_record_count(), 2);
 
         // Make the WAL parent directory read-only to force a rewrite failure.
@@ -3291,9 +3287,7 @@ mod tests {
         );
 
         // Both entries should still be searchable.
-        let hits = index
-            .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
-            .unwrap();
+        let hits = index.search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None).unwrap();
         assert!(hits.iter().any(|h| h.doc_id == "wal-a"));
         assert!(hits.iter().any(|h| h.doc_id == "wal-b"));
 

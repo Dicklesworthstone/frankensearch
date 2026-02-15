@@ -117,7 +117,9 @@ fn write_multiple_records_preserves_all() {
 
     // Records are sorted by doc_id_hash in the file, so we verify by
     // doc_id_at for each index rather than assuming insertion order.
-    let mut found_ids: Vec<String> = (0..4).map(|i| index.doc_id_at(i).unwrap().to_owned()).collect();
+    let mut found_ids: Vec<String> = (0..4)
+        .map(|i| index.doc_id_at(i).unwrap().to_owned())
+        .collect();
     found_ids.sort();
     let mut expected_ids: Vec<String> = records.iter().map(|(id, _)| (*id).to_owned()).collect();
     expected_ids.sort();
@@ -141,9 +143,7 @@ fn metadata_fields_are_preserved() {
         Quantization::F16,
     )
     .unwrap();
-    writer
-        .write_record("m1", &vec![0.5; 128])
-        .unwrap();
+    writer.write_record("m1", &vec![0.5; 128]).unwrap();
     writer.finish().unwrap();
 
     let index = VectorIndex::open(&path).unwrap();
@@ -259,8 +259,12 @@ fn wal_append_and_compact() {
     let dim = 4;
     let mut writer =
         VectorIndex::create_with_revision(&path, "wal-test", "", dim, Quantization::F32).unwrap();
-    writer.write_record("main-1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    writer.write_record("main-2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+    writer
+        .write_record("main-1", &[1.0, 0.0, 0.0, 0.0])
+        .unwrap();
+    writer
+        .write_record("main-2", &[0.0, 1.0, 0.0, 0.0])
+        .unwrap();
     writer.finish().unwrap();
 
     // Open and append via WAL.
@@ -334,8 +338,12 @@ fn soft_delete_and_vacuum() {
     let mut writer =
         VectorIndex::create_with_revision(&path, "vac", "", dim, Quantization::F32).unwrap();
     writer.write_record("keep", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    writer.write_record("delete-me", &[0.0, 1.0, 0.0, 0.0]).unwrap();
-    writer.write_record("also-keep", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+    writer
+        .write_record("delete-me", &[0.0, 1.0, 0.0, 0.0])
+        .unwrap();
+    writer
+        .write_record("also-keep", &[0.0, 0.0, 1.0, 0.0])
+        .unwrap();
     writer.finish().unwrap();
 
     let mut index = VectorIndex::open(&path).unwrap();
@@ -411,12 +419,18 @@ fn search_returns_closest_vector() {
     let query = normalize(&[0.9, 0.1, 0.0, 0.0]);
     let results = index.search_top_k(&query, 3, None).unwrap();
     assert!(!results.is_empty());
-    assert_eq!(results[0].doc_id, "north", "north should be closest to [0.9, 0.1, 0, 0]");
+    assert_eq!(
+        results[0].doc_id, "north",
+        "north should be closest to [0.9, 0.1, 0, 0]"
+    );
 
     // Query close to "east" — east should rank highest.
     let query = normalize(&[0.1, 0.9, 0.0, 0.0]);
     let results = index.search_top_k(&query, 3, None).unwrap();
-    assert_eq!(results[0].doc_id, "east", "east should be closest to [0.1, 0.9, 0, 0]");
+    assert_eq!(
+        results[0].doc_id, "east",
+        "east should be closest to [0.1, 0.9, 0, 0]"
+    );
 
     cleanup(&path);
 }
@@ -432,9 +446,7 @@ fn search_respects_limit() {
     for i in 0..10 {
         let mut emb = vec![0.0; dim];
         emb[i % dim] = 1.0;
-        writer
-            .write_record(&format!("doc-{i}"), &emb)
-            .unwrap();
+        writer.write_record(&format!("doc-{i}"), &emb).unwrap();
     }
     writer.finish().unwrap();
 
@@ -442,7 +454,11 @@ fn search_respects_limit() {
     let query = vec![1.0, 0.0, 0.0, 0.0];
 
     let results = index.search_top_k(&query, 3, None).unwrap();
-    assert!(results.len() <= 3, "should respect limit=3, got {}", results.len());
+    assert!(
+        results.len() <= 3,
+        "should respect limit=3, got {}",
+        results.len()
+    );
 
     let results = index.search_top_k(&query, 100, None).unwrap();
     assert_eq!(results.len(), 10, "should return all 10 when limit > count");
@@ -494,7 +510,9 @@ fn wal_entries_are_searchable_before_compaction() {
     let dim = 4;
     let mut writer =
         VectorIndex::create_with_revision(&path, "wal-s", "", dim, Quantization::F32).unwrap();
-    writer.write_record("main-doc", &normalize(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+    writer
+        .write_record("main-doc", &normalize(&[1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
     writer.finish().unwrap();
 
     let mut index = VectorIndex::open(&path).unwrap();
@@ -538,7 +556,10 @@ fn corrupted_header_is_detected() {
     assert!(result.is_err(), "corrupted header should be detected");
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
-        err_msg.contains("Corrupted") || err_msg.contains("corrupted") || err_msg.contains("CRC") || err_msg.contains("crc"),
+        err_msg.contains("Corrupted")
+            || err_msg.contains("corrupted")
+            || err_msg.contains("CRC")
+            || err_msg.contains("crc"),
         "expected corruption/CRC error, got: {err_msg}"
     );
 
@@ -582,7 +603,9 @@ fn soft_delete_batch() {
     writer.finish().unwrap();
 
     let mut index = VectorIndex::open(&path).unwrap();
-    let deleted = index.soft_delete_batch(&["doc-1", "doc-3", "no-such-doc"]).unwrap();
+    let deleted = index
+        .soft_delete_batch(&["doc-1", "doc-3", "no-such-doc"])
+        .unwrap();
     assert_eq!(deleted, 2, "should delete 2 existing docs");
     assert_eq!(index.tombstone_count(), 2);
 
@@ -679,7 +702,10 @@ fn f16_and_f32_search_produce_same_ranking() {
     // Rankings should match (doc ids in same order).
     let ranking_f16: Vec<&str> = r16.iter().map(|h| h.doc_id.as_str()).collect();
     let ranking_f32: Vec<&str> = r32.iter().map(|h| h.doc_id.as_str()).collect();
-    assert_eq!(ranking_f16, ranking_f32, "f16 and f32 should produce the same ranking order");
+    assert_eq!(
+        ranking_f16, ranking_f32,
+        "f16 and f32 should produce the same ranking order"
+    );
 
     cleanup(&path_f16);
     cleanup(&path_f32);
