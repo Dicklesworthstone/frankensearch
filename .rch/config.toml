@@ -1,0 +1,28 @@
+# .rch/config.toml — Project-level RCH configuration for frankensearch
+#
+# This file is loaded by rch (Remote Compilation Helper) when building
+# within this workspace. See: rch config show --sources
+#
+# KNOWN ISSUE (bd-1pgv): rch workers fail to build frankensearch because
+# sibling path dependencies (asupersync, frankensqlite, fast_cmaes) are not
+# synced to the worker filesystem. Workers only sync the project directory
+# but Cargo.toml references paths outside it.
+#
+# WORKAROUND: Before offloading builds, agents should run:
+#   scripts/rch-ensure-deps.sh
+# on the worker (via rch exec) to clone sibling deps. Or use the compound
+# command pattern:
+#   rch exec -- bash -c 'cd /path/to/frankensearch && scripts/rch-ensure-deps.sh && cargo check --workspace'
+#
+# FUTURE FIX: When rch adds transfer.extra_sync_dirs support, uncomment:
+# [transfer]
+# extra_sync_dirs = [
+#   "../asupersync",
+#   "/data/projects/frankensqlite",
+#   "/data/projects/fast_cmaes",
+# ]
+
+[compilation]
+# frankensearch nightly Rust builds are heavy — use high confidence to avoid
+# intercepting non-compilation commands.
+confidence_threshold = 0.85
