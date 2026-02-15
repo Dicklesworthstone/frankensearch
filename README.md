@@ -191,7 +191,11 @@ Model path used in the default quality lane:
 | `frankensearch-lexical` | Tantivy schema/index/search for BM25 lexical retrieval |
 | `frankensearch-fusion` | RRF fusion, two-tier orchestration, blending, optional rerank integration |
 | `frankensearch-rerank` | Cross-encoder reranking integration |
+| `frankensearch-storage` | FrankenSQLite metadata persistence, dedup/content-hash tracking, embedding queue |
+| `frankensearch-durability` | Repair/protection primitives for index artifacts and segment health |
 | `crates/frankensearch-fsfs` | Standalone CLI product around the library stack |
+| `crates/frankensearch-tui` | Shared TUI shell/input/theme/replay framework used by fsfs/ops |
+| `crates/frankensearch-ops` | Fleet observability/control-plane TUI and telemetry materialization |
 
 This separation gives you two options:
 - use the top-level library as a drop-in engine in your own app
@@ -647,7 +651,12 @@ host-specific env var drift.
 | Query classification | [`crates/frankensearch-core/src/query_class.rs`](crates/frankensearch-core/src/query_class.rs) | Query-type detection and adaptive budgets |
 | Eval/statistics | [`crates/frankensearch-core/src/metrics_eval.rs`](crates/frankensearch-core/src/metrics_eval.rs) | nDCG/MRR/Recall/MAP + bootstrap helpers |
 | Embedder auto-detect | [`crates/frankensearch-embed/src/auto_detect.rs`](crates/frankensearch-embed/src/auto_detect.rs) | Fast/quality model discovery and stack setup |
+| Storage ingest/queue | [`crates/frankensearch-storage/src/pipeline.rs`](crates/frankensearch-storage/src/pipeline.rs) | Storage-backed ingestion, queue processing, embedding sinks |
+| Durability repair layer | [`crates/frankensearch-durability/src/fsvi_protector.rs`](crates/frankensearch-durability/src/fsvi_protector.rs) | Protect/verify/repair flows for vector artifacts |
 | FSFS CLI entry | [`crates/frankensearch-fsfs/src/lib.rs`](crates/frankensearch-fsfs/src/lib.rs) | Standalone CLI product wiring |
+| FSFS runtime orchestration | [`crates/frankensearch-fsfs/src/runtime.rs`](crates/frankensearch-fsfs/src/runtime.rs) | Command dispatch, search/index execution, stream emission |
+| Shared TUI shell | [`crates/frankensearch-tui/src/shell.rs`](crates/frankensearch-tui/src/shell.rs) | Reusable shell loop/navigation/overlay plumbing |
+| Ops telemetry storage | [`crates/frankensearch-ops/src/storage.rs`](crates/frankensearch-ops/src/storage.rs) | Control-plane telemetry persistence/materialization |
 
 ### Glossary
 

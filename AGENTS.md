@@ -180,6 +180,11 @@ cargo test -p frankensearch-index
 cargo test -p frankensearch-lexical
 cargo test -p frankensearch-fusion
 cargo test -p frankensearch-rerank
+cargo test -p frankensearch-storage
+cargo test -p frankensearch-durability
+cargo test -p frankensearch-fsfs
+cargo test -p frankensearch-tui
+cargo test -p frankensearch-ops
 
 # Run tests with all features enabled
 cargo test --workspace --all-features
@@ -195,6 +200,11 @@ cargo test --workspace --all-features
 | `frankensearch-lexical` | Tantivy schema creation, document indexing, BM25 query parsing, search result ranking |
 | `frankensearch-fusion` | RRF score calculation, 4-level tie-breaking, score normalization, two-tier blending, candidate budgeting |
 | `frankensearch-rerank` | Cross-encoder scoring, sigmoid activation, pipeline integration |
+| `frankensearch-storage` | SQLite schema bootstrap, dedup/content hashing, metadata persistence, embedding queue correctness |
+| `frankensearch-durability` | Repair trailer I/O, file protection/repair pipelines, codec verification paths |
+| `frankensearch-fsfs` | CLI config precedence, stream/output contracts, query execution pipeline, watcher lifecycle |
+| `frankensearch-tui` | Shared shell/keymap/theme/determinism primitives, replay/evidence contracts |
+| `frankensearch-ops` | Fleet telemetry ingestion/materialization, discovery logic, operations screens/state projection |
 | `tests/` (workspace) | Cross-component integration, full search pipeline end-to-end, progressive iterator contract |
 | `benches/` (workspace) | SIMD dot product throughput, top-k search scaling, embedding latency, RRF fusion overhead |
 
@@ -247,9 +257,15 @@ frankensearch/
 │   ├── frankensearch-embed/           # Embedder impls (hash, model2vec, fastembed)
 │   ├── frankensearch-index/           # FSVI vector index, SIMD dot product, top-k search
 │   ├── frankensearch-lexical/         # Tantivy BM25 integration
-│   ├── frankensearch-fusion/          # RRF, blending, TwoTierSearcher, query classification
-│   └── frankensearch-rerank/          # FlashRank cross-encoder
+│   ├── frankensearch-fusion/          # RRF, blending, TwoTierSearcher, telemetry/queue utilities
+│   ├── frankensearch-rerank/          # FlashRank cross-encoder
+│   ├── frankensearch-storage/         # FrankenSQLite metadata + job queue + optional FTS5
+│   ├── frankensearch-durability/      # Repair/protection layer for index artifacts
+│   ├── frankensearch-fsfs/            # Standalone CLI product
+│   ├── frankensearch-tui/             # Shared TUI framework primitives
+│   └── frankensearch-ops/             # Fleet observability/control-plane TUI
 ├── frankensearch/                     # Facade crate (re-exports everything)
+├── tools/optimize_params/             # Parameter search/optimization helper tool
 ├── tests/                             # Cross-component integration tests
 ├── benches/                           # Performance benchmarks
 └── examples/                          # Usage examples
@@ -270,8 +286,12 @@ frankensearch/
 | `frankensearch-lexical` | `src/lib.rs` | Tantivy schema, document indexing, BM25 query parsing |
 | `frankensearch-fusion` | `src/rrf.rs` | Reciprocal Rank Fusion (K=60), 4-level tie-breaking |
 | `frankensearch-fusion` | `src/blend.rs` | Two-tier score blending (0.7 quality / 0.3 fast) |
-| `frankensearch-fusion` | `src/two_tier_searcher.rs` | `TwoTierSearcher` progressive iterator orchestrator |
-| `frankensearch-fusion` | `src/query_class.rs` | Query classification (Empty/Identifier/Short/NL) + adaptive budgets |
+| `frankensearch-fusion` | `src/searcher.rs` | `TwoTierSearcher` progressive search orchestration and telemetry emission |
+| `frankensearch-storage` | `src/pipeline.rs` | Storage-backed ingest/job pipeline and embedding vector sink contracts |
+| `frankensearch-durability` | `src/fsvi_protector.rs` | FSVI protect/verify/repair flow for durability envelopes |
+| `frankensearch-fsfs` | `src/runtime.rs` | CLI command execution lanes, search/index orchestration, stream protocol wiring |
+| `frankensearch-tui` | `src/shell.rs` | Shared app-shell frame loop, navigation, overlays, and status plumbing |
+| `frankensearch-ops` | `src/storage.rs` | Ops telemetry storage/materialization and control-plane persistence |
 | `frankensearch-rerank` | `src/lib.rs` | FlashRank cross-encoder with sigmoid activation |
 
 ### Feature Flags
@@ -279,16 +299,22 @@ frankensearch/
 ```toml
 [features]
 default = ['hash']
-hash = []                                           # FNV-1a hash embedder (zero deps)
-model2vec = ['dep:safetensors', 'dep:tokenizers']   # potion-128M fast embedder
-fastembed = ['dep:fastembed']                        # MiniLM-L6-v2 quality embedder
-lexical = ['dep:tantivy']                           # Tantivy BM25 full-text search
-rerank = ['dep:ort', 'dep:tokenizers']              # FlashRank cross-encoder
-ann = ['dep:hnsw_rs']                               # HNSW approximate nearest neighbors
-download = ['asupersync/tls']                       # Model download via asupersync HTTP (NO reqwest/tokio)
-semantic = ['hash', 'model2vec', 'fastembed']        # All embedding models
-hybrid = ['semantic', 'lexical']                     # Semantic + lexical + RRF
-full = ['hybrid', 'rerank', 'ann', 'download']       # Everything
+hash = ['frankensearch-embed/hash']                              # FNV-1a hash embedder (zero deps)
+model2vec = ['frankensearch-embed/model2vec']                    # potion-128M fast embedder
+fastembed = ['frankensearch-embed/fastembed']                    # MiniLM-L6-v2 quality embedder
+lexical = ['dep:frankensearch-lexical', 'frankensearch-fusion/lexical']  # Tantivy BM25
+storage = ['dep:frankensearch-storage']                          # FrankenSQLite persistence
+durability = ['dep:frankensearch-durability']                    # Repair/protection layer
+fts5 = ['storage', 'frankensearch-storage/fts5']                 # FTS5 storage backend
+rerank = ['dep:frankensearch-rerank']                            # FlashRank cross-encoder
+ann = ['frankensearch-index/ann']                                # HNSW approximate nearest neighbors
+download = ['frankensearch-embed/download']                      # Model download via asupersync HTTP
+semantic = ['hash', 'model2vec', 'fastembed']                    # All embedding models
+hybrid = ['semantic', 'lexical']                                 # Semantic + lexical + RRF
+persistent = ['hybrid', 'storage']                               # Hybrid + durable metadata/index queues
+durable = ['persistent', 'durability']                           # Persistent + repair/protection
+full = ['durable', 'rerank', 'ann', 'download']                  # Everything except FTS5
+full-fts5 = ['full', 'fts5']                                     # Full stack + FTS5
 ```
 
 ### Core Types Quick Reference
