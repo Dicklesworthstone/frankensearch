@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{
-    SearchError, SearchResult, SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
-    TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
+    SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
+    TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
 };
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -426,13 +426,12 @@ const fn telemetry_event_kind(event: &TelemetryEvent) -> &'static str {
 }
 
 fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
-    let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| {
-        SearchError::InvalidConfig {
+    let parsed =
+        OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| SearchError::InvalidConfig {
             field: "telemetry_envelope.ts".to_owned(),
             value: timestamp.to_owned(),
             reason: format!("must be RFC3339 ({err})"),
-        }
-    })?;
+        })?;
     let millis = parsed.unix_timestamp_nanos() / 1_000_000;
     i64::try_from(millis).map_err(|_| SearchError::InvalidConfig {
         field: "telemetry_envelope.ts".to_owned(),
@@ -3302,7 +3301,12 @@ mod tests {
         SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
         evidence_link_id, ops_error,
     };
-    use frankensearch_core::SearchError;
+    use frankensearch_core::{
+        LifecycleSeverity, LifecycleState, SearchError,
+        SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
+        TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
+        TelemetryQueryClass, TelemetrySearchMetrics, TelemetrySearchQuery, TelemetrySearchResults,
+    };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
 
@@ -3461,6 +3465,47 @@ mod tests {
             memory_bytes: Some(8_192),
             ts_ms,
         }
+    }
+
+    fn sample_telemetry_instance() -> TelemetryInstance {
+        TelemetryInstance {
+            instance_id: "instance-a".to_owned(),
+            project_key: "project-a".to_owned(),
+            host_name: "host-a".to_owned(),
+            pid: Some(7),
+        }
+    }
+
+    fn sample_telemetry_correlation(event_id: &str) -> TelemetryCorrelation {
+        TelemetryCorrelation {
+            event_id: event_id.to_owned(),
+            root_request_id: "root-123".to_owned(),
+            parent_event_id: Some("parent-9".to_owned()),
+        }
+    }
+
+    fn sample_search_envelope(phase: TelemetrySearchEventPhase) -> TelemetryEnvelope {
+        TelemetryEnvelope::new(
+            "2026-02-15T17:00:00Z",
+            TelemetryEvent::Search {
+                instance: sample_telemetry_instance(),
+                correlation: sample_telemetry_correlation("event-telemetry-a"),
+                query: TelemetrySearchQuery {
+                    text: "hybrid search".to_owned(),
+                    class: TelemetryQueryClass::NaturalLanguage,
+                    phase,
+                },
+                results: TelemetrySearchResults {
+                    result_count: 7,
+                    lexical_count: 3,
+                    semantic_count: 4,
+                },
+                metrics: TelemetrySearchMetrics {
+                    latency_us: 1_200,
+                    memory_bytes: Some(8_192),
+                },
+            },
+        )
     }
 
     #[derive(Clone, Debug)]
@@ -5389,6 +5434,89 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: SearchEventRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn search_event_record_from_search_envelope_maps_fields() {
+        let envelope = sample_search_envelope(TelemetrySearchEventPhase::Refined);
+        let record = SearchEventRecord::from_search_envelope(&envelope)
+            .expect("search envelope should map to storage record");
+
+        assert_eq!(record.event_id, "event-telemetry-a");
+        assert_eq!(record.project_key, "project-a");
+        assert_eq!(record.instance_id, "instance-a");
+        assert_eq!(record.correlation_id, "root-123");
+        assert_eq!(record.query_hash, None);
+        assert_eq!(record.query_class.as_deref(), Some("natural_language"));
+        assert_eq!(record.phase, SearchEventPhase::Refined);
+        assert_eq!(record.latency_us, 1_200);
+        assert_eq!(record.result_count, Some(7));
+        assert_eq!(record.memory_bytes, Some(8_192));
+        assert_eq!(
+            record.ts_ms,
+            super::parse_rfc3339_timestamp_ms("2026-02-15T17:00:00Z")
+                .expect("timestamp should parse in test fixture")
+        );
+    }
+
+    #[test]
+    fn search_event_record_from_search_envelope_maps_refinement_failed_phase() {
+        let envelope = sample_search_envelope(TelemetrySearchEventPhase::RefinementFailed);
+        let record = SearchEventRecord::from_search_envelope(&envelope)
+            .expect("search envelope should map to storage record");
+        assert_eq!(record.phase, SearchEventPhase::Failed);
+    }
+
+    #[test]
+    fn search_event_record_from_search_envelope_rejects_non_search_event() {
+        let envelope = TelemetryEnvelope::new(
+            "2026-02-15T17:00:00Z",
+            TelemetryEvent::Lifecycle {
+                instance: sample_telemetry_instance(),
+                correlation: sample_telemetry_correlation("event-lifecycle-a"),
+                state: LifecycleState::Started,
+                severity: LifecycleSeverity::Info,
+                reason: None,
+                uptime_ms: Some(5),
+            },
+        );
+
+        let err = SearchEventRecord::from_search_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = err
+        else {
+            panic!("expected InvalidConfig for non-search event");
+        };
+        assert_eq!(field, "telemetry_envelope.event.type");
+        assert_eq!(value, "lifecycle");
+        assert!(reason.contains("event.type=search"));
+    }
+
+    #[test]
+    fn search_event_record_from_search_envelope_rejects_invalid_timestamp() {
+        let mut envelope = sample_search_envelope(TelemetrySearchEventPhase::Initial);
+        envelope.ts = "not-a-timestamp".to_owned();
+
+        let err = SearchEventRecord::from_search_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig { field, .. } = err else {
+            panic!("expected InvalidConfig for invalid RFC3339 timestamp");
+        };
+        assert_eq!(field, "telemetry_envelope.ts");
+    }
+
+    #[test]
+    fn search_event_record_from_search_envelope_rejects_schema_mismatch() {
+        let mut envelope = sample_search_envelope(TelemetrySearchEventPhase::Initial);
+        envelope.v = TELEMETRY_SCHEMA_VERSION.saturating_add(1);
+
+        let err = SearchEventRecord::from_search_envelope(&envelope).unwrap_err();
+        let SearchError::InvalidConfig { field, .. } = err else {
+            panic!("expected InvalidConfig for schema mismatch");
+        };
+        assert_eq!(field, "telemetry_envelope.v");
     }
 
     #[test]
