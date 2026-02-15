@@ -65,6 +65,59 @@ cargo test -p frankensearch-core contract_sanity::tests::classify_version_agains
 
 These tests validate two-host lockstep behavior and deterministic drift classification across simulated core version changes.
 
+## 4) Host Adapter E2E Lanes (deterministic scripts)
+
+Mandatory host lanes for `bd-2yu.5.9` live under `scripts/e2e/`:
+
+```bash
+scripts/e2e/telemetry_adapter_cass.sh --mode all
+scripts/e2e/telemetry_adapter_xf.sh --mode all
+scripts/e2e/telemetry_adapter_agent_mail.sh --mode all
+```
+
+Fast contract smoke path (no remote compile, deterministic artifact emission):
+
+```bash
+scripts/e2e/telemetry_adapter_cass.sh --mode unit --dry-run
+scripts/e2e/telemetry_adapter_xf.sh --mode unit --dry-run
+scripts/e2e/telemetry_adapter_agent_mail.sh --mode unit --dry-run
+```
+
+Dry/mock verification (no external host repository dependency):
+
+```bash
+scripts/e2e/telemetry_adapter_cass.sh --mode all --dry-run
+scripts/e2e/telemetry_adapter_xf.sh --mode all --dry-run
+scripts/e2e/telemetry_adapter_agent_mail.sh --mode all --dry-run
+```
+
+Contract for each lane:
+
+- uses `rch exec -- ...` for every cargo-heavy command
+- accepts `--execution live|dry` (`--dry-run` is an alias of `--execution dry`)
+- emits deterministic artifacts under:
+  - `test_logs/telemetry_adapters/<host>-<mode>-<timestamp>/`
+  - `structured_events.jsonl` (schema: `telemetry-adapter-e2e-event-v1`)
+  - `terminal_transcript.txt`
+  - `replay_command.txt`
+  - `summary.json`
+  - `summary.md`
+  - `manifest.json` (schema: `telemetry-adapter-e2e-manifest-v1`)
+- guarantees summary/manifest emission on both success and failure via exit-trap finalization
+- includes machine-stable `reason_code` values in event lines and lane summaries
+- includes host-specific migration check command against:
+  - `/data/projects/coding_agent_session_search`
+  - `/data/projects/xf`
+  - `/data/projects/mcp_agent_mail_rust`
+
+Artifact interpretation quick map:
+
+- `structured_events.jsonl`: canonical stage timeline and status transitions (`started`, `ok`, `fail`, `skipped_dry_run`).
+- `terminal_transcript.txt`: full command transcript with reproducible command headers.
+- `replay_command.txt`: deterministic replay command for rerunning the exact lane.
+- `summary.md` / `summary.json`: human + machine lane summary including `status`, `reason_code`, and `execution_mode`.
+- `manifest.json`: run envelope with artifact inventory and stable metadata for downstream tooling.
+
 ## Reason Codes and Replay Commands
 
 Primary reason codes:
