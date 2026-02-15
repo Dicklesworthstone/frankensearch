@@ -3402,4 +3402,1371 @@ mod tests {
                 .contains(&"FRANKENSEARCH_FAST_ONLY".to_string())
         );
     }
+
+    // ─── bd-12af tests begin ───
+
+    // ── Enum defaults ──
+
+    #[test]
+    fn text_selection_mode_default_is_blocklist() {
+        assert_eq!(
+            super::TextSelectionMode::default(),
+            super::TextSelectionMode::Blocklist
+        );
+    }
+
+    #[test]
+    fn pressure_profile_default_is_performance() {
+        assert_eq!(
+            super::PressureProfile::default(),
+            super::PressureProfile::Performance
+        );
+    }
+
+    #[test]
+    fn degradation_override_mode_default_is_auto() {
+        assert_eq!(
+            super::DegradationOverrideMode::default(),
+            super::DegradationOverrideMode::Auto
+        );
+    }
+
+    #[test]
+    fn tui_theme_default_is_dark() {
+        assert_eq!(super::TuiTheme::default(), super::TuiTheme::Dark);
+    }
+
+    #[test]
+    fn density_default_is_normal() {
+        assert_eq!(super::Density::default(), super::Density::Normal);
+    }
+
+    // ── FromStr implementations ──
+
+    #[test]
+    fn pressure_profile_from_str_all_variants() {
+        use std::str::FromStr;
+        assert_eq!(
+            super::PressureProfile::from_str("strict").unwrap(),
+            super::PressureProfile::Strict
+        );
+        assert_eq!(
+            super::PressureProfile::from_str("performance").unwrap(),
+            super::PressureProfile::Performance
+        );
+        assert_eq!(
+            super::PressureProfile::from_str("degraded").unwrap(),
+            super::PressureProfile::Degraded
+        );
+    }
+
+    #[test]
+    fn pressure_profile_from_str_invalid() {
+        use std::str::FromStr;
+        assert!(super::PressureProfile::from_str("STRICT").is_err());
+        assert!(super::PressureProfile::from_str("unknown").is_err());
+        assert!(super::PressureProfile::from_str("").is_err());
+    }
+
+    #[test]
+    fn degradation_override_mode_from_str_all_aliases() {
+        use std::str::FromStr;
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("auto").unwrap(),
+            super::DegradationOverrideMode::Auto
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("full").unwrap(),
+            super::DegradationOverrideMode::ForceFull
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("force_full").unwrap(),
+            super::DegradationOverrideMode::ForceFull
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("embed_deferred").unwrap(),
+            super::DegradationOverrideMode::ForceEmbedDeferred
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("force_embed_deferred").unwrap(),
+            super::DegradationOverrideMode::ForceEmbedDeferred
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("lexical_only").unwrap(),
+            super::DegradationOverrideMode::ForceLexicalOnly
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("force_lexical_only").unwrap(),
+            super::DegradationOverrideMode::ForceLexicalOnly
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("metadata_only").unwrap(),
+            super::DegradationOverrideMode::ForceMetadataOnly
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("force_metadata_only").unwrap(),
+            super::DegradationOverrideMode::ForceMetadataOnly
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("paused").unwrap(),
+            super::DegradationOverrideMode::ForcePaused
+        );
+        assert_eq!(
+            super::DegradationOverrideMode::from_str("force_paused").unwrap(),
+            super::DegradationOverrideMode::ForcePaused
+        );
+    }
+
+    #[test]
+    fn degradation_override_mode_from_str_invalid() {
+        use std::str::FromStr;
+        assert!(super::DegradationOverrideMode::from_str("AUTO").is_err());
+        assert!(super::DegradationOverrideMode::from_str("").is_err());
+        assert!(super::DegradationOverrideMode::from_str("force").is_err());
+    }
+
+    #[test]
+    fn tui_theme_from_str_all_variants() {
+        use std::str::FromStr;
+        assert_eq!(
+            super::TuiTheme::from_str("auto").unwrap(),
+            super::TuiTheme::Auto
+        );
+        assert_eq!(
+            super::TuiTheme::from_str("light").unwrap(),
+            super::TuiTheme::Light
+        );
+        assert_eq!(
+            super::TuiTheme::from_str("dark").unwrap(),
+            super::TuiTheme::Dark
+        );
+    }
+
+    #[test]
+    fn tui_theme_from_str_invalid() {
+        use std::str::FromStr;
+        assert!(super::TuiTheme::from_str("DARK").is_err());
+        assert!(super::TuiTheme::from_str("").is_err());
+    }
+
+    // ── Serde roundtrips ──
+
+    #[test]
+    fn text_selection_mode_serde_roundtrip() {
+        for mode in [
+            super::TextSelectionMode::Blocklist,
+            super::TextSelectionMode::Allowlist,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: super::TextSelectionMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn pressure_profile_serde_roundtrip() {
+        for profile in [
+            super::PressureProfile::Strict,
+            super::PressureProfile::Performance,
+            super::PressureProfile::Degraded,
+        ] {
+            let json = serde_json::to_string(&profile).unwrap();
+            let back: super::PressureProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(profile, back);
+        }
+    }
+
+    #[test]
+    fn degradation_override_mode_serde_roundtrip() {
+        for mode in [
+            super::DegradationOverrideMode::Auto,
+            super::DegradationOverrideMode::ForceFull,
+            super::DegradationOverrideMode::ForceEmbedDeferred,
+            super::DegradationOverrideMode::ForceLexicalOnly,
+            super::DegradationOverrideMode::ForceMetadataOnly,
+            super::DegradationOverrideMode::ForcePaused,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: super::DegradationOverrideMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn tui_theme_serde_roundtrip() {
+        for theme in [
+            super::TuiTheme::Auto,
+            super::TuiTheme::Light,
+            super::TuiTheme::Dark,
+        ] {
+            let json = serde_json::to_string(&theme).unwrap();
+            let back: super::TuiTheme = serde_json::from_str(&json).unwrap();
+            assert_eq!(theme, back);
+        }
+    }
+
+    #[test]
+    fn density_serde_roundtrip() {
+        for density in [
+            super::Density::Compact,
+            super::Density::Normal,
+            super::Density::Expanded,
+        ] {
+            let json = serde_json::to_string(&density).unwrap();
+            let back: super::Density = serde_json::from_str(&json).unwrap();
+            assert_eq!(density, back);
+        }
+    }
+
+    #[test]
+    fn ingestion_class_serde_roundtrip() {
+        for class in [
+            IngestionClass::FullSemanticLexical,
+            IngestionClass::LexicalOnly,
+            IngestionClass::MetadataOnly,
+            IngestionClass::Skip,
+        ] {
+            let json = serde_json::to_string(&class).unwrap();
+            let back: IngestionClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(class, back);
+        }
+    }
+
+    #[test]
+    fn config_source_serde_roundtrip() {
+        for source in [
+            super::ConfigSource::Cli,
+            super::ConfigSource::Env,
+            super::ConfigSource::File,
+            super::ConfigSource::Defaults,
+            super::ConfigSource::Runtime,
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            let back: super::ConfigSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(source, back);
+        }
+    }
+
+    #[test]
+    fn profile_scheduler_mode_serde_roundtrip() {
+        for mode in [
+            super::ProfileSchedulerMode::FairShare,
+            super::ProfileSchedulerMode::LatencySensitive,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: super::ProfileSchedulerMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn pressure_profile_field_serde_roundtrip() {
+        for field in [
+            PressureProfileField::SchedulerMode,
+            PressureProfileField::MaxEmbedConcurrency,
+            PressureProfileField::MaxIndexConcurrency,
+            PressureProfileField::QualityEnabled,
+            PressureProfileField::AllowBackgroundIndexing,
+        ] {
+            let json = serde_json::to_string(&field).unwrap();
+            let back: PressureProfileField = serde_json::from_str(&json).unwrap();
+            assert_eq!(field, back);
+        }
+    }
+
+    #[test]
+    fn profile_override_source_serde_roundtrip() {
+        for source in [
+            ProfileOverrideSource::Cli,
+            ProfileOverrideSource::Env,
+            ProfileOverrideSource::Config,
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            let back: ProfileOverrideSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(source, back);
+        }
+    }
+
+    #[test]
+    fn discovery_scope_decision_serde_roundtrip() {
+        for scope in [
+            DiscoveryScopeDecision::Include,
+            DiscoveryScopeDecision::Exclude,
+        ] {
+            let json = serde_json::to_string(&scope).unwrap();
+            let back: DiscoveryScopeDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(scope, back);
+        }
+    }
+
+    // ── IngestionClass::is_indexed ──
+
+    #[test]
+    fn ingestion_class_is_indexed_all_variants() {
+        assert!(IngestionClass::FullSemanticLexical.is_indexed());
+        assert!(IngestionClass::LexicalOnly.is_indexed());
+        assert!(IngestionClass::MetadataOnly.is_indexed());
+        assert!(!IngestionClass::Skip.is_indexed());
+    }
+
+    // ── PressureProfileContract values per profile ──
+
+    #[test]
+    fn strict_contract_values() {
+        let contract = super::PressureProfile::Strict.contract();
+        assert_eq!(
+            contract.scheduler_mode,
+            super::ProfileSchedulerMode::FairShare
+        );
+        assert_eq!(contract.max_embed_concurrency, 2);
+        assert_eq!(contract.max_index_concurrency, 2);
+        assert!(!contract.quality_enabled);
+        assert!(!contract.allow_background_indexing);
+        assert_eq!(contract.pressure_enter_threshold_per_mille, 350);
+        assert_eq!(contract.pressure_exit_threshold_per_mille, 200);
+    }
+
+    #[test]
+    fn performance_contract_values() {
+        let contract = super::PressureProfile::Performance.contract();
+        assert_eq!(
+            contract.scheduler_mode,
+            super::ProfileSchedulerMode::LatencySensitive
+        );
+        assert_eq!(contract.max_embed_concurrency, 6);
+        assert_eq!(contract.max_index_concurrency, 8);
+        assert!(contract.quality_enabled);
+        assert!(contract.allow_background_indexing);
+        assert_eq!(contract.pressure_enter_threshold_per_mille, 650);
+        assert_eq!(contract.pressure_exit_threshold_per_mille, 450);
+    }
+
+    #[test]
+    fn degraded_contract_values() {
+        let contract = super::PressureProfile::Degraded.contract();
+        assert_eq!(
+            contract.scheduler_mode,
+            super::ProfileSchedulerMode::FairShare
+        );
+        assert_eq!(contract.max_embed_concurrency, 1);
+        assert_eq!(contract.max_index_concurrency, 1);
+        assert!(!contract.quality_enabled);
+        assert!(!contract.allow_background_indexing);
+        assert_eq!(contract.pressure_enter_threshold_per_mille, 150);
+        assert_eq!(contract.pressure_exit_threshold_per_mille, 100);
+    }
+
+    #[test]
+    fn strict_contract_locked_fields() {
+        let contract = super::PressureProfile::Strict.contract();
+        assert!(contract.is_locked_field(PressureProfileField::QualityEnabled));
+        assert!(contract.is_locked_field(PressureProfileField::AllowBackgroundIndexing));
+        assert!(contract.is_locked_field(PressureProfileField::MaxEmbedConcurrency));
+        assert!(!contract.is_locked_field(PressureProfileField::SchedulerMode));
+        assert!(!contract.is_locked_field(PressureProfileField::MaxIndexConcurrency));
+    }
+
+    #[test]
+    fn performance_contract_locked_fields() {
+        let contract = super::PressureProfile::Performance.contract();
+        assert!(contract.is_locked_field(PressureProfileField::QualityEnabled));
+        assert!(!contract.is_locked_field(PressureProfileField::AllowBackgroundIndexing));
+        assert!(!contract.is_locked_field(PressureProfileField::MaxEmbedConcurrency));
+        assert!(!contract.is_locked_field(PressureProfileField::SchedulerMode));
+        assert!(!contract.is_locked_field(PressureProfileField::MaxIndexConcurrency));
+    }
+
+    #[test]
+    fn degraded_contract_locks_all_fields() {
+        let contract = super::PressureProfile::Degraded.contract();
+        assert!(contract.is_locked_field(PressureProfileField::QualityEnabled));
+        assert!(contract.is_locked_field(PressureProfileField::AllowBackgroundIndexing));
+        assert!(contract.is_locked_field(PressureProfileField::MaxEmbedConcurrency));
+        assert!(contract.is_locked_field(PressureProfileField::SchedulerMode));
+        assert!(contract.is_locked_field(PressureProfileField::MaxIndexConcurrency));
+    }
+
+    #[test]
+    fn to_effective_settings_preserves_contract() {
+        let contract = super::PressureProfile::Performance.contract();
+        let effective = contract.to_effective_settings();
+        assert_eq!(effective.scheduler_mode, contract.scheduler_mode);
+        assert_eq!(
+            effective.max_embed_concurrency,
+            contract.max_embed_concurrency
+        );
+        assert_eq!(
+            effective.max_index_concurrency,
+            contract.max_index_concurrency
+        );
+        assert_eq!(effective.quality_enabled, contract.quality_enabled);
+        assert_eq!(
+            effective.allow_background_indexing,
+            contract.allow_background_indexing
+        );
+        assert_eq!(
+            effective.pressure_enter_threshold_per_mille,
+            contract.pressure_enter_threshold_per_mille
+        );
+        assert_eq!(
+            effective.pressure_exit_threshold_per_mille,
+            contract.pressure_exit_threshold_per_mille
+        );
+    }
+
+    // ── Helper functions ──
+
+    #[test]
+    fn wildcard_match_star_middle() {
+        assert!(super::wildcard_match("src/main.rs", "src/*.rs"));
+    }
+
+    #[test]
+    fn wildcard_match_star_prefix() {
+        assert!(super::wildcard_match("foo/bar.js", "*.js"));
+    }
+
+    #[test]
+    fn wildcard_match_star_suffix() {
+        assert!(super::wildcard_match("readme.md", "readme*"));
+    }
+
+    #[test]
+    fn wildcard_match_no_star() {
+        assert!(super::wildcard_match("exact", "exact"));
+        assert!(!super::wildcard_match("exact", "notexact"));
+    }
+
+    #[test]
+    fn wildcard_match_empty_pattern() {
+        assert!(super::wildcard_match("", ""));
+        // Empty pattern splits to [""], all parts are empty and skipped,
+        // so ends_with check passes vacuously.
+        assert!(super::wildcard_match("notempty", ""));
+    }
+
+    #[test]
+    fn wildcard_match_double_star() {
+        assert!(super::wildcard_match("a/b/c/d.rs", "a/**/d.rs"));
+    }
+
+    #[test]
+    fn wildcard_match_trailing_requires_match() {
+        assert!(!super::wildcard_match("foo.js.bak", "*.js"));
+    }
+
+    #[test]
+    fn path_matches_pattern_simple_component() {
+        let components = super::normalized_components(Path::new("/src/node_modules/pkg/index.js"));
+        assert!(super::path_matches_pattern(
+            "node_modules",
+            "src/node_modules/pkg/index.js",
+            &components,
+        ));
+    }
+
+    #[test]
+    fn path_matches_pattern_slash_segment() {
+        let components = super::normalized_components(Path::new("/vendor/lib/foo.go"));
+        assert!(super::path_matches_pattern(
+            "vendor/lib",
+            "vendor/lib/foo.go",
+            &components,
+        ));
+    }
+
+    #[test]
+    fn path_matches_pattern_wildcard() {
+        let components = super::normalized_components(Path::new("/src/main.rs"));
+        assert!(super::path_matches_pattern(
+            "*.rs",
+            "src/main.rs",
+            &components,
+        ));
+    }
+
+    #[test]
+    fn path_matches_pattern_empty_trimmed() {
+        let components = super::normalized_components(Path::new("/src/main.rs"));
+        assert!(!super::path_matches_pattern(
+            "//",
+            "src/main.rs",
+            &components
+        ));
+    }
+
+    #[test]
+    fn normalize_path_backslashes_and_case() {
+        assert_eq!(
+            super::normalize_path(Path::new("SRC\\Main.RS")),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn normalized_components_filters_non_normal() {
+        let components = super::normalized_components(Path::new("/foo/bar/baz.txt"));
+        assert!(components.contains(&"foo".to_string()));
+        assert!(components.contains(&"bar".to_string()));
+        assert!(components.contains(&"baz.txt".to_string()));
+    }
+
+    #[test]
+    fn lower_extension_returns_lowercase() {
+        assert_eq!(
+            super::lower_extension(Path::new("foo.RS")),
+            Some("rs".to_string())
+        );
+    }
+
+    #[test]
+    fn lower_extension_returns_none_for_no_ext() {
+        assert_eq!(super::lower_extension(Path::new("Makefile")), None);
+    }
+
+    #[test]
+    fn lower_filename_returns_lowercase() {
+        assert_eq!(
+            super::lower_filename(Path::new("/src/Main.rs")),
+            Some("main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn has_low_utility_component_detects() {
+        assert!(super::has_low_utility_component(Path::new(
+            "/project/node_modules/pkg/index.js"
+        )));
+        assert!(super::has_low_utility_component(Path::new(
+            "/project/.cache/data"
+        )));
+    }
+
+    #[test]
+    fn has_low_utility_component_clean_path() {
+        assert!(!super::has_low_utility_component(Path::new(
+            "/project/src/main.rs"
+        )));
+    }
+
+    #[test]
+    fn is_low_value_extension_all_variants() {
+        assert!(super::is_low_value_extension("log"));
+        assert!(super::is_low_value_extension("tmp"));
+        assert!(super::is_low_value_extension("bak"));
+        assert!(super::is_low_value_extension("old"));
+        assert!(super::is_low_value_extension("map"));
+        assert!(!super::is_low_value_extension("rs"));
+        assert!(!super::is_low_value_extension("js"));
+    }
+
+    #[test]
+    fn is_generated_or_minified_all_patterns() {
+        assert!(super::is_generated_or_minified_filename("app.min.js"));
+        assert!(super::is_generated_or_minified_filename("vendor.bundle.js"));
+        assert!(super::is_generated_or_minified_filename(
+            "schema.generated.rs"
+        ));
+        assert!(super::is_generated_or_minified_filename(
+            "types.generated.ts"
+        ));
+        assert!(!super::is_generated_or_minified_filename("main.rs"));
+        assert!(!super::is_generated_or_minified_filename("app.js"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        assert_eq!(
+            super::expand_tilde("~", Path::new("/home/user")),
+            Some("/home/user".to_string())
+        );
+    }
+
+    #[test]
+    fn expand_tilde_with_subpath() {
+        let result = super::expand_tilde("~/docs/readme.md", Path::new("/home/user"));
+        assert_eq!(result, Some("/home/user/docs/readme.md".to_string()));
+    }
+
+    #[test]
+    fn expand_tilde_no_tilde() {
+        assert_eq!(
+            super::expand_tilde("/absolute/path", Path::new("/home/user")),
+            None
+        );
+        assert_eq!(
+            super::expand_tilde("relative/path", Path::new("/home/user")),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_reason_codes_dedup_and_sort() {
+        let mut codes = vec![
+            "b.code".to_string(),
+            "a.code".to_string(),
+            "b.code".to_string(),
+        ];
+        super::normalize_reason_codes(&mut codes);
+        assert_eq!(codes, vec!["a.code", "b.code"]);
+    }
+
+    // ── Parse helper functions ──
+
+    #[test]
+    fn parse_usize_valid() {
+        assert_eq!(super::parse_usize("42", "test").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_usize_invalid() {
+        assert!(super::parse_usize("abc", "test").is_err());
+        assert!(super::parse_usize("-1", "test").is_err());
+    }
+
+    #[test]
+    fn parse_u64_valid() {
+        assert_eq!(
+            super::parse_u64("18446744073709551615", "test").unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn parse_u64_invalid() {
+        assert!(super::parse_u64("xyz", "test").is_err());
+    }
+
+    #[test]
+    fn parse_u16_valid() {
+        assert_eq!(super::parse_u16("65535", "test").unwrap(), u16::MAX);
+    }
+
+    #[test]
+    fn parse_u16_invalid() {
+        assert!(super::parse_u16("70000", "test").is_err());
+    }
+
+    #[test]
+    fn parse_u8_valid() {
+        assert_eq!(super::parse_u8("255", "test").unwrap(), u8::MAX);
+    }
+
+    #[test]
+    fn parse_u8_invalid() {
+        assert!(super::parse_u8("300", "test").is_err());
+    }
+
+    #[test]
+    fn parse_f64_valid() {
+        assert!((super::parse_f64("2.5", "test").unwrap() - 2.5_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_f64_invalid() {
+        assert!(super::parse_f64("not_a_number", "test").is_err());
+    }
+
+    #[test]
+    fn parse_csv_empty_value_rejected() {
+        assert!(parse_csv("", "test").is_err());
+        assert!(parse_csv("   , ,  ", "test").is_err());
+    }
+
+    // ── Config sub-struct defaults ──
+
+    #[test]
+    fn fsfs_config_default_has_all_sub_defaults() {
+        let config = super::FsfsConfig::default();
+        assert_eq!(config.discovery.roots, vec![".".to_string()]);
+        assert_eq!(config.indexing.fast_model, "potion-multilingual-128M");
+        assert_eq!(config.search.default_limit, 10);
+        assert_eq!(config.pressure.profile, super::PressureProfile::Performance);
+        assert_eq!(config.tui.theme, super::TuiTheme::Dark);
+        assert_eq!(config.storage.index_dir, ".frankensearch");
+        assert!(config.privacy.redact_file_contents_in_logs);
+    }
+
+    #[test]
+    fn indexing_config_default_values() {
+        let cfg = super::IndexingConfig::default();
+        assert_eq!(cfg.fast_model, "potion-multilingual-128M");
+        assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2");
+        assert_eq!(cfg.embedding_batch_size, 64);
+        assert!(cfg.reindex_on_change);
+        assert!(!cfg.watch_mode);
+    }
+
+    #[test]
+    fn search_config_default_values() {
+        let cfg = super::SearchConfig::default();
+        assert_eq!(cfg.default_limit, 10);
+        assert!((cfg.quality_weight - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.rrf_k - 60.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.quality_timeout_ms, 500);
+        assert!(!cfg.fast_only);
+        assert!(!cfg.explain);
+    }
+
+    #[test]
+    fn pressure_config_default_values() {
+        let cfg = super::PressureConfig::default();
+        assert_eq!(cfg.cpu_ceiling_pct, 80);
+        assert_eq!(cfg.memory_ceiling_mb, 2048);
+        assert_eq!(cfg.sample_interval_ms, 2_000);
+        assert_eq!(cfg.ewma_alpha_per_mille, 300);
+        assert_eq!(cfg.anti_flap_readings, 3);
+        assert_eq!(cfg.io_ceiling_bytes_per_sec, 100 * 1024 * 1024);
+        assert_eq!(cfg.load_ceiling_per_mille, 3_000);
+        assert_eq!(
+            cfg.degradation_override,
+            super::DegradationOverrideMode::Auto
+        );
+        assert!(!cfg.hard_pause_requested);
+        assert!(!cfg.quality_circuit_open);
+    }
+
+    #[test]
+    fn tui_config_default_values() {
+        let cfg = super::TuiConfig::default();
+        assert_eq!(cfg.frame_budget_ms, 16);
+        assert!(cfg.show_explanations);
+        assert_eq!(cfg.density, super::Density::Normal);
+    }
+
+    #[test]
+    fn storage_config_default_values() {
+        let cfg = super::StorageConfig::default();
+        assert_eq!(cfg.index_dir, ".frankensearch");
+        assert_eq!(cfg.db_path, "~/.local/share/fsfs/fsfs.db");
+        assert_eq!(cfg.evidence_retention_days, 7);
+        assert_eq!(cfg.summary_retention_days, 90);
+    }
+
+    #[test]
+    fn privacy_config_default_values() {
+        let cfg = super::PrivacyConfig::default();
+        assert!(cfg.redact_file_contents_in_logs);
+        assert!(cfg.redact_paths_in_telemetry);
+    }
+
+    #[test]
+    fn discovery_config_default_values() {
+        let cfg = super::DiscoveryConfig::default();
+        assert_eq!(cfg.roots, vec![".".to_string()]);
+        assert!(!cfg.exclude_patterns.is_empty());
+        assert!(cfg.exclude_patterns.contains(&".git".to_string()));
+        assert!(cfg.exclude_patterns.contains(&"node_modules".to_string()));
+        assert!(cfg.exclude_patterns.contains(&"target".to_string()));
+        assert_eq!(cfg.text_selection_mode, super::TextSelectionMode::Blocklist);
+        assert!(!cfg.binary_blocklist_extensions.is_empty());
+        assert!(
+            cfg.binary_blocklist_extensions
+                .contains(&".exe".to_string())
+        );
+        assert_eq!(cfg.max_file_size_mb, 10);
+        assert!(!cfg.follow_symlinks);
+        assert!(cfg.mount_overrides.is_empty());
+        assert!(!cfg.skip_network_mounts);
+    }
+
+    // ── CliOverrides::used_flags ──
+
+    #[test]
+    fn cli_overrides_used_flags_empty() {
+        let cli = CliOverrides::default();
+        assert!(cli.used_flags().is_empty());
+    }
+
+    #[test]
+    fn cli_overrides_used_flags_all_set() {
+        let cli = CliOverrides {
+            roots: Some(vec!["src".into()]),
+            exclude_patterns: Some(vec!["target".into()]),
+            limit: Some(20),
+            fast_only: Some(true),
+            allow_background_indexing: Some(false),
+            explain: Some(true),
+            profile: Some(super::PressureProfile::Strict),
+            degradation_override: Some(super::DegradationOverrideMode::ForcePaused),
+            hard_pause_requested: Some(true),
+            quality_circuit_open: Some(false),
+            theme: Some(super::TuiTheme::Light),
+            config_path: Some(Path::new("/tmp/config.toml").to_path_buf()),
+        };
+        let flags = cli.used_flags();
+        assert_eq!(flags.len(), 12);
+        assert!(flags.contains(&"--roots".to_string()));
+        assert!(flags.contains(&"--exclude".to_string()));
+        assert!(flags.contains(&"--limit".to_string()));
+        assert!(flags.contains(&"--fast-only".to_string()));
+        assert!(flags.contains(&"--watch-mode".to_string()));
+        assert!(flags.contains(&"--explain".to_string()));
+        assert!(flags.contains(&"--profile".to_string()));
+        assert!(flags.contains(&"--degradation-override".to_string()));
+        assert!(flags.contains(&"--hard-pause".to_string()));
+        assert!(flags.contains(&"--quality-circuit-open".to_string()));
+        assert!(flags.contains(&"--theme".to_string()));
+        assert!(flags.contains(&"--config".to_string()));
+    }
+
+    // ── DiscoveryCandidate builders ──
+
+    #[test]
+    fn discovery_candidate_new_defaults() {
+        let candidate = DiscoveryCandidate::new(Path::new("/foo.rs"), 1024);
+        assert_eq!(candidate.byte_len, 1024);
+        assert!(!candidate.is_symlink);
+        assert!(candidate.mount_category.is_none());
+    }
+
+    #[test]
+    fn discovery_candidate_with_symlink() {
+        let candidate = DiscoveryCandidate::new(Path::new("/foo.rs"), 100).with_symlink(true);
+        assert!(candidate.is_symlink);
+    }
+
+    #[test]
+    fn discovery_candidate_with_mount_category() {
+        let candidate = DiscoveryCandidate::new(Path::new("/foo.rs"), 100)
+            .with_mount_category(crate::mount_info::FsCategory::Nfs);
+        assert_eq!(
+            candidate.mount_category,
+            Some(crate::mount_info::FsCategory::Nfs)
+        );
+    }
+
+    // ── RootDiscoveryDecision ──
+
+    #[test]
+    fn root_discovery_decision_include_method() {
+        let included = super::RootDiscoveryDecision {
+            scope: DiscoveryScopeDecision::Include,
+            reason_codes: vec![],
+        };
+        assert!(included.include());
+
+        let excluded = super::RootDiscoveryDecision {
+            scope: DiscoveryScopeDecision::Exclude,
+            reason_codes: vec![],
+        };
+        assert!(!excluded.include());
+    }
+
+    // ── Discovery evaluate_root ──
+
+    #[test]
+    fn evaluate_root_empty_path_rejected() {
+        let config = super::DiscoveryConfig::default();
+        let decision = config.evaluate_root(Path::new(""), None);
+        assert!(!decision.include());
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"discovery.root.rejected".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_root_virtual_mount_rejected() {
+        let config = super::DiscoveryConfig::default();
+        let decision = config.evaluate_root(
+            Path::new("/proc"),
+            Some(crate::mount_info::FsCategory::Virtual),
+        );
+        assert!(!decision.include());
+    }
+
+    #[test]
+    fn evaluate_root_excluded_pattern_rejected() {
+        let config = super::DiscoveryConfig::default();
+        let decision = config.evaluate_root(Path::new("/project/node_modules"), None);
+        assert!(!decision.include());
+    }
+
+    #[test]
+    fn evaluate_root_normal_accepted() {
+        let config = super::DiscoveryConfig::default();
+        let decision = config.evaluate_root(Path::new("/home/user/src"), None);
+        assert!(decision.include());
+    }
+
+    // ── Discovery evaluate_candidate edge cases ──
+
+    #[test]
+    fn evaluate_candidate_empty_path_excluded() {
+        let config = super::DiscoveryConfig::default();
+        let candidate = DiscoveryCandidate::new(Path::new(""), 100);
+        let decision = config.evaluate_candidate(&candidate);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.utility_score, i32::MIN);
+    }
+
+    #[test]
+    fn evaluate_candidate_virtual_mount_excluded() {
+        let config = super::DiscoveryConfig::default();
+        let candidate = DiscoveryCandidate::new(Path::new("/proc/cpuinfo"), 100)
+            .with_mount_category(crate::mount_info::FsCategory::Virtual);
+        let decision = config.evaluate_candidate(&candidate);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+    }
+
+    #[test]
+    fn evaluate_candidate_symlink_excluded_when_not_following() {
+        let config = super::DiscoveryConfig::default();
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/user/link.rs"), 100).with_symlink(true);
+        let decision = config.evaluate_candidate(&candidate);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+    }
+
+    #[test]
+    fn evaluate_candidate_extremely_large_file_excluded() {
+        let config = super::DiscoveryConfig::default();
+        let max = config.max_file_size_mb as u64 * 1024 * 1024;
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/user/huge.rs"), max.saturating_mul(4) + 1);
+        let decision = config.evaluate_candidate(&candidate);
+        assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+        assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+    }
+
+    #[test]
+    fn evaluate_candidate_high_signal_filename_boosts_score() {
+        let config = super::DiscoveryConfig::default();
+        let candidate = DiscoveryCandidate::new(Path::new("/home/user/project/Cargo.toml"), 512);
+        let decision = config.evaluate_candidate(&candidate);
+        assert!(decision.utility_score >= 70);
+        assert_eq!(
+            decision.ingestion_class,
+            IngestionClass::FullSemanticLexical
+        );
+    }
+
+    #[test]
+    fn evaluate_candidate_low_utility_filename_reduces_score() {
+        let config = super::DiscoveryConfig::default();
+        let candidate =
+            DiscoveryCandidate::new(Path::new("/home/user/project/package-lock.json"), 4096);
+        let decision = config.evaluate_candidate(&candidate);
+        // Base 50 + 30 (high ext json) - 20 (low utility filename) = 60 < 70
+        assert!(decision.utility_score < 70);
+    }
+
+    #[test]
+    fn evaluate_candidate_network_mount_reduces_score() {
+        let config = super::DiscoveryConfig::default();
+        let candidate = DiscoveryCandidate::new(Path::new("/mnt/nfs/src/main.rs"), 1024)
+            .with_mount_category(crate::mount_info::FsCategory::Nfs);
+        let decision = config.evaluate_candidate(&candidate);
+        // 50 + 30 (high ext) - 10 (network) = 70
+        assert!(decision.utility_score <= 70);
+    }
+
+    // ── MountPolicyEntry ──
+
+    #[test]
+    fn mount_policy_entry_to_mount_override() {
+        let entry = super::MountPolicyEntry {
+            mount_point: "/mnt/nfs".into(),
+            category: Some(crate::mount_info::FsCategory::Nfs),
+            enabled: Some(true),
+            change_detection: None,
+            stat_timeout_ms: Some(5000),
+            max_concurrent_io: Some(4),
+            poll_interval_secs: Some(30),
+        };
+        let mount_override = entry.to_mount_override();
+        assert_eq!(
+            mount_override.category,
+            Some(crate::mount_info::FsCategory::Nfs)
+        );
+        assert_eq!(mount_override.enabled, Some(true));
+        assert_eq!(mount_override.stat_timeout_ms, Some(5000));
+        assert_eq!(mount_override.max_concurrent_io, Some(4));
+        assert_eq!(mount_override.poll_interval_secs, Some(30));
+    }
+
+    #[test]
+    fn mount_override_map_builds_correctly() {
+        let config = super::DiscoveryConfig {
+            mount_overrides: vec![
+                super::MountPolicyEntry {
+                    mount_point: "/mnt/a".into(),
+                    category: None,
+                    enabled: Some(false),
+                    change_detection: None,
+                    stat_timeout_ms: None,
+                    max_concurrent_io: None,
+                    poll_interval_secs: None,
+                },
+                super::MountPolicyEntry {
+                    mount_point: "/mnt/b".into(),
+                    category: None,
+                    enabled: Some(true),
+                    change_detection: None,
+                    stat_timeout_ms: None,
+                    max_concurrent_io: None,
+                    poll_interval_secs: None,
+                },
+            ],
+            ..super::DiscoveryConfig::default()
+        };
+        let map = config.mount_override_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["/mnt/a"].enabled, Some(false));
+        assert_eq!(map["/mnt/b"].enabled, Some(true));
+    }
+
+    // ── Helper function labels ──
+
+    #[test]
+    fn override_source_label_all_variants() {
+        assert_eq!(
+            super::override_source_label(ProfileOverrideSource::Cli),
+            "cli"
+        );
+        assert_eq!(
+            super::override_source_label(ProfileOverrideSource::Env),
+            "env"
+        );
+        assert_eq!(
+            super::override_source_label(ProfileOverrideSource::Config),
+            "config"
+        );
+    }
+
+    #[test]
+    fn config_source_for_override_all_variants() {
+        assert_eq!(
+            super::config_source_for_override(ProfileOverrideSource::Cli),
+            super::ConfigSource::Cli
+        );
+        assert_eq!(
+            super::config_source_for_override(ProfileOverrideSource::Env),
+            super::ConfigSource::Env
+        );
+        assert_eq!(
+            super::config_source_for_override(ProfileOverrideSource::Config),
+            super::ConfigSource::File
+        );
+    }
+
+    #[test]
+    fn profile_field_path_all_variants() {
+        assert_eq!(
+            super::profile_field_path(PressureProfileField::SchedulerMode),
+            "pressure.profile.scheduler_mode"
+        );
+        assert_eq!(
+            super::profile_field_path(PressureProfileField::MaxEmbedConcurrency),
+            "pressure.profile.max_embed_concurrency"
+        );
+        assert_eq!(
+            super::profile_field_path(PressureProfileField::MaxIndexConcurrency),
+            "pressure.profile.max_index_concurrency"
+        );
+        assert_eq!(
+            super::profile_field_path(PressureProfileField::QualityEnabled),
+            "pressure.profile.quality_enabled"
+        );
+        assert_eq!(
+            super::profile_field_path(PressureProfileField::AllowBackgroundIndexing),
+            "pressure.profile.allow_background_indexing"
+        );
+    }
+
+    // ── Validation boundary tests ──
+
+    #[test]
+    fn validate_quality_weight_above_one_rejected() {
+        assert_invalid_field("[search]\nquality_weight = 1.1\n", "search.quality_weight");
+    }
+
+    #[test]
+    fn validate_quality_weight_negative_rejected() {
+        assert_invalid_field("[search]\nquality_weight = -0.1\n", "search.quality_weight");
+    }
+
+    #[test]
+    fn validate_rrf_k_nan_rejected() {
+        assert_invalid_field("[search]\nrrf_k = nan\n", "search.rrf_k");
+    }
+
+    #[test]
+    fn validate_empty_index_dir_rejected() {
+        assert_invalid_field("[storage]\nindex_dir = \"  \"\n", "storage.index_dir");
+    }
+
+    #[test]
+    fn validate_cpu_ceiling_pct_101_rejected() {
+        assert_invalid_field(
+            "[pressure]\ncpu_ceiling_pct = 101\n",
+            "pressure.cpu_ceiling_pct",
+        );
+    }
+
+    #[test]
+    fn validate_anti_flap_readings_33_rejected() {
+        assert_invalid_field(
+            "[pressure]\nanti_flap_readings = 33\n",
+            "pressure.anti_flap_readings",
+        );
+    }
+
+    #[test]
+    fn validate_ewma_alpha_1001_rejected() {
+        assert_invalid_field(
+            "[pressure]\newma_alpha_per_mille = 1001\n",
+            "pressure.ewma_alpha_per_mille",
+        );
+    }
+
+    #[test]
+    fn validate_frame_budget_ms_201_rejected() {
+        assert_invalid_field("[tui]\nframe_budget_ms = 201\n", "tui.frame_budget_ms");
+    }
+
+    #[test]
+    fn validate_evidence_retention_3651_rejected() {
+        // summary_retention_days defaults to 90, which is < 3651,
+        // so the summary < evidence check fires first.
+        assert_invalid_field(
+            "[storage]\nevidence_retention_days = 3651\nsummary_retention_days = 3651\n",
+            "storage.evidence_retention_days",
+        );
+    }
+
+    #[test]
+    fn validate_summary_retention_3651_rejected() {
+        assert_invalid_field(
+            "[storage]\nsummary_retention_days = 3651\n",
+            "storage.summary_retention_days",
+        );
+    }
+
+    #[test]
+    fn validate_max_file_size_mb_1025_rejected() {
+        assert_invalid_field(
+            "[discovery]\nmax_file_size_mb = 1025\n",
+            "discovery.max_file_size_mb",
+        );
+    }
+
+    #[test]
+    fn validate_embedding_batch_size_4097_rejected() {
+        assert_invalid_field(
+            "[indexing]\nembedding_batch_size = 4097\n",
+            "indexing.embedding_batch_size",
+        );
+    }
+
+    #[test]
+    fn validate_default_limit_201_rejected() {
+        assert_invalid_field("[search]\ndefault_limit = 201\n", "search.default_limit");
+    }
+
+    // ── ConfigLoadResult::to_loaded_event ──
+
+    #[test]
+    fn to_loaded_event_collects_reason_codes() {
+        let result = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load defaults");
+        let event = result.to_loaded_event();
+        assert_eq!(event.event, "config_loaded");
+        assert!(!event.reason_codes.is_empty());
+        // reason_codes should be sorted and deduped
+        let mut sorted = event.reason_codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(event.reason_codes, sorted);
+    }
+
+    // ── Unknown section warning ──
+
+    #[test]
+    fn unknown_section_produces_warning() {
+        let file = "[fantasy]\nfoo = 42\n";
+        let result = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load config");
+        assert!(result.warnings.iter().any(|w| {
+            w.reason_code == "config.unknown_key.warning" && w.field == "config.fantasy"
+        }));
+    }
+
+    // ── expand_home_prefix ──
+
+    #[test]
+    fn expand_home_prefix_tilde() {
+        let expanded =
+            super::expand_home_prefix(Path::new("~/docs/readme.md"), Path::new("/home/user"));
+        assert_eq!(expanded, Path::new("/home/user/docs/readme.md"));
+    }
+
+    #[test]
+    fn expand_home_prefix_no_tilde() {
+        let expanded =
+            super::expand_home_prefix(Path::new("/absolute/path"), Path::new("/home/user"));
+        assert_eq!(expanded, Path::new("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_home_prefix_relative_no_tilde() {
+        let expanded =
+            super::expand_home_prefix(Path::new("relative/path"), Path::new("/home/user"));
+        assert_eq!(expanded, Path::new("relative/path"));
+    }
+
+    // ── Constants sanity checks ──
+
+    #[test]
+    fn pressure_profile_version_is_nonzero() {
+        assert_ne!(PRESSURE_PROFILE_VERSION, 0);
+    }
+
+    #[test]
+    fn profile_precedence_chain_length() {
+        assert_eq!(super::PROFILE_PRECEDENCE_CHAIN.len(), 5);
+    }
+
+    // ── Env override integration ──
+
+    #[test]
+    fn env_override_pressure_settings() {
+        let env = HashMap::from([
+            (
+                "FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS".into(),
+                "500".into(),
+            ),
+            (
+                "FRANKENSEARCH_PRESSURE_EWMA_ALPHA_PER_MILLE".into(),
+                "200".into(),
+            ),
+            (
+                "FRANKENSEARCH_PRESSURE_ANTI_FLAP_READINGS".into(),
+                "5".into(),
+            ),
+            (
+                "FRANKENSEARCH_PRESSURE_IO_CEILING_BYTES_PER_SEC".into(),
+                "52428800".into(),
+            ),
+            (
+                "FRANKENSEARCH_PRESSURE_LOAD_CEILING_PER_MILLE".into(),
+                "2000".into(),
+            ),
+        ]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(result.config.pressure.sample_interval_ms, 500);
+        assert_eq!(result.config.pressure.ewma_alpha_per_mille, 200);
+        assert_eq!(result.config.pressure.anti_flap_readings, 5);
+        assert_eq!(result.config.pressure.io_ceiling_bytes_per_sec, 52_428_800);
+        assert_eq!(result.config.pressure.load_ceiling_per_mille, 2000);
+    }
+
+    #[test]
+    fn env_override_degradation_override() {
+        let env = HashMap::from([(
+            "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE".into(),
+            "force_paused".into(),
+        )]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(
+            result.config.pressure.degradation_override,
+            super::DegradationOverrideMode::ForcePaused
+        );
+    }
+
+    #[test]
+    fn env_override_tui_theme() {
+        let env = HashMap::from([("FRANKENSEARCH_TUI_THEME".into(), "light".into())]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(result.config.tui.theme, super::TuiTheme::Light);
+    }
+
+    #[test]
+    fn env_override_privacy_redact() {
+        let env = HashMap::from([(
+            "FRANKENSEARCH_PRIVACY_REDACT_PATHS_IN_TELEMETRY".into(),
+            "false".into(),
+        )]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert!(!result.config.privacy.redact_paths_in_telemetry);
+    }
+
+    #[test]
+    fn env_override_storage_db_path() {
+        let env = HashMap::from([(
+            "FRANKENSEARCH_STORAGE_DB_PATH".into(),
+            "/tmp/custom.db".into(),
+        )]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(result.config.storage.db_path, "/tmp/custom.db");
+    }
+
+    #[test]
+    fn env_override_search_explain() {
+        let env = HashMap::from([("FRANKENSEARCH_SEARCH_EXPLAIN".into(), "true".into())]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert!(result.config.search.explain);
+    }
+
+    #[test]
+    fn env_override_discovery_roots() {
+        let env = HashMap::from([(
+            "FRANKENSEARCH_DISCOVERY_ROOTS".into(),
+            "src, lib, tests".into(),
+        )]);
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load");
+        assert_eq!(result.config.discovery.roots, vec!["src", "lib", "tests"]);
+    }
+
+    #[test]
+    fn env_override_invalid_degradation_override_rejected() {
+        let env = HashMap::from([(
+            "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE".into(),
+            "bogus".into(),
+        )]);
+        let err = load_from_str(None, None, &env, &CliOverrides::default(), home())
+            .expect_err("should reject invalid degradation override");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn env_override_invalid_tui_theme_rejected() {
+        let env = HashMap::from([("FRANKENSEARCH_TUI_THEME".into(), "neon".into())]);
+        let err = load_from_str(None, None, &env, &CliOverrides::default(), home())
+            .expect_err("should reject invalid tui theme");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn env_override_invalid_pressure_profile_rejected() {
+        let env = HashMap::from([("FRANKENSEARCH_PRESSURE_PROFILE".into(), "turbo".into())]);
+        let err = load_from_str(None, None, &env, &CliOverrides::default(), home())
+            .expect_err("should reject invalid pressure profile");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    // ─── bd-12af tests end ───
 }

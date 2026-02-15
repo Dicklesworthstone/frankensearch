@@ -1732,4 +1732,771 @@ mod tests {
         assert_eq!(selected_reason.as_deref(), Some("lifecycle.heartbeat_gap"));
         assert_eq!(selected_host.as_deref(), Some("host-b"));
     }
+
+    // ─── bd-3q2p tests begin ───
+
+    // ── EventSeverity ──
+
+    #[test]
+    fn event_severity_label_all_variants() {
+        assert_eq!(EventSeverity::Info.label(), "info");
+        assert_eq!(EventSeverity::Warn.label(), "warn");
+        assert_eq!(EventSeverity::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn event_severity_color_all_variants() {
+        assert_eq!(EventSeverity::Info.color(), Color::Gray);
+        assert_eq!(EventSeverity::Warn.color(), Color::Yellow);
+        assert_eq!(EventSeverity::Critical.color(), Color::Red);
+    }
+
+    #[test]
+    fn event_severity_rank_ordering() {
+        assert_eq!(EventSeverity::Info.rank(), 0);
+        assert_eq!(EventSeverity::Warn.rank(), 1);
+        assert_eq!(EventSeverity::Critical.rank(), 2);
+        assert!(EventSeverity::Critical.rank() > EventSeverity::Warn.rank());
+        assert!(EventSeverity::Warn.rank() > EventSeverity::Info.rank());
+    }
+
+    // ── SnapshotExportMode ──
+
+    #[test]
+    fn snapshot_export_mode_from_compact() {
+        assert_eq!(
+            SnapshotExportMode::from_compact(true),
+            SnapshotExportMode::Compact
+        );
+        assert_eq!(
+            SnapshotExportMode::from_compact(false),
+            SnapshotExportMode::Full
+        );
+    }
+
+    // ── host_bucket ──
+
+    #[test]
+    fn host_bucket_colon_separator() {
+        assert_eq!(
+            HistoricalAnalyticsScreen::host_bucket("host-a:alpha-1"),
+            "host-a"
+        );
+    }
+
+    #[test]
+    fn host_bucket_dash_separator() {
+        assert_eq!(
+            HistoricalAnalyticsScreen::host_bucket("hostonly-inst42"),
+            "hostonly"
+        );
+    }
+
+    #[test]
+    fn host_bucket_no_separator() {
+        assert_eq!(
+            HistoricalAnalyticsScreen::host_bucket("singlesegment"),
+            "singlesegment"
+        );
+    }
+
+    #[test]
+    fn host_bucket_colon_takes_priority_over_dash() {
+        assert_eq!(HistoricalAnalyticsScreen::host_bucket("a-b:c-d"), "a-b");
+    }
+
+    // ── event_severity classification ──
+
+    #[test]
+    fn event_severity_stopped_is_critical() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stopped,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 80,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn event_severity_degraded_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Degraded,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 60,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_recovering_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Degraded,
+            to: LifecycleState::Recovering,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 50,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_stale_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stale,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 40,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_collision_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 90,
+            attribution_collision: true,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Warn
+        );
+    }
+
+    #[test]
+    fn event_severity_healthy_no_collision_is_info() {
+        let event = LifecycleEvent {
+            instance_id: "x:y".into(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".into(),
+            at_ms: 1,
+            attribution_confidence_score: 95,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::event_severity(&event),
+            EventSeverity::Info
+        );
+    }
+
+    // ── percentile ──
+
+    #[test]
+    fn percentile_empty_returns_zero() {
+        assert_eq!(HistoricalAnalyticsScreen::percentile(&[], 50), 0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        assert_eq!(HistoricalAnalyticsScreen::percentile(&[42], 0), 42);
+        assert_eq!(HistoricalAnalyticsScreen::percentile(&[42], 50), 42);
+        assert_eq!(HistoricalAnalyticsScreen::percentile(&[42], 100), 42);
+    }
+
+    #[test]
+    fn percentile_sorted_input() {
+        let values = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let p0 = HistoricalAnalyticsScreen::percentile(&values, 0);
+        let p50 = HistoricalAnalyticsScreen::percentile(&values, 50);
+        let p95 = HistoricalAnalyticsScreen::percentile(&values, 95);
+        let p100 = HistoricalAnalyticsScreen::percentile(&values, 100);
+        assert_eq!(p0, 10);
+        assert!(p50 >= 50 && p50 <= 60);
+        assert!(p95 >= 90);
+        assert_eq!(p100, 100);
+    }
+
+    #[test]
+    fn percentile_unsorted_input() {
+        let values = [50, 10, 90, 30, 70];
+        let p50 = HistoricalAnalyticsScreen::percentile(&values, 50);
+        assert_eq!(p50, 50);
+    }
+
+    #[test]
+    fn percentile_pct_clamped_above_100() {
+        let values = [1, 2, 3];
+        let p200 = HistoricalAnalyticsScreen::percentile(&values, 200);
+        assert_eq!(p200, 3);
+    }
+
+    // ── window_scale ──
+
+    #[test]
+    fn window_scale_all_variants() {
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::OneMinute),
+            (100, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::FifteenMinutes),
+            (95, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::OneHour),
+            (90, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::SixHours),
+            (85, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::TwentyFourHours),
+            (80, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::ThreeDays),
+            (75, 100)
+        );
+        assert_eq!(
+            HistoricalAnalyticsScreen::window_scale(TimeWindow::OneWeek),
+            (70, 100)
+        );
+    }
+
+    #[test]
+    fn window_scale_monotonically_decreases() {
+        let windows = TimeWindow::ALL;
+        for pair in windows.windows(2) {
+            let (a_num, _) = HistoricalAnalyticsScreen::window_scale(pair[0]);
+            let (b_num, _) = HistoricalAnalyticsScreen::window_scale(pair[1]);
+            assert!(
+                a_num >= b_num,
+                "window_scale should decrease: {:?}={a_num} >= {:?}={b_num}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    // ── normalize_replay_handle ──
+
+    #[test]
+    fn normalize_replay_handle_empty_produces_fallback() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 90,
+            replay_handle: "".into(),
+        };
+        let normalized = HistoricalAnalyticsScreen::normalize_replay_handle(&row);
+        assert!(normalized.starts_with("replay://"));
+        assert!(normalized.contains("proj"));
+        assert!(normalized.contains("h1:inst"));
+    }
+
+    #[test]
+    fn normalize_replay_handle_preserves_replay_prefix() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 90,
+            replay_handle: "replay://proj/h1/inst/100".into(),
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::normalize_replay_handle(&row),
+            "replay://proj/h1/inst/100"
+        );
+    }
+
+    #[test]
+    fn normalize_replay_handle_preserves_file_prefix() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 90,
+            replay_handle: "file:///tmp/replay.json".into(),
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::normalize_replay_handle(&row),
+            "file:///tmp/replay.json"
+        );
+    }
+
+    #[test]
+    fn normalize_replay_handle_preserves_arbitrary_uri() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 90,
+            replay_handle: "s3://bucket/key".into(),
+        };
+        assert_eq!(
+            HistoricalAnalyticsScreen::normalize_replay_handle(&row),
+            "s3://bucket/key"
+        );
+    }
+
+    #[test]
+    fn normalize_replay_handle_wraps_legacy() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 90,
+            replay_handle: "legacy-token".into(),
+        };
+        let normalized = HistoricalAnalyticsScreen::normalize_replay_handle(&row);
+        assert!(normalized.starts_with("replay://legacy/"));
+        assert!(normalized.ends_with("/legacy-token"));
+    }
+
+    // ── fallback_replay_handle ──
+
+    #[test]
+    fn fallback_replay_handle_format() {
+        let row = EvidenceRow {
+            ts_ms: 42,
+            project: "myproj".into(),
+            host: "h1".into(),
+            instance_id: "h1:abc".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test".into(),
+            confidence: 50,
+            replay_handle: "".into(),
+        };
+        let fallback = HistoricalAnalyticsScreen::fallback_replay_handle(&row);
+        assert_eq!(fallback, "replay://myproj/h1/h1:abc/42");
+    }
+
+    // ── correlation_summary_line ──
+
+    #[test]
+    fn correlation_summary_line_empty() {
+        let line = HistoricalAnalyticsScreen::correlation_summary_line(&[]);
+        assert_eq!(line, "correlation: no rows");
+    }
+
+    #[test]
+    fn correlation_summary_line_with_data() {
+        let rows = vec![CorrelationRow {
+            reason_code: "lifecycle.crash".into(),
+            project_span: 3,
+            event_count: 10,
+            critical_count: 4,
+            avg_confidence: 80,
+            stream_correlation: 92,
+        }];
+        let line = HistoricalAnalyticsScreen::correlation_summary_line(&rows);
+        assert!(line.contains("lifecycle.crash"));
+        assert!(line.contains("score=92"));
+        assert!(line.contains("critical=4"));
+        assert!(line.contains("span=3"));
+    }
+
+    // ── Default impl ──
+
+    #[test]
+    fn default_impl_matches_new() {
+        let from_new = HistoricalAnalyticsScreen::new();
+        let from_default = HistoricalAnalyticsScreen::default();
+        assert_eq!(from_new.id(), from_default.id());
+        assert_eq!(from_new.title(), from_default.title());
+        assert_eq!(from_new.semantic_role(), from_default.semantic_role());
+        assert_eq!(from_new.evidence_count(), from_default.evidence_count());
+    }
+
+    // ── active_*_filter ──
+
+    #[test]
+    fn active_project_filter_none_when_all() {
+        let screen = HistoricalAnalyticsScreen::new();
+        assert_eq!(screen.active_project_filter(), None);
+    }
+
+    #[test]
+    fn active_reason_filter_none_when_all() {
+        let screen = HistoricalAnalyticsScreen::new();
+        assert_eq!(screen.active_reason_filter(), None);
+    }
+
+    #[test]
+    fn active_host_filter_none_when_all() {
+        let screen = HistoricalAnalyticsScreen::new();
+        assert_eq!(screen.active_host_filter(), None);
+    }
+
+    #[test]
+    fn active_project_filter_some_when_filtered() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("alpha");
+        assert_eq!(screen.active_project_filter().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn active_reason_filter_some_when_filtered() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_reason_filter("lifecycle.heartbeat_gap");
+        assert_eq!(
+            screen.active_reason_filter().as_deref(),
+            Some("lifecycle.heartbeat_gap")
+        );
+    }
+
+    #[test]
+    fn active_host_filter_some_when_filtered() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_host_filter("host-b");
+        assert_eq!(screen.active_host_filter().as_deref(), Some("host-b"));
+    }
+
+    // ── set_*_filter falls back to all when unknown ──
+
+    #[test]
+    fn set_project_filter_unknown_falls_back_to_all() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("nonexistent");
+        assert_eq!(screen.active_project_filter(), None);
+    }
+
+    #[test]
+    fn set_reason_filter_unknown_falls_back_to_all() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_reason_filter("nonexistent");
+        assert_eq!(screen.active_reason_filter(), None);
+    }
+
+    #[test]
+    fn set_host_filter_unknown_falls_back_to_all() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_host_filter("nonexistent");
+        assert_eq!(screen.active_host_filter(), None);
+    }
+
+    // ── Selection navigation ──
+
+    #[test]
+    fn nav_up_at_zero_stays_at_zero() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+        let up = InputEvent::Key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn nav_down_increments_selection() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+        let down = InputEvent::Key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+    }
+
+    #[test]
+    fn nav_k_moves_up() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 2;
+        let ctx = context();
+        let k = InputEvent::Key(
+            crossterm::event::KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&k, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+    }
+
+    #[test]
+    fn nav_j_moves_down() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+        let j = InputEvent::Key(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&j, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, 1);
+    }
+
+    #[test]
+    fn nav_down_clamps_at_last_row() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+        let count = screen.evidence_count();
+        screen.selected_row = count.saturating_sub(1);
+        let down = InputEvent::Key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_row, count.saturating_sub(1));
+    }
+
+    #[test]
+    fn unrecognized_key_returns_ignored() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        let ctx = context();
+        let f12 = InputEvent::Key(
+            crossterm::event::KeyCode::F(12),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&f12, &ctx), ScreenAction::Ignored);
+    }
+
+    // ── Evidence sorting ──
+
+    #[test]
+    fn evidence_rows_sorted_severity_then_timestamp() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let rows = screen.filtered_evidence_rows();
+        assert!(rows.len() >= 3);
+        // Critical should come first, then Warn, then Info
+        assert_eq!(rows[0].severity, EventSeverity::Critical);
+        assert_eq!(rows[1].severity, EventSeverity::Warn);
+        assert_eq!(rows[2].severity, EventSeverity::Info);
+    }
+
+    // ── Correlation rows ──
+
+    #[test]
+    fn correlation_rows_aggregate_correctly() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let rows = screen.correlation_rows();
+        // We have 3 events with 3 distinct reason codes
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert!(row.event_count >= 1);
+            assert!(row.avg_confidence > 0);
+            assert!(row.stream_correlation <= 100);
+        }
+    }
+
+    #[test]
+    fn correlation_rows_empty_state() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&AppState::new());
+        let rows = screen.correlation_rows();
+        assert!(rows.is_empty());
+    }
+
+    // ── filter_summary ──
+
+    #[test]
+    fn filter_summary_contains_default_labels() {
+        let screen = HistoricalAnalyticsScreen::new();
+        let summary = screen.filter_summary();
+        assert!(summary.contains("project=all"));
+        assert!(summary.contains("reason=all"));
+        assert!(summary.contains("host=all"));
+    }
+
+    #[test]
+    fn filter_summary_reflects_active_filter() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        screen.set_project_filter("alpha");
+        let summary = screen.filter_summary();
+        assert!(summary.contains("project=alpha"));
+    }
+
+    // ── evidence_count ──
+
+    #[test]
+    fn evidence_count_empty() {
+        let screen = HistoricalAnalyticsScreen::new();
+        assert_eq!(screen.evidence_count(), 0);
+    }
+
+    #[test]
+    fn evidence_count_with_data() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        assert_eq!(screen.evidence_count(), 3);
+    }
+
+    // ── SnapshotExportPayload from_row ──
+
+    #[test]
+    fn snapshot_export_payload_from_row_compact() {
+        let row = EvidenceRow {
+            ts_ms: 100,
+            project: "proj".into(),
+            host: "h1".into(),
+            instance_id: "h1:inst".into(),
+            severity: EventSeverity::Info,
+            reason_code: "test.reason".into(),
+            confidence: 80,
+            replay_handle: "replay://proj/h1/h1:inst/100".into(),
+        };
+        let payload = SnapshotExportPayload::from_row(&row, true);
+        assert_eq!(payload.mode, SnapshotExportMode::Compact);
+        assert_eq!(payload.project, "proj");
+        assert_eq!(payload.instance_id, "h1:inst");
+        assert_eq!(payload.ts_ms, 100);
+        assert_eq!(payload.confidence, 80);
+    }
+
+    #[test]
+    fn snapshot_export_payload_from_row_full() {
+        let row = EvidenceRow {
+            ts_ms: 200,
+            project: "proj".into(),
+            host: "h2".into(),
+            instance_id: "h2:inst".into(),
+            severity: EventSeverity::Warn,
+            reason_code: "test.warn".into(),
+            confidence: 60,
+            replay_handle: "replay://proj/h2/h2:inst/200".into(),
+        };
+        let payload = SnapshotExportPayload::from_row(&row, false);
+        assert_eq!(payload.mode, SnapshotExportMode::Full);
+        assert_eq!(payload.reason_code, "test.warn");
+        assert_eq!(payload.host, "h2");
+    }
+
+    // ── Enter key navigates to project drilldown ──
+
+    #[test]
+    fn enter_key_navigates_to_project() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+        let enter = InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let action = screen.handle_input(&enter, &ctx);
+        assert!(matches!(action, ScreenAction::Navigate(_)));
+    }
+
+    // ── selected_project with valid data ──
+
+    #[test]
+    fn selected_project_returns_project_name() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let project = screen.selected_project();
+        assert!(project.is_some());
+    }
+
+    #[test]
+    fn selected_project_empty_state_is_none() {
+        let screen = HistoricalAnalyticsScreen::new();
+        assert!(screen.selected_project().is_none());
+    }
+
+    // ── set_*_screen_id ──
+
+    #[test]
+    fn set_screen_ids_affect_navigation() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.set_project_screen_id(ScreenId::new("custom.project"));
+        screen.set_live_stream_screen_id(ScreenId::new("custom.stream"));
+        screen.set_timeline_screen_id(ScreenId::new("custom.timeline"));
+        screen.update_state(&sample_state());
+        let ctx = context();
+
+        let l = InputEvent::Key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&l, &ctx),
+            ScreenAction::Navigate(ScreenId::new("custom.stream"))
+        );
+
+        let t = InputEvent::Key(
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.handle_input(&t, &ctx),
+            ScreenAction::Navigate(ScreenId::new("custom.timeline"))
+        );
+    }
+
+    // ── trend_window_summary ──
+
+    #[test]
+    fn trend_window_summary_contains_all_labels() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let summary = screen.trend_window_summary();
+        assert!(summary.starts_with("trends:"));
+        assert!(summary.contains("p95="));
+        assert!(summary.contains("mem95="));
+    }
+
+    // ── as_any ──
+
+    #[test]
+    fn as_any_downcast_works() {
+        let screen = HistoricalAnalyticsScreen::new();
+        let any_ref: &dyn Any = screen.as_any();
+        assert!(
+            any_ref
+                .downcast_ref::<HistoricalAnalyticsScreen>()
+                .is_some()
+        );
+    }
+
+    // ─── bd-3q2p tests end ───
 }

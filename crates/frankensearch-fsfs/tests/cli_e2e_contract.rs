@@ -5,8 +5,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::{
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPRO_LOCK,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, ExitStatus,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, ExitStatus,
 };
 use frankensearch_fsfs::{
     CLI_E2E_SCHEMA_VERSION, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenarioKind,
@@ -20,6 +20,29 @@ fn scenario_by_kind(kind: CliE2eScenarioKind) -> frankensearch_fsfs::CliE2eScena
         .into_iter()
         .find(|scenario| scenario.kind == kind)
         .expect("scenario should exist")
+}
+
+fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL),
+        "manifest must list structured events artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON),
+        "manifest must list artifacts index artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_ENV_JSON),
+        "manifest must list env metadata artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK),
+        "manifest must list reproducibility lock artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT),
+        "manifest must list replay command artifact"
+    );
 }
 
 #[test]
@@ -82,7 +105,7 @@ fn scenario_cli_degrade_path() {
             .body
             .artifacts
             .iter()
-            .any(|artifact| artifact.file == "replay_command.txt")
+            .any(|artifact| artifact.file == E2E_ARTIFACT_REPLAY_COMMAND_TXT)
     );
     assert!(
         bundle
@@ -106,22 +129,7 @@ fn scenario_cli_manifest_lists_required_artifacts() {
         .map(|artifact| artifact.file.as_str())
         .collect::<Vec<_>>();
 
-    assert!(
-        artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL),
-        "manifest must list structured events artifact"
-    );
-    assert!(
-        artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON),
-        "manifest must list artifacts index artifact"
-    );
-    assert!(
-        artifact_files.contains(&E2E_ARTIFACT_ENV_JSON),
-        "manifest must list env metadata artifact"
-    );
-    assert!(
-        artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK),
-        "manifest must list reproducibility lock artifact"
-    );
+    assert_manifest_contains_required_artifacts(&artifact_files);
 }
 
 #[test]
@@ -131,6 +139,21 @@ fn default_bundle_set_covers_all_cli_flows() {
     for bundle in bundles {
         bundle.validate().expect("bundle must validate");
         assert_eq!(bundle.schema_version, CLI_E2E_SCHEMA_VERSION);
+    }
+}
+
+#[test]
+fn default_bundle_set_manifests_list_required_artifacts() {
+    let bundles = build_default_cli_e2e_bundles(&CliE2eRunConfig::default());
+    for bundle in bundles {
+        let artifact_files = bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.file.as_str())
+            .collect::<Vec<_>>();
+        assert_manifest_contains_required_artifacts(&artifact_files);
     }
 }
 

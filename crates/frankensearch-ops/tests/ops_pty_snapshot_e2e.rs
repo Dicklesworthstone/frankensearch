@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankensearch_core::{
-    build_artifact_entries, normalize_replay_command, render_artifacts_index, sha256_checksum,
-    validate_event_envelope, validate_manifest_envelope, ArtifactEmissionInput, ArtifactEntry,
-    ClockMode, Correlation, DeterminismTier, DiffEntry, E2eEnvelope, E2eEventType, E2eOutcome,
-    E2eSeverity, EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody,
-    ReplayEventType, SnapshotDiffBody, Suite, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
-    E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT, E2E_SCHEMA_EVENT,
-    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2E_SCHEMA_SNAPSHOT_DIFF,
+    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier, DiffEntry,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+    E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
+    E2E_SCHEMA_SNAPSHOT_DIFF, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody,
+    ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
+    SnapshotDiffBody, Suite, build_artifact_entries, normalize_replay_command,
+    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
 };
 use frankensearch_ops::data_source::TimeWindow;
 use frankensearch_ops::state::{FleetSnapshot, ResourceMetrics, SearchMetrics};
@@ -18,8 +18,8 @@ use frankensearch_ops::{
     OpsApp, ViewPreset,
 };
 use frankensearch_tui::{InputEvent, ReplayPlayer, ReplayRecorder};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use serde::{Deserialize, Serialize};
 
 const OPS_RUN_ID: &str = "01HQXG5M7P3KZFV9N2RSTW6YAB";

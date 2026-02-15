@@ -4715,6 +4715,827 @@ mod tests {
         assert_eq!(actual_link_id, &expected_link_id);
     }
 
+    // ─── bd-3tjs tests begin ───
+
+    // --- OpsStorageConfig ---
+
+    #[test]
+    fn ops_storage_config_default_values() {
+        let cfg = super::OpsStorageConfig::default();
+        assert_eq!(
+            cfg.db_path,
+            std::path::PathBuf::from("frankensearch-ops.db")
+        );
+        assert!(cfg.wal_mode);
+        assert_eq!(cfg.busy_timeout_ms, 5_000);
+        assert_eq!(cfg.cache_size_pages, 2_000);
+    }
+
+    #[test]
+    fn ops_storage_config_in_memory() {
+        let cfg = super::OpsStorageConfig::in_memory();
+        assert_eq!(cfg.db_path, std::path::PathBuf::from(":memory:"));
+        assert!(cfg.wal_mode);
+    }
+
+    #[test]
+    fn ops_storage_config_serde_roundtrip() {
+        let cfg = super::OpsStorageConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: super::OpsStorageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    // --- SearchEventPhase ---
+
+    #[test]
+    fn search_event_phase_as_str_all_variants() {
+        assert_eq!(SearchEventPhase::Initial.as_str(), "initial");
+        assert_eq!(SearchEventPhase::Refined.as_str(), "refined");
+        assert_eq!(SearchEventPhase::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn search_event_phase_serde_roundtrip() {
+        for phase in [
+            SearchEventPhase::Initial,
+            SearchEventPhase::Refined,
+            SearchEventPhase::Failed,
+        ] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let back: SearchEventPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    // --- SummaryWindow ---
+
+    #[test]
+    fn summary_window_as_label_all_variants() {
+        assert_eq!(SummaryWindow::OneMinute.as_label(), "1m");
+        assert_eq!(SummaryWindow::FifteenMinutes.as_label(), "15m");
+        assert_eq!(SummaryWindow::OneHour.as_label(), "1h");
+        assert_eq!(SummaryWindow::SixHours.as_label(), "6h");
+        assert_eq!(SummaryWindow::TwentyFourHours.as_label(), "24h");
+        assert_eq!(SummaryWindow::ThreeDays.as_label(), "3d");
+        assert_eq!(SummaryWindow::OneWeek.as_label(), "1w");
+    }
+
+    #[test]
+    fn summary_window_all_has_seven_entries() {
+        assert_eq!(SummaryWindow::ALL.len(), 7);
+    }
+
+    #[test]
+    fn summary_window_duration_ms_values() {
+        assert_eq!(SummaryWindow::OneMinute.duration_ms(), 60_000);
+        assert_eq!(SummaryWindow::FifteenMinutes.duration_ms(), 900_000);
+        assert_eq!(SummaryWindow::OneHour.duration_ms(), 3_600_000);
+        assert_eq!(SummaryWindow::SixHours.duration_ms(), 21_600_000);
+        assert_eq!(SummaryWindow::TwentyFourHours.duration_ms(), 86_400_000);
+        assert_eq!(SummaryWindow::ThreeDays.duration_ms(), 259_200_000);
+        assert_eq!(SummaryWindow::OneWeek.duration_ms(), 604_800_000);
+    }
+
+    #[test]
+    fn summary_window_bucket_start_ms() {
+        // 150_000 % 60_000 = 30_000 → bucket_start = 150_000 - 30_000 = 120_000
+        assert_eq!(SummaryWindow::OneMinute.bucket_start_ms(150_000), 120_000);
+        // Exact boundary
+        assert_eq!(SummaryWindow::OneMinute.bucket_start_ms(120_000), 120_000);
+        // Zero
+        assert_eq!(SummaryWindow::OneMinute.bucket_start_ms(0), 0);
+        // Negative
+        assert_eq!(SummaryWindow::OneMinute.bucket_start_ms(-5), 0);
+    }
+
+    #[test]
+    fn summary_window_rolling_start_ms() {
+        // now=120_000, duration=60_000 → start = 120_000 - 60_000 + 1 = 60_001
+        assert_eq!(SummaryWindow::OneMinute.rolling_start_ms(120_000), 60_001);
+        // Zero
+        assert_eq!(SummaryWindow::OneMinute.rolling_start_ms(0), 0);
+        // Negative
+        assert_eq!(SummaryWindow::OneMinute.rolling_start_ms(-1), 0);
+        // Less than duration
+        assert_eq!(SummaryWindow::OneMinute.rolling_start_ms(30_000), 0);
+    }
+
+    #[test]
+    fn summary_window_from_label_all_variants() {
+        assert_eq!(
+            SummaryWindow::from_label("1m"),
+            Some(SummaryWindow::OneMinute)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("15m"),
+            Some(SummaryWindow::FifteenMinutes)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("1h"),
+            Some(SummaryWindow::OneHour)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("6h"),
+            Some(SummaryWindow::SixHours)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("24h"),
+            Some(SummaryWindow::TwentyFourHours)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("3d"),
+            Some(SummaryWindow::ThreeDays)
+        );
+        assert_eq!(
+            SummaryWindow::from_label("1w"),
+            Some(SummaryWindow::OneWeek)
+        );
+    }
+
+    #[test]
+    fn summary_window_from_label_unknown_returns_none() {
+        assert_eq!(SummaryWindow::from_label("2h"), None);
+        assert_eq!(SummaryWindow::from_label(""), None);
+    }
+
+    #[test]
+    fn summary_window_serde_roundtrip() {
+        for window in SummaryWindow::ALL {
+            let json = serde_json::to_string(&window).unwrap();
+            let back: SummaryWindow = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, window);
+        }
+    }
+
+    // --- SloScope ---
+
+    #[test]
+    fn slo_scope_as_str() {
+        assert_eq!(SloScope::Project.as_str(), "project");
+        assert_eq!(SloScope::Fleet.as_str(), "fleet");
+    }
+
+    #[test]
+    fn slo_scope_from_db() {
+        assert_eq!(SloScope::from_db("project"), Some(SloScope::Project));
+        assert_eq!(SloScope::from_db("fleet"), Some(SloScope::Fleet));
+        assert_eq!(SloScope::from_db("unknown"), None);
+    }
+
+    #[test]
+    fn slo_scope_serde_roundtrip() {
+        for scope in [SloScope::Project, SloScope::Fleet] {
+            let json = serde_json::to_string(&scope).unwrap();
+            let back: SloScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, scope);
+        }
+    }
+
+    // --- SloHealth ---
+
+    #[test]
+    fn slo_health_as_str_all_variants() {
+        assert_eq!(SloHealth::Healthy.as_str(), "healthy");
+        assert_eq!(SloHealth::Warn.as_str(), "warn");
+        assert_eq!(SloHealth::Error.as_str(), "error");
+        assert_eq!(SloHealth::Critical.as_str(), "critical");
+        assert_eq!(SloHealth::NoData.as_str(), "no_data");
+    }
+
+    #[test]
+    fn slo_health_from_db() {
+        assert_eq!(SloHealth::from_db("healthy"), Some(SloHealth::Healthy));
+        assert_eq!(SloHealth::from_db("warn"), Some(SloHealth::Warn));
+        assert_eq!(SloHealth::from_db("error"), Some(SloHealth::Error));
+        assert_eq!(SloHealth::from_db("critical"), Some(SloHealth::Critical));
+        assert_eq!(SloHealth::from_db("no_data"), Some(SloHealth::NoData));
+        assert_eq!(SloHealth::from_db("invalid"), None);
+    }
+
+    #[test]
+    fn slo_health_serde_roundtrip() {
+        for health in [
+            SloHealth::Healthy,
+            SloHealth::Warn,
+            SloHealth::Error,
+            SloHealth::Critical,
+            SloHealth::NoData,
+        ] {
+            let json = serde_json::to_string(&health).unwrap();
+            let back: SloHealth = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, health);
+        }
+    }
+
+    // --- AnomalySeverity ---
+
+    #[test]
+    fn anomaly_severity_as_str_all_variants() {
+        assert_eq!(super::AnomalySeverity::Info.as_str(), "info");
+        assert_eq!(super::AnomalySeverity::Warn.as_str(), "warn");
+        assert_eq!(super::AnomalySeverity::Error.as_str(), "error");
+        assert_eq!(super::AnomalySeverity::Critical.as_str(), "critical");
+    }
+
+    #[test]
+    fn anomaly_severity_from_db() {
+        assert_eq!(
+            super::AnomalySeverity::from_db("info"),
+            Some(super::AnomalySeverity::Info)
+        );
+        assert_eq!(
+            super::AnomalySeverity::from_db("warn"),
+            Some(super::AnomalySeverity::Warn)
+        );
+        assert_eq!(
+            super::AnomalySeverity::from_db("error"),
+            Some(super::AnomalySeverity::Error)
+        );
+        assert_eq!(
+            super::AnomalySeverity::from_db("critical"),
+            Some(super::AnomalySeverity::Critical)
+        );
+        assert_eq!(super::AnomalySeverity::from_db("debug"), None);
+    }
+
+    #[test]
+    fn anomaly_severity_serde_roundtrip() {
+        for severity in [
+            super::AnomalySeverity::Info,
+            super::AnomalySeverity::Warn,
+            super::AnomalySeverity::Error,
+            super::AnomalySeverity::Critical,
+        ] {
+            let json = serde_json::to_string(&severity).unwrap();
+            let back: super::AnomalySeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, severity);
+        }
+    }
+
+    // --- SloMaterializationConfig ---
+
+    #[test]
+    fn slo_materialization_config_default_values() {
+        let cfg = SloMaterializationConfig::default();
+        assert_eq!(cfg.target_p95_latency_us, 150_000);
+        assert!((cfg.error_budget_ratio - 0.01).abs() < f64::EPSILON);
+        assert!((cfg.warn_burn_rate - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.error_burn_rate - 2.0).abs() < f64::EPSILON);
+        assert!((cfg.critical_burn_rate - 4.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.min_requests, 10);
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_target_latency_zero() {
+        let cfg = SloMaterializationConfig {
+            target_p95_latency_us: 0,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_error_budget_zero() {
+        let cfg = SloMaterializationConfig {
+            error_budget_ratio: 0.0,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_error_budget_over_one() {
+        let cfg = SloMaterializationConfig {
+            error_budget_ratio: 1.5,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_burn_rate_not_monotonic() {
+        let cfg = SloMaterializationConfig {
+            warn_burn_rate: 5.0,
+            error_burn_rate: 3.0,
+            critical_burn_rate: 10.0,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_latency_multiplier_not_monotonic() {
+        let cfg = SloMaterializationConfig {
+            warn_latency_multiplier: 2.0,
+            error_latency_multiplier: 1.5,
+            critical_latency_multiplier: 3.0,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_ok() {
+        assert!(SloMaterializationConfig::default().validate().is_ok());
+    }
+
+    // --- OpsRetentionPolicy ---
+
+    #[test]
+    fn ops_retention_policy_default_values() {
+        let p = OpsRetentionPolicy::default();
+        assert_eq!(p.raw_search_event_retention_ms, 3 * 24 * 3_600_000);
+        assert_eq!(p.search_summary_retention_ms, 14 * 24 * 3_600_000);
+        assert_eq!(p.resource_sample_retention_ms, 7 * 24 * 3_600_000);
+        assert_eq!(p.resource_downsample_after_ms, 6 * 3_600_000);
+        assert_eq!(p.resource_downsample_stride, 6);
+    }
+
+    #[test]
+    fn ops_retention_policy_serde_roundtrip() {
+        let p = OpsRetentionPolicy::default();
+        let json = serde_json::to_string(&p).unwrap();
+        let back: OpsRetentionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    // --- percentile_nearest_rank ---
+
+    #[test]
+    fn percentile_nearest_rank_empty_returns_none() {
+        assert_eq!(super::percentile_nearest_rank(&[], 95, 100), None);
+    }
+
+    #[test]
+    fn percentile_nearest_rank_denominator_zero_returns_none() {
+        assert_eq!(super::percentile_nearest_rank(&[1, 2, 3], 95, 0), None);
+    }
+
+    #[test]
+    fn percentile_nearest_rank_single_element() {
+        assert_eq!(super::percentile_nearest_rank(&[42], 50, 100), Some(42));
+        assert_eq!(super::percentile_nearest_rank(&[42], 99, 100), Some(42));
+    }
+
+    #[test]
+    fn percentile_nearest_rank_p50() {
+        let values = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let p50 = super::percentile_nearest_rank(&values, 50, 100);
+        assert_eq!(p50, Some(50));
+    }
+
+    #[test]
+    fn percentile_nearest_rank_p95() {
+        let values = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let p95 = super::percentile_nearest_rank(&values, 95, 100);
+        assert_eq!(p95, Some(100));
+    }
+
+    // --- ensure_non_empty ---
+
+    #[test]
+    fn ensure_non_empty_rejects_empty_string() {
+        assert!(super::ensure_non_empty("", "test_field").is_err());
+    }
+
+    #[test]
+    fn ensure_non_empty_rejects_whitespace() {
+        assert!(super::ensure_non_empty("   ", "test_field").is_err());
+    }
+
+    #[test]
+    fn ensure_non_empty_accepts_valid() {
+        assert!(super::ensure_non_empty("hello", "test_field").is_ok());
+    }
+
+    // --- optional helpers ---
+
+    #[test]
+    fn optional_text_none_is_null() {
+        assert_eq!(super::optional_text(None), SqliteValue::Null);
+    }
+
+    #[test]
+    fn optional_text_some_is_text() {
+        match super::optional_text(Some("hello")) {
+            SqliteValue::Text(v) => assert_eq!(v, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_u64_none_is_null() {
+        assert_eq!(
+            super::optional_u64(None, "field").unwrap(),
+            SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn optional_u64_some_valid() {
+        match super::optional_u64(Some(42), "field").unwrap() {
+            SqliteValue::Integer(v) => assert_eq!(v, 42),
+            other => panic!("expected Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_f64_none_is_null() {
+        assert_eq!(super::optional_f64(None), SqliteValue::Null);
+    }
+
+    #[test]
+    fn optional_f64_some_is_float() {
+        match super::optional_f64(Some(3.14_f64)) {
+            SqliteValue::Float(v) => assert!((v - 3.14_f64).abs() < f64::EPSILON),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    // --- integer conversion helpers ---
+
+    #[test]
+    fn u64_to_i64_valid() {
+        assert_eq!(super::u64_to_i64(42, "test").unwrap(), 42);
+    }
+
+    #[test]
+    fn u64_to_i64_overflow() {
+        assert!(super::u64_to_i64(u64::MAX, "test").is_err());
+    }
+
+    #[test]
+    fn usize_to_u64_normal() {
+        assert_eq!(super::usize_to_u64(42), 42);
+    }
+
+    #[test]
+    fn usize_to_i64_valid() {
+        assert_eq!(super::usize_to_i64(42, "test").unwrap(), 42);
+    }
+
+    #[test]
+    fn i64_to_u64_non_negative_positive() {
+        assert_eq!(super::i64_to_u64_non_negative(42, "test").unwrap(), 42);
+    }
+
+    #[test]
+    fn i64_to_u64_non_negative_zero() {
+        assert_eq!(super::i64_to_u64_non_negative(0, "test").unwrap(), 0);
+    }
+
+    #[test]
+    fn i64_to_u64_non_negative_negative_fails() {
+        assert!(super::i64_to_u64_non_negative(-1, "test").is_err());
+    }
+
+    #[test]
+    fn duration_as_u64_normal() {
+        assert_eq!(super::duration_as_u64(42), 42);
+    }
+
+    #[test]
+    fn duration_as_u64_overflow_saturates() {
+        assert_eq!(super::duration_as_u64(u128::MAX), u64::MAX);
+    }
+
+    // --- severity_for_level / level_to_health / budget_fraction_for_window ---
+
+    #[test]
+    fn severity_for_level_values() {
+        assert_eq!(super::severity_for_level(1), super::AnomalySeverity::Warn);
+        assert_eq!(super::severity_for_level(2), super::AnomalySeverity::Error);
+        assert_eq!(
+            super::severity_for_level(3),
+            super::AnomalySeverity::Critical
+        );
+        assert_eq!(
+            super::severity_for_level(0),
+            super::AnomalySeverity::Critical
+        );
+    }
+
+    #[test]
+    fn level_to_health_values() {
+        assert_eq!(super::level_to_health(1), SloHealth::Warn);
+        assert_eq!(super::level_to_health(2), SloHealth::Error);
+        assert_eq!(super::level_to_health(3), SloHealth::Critical);
+        assert_eq!(super::level_to_health(0), SloHealth::Critical);
+    }
+
+    #[test]
+    fn budget_fraction_for_window_values() {
+        assert!(
+            (super::budget_fraction_for_window(SummaryWindow::OneMinute) - 0.005).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (super::budget_fraction_for_window(SummaryWindow::OneWeek) - 1.0).abs() < f64::EPSILON
+        );
+    }
+
+    // --- Record validation ---
+
+    #[test]
+    fn search_event_record_validate_empty_event_id() {
+        let r = SearchEventRecord {
+            event_id: String::new(),
+            ..sample_search_event("x", 1)
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn search_event_record_validate_empty_project_key() {
+        let r = SearchEventRecord {
+            project_key: String::new(),
+            ..sample_search_event("x", 1)
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn search_event_record_validate_empty_instance_id() {
+        let r = SearchEventRecord {
+            instance_id: String::new(),
+            ..sample_search_event("x", 1)
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn search_event_record_validate_negative_ts_ms() {
+        let r = SearchEventRecord {
+            ts_ms: -1,
+            ..sample_search_event("x", -1)
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn search_event_record_validate_valid() {
+        let r = sample_search_event("valid", 42);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn search_event_record_serde_roundtrip() {
+        let r = sample_search_event("serde-test", 100);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: SearchEventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn resource_sample_record_validate_empty_project_key() {
+        let r = ResourceSampleRecord {
+            project_key: String::new(),
+            instance_id: "inst".to_owned(),
+            cpu_pct: None,
+            rss_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            queue_depth: None,
+            ts_ms: 1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn resource_sample_record_validate_empty_instance_id() {
+        let r = ResourceSampleRecord {
+            project_key: "proj".to_owned(),
+            instance_id: String::new(),
+            cpu_pct: None,
+            rss_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            queue_depth: None,
+            ts_ms: 1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn resource_sample_record_validate_negative_ts_ms() {
+        let r = ResourceSampleRecord {
+            project_key: "proj".to_owned(),
+            instance_id: "inst".to_owned(),
+            cpu_pct: None,
+            rss_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            queue_depth: None,
+            ts_ms: -1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn resource_sample_record_validate_valid() {
+        let r = ResourceSampleRecord {
+            project_key: "proj".to_owned(),
+            instance_id: "inst".to_owned(),
+            cpu_pct: Some(50.0),
+            rss_bytes: Some(1024),
+            io_read_bytes: None,
+            io_write_bytes: None,
+            queue_depth: Some(5),
+            ts_ms: 42,
+        };
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn evidence_link_record_validate_empty_alert_id() {
+        let r = EvidenceLinkRecord {
+            project_key: "proj".to_owned(),
+            alert_id: String::new(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///test".to_owned(),
+            evidence_hash: None,
+            created_at_ms: 1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn evidence_link_record_validate_empty_evidence_type() {
+        let r = EvidenceLinkRecord {
+            project_key: "proj".to_owned(),
+            alert_id: "alert".to_owned(),
+            evidence_type: String::new(),
+            evidence_uri: "file:///test".to_owned(),
+            evidence_hash: None,
+            created_at_ms: 1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn evidence_link_record_validate_negative_created_at_ms() {
+        let r = EvidenceLinkRecord {
+            project_key: "proj".to_owned(),
+            alert_id: "alert".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///test".to_owned(),
+            evidence_hash: None,
+            created_at_ms: -1,
+        };
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn evidence_link_record_validate_valid() {
+        let r = EvidenceLinkRecord {
+            project_key: "proj".to_owned(),
+            alert_id: "alert".to_owned(),
+            evidence_type: "jsonl".to_owned(),
+            evidence_uri: "file:///test".to_owned(),
+            evidence_hash: Some("hash".to_owned()),
+            created_at_ms: 42,
+        };
+        assert!(r.validate().is_ok());
+    }
+
+    // --- Type defaults and serde ---
+
+    #[test]
+    fn ops_ingest_batch_result_default() {
+        let d = super::OpsIngestBatchResult::default();
+        assert_eq!(d.requested, 0);
+        assert_eq!(d.inserted, 0);
+        assert_eq!(d.deduplicated, 0);
+        assert_eq!(d.failed, 0);
+        assert_eq!(d.queue_depth_before, 0);
+        assert_eq!(d.queue_depth_after, 0);
+        assert_eq!(d.write_latency_us, 0);
+    }
+
+    #[test]
+    fn ops_ingest_batch_result_serde_roundtrip() {
+        let r = super::OpsIngestBatchResult {
+            requested: 10,
+            inserted: 8,
+            deduplicated: 2,
+            failed: 0,
+            queue_depth_before: 3,
+            queue_depth_after: 1,
+            write_latency_us: 500,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: super::OpsIngestBatchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn ops_ingestion_metrics_snapshot_default() {
+        let d = super::OpsIngestionMetricsSnapshot::default();
+        assert_eq!(d.total_batches, 0);
+        assert_eq!(d.total_inserted, 0);
+        assert_eq!(d.pending_events, 0);
+    }
+
+    #[test]
+    fn ops_ingestion_metrics_snapshot_serde_roundtrip() {
+        let s = super::OpsIngestionMetricsSnapshot {
+            total_batches: 5,
+            total_inserted: 20,
+            total_deduplicated: 3,
+            total_failed_records: 1,
+            total_backpressured_batches: 0,
+            total_write_latency_us: 1500,
+            pending_events: 0,
+            high_watermark_pending_events: 10,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: super::OpsIngestionMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn slo_materialization_result_default() {
+        let d = super::SloMaterializationResult::default();
+        assert_eq!(d.rollups_upserted, 0);
+        assert_eq!(d.anomalies_opened, 0);
+        assert_eq!(d.anomalies_resolved, 0);
+    }
+
+    #[test]
+    fn ops_retention_result_default() {
+        let d = super::OpsRetentionResult::default();
+        assert_eq!(d.deleted_search_events, 0);
+        assert_eq!(d.deleted_search_summaries, 0);
+        assert_eq!(d.deleted_resource_samples, 0);
+        assert_eq!(d.downsampled_resource_samples, 0);
+    }
+
+    // --- OpsIngestionMetrics ---
+
+    #[test]
+    fn ops_ingestion_metrics_update_high_watermark() {
+        let m = super::OpsIngestionMetrics::default();
+        m.update_high_watermark(5);
+        assert_eq!(m.snapshot().high_watermark_pending_events, 5);
+        m.update_high_watermark(3);
+        assert_eq!(m.snapshot().high_watermark_pending_events, 5);
+        m.update_high_watermark(10);
+        assert_eq!(m.snapshot().high_watermark_pending_events, 10);
+    }
+
+    // --- Backpressure threshold 0 ---
+
+    #[test]
+    fn ingest_search_events_batch_rejects_zero_backpressure_threshold() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+        let event = sample_search_event("event-zero-bp", 1);
+        let err = storage.ingest_search_events_batch(&[event], 0).unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "backpressure_threshold")
+        );
+    }
+
+    // --- Empty batch returns default ---
+
+    #[test]
+    fn ingest_search_events_batch_empty_returns_default() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        let result = storage
+            .ingest_search_events_batch(&[], 64)
+            .expect("empty batch should succeed");
+        assert_eq!(result, super::OpsIngestBatchResult::default());
+    }
+
+    // --- OpsStorage accessors ---
+
+    #[test]
+    fn ops_storage_config_accessor() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        assert_eq!(
+            storage.config().db_path,
+            std::path::PathBuf::from(":memory:")
+        );
+    }
+
+    #[test]
+    fn ops_storage_debug_output() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        let debug = format!("{storage:?}");
+        assert!(debug.contains("OpsStorage"));
+        assert!(debug.contains(":memory:"));
+    }
+
+    // --- OPS_SCHEMA_VERSION constant ---
+
+    #[test]
+    fn ops_schema_version_is_two() {
+        assert_eq!(OPS_SCHEMA_VERSION, 2);
+    }
+
+    // ─── bd-3tjs tests end ───
+
     #[test]
     fn evidence_link_id_is_stable_and_separator_sensitive() {
         let alert = "alert-stable";

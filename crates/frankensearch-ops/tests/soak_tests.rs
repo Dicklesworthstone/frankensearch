@@ -170,8 +170,12 @@ impl DriftReport {
         let total_backpressured = checkpoints.last().map_or(0, |c| c.backpressured_batches);
         let total_failed = checkpoints.last().map_or(0, |c| c.total_failed_records);
 
-        let first_avg_latency_us = checkpoints.first().map_or(0.0, SoakCheckpoint::avg_write_latency_us);
-        let last_avg_latency_us = checkpoints.last().map_or(0.0, SoakCheckpoint::avg_write_latency_us);
+        let first_avg_latency_us = checkpoints
+            .first()
+            .map_or(0.0, SoakCheckpoint::avg_write_latency_us);
+        let last_avg_latency_us = checkpoints
+            .last()
+            .map_or(0.0, SoakCheckpoint::avg_write_latency_us);
         let latency_drift_pct = if first_avg_latency_us > 0.0 {
             ((last_avg_latency_us - first_avg_latency_us) / first_avg_latency_us) * 100.0
         } else {
@@ -191,18 +195,26 @@ impl DriftReport {
 
         // Detect monotonic growth in pending events.
         let monotonic_pending_growth = checkpoints.len() >= 3
-            && checkpoints.windows(2).all(|w| w[1].pending_events >= w[0].pending_events)
+            && checkpoints
+                .windows(2)
+                .all(|w| w[1].pending_events >= w[0].pending_events)
             && checkpoints.last().is_some_and(|c| c.pending_events > 0);
 
         // Detect monotonic growth in anomalies.
         let monotonic_anomaly_growth = checkpoints.len() >= 3
-            && checkpoints.windows(2).all(|w| w[1].open_anomalies >= w[0].open_anomalies)
+            && checkpoints
+                .windows(2)
+                .all(|w| w[1].open_anomalies >= w[0].open_anomalies)
             && checkpoints.last().is_some_and(|c| c.open_anomalies > 0);
 
         // Per-checkpoint throughput deltas.
         let mut throughput_deltas = Vec::with_capacity(checkpoint_count);
         for pair in checkpoints.windows(2) {
-            throughput_deltas.push(pair[1].total_inserted.saturating_sub(pair[0].total_inserted));
+            throughput_deltas.push(
+                pair[1]
+                    .total_inserted
+                    .saturating_sub(pair[0].total_inserted),
+            );
         }
 
         Self {
@@ -229,7 +241,10 @@ impl DriftReport {
         eprintln!("  checkpoints:          {}", self.checkpoint_count);
         eprintln!("  total_events:         {}", self.total_events);
         eprintln!("  total_batches:        {}", self.total_batches);
-        eprintln!("  avg_latency (first):  {:.1} us", self.first_avg_latency_us);
+        eprintln!(
+            "  avg_latency (first):  {:.1} us",
+            self.first_avg_latency_us
+        );
         eprintln!("  avg_latency (last):   {:.1} us", self.last_avg_latency_us);
         eprintln!("  latency_drift:        {:+.1}%", self.latency_drift_pct);
         eprintln!("  max_pending_events:   {}", self.max_pending_events);
@@ -241,8 +256,8 @@ impl DriftReport {
         if !self.throughput_deltas.is_empty() {
             let min_delta = self.throughput_deltas.iter().min().copied().unwrap_or(0);
             let max_delta = self.throughput_deltas.iter().max().copied().unwrap_or(0);
-            let avg_delta: f64 =
-                self.throughput_deltas.iter().sum::<u64>() as f64 / self.throughput_deltas.len() as f64;
+            let avg_delta: f64 = self.throughput_deltas.iter().sum::<u64>() as f64
+                / self.throughput_deltas.len() as f64;
             eprintln!("  throughput (min/avg/max): {min_delta}/{avg_delta:.0}/{max_delta}");
         }
         eprintln!("==============================");
@@ -303,10 +318,7 @@ fn materialize_batch(
 }
 
 /// Capture a checkpoint from current storage state.
-fn capture_checkpoint(
-    storage: &OpsStorage,
-    tick_index: usize,
-) -> SoakCheckpoint {
+fn capture_checkpoint(storage: &OpsStorage, tick_index: usize) -> SoakCheckpoint {
     let metrics = storage.ingestion_metrics();
     let open_anomalies = storage
         .query_open_anomalies_for_scope(SloScope::Fleet, "__fleet__", 1024)
@@ -463,10 +475,7 @@ fn soak_short_no_leak_or_drift() {
     );
 
     // Events must actually have been ingested.
-    assert!(
-        report.total_events > 0,
-        "no events ingested during soak"
-    );
+    assert!(report.total_events > 0, "no events ingested during soak");
 }
 
 #[test]
@@ -701,7 +710,10 @@ fn soak_embedding_wave_queue_stability() {
     }
 
     // Zero failed records.
-    assert_eq!(report.total_failed, 0, "failed records during embedding wave soak");
+    assert_eq!(
+        report.total_failed, 0,
+        "failed records during embedding wave soak"
+    );
 
     // Substantial volume due to high instance count × embedding wave baseline.
     assert!(
@@ -754,8 +766,7 @@ fn soak_materialization_consistency() {
 
         // Materialize and check rollups every 60 ticks.
         if batch_idx % 60 == 0 && batch_idx > 0 {
-            materialize_batch(&storage, batch)
-                .expect("materialization should succeed");
+            materialize_batch(&storage, batch).expect("materialization should succeed");
             let rollups = storage
                 .query_slo_rollups_for_scope(SloScope::Fleet, "__fleet__", 1024)
                 .expect("rollup query should succeed");
@@ -775,9 +786,6 @@ fn soak_materialization_consistency() {
 
     // At least some rollups should exist by the end.
     if let Some(&last) = rollup_counts.last() {
-        assert!(
-            last > 0,
-            "no rollups materialized after full soak"
-        );
+        assert!(last > 0, "no rollups materialized after full soak");
     }
 }

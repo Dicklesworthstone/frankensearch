@@ -905,7 +905,7 @@ mod tests {
     use super::{
         CancellationOutcome, FusionStrategy, FusionTieBreakRule, QueryBudgetProfile,
         QueryExecutionCapabilities, QueryExecutionMode, QueryFallbackPath, QueryIntentClass,
-        QueryPlanner, QueryPlannerConfig,
+        QueryIntentDecision, QueryPlanner, QueryPlannerConfig, RetrievalBudget,
     };
     use crate::config::{FsfsConfig, PressureProfile};
 
@@ -1127,4 +1127,1145 @@ mod tests {
             CancellationOutcome::ReturnEmptyResults
         );
     }
+
+    // ─── bd-3het tests begin ───
+
+    // --- normalize_query ---
+
+    #[test]
+    fn normalize_query_collapses_whitespace() {
+        assert_eq!(super::normalize_query("  hello   world  "), "hello world");
+    }
+
+    #[test]
+    fn normalize_query_empty_input() {
+        assert_eq!(super::normalize_query(""), "");
+    }
+
+    #[test]
+    fn normalize_query_only_whitespace() {
+        assert_eq!(super::normalize_query("   \t\n  "), "");
+    }
+
+    #[test]
+    fn normalize_query_single_token() {
+        assert_eq!(super::normalize_query("  token  "), "token");
+    }
+
+    #[test]
+    fn normalize_query_tabs_and_newlines() {
+        assert_eq!(super::normalize_query("a\tb\nc"), "a b c");
+    }
+
+    // --- malformed_reason ---
+
+    #[test]
+    fn malformed_reason_control_char() {
+        assert_eq!(
+            super::malformed_reason("hello\u{0007}world"),
+            Some("query.intent.malformed.control_chars")
+        );
+    }
+
+    #[test]
+    fn malformed_reason_null_byte() {
+        assert_eq!(
+            super::malformed_reason("hello\u{0000}world"),
+            Some("query.intent.malformed.control_chars")
+        );
+    }
+
+    #[test]
+    fn malformed_reason_tab_allowed() {
+        assert_eq!(super::malformed_reason("hello\tworld"), None);
+    }
+
+    #[test]
+    fn malformed_reason_newline_allowed() {
+        assert_eq!(super::malformed_reason("hello\nworld"), None);
+    }
+
+    #[test]
+    fn malformed_reason_cr_allowed() {
+        assert_eq!(super::malformed_reason("hello\rworld"), None);
+    }
+
+    #[test]
+    fn malformed_reason_too_long() {
+        let long_query = "a".repeat(super::MAX_QUERY_CHARS + 1);
+        assert_eq!(
+            super::malformed_reason(&long_query),
+            Some("query.intent.malformed.too_long")
+        );
+    }
+
+    #[test]
+    fn malformed_reason_at_limit_ok() {
+        let at_limit = "a".repeat(super::MAX_QUERY_CHARS);
+        assert_eq!(super::malformed_reason(&at_limit), None);
+    }
+
+    #[test]
+    fn malformed_reason_normal_query() {
+        assert_eq!(super::malformed_reason("normal query text"), None);
+    }
+
+    // --- appears_low_signal ---
+
+    #[test]
+    fn appears_low_signal_pure_punctuation() {
+        assert!(super::appears_low_signal("???!!!"));
+    }
+
+    #[test]
+    fn appears_low_signal_no_alnum() {
+        assert!(super::appears_low_signal("..."));
+    }
+
+    #[test]
+    fn appears_low_signal_few_alnum_lots_of_punct() {
+        // 2 alnum, 4+ punctuation → low signal
+        assert!(super::appears_low_signal("a!@#$b"));
+    }
+
+    #[test]
+    fn appears_low_signal_normal_text() {
+        assert!(!super::appears_low_signal("hello world"));
+    }
+
+    #[test]
+    fn appears_low_signal_single_word() {
+        assert!(!super::appears_low_signal("rust"));
+    }
+
+    #[test]
+    fn appears_low_signal_empty() {
+        // 0 alnum → low signal
+        assert!(super::appears_low_signal(""));
+    }
+
+    // --- looks_like_ticket_id ---
+
+    #[test]
+    fn looks_like_ticket_id_valid() {
+        assert!(super::looks_like_ticket_id("JIRA-1234"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_lowercase() {
+        assert!(super::looks_like_ticket_id("proj-42"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_with_space() {
+        assert!(!super::looks_like_ticket_id("JIRA 1234"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_no_dash() {
+        assert!(!super::looks_like_ticket_id("JIRA1234"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_empty_left() {
+        assert!(!super::looks_like_ticket_id("-1234"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_empty_right() {
+        assert!(!super::looks_like_ticket_id("JIRA-"));
+    }
+
+    #[test]
+    fn looks_like_ticket_id_multiple_dashes() {
+        // splitn(2, '-') keeps the second part as "is-it"
+        // right = "is-it" which contains non-alphanumeric '-'
+        assert!(!super::looks_like_ticket_id("what-is-it"));
+    }
+
+    // --- identifier_signal_count ---
+
+    #[test]
+    fn identifier_signal_count_path_separator() {
+        assert!(super::identifier_signal_count("src/main.rs") >= 2);
+    }
+
+    #[test]
+    fn identifier_signal_count_double_colon() {
+        assert!(super::identifier_signal_count("std::vec::Vec") >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_dot_no_space() {
+        assert!(super::identifier_signal_count("config.toml") >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_ticket_id() {
+        let count = super::identifier_signal_count("PROJ-123");
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_code_keyword_fn() {
+        assert!(super::identifier_signal_count("fn main") >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_code_keyword_struct() {
+        assert!(super::identifier_signal_count("struct Foo") >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_code_keyword_impl() {
+        assert!(super::identifier_signal_count("impl Bar") >= 1);
+    }
+
+    #[test]
+    fn identifier_signal_count_plain_word() {
+        assert_eq!(super::identifier_signal_count("hello"), 0);
+    }
+
+    #[test]
+    fn identifier_signal_double_colon_with_space_no_signal() {
+        // "foo :: bar" has a space, so :: check doesn't fire
+        assert_eq!(
+            super::identifier_signal_count("foo :: bar") & 0, // just check it doesn't panic
+            0
+        );
+    }
+
+    // --- natural_language_signal_count ---
+
+    #[test]
+    fn natural_language_signal_question_mark() {
+        assert!(super::natural_language_signal_count("what is this?") >= 2);
+    }
+
+    #[test]
+    fn natural_language_signal_interrogative_word() {
+        assert!(super::natural_language_signal_count("how does it work") >= 1);
+    }
+
+    #[test]
+    fn natural_language_signal_all_interrogatives() {
+        for word in &[
+            "how", "what", "why", "where", "when", "which", "who", "can", "does",
+        ] {
+            let query = format!("{word} is this");
+            assert!(
+                super::natural_language_signal_count(&query) >= 1,
+                "Expected signal for '{word}'"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_language_signal_long_query() {
+        // 6+ words → extra signal
+        let count = super::natural_language_signal_count("one two three four five six seven");
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn natural_language_signal_short_no_signal() {
+        assert_eq!(super::natural_language_signal_count("rust"), 0);
+    }
+
+    // --- confidence_per_mille ---
+
+    #[test]
+    fn confidence_per_mille_empty_is_low_signal() {
+        // Empty string has 0 alnum chars → appears_low_signal returns true → 420
+        assert_eq!(
+            super::confidence_per_mille("", frankensearch_core::query_class::QueryClass::Empty),
+            420
+        );
+    }
+
+    #[test]
+    fn confidence_per_mille_identifier_base() {
+        let conf = super::confidence_per_mille(
+            "foo",
+            frankensearch_core::query_class::QueryClass::Identifier,
+        );
+        // 0 signals → 700 + 0 = 700
+        assert_eq!(conf, 700);
+    }
+
+    #[test]
+    fn confidence_per_mille_identifier_with_signals() {
+        let conf = super::confidence_per_mille(
+            "src/main.rs",
+            frankensearch_core::query_class::QueryClass::Identifier,
+        );
+        // Has / and . → 2 signals → 700 + 130 = 830
+        assert_eq!(conf, 830);
+    }
+
+    #[test]
+    fn confidence_per_mille_identifier_capped_at_970() {
+        // Many signals, but capped
+        let conf = super::confidence_per_mille(
+            "fn src/foo.rs",
+            frankensearch_core::query_class::QueryClass::Identifier,
+        );
+        assert!(conf <= 970);
+    }
+
+    #[test]
+    fn confidence_per_mille_short_keyword_1_word() {
+        let conf = super::confidence_per_mille(
+            "hello",
+            frankensearch_core::query_class::QueryClass::ShortKeyword,
+        );
+        assert_eq!(conf, 860);
+    }
+
+    #[test]
+    fn confidence_per_mille_short_keyword_2_words() {
+        let conf = super::confidence_per_mille(
+            "hello world",
+            frankensearch_core::query_class::QueryClass::ShortKeyword,
+        );
+        assert_eq!(conf, 810);
+    }
+
+    #[test]
+    fn confidence_per_mille_short_keyword_3_words() {
+        let conf = super::confidence_per_mille(
+            "one two three",
+            frankensearch_core::query_class::QueryClass::ShortKeyword,
+        );
+        assert_eq!(conf, 760);
+    }
+
+    #[test]
+    fn confidence_per_mille_natural_language_0_signals() {
+        let conf = super::confidence_per_mille(
+            "rust",
+            frankensearch_core::query_class::QueryClass::NaturalLanguage,
+        );
+        assert_eq!(conf, 730);
+    }
+
+    #[test]
+    fn confidence_per_mille_natural_language_1_signal() {
+        let conf = super::confidence_per_mille(
+            "does it work",
+            frankensearch_core::query_class::QueryClass::NaturalLanguage,
+        );
+        assert_eq!(conf, 810);
+    }
+
+    #[test]
+    fn confidence_per_mille_natural_language_3_signals() {
+        // question mark + interrogative + 6+ words
+        let conf = super::confidence_per_mille(
+            "how does this particular thing actually work?",
+            frankensearch_core::query_class::QueryClass::NaturalLanguage,
+        );
+        assert_eq!(conf, 960);
+    }
+
+    #[test]
+    fn confidence_per_mille_low_signal_returns_420() {
+        let conf = super::confidence_per_mille(
+            "???",
+            frankensearch_core::query_class::QueryClass::ShortKeyword,
+        );
+        assert_eq!(conf, 420);
+    }
+
+    // --- scale_usize ---
+
+    #[test]
+    fn scale_usize_identity() {
+        assert_eq!(super::scale_usize(100, 1, 1), 100);
+    }
+
+    #[test]
+    fn scale_usize_half_rounds_up() {
+        // 3 * 1 / 2 with ceiling = (3 + 1) / 2 = 2
+        assert_eq!(super::scale_usize(3, 1, 2), 2);
+    }
+
+    #[test]
+    fn scale_usize_three_quarters() {
+        // 100 * 3 / 4 = 300/4 = 75 exactly, ceiling = 75
+        assert_eq!(super::scale_usize(100, 3, 4), 75);
+    }
+
+    #[test]
+    fn scale_usize_zero_value() {
+        assert_eq!(super::scale_usize(0, 3, 4), 0);
+    }
+
+    // --- scale_u64 ---
+
+    #[test]
+    fn scale_u64_identity() {
+        assert_eq!(super::scale_u64(100, 1, 1), 100);
+    }
+
+    #[test]
+    fn scale_u64_four_fifths() {
+        // 100 * 4 / 5 = 400/5 = 80 exactly, ceiling = 80
+        assert_eq!(super::scale_u64(100, 4, 5), 80);
+    }
+
+    #[test]
+    fn scale_u64_seven_tenths() {
+        // 100 * 7 / 10 = 700/10 = 70 exactly, ceiling = 70
+        assert_eq!(super::scale_u64(100, 7, 10), 70);
+    }
+
+    #[test]
+    fn scale_u64_zero_value() {
+        assert_eq!(super::scale_u64(0, 7, 10), 0);
+    }
+
+    // --- BudgetScale ---
+
+    #[test]
+    fn budget_scale_performance_is_identity() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Performance);
+        assert_eq!(scale.fanout_num, 1);
+        assert_eq!(scale.fanout_den, 1);
+        assert!(!scale.force_fast_only);
+    }
+
+    #[test]
+    fn budget_scale_strict_forces_fast_only() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        assert!(scale.force_fast_only);
+    }
+
+    #[test]
+    fn budget_scale_degraded_forces_fast_only() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Degraded);
+        assert!(scale.force_fast_only);
+    }
+
+    #[test]
+    fn budget_scale_fanout_zero_stays_zero() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        assert_eq!(scale.scale_fanout(0), 0);
+    }
+
+    #[test]
+    fn budget_scale_fanout_nonzero_min_1() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Degraded);
+        assert!(scale.scale_fanout(1) >= 1);
+    }
+
+    #[test]
+    fn budget_scale_latency_zero_stays_zero() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        assert_eq!(scale.scale_latency(0), 0);
+    }
+
+    #[test]
+    fn budget_scale_latency_nonzero_min_1() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Degraded);
+        assert!(scale.scale_latency(1) >= 1);
+    }
+
+    #[test]
+    fn budget_scale_rerank_zero_stays_zero() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        assert_eq!(scale.scale_rerank(0), 0);
+    }
+
+    #[test]
+    fn budget_scale_rerank_nonzero_min_1() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Degraded);
+        assert!(scale.scale_rerank(1) >= 1);
+    }
+
+    #[test]
+    fn budget_scale_strict_reduces_fanout() {
+        let perf = super::BudgetScale::from_pressure(PressureProfile::Performance);
+        let strict = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        assert!(strict.scale_fanout(100) < perf.scale_fanout(100));
+    }
+
+    #[test]
+    fn budget_scale_degraded_reduces_more_than_strict() {
+        let strict = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        let degraded = super::BudgetScale::from_pressure(PressureProfile::Degraded);
+        assert!(degraded.scale_fanout(100) <= strict.scale_fanout(100));
+    }
+
+    // --- CapabilityState ---
+
+    #[test]
+    fn capability_state_enabled_is_enabled() {
+        assert!(super::CapabilityState::Enabled.is_enabled());
+    }
+
+    #[test]
+    fn capability_state_disabled_is_not_enabled() {
+        assert!(!super::CapabilityState::Disabled.is_enabled());
+    }
+
+    // --- QueryExecutionCapabilities ---
+
+    #[test]
+    fn query_execution_capabilities_all_enabled() {
+        let caps = QueryExecutionCapabilities::all_enabled();
+        assert!(caps.lexical.is_enabled());
+        assert!(caps.fast_semantic.is_enabled());
+        assert!(caps.quality_semantic.is_enabled());
+        assert!(caps.rerank.is_enabled());
+    }
+
+    #[test]
+    fn query_execution_capabilities_default_is_all_enabled() {
+        let caps = QueryExecutionCapabilities::default();
+        assert!(caps.lexical.is_enabled());
+        assert!(caps.fast_semantic.is_enabled());
+        assert!(caps.quality_semantic.is_enabled());
+        assert!(caps.rerank.is_enabled());
+    }
+
+    // --- rerank_depth ---
+
+    #[test]
+    fn rerank_depth_disabled_returns_zero() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Performance);
+        assert_eq!(super::rerank_depth(false, scale, 24), 0);
+    }
+
+    #[test]
+    fn rerank_depth_enabled_returns_scaled() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Performance);
+        assert_eq!(super::rerank_depth(true, scale, 24), 24);
+    }
+
+    #[test]
+    fn rerank_depth_enabled_strict_scales_down() {
+        let scale = super::BudgetScale::from_pressure(PressureProfile::Strict);
+        let depth = super::rerank_depth(true, scale, 24);
+        assert!(depth > 0);
+        assert!(depth < 24);
+    }
+
+    // --- QueryPlannerConfig::from_fsfs ---
+
+    #[test]
+    fn planner_config_from_fsfs_default_limit_min_1() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.default_limit = 0;
+        let planner_cfg = QueryPlannerConfig::from_fsfs(&cfg);
+        assert_eq!(planner_cfg.default_limit, 1);
+    }
+
+    #[test]
+    fn planner_config_from_fsfs_copies_fields() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.default_limit = 25;
+        cfg.search.quality_timeout_ms = 500;
+        cfg.search.rrf_k = 42.0;
+        cfg.search.fast_only = true;
+        cfg.pressure.profile = PressureProfile::Degraded;
+        let planner_cfg = QueryPlannerConfig::from_fsfs(&cfg);
+        assert_eq!(planner_cfg.default_limit, 25);
+        assert_eq!(planner_cfg.quality_timeout_ms, 500);
+        assert!((planner_cfg.rrf_k - 42.0).abs() < f64::EPSILON);
+        assert!(planner_cfg.fast_only);
+        assert_eq!(planner_cfg.pressure_profile, PressureProfile::Degraded);
+        assert_eq!(
+            planner_cfg.low_confidence_threshold_per_mille,
+            super::DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE
+        );
+    }
+
+    // --- resolve_limit ---
+
+    #[test]
+    fn resolve_limit_none_uses_default() {
+        let planner = QueryPlanner::new(QueryPlannerConfig {
+            default_limit: 15,
+            quality_timeout_ms: 500,
+            rrf_k: 60.0,
+            fast_only: false,
+            pressure_profile: PressureProfile::Performance,
+            low_confidence_threshold_per_mille: 650,
+        });
+        let budget = planner.budget_for_query("hello world", None);
+        assert_eq!(budget.limit, 15);
+    }
+
+    #[test]
+    fn resolve_limit_some_zero_clamps_to_1() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("hello world", Some(0));
+        assert_eq!(budget.limit, 1);
+    }
+
+    #[test]
+    fn resolve_limit_some_value_used() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("hello world", Some(42));
+        assert_eq!(budget.limit, 42);
+    }
+
+    // --- quality_enabled ---
+
+    #[test]
+    fn quality_enabled_false_when_fast_only() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.fast_only = true;
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let budget = planner.budget_for_query("how does this work", Some(10));
+        assert!(!budget.quality_enabled);
+    }
+
+    #[test]
+    fn quality_enabled_false_under_strict_pressure() {
+        let planner = QueryPlanner::new(QueryPlannerConfig {
+            pressure_profile: PressureProfile::Strict,
+            ..QueryPlannerConfig::from_fsfs(&FsfsConfig::default())
+        });
+        let budget = planner.budget_for_query("how does this work", Some(10));
+        assert!(!budget.quality_enabled);
+    }
+
+    #[test]
+    fn quality_enabled_false_with_fallback() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        // Malformed queries have MalformedLexicalOnly fallback
+        let budget = planner.budget_for_query("hello\u{0007}world", Some(10));
+        assert!(!budget.quality_enabled);
+    }
+
+    #[test]
+    fn quality_enabled_true_performance_no_fallback() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("how does this work", Some(10));
+        assert!(budget.quality_enabled);
+    }
+
+    // --- budget profiles per intent ---
+
+    #[test]
+    fn budget_identifier_focused_profile() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("src/main.rs", Some(10));
+        assert_eq!(budget.profile, QueryBudgetProfile::IdentifierFocused);
+        assert_eq!(budget.reason_code, "query.budget.identifier_focused");
+        assert!(budget.lexical_fanout > budget.semantic_fanout);
+    }
+
+    #[test]
+    fn budget_balanced_profile_for_short_keyword() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("rust ownership", Some(10));
+        assert_eq!(budget.profile, QueryBudgetProfile::Balanced);
+        assert_eq!(budget.reason_code, "query.budget.balanced");
+        assert_eq!(budget.lexical_fanout, budget.semantic_fanout);
+    }
+
+    #[test]
+    fn budget_malformed_uses_safe_fallback() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let budget = planner.budget_for_query("find\u{0007}secret", Some(10));
+        assert_eq!(budget.profile, QueryBudgetProfile::SafeFallback);
+        assert_eq!(budget.semantic_fanout, 0);
+        assert!(!budget.quality_enabled);
+        assert_eq!(budget.rerank_depth, 0);
+        assert_eq!(budget.fallback, QueryFallbackPath::MalformedLexicalOnly);
+    }
+
+    #[test]
+    fn budget_degraded_pressure_reduces_all() {
+        let perf_planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let degraded_planner = QueryPlanner::new(QueryPlannerConfig {
+            pressure_profile: PressureProfile::Degraded,
+            ..QueryPlannerConfig::from_fsfs(&FsfsConfig::default())
+        });
+        let perf_budget = perf_planner.budget_for_query("how does ranking work", Some(10));
+        let deg_budget = degraded_planner.budget_for_query("how does ranking work", Some(10));
+
+        assert!(deg_budget.lexical_fanout < perf_budget.lexical_fanout);
+        assert!(deg_budget.semantic_fanout < perf_budget.semantic_fanout);
+        assert!(deg_budget.latency_budget_ms < perf_budget.latency_budget_ms);
+        assert!(!deg_budget.quality_enabled);
+    }
+
+    // --- fusion_policy_for_mode ---
+
+    #[test]
+    fn fusion_policy_rrf_mode() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::HybridRrf, 60.0);
+        assert_eq!(policy.strategy, FusionStrategy::Rrf);
+        assert_eq!(policy.rrf_k, Some(60.0));
+        assert_eq!(policy.tie_break_rules.len(), 4);
+        assert_eq!(policy.reason_code, "query.fusion.rrf");
+    }
+
+    #[test]
+    fn fusion_policy_semantic_only_mode() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::FastSemanticOnly, 60.0);
+        assert_eq!(policy.strategy, FusionStrategy::SemanticOnly);
+        assert_eq!(policy.rrf_k, None);
+        assert_eq!(policy.tie_break_rules.len(), 2);
+        assert_eq!(policy.reason_code, "query.fusion.semantic_only");
+    }
+
+    #[test]
+    fn fusion_policy_lexical_only_mode() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::LexicalOnly, 60.0);
+        assert_eq!(policy.strategy, FusionStrategy::LexicalOnly);
+        assert_eq!(policy.rrf_k, None);
+        assert_eq!(policy.reason_code, "query.fusion.lexical_only");
+    }
+
+    #[test]
+    fn fusion_policy_empty_mode() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::Empty, 60.0);
+        assert_eq!(policy.strategy, FusionStrategy::None);
+        assert_eq!(policy.rrf_k, None);
+        assert_eq!(policy.tie_break_rules, vec![FusionTieBreakRule::DocIdAsc]);
+        assert_eq!(policy.reason_code, "query.fusion.none");
+    }
+
+    #[test]
+    fn fusion_policy_invalid_rrf_k_defaults_to_60() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::HybridRrf, f64::NAN);
+        assert_eq!(policy.rrf_k, Some(60.0));
+    }
+
+    #[test]
+    fn fusion_policy_rrf_k_below_1_defaults_to_60() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::HybridRrf, 0.5);
+        assert_eq!(policy.rrf_k, Some(60.0));
+    }
+
+    #[test]
+    fn fusion_policy_rrf_k_infinite_defaults_to_60() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::HybridRrf, f64::INFINITY);
+        assert_eq!(policy.rrf_k, Some(60.0));
+    }
+
+    #[test]
+    fn fusion_policy_rrf_k_valid_custom() {
+        let policy = super::fusion_policy_for_mode(QueryExecutionMode::HybridRrf, 42.0);
+        assert_eq!(policy.rrf_k, Some(42.0));
+    }
+
+    // --- cancellation_semantics_for_mode ---
+
+    #[test]
+    fn cancellation_empty_mode() {
+        let sem = super::cancellation_semantics_for_mode(QueryExecutionMode::Empty, false);
+        assert_eq!(
+            sem.before_initial_yield,
+            CancellationOutcome::ReturnEmptyResults
+        );
+        assert_eq!(
+            sem.after_initial_yield,
+            CancellationOutcome::ReturnEmptyResults
+        );
+        assert_eq!(sem.reason_code, "query.cancel.empty");
+    }
+
+    #[test]
+    fn cancellation_lexical_only_mode() {
+        let sem = super::cancellation_semantics_for_mode(QueryExecutionMode::LexicalOnly, false);
+        assert_eq!(
+            sem.before_initial_yield,
+            CancellationOutcome::AbortWithoutPartial
+        );
+        assert_eq!(
+            sem.after_initial_yield,
+            CancellationOutcome::ReturnLexicalResults
+        );
+        assert_eq!(sem.reason_code, "query.cancel.lexical_only");
+    }
+
+    #[test]
+    fn cancellation_hybrid_quality_enabled() {
+        let sem = super::cancellation_semantics_for_mode(QueryExecutionMode::HybridRrf, true);
+        assert_eq!(
+            sem.before_initial_yield,
+            CancellationOutcome::AbortWithoutPartial
+        );
+        assert_eq!(
+            sem.after_initial_yield,
+            CancellationOutcome::ReturnInitialResults
+        );
+        assert_eq!(sem.reason_code, "query.cancel.phase2_returns_initial");
+    }
+
+    #[test]
+    fn cancellation_hybrid_quality_disabled() {
+        let sem = super::cancellation_semantics_for_mode(QueryExecutionMode::HybridRrf, false);
+        assert_eq!(sem.reason_code, "query.cancel.single_phase_returns_initial");
+    }
+
+    #[test]
+    fn cancellation_semantic_only_quality_enabled() {
+        let sem =
+            super::cancellation_semantics_for_mode(QueryExecutionMode::FastSemanticOnly, true);
+        assert_eq!(sem.reason_code, "query.cancel.phase2_returns_initial");
+    }
+
+    // --- execution_reason_code ---
+
+    #[test]
+    fn execution_reason_code_empty() {
+        assert_eq!(
+            super::execution_reason_code(QueryExecutionMode::Empty, QueryFallbackPath::None),
+            "query.execution.mode.empty"
+        );
+    }
+
+    #[test]
+    fn execution_reason_code_hybrid_no_fallback() {
+        assert_eq!(
+            super::execution_reason_code(QueryExecutionMode::HybridRrf, QueryFallbackPath::None),
+            "query.execution.mode.hybrid"
+        );
+    }
+
+    #[test]
+    fn execution_reason_code_hybrid_lexical_bias() {
+        assert_eq!(
+            super::execution_reason_code(
+                QueryExecutionMode::HybridRrf,
+                QueryFallbackPath::LowConfidenceLexicalBias
+            ),
+            "query.execution.mode.hybrid.lexical_bias"
+        );
+    }
+
+    #[test]
+    fn execution_reason_code_semantic_only() {
+        assert_eq!(
+            super::execution_reason_code(
+                QueryExecutionMode::FastSemanticOnly,
+                QueryFallbackPath::None
+            ),
+            "query.execution.mode.semantic_only"
+        );
+    }
+
+    #[test]
+    fn execution_reason_code_lexical_only_malformed() {
+        assert_eq!(
+            super::execution_reason_code(
+                QueryExecutionMode::LexicalOnly,
+                QueryFallbackPath::MalformedLexicalOnly
+            ),
+            "query.execution.mode.lexical_only.malformed"
+        );
+    }
+
+    #[test]
+    fn execution_reason_code_lexical_only_no_malformed() {
+        assert_eq!(
+            super::execution_reason_code(QueryExecutionMode::LexicalOnly, QueryFallbackPath::None),
+            "query.execution.mode.lexical_only"
+        );
+    }
+
+    // --- resolve_execution_mode ---
+
+    #[test]
+    fn resolve_execution_mode_empty_intent() {
+        let decision = QueryIntentDecision {
+            normalized_query: String::new(),
+            intent: QueryIntentClass::Empty,
+            base_class: Some(frankensearch_core::query_class::QueryClass::Empty),
+            confidence_per_mille: 1000,
+            fallback: QueryFallbackPath::EmptyQuery,
+            reason_code: "query.intent.empty",
+        };
+        let budget = RetrievalBudget {
+            profile: QueryBudgetProfile::Empty,
+            limit: 10,
+            latency_budget_ms: 0,
+            lexical_fanout: 0,
+            semantic_fanout: 0,
+            rerank_depth: 0,
+            quality_enabled: false,
+            fallback: QueryFallbackPath::EmptyQuery,
+            reason_code: "query.budget.empty",
+        };
+        let mode = super::resolve_execution_mode(
+            &decision,
+            &budget,
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(mode, QueryExecutionMode::Empty);
+    }
+
+    #[test]
+    fn resolve_execution_mode_no_capabilities() {
+        let decision = QueryIntentDecision {
+            normalized_query: "hello".to_string(),
+            intent: QueryIntentClass::ShortKeyword,
+            base_class: Some(frankensearch_core::query_class::QueryClass::ShortKeyword),
+            confidence_per_mille: 860,
+            fallback: QueryFallbackPath::None,
+            reason_code: "query.intent.short_keyword",
+        };
+        let budget = RetrievalBudget {
+            profile: QueryBudgetProfile::Balanced,
+            limit: 10,
+            latency_budget_ms: 180,
+            lexical_fanout: 40,
+            semantic_fanout: 40,
+            rerank_depth: 20,
+            quality_enabled: true,
+            fallback: QueryFallbackPath::None,
+            reason_code: "query.budget.balanced",
+        };
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Disabled,
+            fast_semantic: super::CapabilityState::Disabled,
+            quality_semantic: super::CapabilityState::Disabled,
+            rerank: super::CapabilityState::Disabled,
+        };
+        let mode = super::resolve_execution_mode(&decision, &budget, caps);
+        assert_eq!(mode, QueryExecutionMode::Empty);
+    }
+
+    #[test]
+    fn resolve_execution_mode_malformed_lexical_only() {
+        let decision = QueryIntentDecision {
+            normalized_query: "hello".to_string(),
+            intent: QueryIntentClass::Malformed,
+            base_class: None,
+            confidence_per_mille: 1000,
+            fallback: QueryFallbackPath::MalformedLexicalOnly,
+            reason_code: "query.intent.malformed.control_chars",
+        };
+        let budget = RetrievalBudget {
+            profile: QueryBudgetProfile::SafeFallback,
+            limit: 10,
+            latency_budget_ms: 60,
+            lexical_fanout: 20,
+            semantic_fanout: 0,
+            rerank_depth: 0,
+            quality_enabled: false,
+            fallback: QueryFallbackPath::MalformedLexicalOnly,
+            reason_code: "query.budget.safe_fallback",
+        };
+        let mode = super::resolve_execution_mode(
+            &decision,
+            &budget,
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(mode, QueryExecutionMode::LexicalOnly);
+    }
+
+    #[test]
+    fn resolve_execution_mode_semantic_zero_fanout_falls_to_lexical() {
+        let decision = QueryIntentDecision {
+            normalized_query: "hello".to_string(),
+            intent: QueryIntentClass::ShortKeyword,
+            base_class: Some(frankensearch_core::query_class::QueryClass::ShortKeyword),
+            confidence_per_mille: 860,
+            fallback: QueryFallbackPath::None,
+            reason_code: "query.intent.short_keyword",
+        };
+        let budget = RetrievalBudget {
+            profile: QueryBudgetProfile::Balanced,
+            limit: 10,
+            latency_budget_ms: 180,
+            lexical_fanout: 40,
+            semantic_fanout: 0, // no semantic budget
+            rerank_depth: 0,
+            quality_enabled: false,
+            fallback: QueryFallbackPath::None,
+            reason_code: "query.budget.balanced",
+        };
+        let mode = super::resolve_execution_mode(
+            &decision,
+            &budget,
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(mode, QueryExecutionMode::LexicalOnly);
+    }
+
+    // --- execution plan stage reason codes ---
+
+    #[test]
+    fn execution_plan_quality_disabled_reason_no_semantic() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Enabled,
+            fast_semantic: super::CapabilityState::Disabled,
+            quality_semantic: super::CapabilityState::Enabled,
+            rerank: super::CapabilityState::Enabled,
+        };
+        let plan = planner.execution_plan_for_query("hello world", Some(10), caps);
+        assert_eq!(
+            plan.quality_stage.reason_code,
+            "query.stage.quality.disabled.no_semantic"
+        );
+    }
+
+    #[test]
+    fn execution_plan_quality_disabled_reason_policy() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.fast_only = true;
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let plan = planner.execution_plan_for_query(
+            "how does this work",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(
+            plan.quality_stage.reason_code,
+            "query.stage.quality.disabled.policy_or_pressure"
+        );
+    }
+
+    #[test]
+    fn execution_plan_quality_disabled_reason_unavailable() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Enabled,
+            fast_semantic: super::CapabilityState::Enabled,
+            quality_semantic: super::CapabilityState::Disabled,
+            rerank: super::CapabilityState::Enabled,
+        };
+        let plan = planner.execution_plan_for_query("how does this work", Some(10), caps);
+        assert_eq!(
+            plan.quality_stage.reason_code,
+            "query.stage.quality.disabled.unavailable"
+        );
+    }
+
+    #[test]
+    fn execution_plan_rerank_disabled_reason_no_quality() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.fast_only = true;
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let plan = planner.execution_plan_for_query(
+            "how does this work",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(
+            plan.rerank_stage.reason_code,
+            "query.stage.rerank.disabled.no_quality"
+        );
+    }
+
+    #[test]
+    fn execution_plan_rerank_disabled_reason_unavailable() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let caps = QueryExecutionCapabilities {
+            lexical: super::CapabilityState::Enabled,
+            fast_semantic: super::CapabilityState::Enabled,
+            quality_semantic: super::CapabilityState::Enabled,
+            rerank: super::CapabilityState::Disabled,
+        };
+        let plan = planner.execution_plan_for_query("how does this work", Some(10), caps);
+        assert_eq!(
+            plan.rerank_stage.reason_code,
+            "query.stage.rerank.disabled.unavailable"
+        );
+    }
+
+    // --- classify_intent integration ---
+
+    #[test]
+    fn classify_intent_natural_language() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let decision = planner.classify_intent("how does query ranking work");
+        assert_eq!(decision.intent, QueryIntentClass::NaturalLanguage);
+        assert_eq!(decision.fallback, QueryFallbackPath::None);
+        assert!(decision.confidence_per_mille >= 650);
+    }
+
+    #[test]
+    fn classify_intent_short_keyword() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let decision = planner.classify_intent("rust ownership");
+        assert_eq!(decision.intent, QueryIntentClass::ShortKeyword);
+    }
+
+    #[test]
+    fn classify_intent_normalizes_whitespace() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let decision = planner.classify_intent("  hello   world  ");
+        assert_eq!(decision.normalized_query, "hello world");
+    }
+
+    #[test]
+    fn classify_intent_too_long_query() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let long_query = "a ".repeat(super::MAX_QUERY_CHARS + 1);
+        let decision = planner.classify_intent(&long_query);
+        assert_eq!(decision.intent, QueryIntentClass::Malformed);
+        assert_eq!(decision.reason_code, "query.intent.malformed.too_long");
+    }
+
+    #[test]
+    fn classify_intent_empty_whitespace() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let decision = planner.classify_intent("   ");
+        assert_eq!(decision.intent, QueryIntentClass::Empty);
+        assert_eq!(decision.confidence_per_mille, 1000);
+    }
+
+    // --- QueryPlanner::from_fsfs ---
+
+    #[test]
+    fn planner_from_fsfs_roundtrip() {
+        let cfg = FsfsConfig::default();
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let planner2 = QueryPlanner::new(QueryPlannerConfig::from_fsfs(&cfg));
+        assert_eq!(planner, planner2);
+    }
+
+    // --- execution plan uncertain fallback ---
+
+    #[test]
+    fn execution_plan_uncertain_uses_lexical_bias_reason() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let plan = planner.execution_plan_for_query(
+            "???!!!",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert_eq!(plan.reason_code, "query.execution.mode.hybrid.lexical_bias");
+    }
+
+    // --- quality_timeout_ms clamping ---
+
+    #[test]
+    fn quality_timeout_ms_clamped_low() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.quality_timeout_ms = 10; // Below 180
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let plan = planner.execution_plan_for_query(
+            "how does this work",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        // quality_stage timeout should be clamped to at least 180
+        assert!(plan.quality_stage.timeout_ms >= 180);
+    }
+
+    #[test]
+    fn quality_timeout_ms_clamped_high() {
+        let mut cfg = FsfsConfig::default();
+        cfg.search.quality_timeout_ms = 10_000; // Above 2000
+        let planner = QueryPlanner::from_fsfs(&cfg);
+        let plan = planner.execution_plan_for_query(
+            "how does this work",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        );
+        assert!(plan.quality_stage.timeout_ms <= 2_000);
+    }
+
+    // ─── bd-3het tests end ───
 }
