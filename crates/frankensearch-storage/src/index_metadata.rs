@@ -789,7 +789,7 @@ fn sqlite_f64_opt(value: Option<f64>) -> SqliteValue {
 /// Escape single quotes for SQL string literals.
 ///
 /// Used as a workaround for multi-row SELECT queries where
-/// `query_with_params` currently returns at most one row (FrankenSQLite
+/// `query_with_params` currently returns at most one row (`FrankenSQLite`
 /// limitation).  Single-row queries and DML (INSERT/UPDATE/DELETE) use
 /// parameterized queries instead.
 fn sql_escape_single_quoted(value: &str) -> String {
