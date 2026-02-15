@@ -334,7 +334,17 @@ impl DiskBudgetPolicy {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn evaluate(&self, used_bytes: u64, budget_bytes: u64) -> DiskBudgetSnapshot {
-        debug_assert!(budget_bytes > 0, "budget_bytes must be non-zero");
+        if budget_bytes == 0 {
+            // Treat zero budget as maximally over-limit.
+            return DiskBudgetSnapshot {
+                used_bytes,
+                budget_bytes,
+                usage_per_mille: u16::MAX,
+                stage: DiskBudgetStage::Critical,
+                action: DiskBudgetAction::PauseWrites,
+                reason_code: FsfsReasonCode::DEGRADE_DISK_CRITICAL,
+            };
+        }
         let usage_per_mille_u64 = used_bytes
             .saturating_mul(1000)
             .saturating_add(budget_bytes.saturating_sub(1))

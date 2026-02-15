@@ -250,6 +250,11 @@ impl ContentionPolicy {
         let multiplier = self.backoff_multiplier.powi(attempt as i32);
         let delay = self.initial_backoff.as_secs_f64() * multiplier;
         let capped = delay.min(self.max_backoff.as_secs_f64());
+        // Guard against negative or NaN from misconfigured multiplier —
+        // Duration::from_secs_f64 panics on negative/NaN/infinite values.
+        if !capped.is_finite() || capped < 0.0 {
+            return self.initial_backoff;
+        }
         Duration::from_secs_f64(capped)
     }
 
