@@ -28,6 +28,17 @@ pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
 pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
 const DIST_DOT_SHRINK: f32 = 0.999_999;
 
+/// Maximum dimension allowed in CHSW files. No real embedding model
+/// exceeds 8192 dimensions; 65536 provides ample headroom while
+/// preventing OOM from malformed/malicious files.
+const CHSW_MAX_DIMENSION: usize = 65_536;
+/// Maximum `doc_id` byte length in CHSW files.
+const CHSW_MAX_DOC_ID_LEN: usize = 65_536;
+/// Pre-allocation cap for record vectors, preventing OOM from
+/// malicious `record_count` values. Actual records are read
+/// incrementally and will fail with EOF if the file is truncated.
+const CHSW_MAX_PREALLOC_RECORDS: usize = 1_024 * 1_024;
+
 /// ANN construction/runtime parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
@@ -141,8 +152,41 @@ impl HnswIndex {
 
         let dimension = usize::try_from(read_u32(&mut reader, path, "dimension")?)
             .map_err(|_| ann_corrupted(path, "dimension field does not fit in usize"))?;
+        if dimension == 0 || dimension > CHSW_MAX_DIMENSION {
+            return Err(ann_corrupted(
+                path,
+                format!("dimension {dimension} out of valid range 1..={CHSW_MAX_DIMENSION}"),
+            ));
+        }
+
         let record_count = usize::try_from(read_u32(&mut reader, path, "record_count")?)
             .map_err(|_| ann_corrupted(path, "record_count field does not fit in usize"))?;
+
+        // Each record needs at minimum 4 bytes (doc_id_len) + dimension × 4 bytes (vector).
+        // Validate that the implied total doesn't overflow or exceed a sane ceiling.
+        let per_record_min = dimension.checked_mul(4).and_then(|v| v.checked_add(4));
+        let total_data_min = per_record_min.and_then(|pr| record_count.checked_mul(pr));
+        match total_data_min {
+            Some(total) if total > 4 * 1024 * 1024 * 1024 => {
+                return Err(ann_corrupted(
+                    path,
+                    format!(
+                        "record_count {record_count} × dimension {dimension} implies \
+                         {total} bytes, exceeding 4 GiB safety limit"
+                    ),
+                ));
+            }
+            None => {
+                return Err(ann_corrupted(
+                    path,
+                    format!(
+                        "record_count {record_count} × dimension {dimension} overflows \
+                         when computing minimum data size"
+                    ),
+                ));
+            }
+            _ => {}
+        }
 
         let config = HnswConfig {
             m: usize::try_from(read_u32(&mut reader, path, "m")?)
@@ -155,11 +199,17 @@ impl HnswIndex {
                 .map_err(|_| ann_corrupted(path, "max_layer field does not fit in usize"))?,
         };
 
-        let mut doc_ids = Vec::with_capacity(record_count);
-        let mut vectors = Vec::with_capacity(record_count);
+        let mut doc_ids = Vec::with_capacity(record_count.min(CHSW_MAX_PREALLOC_RECORDS));
+        let mut vectors = Vec::with_capacity(record_count.min(CHSW_MAX_PREALLOC_RECORDS));
         for _ in 0..record_count {
             let doc_id_len = usize::try_from(read_u32(&mut reader, path, "doc_id_len")?)
                 .map_err(|_| ann_corrupted(path, "doc_id_len does not fit in usize"))?;
+            if doc_id_len > CHSW_MAX_DOC_ID_LEN {
+                return Err(ann_corrupted(
+                    path,
+                    format!("doc_id_len {doc_id_len} exceeds maximum {CHSW_MAX_DOC_ID_LEN}"),
+                ));
+            }
             let mut doc_id_bytes = vec![0_u8; doc_id_len];
             read_exact_or_corrupted(&mut reader, &mut doc_id_bytes, path, "doc_id")?;
             let doc_id = String::from_utf8(doc_id_bytes)
