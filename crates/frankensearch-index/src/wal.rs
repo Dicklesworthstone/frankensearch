@@ -219,17 +219,25 @@ fn parse_batch(
     }
     let entry_count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
-    let mut cursor = 8;
-    let mut entries = Vec::with_capacity(entry_count);
+    // Bound capacity to what the data can actually hold (minimum 2 bytes header
+    // + vector_bytes per entry) to prevent OOM from malicious entry_count values.
+    let min_entry_bytes = 2_usize.saturating_add(vector_bytes).max(1);
+    let max_possible = data.len().saturating_sub(8) / min_entry_bytes;
+    let mut cursor: usize = 8;
+    let mut entries = Vec::with_capacity(entry_count.min(max_possible));
 
     for _ in 0..entry_count {
-        if cursor + 2 > data.len() {
+        if cursor.checked_add(2).is_none_or(|end| end > data.len()) {
             return Err(());
         }
         let doc_id_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
         cursor += 2;
 
-        if cursor + doc_id_len + vector_bytes > data.len() {
+        let needed = doc_id_len.checked_add(vector_bytes).ok_or(())?;
+        if cursor
+            .checked_add(needed)
+            .is_none_or(|end| end > data.len())
+        {
             return Err(());
         }
         let doc_id = std::str::from_utf8(&data[cursor..cursor + doc_id_len])

@@ -280,7 +280,13 @@ impl LiveIngestPipeline {
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = vi.soft_delete(rel_key).ok();
+        if let Err(error) = vi.soft_delete(rel_key) {
+            tracing::debug!(
+                file_key = %rel_key,
+                error = %error,
+                "soft_delete_vector: ignored (doc may not exist yet)"
+            );
+        }
     }
 
     fn prune_indexes(&self, rel_key: &str) -> frankensearch_core::SearchResult<()> {
@@ -342,7 +348,13 @@ impl LiveIngestPipeline {
                         .vector_index
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = vi.soft_delete(&rel_key).ok();
+                    if let Err(error) = vi.soft_delete(&rel_key) {
+                        tracing::debug!(
+                            file_key = %rel_key,
+                            error = %error,
+                            "upsert soft_delete: ignored (doc may not exist yet)"
+                        );
+                    }
                     vi.append(&rel_key, &embedding)?;
                 }
                 Err(error) => {
@@ -5064,7 +5076,7 @@ mod tests {
     use super::{
         EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
         VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
-        degradation_controller_config_for_profile,
+        degradation_controller_config_for_profile, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::config::{
@@ -6389,6 +6401,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn runtime_status_payload_reports_index_and_model_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("project");
@@ -6477,6 +6490,27 @@ mod tests {
         assert!(payload.models[0].cached);
         assert_eq!(payload.models[1].tier, "quality");
         assert!(!payload.models[1].cached);
+        assert_eq!(
+            payload.runtime.tracked_index_bytes,
+            Some(payload.index.size_bytes)
+        );
+        assert!(
+            payload.runtime.disk_budget_stage.is_some(),
+            "status payload should expose disk budget stage"
+        );
+        assert!(
+            payload.runtime.disk_budget_action.is_some(),
+            "status payload should expose disk budget action"
+        );
+        assert!(
+            payload.runtime.disk_budget_reason_code.is_some(),
+            "status payload should expose disk budget reason code"
+        );
+
+        let table = render_status_table(&payload, true);
+        assert!(table.contains("disk budget stage:"));
+        assert!(table.contains("disk budget action:"));
+        assert!(table.contains("disk budget reason:"));
     }
 
     #[test]

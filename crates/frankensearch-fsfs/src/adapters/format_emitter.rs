@@ -442,8 +442,6 @@ fn render_search_table_with_options(
     let mut out = String::new();
     let query_terms = collect_query_terms(&payload.query);
     let total_ms = duration_ms.unwrap_or(0);
-    let fast_ms = total_ms;
-    let quality_ms = 0_u64;
     let snippet_width = width.saturating_sub(34).max(32);
     let phase = payload.phase.to_string().to_ascii_uppercase();
     let phase_label = paint(&phase, "1;34", color_enabled);
@@ -459,11 +457,7 @@ fn render_search_table_with_options(
             "No results for \"{}\". Try broadening your search or checking the index with fsfs status.",
             payload.query
         );
-        let _ = writeln!(
-            out,
-            "{} results in {total_ms}ms (fast: {fast_ms}ms, quality: {quality_ms}ms)",
-            payload.returned_hits
-        );
+        let _ = writeln!(out, "{} results in {total_ms}ms", payload.returned_hits);
         return out;
     }
 
@@ -497,11 +491,7 @@ fn render_search_table_with_options(
         }
     }
 
-    let _ = writeln!(
-        out,
-        "{} results in {total_ms}ms (fast: {fast_ms}ms, quality: {quality_ms}ms)",
-        payload.returned_hits
-    );
+    let _ = writeln!(out, "{} results in {total_ms}ms", payload.returned_hits);
     out
 }
 
@@ -899,7 +889,7 @@ mod tests {
         assert!(output.contains("[both]"));
         assert!(output.contains("[lexical]"));
         assert!(output.contains("fn authenticate(token: &str) -> bool"));
-        assert!(output.contains("2 results in 0ms (fast: 0ms, quality: 0ms)"));
+        assert!(output.contains("2 results in 0ms"));
     }
 
     #[test]
@@ -908,7 +898,7 @@ mod tests {
         let output = render_search_table_with_options(&payload, Some(19), false, 80);
         assert!(output.contains("No results for \"auth middleware\"."));
         assert!(output.contains("checking the index with fsfs status"));
-        assert!(output.contains("0 results in 19ms (fast: 19ms, quality: 0ms)"));
+        assert!(output.contains("0 results in 19ms"));
     }
 
     #[test]
@@ -929,7 +919,7 @@ mod tests {
         );
         let output = render_search_table_with_options(&payload, Some(42), true, 80);
         assert!(output.contains("\u{1b}["));
-        assert!(output.contains("1 results in 42ms (fast: 42ms, quality: 0ms)"));
+        assert!(output.contains("1 results in 42ms"));
     }
 
     #[test]

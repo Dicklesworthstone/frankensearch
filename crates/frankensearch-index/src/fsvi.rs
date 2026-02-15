@@ -326,18 +326,45 @@ impl VectorIndex {
 
         let record_table_offset = header.header_size;
         let record_count = header.record_count as usize;
-        let string_table_offset = record_table_offset + record_count * RECORD_ENTRY_SIZE;
+        let string_table_offset = record_table_offset
+            .checked_add(record_count.checked_mul(RECORD_ENTRY_SIZE).ok_or_else(|| {
+                SearchError::IndexCorrupted {
+                    path: path_str.clone(),
+                    detail: "record_count overflow in record table size".into(),
+                }
+            })?)
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: path_str.clone(),
+                detail: "record table offset overflow".into(),
+            })?;
 
         // Compute string table size by scanning record entries
         let string_table_size = Self::compute_string_table_size(&mmap, &header, &path_str)?;
 
-        let raw_slab_start = string_table_offset + string_table_size;
+        let raw_slab_start = string_table_offset
+            .checked_add(string_table_size)
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: path_str.clone(),
+                detail: "string table offset overflow".into(),
+            })?;
         let vector_slab_offset = align_up(raw_slab_start, VECTOR_ALIGN_BYTES);
 
         // Validate file size
-        let expected_slab_size =
-            record_count * header.dimension as usize * header.quantization.element_size();
-        let expected_file_size = vector_slab_offset + expected_slab_size;
+        let dim = header.dimension as usize;
+        let elem = header.quantization.element_size();
+        let expected_slab_size = record_count
+            .checked_mul(dim)
+            .and_then(|v| v.checked_mul(elem))
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: path_str.clone(),
+                detail: "vector slab size overflow".into(),
+            })?;
+        let expected_file_size = vector_slab_offset
+            .checked_add(expected_slab_size)
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: path_str.clone(),
+                detail: "expected file size overflow".into(),
+            })?;
         if mmap.len() < expected_file_size {
             return Err(SearchError::IndexCorrupted {
                 path: path_str,
@@ -368,10 +395,26 @@ impl VectorIndex {
         let mut max_end: usize = 0;
 
         for i in 0..record_count {
-            let entry_offset = record_table_offset + i * RECORD_ENTRY_SIZE;
+            let entry_offset = record_table_offset
+                .checked_add(i.checked_mul(RECORD_ENTRY_SIZE).ok_or_else(|| {
+                    SearchError::IndexCorrupted {
+                        path: path.to_owned(),
+                        detail: "record entry offset overflow".into(),
+                    }
+                })?)
+                .ok_or_else(|| SearchError::IndexCorrupted {
+                    path: path.to_owned(),
+                    detail: "record entry offset overflow".into(),
+                })?;
             let doc_offset = read_u32(data, entry_offset)? as usize;
             let doc_len = read_u16(data, entry_offset + 4)? as usize;
-            let end = doc_offset + doc_len;
+            let end =
+                doc_offset
+                    .checked_add(doc_len)
+                    .ok_or_else(|| SearchError::IndexCorrupted {
+                        path: path.to_owned(),
+                        detail: "doc_id string range overflow".into(),
+                    })?;
             if end > max_end {
                 max_end = end;
             }
@@ -382,8 +425,24 @@ impl VectorIndex {
         }
 
         // Verify the string table is within bounds
-        let string_table_offset = record_table_offset + record_count * RECORD_ENTRY_SIZE;
-        if string_table_offset + max_end > data.len() {
+        let string_table_offset = record_table_offset
+            .checked_add(record_count.checked_mul(RECORD_ENTRY_SIZE).ok_or_else(|| {
+                SearchError::IndexCorrupted {
+                    path: path.to_owned(),
+                    detail: "record table size overflow".into(),
+                }
+            })?)
+            .ok_or_else(|| SearchError::IndexCorrupted {
+                path: path.to_owned(),
+                detail: "string table offset overflow".into(),
+            })?;
+        let bounds_end = string_table_offset.checked_add(max_end).ok_or_else(|| {
+            SearchError::IndexCorrupted {
+                path: path.to_owned(),
+                detail: "string table bounds overflow".into(),
+            }
+        })?;
+        if bounds_end > data.len() {
             return Err(SearchError::IndexCorrupted {
                 path: path.to_owned(),
                 detail: "string table extends beyond file".into(),
@@ -494,9 +553,7 @@ impl VectorIndex {
                 let bytes = &self.mmap[byte_offset..byte_end];
                 bytes
                     .chunks_exact(2)
-                    .map(|chunk| {
-                        f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()
-                    })
+                    .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                     .collect()
             }
             Quantization::F32 => {
@@ -693,7 +750,10 @@ impl VectorIndexWriter {
 
         // Flush and fsync
         self.writer.flush().map_err(SearchError::Io)?;
-        let file = self.writer.into_inner().map_err(|e| SearchError::Io(e.into_error()))?;
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|e| SearchError::Io(e.into_error()))?;
         file.sync_all().map_err(SearchError::Io)?;
 
         // fsync parent directory for durability
@@ -749,9 +809,7 @@ mod tests {
             VectorIndexWriter::create(&path, "test-embedder", "rev1", dim, Quantization::F16)
                 .unwrap();
         for (i, v) in vecs.iter().enumerate() {
-            writer
-                .write_record(&format!("doc-{i}"), v)
-                .unwrap();
+            writer.write_record(&format!("doc-{i}"), v).unwrap();
         }
         writer.finish().unwrap();
 
@@ -768,10 +826,7 @@ mod tests {
             let recovered = index.vector_f32_at(i);
             assert_eq!(recovered.len(), dim as usize);
             for (a, b) in original.iter().zip(recovered.iter()) {
-                assert!(
-                    (a - b).abs() < 0.001,
-                    "f16 roundtrip error: {a} vs {b}"
-                );
+                assert!((a - b).abs() < 0.001, "f16 roundtrip error: {a} vs {b}");
             }
         }
 
@@ -839,7 +894,13 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, SearchError::DimensionMismatch { expected: 3, actual: 2 }),
+            matches!(
+                err,
+                SearchError::DimensionMismatch {
+                    expected: 3,
+                    actual: 2
+                }
+            ),
             "expected DimensionMismatch, got: {err}"
         );
 
@@ -938,9 +999,7 @@ mod tests {
             let vec: Vec<f32> = (0..dim)
                 .map(|d| ((i * dim as usize + d) as f32) * 0.001)
                 .collect();
-            writer
-                .write_record(&format!("doc-{i:04}"), &vec)
-                .unwrap();
+            writer.write_record(&format!("doc-{i:04}"), &vec).unwrap();
         }
         writer.finish().unwrap();
 
@@ -985,9 +1044,7 @@ mod tests {
         writer
             .write_record("a-longer-document-id", &[0.0, 1.0])
             .unwrap();
-        writer
-            .write_record("unicode-café", &[0.5, 0.5])
-            .unwrap();
+        writer.write_record("unicode-café", &[0.5, 0.5]).unwrap();
         writer.finish().unwrap();
 
         let index = VectorIndex::open(&path).unwrap();
