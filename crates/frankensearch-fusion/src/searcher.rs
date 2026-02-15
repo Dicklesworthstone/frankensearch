@@ -38,6 +38,7 @@ use frankensearch_core::{
     LiveSearchStreamEmitter, RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase,
     SearchStreamHealth, TelemetryCorrelation, TelemetryInstance,
 };
+use frankensearch_embed::CachedEmbedder;
 use frankensearch_index::TwoTierIndex;
 
 use crate::blend::{blend_two_tier, compute_rank_changes, kendall_tau};
@@ -90,6 +91,8 @@ pub struct TwoTierSearcher {
     live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
     canonicalizer: Box<dyn Canonicalizer>,
     config: TwoTierConfig,
+    /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
+    embedding_cache_capacity: Option<usize>,
 }
 
 impl TwoTierSearcher {
@@ -111,13 +114,21 @@ impl TwoTierSearcher {
             live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
             canonicalizer: Box::new(DefaultCanonicalizer::default()),
             config,
+            embedding_cache_capacity: None,
         }
     }
 
     /// Set the quality-tier embedder for progressive refinement.
+    ///
+    /// If `with_embedding_cache` was called first, the quality embedder is
+    /// automatically wrapped with a `CachedEmbedder` at the same capacity.
     #[must_use]
     pub fn with_quality_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
-        self.quality_embedder = Some(embedder);
+        if let Some(cap) = self.embedding_cache_capacity {
+            self.quality_embedder = Some(Arc::new(CachedEmbedder::new(embedder, cap)));
+        } else {
+            self.quality_embedder = Some(embedder);
+        }
         self
     }
 
@@ -166,6 +177,24 @@ impl TwoTierSearcher {
     #[must_use]
     pub fn with_canonicalizer(mut self, canonicalizer: Box<dyn Canonicalizer>) -> Self {
         self.canonicalizer = canonicalizer;
+        self
+    }
+
+    /// Wrap the fast (and quality, if set) embedders with a query embedding cache.
+    ///
+    /// Repeated queries will return cached vectors instead of re-running inference.
+    /// `capacity` controls the maximum number of cached embeddings per embedder
+    /// (FIFO eviction when full).
+    ///
+    /// Safe to call in any builder order: if `with_quality_embedder` is called
+    /// later, the quality embedder is automatically wrapped at the same capacity.
+    #[must_use]
+    pub fn with_embedding_cache(mut self, capacity: usize) -> Self {
+        self.embedding_cache_capacity = Some(capacity);
+        self.fast_embedder = Arc::new(CachedEmbedder::new(self.fast_embedder, capacity));
+        if let Some(qe) = self.quality_embedder.take() {
+            self.quality_embedder = Some(Arc::new(CachedEmbedder::new(qe, capacity)));
+        }
         self
     }
 
@@ -2726,6 +2755,192 @@ mod tests {
                 assert_eq!(search_events.len(), 1);
                 assert!(!search_events[0].refined);
             }
+        });
+    }
+
+    // ─── Counting Embedder (for cache-wiring tests) ────────────────────
+
+    /// Embedder that counts inner `embed()` invocations via an external counter.
+    struct CountingEmbedder {
+        id: &'static str,
+        dimension: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingEmbedder {
+        fn new(
+            id: &'static str,
+            dimension: usize,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                id,
+                dimension,
+                calls,
+            }
+        }
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dim = self.dimension;
+            Box::pin(async move {
+                let mut vec = vec![0.0; dim];
+                if !vec.is_empty() {
+                    vec[0] = 1.0;
+                }
+                Ok(vec)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    // ─── Cache-wiring tests ────────────────────────────────────────────
+
+    #[test]
+    fn embedding_cache_wraps_fast_tier() {
+        let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone()));
+
+        let index = build_test_index(4);
+        let searcher =
+            TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_embedding_cache(64);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // First search: fast embedder called
+            let _ = searcher
+                .search(&cx, "hello world", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let after_first = fast_calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                after_first >= 1,
+                "fast embedder should be called at least once"
+            );
+
+            // Same query again: should hit cache, no additional inner calls
+            let _ = searcher
+                .search(&cx, "hello world", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let after_second = fast_calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after_first, after_second,
+                "repeated query should hit cache (fast tier)"
+            );
+        });
+    }
+
+    #[test]
+    fn embedding_cache_wraps_quality_tier_when_set_before() {
+        let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
+        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
+
+        let index = build_test_index(4);
+        // quality set BEFORE cache — both should be wrapped
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality)
+            .with_embedding_cache(64);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let _ = searcher
+                .search(&cx, "cache test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let q_after_first = quality_calls.load(std::sync::atomic::Ordering::Relaxed);
+
+            let _ = searcher
+                .search(&cx, "cache test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let q_after_second = quality_calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                q_after_first, q_after_second,
+                "repeated query should hit cache (quality tier, set before cache)"
+            );
+        });
+    }
+
+    #[test]
+    fn embedding_cache_wraps_quality_tier_when_set_after() {
+        let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
+        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
+
+        let index = build_test_index(4);
+        // cache set BEFORE quality — quality should still be auto-wrapped
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_embedding_cache(64)
+            .with_quality_embedder(quality);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let _ = searcher
+                .search(&cx, "order test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let q_after_first = quality_calls.load(std::sync::atomic::Ordering::Relaxed);
+
+            let _ = searcher
+                .search(&cx, "order test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let q_after_second = quality_calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                q_after_first, q_after_second,
+                "repeated query should hit cache (quality tier, set after cache)"
+            );
+        });
+    }
+
+    #[test]
+    fn different_queries_are_cache_misses() {
+        let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone()));
+
+        let index = build_test_index(4);
+        let searcher =
+            TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_embedding_cache(64);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let _ = searcher
+                .search(&cx, "query alpha", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let after_alpha = fast_calls.load(std::sync::atomic::Ordering::Relaxed);
+
+            let _ = searcher
+                .search(&cx, "query beta", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+            let after_beta = fast_calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                after_beta > after_alpha,
+                "different query should be a cache miss"
+            );
         });
     }
 }
