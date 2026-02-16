@@ -347,8 +347,16 @@ impl FsWatcher {
         }
 
         let mut control = lock_or_recover(&self.control);
-        if control.worker.is_some() {
-            return Ok(());
+        if let Some(worker) = control.worker.take() {
+            if worker.is_finished() {
+                if let Err(error) = worker.join() {
+                    warn!(?error, "previous fsfs watcher worker panicked");
+                }
+                control.stop_flag = None;
+            } else {
+                control.worker = Some(worker);
+                return Ok(());
+            }
         }
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -580,9 +588,19 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             }
             Err(error) => {
                 context.stats.add_error();
-                let retried = requeue_failed_ready_events(&mut pending, ready);
-                warn!(error = %error, "watcher failed to apply ingest batch");
-                debug!(retried, "watcher requeued failed batch for retry");
+                if should_retry_ingest_error(&error) {
+                    let retried = requeue_failed_ready_events(&mut pending, ready);
+                    warn!(error = %error, "watcher failed to apply ingest batch");
+                    debug!(retried, "watcher requeued failed batch for retry");
+                } else {
+                    let dropped = ready.len();
+                    context.stats.add_skipped(dropped);
+                    warn!(
+                        error = %error,
+                        dropped,
+                        "watcher dropped non-retryable ingest batch"
+                    );
+                }
             }
         }
     }
@@ -599,6 +617,18 @@ fn requeue_failed_ready_events(pending: &mut PendingEvents, ready: Vec<WatchEven
         count = count.saturating_add(1);
     }
     count
+}
+
+fn should_retry_ingest_error(error: &SearchError) -> bool {
+    matches!(
+        error,
+        SearchError::Io(_)
+            | SearchError::EmbeddingFailed { .. }
+            | SearchError::SearchTimeout { .. }
+            | SearchError::Cancelled { .. }
+            | SearchError::QueueFull { .. }
+            | SearchError::SubsystemError { .. }
+    )
 }
 
 fn process_notify_result(
@@ -1049,7 +1079,7 @@ mod tests {
         DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
         PendingEvents, WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestOp,
         WatchIngestPipeline, WatcherExecutionPolicy, normalize_file_key, now_millis,
-        requeue_failed_ready_events,
+        requeue_failed_ready_events, should_retry_ingest_error,
     };
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
@@ -1546,6 +1576,25 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_treats_invalid_config_as_non_retryable() {
+        let invalid = SearchError::InvalidConfig {
+            field: "file_key".to_owned(),
+            value: "../etc/passwd".to_owned(),
+            reason: "path escapes target root".to_owned(),
+        };
+        assert!(!should_retry_ingest_error(&invalid));
+
+        let dimension_mismatch = SearchError::DimensionMismatch {
+            expected: 384,
+            found: 768,
+        };
+        assert!(!should_retry_ingest_error(&dimension_mismatch));
+
+        let io_error = SearchError::Io(io::Error::other("temporary failure"));
+        assert!(should_retry_ingest_error(&io_error));
+    }
+
+    #[test]
     fn start_and_stop_worker_without_runtime_integration() {
         run_test_with_cx(|cx| async move {
             let temp = tempdir().expect("tempdir");
@@ -1556,6 +1605,51 @@ mod tests {
             );
 
             watcher.start(&cx).await.expect("start watcher");
+            watcher.stop().await;
+        });
+    }
+
+    #[test]
+    fn start_replaces_finished_worker_handle() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let root = temp.path().join("watched");
+            let watcher = FsWatcher::new(
+                vec![root.clone()],
+                DiscoveryConfig::default(),
+                Arc::new(NoopWatchIngestPipeline),
+            );
+
+            // Missing root => worker exits quickly with zero watched dirs.
+            watcher.start(&cx).await.expect("initial start");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            {
+                let control = lock_or_recover(&watcher.control);
+                let worker = control
+                    .worker
+                    .as_ref()
+                    .expect("worker handle should be retained");
+                assert!(worker.is_finished(), "expected initial worker to have exited");
+            }
+
+            // Create the root and start again. This should replace the finished handle.
+            fs::create_dir_all(&root).expect("create watcher root");
+            watcher.start(&cx).await.expect("restart watcher");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            {
+                let control = lock_or_recover(&watcher.control);
+                let worker = control
+                    .worker
+                    .as_ref()
+                    .expect("worker handle should exist after restart");
+                assert!(
+                    !worker.is_finished(),
+                    "watcher should replace finished worker handle on restart"
+                );
+            }
+
             watcher.stop().await;
         });
     }

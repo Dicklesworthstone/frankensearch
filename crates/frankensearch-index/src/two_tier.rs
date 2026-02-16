@@ -1110,6 +1110,83 @@ mod tests {
         assert_eq!(after_config.ef_search, 48);
     }
 
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_sidecar_rebuilds_when_vectors_change_with_same_doc_ids() {
+        let dir = temp_index_dir("ann-rebuild-vectors");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0, 0.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write initial fast index");
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 64,
+            ..TwoTierConfig::default()
+        };
+        let first = TwoTierIndex::open(&dir, config).expect("open initial");
+        assert!(first.has_fast_ann());
+        let before = first.search_fast(&[1.0, 0.0, 0.0], 1).expect("search before");
+        assert_eq!(before[0].doc_id, "doc-a");
+
+        // Same doc IDs/order, but vectors are swapped. Sidecar must rebuild.
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[0.0, 1.0, 0.0]), ("doc-b", &[1.0, 0.0, 0.0])],
+        )
+        .expect("rewrite fast index");
+
+        let reopened = TwoTierIndex::open(&dir, config).expect("reopen");
+        assert!(reopened.has_fast_ann());
+        let after = reopened.search_fast(&[1.0, 0.0, 0.0], 1).expect("search after");
+        assert_eq!(
+            after[0].doc_id, "doc-b",
+            "ANN sidecar should rebuild when vector content changes"
+        );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_search_excludes_tombstoned_docs() {
+        let dir = temp_index_dir("ann-tombstones");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        let fast_index = VectorIndex::open(&fast_path).expect("open fast index");
+        let deleted = fast_index
+            .soft_delete("doc-b")
+            .expect("soft delete should succeed");
+        assert_eq!(deleted, 1);
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 64,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).expect("open with ann");
+        assert!(index.has_fast_ann());
+
+        let hits = index.search_fast(&[0.0, 1.0, 0.0], 10).expect("search");
+        assert!(
+            !hits.iter().any(|hit| hit.doc_id == "doc-b"),
+            "tombstoned document should not be returned by ANN search"
+        );
+    }
+
     // ─── bd-3szp tests begin ───
 
     #[test]
