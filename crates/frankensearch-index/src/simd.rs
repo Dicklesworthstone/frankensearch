@@ -21,38 +21,38 @@ pub fn dot_product_f32_f32(a: &[f32], b: &[f32]) -> SearchResult<f32> {
 /// Returns `SearchError::DimensionMismatch` when slice lengths differ.
 pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     ensure_same_len(stored.len(), query.len())?;
-    let len = stored.len();
-    let chunks = len / 8;
+    
     let mut sum = f32x8::splat(0.0);
+    let mut stored_chunks = stored.chunks_exact(8);
+    let mut query_chunks = query.chunks_exact(8);
 
-    for chunk_index in 0..chunks {
-        let base = chunk_index * 8;
-        let stored_chunk = [
-            stored[base].to_f32(),
-            stored[base + 1].to_f32(),
-            stored[base + 2].to_f32(),
-            stored[base + 3].to_f32(),
-            stored[base + 4].to_f32(),
-            stored[base + 5].to_f32(),
-            stored[base + 6].to_f32(),
-            stored[base + 7].to_f32(),
+    for (stored_chunk, query_chunk) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
+        let s = [
+            stored_chunk[0].to_f32(),
+            stored_chunk[1].to_f32(),
+            stored_chunk[2].to_f32(),
+            stored_chunk[3].to_f32(),
+            stored_chunk[4].to_f32(),
+            stored_chunk[5].to_f32(),
+            stored_chunk[6].to_f32(),
+            stored_chunk[7].to_f32(),
         ];
-        let query_chunk = [
-            query[base],
-            query[base + 1],
-            query[base + 2],
-            query[base + 3],
-            query[base + 4],
-            query[base + 5],
-            query[base + 6],
-            query[base + 7],
+        let q = [
+            query_chunk[0],
+            query_chunk[1],
+            query_chunk[2],
+            query_chunk[3],
+            query_chunk[4],
+            query_chunk[5],
+            query_chunk[6],
+            query_chunk[7],
         ];
-        sum += f32x8::from(stored_chunk) * f32x8::from(query_chunk);
+        sum += f32x8::from(s) * f32x8::from(q);
     }
 
     let mut result = sum.reduce_add();
-    for index in (chunks * 8)..len {
-        result += stored[index].to_f32() * query[index];
+    for (s, q) in stored_chunks.remainder().iter().zip(query_chunks.remainder()) {
+        result += s.to_f32() * q;
     }
     Ok(result)
 }
@@ -176,38 +176,25 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 }
 
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len();
-    let chunks = len / 8;
     let mut sum = f32x8::splat(0.0);
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
 
-    for chunk_index in 0..chunks {
-        let base = chunk_index * 8;
-        let a_chunk = [
-            a[base],
-            a[base + 1],
-            a[base + 2],
-            a[base + 3],
-            a[base + 4],
-            a[base + 5],
-            a[base + 6],
-            a[base + 7],
+    for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        let a_arr = [
+            a_chunk[0], a_chunk[1], a_chunk[2], a_chunk[3], a_chunk[4], a_chunk[5], a_chunk[6],
+            a_chunk[7],
         ];
-        let b_chunk = [
-            b[base],
-            b[base + 1],
-            b[base + 2],
-            b[base + 3],
-            b[base + 4],
-            b[base + 5],
-            b[base + 6],
-            b[base + 7],
+        let b_arr = [
+            b_chunk[0], b_chunk[1], b_chunk[2], b_chunk[3], b_chunk[4], b_chunk[5], b_chunk[6],
+            b_chunk[7],
         ];
-        sum += f32x8::from(a_chunk) * f32x8::from(b_chunk);
+        sum += f32x8::from(a_arr) * f32x8::from(b_arr);
     }
 
     let mut result = sum.reduce_add();
-    for index in (chunks * 8)..len {
-        result += a[index] * b[index];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        result += x * y;
     }
     result
 }
