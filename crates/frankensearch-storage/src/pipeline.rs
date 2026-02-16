@@ -3553,7 +3553,6 @@ mod integration_tests {
     fn process_batch_reads_source_file_content_if_available() {
         use std::io::Write;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let sink = Arc::new(InMemoryVectorSink::default());
             // Create a SpyEmbedder that records the text it sees.
             #[derive(Debug)]
             struct SpyEmbedder {
@@ -3567,10 +3566,10 @@ mod integration_tests {
                 fn dimension(&self) -> usize {
                     4
                 }
-                fn id(&self) -> &str {
+                fn id(&self) -> &'static str {
                     "spy"
                 }
-                fn model_name(&self) -> &str {
+                fn model_name(&self) -> &'static str {
                     "spy"
                 }
                 fn is_semantic(&self) -> bool {
@@ -3580,6 +3579,7 @@ mod integration_tests {
                     ModelCategory::StaticEmbedder
                 }
             }
+            let sink = Arc::new(InMemoryVectorSink::default());
             let captured = Arc::new(Mutex::new(None));
             let fast = Arc::new(SpyEmbedder {
                 captured: Arc::clone(&captured),
