@@ -131,14 +131,14 @@ pub(crate) fn read_wal(
     path: &Path,
     expected_dimension: usize,
     quantization: Quantization,
-) -> SearchResult<(Vec<WalEntry>, u8)> {
+) -> SearchResult<(Vec<WalEntry>, u8, u64)> {
     if !path.exists() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
     let data = std::fs::read(path)?;
     if data.len() < WAL_HEADER_SIZE {
         warn!(path = %path.display(), len = data.len(), "WAL file too small, ignoring");
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
     parse_wal_bytes(&data, expected_dimension, quantization, path)
 }
@@ -148,7 +148,7 @@ fn parse_wal_bytes(
     expected_dimension: usize,
     quantization: Quantization,
     path: &Path,
-) -> SearchResult<(Vec<WalEntry>, u8)> {
+) -> SearchResult<(Vec<WalEntry>, u8, u64)> {
     // Header validation.
     if data[..4] != WAL_MAGIC {
         return Err(wal_corrupted(path, "bad magic bytes"));
@@ -203,7 +203,7 @@ fn parse_wal_bytes(
     }
 
     debug!(path = %path.display(), entries = entries.len(), "loaded WAL entries");
-    Ok((entries, compaction_gen))
+    Ok((entries, compaction_gen, cursor as u64))
 }
 
 fn parse_batch(

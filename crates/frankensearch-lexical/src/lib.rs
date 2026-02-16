@@ -603,6 +603,7 @@ impl LexicalSearch for TantivyIndex {
                     doc_id,
                     score: bm25_score,
                     source: ScoreSource::Lexical,
+                    index: None,
                     fast_score: None,
                     quality_score: None,
                     lexical_score: Some(bm25_score),

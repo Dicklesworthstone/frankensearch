@@ -52,6 +52,7 @@ pub mod two_tier;
 pub mod wal;
 pub mod warmup;
 mod repro_soft_delete_rollback;
+mod repro_wal_truncation;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -243,8 +244,27 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        let (mut wal_entries, wal_compaction_gen) =
+        let (mut wal_entries, wal_compaction_gen, valid_len) =
             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+
+        // If the WAL file has trailing garbage (e.g. from a crash during append),
+        // truncate it to the valid length so future appends are contiguous.
+        if wal_path.exists() {
+            let actual_len = std::fs::metadata(&wal_path)
+                .map_err(SearchError::Io)?
+                .len();
+            if actual_len > valid_len {
+                tracing::warn!(
+                    path = %wal_path.display(),
+                    actual_len,
+                    valid_len,
+                    "truncating corrupted WAL trailer"
+                );
+                let file = OpenOptions::new().write(true).open(&wal_path).map_err(SearchError::Io)?;
+                file.set_len(valid_len).map_err(SearchError::Io)?;
+                file.sync_all().map_err(SearchError::Io)?;
+            }
+        }
 
         // Stale WAL detection:
         //
