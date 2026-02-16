@@ -23,7 +23,7 @@ use tracing::instrument;
 
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Default quality-tier model directory name.
 pub const DEFAULT_MODEL_NAME: &str = "all-MiniLM-L6-v2";
@@ -178,7 +178,7 @@ impl FastEmbedEmbedder {
                     source: format!("fastembed inference failed: {e}").into(),
                 })?;
 
-        let embedding = embeddings
+        let mut embedding = embeddings
             .pop()
             .ok_or_else(|| SearchError::EmbeddingFailed {
                 model: self.name.clone(),
@@ -196,7 +196,8 @@ impl FastEmbedEmbedder {
             });
         }
 
-        Ok(l2_normalize(&embedding))
+        normalize_in_place(&mut embedding);
+        Ok(embedding)
     }
 
     /// Embed a batch of non-empty strings.
@@ -207,7 +208,7 @@ impl FastEmbedEmbedder {
             .await
             .map_err(|err| map_lock_error(&self.name, "fastembed.embed_batch", err))?;
 
-        let embeddings =
+        let mut embeddings =
             model
                 .embed(texts.to_vec(), None)
                 .map_err(|e| SearchError::EmbeddingFailed {
@@ -227,8 +228,7 @@ impl FastEmbedEmbedder {
             });
         }
 
-        let mut normalized = Vec::with_capacity(embeddings.len());
-        for embedding in embeddings {
+        for embedding in &mut embeddings {
             if embedding.len() != DEFAULT_DIMENSION {
                 return Err(SearchError::EmbeddingFailed {
                     model: self.name.clone(),
@@ -239,15 +239,27 @@ impl FastEmbedEmbedder {
                     .into(),
                 });
             }
-            normalized.push(l2_normalize(&embedding));
+            normalize_in_place(embedding);
         }
-        Ok(normalized)
+        Ok(embeddings)
     }
 
     /// Directory containing model assets.
     #[must_use]
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
+    }
+}
+
+fn normalize_in_place(vec: &mut [f32]) {
+    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+    if norm_sq.is_finite() && norm_sq > f32::EPSILON {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        for x in vec {
+            *x *= inv_norm;
+        }
+    } else {
+        vec.fill(0.0);
     }
 }
 

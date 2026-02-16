@@ -894,9 +894,20 @@ fn collect_snapshot_for_root(
     }
 
     // Handle single-file roots explicitly to avoid walk errors
-    let metadata = fs::symlink_metadata(root).map_err(SearchError::Io)?;
+    let symlink_meta = fs::symlink_metadata(root).map_err(SearchError::Io)?;
+    let (metadata, is_symlink) = if symlink_meta.is_symlink() {
+        match fs::metadata(root) {
+            Ok(target) if target.is_file() => (target, true),
+            Ok(_) => (symlink_meta, false), // Directory or other: let walker handle it
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // Broken link
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        (symlink_meta, false)
+    };
+
     if metadata.is_file() {
-        let mut candidate = DiscoveryCandidate::new(root, metadata.len());
+        let mut candidate = DiscoveryCandidate::new(root, metadata.len()).with_symlink(is_symlink);
         if let Some(category) = lookup_mount_category(mount_table, root) {
             candidate = candidate.with_mount_category(category);
         }

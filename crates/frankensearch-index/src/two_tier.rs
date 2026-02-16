@@ -262,7 +262,37 @@ impl TwoTierIndex {
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> SearchResult<Vec<VectorHit>> {
         #[cfg(feature = "ann")]
         if let Some(ann) = &self.fast_ann {
-            return ann.knn_search(query_vec, k, self.config.hnsw_ef_search);
+            // Fetch a few extra candidates to buffer against soft-deleted records.
+            // This isn't perfect but helps maintain recall when tombstones exist.
+            let fetch_k = k.saturating_add(10);
+            let mut hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
+
+            // Filter soft-deleted records from ANN results (HNSW index is static).
+            hits.retain(|hit| !self.fast_index.is_deleted(hit.index as usize));
+
+            // Merge WAL entries (not yet in ANN).
+            if !self.fast_index.wal_entries.is_empty() {
+                let base_index = self.fast_index.record_count();
+                for (i, entry) in self.fast_index.wal_entries.iter().enumerate() {
+                    let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
+                    // Virtual index logic must match VectorIndex::resolve_wal_hit
+                    let index = u32::try_from(base_index + i).unwrap_or(u32::MAX);
+                    hits.push(VectorHit {
+                        index,
+                        score,
+                        doc_id: entry.doc_id.clone(),
+                    });
+                }
+                // Re-sort and truncate after merging
+                hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+                if hits.len() > k {
+                    hits.truncate(k);
+                }
+            } else if hits.len() > k {
+                // If no WAL but we fetched extra for filtering, truncate back to k
+                hits.truncate(k);
+            }
+            return Ok(hits);
         }
         self.fast_index.search_top_k(query_vec, k, None)
     }
