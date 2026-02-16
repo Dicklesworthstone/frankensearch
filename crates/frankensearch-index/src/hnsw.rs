@@ -4,11 +4,10 @@
 //!
 //! # Persistence
 //!
-//! Persistence is split into two files:
-//! 1. The main file (e.g. `vector.fast.hnsw`) stores metadata: `doc_ids` and `HnswConfig`.
-//! 2. A sidecar file (`vector.fast.hnsw.graph`) stores the native `hnsw_rs` graph.
-//!
-//! This ensures fast startup by loading the pre-built graph instead of rebuilding it.
+//! Persistence uses one metadata file plus `hnsw_rs` sidecars:
+//! 1. `vector.fast.hnsw` stores metadata (`doc_ids`, `HnswConfig`, dimension).
+//! 2. `vector.fast.hnsw.graph` stores graph topology.
+//! 3. `vector.fast.hnsw.data` stores vector payload for reloading.
 
 use std::path::Path;
 use std::time::Instant;
@@ -134,27 +133,49 @@ impl HnswIndex {
         // 2. Load graph + vectors from hnsw_rs sidecar files.
         let (directory, basename) = dump_location(path)?;
         let mut reloader = HnswIo::new(&directory, &basename);
-        let hnsw = reloader.load_hnsw::<f32, DistDot>().map_err(|e| {
+        let loaded = reloader.load_hnsw::<f32, DistDot>().map_err(|e| {
             ann_corrupted(path, format!("failed to load HNSW graph sidecar pair: {e}"))
         })?;
 
-        if hnsw.get_nb_point() != meta.doc_ids.len() {
+        if loaded.get_nb_point() != meta.doc_ids.len() {
             return Err(ann_corrupted(
                 path,
                 format!(
                     "graph size ({}) mismatch with doc_ids count ({})",
-                    hnsw.get_nb_point(),
+                    loaded.get_nb_point(),
                     meta.doc_ids.len()
                 ),
             ));
         }
 
-        Ok(Self {
-            hnsw,
-            doc_ids: meta.doc_ids,
-            dimension: meta.dimension,
-            config: meta.config,
-        })
+        // Convert loaded points back to row-ordered vectors (origin id order),
+        // then rebuild a `'static` HNSW so we are not tied to the reloader lifetime.
+        let mut vectors_by_origin: Vec<Option<Vec<f32>>> = vec![None; meta.doc_ids.len()];
+        for point in loaded.get_point_indexation().get_layer_iterator(0) {
+            let origin_id = point.get_origin_id();
+            if origin_id >= vectors_by_origin.len() {
+                return Err(ann_corrupted(
+                    path,
+                    format!(
+                        "loaded origin id {origin_id} exceeds doc_id count {}",
+                        vectors_by_origin.len()
+                    ),
+                ));
+            }
+            vectors_by_origin[origin_id] = Some(point.get_v().to_vec());
+        }
+        let mut vectors = Vec::with_capacity(vectors_by_origin.len());
+        for (origin_id, maybe_vector) in vectors_by_origin.into_iter().enumerate() {
+            let vector = maybe_vector.ok_or_else(|| {
+                ann_corrupted(
+                    path,
+                    format!("missing loaded vector for origin id {origin_id}"),
+                )
+            })?;
+            vectors.push(vector);
+        }
+
+        Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
     }
 
     /// Persist ANN index to disk.

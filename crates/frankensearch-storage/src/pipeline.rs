@@ -2483,10 +2483,7 @@ mod integration_tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
     use std::collections::HashSet;
-    use std::io;
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
@@ -2494,9 +2491,9 @@ mod integration_tests {
     use frankensearch_core::{Canonicalizer, Embedder, SearchError};
     use fsqlite_types::value::SqliteValue;
 
-    use crate::connection::{Storage, StorageConfig, map_storage_error};
+    use crate::connection::Storage;
     use crate::index_metadata::{BuildTrigger, RecordBuildParams};
-    use crate::job_queue::{JobQueueConfig, JobStatus, PersistentJobQueue};
+    use crate::job_queue::{JobQueueConfig, PersistentJobQueue};
     use crate::schema::SCHEMA_VERSION;
     use crate::staleness::{
         RecommendedAction, StalenessConfig, StalenessLevel, StorageBackedStaleness,
@@ -2575,69 +2572,6 @@ mod integration_tests {
             } else {
                 ModelCategory::StaticEmbedder
             }
-        }
-    }
-
-    #[derive(Debug)]
-    struct CompletionConflictSink {
-        db_path: PathBuf,
-        entries: Mutex<Vec<PersistedEmbedding>>,
-    }
-
-    impl CompletionConflictSink {
-        fn new(db_path: PathBuf) -> Self {
-            Self {
-                db_path,
-                entries: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn entries(&self) -> Vec<PersistedEmbedding> {
-            self.entries
-                .lock()
-                .expect("completion-conflict sink lock poisoned")
-                .clone()
-        }
-    }
-
-    impl EmbeddingVectorSink for CompletionConflictSink {
-        fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()> {
-            self.entries
-                .lock()
-                .expect("completion-conflict sink lock poisoned")
-                .push(PersistedEmbedding {
-                    doc_id: doc_id.to_owned(),
-                    embedder_id: embedder_id.to_owned(),
-                    embedding: embedding.to_vec(),
-                });
-
-            let storage = Storage::open(StorageConfig {
-                db_path: self.db_path.clone(),
-                ..StorageConfig::default()
-            })?;
-            let params = [
-                SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
-                SqliteValue::Text(doc_id.to_owned()),
-                SqliteValue::Text(embedder_id.to_owned()),
-            ];
-            let updated = storage
-                .connection()
-                .execute_with_params(
-                    "UPDATE embedding_jobs \
-                     SET status = ?1, worker_id = NULL, started_at = NULL \
-                     WHERE doc_id = ?2 AND embedder_id = ?3 AND status = 'processing';",
-                    &params,
-                )
-                .map_err(map_storage_error)?;
-            if updated != 1 {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "storage",
-                    source: Box::new(io::Error::other(
-                        "expected one processing job to force completion conflict",
-                    )),
-                });
-            }
-            Ok(())
         }
     }
 
@@ -3091,29 +3025,50 @@ mod integration_tests {
     #[test]
     fn process_batch_completion_conflict_is_non_fatal_and_drains_job() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let tempdir = tempfile::tempdir().expect("tempdir");
-            let db_path = tempdir.path().join("completion-conflict.sqlite3");
-            let storage = Arc::new(
-                Storage::open(StorageConfig {
-                    db_path: db_path.clone(),
-                    ..StorageConfig::default()
-                })
-                .expect("storage should open"),
-            );
+            let storage = Arc::new(Storage::open_in_memory().expect("storage should open"));
             let queue = Arc::new(PersistentJobQueue::new(
                 Arc::clone(&storage),
                 JobQueueConfig::default(),
             ));
-            let sink = Arc::new(CompletionConflictSink::new(db_path));
-            let sink_trait: Arc<dyn EmbeddingVectorSink> = sink.clone();
+            let sink = Arc::new(InMemoryVectorSink::default());
             let fast = Arc::new(StubEmbedder::new("fast-tier", 4, None, 1.0));
             let canonicalizer: Arc<dyn Canonicalizer> = Arc::new(DefaultCanonicalizer::default());
+
+            storage
+                .connection()
+                .execute(
+                    "CREATE TRIGGER force_completion_conflict_insert \
+                     AFTER INSERT ON embedding_status \
+                     BEGIN \
+                         UPDATE embedding_jobs \
+                         SET status = 'pending', worker_id = NULL, started_at = NULL \
+                         WHERE doc_id = NEW.doc_id \
+                           AND embedder_id = NEW.embedder_id \
+                           AND status = 'processing'; \
+                     END;",
+                )
+                .expect("insert trigger should install");
+            storage
+                .connection()
+                .execute(
+                    "CREATE TRIGGER force_completion_conflict_update \
+                     AFTER UPDATE ON embedding_status \
+                     BEGIN \
+                         UPDATE embedding_jobs \
+                         SET status = 'pending', worker_id = NULL, started_at = NULL \
+                         WHERE doc_id = NEW.doc_id \
+                           AND embedder_id = NEW.embedder_id \
+                           AND status = 'processing'; \
+                     END;",
+                )
+                .expect("update trigger should install");
+
             let runner = StorageBackedJobRunner::new(
                 Arc::clone(&storage),
                 Arc::clone(&queue),
                 canonicalizer,
                 fast,
-                sink_trait,
+                Arc::clone(&sink) as Arc<dyn EmbeddingVectorSink>,
             )
             .with_config(PipelineConfig {
                 process_batch_size: 1,

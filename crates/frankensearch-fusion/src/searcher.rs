@@ -755,14 +755,13 @@ impl TwoTierSearcher {
                 } else {
                     None
                 };
-                let graph_candidates =
-                    graph_candidates.map(|results| {
-                        if let Some(exclusions) = normalized_exclusions {
-                            filter_scored_results_by_negations(results, exclusions, text_fn, "graph")
-                        } else {
-                            results
-                        }
-                    });
+                let graph_candidates = graph_candidates.map(|results| {
+                    if let Some(exclusions) = normalized_exclusions {
+                        filter_scored_results_by_negations(results, exclusions, text_fn, "graph")
+                    } else {
+                        results
+                    }
+                });
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();

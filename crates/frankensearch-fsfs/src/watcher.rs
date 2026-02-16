@@ -862,6 +862,27 @@ fn collect_snapshot_for_root(
         return Ok(());
     }
 
+    // Handle single-file roots explicitly to avoid walk errors
+    let metadata = fs::symlink_metadata(root).map_err(|error| SearchError::Io(error))?;
+    if metadata.is_file() {
+        let mut candidate = DiscoveryCandidate::new(root, metadata.len());
+        if let Some(category) = lookup_mount_category(mount_table, root) {
+            candidate = candidate.with_mount_category(category);
+        }
+        let decision = discovery.evaluate_candidate(&candidate);
+        if !matches!(decision.scope, DiscoveryScopeDecision::Exclude)
+            && decision.ingestion_class.is_indexed()
+        {
+            let modified = metadata
+                .modified()
+                .ok()
+                .map(system_time_to_ms)
+                .unwrap_or_default();
+            snapshot.insert(root.to_path_buf(), modified);
+        }
+        return Ok(());
+    }
+
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir_path) = stack.pop() {
         let dir_entries = match fs::read_dir(&dir_path) {
@@ -1537,6 +1558,23 @@ mod tests {
             watcher.start(&cx).await.expect("start watcher");
             watcher.stop().await;
         });
+    }
+
+    #[test]
+    fn collect_snapshot_supports_file_root() {
+        let temp = tempdir().expect("tempdir");
+        let file_root = temp.path().join("single.rs");
+        fs::write(&file_root, "fn main() {}").expect("write");
+
+        let watcher = FsWatcher::new(
+            vec![file_root.clone()],
+            DiscoveryConfig::default(),
+            Arc::new(NoopWatchIngestPipeline),
+        );
+        let snapshot = watcher.collect_snapshot().expect("collect snapshot");
+
+        assert!(snapshot.contains_key(&file_root));
+        assert_eq!(snapshot.len(), 1);
     }
 
     fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
