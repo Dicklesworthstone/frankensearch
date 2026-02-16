@@ -908,13 +908,17 @@ fn collect_snapshot_for_root(
     let (metadata, is_symlink) = if symlink_meta.is_symlink() {
         match fs::metadata(root) {
             Ok(target) if target.is_file() => (target, true),
-            Ok(_) => (symlink_meta, false), // Directory or other: let walker handle it
+            Ok(target) => (target, true), // Directory or other: preserve symlink identity
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // Broken link
             Err(e) => return Err(e.into()),
         }
     } else {
         (symlink_meta, false)
     };
+
+    if is_symlink && !discovery.follow_symlinks {
+        return Ok(());
+    }
 
     if metadata.is_file() {
         let mut candidate = DiscoveryCandidate::new(root, metadata.len()).with_symlink(is_symlink);
@@ -1456,6 +1460,54 @@ mod tests {
         super::collect_snapshot_for_root(&root, &discovery, Some(&mount_table), &mut snapshot)
             .expect("collect snapshot");
         assert!(snapshot.is_empty(), "network root should be excluded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_snapshot_skips_root_directory_symlink_when_follow_disabled() {
+        let temp = tempdir().expect("tempdir");
+        let target_root = temp.path().join("target");
+        fs::create_dir_all(&target_root).expect("create target");
+        fs::write(target_root.join("lib.rs"), "fn main() {}\n").expect("write source");
+
+        let symlink_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(&target_root, &symlink_root).expect("create symlink");
+
+        let discovery = DiscoveryConfig {
+            follow_symlinks: false,
+            ..DiscoveryConfig::default()
+        };
+        let mut snapshot = FileSnapshot::new();
+        super::collect_snapshot_for_root(&symlink_root, &discovery, None, &mut snapshot)
+            .expect("collect snapshot");
+        assert!(
+            snapshot.is_empty(),
+            "root symlink should be skipped when follow_symlinks=false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_snapshot_includes_root_directory_symlink_when_follow_enabled() {
+        let temp = tempdir().expect("tempdir");
+        let target_root = temp.path().join("target");
+        fs::create_dir_all(&target_root).expect("create target");
+        fs::write(target_root.join("lib.rs"), "fn main() {}\n").expect("write source");
+
+        let symlink_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(&target_root, &symlink_root).expect("create symlink");
+
+        let discovery = DiscoveryConfig {
+            follow_symlinks: true,
+            ..DiscoveryConfig::default()
+        };
+        let mut snapshot = FileSnapshot::new();
+        super::collect_snapshot_for_root(&symlink_root, &discovery, None, &mut snapshot)
+            .expect("collect snapshot");
+        assert!(
+            snapshot.contains_key(&symlink_root.join("lib.rs")),
+            "root symlink contents should be indexed when follow_symlinks=true"
+        );
     }
 
     #[test]

@@ -868,9 +868,7 @@ mod tests {
             alpha: f32::NAN,
             gamma: 0.5,
         };
-        let err = state
-            .update(0.1, &cal)
-            .expect_err("must reject NaN alpha");
+        let err = state.update(0.1, &cal).expect_err("must reject NaN alpha");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
         // Alpha should still be NaN (not corrupted further — error before mutation).
         assert!(state.alpha.is_nan());
@@ -884,9 +882,7 @@ mod tests {
             alpha: 0.1,
             gamma: f32::NAN,
         };
-        let err = state
-            .update(0.1, &cal)
-            .expect_err("must reject NaN gamma");
+        let err = state.update(0.1, &cal).expect_err("must reject NaN gamma");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
         // Alpha should NOT have been mutated (error before computation).
         assert!((state.alpha - 0.1).abs() < f32::EPSILON);

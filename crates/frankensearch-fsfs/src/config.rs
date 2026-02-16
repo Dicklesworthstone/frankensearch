@@ -2608,13 +2608,21 @@ fn parse_u8(value: &str, field: &str) -> SearchResult<u8> {
 }
 
 fn parse_f64(value: &str, field: &str) -> SearchResult<f64> {
-    value
+    let parsed = value
         .parse::<f64>()
         .map_err(|_| SearchError::InvalidConfig {
             field: field.into(),
             value: value.into(),
             reason: "expected floating-point number".into(),
-        })
+        })?;
+    if !parsed.is_finite() {
+        return Err(SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "value must be finite (not NaN or Infinity)".into(),
+        });
+    }
+    Ok(parsed)
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -4150,6 +4158,15 @@ mod tests {
     #[test]
     fn parse_f64_invalid() {
         assert!(super::parse_f64("not_a_number", "test").is_err());
+    }
+
+    #[test]
+    fn parse_f64_rejects_nan_and_infinity() {
+        assert!(super::parse_f64("nan", "test").is_err());
+        assert!(super::parse_f64("NaN", "test").is_err());
+        assert!(super::parse_f64("inf", "test").is_err());
+        assert!(super::parse_f64("infinity", "test").is_err());
+        assert!(super::parse_f64("-inf", "test").is_err());
     }
 
     #[test]

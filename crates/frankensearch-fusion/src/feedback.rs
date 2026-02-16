@@ -140,8 +140,28 @@ pub struct DocumentBoost {
     pub positive_signals: u32,
     /// Total negative interactions.
     pub negative_signals: u32,
-    /// Timestamp of the last signal (seconds since collector creation).
+    /// Timestamp of the last signal (seconds since collector epoch).
+    ///
+    /// Note: this may be negative immediately after import if the restored
+    /// signal predates the current collector's epoch.
     last_signal_secs: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeedbackBoostSnapshot {
+    /// Snapshot schema version for forward-compatible parsing.
+    schema_version: u32,
+    /// Collector elapsed seconds at export time.
+    exported_elapsed_secs: f64,
+    /// Persisted boost entries.
+    boosts: HashMap<String, DocumentBoost>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FeedbackImportPayload {
+    Snapshot(FeedbackBoostSnapshot),
+    Legacy(HashMap<String, DocumentBoost>),
 }
 
 // ─── Feedback Collector ──────────────────────────────────────────────────────
@@ -310,8 +330,15 @@ impl FeedbackCollector {
     ///
     /// Returns an error if JSON serialization fails.
     pub fn export_boost_map(&self) -> Result<String, serde_json::Error> {
-        let map = self.read_map();
-        serde_json::to_string(&*map)
+        let snapshot = {
+            let map = self.read_map();
+            FeedbackBoostSnapshot {
+                schema_version: 1,
+                exported_elapsed_secs: self.elapsed_secs(),
+                boosts: map.clone(),
+            }
+        };
+        serde_json::to_string(&snapshot)
     }
 
     /// Restore the boost map from a JSON string.
@@ -321,7 +348,33 @@ impl FeedbackCollector {
     /// Returns an error if JSON deserialization fails.
     #[allow(clippy::significant_drop_tightening)]
     pub fn import_boost_map(&self, json: &str) -> Result<(), serde_json::Error> {
-        let mut imported: HashMap<String, DocumentBoost> = serde_json::from_str(json)?;
+        let now_secs = self.elapsed_secs();
+        let mut imported = match serde_json::from_str::<FeedbackImportPayload>(json)? {
+            FeedbackImportPayload::Snapshot(mut snapshot) => {
+                let exported_elapsed_secs = if snapshot.exported_elapsed_secs.is_finite()
+                    && snapshot.exported_elapsed_secs >= 0.0
+                {
+                    snapshot.exported_elapsed_secs
+                } else {
+                    0.0
+                };
+                // Rebase imported timestamps to this collector's epoch so decay
+                // continues correctly after export/import.
+                for entry in snapshot.boosts.values_mut() {
+                    let age_secs = (exported_elapsed_secs - entry.last_signal_secs).max(0.0);
+                    entry.last_signal_secs = now_secs - age_secs;
+                }
+                snapshot.boosts
+            }
+            FeedbackImportPayload::Legacy(mut map) => {
+                // Legacy payloads only contain epoch-relative timestamps. Clamp
+                // to "not in the future" to avoid multi-hour/day decay freeze.
+                for entry in map.values_mut() {
+                    entry.last_signal_secs = entry.last_signal_secs.min(now_secs);
+                }
+                map
+            }
+        };
         // Reject entries with non-finite raw_boost or last_signal_secs to prevent
         // NaN propagation through apply_decay/clamp (clamp propagates NaN).
         imported
@@ -354,11 +407,7 @@ impl FeedbackCollector {
         } else {
             2.0
         };
-        if lo <= hi {
-            (lo, hi)
-        } else {
-            (hi, lo)
-        }
+        if lo <= hi { (lo, hi) } else { (hi, lo) }
     }
 
     fn read_map(&self) -> RwLockReadGuard<'_, HashMap<String, DocumentBoost>> {
@@ -732,6 +781,40 @@ mod tests {
         // but they should be close.
         let diff = (fc.get_boost("doc1") - fc2.get_boost("doc1")).abs();
         assert!(diff < 0.01);
+    }
+
+    #[test]
+    fn import_snapshot_rebases_elapsed_time_into_current_epoch() {
+        let config = FeedbackConfig {
+            decay_halflife_hours: 24.0,
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config);
+        // Entry is 72h old at export time (exported_elapsed_secs=72h, last_signal=0).
+        let snapshot = r#"{"schema_version":1,"exported_elapsed_secs":259200.0,"boosts":{"doc1":{"raw_boost":2.0,"positive_signals":10,"negative_signals":0,"last_signal_secs":0.0}}}"#;
+
+        fc.import_boost_map(snapshot).unwrap();
+        let boost = fc.get_boost("doc1");
+        // 2^(-72/24) = 1/8, so 1 + (2-1)*(1/8) = 1.125.
+        assert!(
+            (boost - 1.125).abs() < 0.01,
+            "expected rebased decay near 1.125, got {boost}"
+        );
+    }
+
+    #[test]
+    fn import_legacy_map_clamps_future_last_signal_to_now() {
+        let fc = FeedbackCollector::new(enabled_config());
+        // Legacy payload: epoch-relative timestamp from a different collector.
+        let legacy = r#"{"doc1":{"raw_boost":1.5,"positive_signals":1,"negative_signals":0,"last_signal_secs":3600.0}}"#;
+
+        fc.import_boost_map(legacy).unwrap();
+        let map = fc.read_map();
+        let entry = map.get("doc1").expect("legacy import should keep doc1");
+        assert!(
+            entry.last_signal_secs <= fc.elapsed_secs(),
+            "imported legacy timestamp must not be in the future"
+        );
     }
 
     // ─── Config Serde ───────────────────────────────────────────────

@@ -344,8 +344,7 @@ pub fn bootstrap_ci(
     if scores.is_empty()
         || !all_finite(scores)
         || n_resamples == 0
-        || confidence <= 0.0
-        || confidence >= 1.0
+        || !(confidence > 0.0 && confidence < 1.0)
     {
         return None;
     }
@@ -411,8 +410,7 @@ pub fn bootstrap_compare(
         || !all_finite(scores_a)
         || !all_finite(scores_b)
         || n_resamples == 0
-        || confidence <= 0.0
-        || confidence >= 1.0
+        || !(confidence > 0.0 && confidence < 1.0)
     {
         return None;
     }
@@ -946,6 +944,8 @@ mod tests {
         assert!(bootstrap_ci(&scores, 0.0, 1000, 42).is_none());
         assert!(bootstrap_ci(&scores, 1.0, 1000, 42).is_none());
         assert!(bootstrap_ci(&scores, -0.1, 1000, 42).is_none());
+        assert!(bootstrap_ci(&scores, f64::NAN, 1000, 42).is_none());
+        assert!(bootstrap_ci(&scores, f64::INFINITY, 1000, 42).is_none());
     }
 
     #[test]

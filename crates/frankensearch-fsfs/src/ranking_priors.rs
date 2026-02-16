@@ -89,7 +89,9 @@ impl PriorFamilyConfig {
     #[must_use]
     pub const fn new(family: PriorFamily, weight: f64) -> Self {
         // const fn cannot call clamp, so manual clamping:
-        let w = if weight < 0.0 {
+        // NaN comparisons are always false, so `NaN < 0.0` and
+        // `NaN > MAX` both fall through to the else branch.
+        let w = if weight.is_nan() || weight < 0.0 {
             0.0
         } else if weight > DEFAULT_MAX_PRIOR_BOOST {
             DEFAULT_MAX_PRIOR_BOOST
@@ -259,6 +261,9 @@ pub fn recency_multiplier(
     if half_life_days <= 0.0 || !half_life_days.is_finite() {
         return (1.0, "prior.recency.disabled_invalid_config", String::new());
     }
+    if !weight.is_finite() || weight < 0.0 {
+        return (1.0, "prior.recency.disabled_invalid_weight", String::new());
+    }
     if modified_unix_seconds > now_unix_seconds {
         return (1.0, "prior.recency.future_timestamp", String::new());
     }
@@ -292,6 +297,13 @@ pub fn path_proximity_multiplier(
             String::new(),
         );
     }
+    if !weight.is_finite() || weight < 0.0 {
+        return (
+            1.0,
+            "prior.path_proximity.disabled_invalid_weight",
+            String::new(),
+        );
+    }
 
     let shared = shared_prefix_depth(query_path, doc_path);
     if shared == 0 {
@@ -322,6 +334,13 @@ pub fn project_affinity_multiplier(
         return (
             1.0,
             "prior.project_affinity.disabled_missing_context",
+            String::new(),
+        );
+    }
+    if !weight.is_finite() || weight < 0.0 {
+        return (
+            1.0,
+            "prior.project_affinity.disabled_invalid_weight",
             String::new(),
         );
     }
@@ -521,9 +540,14 @@ impl PriorApplier {
             }
         }
 
-        // Clamp combined multiplier.
-        combined_multiplier =
-            combined_multiplier.clamp(MIN_PRIOR_MULTIPLIER, self.config.max_boost);
+        // Clamp combined multiplier. Guard max_boost against NaN/Inf
+        // (Deserialize can bypass constructor validation).
+        let effective_max = if self.config.max_boost.is_finite() && self.config.max_boost > 0.0 {
+            self.config.max_boost
+        } else {
+            DEFAULT_MAX_PRIOR_BOOST
+        };
+        combined_multiplier = combined_multiplier.clamp(MIN_PRIOR_MULTIPLIER, effective_max);
         let adjusted_score = base_score * combined_multiplier;
 
         PriorApplicationResult {
@@ -958,5 +982,50 @@ mod tests {
 
         let fc2 = PriorFamilyConfig::new(PriorFamily::Recency, -5.0);
         assert!((fc2.weight - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prior_family_config_nan_weight_clamped_to_zero() {
+        let fc = PriorFamilyConfig::new(PriorFamily::Recency, f64::NAN);
+        assert!((fc.weight - 0.0).abs() < 1e-9, "NaN weight must clamp to 0");
+    }
+
+    #[test]
+    fn recency_multiplier_nan_weight_returns_neutral() {
+        let (mult, code, _) = recency_multiplier(1000, 500, 7.0, f64::NAN);
+        assert!((mult - 1.0).abs() < 1e-9);
+        assert!(code.contains("invalid_weight"));
+    }
+
+    #[test]
+    fn path_proximity_nan_weight_returns_neutral() {
+        let (mult, code, _) = path_proximity_multiplier("/a/b", "/a/c", 5, f64::NAN);
+        assert!((mult - 1.0).abs() < 1e-9);
+        assert!(code.contains("invalid_weight"));
+    }
+
+    #[test]
+    fn project_affinity_nan_weight_returns_neutral() {
+        let (mult, code, _) = project_affinity_multiplier("proj", "proj", f64::NAN);
+        assert!((mult - 1.0).abs() < 1e-9);
+        assert!(code.contains("invalid_weight"));
+    }
+
+    #[test]
+    fn applier_nan_max_boost_uses_default() {
+        let config = RankingPriorConfig {
+            max_boost: f64::NAN,
+            ..RankingPriorConfig::default()
+        };
+        let applier = PriorApplier::new(config);
+        let candidates = vec![make_fused("doc-a", 1.0)];
+        let context = QueryPriorContext::default();
+        let metadata = HashMap::new();
+
+        let results = applier.apply(&candidates, &context, &metadata);
+        assert!(
+            results[0].combined_multiplier.is_finite(),
+            "NaN max_boost must not poison combined_multiplier"
+        );
     }
 }

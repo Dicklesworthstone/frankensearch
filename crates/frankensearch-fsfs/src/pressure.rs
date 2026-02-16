@@ -1258,7 +1258,7 @@ impl HostPressureCollector {
                     self.system.process(p).map(sysinfo::Process::memory)
                 })
                 .unwrap_or(0);
-            
+
             let effective_memory_ceiling_mb = memory_ceiling_mb.max(1);
             let memory_pct = normalize_pct(
                 (rss_bytes as f64 / (effective_memory_ceiling_mb as f64 * 1024.0 * 1024.0)) * 100.0,

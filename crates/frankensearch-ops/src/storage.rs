@@ -1311,23 +1311,24 @@ impl OpsStorage {
 
             let mut to_insert: Vec<&SearchEventRecord> = Vec::with_capacity(ordered_events.len());
             let mut seen_event_ids: BTreeSet<&str> = BTreeSet::new();
-            let mut deduplicated = 0_usize;
+            let mut batch_deduplicated = 0_usize;
             for event in ordered_events {
-                if !seen_event_ids.insert(event.event_id.as_str())
-                    || search_event_exists(conn, &event.event_id)?
-                {
-                    deduplicated = deduplicated.saturating_add(1);
-                } else {
+                if seen_event_ids.insert(event.event_id.as_str()) {
                     to_insert.push(event);
+                } else {
+                    batch_deduplicated = batch_deduplicated.saturating_add(1);
                 }
             }
 
+            let mut db_inserted = 0_usize;
             for event in &to_insert {
-                insert_search_event_row(conn, event)?;
+                db_inserted = db_inserted.saturating_add(insert_search_event_row(conn, event)?);
             }
-            let inserted = to_insert.len();
 
-            Ok((inserted, deduplicated))
+            let db_deduplicated = to_insert.len().saturating_sub(db_inserted);
+            let total_deduplicated = batch_deduplicated.saturating_add(db_deduplicated);
+
+            Ok((db_inserted, total_deduplicated))
         })
     }
 
@@ -2380,16 +2381,6 @@ fn unix_timestamp_ms() -> SearchResult<i64> {
     i64::try_from(since_epoch.as_millis()).map_err(ops_error)
 }
 
-fn search_event_exists(conn: &Connection, event_id: &str) -> SearchResult<bool> {
-    let existing = conn
-        .query_with_params(
-            "SELECT 1 FROM search_events WHERE event_id = ?1;",
-            &[SqliteValue::Text(event_id.to_owned())],
-        )
-        .map_err(ops_error)?;
-    Ok(!existing.is_empty())
-}
-
 fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
     // Deterministic FNV-1a 64-bit hash over (alert_id, U+001F, evidence_uri).
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2408,6 +2399,17 @@ fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
 }
 
 fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<usize> {
+    // Manual dedup: FrankenSQLite does not support INSERT OR IGNORE reliably.
+    let existing = conn
+        .query_with_params(
+            "SELECT 1 FROM search_events WHERE event_id = ?1;",
+            &[SqliteValue::Text(event.event_id.clone())],
+        )
+        .map_err(ops_error)?;
+    if !existing.is_empty() {
+        return Ok(0);
+    }
+
     let params = [
         SqliteValue::Text(event.event_id.clone()),
         SqliteValue::Text(event.project_key.clone()),
@@ -2423,7 +2425,7 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
     ];
 
     conn.execute_with_params(
-        "INSERT OR IGNORE INTO search_events(\
+        "INSERT INTO search_events(\
             event_id, project_key, instance_id, correlation_id, query_hash, query_class, \
             phase, latency_us, result_count, memory_bytes, ts_ms\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
