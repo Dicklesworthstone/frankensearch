@@ -4,16 +4,14 @@
 //!
 //! # Persistence
 //!
-//! Persistence uses one metadata file plus `hnsw_rs` sidecars:
-//! 1. `vector.fast.hnsw` stores metadata (`doc_ids`, `HnswConfig`, dimension).
-//! 2. `vector.fast.hnsw.graph` stores graph topology.
-//! 3. `vector.fast.hnsw.data` stores vector payload for reloading.
+//! Persistence stores metadata and row-ordered vectors in one sidecar file
+//! (e.g. `vector.fast.hnsw`), then rebuilds the ANN graph on load.
 
 use std::path::Path;
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo};
+use hnsw_rs::prelude::{DistDot, Hnsw};
 use serde::{Deserialize, Serialize};
 
 use crate::VectorIndex;
@@ -56,6 +54,7 @@ impl Default for HnswConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct HnswMeta {
     doc_ids: Vec<String>,
+    vectors: Vec<Vec<f32>>,
     config: HnswConfig,
     dimension: usize,
 }
@@ -85,6 +84,7 @@ pub struct AnnSearchStats {
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistDot>,
     doc_ids: Vec<String>,
+    vectors: Vec<Vec<f32>>,
     dimension: usize,
     config: HnswConfig,
 }
@@ -125,85 +125,42 @@ impl HnswIndex {
     ///
     /// Returns `SearchError::IndexCorrupted` if metadata or graph files are missing/malformed.
     pub fn load(path: &Path) -> SearchResult<Self> {
-        // 1. Load metadata (JSON)
+        // Load metadata + vectors, then rebuild graph from vectors.
         let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
         let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
 
-        // 2. Load graph + vectors from hnsw_rs sidecar files.
-        let (directory, basename) = dump_location(path)?;
-        let mut reloader = HnswIo::new(&directory, &basename);
-        let loaded = reloader.load_hnsw::<f32, DistDot>().map_err(|e| {
-            ann_corrupted(path, format!("failed to load HNSW graph sidecar pair: {e}"))
-        })?;
-
-        if loaded.get_nb_point() != meta.doc_ids.len() {
+        if meta.doc_ids.len() != meta.vectors.len() {
             return Err(ann_corrupted(
                 path,
                 format!(
-                    "graph size ({}) mismatch with doc_ids count ({})",
-                    loaded.get_nb_point(),
-                    meta.doc_ids.len()
+                    "metadata mismatch: doc_ids={} vectors={}",
+                    meta.doc_ids.len(),
+                    meta.vectors.len()
                 ),
             ));
         }
 
-        // Convert loaded points back to row-ordered vectors (origin id order),
-        // then rebuild a `'static` HNSW so we are not tied to the reloader lifetime.
-        let mut vectors_by_origin: Vec<Option<Vec<f32>>> = vec![None; meta.doc_ids.len()];
-        for point in loaded.get_point_indexation().get_layer_iterator(0) {
-            let origin_id = point.get_origin_id();
-            if origin_id >= vectors_by_origin.len() {
-                return Err(ann_corrupted(
-                    path,
-                    format!(
-                        "loaded origin id {origin_id} exceeds doc_id count {}",
-                        vectors_by_origin.len()
-                    ),
-                ));
-            }
-            vectors_by_origin[origin_id] = Some(point.get_v().to_vec());
-        }
-        let mut vectors = Vec::with_capacity(vectors_by_origin.len());
-        for (origin_id, maybe_vector) in vectors_by_origin.into_iter().enumerate() {
-            let vector = maybe_vector.ok_or_else(|| {
-                ann_corrupted(
-                    path,
-                    format!("missing loaded vector for origin id {origin_id}"),
-                )
-            })?;
-            vectors.push(vector);
-        }
-
-        Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
+        Self::build_from_parts(meta.doc_ids, meta.vectors, meta.dimension, meta.config)
     }
 
     /// Persist ANN index to disk.
     ///
-    /// Writes metadata to `path` and graph/vector payloads via `hnsw_rs`
-    /// sidecar files in the same directory.
+    /// Writes metadata + vectors to `path`.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::Io` on write failure.
     pub fn save(&self, path: &Path) -> SearchResult<()> {
-        let (directory, basename) = dump_location(path)?;
-        std::fs::create_dir_all(&directory)?;
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
 
-        // 1. Save graph + vectors through hnsw_rs.
-        let dumped_basename = self
-            .hnsw
-            .file_dump(&directory, &basename)
-            .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
-        if dumped_basename != basename {
-            return Err(SearchError::Io(std::io::Error::other(format!(
-                "unexpected dump basename '{dumped_basename}', expected '{basename}'"
-            ))));
-        }
-
-        // 2. Save metadata
         let meta = HnswMeta {
             doc_ids: self.doc_ids.clone(),
+            vectors: self.vectors.clone(),
             config: self.config,
             dimension: self.dimension,
         };
@@ -373,6 +330,7 @@ impl HnswIndex {
                 reason: format!("doc_id count {} must match vector count", doc_ids.len()),
             });
         }
+        let mut source_vectors = Vec::with_capacity(vectors.len());
         let mut normalized_vectors = Vec::with_capacity(vectors.len());
         for (idx, vector) in vectors.into_iter().enumerate() {
             if vector.len() != dimension {
@@ -388,6 +346,7 @@ impl HnswIndex {
                     reason: "all vector values must be finite".to_owned(),
                 });
             }
+            source_vectors.push(vector.clone());
             normalized_vectors.push(normalize_for_dist_dot(vector));
         }
 
@@ -410,7 +369,7 @@ impl HnswIndex {
         Ok(Self {
             hnsw,
             doc_ids,
-            // vectors field removed to save RAM
+            vectors: source_vectors,
             dimension,
             config,
         })
@@ -461,21 +420,6 @@ fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
         path: path.to_path_buf(),
         detail: detail.into(),
     }
-}
-
-fn dump_location(path: &Path) -> SearchResult<(std::path::PathBuf, String)> {
-    let directory = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let basename = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .ok_or_else(|| ann_corrupted(path, "metadata path has no valid UTF-8 basename"))?
-        .to_owned();
-    Ok((directory, basename))
 }
 
 fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {

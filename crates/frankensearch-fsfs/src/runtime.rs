@@ -4331,7 +4331,7 @@ impl FsfsRuntime {
             });
         }
 
-        Ok(target)
+        fs::canonicalize(&target).map_err(SearchError::Io)
     }
 
     fn resolve_index_root(&self, target_root: &Path) -> SearchResult<PathBuf> {
@@ -6242,6 +6242,58 @@ mod tests {
                 frankensearch_core::SearchError::InvalidConfig { field, .. }
                 if field == "file_key"
             ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_ingest_accepts_canonical_file_paths_with_symlink_cli_root() {
+        use std::os::unix::fs::symlink;
+
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let canonical_root = temp.path().join("canonical-project");
+            let symlink_root = temp.path().join("project-link");
+            fs::create_dir_all(canonical_root.join("src")).expect("canonical root");
+            symlink(&canonical_root, &symlink_root).expect("create symlink root");
+            let canonical_file = canonical_root.join("src/main.rs");
+            fs::write(&canonical_file, "fn main() {}\n").expect("write source file");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(symlink_root),
+                ..CliInput::default()
+            });
+            let resolved_root = runtime
+                .resolve_target_root()
+                .expect("canonical target root");
+            assert_eq!(
+                resolved_root,
+                fs::canonicalize(&canonical_root).expect("canonicalize target root")
+            );
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer.finish().expect("finish vector index");
+            let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
+
+            let pipeline = LiveIngestPipeline::new(
+                resolved_root,
+                lexical_index,
+                vector_index,
+                Arc::new(HashEmbedder::default_256()),
+            );
+
+            let (resolved_file, rel_key) = pipeline
+                .resolve_paths(&canonical_file.display().to_string())
+                .expect("canonical watcher path should remain within target root");
+            assert_eq!(resolved_file, canonical_file);
+            assert_eq!(rel_key, "src/main.rs");
         });
     }
 

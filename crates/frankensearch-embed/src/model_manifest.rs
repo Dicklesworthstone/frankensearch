@@ -69,10 +69,10 @@ impl ModelFile {
         self.sha256 == PLACEHOLDER_VERIFY_AFTER_DOWNLOAD
     }
 
-    /// Returns true when checksum and size are usable for production verification.
+    /// Returns true when checksum is usable for production verification.
     #[must_use]
     pub fn has_verified_checksum(&self) -> bool {
-        self.size > 0 && is_valid_sha256_hex(&self.sha256) && !self.uses_placeholder_checksum()
+        is_valid_sha256_hex(&self.sha256) && !self.uses_placeholder_checksum()
     }
 
     /// Return the download URL for this file, preferring the explicit `url`
@@ -370,7 +370,7 @@ impl ModelManifest {
         })
     }
 
-    /// Returns true when all files have non-placeholder checksums and non-zero sizes.
+    /// Returns true when all files have non-placeholder concrete checksums.
     #[must_use]
     pub fn has_verified_checksums(&self) -> bool {
         !self.files.is_empty() && self.files.iter().all(ModelFile::has_verified_checksum)
@@ -471,13 +471,6 @@ impl ModelManifest {
                     "files[].sha256",
                     &file.sha256,
                     "must be lowercase 64-char SHA256 hex or placeholder",
-                ));
-            }
-            if file.size == 0 {
-                return Err(invalid_manifest_field(
-                    "files[].size",
-                    "0",
-                    "must be > 0 when checksum is non-placeholder",
                 ));
             }
         }
@@ -587,17 +580,25 @@ impl ModelManifest {
     /// Look up a registered manifest by id.
     #[must_use]
     pub fn lookup(id: &str) -> Option<Self> {
-        let guard = manifest_registry().read().ok()?;
+        let guard = manifest_registry().read().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "model manifest registry lock poisoned on read during lookup; using recovered state"
+            );
+            poisoned.into_inner()
+        });
         guard.get(id).cloned()
     }
 
     /// Return all registered manifests in deterministic id order.
     #[must_use]
     pub fn registered() -> Vec<Self> {
-        manifest_registry()
-            .read()
-            .map(|guard| guard.values().cloned().collect())
-            .unwrap_or_default()
+        let guard = manifest_registry().read().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "model manifest registry lock poisoned on read during listing; using recovered state"
+            );
+            poisoned.into_inner()
+        });
+        guard.values().cloned().collect()
     }
 }
 
@@ -980,14 +981,6 @@ pub fn verify_file_sha256(
             reason: "expected lowercase 64-char SHA256 hex".to_owned(),
         });
     }
-    if expected_size == 0 {
-        return Err(SearchError::InvalidConfig {
-            field: "size".to_owned(),
-            value: "0".to_owned(),
-            reason: "expected size must be greater than zero".to_owned(),
-        });
-    }
-
     if !path.exists() {
         return Err(SearchError::ModelNotFound {
             name: format!("missing model file: {}", path.display()),
@@ -1711,14 +1704,22 @@ mod tests {
     }
 
     #[test]
-    fn verify_zero_expected_size_rejected() {
+    fn verify_zero_expected_size_accepts_empty_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("empty.bin");
+        write_temp_file(&path, b"");
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        verify_file_sha256(&path, hash, 0).unwrap();
+    }
+
+    #[test]
+    fn verify_zero_expected_size_still_rejects_non_empty_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("file.bin");
         write_temp_file(&path, b"data");
-        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let err = verify_file_sha256(&path, hash, 0).unwrap_err();
-        assert!(matches!(err, SearchError::InvalidConfig { .. }));
-        assert!(err.to_string().contains("greater than zero"));
+        let hash = to_hex_lowercase(&Sha256::digest(b"data"));
+        let err = verify_file_sha256(&path, &hash, 0).unwrap_err();
+        assert!(matches!(err, SearchError::HashMismatch { .. }));
     }
 
     #[test]
@@ -2011,6 +2012,18 @@ mod tests {
             name: "f.bin".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             size: 42,
+            url: None,
+        };
+        assert!(!file.uses_placeholder_checksum());
+        assert!(file.has_verified_checksum());
+    }
+
+    #[test]
+    fn model_file_zero_byte_verified_checksum_detection() {
+        let file = ModelFile {
+            name: "empty.bin".to_owned(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            size: 0,
             url: None,
         };
         assert!(!file.uses_placeholder_checksum());

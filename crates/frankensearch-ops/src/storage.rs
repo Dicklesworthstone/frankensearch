@@ -1416,60 +1416,31 @@ impl OpsStorage {
         sample.validate()?;
         let conn = self.connection();
 
-        // Manual upsert: FrankenSQLite does not yet support
-        // ON CONFLICT(...) DO UPDATE, so we check existence first.
-        let key_params = [
+        let params = [
             SqliteValue::Text(sample.project_key.clone()),
             SqliteValue::Text(sample.instance_id.clone()),
+            optional_f64(sample.cpu_pct),
+            optional_u64(sample.rss_bytes, "rss_bytes")?,
+            optional_u64(sample.io_read_bytes, "io_read_bytes")?,
+            optional_u64(sample.io_write_bytes, "io_write_bytes")?,
+            optional_u64(sample.queue_depth, "queue_depth")?,
             SqliteValue::Integer(sample.ts_ms),
         ];
-        let existing = conn
-            .query_with_params(
-                "SELECT sample_id FROM resource_samples \
-                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
-                &key_params,
-            )
-            .map_err(ops_error)?;
 
-        if existing.is_empty() {
-            let params = [
-                SqliteValue::Text(sample.project_key.clone()),
-                SqliteValue::Text(sample.instance_id.clone()),
-                optional_f64(sample.cpu_pct),
-                optional_u64(sample.rss_bytes, "rss_bytes")?,
-                optional_u64(sample.io_read_bytes, "io_read_bytes")?,
-                optional_u64(sample.io_write_bytes, "io_write_bytes")?,
-                optional_u64(sample.queue_depth, "queue_depth")?,
-                SqliteValue::Integer(sample.ts_ms),
-            ];
-            conn.execute_with_params(
-                "INSERT INTO resource_samples(\
-                    project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
-                    queue_depth, ts_ms\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-                &params,
-            )
-            .map_err(ops_error)?;
-        } else {
-            let params = [
-                optional_f64(sample.cpu_pct),
-                optional_u64(sample.rss_bytes, "rss_bytes")?,
-                optional_u64(sample.io_read_bytes, "io_read_bytes")?,
-                optional_u64(sample.io_write_bytes, "io_write_bytes")?,
-                optional_u64(sample.queue_depth, "queue_depth")?,
-                SqliteValue::Text(sample.project_key.clone()),
-                SqliteValue::Text(sample.instance_id.clone()),
-                SqliteValue::Integer(sample.ts_ms),
-            ];
-            conn.execute_with_params(
-                "UPDATE resource_samples SET \
-                    cpu_pct = ?1, rss_bytes = ?2, io_read_bytes = ?3, \
-                    io_write_bytes = ?4, queue_depth = ?5 \
-                 WHERE project_key = ?6 AND instance_id = ?7 AND ts_ms = ?8;",
-                &params,
-            )
-            .map_err(ops_error)?;
-        }
+        conn.execute_with_params(
+            "INSERT INTO resource_samples(\
+                project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
+                queue_depth, ts_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(project_key, instance_id, ts_ms) DO UPDATE SET \
+                cpu_pct = excluded.cpu_pct, \
+                rss_bytes = excluded.rss_bytes, \
+                io_read_bytes = excluded.io_read_bytes, \
+                io_write_bytes = excluded.io_write_bytes, \
+                queue_depth = excluded.queue_depth;",
+            &params,
+        )
+        .map_err(ops_error)?;
         Ok(())
     }
 
@@ -2427,7 +2398,7 @@ fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
     format!("evlnk:{hash:016x}")
 }
 
-fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<()> {
+fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<usize> {
     let params = [
         SqliteValue::Text(event.event_id.clone()),
         SqliteValue::Text(event.project_key.clone()),
@@ -2443,14 +2414,13 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
     ];
 
     conn.execute_with_params(
-        "INSERT INTO search_events(\
+        "INSERT OR IGNORE INTO search_events(\
             event_id, project_key, instance_id, correlation_id, query_hash, query_class, \
             phase, latency_us, result_count, memory_bytes, ts_ms\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
         &params,
     )
-    .map_err(ops_error)?;
-    Ok(())
+    .map_err(ops_error)
 }
 
 fn upsert_search_summary_row(

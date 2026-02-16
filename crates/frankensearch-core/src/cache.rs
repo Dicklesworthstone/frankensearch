@@ -351,10 +351,28 @@ where
     K: Hash + Eq + Clone,
 {
     let max_main = config.max_main_bytes();
+    // Loop until we have enough space.
+    // Note: We might cycle through the entire queue if everything is hot.
+    // The queue length is finite, and we reset freq to 0, so we are guaranteed
+    // to eventually find a victim or exhaust the queue (worst case 2 passes).
     while state.main_bytes + needed_bytes > max_main {
         let Some(evict_key) = state.main_order.pop_front() else {
             break;
         };
+
+        // Check if the item is hot (freq > 0).
+        let freq = state.entries.get(&evict_key).map_or(0, |e| e.freq);
+
+        if freq > 0 {
+            // Second chance: reset freq and move to back.
+            if let Some(entry) = state.entries.get_mut(&evict_key) {
+                entry.freq = 0;
+            }
+            state.main_order.push_back(evict_key);
+            continue;
+        }
+
+        // Cold item: evict.
         let Some(entry) = state.entries.remove(&evict_key) else {
             continue;
         };
@@ -1065,6 +1083,67 @@ mod tests {
 
         // Entry should still be retrievable (no overflow panic).
         assert_eq!(cache.get(&"sat"), Some(1));
+    }
+
+    #[test]
+    fn main_eviction_retains_hot_items() {
+        // max_bytes=300, small=10% (30 bytes), main=270 bytes.
+        // Entry size = 10 bytes.
+        // Small capacity = 3 entries. Main capacity = 27 entries.
+        let cache = S3FifoCache::new(small_config(300));
+
+        // 1. Insert "A". It goes to Small.
+        cache.insert("A", 1, 10);
+        // Access "A" so it promotes to Main upon eviction.
+        let _ = cache.get(&"A");
+
+        // 2. Fill Main.
+        // We need to push "A" out of Small. Insert 3 items "S1","S2","S3".
+        // "A" moves to Main. "S1","S2","S3" are in Small.
+        cache.insert("S1", 1, 10);
+        cache.insert("S2", 1, 10);
+        cache.insert("S3", 1, 10);
+
+        // Verify "A" is in Main (implied because it wasn't evicted).
+        assert_eq!(cache.get(&"A"), Some(1)); // "A" freq incremented to 1 (hot).
+
+        // Now fill Main with other items "B0".."B25".
+        // We need 26 items to fill the remaining 26 slots in Main (27 total - 1 for A).
+        // Each insertion requires pushing through Small.
+        for i in 0..26 {
+            let key: &'static str = Box::leak(format!("B{i}").into_boxed_str());
+            cache.insert(key, 1, 10);
+            let _ = cache.get(&key); // Ensure promotion
+        }
+        // Flush the B items from Small to Main by inserting filler items.
+        // This is getting complicated.
+        // Simpler approach:
+        // Just rely on `evict_main` logic directly.
+        // We know "A" is at the head of Main because it was promoted first.
+        // "A" has freq > 0 (accessed above).
+
+        // Force eviction from Main.
+        // Insert a large item that forces Main eviction.
+        // Or just insert enough items to overflow Main.
+        // Currently Main has "A" + 26 "B" items = 270 bytes (Full).
+        // Insert "Killer". It goes to Small.
+        // Access "Killer" to ensure it promotes.
+        cache.insert("Killer", 999, 10);
+        let _ = cache.get(&"Killer");
+
+        // Now push "Killer" from Small to Main by inserting more junk.
+        cache.insert("Junk1", 0, 10);
+        cache.insert("Junk2", 0, 10);
+        cache.insert("Junk3", 0, 10);
+        // Small eviction triggers promotion of "Killer" to Main.
+        // Main is full. "A" is at head.
+        // "A" is hot (freq > 0). It should survive.
+        // The next item "B0" (if freq=0) or "S1" (if it promoted) should be evicted.
+        // Wait, "S1".."S3" were in Small earlier. Did they promote?
+        // We didn't access them. So they likely went to Ghost.
+
+        // "A" should still be there.
+        assert_eq!(cache.get(&"A"), Some(1));
     }
 
     #[test]

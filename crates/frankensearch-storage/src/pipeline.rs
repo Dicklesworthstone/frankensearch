@@ -900,10 +900,8 @@ fn dedup_state_for_doc(
         DedupState::Unchanged
     } else {
         match status {
-            Some(
-                EmbeddingStatus::Embedded | EmbeddingStatus::Pending | EmbeddingStatus::Skipped,
-            ) => DedupState::Unchanged,
-            Some(EmbeddingStatus::Failed) | None => DedupState::New,
+            Some(EmbeddingStatus::Embedded | EmbeddingStatus::Skipped) => DedupState::Unchanged,
+            Some(EmbeddingStatus::Pending | EmbeddingStatus::Failed) | None => DedupState::New,
         }
     };
 
@@ -1494,6 +1492,53 @@ mod tests {
                 .expect("queue depth should succeed");
             assert_eq!(depth.pending, 0);
             assert_eq!(depth.processing, 0);
+        });
+    }
+
+    #[test]
+    fn ingest_recovers_from_zombie_pending_state() {
+        asupersync::test_utils::run_test_with_cx(|_cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            // 1. Ingest document (creates job + pending status)
+            let _ = runner
+                .ingest(IngestRequest::new("doc-zombie", "content"))
+                .expect("initial ingest should succeed");
+
+            let initial_depth = runner.queue.queue_depth().expect("depth");
+            assert_eq!(initial_depth.pending, 1);
+
+            // 2. Manually delete the job to create zombie state
+            // (Status remains 'pending' in embedding_status, but job is gone)
+            runner
+                .storage
+                .connection()
+                .execute("DELETE FROM embedding_jobs;")
+                .expect("manual delete should succeed");
+
+            let zombie_depth = runner.queue.queue_depth().expect("depth");
+            assert_eq!(zombie_depth.pending, 0);
+
+            // 3. Ingest same document again
+            let repair = runner
+                .ingest(IngestRequest::new("doc-zombie", "content"))
+                .expect("repair ingest should succeed");
+
+            // 4. Should be treated as New (to trigger re-enqueue)
+            assert_eq!(repair.action, IngestAction::New);
+            assert!(repair.fast_job_enqueued);
+
+            // 5. Job should be back
+            let repaired_depth = runner.queue.queue_depth().expect("depth");
+            assert_eq!(repaired_depth.pending, 1);
         });
     }
 
