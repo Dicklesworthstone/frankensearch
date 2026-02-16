@@ -185,13 +185,16 @@ pub struct PersistedEmbedding {
 
 impl InMemoryVectorSink {
     #[must_use]
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned.
     pub fn entries(&self) -> Vec<PersistedEmbedding> {
         self.entries
             .lock()
-            .expect("vector sink lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "frankensearch.pipeline",
+                    "vector sink lock poisoned; using recovered state"
+                );
+                poisoned.into_inner()
+            })
             .clone()
     }
 }
@@ -199,7 +202,13 @@ impl InMemoryVectorSink {
 impl EmbeddingVectorSink for InMemoryVectorSink {
     fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()> {
         {
-            let mut guard = self.entries.lock().expect("vector sink lock poisoned");
+            let mut guard = self.entries.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "frankensearch.pipeline",
+                    "vector sink lock poisoned; using recovered state"
+                );
+                poisoned.into_inner()
+            });
             guard.push(PersistedEmbedding {
                 doc_id: doc_id.to_owned(),
                 embedder_id: embedder_id.to_owned(),

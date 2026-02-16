@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+use tracing::warn;
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
 
@@ -184,14 +186,17 @@ where
         Self::new(S3FifoConfig::default())
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, CacheState<K, V>> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!("s3fifo cache lock poisoned; using recovered state");
+            poisoned.into_inner()
+        })
+    }
+
     /// Number of entries currently cached (Small + Main).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        let state = self.state.lock().expect("cache lock poisoned");
+        let state = self.lock_state();
         state.entries.len()
     }
 
@@ -208,7 +213,7 @@ where
     V: Clone + Send + Sync,
 {
     fn get(&self, key: &K) -> Option<V> {
-        let mut state = self.state.lock().expect("cache lock poisoned");
+        let mut state = self.lock_state();
         let alpha = if self.config.hit_rate_alpha.is_finite() {
             self.config.hit_rate_alpha.clamp(0.0, 1.0)
         } else {
@@ -236,7 +241,7 @@ where
             return;
         }
 
-        let mut state = self.state.lock().expect("cache lock poisoned");
+        let mut state = self.lock_state();
         let max_small = self.config.max_small_bytes();
 
         // Update existing entry in-place.
@@ -296,12 +301,12 @@ where
     }
 
     fn hit_rate(&self) -> f64 {
-        let state = self.state.lock().expect("cache lock poisoned");
+        let state = self.lock_state();
         state.hit_rate_ema
     }
 
     fn memory_used(&self) -> usize {
-        let state = self.state.lock().expect("cache lock poisoned");
+        let state = self.lock_state();
         state.small_bytes + state.main_bytes
     }
 }
@@ -457,6 +462,31 @@ mod tests {
         cache.insert("a", 1, 10);
         assert!(!cache.is_empty());
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn poisoned_mutex_recovered_across_public_api() {
+        use std::sync::Arc;
+
+        let cache = Arc::new(S3FifoCache::new(small_config(1024)));
+        cache.insert("seed", 1, 10);
+
+        let poison_target = Arc::clone(&cache);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison_target
+                .state
+                .lock()
+                .expect("cache lock should be available for poisoning test");
+            panic!("intentional poison");
+        });
+        assert!(poisoner.join().is_err(), "poisoning thread should panic");
+
+        // Public API should keep functioning after poison recovery.
+        cache.insert("key", 42, 20);
+        assert_eq!(cache.get(&"key"), Some(42));
+        assert!(!cache.is_empty());
+        assert!(cache.memory_used() >= 20);
+        assert!(cache.hit_rate().is_finite());
     }
 
     #[test]

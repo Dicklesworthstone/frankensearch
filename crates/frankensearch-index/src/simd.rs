@@ -21,7 +21,7 @@ pub fn dot_product_f32_f32(a: &[f32], b: &[f32]) -> SearchResult<f32> {
 /// Returns `SearchError::DimensionMismatch` when slice lengths differ.
 pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     ensure_same_len(stored.len(), query.len())?;
-    
+
     let mut sum = f32x8::splat(0.0);
     let mut stored_chunks = stored.chunks_exact(8);
     let mut query_chunks = query.chunks_exact(8);
@@ -51,7 +51,11 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     }
 
     let mut result = sum.reduce_add();
-    for (s, q) in stored_chunks.remainder().iter().zip(query_chunks.remainder()) {
+    for (s, q) in stored_chunks
+        .remainder()
+        .iter()
+        .zip(query_chunks.remainder())
+    {
         result += s.to_f32() * q;
     }
     Ok(result)

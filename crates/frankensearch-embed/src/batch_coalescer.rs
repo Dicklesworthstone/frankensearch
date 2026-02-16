@@ -36,7 +36,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::{SearchError, SearchResult};
@@ -297,6 +297,16 @@ impl std::fmt::Debug for BatchCoalescer {
 }
 
 impl BatchCoalescer {
+    fn lock_state(&self) -> MutexGuard<'_, CoalescerState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                target: "frankensearch.coalescer",
+                "coalescer lock poisoned; using recovered state"
+            );
+            poisoned.into_inner()
+        })
+    }
+
     /// Create a new batch coalescer with the given configuration.
     #[must_use]
     pub fn new(config: CoalescerConfig) -> Self {
@@ -330,10 +340,6 @@ impl BatchCoalescer {
     ///
     /// The `priority` controls scheduling: [`Priority::Interactive`] requests
     /// trigger early batch dispatch to meet latency SLOs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn submit(
         &self,
         text: String,
@@ -372,7 +378,7 @@ impl BatchCoalescer {
         }
 
         {
-            let mut state = self.state.lock().expect("coalescer lock poisoned");
+            let mut state = self.lock_state();
             state.pending.push_back(request);
             trace!(
                 target: "frankensearch.coalescer",
@@ -396,12 +402,8 @@ impl BatchCoalescer {
     ///
     /// This method blocks the calling thread (via [`Condvar::wait_timeout`])
     /// and should be run on a dedicated worker thread.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn wait_for_batch(&self) -> Option<CoalescedBatch> {
-        let mut state = self.state.lock().expect("coalescer lock poisoned");
+        let mut state = self.lock_state();
 
         loop {
             // Shutdown with empty queue → done
@@ -420,7 +422,13 @@ impl BatchCoalescer {
             let (new_state, _timeout_result) = self
                 .notify
                 .wait_timeout(state, timeout)
-                .expect("coalescer lock poisoned");
+                .unwrap_or_else(|poisoned| {
+                    warn!(
+                        target: "frankensearch.coalescer",
+                        "coalescer condvar wait poisoned; using recovered state"
+                    );
+                    poisoned.into_inner()
+                });
             state = new_state;
         }
     }
@@ -429,12 +437,8 @@ impl BatchCoalescer {
     ///
     /// Returns `Some(batch)` if scheduling conditions are currently met,
     /// `None` otherwise. Does not wait.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn try_form_batch(&self) -> Option<CoalescedBatch> {
-        let mut state = self.state.lock().expect("coalescer lock poisoned");
+        let mut state = self.lock_state();
         let reason = self.batch_ready_reason(&state)?;
         let batch = self.form_batch(&mut state, reason);
         drop(state);
@@ -447,12 +451,8 @@ impl BatchCoalescer {
     ///
     /// After this call, [`wait_for_batch`](Self::wait_for_batch) will drain
     /// any remaining pending requests as a final batch and then return `None`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn shutdown(&self) {
-        let mut state = self.state.lock().expect("coalescer lock poisoned");
+        let mut state = self.lock_state();
         state.shutdown = true;
         debug!(
             target: "frankensearch.coalescer",
@@ -464,29 +464,17 @@ impl BatchCoalescer {
     }
 
     /// Whether shutdown has been requested.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.state.lock().expect("coalescer lock poisoned").shutdown
+        self.lock_state().shutdown
     }
 
     // ── Accessors ────────────────────────────────────────────────────
 
     /// Number of requests currently pending.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.state
-            .lock()
-            .expect("coalescer lock poisoned")
-            .pending
-            .len()
+        self.lock_state().pending.len()
     }
 
     /// Shared reference to the metrics counters.
@@ -1598,5 +1586,51 @@ mod tests {
         assert_eq!(texts[2], "bg-2");
         assert_eq!(texts[3], "int-2");
         assert!(batch.has_interactive());
+    }
+
+    #[test]
+    fn poisoned_mutex_recovered_across_public_api() {
+        let coalescer = Arc::new(BatchCoalescer::new(CoalescerConfig {
+            max_batch_size: 1,
+            max_wait_ms: 10_000,
+            min_batch_size: 1,
+            use_priority_lanes: true,
+        }));
+
+        // Poison the mutex by panicking while holding the lock.
+        let poison_target = Arc::clone(&coalescer);
+        let poisoner = thread::spawn(move || {
+            let _guard = poison_target
+                .state
+                .lock()
+                .expect("coalescer lock should be available for poisoning test");
+            panic!("intentional poison");
+        });
+        assert!(poisoner.join().is_err(), "poisoning thread should panic");
+
+        // Every public API path should keep working after lock poisoning.
+        assert_eq!(coalescer.pending_count(), 0);
+        assert!(!coalescer.is_shutdown());
+
+        let rx = coalescer.submit("after-poison".into(), Priority::Interactive);
+        assert_eq!(coalescer.pending_count(), 1);
+
+        let batch = coalescer.try_form_batch();
+        assert!(batch.is_some());
+        let batch = batch.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.texts(), vec!["after-poison"]);
+        batch.deliver(Ok(vec![vec![42.0]]));
+
+        let result = rx.recv().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![42.0]);
+
+        coalescer.shutdown();
+        assert!(coalescer.is_shutdown());
+
+        // wait_for_batch should return None (shutdown + empty)
+        let final_batch = coalescer.wait_for_batch();
+        assert!(final_batch.is_none());
     }
 }

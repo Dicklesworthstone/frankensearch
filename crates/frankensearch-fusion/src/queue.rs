@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use frankensearch_core::canonicalize::Canonicalizer;
@@ -239,10 +239,6 @@ impl EmbeddingQueue {
     /// # Errors
     ///
     /// Returns [`SearchError::QueueFull`] when the queue is at capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[allow(clippy::too_many_lines)]
     pub fn submit(&self, request: EmbeddingRequest) -> SearchResult<JobOutcome> {
         self.metrics.total_submitted.fetch_add(1, Ordering::Relaxed);
@@ -268,27 +264,37 @@ impl EmbeddingQueue {
             ..
         } = request;
 
-        let mut state = self.state.lock().expect("queue lock poisoned");
+        let mut state = self.lock_state();
 
         // Handle an existing pending job first so "latest submission wins" is honored.
         if let Some(&old_seq) = state.pending_ids.get(&doc_id) {
             if let Some(position) = state.jobs.iter().position(|job| job.doc_id == doc_id) {
                 // Duplicate of the pending payload: keep one job but refresh metadata/timestamp.
-                if state.jobs[position].content_hash == content_hash {
-                    let existing = state
-                        .jobs
-                        .get_mut(position)
-                        .expect("position came from VecDeque::position");
-                    existing.metadata = metadata;
-                    existing.submitted_at = submitted_at;
-                    existing.retry_count = 0;
-                    debug!(
+                if state
+                    .jobs
+                    .get(position)
+                    .is_some_and(|job| job.content_hash == content_hash)
+                {
+                    if let Some(existing) = state.jobs.get_mut(position) {
+                        existing.metadata = metadata;
+                        existing.submitted_at = submitted_at;
+                        existing.retry_count = 0;
+                        debug!(
+                            target: "frankensearch.queue",
+                            doc_id = %doc_id,
+                            seq = old_seq,
+                            "deduped duplicate submission for pending job"
+                        );
+                        return Ok(JobOutcome::Succeeded);
+                    }
+
+                    state.pending_ids.remove(&doc_id);
+                    warn!(
                         target: "frankensearch.queue",
                         doc_id = %doc_id,
                         seq = old_seq,
-                        "deduped duplicate submission for pending job"
+                        "recovered missing queue job while refreshing duplicate submission"
                     );
-                    return Ok(JobOutcome::Succeeded);
                 }
 
                 // If latest payload matches the already-embedded hash, drop pending update.
@@ -310,22 +316,28 @@ impl EmbeddingQueue {
                 }
 
                 // Replace pending job with newer content.
-                let existing = state
-                    .jobs
-                    .get_mut(position)
-                    .expect("position came from VecDeque::position");
-                existing.canonical_text = canonical;
-                existing.content_hash = content_hash;
-                existing.metadata = metadata;
-                existing.submitted_at = submitted_at;
-                existing.retry_count = 0;
-                debug!(
+                if let Some(existing) = state.jobs.get_mut(position) {
+                    existing.canonical_text = canonical;
+                    existing.content_hash = content_hash;
+                    existing.metadata = metadata;
+                    existing.submitted_at = submitted_at;
+                    existing.retry_count = 0;
+                    debug!(
+                        target: "frankensearch.queue",
+                        doc_id = %doc_id,
+                        seq = old_seq,
+                        "replaced pending job with newer text"
+                    );
+                    return Ok(JobOutcome::Succeeded);
+                }
+
+                state.pending_ids.remove(&doc_id);
+                warn!(
                     target: "frankensearch.queue",
                     doc_id = %doc_id,
                     seq = old_seq,
-                    "replaced pending job with newer text"
+                    "recovered missing queue job while replacing pending submission"
                 );
-                return Ok(JobOutcome::Succeeded);
             }
 
             // Defensive recovery: pending index said present, queue entry missing.
@@ -373,12 +385,12 @@ impl EmbeddingQueue {
             retry_count: 0,
         };
 
-        state.pending_ids.insert(doc_id, seq);
+        state.pending_ids.insert(doc_id.clone(), seq);
         state.jobs.push_back(job);
 
         debug!(
             target: "frankensearch.queue",
-            doc_id = %state.jobs.back().expect("just pushed").doc_id,
+            doc_id = %doc_id,
             pending = state.jobs.len(),
             "job enqueued"
         );
@@ -391,7 +403,7 @@ impl EmbeddingQueue {
             return Vec::new();
         }
 
-        let mut state = self.state.lock().expect("queue lock poisoned");
+        let mut state = self.lock_state();
         let count = state.jobs.len().min(limit);
         let mut batch = Vec::with_capacity(count);
 
@@ -418,10 +430,6 @@ impl EmbeddingQueue {
     /// Drain up to `batch_size` jobs from the queue.
     ///
     /// Returns an empty vec if no jobs are pending.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn drain_batch(&self) -> Vec<EmbeddingJob> {
         self.drain_with_limit(self.config.batch_size)
@@ -440,10 +448,6 @@ impl EmbeddingQueue {
     ///
     /// If the job has exceeded `max_retries`, it is not re-enqueued and
     /// `JobOutcome::Failed` is returned.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn requeue(&self, mut job: EmbeddingJob) -> JobOutcome {
         job.retry_count += 1;
 
@@ -458,7 +462,7 @@ impl EmbeddingQueue {
             return JobOutcome::Failed;
         }
 
-        let mut state = self.state.lock().expect("queue lock poisoned");
+        let mut state = self.lock_state();
 
         // If queue is full, drop the retry (backpressure)
         if state.jobs.len() >= self.config.capacity {
@@ -509,24 +513,16 @@ impl EmbeddingQueue {
     /// Record that a document was successfully embedded with a given content hash.
     ///
     /// Future submissions with the same `doc_id` and hash will be skipped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn record_embedded(&self, doc_id: &str, content_hash: &str) {
-        let mut state = self.state.lock().expect("queue lock poisoned");
+        let mut state = self.lock_state();
         self.record_known_hash_locked(&mut state, doc_id, content_hash);
         self.metrics.record(JobOutcome::Succeeded);
     }
 
     /// Number of jobs currently pending.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.state.lock().expect("queue lock poisoned").jobs.len()
+        self.lock_state().jobs.len()
     }
 
     /// Whether the queue is empty.
@@ -554,12 +550,8 @@ impl EmbeddingQueue {
     }
 
     /// Clear all known content hashes (e.g., after a full rebuild).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn clear_known_hashes(&self) {
-        let mut state = self.state.lock().expect("queue lock poisoned");
+        let mut state = self.lock_state();
         state.known_hashes.clear();
         state.known_hash_order.clear();
     }
@@ -574,6 +566,10 @@ impl EmbeddingQueue {
         self.config
             .capacity
             .saturating_mul(Self::KNOWN_HASH_CAPACITY_FACTOR)
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn record_known_hash_locked(&self, state: &mut QueueState, doc_id: &str, content_hash: &str) {
@@ -902,7 +898,7 @@ mod tests {
 
         queue.submit(request("doc-1", "fresh payload")).unwrap();
         {
-            let mut state = queue.state.lock().expect("queue lock poisoned");
+            let mut state = queue.lock_state();
             state.pending_ids.clear();
             assert_eq!(state.jobs.len(), 1);
             drop(state);
@@ -1093,6 +1089,40 @@ mod tests {
         // Third requeue: retry_count becomes 3 (> max_retries=2) -> Failed
         let outcome = queue.requeue(job);
         assert_eq!(outcome, JobOutcome::Failed);
+    }
+
+    #[test]
+    fn poisoned_mutex_recovered_across_public_api() {
+        let queue = std::sync::Arc::new(make_queue(8));
+        let poison_target = std::sync::Arc::clone(&queue);
+
+        let join_result = std::thread::spawn(move || {
+            let _guard = poison_target
+                .state
+                .lock()
+                .expect("write lock should be available for poisoning test");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(join_result.is_err());
+
+        let first = queue
+            .submit(request("doc-1", "Poison recovery text"))
+            .expect("submit should recover after poison");
+        assert_eq!(first, JobOutcome::Succeeded);
+        assert_eq!(queue.pending_count(), 1);
+
+        let batch = queue.drain_batch();
+        assert_eq!(batch.len(), 1);
+        queue.record_embedded(&batch[0].doc_id, &batch[0].content_hash);
+
+        let dedup = queue
+            .submit(request("doc-1", "Poison recovery text"))
+            .expect("dedup submit should recover after poison");
+        assert_eq!(dedup, JobOutcome::SkippedUnchanged);
+
+        queue.clear_known_hashes();
+        assert!(queue.is_empty());
     }
 
     #[test]

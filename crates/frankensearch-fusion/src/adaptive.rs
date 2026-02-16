@@ -18,11 +18,11 @@
 //! [`QueryClass`]: frankensearch_core::QueryClass
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use frankensearch_core::QueryClass;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -247,17 +247,20 @@ impl AdaptiveFusion {
         Self::new(AdaptiveConfig::default())
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, AdaptiveState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!("adaptive state lock poisoned; using recovered state");
+            poisoned.into_inner()
+        })
+    }
+
     /// Get the current blend factor for a query class.
     ///
     /// Returns the posterior mean, clamped to `[blend_min, blend_max]`.
     /// Falls back to the global posterior when per-class data is insufficient.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn blend_factor(&self, query_class: QueryClass) -> f64 {
-        let state = self.state.lock().expect("adaptive lock poisoned");
+        let state = self.lock_state();
         let blend = self.resolve_blend(&state, query_class);
         drop(state);
         blend.clamp(self.config.blend_min, self.config.blend_max)
@@ -267,13 +270,9 @@ impl AdaptiveFusion {
     ///
     /// Returns the posterior mean, clamped to `[k_min, k_max]`.
     /// Falls back to the global posterior when per-class data is insufficient.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn rrf_k(&self, query_class: QueryClass) -> f64 {
-        let state = self.state.lock().expect("adaptive lock poisoned");
+        let state = self.lock_state();
         let k = self.resolve_k(&state, query_class);
         drop(state);
         k.clamp(self.config.k_min, self.config.k_max)
@@ -282,17 +281,13 @@ impl AdaptiveFusion {
     /// Update the blend posterior with a Bernoulli observation.
     ///
     /// `success = true` means quality-tier reranking improved the ranking.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn update_blend(
         &self,
         query_class: QueryClass,
         success: bool,
         signal: SignalSource,
     ) -> EvidenceEvent {
-        let mut state = self.state.lock().expect("adaptive lock poisoned");
+        let mut state = self.lock_state();
 
         // Update per-class posterior.
         let class_state = state.per_class.entry(query_class).or_default();
@@ -328,17 +323,13 @@ impl AdaptiveFusion {
     }
 
     /// Update the RRF K posterior with an observed optimal K value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn update_k(
         &self,
         query_class: QueryClass,
         observed_k: f64,
         signal: SignalSource,
     ) -> EvidenceEvent {
-        let mut state = self.state.lock().expect("adaptive lock poisoned");
+        let mut state = self.lock_state();
 
         // Update per-class posterior.
         let class_state = state.per_class.entry(query_class).or_default();
@@ -378,12 +369,8 @@ impl AdaptiveFusion {
     ///
     /// Clears all per-class and global observations, returning the fusion
     /// state to its initial configuration.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn reset(&self) {
-        let mut state = self.state.lock().expect("adaptive lock poisoned");
+        let mut state = self.lock_state();
         state.per_class.clear();
         state.global = ClassState::default();
         drop(state);
@@ -391,13 +378,9 @@ impl AdaptiveFusion {
     }
 
     /// Snapshot the current state for serialization or inspection.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> AdaptiveSnapshot {
-        let state = self.state.lock().expect("adaptive lock poisoned");
+        let state = self.lock_state();
         AdaptiveSnapshot {
             global_blend: state.global.blend.clone(),
             global_k: state.global.k.clone(),
@@ -759,6 +742,52 @@ mod tests {
         let snap = af.snapshot();
         assert_eq!(snap.global_blend.n, 200);
         assert_eq!(snap.global_k.n, 200);
+    }
+
+    #[test]
+    fn poisoned_mutex_recovered_across_public_api() {
+        use std::sync::Arc;
+
+        let af = Arc::new(AdaptiveFusion::new(test_config()));
+        let poison_target = Arc::clone(&af);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison_target
+                .state
+                .lock()
+                .expect("adaptive lock should be available for poisoning test");
+            panic!("intentional poison");
+        });
+        assert!(poisoner.join().is_err(), "poisoning thread should panic");
+
+        // Every public API path should keep working after lock poisoning.
+        let blend = af.blend_factor(QueryClass::NaturalLanguage);
+        assert!((blend - 0.7).abs() < 1e-10);
+
+        let blend_event = af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+        assert_eq!(blend_event.query_class, QueryClass::NaturalLanguage);
+        assert_eq!(blend_event.signal_source, SignalSource::Click);
+
+        let k_event = af.update_k(QueryClass::NaturalLanguage, 72.0, SignalSource::NdcgEval);
+        assert_eq!(k_event.query_class, QueryClass::NaturalLanguage);
+        assert_eq!(k_event.signal_source, SignalSource::NdcgEval);
+
+        let k = af.rrf_k(QueryClass::NaturalLanguage);
+        assert!(k.is_finite(), "RRF K should remain finite after recovery");
+
+        let snap = af.snapshot();
+        assert!(
+            snap.global_blend.n > 0,
+            "snapshot should include recovered updates"
+        );
+        assert!(
+            snap.global_k.n > 0,
+            "snapshot should include recovered updates"
+        );
+
+        af.reset();
+        let reset_snap = af.snapshot();
+        assert_eq!(reset_snap.global_blend.n, 0);
+        assert_eq!(reset_snap.global_k.n, 0);
     }
 
     #[test]

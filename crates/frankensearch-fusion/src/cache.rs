@@ -10,12 +10,12 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use frankensearch_index::TwoTierIndex;
 
@@ -350,21 +350,28 @@ impl IndexCache {
         })
     }
 
+    fn read_index(&self) -> RwLockReadGuard<'_, Arc<TwoTierIndex>> {
+        self.inner.read().unwrap_or_else(|poisoned| {
+            warn!("index cache rwlock poisoned on read; using recovered state");
+            poisoned.into_inner()
+        })
+    }
+
+    fn write_index(&self) -> RwLockWriteGuard<'_, Arc<TwoTierIndex>> {
+        self.inner.write().unwrap_or_else(|poisoned| {
+            warn!("index cache rwlock poisoned on write; using recovered state");
+            poisoned.into_inner()
+        })
+    }
+
     /// Get a snapshot of the current index.
     ///
     /// Returns an `Arc<TwoTierIndex>` that remains valid even if the cache
     /// is refreshed concurrently. Readers holding this reference will continue
     /// to use the old index until they drop it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn current(&self) -> Arc<TwoTierIndex> {
-        self.inner
-            .read()
-            .expect("index cache rwlock poisoned")
-            .clone()
+        self.read_index().clone()
     }
 
     /// Atomically replace the cached index with a new one.
@@ -372,12 +379,8 @@ impl IndexCache {
     /// Existing readers holding `Arc<TwoTierIndex>` from [`current()`](Self::current)
     /// are unaffected. The old index is dropped when its last `Arc` reference
     /// goes out of scope.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub fn replace(&self, new_index: TwoTierIndex) {
-        let mut guard = self.inner.write().expect("index cache rwlock poisoned");
+        let mut guard = self.write_index();
         debug!(
             target: "frankensearch.cache",
             dir = %self.dir.display(),
@@ -722,6 +725,45 @@ mod tests {
         // New reference has updated count
         let fresh = cache.current();
         assert_eq!(fresh.doc_count(), 5);
+    }
+
+    #[test]
+    fn cache_recovers_from_poisoned_rwlock() {
+        let dir = temp_dir("cache-poisoned-rwlock");
+        write_fast_index(&dir, &sample_records());
+
+        let cache = std::sync::Arc::new(
+            IndexCache::open(
+                &dir,
+                TwoTierConfig::default(),
+                Box::new(SentinelFileDetector::new()),
+            )
+            .expect("open cache"),
+        );
+
+        let poison_target = std::sync::Arc::clone(&cache);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison_target
+                .inner
+                .write()
+                .expect("cache lock should be available for poisoning test");
+            panic!("intentional poison");
+        });
+        assert!(poisoner.join().is_err(), "poisoning thread should panic");
+
+        // Public API should recover and remain usable.
+        assert_eq!(cache.current().doc_count(), 3);
+
+        write_fast_index(
+            &dir,
+            &[
+                ("doc-x", vec![1.0, 0.0, 0.0, 0.0]),
+                ("doc-y", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let replacement = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        cache.replace(replacement);
+        assert_eq!(cache.current().doc_count(), 2);
     }
 
     #[test]
