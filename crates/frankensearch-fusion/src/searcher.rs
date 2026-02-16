@@ -786,7 +786,13 @@ impl TwoTierSearcher {
                                     0,
                                     &rrf_config,
                                 );
-                                fused_hits_to_scored_results(&fused, &[])
+                                fused_hits_to_scored_results(
+                                    &fused,
+                                    &[],
+                                    self.config.explain,
+                                    self.fast_embedder.id(),
+                                    self.config.rrf_k,
+                                )
                             },
                         )
                     },
@@ -805,7 +811,13 @@ impl TwoTierSearcher {
                                 )
                             },
                         );
-                        fused_hits_to_scored_results(&fused, lexical)
+                        fused_hits_to_scored_results(
+                            &fused,
+                            lexical,
+                            self.config.explain,
+                            self.fast_embedder.id(),
+                            self.config.rrf_k,
+                        )
                     },
                 );
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
@@ -1720,6 +1732,9 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
 fn fused_hits_to_scored_results(
     fused: &[frankensearch_core::types::FusedHit],
     lexical_results: &[ScoredResult],
+    explain: bool,
+    fast_embedder_id: &str,
+    rrf_k: f64,
 ) -> Vec<ScoredResult> {
     let lexical_metadata_by_doc: HashMap<&str, serde_json::Value> = lexical_results
         .iter()
@@ -1736,25 +1751,80 @@ fn fused_hits_to_scored_results(
         .map(|fh| {
             #[allow(clippy::cast_possible_truncation)]
             let score = fh.rrf_score as f32;
+            let source = if fh.in_both_sources {
+                ScoreSource::Hybrid
+            } else if fh.lexical_rank.is_some() {
+                ScoreSource::Lexical
+            } else if fh.semantic_rank.is_some() {
+                ScoreSource::SemanticFast
+            } else {
+                // Graph-only candidates (no lexical/semantic rank) still come from hybrid fusion.
+                ScoreSource::Hybrid
+            };
+            let explanation = explain.then(|| {
+                let mut components = Vec::new();
+
+                if let (Some(rank), Some(raw_score)) = (fh.lexical_rank, fh.lexical_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::LexicalBm25 {
+                            matched_terms: Vec::new(),
+                            tf: 0.0,
+                            idf: 0.0,
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rank_contribution(rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+
+                if let (Some(rank), Some(raw_score)) = (fh.semantic_rank, fh.semantic_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: fast_embedder_id.to_owned(),
+                            cosine_sim: f64::from(raw_score),
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rank_contribution(rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+
+                HitExplanation {
+                    final_score: f64::from(score),
+                    components,
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                }
+            });
             ScoredResult {
                 doc_id: fh.doc_id.clone(),
                 score,
-                source: if fh.in_both_sources {
-                    ScoreSource::Hybrid
-                } else if fh.lexical_rank.is_some() {
-                    ScoreSource::Lexical
-                } else {
-                    ScoreSource::SemanticFast
-                },
+                source,
                 fast_score: fh.semantic_score,
                 quality_score: None,
                 lexical_score: fh.lexical_score,
                 rerank_score: None,
-                explanation: None,
+                explanation,
                 metadata: lexical_metadata_by_doc.get(fh.doc_id.as_str()).cloned(),
             }
         })
         .collect()
+}
+
+fn rank_contribution(rrf_k: f64, rank: usize) -> f64 {
+    let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
+    1.0 / (sanitize_rrf_k(rrf_k) + f64::from(rank_u32) + 1.0)
+}
+
+fn sanitize_rrf_k(k: f64) -> f64 {
+    const DEFAULT_RRF_K: f64 = 60.0;
+    if k.is_finite() && k >= 0.0 {
+        k
+    } else {
+        DEFAULT_RRF_K
+    }
 }
 
 /// Convert `VectorHit` results to `ScoredResult` (semantic-only mode).
@@ -1764,7 +1834,9 @@ fn vector_hits_to_scored_results(
     config: &TwoTierConfig,
     fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
+    let mut seen = std::collections::HashSet::new();
     hits.iter()
+        .filter(|h| seen.insert(&h.doc_id))
         .take(k)
         .map(|h| {
             let explanation = if config.explain {
@@ -3315,7 +3387,8 @@ mod tests {
             })),
         }];
 
-        let scored = fused_hits_to_scored_results(&fused, &lexical_results);
+        let scored =
+            fused_hits_to_scored_results(&fused, &lexical_results, false, "fast-test", 60.0);
         let lexical = scored
             .iter()
             .find(|result| result.doc_id == "lex-doc-1")
@@ -4333,7 +4406,7 @@ mod tests {
             semantic_score: Some(0.8),
             in_both_sources: true,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[]);
+        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
         assert_eq!(results[0].source, ScoreSource::Hybrid);
         assert_eq!(results[0].fast_score, Some(0.8));
         assert_eq!(results[0].lexical_score, Some(3.0));
@@ -4350,7 +4423,7 @@ mod tests {
             semantic_score: Some(0.9),
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[]);
+        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
         assert_eq!(results[0].source, ScoreSource::SemanticFast);
     }
 
@@ -4365,8 +4438,46 @@ mod tests {
             semantic_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[]);
+        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
         assert_eq!(results[0].source, ScoreSource::Lexical);
+    }
+
+    #[test]
+    fn fused_hits_graph_only_source_defaults_to_hybrid() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "graph-only".to_owned(),
+            rrf_score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        }];
+        let results = fused_hits_to_scored_results(&fused, &[], false, "fast-test", 60.0);
+        assert_eq!(results[0].source, ScoreSource::Hybrid);
+    }
+
+    #[test]
+    fn fused_hits_include_explanation_when_enabled() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "explained".to_owned(),
+            rrf_score: 1.25,
+            lexical_rank: Some(1),
+            semantic_rank: Some(3),
+            lexical_score: Some(2.0),
+            semantic_score: Some(0.5),
+            in_both_sources: true,
+        }];
+
+        let results = fused_hits_to_scored_results(&fused, &[], true, "fast-test", 60.0);
+        let explanation = results[0]
+            .explanation
+            .as_ref()
+            .expect("explain=true should populate explanation");
+        assert_eq!(explanation.phase, ExplanationPhase::Initial);
+        assert_eq!(explanation.components.len(), 2);
+        assert!(explanation.components[0].rrf_contribution > 0.0);
+        assert!(explanation.components[1].rrf_contribution > 0.0);
     }
 
     #[test]

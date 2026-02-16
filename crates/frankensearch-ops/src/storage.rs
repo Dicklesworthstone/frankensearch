@@ -1416,60 +1416,40 @@ impl OpsStorage {
         sample.validate()?;
         let conn = self.connection();
 
-        // Manual upsert: FrankenSQLite does not yet support
-        // ON CONFLICT(...) DO UPDATE, so we check existence first.
+        // Delete-then-insert upsert: FrankenSQLite does not yet support
+        // ON CONFLICT(...) DO UPDATE and query_with_params may not reliably
+        // detect existing rows, so we delete any conflicting row first.
         let key_params = [
             SqliteValue::Text(sample.project_key.clone()),
             SqliteValue::Text(sample.instance_id.clone()),
             SqliteValue::Integer(sample.ts_ms),
         ];
-        let existing = conn
-            .query_with_params(
-                "SELECT sample_id FROM resource_samples \
-                 WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
-                &key_params,
-            )
-            .map_err(ops_error)?;
+        conn.execute_with_params(
+            "DELETE FROM resource_samples \
+             WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
+            &key_params,
+        )
+        .map_err(ops_error)?;
 
-        if existing.is_empty() {
-            let params = [
-                SqliteValue::Text(sample.project_key.clone()),
-                SqliteValue::Text(sample.instance_id.clone()),
-                optional_f64(sample.cpu_pct),
-                optional_u64(sample.rss_bytes, "rss_bytes")?,
-                optional_u64(sample.io_read_bytes, "io_read_bytes")?,
-                optional_u64(sample.io_write_bytes, "io_write_bytes")?,
-                optional_u64(sample.queue_depth, "queue_depth")?,
-                SqliteValue::Integer(sample.ts_ms),
-            ];
-            conn.execute_with_params(
-                "INSERT INTO resource_samples(\
-                    project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
-                    queue_depth, ts_ms\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-                &params,
-            )
-            .map_err(ops_error)?;
-        } else {
-            let params = [
-                optional_f64(sample.cpu_pct),
-                optional_u64(sample.rss_bytes, "rss_bytes")?,
-                optional_u64(sample.io_read_bytes, "io_read_bytes")?,
-                optional_u64(sample.io_write_bytes, "io_write_bytes")?,
-                optional_u64(sample.queue_depth, "queue_depth")?,
-                SqliteValue::Text(sample.project_key.clone()),
-                SqliteValue::Text(sample.instance_id.clone()),
-                SqliteValue::Integer(sample.ts_ms),
-            ];
-            conn.execute_with_params(
-                "UPDATE resource_samples SET \
-                    cpu_pct = ?1, rss_bytes = ?2, io_read_bytes = ?3, \
-                    io_write_bytes = ?4, queue_depth = ?5 \
-                 WHERE project_key = ?6 AND instance_id = ?7 AND ts_ms = ?8;",
-                &params,
-            )
-            .map_err(ops_error)?;
-        }
+        let params = [
+            SqliteValue::Text(sample.project_key.clone()),
+            SqliteValue::Text(sample.instance_id.clone()),
+            optional_f64(sample.cpu_pct),
+            optional_u64(sample.rss_bytes, "rss_bytes")?,
+            optional_u64(sample.io_read_bytes, "io_read_bytes")?,
+            optional_u64(sample.io_write_bytes, "io_write_bytes")?,
+            optional_u64(sample.queue_depth, "queue_depth")?,
+            SqliteValue::Integer(sample.ts_ms),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO resource_samples(\
+                project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
+                queue_depth, ts_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            &params,
+        )
+        .map_err(ops_error)?;
+
         Ok(())
     }
 

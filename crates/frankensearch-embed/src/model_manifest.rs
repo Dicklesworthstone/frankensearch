@@ -435,34 +435,7 @@ impl ModelManifest {
         }
 
         for file in &self.files {
-            if file.name.trim().is_empty() {
-                return Err(invalid_manifest_field(
-                    "files[].name",
-                    &file.name,
-                    "must not be empty",
-                ));
-            }
-            // Reject path traversal and absolute paths to prevent writes
-            // outside the staging/model directory.
-            for component in std::path::Path::new(&file.name).components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        return Err(invalid_manifest_field(
-                            "files[].name",
-                            &file.name,
-                            "must not contain '..' path traversal",
-                        ));
-                    }
-                    std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                        return Err(invalid_manifest_field(
-                            "files[].name",
-                            &file.name,
-                            "must be a relative path without root",
-                        ));
-                    }
-                    _ => {}
-                }
-            }
+            validate_model_file_name(&file.name)?;
             if file.uses_placeholder_checksum() {
                 continue;
             }
@@ -521,7 +494,7 @@ impl ModelManifest {
     /// Returns `SearchError` when any file is missing or hash/size verification fails.
     pub fn verify_dir(&self, model_dir: &Path) -> SearchResult<()> {
         for file in &self.files {
-            let path = model_dir.join(&file.name);
+            let path = resolve_model_file_path(model_dir, &file.name)?;
             verify_file_sha256(&path, &file.sha256, file.size)?;
         }
         Ok(())
@@ -1075,6 +1048,41 @@ fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState>
     })
 }
 
+fn resolve_model_file_path(model_dir: &Path, file_name: &str) -> SearchResult<PathBuf> {
+    validate_model_file_name(file_name)?;
+    Ok(model_dir.join(file_name))
+}
+
+fn validate_model_file_name(file_name: &str) -> SearchResult<()> {
+    if file_name.trim().is_empty() {
+        return Err(invalid_manifest_field(
+            "files[].name",
+            file_name,
+            "must not be empty",
+        ));
+    }
+    for component in Path::new(file_name).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(invalid_manifest_field(
+                    "files[].name",
+                    file_name,
+                    "must not contain '..' path traversal",
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(invalid_manifest_field(
+                    "files[].name",
+                    file_name,
+                    "must be a relative path without root",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Cached verification result stored as a small JSON file alongside model files.
 ///
 /// When a model directory passes SHA-256 verification, a `.verified` marker is written
@@ -1102,8 +1110,9 @@ impl VerificationMarker {
 
         let mut file_states = BTreeMap::new();
         for file in &manifest.files {
-            let path = model_dir.join(&file.name);
-            if let Some(state) = capture_file_verification_state(&path) {
+            if let Ok(path) = resolve_model_file_path(model_dir, &file.name)
+                && let Some(state) = capture_file_verification_state(&path)
+            {
                 file_states.insert(file.name.clone(), state);
             }
         }
@@ -1131,7 +1140,9 @@ impl VerificationMarker {
             let Some(expected_state) = self.file_states.get(&file.name) else {
                 return false;
             };
-            let path = model_dir.join(&file.name);
+            let Ok(path) = resolve_model_file_path(model_dir, &file.name) else {
+                return false;
+            };
             let Some(current_state) = capture_file_verification_state(&path) else {
                 return false;
             };
@@ -1549,6 +1560,39 @@ mod tests {
         let err = manifest.verify_dir(model_root).unwrap_err();
         assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
         assert!(err.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn verify_dir_rejects_traversal_file_names_without_needing_validate_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest = ModelManifest {
+            id: "test".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "owner/repo".to_owned(),
+            revision: "abcdef1".to_owned(),
+            files: vec![ModelFile {
+                name: "../escape.bin".to_owned(),
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                size: 0,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
+        };
+
+        let err = manifest
+            .verify_dir(temp.path())
+            .expect_err("must reject traversal");
+        assert!(matches!(
+            err,
+            SearchError::InvalidConfig { ref field, .. } if field == "files[].name"
+        ));
+        assert!(err.to_string().contains("path traversal"));
     }
 
     #[test]

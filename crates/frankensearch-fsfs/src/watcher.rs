@@ -619,6 +619,7 @@ fn requeue_failed_ready_events(pending: &mut PendingEvents, ready: Vec<WatchEven
     count
 }
 
+#[allow(clippy::missing_const_for_fn)]
 fn should_retry_ingest_error(error: &SearchError) -> bool {
     matches!(
         error,
@@ -1084,7 +1085,7 @@ mod tests {
     use crate::config::DiscoveryConfig;
     use crate::pressure::PressureState;
     use asupersync::test_utils::run_test_with_cx;
-    use frankensearch_core::SearchResult;
+    use frankensearch_core::{SearchError, SearchResult};
     use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
     use std::collections::HashMap;
@@ -1630,7 +1631,10 @@ mod tests {
                     .worker
                     .as_ref()
                     .expect("worker handle should be retained");
-                assert!(worker.is_finished(), "expected initial worker to have exited");
+                assert!(
+                    worker.is_finished(),
+                    "expected initial worker to have exited"
+                );
             }
 
             // Create the root and start again. This should replace the finished handle.
