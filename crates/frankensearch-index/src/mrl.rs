@@ -33,11 +33,12 @@ use std::collections::BinaryHeap;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use half::f16;
 use serde::{Deserialize, Serialize};
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
-use crate::{VectorIndex, dot_product_f16_f32, dot_product_f32_f32};
+use crate::{
+    VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -340,7 +341,6 @@ impl VectorIndex {
 
         match self.quantization() {
             crate::Quantization::F16 => {
-                let mut scratch = vec![f16::from_f32(0.0); search_dims];
                 let partial_bytes = search_dims * 2;
                 let mut record_offset = self.records_offset;
                 let mut vector_offset = self.vectors_offset;
@@ -379,10 +379,7 @@ impl VectorIndex {
 
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
-                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
-                        }
-                        let score = dot_product_f16_f32(&scratch, query_truncated)?;
+                        let score = dot_product_f16_bytes_f32(vector_bytes, query_truncated)?;
                         insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
                     }
 
@@ -391,7 +388,6 @@ impl VectorIndex {
                 }
             }
             crate::Quantization::F32 => {
-                let mut scratch = vec![0.0_f32; search_dims];
                 let partial_bytes = search_dims * 4;
                 let mut record_offset = self.records_offset;
                 let mut vector_offset = self.vectors_offset;
@@ -430,10 +426,7 @@ impl VectorIndex {
 
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
-                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        }
-                        let score = dot_product_f32_f32(&scratch, query_truncated)?;
+                        let score = dot_product_f32_bytes_f32(vector_bytes, query_truncated)?;
                         insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
                     }
 
@@ -498,50 +491,20 @@ impl VectorIndex {
 
         match self.quantization() {
             crate::Quantization::F16 => {
-                let mut scratch = vec![f16::from_f32(0.0); rescore_dims];
-                self.decode_f16_partial(index, &mut scratch, rescore_dims)?;
-                dot_product_f16_f32(&scratch, query_rescore)
+                let byte_count = rescore_dims.checked_mul(2).ok_or_else(|| {
+                    crate::index_corrupted(&self.path, "f16 truncated byte length overflow")
+                })?;
+                let bytes = self.raw_vector_bytes_partial(index, byte_count)?;
+                dot_product_f16_bytes_f32(bytes, query_rescore)
             }
             crate::Quantization::F32 => {
-                let mut scratch = vec![0.0_f32; rescore_dims];
-                self.decode_f32_partial(index, &mut scratch, rescore_dims)?;
-                dot_product_f32_f32(&scratch, query_rescore)
+                let byte_count = rescore_dims.checked_mul(4).ok_or_else(|| {
+                    crate::index_corrupted(&self.path, "f32 truncated byte length overflow")
+                })?;
+                let bytes = self.raw_vector_bytes_partial(index, byte_count)?;
+                dot_product_f32_bytes_f32(bytes, query_rescore)
             }
         }
-    }
-
-    /// Decode the first `dims` elements of an f16 stored vector.
-    fn decode_f16_partial(
-        &self,
-        index: usize,
-        output: &mut [f16],
-        dims: usize,
-    ) -> SearchResult<()> {
-        let byte_count = dims.checked_mul(2).ok_or_else(|| {
-            crate::index_corrupted(&self.path, "f16 truncated byte length overflow")
-        })?;
-        let bytes = self.raw_vector_bytes_partial(index, byte_count)?;
-        for (slot, chunk) in output.iter_mut().zip(bytes.chunks_exact(2)) {
-            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
-        }
-        Ok(())
-    }
-
-    /// Decode the first `dims` elements of an f32 stored vector.
-    fn decode_f32_partial(
-        &self,
-        index: usize,
-        output: &mut [f32],
-        dims: usize,
-    ) -> SearchResult<()> {
-        let byte_count = dims.checked_mul(4).ok_or_else(|| {
-            crate::index_corrupted(&self.path, "f32 truncated byte length overflow")
-        })?;
-        let bytes = self.raw_vector_bytes_partial(index, byte_count)?;
-        for (slot, chunk) in output.iter_mut().zip(bytes.chunks_exact(4)) {
-            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        Ok(())
     }
 
     /// Read the first `byte_count` bytes of a stored vector (without reading

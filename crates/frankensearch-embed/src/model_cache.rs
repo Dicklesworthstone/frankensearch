@@ -107,17 +107,17 @@ pub fn resolve_cache_root() -> PathBuf {
 /// Resolve the cache root with a custom environment reader (for testing).
 fn resolve_cache_root_with(env: &dyn EnvLookup) -> PathBuf {
     // 1. FRANKENSEARCH_MODEL_DIR
-    if let Some(path) = env.var(ENV_MODEL_DIR) {
+    if let Some(path) = env_var_if_non_empty(env, ENV_MODEL_DIR) {
         return PathBuf::from(path);
     }
 
     // 2. FRANKENSEARCH_DATA_DIR
-    if let Some(path) = env.var(ENV_DATA_DIR) {
+    if let Some(path) = env_var_if_non_empty(env, ENV_DATA_DIR) {
         return PathBuf::from(path).join(MODELS_SUBDIR);
     }
 
     // 3. XDG_DATA_HOME
-    if let Some(path) = env.var(ENV_XDG_DATA_HOME) {
+    if let Some(path) = env_var_if_non_empty(env, ENV_XDG_DATA_HOME) {
         return PathBuf::from(path)
             .join(FRANKENSEARCH_SUBDIR)
             .join(MODELS_SUBDIR);
@@ -290,6 +290,10 @@ trait EnvLookup {
     fn var(&self, key: &str) -> Option<String>;
 }
 
+fn env_var_if_non_empty(env: &dyn EnvLookup, key: &str) -> Option<String> {
+    env.var(key).filter(|value| !value.trim().is_empty())
+}
+
 enum EnvReader {
     Real,
     #[cfg(test)]
@@ -337,6 +341,20 @@ mod tests {
         let env = mock_env(&[(ENV_DATA_DIR, "/custom/data")]);
         let root = resolve_cache_root_with(&env);
         assert_eq!(root, PathBuf::from("/custom/data/models"));
+    }
+
+    #[test]
+    fn resolve_empty_model_dir_falls_back_to_data_dir() {
+        let env = mock_env(&[(ENV_MODEL_DIR, ""), (ENV_DATA_DIR, "/custom/data")]);
+        let root = resolve_cache_root_with(&env);
+        assert_eq!(root, PathBuf::from("/custom/data/models"));
+    }
+
+    #[test]
+    fn resolve_empty_data_dir_falls_back_to_xdg() {
+        let env = mock_env(&[(ENV_DATA_DIR, "   "), (ENV_XDG_DATA_HOME, "/xdg/data")]);
+        let root = resolve_cache_root_with(&env);
+        assert_eq!(root, PathBuf::from("/xdg/data/frankensearch/models"));
     }
 
     #[test]

@@ -303,11 +303,34 @@ fn decode_vector(bytes: &[u8], dimension: usize, quantization: Quantization) -> 
 
 // ─── WAL writing ────────────────────────────────────────────────────────────
 
+fn wal_entry_count(entries_len: usize) -> SearchResult<u32> {
+    u32::try_from(entries_len).map_err(|_| SearchError::InvalidConfig {
+        field: "wal_batch_entries".to_owned(),
+        value: entries_len.to_string(),
+        reason: "WAL batch entry count exceeds u32 maximum".to_owned(),
+    })
+}
+
+fn wal_doc_id_len(doc_bytes_len: usize) -> SearchResult<u16> {
+    u16::try_from(doc_bytes_len).map_err(|_| SearchError::InvalidConfig {
+        field: "doc_id_length".to_owned(),
+        value: doc_bytes_len.to_string(),
+        reason: format!("document ID length {doc_bytes_len} exceeds WAL u16 limit (65535 bytes)"),
+    })
+}
+
+fn wal_dimension(dimension: usize) -> SearchResult<u32> {
+    u32::try_from(dimension).map_err(|_| SearchError::InvalidConfig {
+        field: "dimension".to_owned(),
+        value: dimension.to_string(),
+        reason: "vector dimension exceeds u32 maximum for WAL header".to_owned(),
+    })
+}
+
 /// Append a batch of entries to the WAL file.
 ///
 /// If the WAL file does not exist, a header is written first.
 /// The batch is CRC32-protected so partial writes are detectable.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn append_wal_batch(
     wal_path: &Path,
     entries: &[WalEntry],
@@ -347,12 +370,11 @@ pub(crate) fn append_wal_batch(
                 file.set_len(0)?;
                 file.seek(std::io::SeekFrom::Start(0))?;
                 write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
-                file
             } else {
                 // Seek to end so the batch is appended after existing data.
                 file.seek(std::io::SeekFrom::End(0))?;
-                file
             }
+            file
         }
         Err(error) => return Err(error.into()),
     };
@@ -360,11 +382,13 @@ pub(crate) fn append_wal_batch(
     // Build batch bytes.
     let mut batch = Vec::new();
     batch.extend_from_slice(&BATCH_MAGIC);
-    batch.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let entry_count = wal_entry_count(entries.len())?;
+    batch.extend_from_slice(&entry_count.to_le_bytes());
 
     for entry in entries {
         let doc_bytes = entry.doc_id.as_bytes();
-        batch.extend_from_slice(&(doc_bytes.len() as u16).to_le_bytes());
+        let doc_id_len = wal_doc_id_len(doc_bytes.len())?;
+        batch.extend_from_slice(&doc_id_len.to_le_bytes());
         batch.extend_from_slice(doc_bytes);
         encode_vector(&mut batch, &entry.embedding, quantization);
     }
@@ -387,7 +411,6 @@ pub(crate) fn append_wal_batch(
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn write_wal_header(
     writer: &mut impl Write,
     dimension: usize,
@@ -397,7 +420,9 @@ fn write_wal_header(
     let mut header = Vec::with_capacity(WAL_HEADER_SIZE);
     header.extend_from_slice(&WAL_MAGIC);
     header.extend_from_slice(&WAL_VERSION.to_le_bytes());
-    header.extend_from_slice(&(dimension as u32).to_le_bytes());
+    let dim_u32 = wal_dimension(dimension)?;
+    header.extend_from_slice(&dim_u32.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
     header.push(quantization as u8);
     header.push(compaction_gen);
     header.extend_from_slice(&[0u8; 4]); // reserved
@@ -855,6 +880,51 @@ mod tests {
         assert_ne!(crc, 0);
         // Same input should produce same CRC
         assert_eq!(crc, crc32_of(b"hello"));
+    }
+
+    #[test]
+    fn oversized_doc_id_returns_error() {
+        let path = temp_wal_path("oversized-docid");
+        let dim = 4;
+        // Create a doc_id that exceeds u16::MAX (65535) bytes.
+        let big_id = "x".repeat(70_000);
+        let entries = vec![WalEntry {
+            doc_id: big_id,
+            doc_id_hash: 0,
+            embedding: vec![1.0; dim],
+        }];
+        let result = append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false);
+        assert!(result.is_err(), "should reject doc_id exceeding u16 length");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("doc_id_length"),
+            "error should mention doc_id_length: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn oversized_batch_entry_count_returns_error() {
+        let result = wal_entry_count(usize::MAX);
+        assert!(result.is_err(), "should reject entry count exceeding u32");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("wal_batch_entries"),
+            "error should mention wal_batch_entries: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_dimension_returns_error() {
+        let path = temp_wal_path("oversized-dimension");
+        let result = append_wal_batch(&path, &[], usize::MAX, Quantization::F16, 0, false);
+        assert!(result.is_err(), "should reject dimension exceeding u32");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("dimension"),
+            "error should mention dimension: {err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

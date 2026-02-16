@@ -268,13 +268,27 @@ impl TwoTierIndex {
             let mut hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
 
             // Filter soft-deleted records from ANN results (HNSW index is static).
-            hits.retain(|hit| !self.fast_index.is_deleted(hit.index as usize));
+            // NOTE: hit.index is the compact HNSW d_id, NOT the VectorIndex position.
+            // After tombstone-aware HNSW rebuild, these diverge. Use doc_id lookup
+            // to find the real VectorIndex position for the tombstone check.
+            hits.retain(|hit| {
+                match self.fast_index.find_index_by_doc_id(&hit.doc_id) {
+                    Ok(Some(pos)) => !self.fast_index.is_deleted(pos),
+                    // doc_id missing or decode error → treat as deleted
+                    _ => false,
+                }
+            });
 
             // Merge WAL entries (not yet in ANN).
             if !self.fast_index.wal_entries.is_empty() {
                 let base_index = self.fast_index.record_count();
                 for (i, entry) in self.fast_index.wal_entries.iter().enumerate() {
                     let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
+                    // Guard: corrupt WAL embeddings (e.g. from crash recovery) can
+                    // produce NaN/Inf scores that poison the top-k sort. Skip them.
+                    if !score.is_finite() {
+                        continue;
+                    }
                     // Virtual index logic must match VectorIndex::resolve_wal_hit
                     let index = u32::try_from(base_index + i).unwrap_or(u32::MAX);
                     hits.push(VectorHit {
@@ -618,7 +632,7 @@ fn maybe_load_or_build_ann(
     };
 
     if ann_path.exists() {
-        match HnswIndex::load(ann_path) {
+        match HnswIndex::load(ann_path, vector_index) {
             Ok(ann) => match ann.matches_vector_index(vector_index) {
                 Ok(true) => {
                     let loaded_config = ann.config();
@@ -1117,7 +1131,8 @@ mod tests {
         assert!(first_open.has_fast_ann());
 
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        let before = HnswIndex::load(&ann_path).expect("load initial ann sidecar");
+        let before =
+            HnswIndex::load(&ann_path, &first_open.fast_index).expect("load initial ann sidecar");
         let before_config = before.config();
         assert_eq!(before_config.m, 8);
         assert_eq!(before_config.ef_construction, 64);
@@ -1133,7 +1148,8 @@ mod tests {
         let second_open = TwoTierIndex::open(&dir, updated).expect("open with updated ann config");
         assert!(second_open.has_fast_ann());
 
-        let after = HnswIndex::load(&ann_path).expect("load rebuilt ann sidecar");
+        let after =
+            HnswIndex::load(&ann_path, &second_open.fast_index).expect("load rebuilt ann sidecar");
         let after_config = after.config();
         assert_eq!(after_config.m, 24);
         assert_eq!(after_config.ef_construction, 96);
@@ -1219,6 +1235,135 @@ mod tests {
             !hits.iter().any(|hit| hit.doc_id == "doc-b"),
             "tombstoned document should not be returned by ANN search"
         );
+    }
+
+    /// Regression test for bd-2grj: HNSW `d_id` diverges from `VectorIndex` position
+    /// after tombstone-aware rebuild. Verifies that live docs survive the tombstone
+    /// filter even when their HNSW `d_id` differs from their `VectorIndex` position.
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_tombstone_filter_uses_doc_id_not_hnsw_position() {
+        let dir = temp_index_dir("ann-tombstone-docid");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        // A@0, B@1, C@2, D@3
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-d", &[0.0, 0.0, 0.0, 1.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        // Soft-delete doc-b (position 1) — creates gap between HNSW d_ids and positions.
+        // After rebuild: HNSW d_ids = {0:doc-a, 1:doc-c, 2:doc-d}
+        // VectorIndex positions = {0:doc-a, 1:doc-b(deleted), 2:doc-c, 3:doc-d}
+        let mut fast_index = VectorIndex::open(&fast_path).expect("open for delete");
+        assert!(fast_index.soft_delete("doc-b").expect("soft_delete"));
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 64,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).expect("open with ann");
+        assert!(index.has_fast_ann());
+
+        // Search for all docs — should return doc-a, doc-c, doc-d (NOT doc-b)
+        let hits = index
+            .search_fast(&[0.25, 0.25, 0.25, 0.25], 10)
+            .expect("search");
+
+        let hit_ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+
+        // Critical: doc-c and doc-d must survive even though their HNSW d_ids (1, 2)
+        // differ from their VectorIndex positions (2, 3). Before bd-2grj fix,
+        // doc-c was incorrectly filtered because is_deleted(1) checked position 1
+        // (doc-b, which IS deleted) instead of position 2 (doc-c, which is live).
+        assert!(
+            hit_ids.contains(&"doc-a"),
+            "doc-a should be returned, got: {hit_ids:?}"
+        );
+        assert!(
+            hit_ids.contains(&"doc-c"),
+            "doc-c should be returned (bd-2grj regression), got: {hit_ids:?}"
+        );
+        assert!(
+            hit_ids.contains(&"doc-d"),
+            "doc-d should be returned (bd-2grj regression), got: {hit_ids:?}"
+        );
+        assert!(
+            !hit_ids.contains(&"doc-b"),
+            "tombstoned doc-b should NOT be returned, got: {hit_ids:?}"
+        );
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected exactly 3 live docs, got: {hit_ids:?}"
+        );
+    }
+
+    // ─── bd-3nsq: NaN score in WAL merge ───
+
+    #[test]
+    fn search_fast_skips_nan_score_wal_entries() {
+        use crate::wal::WalEntry;
+
+        let dir = temp_index_dir("nan-wal-score");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write fast index");
+
+        let mut index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+
+        // Inject a WAL entry with NaN in the embedding. dot_product with NaN
+        // produces NaN, which should be filtered out by the is_finite() guard.
+        index.fast_index.wal_entries.push(WalEntry {
+            doc_id: "doc-nan".to_owned(),
+            doc_id_hash: crate::fnv1a_hash(b"doc-nan"),
+            embedding: vec![f32::NAN, 0.0, 0.0, 0.0],
+        });
+
+        // Also inject a valid WAL entry to confirm it's still returned.
+        index.fast_index.wal_entries.push(WalEntry {
+            doc_id: "doc-wal-ok".to_owned(),
+            doc_id_hash: crate::fnv1a_hash(b"doc-wal-ok"),
+            embedding: vec![0.0, 1.0, 0.0, 0.0],
+        });
+
+        let hits = index
+            .search_fast(&[1.0, 0.0, 0.0, 0.0], 10)
+            .expect("search");
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&"doc-nan"),
+            "NaN-scored WAL entry must be excluded, got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"doc-a"),
+            "base doc-a should be returned, got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"doc-wal-ok"),
+            "valid WAL entry should be returned, got: {ids:?}"
+        );
+
+        // Verify all returned scores are finite.
+        for hit in &hits {
+            assert!(
+                hit.score.is_finite(),
+                "hit {} has non-finite score {}",
+                hit.doc_id,
+                hit.score
+            );
+        }
     }
 
     // ─── bd-3szp tests begin ───

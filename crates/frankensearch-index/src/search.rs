@@ -394,6 +394,11 @@ impl VectorIndex {
                 }
             }
             let score = dot_product_f32_f32(&entry.embedding, query)?;
+            // Guard: corrupt WAL embeddings (e.g. from crash recovery) can
+            // produce NaN/Inf scores. Skip them rather than polluting results.
+            if !score.is_finite() {
+                continue;
+            }
             insert_candidate(heap, HeapEntry::new(to_wal_index(idx), score), limit);
         }
         Ok(())

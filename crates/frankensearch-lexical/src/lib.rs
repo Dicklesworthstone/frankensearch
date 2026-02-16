@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
+use asupersync::sync::Mutex;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{LexicalSearch, SearchFuture};
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
@@ -215,7 +216,7 @@ pub struct TantivyIndex {
     index: Index,
     fields: SchemaFields,
     reader: IndexReader,
-    writer: std::sync::Mutex<IndexWriter>,
+    writer: Mutex<IndexWriter>,
     doc_count: AtomicUsize,
     path: Option<PathBuf>,
 }
@@ -328,7 +329,7 @@ impl TantivyIndex {
             index,
             fields,
             reader,
-            writer: std::sync::Mutex::new(writer),
+            writer: Mutex::new(writer),
             doc_count: AtomicUsize::new(doc_count),
             path,
         })
@@ -383,14 +384,22 @@ impl TantivyIndex {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::SubsystemError` if the writer lock is poisoned.
-    pub fn delete_document(&self, doc_id: &str) -> SearchResult<()> {
+    /// Returns `SearchError::SubsystemError` if the writer lock is poisoned
+    /// or cancelled.
+    pub async fn delete_document(&self, cx: &Cx, doc_id: &str) -> SearchResult<()> {
         let term = Term::from_field_text(self.fields.id, doc_id);
         self.writer
-            .lock()
-            .map_err(|e| SearchError::SubsystemError {
-                subsystem: "tantivy",
-                source: Box::new(std::io::Error::other(e.to_string())),
+            .lock(cx)
+            .await
+            .map_err(|e| match e {
+                asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(std::io::Error::other("writer mutex poisoned")),
+                },
+                asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                    phase: "tantivy.delete".into(),
+                    reason: "writer lock cancelled".into(),
+                },
             })?
             .delete_term(term);
         Ok(())
@@ -609,20 +618,23 @@ impl LexicalSearch for TantivyIndex {
 
     fn index_document<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         doc: &'a IndexableDocument,
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             let tantivy_doc = self.to_tantivy_doc(doc);
 
             {
-                let writer = self
-                    .writer
-                    .lock()
-                    .map_err(|e| SearchError::SubsystemError {
+                let writer = self.writer.lock(cx).await.map_err(|e| match e {
+                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
                         subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(e.to_string())),
-                    })?;
+                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
+                    },
+                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                        phase: "tantivy.index".into(),
+                        reason: "writer lock cancelled".into(),
+                    },
+                })?;
 
                 // Delete any existing document with same ID (upsert semantics).
                 let term = Term::from_field_text(self.fields.id, &doc.id);
@@ -642,18 +654,21 @@ impl LexicalSearch for TantivyIndex {
 
     fn index_documents<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         docs: &'a [IndexableDocument],
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let writer = self
-                    .writer
-                    .lock()
-                    .map_err(|e| SearchError::SubsystemError {
+                let writer = self.writer.lock(cx).await.map_err(|e| match e {
+                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
                         subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(e.to_string())),
-                    })?;
+                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
+                    },
+                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                        phase: "tantivy.batch_index".into(),
+                        reason: "writer lock cancelled".into(),
+                    },
+                })?;
 
                 for doc in docs {
                     let tantivy_doc = self.to_tantivy_doc(doc);
@@ -676,16 +691,19 @@ impl LexicalSearch for TantivyIndex {
         })
     }
 
-    fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let mut writer = self
-                    .writer
-                    .lock()
-                    .map_err(|e| SearchError::SubsystemError {
+                let mut writer = self.writer.lock(cx).await.map_err(|e| match e {
+                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
                         subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(e.to_string())),
-                    })?;
+                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
+                    },
+                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                        phase: "tantivy.commit".into(),
+                        reason: "writer lock cancelled".into(),
+                    },
+                })?;
 
                 writer.commit().map_err(|e| SearchError::SubsystemError {
                     subsystem: "tantivy",
@@ -991,7 +1009,7 @@ mod tests {
             idx.commit(&cx).await.expect("commit");
             assert_eq!(idx.doc_count(), 5);
 
-            idx.delete_document("doc-1").expect("delete");
+            idx.delete_document(&cx, "doc-1").await.expect("delete");
             idx.commit(&cx).await.expect("commit after delete");
 
             let results = idx.search(&cx, "Rust systems", 10).await.expect("search");
@@ -1063,7 +1081,7 @@ mod tests {
             idx.commit(&cx).await.expect("commit");
             assert_eq!(idx.doc_count(), 2);
 
-            idx.delete_document("doc-1").expect("delete");
+            idx.delete_document(&cx, "doc-1").await.expect("delete");
             idx.commit(&cx).await.expect("commit delete");
             assert_eq!(idx.doc_count(), 1);
         });

@@ -119,7 +119,7 @@ impl LexicalChunkPolicy {
             }
 
             let chunk_text = text[start..end].to_owned();
-            let token_count = tokenize_lexical(&chunk_text).len();
+            let token_count = count_lexical_tokens(&chunk_text);
             chunks.push(LexicalChunk {
                 ordinal,
                 byte_start: start,
@@ -141,6 +141,27 @@ impl LexicalChunkPolicy {
 
         chunks
     }
+}
+
+/// Count tokens in text without allocating strings.
+#[must_use]
+pub fn count_lexical_tokens(text: &str) -> usize {
+    let mut count = 0;
+    let mut in_token = false;
+    for ch in text.chars() {
+        if is_token_char(ch) {
+            if !in_token {
+                in_token = true;
+            }
+        } else if in_token {
+            in_token = false;
+            count += 1;
+        }
+    }
+    if in_token {
+        count += 1;
+    }
+    count
 }
 
 /// Split text into lexical tokens while preserving code/path-like identifiers.
@@ -726,6 +747,22 @@ mod tests {
         let tokens = tokenize_lexical("http://example.com:8080/path");
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].text, "http://example.com:8080/path");
+    }
+
+    #[test]
+    fn count_lexical_tokens_matches_tokenize_lexical() {
+        let inputs = [
+            "",
+            "hello world",
+            "src/main.rs -> fn run_fast(x: i32) { return x; }",
+            "   !@# $%^ &*() ",
+            "multiline\ntext\n\nwith\tgaps",
+        ];
+        for input in inputs {
+            let count = super::count_lexical_tokens(input);
+            let tokens = tokenize_lexical(input);
+            assert_eq!(count, tokens.len(), "Mismatch for input: {input:?}");
+        }
     }
 
     // ── Chunker edge cases ──────────────────────────────────────────

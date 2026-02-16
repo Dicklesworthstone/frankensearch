@@ -931,7 +931,7 @@ impl VectorIndex {
         Ok(())
     }
 
-    fn find_index_by_doc_id(&self, doc_id: &str) -> SearchResult<Option<usize>> {
+    pub(crate) fn find_index_by_doc_id(&self, doc_id: &str) -> SearchResult<Option<usize>> {
         let doc_id_hash = fnv1a_hash(doc_id.as_bytes());
         let Some(mut index) = self.find_first_hash_match(doc_id_hash)? else {
             return Ok(None);

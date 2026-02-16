@@ -470,8 +470,6 @@ impl FileProtector {
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let had_source = source_file.is_some();
-
         // Determine if we have a source file to verify/read
         if let Some(ref file) = source_file {
             // Verify first - using mmap
@@ -529,8 +527,23 @@ impl FileProtector {
         let mut symbols = if let Some(ref file) = source_file {
             let len = file.metadata()?.len();
             if len > 0 {
-                let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
-                source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
+                if len == header.source_len {
+                    // Bit-rot case: length matches but verification failed.
+                    // Feeding corrupted source symbols to an erasure codec (which expects
+                    // valid symbols or erasures) usually prevents recovery or produces
+                    // garbage. We skip loading source symbols to avoid OOM on large files
+                    // and rely entirely on repair symbols.
+                    warn!(
+                        path = %path.display(),
+                        len,
+                        "source length matches header but CRC failed; skipping source symbols"
+                    );
+                    Vec::new()
+                } else {
+                    // Truncation case: we need the valid prefix.
+                    let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
+                    source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
+                }
             } else {
                 Vec::new()
             }
@@ -550,76 +563,6 @@ impl FileProtector {
             } => {
                 let data = normalize_recovered_data(data, &header)?;
                 let recovered_crc32 = crc32fast::hash(&data);
-                // We don't have source_bytes vec anymore, but we know if source_file existed.
-                if recovered_crc32 != header.source_crc32 && had_source {
-                    warn!(
-                        path = %path.display(),
-                        expected_crc32 = header.source_crc32,
-                        recovered_crc32,
-                        "decoded payload failed crc verification; retrying with repair symbols only"
-                    );
-
-                    match self.codec.decode_for_symbol_size(
-                        &repair_symbols,
-                        header.k_source,
-                        header.symbol_size,
-                    )? {
-                        DecodedPayload::Success {
-                            data, symbols_used, ..
-                        } => {
-                            let data = normalize_recovered_data(data, &header)?;
-                            let recovered_crc32 = crc32fast::hash(&data);
-                            if recovered_crc32 == header.source_crc32 {
-                                write_durable(path, &data)?;
-                                self.metrics.record_repair_success();
-                                info!(
-                                    path = %path.display(),
-                                    bytes_written = data.len(),
-                                    symbols_used,
-                                    "durability repair completed (repair symbols only)"
-                                );
-                                return Ok(FileRepairOutcome::Repaired {
-                                    bytes_written: data.len(),
-                                    symbols_used,
-                                });
-                            }
-
-                            self.metrics.record_repair_failure();
-                            warn!(
-                                path = %path.display(),
-                                expected_crc32 = header.source_crc32,
-                                recovered_crc32,
-                                "repair-only decode failed crc verification"
-                            );
-                            return Ok(FileRepairOutcome::Unrecoverable {
-                                reason: DecodeFailureReason::SymbolSizeMismatch,
-                                symbols_received: u32::try_from(repair_symbols.len())
-                                    .unwrap_or(u32::MAX),
-                                k_required: header.k_source,
-                            });
-                        }
-                        DecodedPayload::Failure {
-                            reason,
-                            symbols_received,
-                            k_required,
-                            ..
-                        } => {
-                            self.metrics.record_repair_failure();
-                            warn!(
-                                path = %path.display(),
-                                ?reason,
-                                symbols_received,
-                                k_required,
-                                "repair-only decode failed"
-                            );
-                            return Ok(FileRepairOutcome::Unrecoverable {
-                                reason,
-                                symbols_received,
-                                k_required,
-                            });
-                        }
-                    }
-                }
 
                 if recovered_crc32 != header.source_crc32 {
                     self.metrics.record_repair_failure();

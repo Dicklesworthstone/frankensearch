@@ -6,7 +6,7 @@
 //! - adapting behavior based on pressure state,
 //! - providing deterministic snapshot diffing for crash-recovery catch-up.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,6 @@ use crate::pressure::PressureState;
 
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 pub const DEFAULT_BATCH_SIZE: usize = 100;
-const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const WATCHER_SUBSYSTEM: &str = "fsfs_watcher";
 
 /// One normalized filesystem change event.
@@ -542,7 +541,18 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             context.base_batch_size,
         );
 
-        match event_rx.recv_timeout(WATCHER_POLL_INTERVAL) {
+        let timeout = pending.earliest_observed_at().map_or_else(
+            || Duration::from_millis(100),
+            |earliest| {
+                let now = now_millis();
+                let ready_at = earliest.saturating_add(policy.debounce_ms);
+                let wait = ready_at.saturating_sub(now);
+                // Cap at 100ms to check stop flag, but allow short waits for debounce
+                Duration::from_millis(wait.min(100))
+            },
+        );
+
+        match event_rx.recv_timeout(timeout) {
             Ok(event) => process_notify_result(
                 event,
                 policy,
@@ -1038,17 +1048,39 @@ const fn pressure_state_from_code(code: u8) -> PressureState {
 
 #[derive(Default)]
 struct PendingEvents {
-    by_path: BTreeMap<PathBuf, WatchEvent>,
+    by_path: HashMap<PathBuf, WatchEvent>,
+    by_time: BTreeMap<u64, HashSet<PathBuf>>,
 }
 
 impl PendingEvents {
     fn push(&mut self, event: WatchEvent) -> bool {
-        self.by_path.insert(event.path.clone(), event).is_some()
+        let old_event = self.by_path.insert(event.path.clone(), event.clone());
+        if let Some(old) = old_event {
+            if let Some(paths) = self.by_time.get_mut(&old.observed_at_ms) {
+                paths.remove(&old.path);
+                if paths.is_empty() {
+                    self.by_time.remove(&old.observed_at_ms);
+                }
+            }
+            // Return true because we debounced (replaced) an existing event
+            self.by_time
+                .entry(event.observed_at_ms)
+                .or_default()
+                .insert(event.path);
+            true
+        } else {
+            self.by_time
+                .entry(event.observed_at_ms)
+                .or_default()
+                .insert(event.path);
+            false
+        }
     }
 
     fn clear(&mut self) -> usize {
         let count = self.by_path.len();
         self.by_path.clear();
+        self.by_time.clear();
         count
     }
 
@@ -1057,24 +1089,71 @@ impl PendingEvents {
             return Vec::new();
         }
 
-        let mut ready_paths = Vec::new();
-        for (path, event) in &self.by_path {
-            if ready_paths.len() >= batch_size {
+        let cutoff = now_ms.saturating_sub(debounce_ms);
+        let mut ready_events = Vec::new();
+
+        // Split off everything up to (and including) cutoff.
+        // split_off returns keys >= cutoff + 1 (strictly greater than cutoff).
+        // So we keep the "future" part in self.by_time, and take the "past" part.
+        // Wait, split_off returns everything AFTER the key.
+        // We want to remove everything BEFORE the key.
+        // BTreeMap doesn't have split_off_before.
+        // We have to iterate keys.
+
+        // Since we want to limit by batch_size, we can't just take everything.
+        // We must iterate and stop when we hit batch_size.
+
+        let mut timestamps_to_remove = Vec::new();
+        let mut paths_to_remove = Vec::new();
+
+        'outer: for (&ts, paths) in &self.by_time {
+            if ts > cutoff {
                 break;
             }
-            let elapsed = now_ms.saturating_sub(event.observed_at_ms);
-            if elapsed >= debounce_ms {
-                ready_paths.push(path.clone());
+
+            for path in paths {
+                if ready_events.len() >= batch_size {
+                    break 'outer;
+                }
+                if let Some(event) = self.by_path.remove(path) {
+                    ready_events.push(event);
+                    paths_to_remove.push((ts, path.clone()));
+                }
+            }
+
+            // If we didn't break 'outer, it means we consumed all paths for this timestamp.
+            // We can mark the timestamp for removal (if we are sure we took all paths).
+            // But if we broke 'outer inside the inner loop, we might have left some paths.
+            // It's safer to remove paths individually or check if paths is empty.
+        }
+
+        // Cleanup by_time
+        for (ts, path) in paths_to_remove {
+            if let Some(paths) = self.by_time.get_mut(&ts) {
+                paths.remove(&path);
+                if paths.is_empty() {
+                    timestamps_to_remove.push(ts);
+                }
             }
         }
 
-        let mut ready_events = Vec::with_capacity(ready_paths.len());
-        for path in ready_paths {
-            if let Some(event) = self.by_path.remove(&path) {
-                ready_events.push(event);
+        // Use a set to dedup timestamps to remove, though order matters for remove? No.
+        // But timestamps_to_remove might contain duplicates if we iterate multiple paths.
+        // BTreeMap remove is safe.
+        for ts in timestamps_to_remove {
+            // Check again if empty, because we might have added it multiple times
+            if let Some(paths) = self.by_time.get(&ts) {
+                if paths.is_empty() {
+                    self.by_time.remove(&ts);
+                }
             }
         }
+
         ready_events
+    }
+
+    fn earliest_observed_at(&self) -> Option<u64> {
+        self.by_time.keys().next().copied()
     }
 }
 

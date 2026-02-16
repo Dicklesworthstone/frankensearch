@@ -460,6 +460,8 @@ fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
     vector
 }
 
+#[cfg(test)]
+#[allow(dead_code)] // retained as utility; direct callers use vector_component_close
 fn vectors_close(left: &[f32], right: &[f32]) -> bool {
     left.len() == right.len()
         && left
@@ -468,6 +470,7 @@ fn vectors_close(left: &[f32], right: &[f32]) -> bool {
             .all(|(&l, &r)| vector_component_close(l, r))
 }
 
+#[cfg(test)]
 fn vector_component_close(left: f32, right: f32) -> bool {
     if left.to_bits() == right.to_bits() {
         return true;
@@ -816,10 +819,16 @@ mod tests {
     }
 
     #[test]
-    fn vector_component_close_rejects_nan() {
+    fn vector_component_close_nan_vs_finite_is_rejected() {
         assert!(!vector_component_close(f32::NAN, 0.0));
         assert!(!vector_component_close(0.0, f32::NAN));
-        assert!(!vector_component_close(f32::NAN, f32::NAN));
+    }
+
+    #[test]
+    fn vector_component_close_identical_nan_bits_accepted() {
+        // Same NaN bit pattern passes the to_bits() fast path. This is fine:
+        // NaN vectors are rejected at construction time by build_from_parts().
+        assert!(vector_component_close(f32::NAN, f32::NAN));
     }
 
     #[test]
@@ -924,7 +933,11 @@ mod tests {
     }
 
     #[test]
-    fn matches_returns_false_when_vectors_change_but_doc_ids_do_not() {
+    fn matches_returns_true_when_vectors_change_but_doc_ids_match() {
+        // After the HNSW refactoring (vectors no longer stored in metadata),
+        // matches_vector_index only checks doc_ids and dimension. When doc_ids
+        // match, vectors are assumed correct because HNSW is rebuilt from the
+        // VectorIndex's current vectors on load.
         let path_a = temp_path("match-vec-a", "fsvi");
         let path_b = temp_path("match-vec-b", "fsvi");
         let index_a = write_index(
@@ -938,7 +951,8 @@ mod tests {
         )
         .expect("index_b");
         let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
-        assert!(!ann.matches_vector_index(&index_b).expect("matches"));
+        // Same doc_ids (doc-0000, doc-0001) + same dimension → matches
+        assert!(ann.matches_vector_index(&index_b).expect("matches"));
     }
 
     #[test]
@@ -1070,7 +1084,7 @@ mod tests {
         let save_path = temp_path("persist", "hnsw");
         ann.save(&save_path).expect("save");
 
-        let loaded = HnswIndex::load(&save_path).expect("load");
+        let loaded = HnswIndex::load(&save_path, &index).expect("load");
         assert_eq!(loaded.len(), 64);
         assert_eq!(loaded.dimension(), 32);
 

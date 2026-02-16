@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,7 @@ const CORRELATION_METADATA_KEY: &str = "correlation_id";
 const HASH_EMBEDDER_PREFIX: &str = "fnv1a-";
 const LEGACY_HASH_EMBEDDER_ID: &str = "hash/fnv1a";
 const MAX_CONTENT_PREVIEW_CHARS: usize = 400;
+const MAX_SOURCE_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestRequest {
@@ -343,9 +344,24 @@ impl StorageBackedJobRunner {
             && maybe_quality_embedder_id.as_deref() != Some(fast_embedder_id.as_str());
 
         let tx_result = self.storage.transaction(|conn| {
-            let dedup =
+            let fast_dedup =
                 dedup_state_for_doc(conn, &request.doc_id, &content_hash, &fast_embedder_id)?;
-            if dedup.state == DedupState::Unchanged {
+            let quality_needs_requeue = if fast_dedup.state == DedupState::Unchanged
+                && quality_requested
+            {
+                if let Some(quality_embedder_id) = maybe_quality_embedder_id.as_deref() {
+                    dedup_state_for_doc(conn, &request.doc_id, &content_hash, quality_embedder_id)?
+                        .state
+                        != DedupState::Unchanged
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if fast_dedup.state == DedupState::Unchanged && !quality_needs_requeue {
+                upsert_document(conn, &document)?;
                 return Ok(IngestTxResult {
                     action: IngestAction::Unchanged,
                     fast_job_enqueued: false,
@@ -361,8 +377,39 @@ impl StorageBackedJobRunner {
                 });
             }
 
+            if fast_dedup.state == DedupState::Unchanged {
+                upsert_document(conn, &document)?;
+                let quality_job_enqueued =
+                    if let Some(quality_embedder_id) = maybe_quality_embedder_id.as_ref() {
+                        let quality_request = EnqueueRequest::new(
+                            request.doc_id.clone(),
+                            quality_embedder_id.clone(),
+                            content_hash,
+                            self.config.quality_priority,
+                        );
+                        let quality_outcome = enqueue_inner(
+                            conn,
+                            &quality_request,
+                            now_ms,
+                            self.queue.config().max_retries,
+                        )?;
+                        matches!(
+                            quality_outcome,
+                            EnqueueOutcome::Inserted | EnqueueOutcome::Replaced
+                        )
+                    } else {
+                        false
+                    };
+
+                return Ok(IngestTxResult {
+                    action: IngestAction::Unchanged,
+                    fast_job_enqueued: false,
+                    quality_job_enqueued,
+                });
+            }
+
             upsert_document(conn, &document)?;
-            if dedup.had_existing_row {
+            if fast_dedup.had_existing_row {
                 reset_embedding_status(conn, &request.doc_id)?;
             }
 
@@ -406,7 +453,7 @@ impl StorageBackedJobRunner {
                 false
             };
 
-            let action = match dedup.state {
+            let action = match fast_dedup.state {
                 DedupState::New => IngestAction::New,
                 DedupState::Changed => IngestAction::Updated,
                 DedupState::Unchanged => IngestAction::Unchanged,
@@ -522,7 +569,7 @@ impl StorageBackedJobRunner {
                 .unwrap_or_else(|| fallback_correlation_id(&job.doc_id));
 
             let text_cow = if let Some(path) = &doc.source_path {
-                match std::fs::read_to_string(path) {
+                match read_source_text_with_limit(path, MAX_SOURCE_FILE_BYTES) {
                     Ok(raw) => std::borrow::Cow::Owned(self.canonicalizer.canonicalize(&raw)),
                     Err(error) => {
                         tracing::warn!(
@@ -531,6 +578,7 @@ impl StorageBackedJobRunner {
                             worker_id,
                             doc_id = %job.doc_id,
                             path = %path,
+                            max_source_file_bytes = MAX_SOURCE_FILE_BYTES,
                             error = %error,
                             "failed to read source file; falling back to content preview"
                         );
@@ -1002,6 +1050,33 @@ fn is_hash_embedder(embedder_id: &str) -> bool {
     embedder_id.starts_with(HASH_EMBEDDER_PREFIX) || embedder_id == LEGACY_HASH_EMBEDDER_ID
 }
 
+fn read_source_text_with_limit(path: &str, max_bytes: usize) -> io::Result<String> {
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source file exceeds {max_bytes} bytes"),
+        ));
+    }
+
+    let initial_capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let file = std::fs::File::open(path)?;
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source file exceeds {max_bytes} bytes"),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
@@ -1278,6 +1353,61 @@ mod tests {
                 .expect("queue depth should succeed");
             assert_eq!(depth.pending, 0);
             assert_eq!(depth.processing, 0);
+        });
+    }
+
+    #[test]
+    fn ingest_unchanged_document_requeues_quality_after_quality_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 3, None, 1.0));
+            let quality = Arc::new(StubEmbedder::new(
+                "quality-tier",
+                3,
+                Some("fail-quality"),
+                2.0,
+            ));
+            let runner = make_runner(
+                JobQueueConfig {
+                    max_retries: 0,
+                    ..JobQueueConfig::default()
+                },
+                PipelineConfig::default(),
+                fast,
+                Some(quality),
+                sink,
+            );
+
+            let first = runner
+                .ingest(IngestRequest::new("doc-quality-retry", "fail-quality"))
+                .expect("initial ingest should succeed");
+            assert_eq!(first.action, IngestAction::New);
+            assert!(first.fast_job_enqueued);
+            assert!(first.quality_job_enqueued);
+
+            let processed = runner
+                .process_batch(&cx, "worker-quality-failure")
+                .await
+                .expect("process_batch should succeed");
+            assert_eq!(processed.jobs_claimed, 2);
+            assert_eq!(processed.jobs_completed, 1);
+            assert_eq!(processed.jobs_failed, 1);
+
+            let second = runner
+                .ingest(IngestRequest::new("doc-quality-retry", "fail-quality"))
+                .expect("second ingest should succeed");
+            assert_eq!(second.action, IngestAction::Unchanged);
+            assert!(!second.fast_job_enqueued);
+            assert!(
+                second.quality_job_enqueued,
+                "quality job should requeue when quality tier previously failed"
+            );
+
+            let depth = runner
+                .queue
+                .queue_depth()
+                .expect("queue depth should succeed");
+            assert_eq!(depth.pending, 1);
         });
     }
 
@@ -1587,6 +1717,56 @@ mod tests {
         let stored =
             extract_correlation_id(doc.metadata.as_ref()).expect("correlation id should exist");
         assert_eq!(stored, "corr-123");
+    }
+
+    #[test]
+    fn ingest_unchanged_document_updates_metadata_without_reenqueue() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let mut first = IngestRequest::new("doc-metadata-refresh", "stable content");
+        first.correlation_id = Some("corr-1".to_owned());
+        first.metadata = Some(Value::String("first".to_owned()));
+        let first_result = runner.ingest(first).expect("first ingest should succeed");
+        assert_eq!(first_result.action, IngestAction::New);
+        assert!(first_result.fast_job_enqueued);
+
+        let mut second = IngestRequest::new("doc-metadata-refresh", "stable content");
+        second.correlation_id = Some("corr-2".to_owned());
+        second.metadata = Some(Value::String("second".to_owned()));
+        let second_result = runner.ingest(second).expect("second ingest should succeed");
+        assert_eq!(second_result.action, IngestAction::Unchanged);
+        assert!(!second_result.fast_job_enqueued);
+        assert!(!second_result.quality_job_enqueued);
+
+        let doc = runner
+            .storage
+            .get_document("doc-metadata-refresh")
+            .expect("fetch should succeed")
+            .expect("document should exist");
+        let correlation_id =
+            extract_correlation_id(doc.metadata.as_ref()).expect("correlation id should exist");
+        assert_eq!(correlation_id, "corr-2");
+        let payload = doc
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("payload"))
+            .and_then(Value::as_str)
+            .expect("payload metadata should exist");
+        assert_eq!(payload, "second");
+
+        let depth = runner
+            .queue
+            .queue_depth()
+            .expect("queue depth should succeed");
+        assert_eq!(depth.pending, 1);
     }
 
     #[test]
@@ -3632,6 +3812,78 @@ mod integration_tests {
                 "embedder should see full content"
             );
             assert_eq!(captured_text, long_content);
+        });
+    }
+
+    #[test]
+    fn process_batch_falls_back_to_preview_when_source_file_is_too_large() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            #[derive(Debug)]
+            struct SpyEmbedder {
+                captured: Arc<Mutex<Option<String>>>,
+            }
+            impl Embedder for SpyEmbedder {
+                fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                    *self.captured.lock().unwrap() = Some(text.to_owned());
+                    Box::pin(async { Ok(vec![0.0; 4]) })
+                }
+                fn dimension(&self) -> usize {
+                    4
+                }
+                fn id(&self) -> &'static str {
+                    "spy"
+                }
+                fn model_name(&self) -> &'static str {
+                    "spy"
+                }
+                fn is_semantic(&self) -> bool {
+                    true
+                }
+                fn category(&self) -> ModelCategory {
+                    ModelCategory::StaticEmbedder
+                }
+            }
+
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let captured = Arc::new(Mutex::new(None));
+            let fast = Arc::new(SpyEmbedder {
+                captured: Arc::clone(&captured),
+            });
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            let mut temp = tempfile::NamedTempFile::new().expect("tempfile");
+            temp.as_file_mut()
+                .set_len(u64::try_from(MAX_SOURCE_FILE_BYTES + 1).expect("size fits in u64"))
+                .expect("set oversized source file length");
+            let path = temp.path().to_string_lossy().into_owned();
+
+            let preview_source = "P".repeat(MAX_CONTENT_PREVIEW_CHARS + 120);
+            let mut req = IngestRequest::new("doc-file-too-large", &preview_source);
+            req.source_path = Some(path);
+            let ingest_result = runner.ingest(req).expect("ingest");
+            assert_eq!(ingest_result.action, IngestAction::New);
+
+            let _ = runner
+                .process_batch(&cx, "worker-spy")
+                .await
+                .expect("process");
+
+            let captured_text = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("should have captured fallback preview text");
+            assert_eq!(captured_text.len(), MAX_CONTENT_PREVIEW_CHARS);
+            assert_eq!(
+                captured_text,
+                truncate_chars(&preview_source, MAX_CONTENT_PREVIEW_CHARS)
+            );
         });
     }
 }

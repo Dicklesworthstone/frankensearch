@@ -545,6 +545,13 @@ fn has_required_files(dir: &Path) -> bool {
 /// Returns `None` if no directory with required files is found.
 #[must_use]
 pub fn find_model_dir(model_name: &str) -> Option<PathBuf> {
+    // Reject model names containing path traversal sequences (same validation
+    // as resolve_model_dir). Without this, `Path::join(model_name)` with
+    // `../../etc` escapes the intended model directories.
+    if model_name.contains("..") || model_name.starts_with('/') || model_name.starts_with('\\') {
+        return None;
+    }
+
     let mut candidates = Vec::new();
 
     if let Ok(dir) = std::env::var("FRANKENSEARCH_MODEL_DIR") {
@@ -713,6 +720,26 @@ mod tests {
     fn num_cpus_returns_reasonable_value() {
         let n = num_cpus();
         assert!((1..=8).contains(&n));
+    }
+
+    // ─── find_model_dir path traversal (bd-124o) ────────────────────────
+
+    #[test]
+    fn find_model_dir_rejects_dotdot_traversal() {
+        // Even if a model directory existed at a traversed path, the function
+        // must reject it to prevent escaping the model directory hierarchy.
+        assert!(find_model_dir("../../etc").is_none());
+        assert!(find_model_dir("foo/../bar").is_none());
+    }
+
+    #[test]
+    fn find_model_dir_rejects_absolute_path() {
+        assert!(find_model_dir("/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn find_model_dir_rejects_backslash_prefix() {
+        assert!(find_model_dir("\\Windows\\System32").is_none());
     }
 
     // ─── Test helpers ───────────────────────────────────────────────────

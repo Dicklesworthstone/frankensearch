@@ -410,14 +410,27 @@ impl AdaptiveConformalState {
                 "observed error rate must be finite and in [0, 1]",
             ));
         }
+        // Guard against NaN alpha/gamma from deserialized state that bypassed
+        // constructor validation. Without this, NaN propagates through mul_add
+        // and clamp (which propagates NaN), permanently poisoning self.alpha.
+        if !self.alpha.is_finite() || !self.gamma.is_finite() {
+            return Err(invalid_config(
+                "conformal.state",
+                &format!("alpha={}, gamma={}", self.alpha, self.gamma),
+                "adaptive state has non-finite alpha or gamma (possibly from invalid deserialization)",
+            ));
+        }
 
         let alpha_before = self.alpha;
         let drift = observed_error_rate - self.alpha;
-        self.alpha = self
+        // Compute into local first so self.alpha is not corrupted if
+        // required_k_checked fails (state-before-error preservation).
+        let new_alpha = self
             .gamma
             .mul_add(drift, self.alpha)
             .clamp(1e-6, 1.0 - 1e-6);
-        let required_k = calibration.required_k_checked(self.alpha)?;
+        let required_k = calibration.required_k_checked(new_alpha)?;
+        self.alpha = new_alpha;
 
         Ok(AdaptiveConformalUpdate {
             alpha_before,
@@ -844,4 +857,53 @@ mod tests {
         let idx_neg = quantile_index(10, f64::NEG_INFINITY);
         assert_eq!(idx_neg, 9);
     }
+
+    // ─── bd-3gi9 tests begin ───
+
+    #[test]
+    fn adaptive_update_rejects_nan_alpha_from_deserialization() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        // Simulate deserialized state with NaN alpha (bypassing constructor).
+        let mut state = AdaptiveConformalState {
+            alpha: f32::NAN,
+            gamma: 0.5,
+        };
+        let err = state
+            .update(0.1, &cal)
+            .expect_err("must reject NaN alpha");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        // Alpha should still be NaN (not corrupted further — error before mutation).
+        assert!(state.alpha.is_nan());
+    }
+
+    #[test]
+    fn adaptive_update_rejects_nan_gamma_from_deserialization() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        // Simulate deserialized state with NaN gamma (bypassing constructor).
+        let mut state = AdaptiveConformalState {
+            alpha: 0.1,
+            gamma: f32::NAN,
+        };
+        let err = state
+            .update(0.1, &cal)
+            .expect_err("must reject NaN gamma");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        // Alpha should NOT have been mutated (error before computation).
+        assert!((state.alpha - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_update_preserves_state_on_error() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        let mut state = AdaptiveConformalState::new(0.1, 0.5).expect("state");
+        let alpha_before = state.alpha;
+        // Invalid error rate should fail without mutating alpha.
+        let _ = state.update(f32::NAN, &cal);
+        assert!(
+            (state.alpha - alpha_before).abs() < f32::EPSILON,
+            "alpha should not change on error"
+        );
+    }
+
+    // ─── bd-3gi9 tests end ───
 }

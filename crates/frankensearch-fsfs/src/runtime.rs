@@ -398,8 +398,8 @@ impl LiveIngestPipeline {
         }
     }
 
-    fn prune_indexes(&self, rel_key: &str) -> frankensearch_core::SearchResult<()> {
-        self.lexical_index.delete_document(rel_key)?;
+    async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
+        self.lexical_index.delete_document(cx, rel_key).await?;
         self.soft_delete_vector(rel_key);
         Ok(())
     }
@@ -416,14 +416,14 @@ impl LiveIngestPipeline {
             ingestion_class,
             IngestionClass::MetadataOnly | IngestionClass::Skip
         ) {
-            self.prune_indexes(&rel_key)?;
+            self.prune_indexes(cx, &rel_key).await?;
             return Ok(true);
         }
 
         let bytes = match fs::read(&abs_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                self.prune_indexes(&rel_key)?;
+                self.prune_indexes(cx, &rel_key).await?;
                 return Ok(true);
             }
             Err(error)
@@ -438,14 +438,14 @@ impl LiveIngestPipeline {
         };
 
         if is_probably_binary(&bytes) {
-            self.prune_indexes(&rel_key)?;
+            self.prune_indexes(cx, &rel_key).await?;
             return Ok(true);
         }
 
         let raw_text = String::from_utf8_lossy(&bytes);
         let canonical = self.canonicalizer.canonicalize(&raw_text);
         if canonical.trim().is_empty() {
-            self.prune_indexes(&rel_key)?;
+            self.prune_indexes(cx, &rel_key).await?;
             return Ok(true);
         }
 
@@ -484,9 +484,13 @@ impl LiveIngestPipeline {
         Ok(true)
     }
 
-    fn apply_delete_op(&self, file_key: &str) -> frankensearch_core::SearchResult<()> {
+    async fn apply_delete_op(
+        &self,
+        cx: &Cx,
+        file_key: &str,
+    ) -> frankensearch_core::SearchResult<()> {
         let (_abs_path, rel_key) = self.resolve_paths(file_key)?;
-        self.prune_indexes(&rel_key)
+        self.prune_indexes(cx, &rel_key).await
     }
 
     async fn apply_batch_inner(
@@ -508,7 +512,7 @@ impl LiveIngestPipeline {
                     }
                 }
                 WatchIngestOp::Delete { file_key, .. } => {
-                    self.apply_delete_op(file_key)?;
+                    self.apply_delete_op(cx, file_key).await?;
                     count = count.saturating_add(1);
                 }
             }

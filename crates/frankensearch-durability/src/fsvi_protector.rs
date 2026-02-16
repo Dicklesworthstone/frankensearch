@@ -6,7 +6,6 @@
 //! - File naming convention: `index.fsvi` → `index.fsvi.fec`
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,42 +102,12 @@ impl FsviProtector {
     pub fn protect_atomic(&self, fsvi_path: &Path) -> SearchResult<FsviProtectionResult> {
         let start = Instant::now();
 
-        // Generate repair symbols via the inner protector (which now computes xxh3)
+        // Generate repair symbols via the inner protector.
+        // FileProtector::protect_file now handles atomic write (temp + rename) internally.
         let protection = self.protector.protect_file(fsvi_path)?;
         let source_size = protection.source_len;
         let source_hash = protection.source_xxh3;
-
-        // Atomic rename: write to temp, then rename
-        let sidecar_path = Self::sidecar_path(fsvi_path);
-        let temp_path = PathBuf::from(format!("{}.tmp", sidecar_path.display()));
-
-        // The protector already wrote the sidecar; rename it atomically
-        // if it wrote to the canonical path. Since FileProtector writes
-        // directly, we re-read, write to temp, then rename for crash safety.
-        if sidecar_path.exists() {
-            let sidecar_data = fs::read(&sidecar_path).map_err(SearchError::Io)?;
-            fs::write(&temp_path, &sidecar_data).map_err(SearchError::Io)?;
-
-            // fsync the temp file
-            let temp_file = fs::File::open(&temp_path).map_err(SearchError::Io)?;
-            temp_file.sync_all().map_err(SearchError::Io)?;
-
-            // Atomic rename
-            atomic_replace_file(&temp_path, &sidecar_path)?;
-
-            // fsync the parent directory
-            if let Some(parent) = sidecar_path.parent() {
-                if let Ok(dir) = fs::File::open(parent) {
-                    if let Err(sync_err) = dir.sync_all() {
-                        warn!(
-                            dir = %parent.display(),
-                            error = %sync_err,
-                            "directory fsync failed after atomic sidecar replace"
-                        );
-                    }
-                }
-            }
-        }
+        let sidecar_path = protection.sidecar_path;
 
         let repair_size = fs::metadata(&sidecar_path).map_or(0, |metadata| metadata.len());
         // Compute in f64 first to avoid double precision loss from u64→f32.
@@ -368,30 +337,6 @@ impl FsviProtector {
     /// Get the current durability metrics.
     pub fn metrics_snapshot(&self) -> crate::metrics::DurabilityMetricsSnapshot {
         self.metrics.snapshot()
-    }
-}
-
-fn atomic_replace_file(temp_path: &Path, target_path: &Path) -> SearchResult<()> {
-    match fs::rename(temp_path, target_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let backup_path = PathBuf::from(format!("{}.bak", target_path.display()));
-            let _ = fs::remove_file(&backup_path);
-            fs::rename(target_path, &backup_path).map_err(SearchError::Io)?;
-
-            match fs::rename(temp_path, target_path) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&backup_path);
-                    Ok(())
-                }
-                Err(rename_error) => {
-                    let _ = fs::rename(&backup_path, target_path);
-                    let _ = fs::remove_file(temp_path);
-                    Err(SearchError::Io(rename_error))
-                }
-            }
-        }
-        Err(error) => Err(SearchError::Io(error)),
     }
 }
 

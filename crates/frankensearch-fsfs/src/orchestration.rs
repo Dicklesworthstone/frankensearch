@@ -408,23 +408,8 @@ impl OrchestrationState {
             };
         }
 
-        match item.kind {
-            WorkKind::Backfill => {
-                if matches!(self.phase, OrchestrationPhase::Bootstrap) {
-                    self.phase = OrchestrationPhase::Backfill;
-                }
-            }
-            WorkKind::WatchEvent => {
-                if matches!(self.phase, OrchestrationPhase::Bootstrap) {
-                    self.phase = OrchestrationPhase::Watch;
-                }
-            }
-            WorkKind::Replay => {
-                self.phase = OrchestrationPhase::Recovering;
-            }
-        }
-
         if self.queue.len() < self.queue_policy.hard_limit {
+            self.apply_phase_transition(item.kind);
             self.queue.push_back(item);
             self.refresh_mode();
             return QueuePushResult::Enqueued {
@@ -445,12 +430,35 @@ impl OrchestrationState {
             .queue
             .pop_front()
             .map_or(-1, |dropped| dropped.stream_seq);
+        self.apply_phase_transition(item.kind);
         self.queue.push_back(item);
         self.refresh_mode();
         QueuePushResult::DroppedOldest {
             dropped_seq,
             depth: self.queue.len(),
             mode: self.backpressure_mode,
+        }
+    }
+
+    /// Advance `self.phase` to reflect the kind of work being enqueued.
+    ///
+    /// Called only after all rejection checks pass, so the phase is never
+    /// mutated for items that end up rejected.
+    const fn apply_phase_transition(&mut self, kind: WorkKind) {
+        match kind {
+            WorkKind::Backfill => {
+                if matches!(self.phase, OrchestrationPhase::Bootstrap) {
+                    self.phase = OrchestrationPhase::Backfill;
+                }
+            }
+            WorkKind::WatchEvent => {
+                if matches!(self.phase, OrchestrationPhase::Bootstrap) {
+                    self.phase = OrchestrationPhase::Watch;
+                }
+            }
+            WorkKind::Replay => {
+                self.phase = OrchestrationPhase::Recovering;
+            }
         }
     }
 
@@ -1154,6 +1162,47 @@ mod tests {
                 reason_code: "orchestration.reject.queue_saturated",
                 mode: BackpressureMode::Saturated
             }
+        );
+    }
+
+    #[test]
+    fn rejected_push_does_not_mutate_phase() {
+        // Regression: push_work must NOT advance the phase when the item is
+        // rejected due to queue saturation (drop_oldest disabled).
+        let policy = QueuePolicy {
+            high_watermark: 1,
+            hard_limit: 1,
+            drop_oldest_on_saturation: false,
+            scheduler: SchedulerPolicy::default(),
+        };
+        let startup = StartupBootstrapPlan::for_machine(1_000, 40);
+        let mut state = OrchestrationState::new(policy, startup);
+
+        // Fill queue with a Backfill item to leave Bootstrap phase.
+        let enqueued = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "doc/1.md".to_owned(),
+            revision: 1,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 100,
+        });
+        assert!(matches!(enqueued, QueuePushResult::Enqueued { .. }));
+        assert_eq!(state.phase(), OrchestrationPhase::Backfill);
+
+        // Queue is now full. A Replay item should be rejected AND phase must
+        // stay Backfill (not flip to Recovering).
+        let rejected = state.push_work(WorkItem {
+            stream_seq: 2,
+            file_key: "doc/2.md".to_owned(),
+            revision: 2,
+            kind: WorkKind::Replay,
+            event_ts_ms: 200,
+        });
+        assert!(matches!(rejected, QueuePushResult::Rejected { .. }));
+        assert_eq!(
+            state.phase(),
+            OrchestrationPhase::Backfill,
+            "phase must not change when push is rejected"
         );
     }
 
