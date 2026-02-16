@@ -1,6 +1,5 @@
 //! Brute-force top-k vector search over an opened [`crate::VectorIndex`].
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::PathBuf;
@@ -8,11 +7,13 @@ use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use half::f16;
 use rayon::prelude::*;
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
-use crate::{Quantization, VectorIndex, dot_product_f16_f32, dot_product_f32_f32};
+use crate::{
+    dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, Quantization,
+    VectorIndex,
+};
 
 /// Record-count threshold where search switches from sequential to Rayon.
 pub const PARALLEL_THRESHOLD: usize = 10_000;
@@ -47,42 +48,7 @@ impl Default for SearchParams {
     }
 }
 
-// Thread-local scratch buffers for vector decode operations.
-// Reused across search calls and Rayon chunks to avoid per-call allocation.
-thread_local! {
-    static F16_SCRATCH: RefCell<Vec<f16>> = const { RefCell::new(Vec::new()) };
-    static F32_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
-
 static PARALLEL_SEARCH_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
-
-/// Take the thread-local f16 scratch buffer, resized to `dim`.
-fn take_f16_scratch(dim: usize) -> Vec<f16> {
-    F16_SCRATCH.with_borrow_mut(|v| {
-        let mut s = std::mem::take(v);
-        s.resize(dim, f16::from_f32(0.0));
-        s
-    })
-}
-
-/// Return an f16 scratch buffer to thread-local storage for reuse.
-fn return_f16_scratch(buf: Vec<f16>) {
-    F16_SCRATCH.with_borrow_mut(|v| *v = buf);
-}
-
-/// Take the thread-local f32 scratch buffer, resized to `dim`.
-fn take_f32_scratch(dim: usize) -> Vec<f32> {
-    F32_SCRATCH.with_borrow_mut(|v| {
-        let mut s = std::mem::take(v);
-        s.resize(dim, 0.0_f32);
-        s
-    })
-}
-
-/// Return an f32 scratch buffer to thread-local storage for reuse.
-fn return_f32_scratch(buf: Vec<f32>) {
-    F32_SCRATCH.with_borrow_mut(|v| *v = buf);
-}
 
 #[derive(Debug, Clone, Copy)]
 struct HeapEntry {
@@ -266,7 +232,6 @@ impl VectorIndex {
                 // Flags are at offset 14 in 16-byte record
                 let mut flags_offset = self.records_offset + start * 16 + 14;
                 let mut vector_offset = self.vectors_offset + start * stride;
-                let mut scratch = take_f16_scratch(dim);
 
                 for index in start..end {
                     // Check flags directly from mapped memory
@@ -276,24 +241,18 @@ impl VectorIndex {
 
                     if (flags & 0x0001) == 0 {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
-                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
-                        }
-                        let score = dot_product_f16_f32(&scratch, query)?;
+                        let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     flags_offset += 16;
                     vector_offset += stride;
                 }
-
-                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
                 let stride = dim * 4;
                 let mut flags_offset = self.records_offset + start * 16 + 14;
                 let mut vector_offset = self.vectors_offset + start * stride;
-                let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
@@ -301,18 +260,13 @@ impl VectorIndex {
 
                     if (flags & 0x0001) == 0 {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
-                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        }
-                        let score = dot_product_f32_f32(&scratch, query)?;
+                        let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     flags_offset += 16;
                     vector_offset += stride;
                 }
-
-                return_f32_scratch(scratch);
             }
         }
         Ok(heap)
@@ -334,7 +288,6 @@ impl VectorIndex {
                 let stride = dim * 2;
                 let mut record_offset = self.records_offset + start * 16;
                 let mut vector_offset = self.vectors_offset + start * stride;
-                let mut scratch = take_f16_scratch(dim);
 
                 for index in start..end {
                     let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
@@ -367,23 +320,18 @@ impl VectorIndex {
 
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
-                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
-                        }
-                        let score = dot_product_f16_f32(&scratch, query)?;
+                        let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     record_offset += 16;
                     vector_offset += stride;
                 }
-                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
                 let stride = dim * 4;
                 let mut record_offset = self.records_offset + start * 16;
                 let mut vector_offset = self.vectors_offset + start * stride;
-                let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
                     let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
@@ -416,17 +364,13 @@ impl VectorIndex {
 
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
-                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        }
-                        let score = dot_product_f32_f32(&scratch, query)?;
+                        let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     record_offset += 16;
                     vector_offset += stride;
                 }
-                return_f32_scratch(scratch);
             }
         }
         Ok(heap)

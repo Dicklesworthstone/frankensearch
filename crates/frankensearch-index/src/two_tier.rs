@@ -1128,9 +1128,11 @@ mod tests {
             hnsw_ef_search: 64,
             ..TwoTierConfig::default()
         };
-        let first = TwoTierIndex::open(&dir, config).expect("open initial");
+        let first = TwoTierIndex::open(&dir, config.clone()).expect("open initial");
         assert!(first.has_fast_ann());
-        let before = first.search_fast(&[1.0, 0.0, 0.0], 1).expect("search before");
+        let before = first
+            .search_fast(&[1.0, 0.0, 0.0], 1)
+            .expect("search before");
         assert_eq!(before[0].doc_id, "doc-a");
 
         // Same doc IDs/order, but vectors are swapped. Sidecar must rebuild.
@@ -1142,7 +1144,9 @@ mod tests {
 
         let reopened = TwoTierIndex::open(&dir, config).expect("reopen");
         assert!(reopened.has_fast_ann());
-        let after = reopened.search_fast(&[1.0, 0.0, 0.0], 1).expect("search after");
+        let after = reopened
+            .search_fast(&[1.0, 0.0, 0.0], 1)
+            .expect("search after");
         assert_eq!(
             after[0].doc_id, "doc-b",
             "ANN sidecar should rebuild when vector content changes"
@@ -1170,7 +1174,7 @@ mod tests {
         let deleted = fast_index
             .soft_delete("doc-b")
             .expect("soft delete should succeed");
-        assert_eq!(deleted, 1);
+        assert!(deleted);
 
         let config = TwoTierConfig {
             hnsw_threshold: 1,
