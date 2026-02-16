@@ -5,7 +5,6 @@
 //! - optional quality-tier rescoring from `vector.quality.idx`
 //! - doc-id alignment between both tiers
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,9 +37,6 @@ pub struct TwoTierIndex {
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
     quality_ann: Option<HnswIndex>,
-    doc_ids: Vec<String>,
-    doc_id_to_fast_index: HashMap<String, usize>,
-    has_quality: Vec<bool>,
     quality_lookup: Vec<Option<usize>>,
     config: TwoTierConfig,
 }
@@ -59,19 +55,13 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError::IndexNotFound` if neither fast-tier file exists,
     /// and propagates index parse/corruption errors from `VectorIndex::open`.
+    #[allow(clippy::too_many_lines)]
     pub fn open(dir: &Path, config: TwoTierConfig) -> SearchResult<Self> {
         let fast_path = resolve_fast_path(dir)?;
         let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
 
         let fast_index = VectorIndex::open(&fast_path)?;
-        let doc_ids = load_doc_ids(&fast_index)?;
-        let doc_id_to_fast_index: HashMap<String, usize> = doc_ids
-            .iter()
-            .enumerate()
-            .map(|(index, doc_id)| (doc_id.clone(), index))
-            .collect();
-        let mut has_quality = vec![false; doc_ids.len()];
-        let mut quality_lookup = vec![None; doc_ids.len()];
+        let mut quality_lookup = vec![None; fast_index.record_count()];
 
         let quality_index = if quality_path.exists() {
             let quality = VectorIndex::open(&quality_path)?;
@@ -84,21 +74,65 @@ impl TwoTierIndex {
                 );
             }
 
-            let fast_positions: HashMap<&str, usize> = doc_ids
-                .iter()
-                .enumerate()
-                .map(|(index, doc_id)| (doc_id.as_str(), index))
-                .collect();
+            // Efficient merge-join alignment based on hash sorting.
+            // Both indices are sorted by (doc_id_hash, doc_id).
+            let mut f_idx = 0;
+            let mut q_idx = 0;
+            let f_count = fast_index.record_count();
+            let q_count = quality.record_count();
+            let mut unmatched_quality_docs = 0;
 
-            let mut unmatched_quality_docs = 0usize;
-            for quality_idx in 0..quality.record_count() {
-                let quality_doc_id = quality.doc_id_at(quality_idx)?;
-                if let Some(&fast_idx) = fast_positions.get(quality_doc_id) {
-                    has_quality[fast_idx] = true;
-                    quality_lookup[fast_idx] = Some(quality_idx);
-                } else {
+            while f_idx < f_count && q_idx < q_count {
+                let f_rec = fast_index.record_at(f_idx)?;
+                let q_rec = quality.record_at(q_idx)?;
+
+                // Skip tombstones (soft-deleted records)
+                if crate::is_tombstoned_flags(f_rec.flags) {
+                    f_idx += 1;
+                    continue;
+                }
+                if crate::is_tombstoned_flags(q_rec.flags) {
+                    q_idx += 1;
+                    continue;
+                }
+
+                match f_rec.doc_id_hash.cmp(&q_rec.doc_id_hash) {
+                    std::cmp::Ordering::Less => {
+                        f_idx += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        unmatched_quality_docs += 1;
+                        q_idx += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Hashes match, verify string equality to handle collisions.
+                        // Accessing doc_id_at is cheap (mmap slice), no allocation.
+                        let f_id = fast_index.doc_id_at(f_idx)?;
+                        let q_id = quality.doc_id_at(q_idx)?;
+
+                        match f_id.cmp(q_id) {
+                            std::cmp::Ordering::Equal => {
+                                quality_lookup[f_idx] = Some(q_idx);
+                                f_idx += 1;
+                                q_idx += 1;
+                            }
+                            std::cmp::Ordering::Less => f_idx += 1,
+                            std::cmp::Ordering::Greater => {
+                                unmatched_quality_docs += 1;
+                                q_idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Count remaining quality docs as unmatched
+            while q_idx < q_count {
+                let q_rec = quality.record_at(q_idx)?;
+                if !crate::is_tombstoned_flags(q_rec.flags) {
                     unmatched_quality_docs += 1;
                 }
+                q_idx += 1;
             }
 
             if unmatched_quality_docs > 0 {
@@ -140,7 +174,7 @@ impl TwoTierIndex {
             quality_available = quality_index.is_some(),
             fast_ann = fast_ann.is_some(),
             quality_ann = quality_ann.is_some(),
-            doc_count = doc_ids.len(),
+            doc_count = fast_index.record_count(),
             "opened two-tier index"
         );
 
@@ -149,7 +183,7 @@ impl TwoTierIndex {
             fast_path = %fast_path.display(),
             quality_path = %quality_path.display(),
             quality_available = quality_index.is_some(),
-            doc_count = doc_ids.len(),
+            doc_count = fast_index.record_count(),
             "opened two-tier index"
         );
 
@@ -160,9 +194,6 @@ impl TwoTierIndex {
             fast_ann,
             #[cfg(feature = "ann")]
             quality_ann,
-            doc_ids,
-            doc_id_to_fast_index,
-            has_quality,
             quality_lookup,
             config,
         })
@@ -251,25 +282,36 @@ impl TwoTierIndex {
     /// Number of documents in the fast tier (canonical document count).
     #[must_use]
     pub const fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.fast_index.record_count()
     }
 
-    /// Document IDs in fast-tier order.
-    #[must_use]
-    pub fn doc_ids(&self) -> &[String] {
-        &self.doc_ids
+    /// Iterate over all document IDs in fast-tier order.
+    pub fn iter_doc_ids(&self) -> impl Iterator<Item = SearchResult<String>> + '_ {
+        (0..self.doc_count()).map(|i| self.fast_index.doc_id_at(i).map(ToOwned::to_owned))
+    }
+
+    /// Document ID at a given fast-tier index position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the index is out of bounds or reading fails.
+    pub fn doc_id_at(&self, index: usize) -> SearchResult<&str> {
+        self.fast_index.doc_id_at(index)
     }
 
     /// Fast-tier index position for a given document id.
-    #[must_use]
-    pub fn fast_index_for_doc_id(&self, doc_id: &str) -> Option<usize> {
-        self.doc_id_to_fast_index.get(doc_id).copied()
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if index reading fails.
+    pub fn fast_index_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<usize>> {
+        self.fast_index.find_index_by_doc_id(doc_id)
     }
 
     /// Whether the fast-tier document at `index` has a quality-tier vector.
     #[must_use]
     pub fn has_quality_for_index(&self, index: usize) -> bool {
-        self.has_quality.get(index).copied().unwrap_or(false)
+        self.quality_lookup.get(index).copied().flatten().is_some()
     }
 
     /// Accessor for the configuration used to open this index.
@@ -465,18 +507,10 @@ fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
     Err(SearchError::IndexNotFound { path: fast_path })
 }
 
-fn load_doc_ids(index: &VectorIndex) -> SearchResult<Vec<String>> {
-    let mut doc_ids = Vec::with_capacity(index.record_count());
-    for record_index in 0..index.record_count() {
-        doc_ids.push(index.doc_id_at(record_index)?.to_owned());
-    }
-    Ok(doc_ids)
-}
-
 #[cfg(feature = "ann")]
 fn maybe_load_or_build_ann(
     vector_index: &VectorIndex,
-    ann_path: &Path,
+    _ann_path: &Path,
     threshold: usize,
     config: &TwoTierConfig,
     tier: &str,
@@ -492,70 +526,17 @@ fn maybe_load_or_build_ann(
         max_layer: HNSW_DEFAULT_MAX_LAYER,
     };
 
-    if ann_path.exists() {
-        match HnswIndex::load(ann_path) {
-            Ok(ann) => match ann.matches_vector_index(vector_index) {
-                Ok(true) => {
-                    let loaded_config = ann.config();
-                    if loaded_config == ann_config {
-                        return Some(ann);
-                    }
-                    warn!(
-                        tier,
-                        ann_path = %ann_path.display(),
-                        ?loaded_config,
-                        ?ann_config,
-                        "ANN sidecar config differs from requested config; rebuilding"
-                    );
-                }
-                Ok(false) => {
-                    warn!(
-                        tier,
-                        ann_path = %ann_path.display(),
-                        "ANN sidecar exists but does not match vector index; rebuilding"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        tier,
-                        ann_path = %ann_path.display(),
-                        ?error,
-                        "failed to validate ANN sidecar; rebuilding"
-                    );
-                }
-            },
-            Err(error) => {
-                warn!(
-                    tier,
-                    ann_path = %ann_path.display(),
-                    ?error,
-                    "failed to load ANN sidecar; rebuilding"
-                );
-            }
-        }
-    }
-
-    let ann = match HnswIndex::build_from_vector_index(vector_index, ann_config) {
-        Ok(ann) => ann,
+    match HnswIndex::build_from_vector_index(vector_index, ann_config) {
+        Ok(ann) => Some(ann),
         Err(error) => {
             warn!(
                 tier,
                 ?error,
                 "failed to build ANN index; using brute-force fallback"
             );
-            return None;
+            None
         }
-    };
-
-    if let Err(error) = ann.save(ann_path) {
-        warn!(
-            tier,
-            ann_path = %ann_path.display(),
-            ?error,
-            "failed to persist ANN sidecar; ANN stays in-memory for this process"
-        );
     }
-    Some(ann)
 }
 
 #[cfg(test)]
@@ -609,10 +590,14 @@ mod tests {
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open two-tier");
         assert_eq!(index.doc_count(), 2);
         assert!(!index.has_quality_index());
-        assert_eq!(index.doc_ids(), &["doc-a".to_owned(), "doc-b".to_owned()]);
-        assert_eq!(index.fast_index_for_doc_id("doc-a"), Some(0));
-        assert_eq!(index.fast_index_for_doc_id("doc-b"), Some(1));
-        assert_eq!(index.fast_index_for_doc_id("missing"), None);
+        let ids: Vec<String> = index
+            .iter_doc_ids()
+            .collect::<SearchResult<_>>()
+            .expect("ids");
+        assert_eq!(ids, vec!["doc-a".to_owned(), "doc-b".to_owned()]);
+        assert_eq!(index.fast_index_for_doc_id("doc-a").unwrap(), Some(0));
+        assert_eq!(index.fast_index_for_doc_id("doc-b").unwrap(), Some(1));
+        assert_eq!(index.fast_index_for_doc_id("missing").unwrap(), None);
 
         let hits = index
             .search_fast(&[1.0, 0.0, 0.0, 0.0], 1)
@@ -887,7 +872,11 @@ mod tests {
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
         assert_eq!(index.doc_count(), 2);
-        assert_eq!(index.doc_ids(), &["doc-x".to_owned(), "doc-y".to_owned()]);
+        let ids: Vec<String> = index
+            .iter_doc_ids()
+            .collect::<SearchResult<_>>()
+            .expect("ids");
+        assert_eq!(ids, vec!["doc-x".to_owned(), "doc-y".to_owned()]);
 
         let hits = index.search_fast(&[0.0, 0.0, 1.0], 1).expect("fast search");
         assert_eq!(hits.len(), 1);
@@ -1051,7 +1040,11 @@ mod tests {
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
         assert_eq!(index.doc_count(), 1);
-        assert_eq!(index.doc_ids(), &["doc-fast".to_owned()]);
+        let ids: Vec<String> = index
+            .iter_doc_ids()
+            .collect::<SearchResult<_>>()
+            .expect("ids");
+        assert_eq!(ids, vec!["doc-fast".to_owned()]);
     }
 
     #[test]
@@ -1219,7 +1212,11 @@ mod tests {
         }
         let index = builder.finish().expect("finish");
         assert_eq!(index.doc_count(), 4);
-        let mut actual: Vec<&str> = index.doc_ids().iter().map(String::as_str).collect();
+        let ids: Vec<String> = index
+            .iter_doc_ids()
+            .collect::<SearchResult<_>>()
+            .expect("ids");
+        let mut actual: Vec<&str> = ids.iter().map(String::as_str).collect();
         actual.sort_unstable();
         let mut expected = names.to_vec();
         expected.sort_unstable();
@@ -1234,7 +1231,7 @@ mod tests {
         write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast");
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
-        assert_eq!(index.fast_index_for_doc_id(""), None);
+        assert_eq!(index.fast_index_for_doc_id("").unwrap(), None);
     }
 
     #[test]

@@ -457,13 +457,9 @@ impl LiveIngestPipeline {
                         .vector_index
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Err(error) = vi.soft_delete(&rel_key) {
-                        tracing::debug!(
-                            file_key = %rel_key,
-                            error = %error,
-                            "upsert soft_delete: ignored (doc may not exist yet)"
-                        );
-                    }
+                    // soft_delete returns Ok(false) if doc doesn't exist, so Err is a real failure
+                    // (IO/corruption) that must prevent appending.
+                    vi.soft_delete(&rel_key)?;
                     vi.append(&rel_key, &embedding)?;
                 }
                 Err(error) => {

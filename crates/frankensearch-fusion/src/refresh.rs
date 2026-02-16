@@ -992,7 +992,7 @@ mod tests {
                 3,
                 "second incremental cycle must preserve previously indexed docs"
             );
-            let doc_ids = current.doc_ids();
+            let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             assert!(doc_ids.iter().any(|id| id == "doc-1"));
             assert!(doc_ids.iter().any(|id| id == "doc-2"));
             assert!(doc_ids.iter().any(|id| id == "doc-3"));
@@ -1199,7 +1199,7 @@ mod tests {
             assert!(count >= 1);
             let current = cache.current();
             // Only one doc-dup in the index.
-            let doc_ids = current.doc_ids();
+            let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             let dup_count = doc_ids.iter().filter(|id| *id == "doc-dup").count();
             assert_eq!(dup_count, 1);
         });
@@ -1323,7 +1323,7 @@ mod tests {
             // Should still have exactly 1 doc (updated, not duplicated).
             let current = cache.current();
             assert_eq!(current.doc_count(), 1);
-            let doc_ids = current.doc_ids();
+            let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             assert_eq!(doc_ids.len(), 1);
             assert_eq!(doc_ids[0], "doc-1");
         });

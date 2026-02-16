@@ -337,16 +337,21 @@ fn discover_tensor_name(safetensors: &SafeTensors<'_>) -> Option<String> {
 ///
 /// Expects little-endian f32 data with shape `[vocab_size, dimensions]`.
 fn parse_f32_matrix(data: &[u8], vocab_size: usize, dimensions: usize) -> Result<Vec<f32>, String> {
-    let expected_bytes = vocab_size * dimensions * 4;
-    if data.len() < expected_bytes {
+    let expected_elements = vocab_size
+        .checked_mul(dimensions)
+        .ok_or_else(|| format!("matrix size overflow for [{vocab_size} x {dimensions}]"))?;
+    let expected_bytes = expected_elements
+        .checked_mul(4)
+        .ok_or_else(|| format!("byte size overflow for [{vocab_size} x {dimensions}] f32"))?;
+    if data.len() != expected_bytes {
         return Err(format!(
-            "tensor data too short: expected {expected_bytes} bytes for [{vocab_size} x {dimensions}] f32, got {}",
+            "tensor data size mismatch: expected {expected_bytes} bytes for [{vocab_size} x {dimensions}] f32, got {}",
             data.len()
         ));
     }
 
     // Pre-allocate the exact size
-    let mut matrix = Vec::with_capacity(vocab_size * dimensions);
+    let mut matrix = Vec::with_capacity(expected_elements);
 
     // Parse bytes in 4-byte chunks
     for chunk in data.chunks_exact(4) {
@@ -356,10 +361,10 @@ fn parse_f32_matrix(data: &[u8], vocab_size: usize, dimensions: usize) -> Result
         matrix.push(f32::from_le_bytes(bytes));
     }
 
-    if matrix.len() != vocab_size * dimensions {
+    if matrix.len() != expected_elements {
         return Err(format!(
             "parsed element count mismatch: expected {}, got {}",
-            vocab_size * dimensions,
+            expected_elements,
             matrix.len()
         ));
     }
@@ -813,6 +818,25 @@ mod tests {
     fn parse_f32_matrix_too_short() {
         let data = vec![0u8; 4]; // Only 1 float, need more
         let result = parse_f32_matrix(&data, 2, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_f32_matrix_too_long() {
+        // 16 bytes expected for [2 x 2] f32, plus one trailing garbage byte
+        let mut data: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        data.push(0xAA);
+
+        let result = parse_f32_matrix(&data, 2, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_f32_matrix_size_overflow() {
+        let result = parse_f32_matrix(&[], usize::MAX, 2);
         assert!(result.is_err());
     }
 }

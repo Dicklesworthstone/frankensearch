@@ -14,7 +14,9 @@ use crate::Storage;
 use crate::connection::map_storage_error;
 use crate::content_hash::{ContentHasher, record_content_hash};
 use crate::document::{DocumentRecord, EmbeddingStatus, upsert_document};
-use crate::job_queue::{EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner};
+use crate::job_queue::{
+    EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner, fetch_queue_depth,
+};
 
 const PIPELINE_SUBSYSTEM: &str = "storage_pipeline";
 const CORRELATION_METADATA_KEY: &str = "correlation_id";
@@ -313,13 +315,7 @@ impl StorageBackedJobRunner {
             });
         }
 
-        if self.queue.is_backpressured()? {
-            let depth = self.queue.queue_depth()?;
-            return Err(SearchError::QueueFull {
-                pending: depth.pending,
-                capacity: self.queue.config().backpressure_threshold,
-            });
-        }
+        /* Backpressure check moved inside transaction for TOCTOU safety */
 
         let now_ms = unix_timestamp_ms()?;
         let content_hash = ContentHasher::hash(&canonical_text);
@@ -354,6 +350,14 @@ impl StorageBackedJobRunner {
                     action: IngestAction::Unchanged,
                     fast_job_enqueued: false,
                     quality_job_enqueued: false,
+                });
+            }
+
+            let depth = fetch_queue_depth(conn)?;
+            if depth.pending > self.queue.config().backpressure_threshold {
+                return Err(SearchError::QueueFull {
+                    pending: depth.pending,
+                    capacity: self.queue.config().backpressure_threshold,
                 });
             }
 
@@ -607,8 +611,22 @@ impl StorageBackedJobRunner {
                 continue;
             }
 
+            if let Err(error) = self.storage.mark_embedded(&job.doc_id, &job.embedder_id) {
+                self.handle_job_failure(job, &error);
+                result.jobs_failed += 1;
+                tracing::warn!(
+                    target: "frankensearch.storage.pipeline",
+                    stage = "mark_embedded",
+                    worker_id,
+                    correlation_id = %correlation_id,
+                    doc_id = %job.doc_id,
+                    embedder_id = %job.embedder_id,
+                    error = %error,
+                    "failed to record embedded status"
+                );
+                continue;
+            }
             self.queue.complete(job.job_id)?;
-            self.storage.mark_embedded(&job.doc_id, &job.embedder_id)?;
             result.jobs_completed += 1;
             tracing::info!(
                 target: "frankensearch.storage.pipeline",

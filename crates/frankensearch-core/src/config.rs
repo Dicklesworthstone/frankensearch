@@ -23,6 +23,8 @@ use crate::types::RankChanges;
 /// | `FRANKENSEARCH_QUALITY_WEIGHT`   | `quality_weight`   | `0.7`      |
 /// | `FRANKENSEARCH_RRF_K`            | `rrf_k`            | `60.0`     |
 /// | `FRANKENSEARCH_FAST_ONLY`        | `fast_only`        | `false`    |
+/// | `FRANKENSEARCH_GRAPH_RANKING_ENABLED` | `graph_ranking_enabled` | `false` |
+/// | `FRANKENSEARCH_GRAPH_RANKING_WEIGHT` | `graph_ranking_weight` | `0.5` |
 /// | `FRANKENSEARCH_QUALITY_TIMEOUT`  | `quality_timeout_ms` | `500`    |
 /// | `FRANKENSEARCH_HNSW_THRESHOLD`   | `hnsw_threshold`   | `50000`    |
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +48,14 @@ pub struct TwoTierConfig {
     /// Skip quality refinement entirely (fast-only mode).
     /// Default: false.
     pub fast_only: bool,
+
+    /// Enable optional graph-ranking contribution in Phase 1 fusion.
+    /// Default: false.
+    pub graph_ranking_enabled: bool,
+
+    /// Relative graph signal weight when graph ranking is enabled (0.0-1.0).
+    /// Default: 0.5.
+    pub graph_ranking_weight: f64,
 
     /// Optional telemetry exporter callback target.
     ///
@@ -92,6 +102,8 @@ impl Default for TwoTierConfig {
             candidate_multiplier: 3,
             quality_timeout_ms: 500,
             fast_only: false,
+            graph_ranking_enabled: false,
+            graph_ranking_weight: 0.5,
             metrics_exporter: None,
             explain: false,
             hnsw_ef_search: 100,
@@ -142,6 +154,15 @@ impl TwoTierConfig {
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_FAST_ONLY") {
             self.fast_only = val == "true" || val == "1";
+        }
+        if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_ENABLED") {
+            self.graph_ranking_enabled = val == "true" || val == "1";
+        }
+        if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_WEIGHT")
+            && let Ok(weight) = val.parse::<f64>()
+            && (0.0..=1.0).contains(&weight)
+        {
+            self.graph_ranking_weight = weight;
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_QUALITY_TIMEOUT")
             && let Ok(ms) = val.parse::<u64>()
@@ -264,6 +285,8 @@ mod tests {
         assert_eq!(config.candidate_multiplier, 3);
         assert_eq!(config.quality_timeout_ms, 500);
         assert!(!config.fast_only);
+        assert!(!config.graph_ranking_enabled);
+        assert!((config.graph_ranking_weight - 0.5).abs() < 1e-10);
         assert!(config.metrics_exporter.is_none());
         assert!(!config.explain);
         assert_eq!(config.hnsw_ef_search, 100);
@@ -279,6 +302,8 @@ mod tests {
         let config = TwoTierConfig {
             quality_weight: 0.8,
             fast_only: true,
+            graph_ranking_enabled: true,
+            graph_ranking_weight: 0.65,
             ..Default::default()
         };
 
@@ -286,6 +311,8 @@ mod tests {
         let decoded: TwoTierConfig = serde_json::from_str(&json).unwrap();
         assert!((decoded.quality_weight - 0.8).abs() < 1e-10);
         assert!(decoded.fast_only);
+        assert!(decoded.graph_ranking_enabled);
+        assert!((decoded.graph_ranking_weight - 0.65).abs() < 1e-10);
         assert!(decoded.metrics_exporter.is_none());
         assert_eq!(decoded.candidate_multiplier, 3);
         assert_eq!(decoded.hnsw_threshold, 50_000);
@@ -335,6 +362,8 @@ mod tests {
         // With no env vars set, defaults should be preserved
         let config = TwoTierConfig::default().with_env_overrides();
         assert!((config.quality_weight - 0.7).abs() < 1e-10);
+        assert!(!config.graph_ranking_enabled);
+        assert!((config.graph_ranking_weight - 0.5).abs() < 1e-10);
     }
 
     #[test]
@@ -443,6 +472,7 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("quality_weight"));
         assert!(debug.contains("rrf_k"));
+        assert!(debug.contains("graph_ranking_enabled"));
         assert!(debug.contains("hnsw_threshold"));
     }
 

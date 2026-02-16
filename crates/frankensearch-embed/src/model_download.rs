@@ -155,6 +155,14 @@ impl ModelDownloader {
         let total_bytes = manifest.total_size_bytes();
         lifecycle.begin_download(total_bytes.max(1))?;
 
+        if let Err(err) = manifest.validate() {
+            lifecycle.fail_verification(format!(
+                "manifest validation failed for '{}': {err}",
+                manifest.id
+            ));
+            return Err(err);
+        }
+
         if !manifest.is_production_ready() {
             let reason = format!(
                 "manifest for '{}' must be production-ready (pinned revision + verified checksums) before download",
@@ -451,12 +459,23 @@ fn huggingface_url(repo: &str, revision: &str, file_name: &str) -> String {
 }
 
 fn create_unique_staging_dir(dest_dir: &Path) -> SearchResult<PathBuf> {
-    std::fs::create_dir_all(dest_dir).map_err(SearchError::from)?;
+    // Prefer creating staging dir as a sibling to avoid dirtying the target dir.
+    let (base_dir, prefix) = dest_dir.parent().map_or((dest_dir, "download"), |parent| {
+        (
+            parent,
+            dest_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("model"),
+        )
+    });
+
+    std::fs::create_dir_all(base_dir).map_err(SearchError::from)?;
 
     let pid = std::process::id();
     for _ in 0..64 {
         let counter = STAGING_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = dest_dir.join(format!(".download-{pid}-{counter:016x}"));
+        let candidate = base_dir.join(format!(".{prefix}-download-{pid}-{counter:016x}"));
         match std::fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
@@ -465,7 +484,7 @@ fn create_unique_staging_dir(dest_dir: &Path) -> SearchResult<PathBuf> {
     }
 
     Err(SearchError::ModelLoadFailed {
-        path: dest_dir.to_path_buf(),
+        path: base_dir.to_path_buf(),
         source: "failed to allocate unique staging directory".into(),
     })
 }
@@ -1157,7 +1176,8 @@ mod tests {
         let nested = temp.path().join("deeply").join("nested").join("dir");
         let result = create_unique_staging_dir(&nested).expect("should create nested dir");
         assert!(result.is_dir());
-        assert!(nested.is_dir());
+        // The function creates the parent of dest_dir (for sibling staging), not dest_dir itself.
+        assert!(nested.parent().unwrap().is_dir());
     }
 
     // ─── bd-r476 tests end ───
@@ -1188,6 +1208,38 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, SearchError::InvalidConfig { .. }));
             assert!(err.to_string().contains("production-ready"));
+            assert!(matches!(
+                lifecycle.state(),
+                crate::model_manifest::ModelState::VerificationFailed { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn download_model_rejects_manifest_with_path_traversal_filename() {
+        let mut manifest = ModelManifest::minilm_v2();
+        manifest.files[0].name = "../escape.bin".to_owned();
+        let consent = crate::model_manifest::DownloadConsent::granted(
+            crate::model_manifest::ConsentSource::Environment,
+        );
+        let mut lifecycle = ModelLifecycle::new(manifest.clone(), consent);
+        let dest = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+        });
+
+        run_test_with_cx(|_cx| async move {
+            let err = downloader
+                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                SearchError::InvalidConfig { ref field, .. } if field == "files[].name"
+            ));
             assert!(matches!(
                 lifecycle.state(),
                 crate::model_manifest::ModelState::VerificationFailed { .. }

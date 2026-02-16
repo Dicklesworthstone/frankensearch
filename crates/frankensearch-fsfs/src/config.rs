@@ -1363,6 +1363,34 @@ const fn merge_profile_overrides(
     }
 }
 
+fn resolve_relative_config_paths(config: &mut FsfsConfig, base_file: &Path) {
+    let base_dir = base_file.parent().unwrap_or_else(|| Path::new("."));
+
+    // model_dir
+    if is_relative_non_tilde(&config.indexing.model_dir) {
+        config.indexing.model_dir = base_dir
+            .join(&config.indexing.model_dir)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    // db_path
+    if is_relative_non_tilde(&config.storage.db_path) {
+        config.storage.db_path = base_dir
+            .join(&config.storage.db_path)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    // index_dir is intentionally NOT resolved here; it resolves relative to
+    // the runtime target_root (project directory) in runtime.rs.
+}
+
+fn is_relative_non_tilde(path_str: &str) -> bool {
+    let path = Path::new(path_str);
+    path.is_relative() && !path_str.starts_with('~')
+}
+
 fn apply_file_patch(
     config: &mut FsfsConfig,
     warnings: &mut Vec<ConfigWarning>,
@@ -1407,6 +1435,9 @@ where
             &mut file_profile_overrides,
             config_toml,
         )?;
+        if let Some(path) = user_config_path {
+            resolve_relative_config_paths(&mut config, path);
+        }
     }
 
     if let Some(config_toml) = project_config_toml {
@@ -1416,6 +1447,9 @@ where
             &mut file_profile_overrides,
             config_toml,
         )?;
+        if let Some(path) = project_config_path {
+            resolve_relative_config_paths(&mut config, path);
+        }
     }
 
     let env_report = apply_env_overrides(&mut config, env)?;

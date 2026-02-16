@@ -10,6 +10,7 @@ repository.workspace = true
 default = []
 lexical = ["dep:frankensearch-lexical"]
 rerank = ["dep:frankensearch-rerank"]
+graph = []
 
 [dependencies]
 frankensearch-core = { workspace = true }

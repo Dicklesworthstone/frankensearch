@@ -1,3 +1,5 @@
+// MmapMut (memmap2) requires unsafe for memory-mapped I/O.
+#![allow(unsafe_code)]
 //! Vector index storage and loading for frankensearch.
 //!
 //! This crate implements the FSVI binary format reader/writer plus exact
@@ -53,13 +55,14 @@ pub mod wal;
 pub mod warmup;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
+use memmap2::MmapMut;
 use tracing::debug;
 
 #[cfg(feature = "ann")]
@@ -156,17 +159,17 @@ pub struct VacuumStats {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RecordEntry {
-    doc_id_hash: u64,
-    doc_id_offset: u32,
-    doc_id_len: u16,
-    flags: u16,
+pub(crate) struct RecordEntry {
+    pub(crate) doc_id_hash: u64,
+    pub(crate) doc_id_offset: u32,
+    pub(crate) doc_id_len: u16,
+    pub(crate) flags: u16,
 }
 
 #[derive(Debug)]
 pub struct VectorIndex {
     pub(crate) path: PathBuf,
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: MmapMut,
     pub(crate) metadata: VectorMetadata,
     pub(crate) records_offset: usize,
     pub(crate) strings_offset: usize,
@@ -191,8 +194,13 @@ impl VectorIndex {
             });
         }
 
-        let data = fs::read(path)?;
-        let (mut metadata, header_len) = parse_header(path, &data)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(SearchError::Io)?;
+        let data = unsafe { MmapMut::map_mut(&file).map_err(SearchError::Io)? };
+        let (metadata, header_len) = parse_header(path, &data)?;
 
         let records_bytes = metadata
             .record_count
@@ -232,9 +240,23 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        let (wal_entries, wal_compaction_gen) =
+        let (mut wal_entries, wal_compaction_gen) =
             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
-        metadata.compaction_gen = metadata.compaction_gen.max(wal_compaction_gen);
+
+        // WAL generation must be exactly one ahead of the main index generation.
+        // If they are equal, it means the WAL was already compacted into this
+        // main index (crash after compaction but before WAL deletion).
+        let expected_wal_gen = metadata.compaction_gen.wrapping_add(1);
+        if !wal_entries.is_empty() && wal_compaction_gen != expected_wal_gen {
+            tracing::warn!(
+                path = %path.display(),
+                main_gen = metadata.compaction_gen,
+                wal_gen = wal_compaction_gen,
+                expected_wal_gen,
+                "discarding stale WAL entries (post-compaction artifact)"
+            );
+            wal_entries.clear();
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -966,13 +988,9 @@ impl VectorIndex {
 
         let flag_bytes = flags.to_le_bytes();
         self.data[flags_offset..end].copy_from_slice(&flag_bytes);
-
-        let mut file = OpenOptions::new().write(true).open(&self.path)?;
-        let seek_offset = u64::try_from(flags_offset)
-            .map_err(|_| index_corrupted(&self.path, "flags offset does not fit in u64"))?;
-        file.seek(SeekFrom::Start(seek_offset))?;
-        file.write_all(&flag_bytes)?;
-        file.sync_data()?;
+        self.data
+            .flush_range(flags_offset, 2)
+            .map_err(SearchError::Io)?;
         Ok(())
     }
 
@@ -1032,7 +1050,7 @@ impl VectorIndex {
         }
     }
 
-    fn record_at(&self, index: usize) -> SearchResult<RecordEntry> {
+    pub(crate) fn record_at(&self, index: usize) -> SearchResult<RecordEntry> {
         self.ensure_index(index)?;
         let offset = self
             .records_offset
@@ -1152,7 +1170,8 @@ impl VectorIndexWriter {
         Ok(())
     }
 
-    pub(crate) fn with_generation(mut self, generation: u8) -> Self {
+    #[allow(dead_code)]
+    pub(crate) const fn with_generation(mut self, generation: u8) -> Self {
         self.compaction_gen = generation;
         self
     }

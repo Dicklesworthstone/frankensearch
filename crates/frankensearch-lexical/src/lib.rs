@@ -898,6 +898,7 @@ mod tests {
                 assert!(r.fast_score.is_none());
                 assert!(r.quality_score.is_none());
                 assert!(r.rerank_score.is_none());
+                assert!(r.explanation.is_none());
             }
         });
     }

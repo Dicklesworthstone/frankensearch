@@ -103,7 +103,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 sysinfo = "0.33"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

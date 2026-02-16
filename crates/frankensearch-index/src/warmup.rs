@@ -125,7 +125,7 @@ impl AdaptiveConfig {
     ///
     /// Non-finite values (NaN/Inf from deserialization) fall back to 0.95.
     #[must_use]
-    pub fn clamped_heat_decay(&self) -> f64 {
+    pub const fn clamped_heat_decay(&self) -> f64 {
         if self.heat_decay.is_finite() {
             self.heat_decay.clamp(0.0, 1.0)
         } else {
@@ -137,7 +137,7 @@ impl AdaptiveConfig {
     ///
     /// Non-finite values (NaN/Inf from deserialization) fall back to 0.1.
     #[must_use]
-    pub fn clamped_min_heat(&self) -> f64 {
+    pub const fn clamped_min_heat(&self) -> f64 {
         if self.min_heat.is_finite() {
             self.min_heat.clamp(0.0, 1.0)
         } else {

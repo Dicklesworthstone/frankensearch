@@ -1223,14 +1223,16 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
         || "model".to_owned(),
         |part| part.to_string_lossy().into_owned(),
     );
-    let stage_target = destination_parent.join(format!(".{stage_name}.installing"));
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let pid = std::process::id();
+    let stage_target =
+        destination_parent.join(format!(".{stage_name}.installing.{timestamp}.{pid}"));
     fs::rename(staged_dir, &stage_target).map_err(SearchError::from)?;
 
     let backup_path = if destination_dir.exists() {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs());
-        let backup = destination_parent.join(format!("{stage_name}.backup.{timestamp}"));
+        let backup = destination_parent.join(format!("{stage_name}.backup.{timestamp}.{pid}"));
         fs::rename(destination_dir, &backup).map_err(SearchError::from)?;
         Some(backup)
     } else {

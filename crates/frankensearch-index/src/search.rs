@@ -219,11 +219,10 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         // Re-use the parallel chunk logic for sequential scan to benefit from optimizations.
-        if let Some(filter) = filter {
-            self.scan_range_chunk_filtered(0, self.record_count(), query, limit, filter)
-        } else {
-            self.scan_range_chunk(0, self.record_count(), query, limit)
-        }
+        filter.map_or_else(
+            || self.scan_range_chunk(0, self.record_count(), query, limit),
+            |filter| self.scan_range_chunk_filtered(0, self.record_count(), query, limit, filter),
+        )
     }
 
     fn scan_parallel(

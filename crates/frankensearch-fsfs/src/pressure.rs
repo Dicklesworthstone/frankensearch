@@ -1207,29 +1207,37 @@ impl HostPressureCollector {
     /// # Errors
     ///
     /// Returns [`SearchError::Io`] or [`SearchError::InvalidConfig`] when proc
-    /// files cannot be read/parsed.
+    /// files cannot be read/parsed (Linux only).
     #[allow(clippy::cast_precision_loss)]
     pub fn collect(
         &mut self,
         interval: Duration,
         memory_ceiling_mb: usize,
     ) -> SearchResult<PressureSignal> {
-        let load_avg_1m = read_load_avg_1m(Path::new("/proc/loadavg"))?;
-        let cpu_slots =
-            std::thread::available_parallelism().map_or(1_usize, std::num::NonZeroUsize::get);
-        let load_pct = normalize_pct((load_avg_1m / cpu_slots as f64) * 100.0);
-        let cpu_pct = load_pct;
+        #[cfg(target_os = "linux")]
+        {
+            let load_avg_1m = read_load_avg_1m(Path::new("/proc/loadavg"))?;
+            let cpu_slots =
+                std::thread::available_parallelism().map_or(1_usize, std::num::NonZeroUsize::get);
+            let load_pct = normalize_pct((load_avg_1m / cpu_slots as f64) * 100.0);
+            let cpu_pct = load_pct;
 
-        let rss_mb = read_self_rss_mb(Path::new("/proc/self/status"))?;
-        let effective_memory_ceiling_mb = memory_ceiling_mb.max(1);
-        let memory_pct =
-            normalize_pct((rss_mb as f64 / effective_memory_ceiling_mb as f64) * 100.0);
+            let rss_mb = read_self_rss_mb(Path::new("/proc/self/status"))?;
+            let effective_memory_ceiling_mb = memory_ceiling_mb.max(1);
+            let memory_pct =
+                normalize_pct((rss_mb as f64 / effective_memory_ceiling_mb as f64) * 100.0);
 
-        let io_now = read_proc_self_io(Path::new("/proc/self/io"))?;
-        let io_pct = self.io_pct_for_interval(interval, io_now);
-        self.previous_io = Some(io_now);
+            let io_now = read_proc_self_io(Path::new("/proc/self/io"))?;
+            let io_pct = self.io_pct_for_interval(interval, io_now);
+            self.previous_io = Some(io_now);
 
-        Ok(PressureSignal::new(cpu_pct, memory_pct, io_pct, load_pct))
+            Ok(PressureSignal::new(cpu_pct, memory_pct, io_pct, load_pct))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (interval, memory_ceiling_mb);
+            Ok(PressureSignal::new(0.0, 0.0, 0.0, 0.0))
+        }
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1257,11 +1265,13 @@ fn normalize_pct(value: f64) -> f64 {
     value.min(200.0)
 }
 
+#[cfg(target_os = "linux")]
 fn read_proc_self_io(path: &Path) -> SearchResult<ProcIoCounters> {
     let contents = fs::read_to_string(path)?;
     parse_proc_self_io(&contents)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_proc_self_io(contents: &str) -> SearchResult<ProcIoCounters> {
     let mut read_bytes = None;
     let mut write_bytes = None;
@@ -1294,11 +1304,13 @@ fn parse_proc_self_io(contents: &str) -> SearchResult<ProcIoCounters> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn read_self_rss_mb(path: &Path) -> SearchResult<u64> {
     let contents = fs::read_to_string(path)?;
     parse_self_status_rss_mb(&contents)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_self_status_rss_mb(contents: &str) -> SearchResult<u64> {
     for line in contents.lines() {
         if !line.starts_with("VmRSS:") {
@@ -1322,6 +1334,7 @@ fn parse_self_status_rss_mb(contents: &str) -> SearchResult<u64> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn read_load_avg_1m(path: &Path) -> SearchResult<f64> {
     let contents = fs::read_to_string(path)?;
     parse_load_avg_1m(&contents)

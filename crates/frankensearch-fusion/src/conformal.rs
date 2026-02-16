@@ -464,7 +464,7 @@ fn quantile_index(n: usize, quantile: f64) -> usize {
     let adjusted = ((n as f64 + 1.0) * q).ceil();
     #[allow(clippy::cast_precision_loss)]
     let bounded = adjusted.max(1.0).min(n as f64);
-    bounded as usize - 1
+    (bounded as usize).saturating_sub(1)
 }
 
 #[cfg(test)]

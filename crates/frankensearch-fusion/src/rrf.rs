@@ -158,6 +158,14 @@ pub fn rrf_fuse(
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
+        // If we've already seen this doc in this source (lexical), skip it.
+        // We iterate in rank order (0, 1, ...), so the first occurrence is the best one.
+        if let Some(existing) = hits.get(result.doc_id.as_str())
+            && existing.lexical_rank.is_some()
+        {
+            continue;
+        }
+
         let rrf_contribution = rank_contribution(k, rank);
 
         hits.entry(result.doc_id.as_str())
@@ -179,6 +187,13 @@ pub fn rrf_fuse(
 
     // Score semantic results.
     for (rank, hit) in semantic.iter().enumerate() {
+        // If we've already seen this doc in this source (semantic), skip it.
+        if let Some(existing) = hits.get(hit.doc_id.as_str())
+            && existing.semantic_rank.is_some()
+        {
+            continue;
+        }
+
         let rrf_contribution = rank_contribution(k, rank);
 
         hits.entry(hit.doc_id.as_str())
@@ -683,6 +698,13 @@ mod tests {
         let mut hits: HashMap<String, FusedHit> = HashMap::with_capacity(capacity);
 
         for (rank, result) in lexical.iter().enumerate() {
+            // Skip within-source duplicates (keep first/best-ranked occurrence).
+            if let Some(existing) = hits.get(result.doc_id.as_str())
+                && existing.lexical_rank.is_some()
+            {
+                continue;
+            }
+
             let rrf_contribution = rank_contribution(k, rank);
 
             hits.entry(result.doc_id.clone())
@@ -703,6 +725,13 @@ mod tests {
         }
 
         for (rank, hit) in semantic.iter().enumerate() {
+            // Skip within-source duplicates (keep first/best-ranked occurrence).
+            if let Some(existing) = hits.get(hit.doc_id.as_str())
+                && existing.semantic_rank.is_some()
+            {
+                continue;
+            }
+
             let rrf_contribution = rank_contribution(k, rank);
 
             hits.entry(hit.doc_id.clone())
@@ -897,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_doc_id_same_source_uses_last_rank() {
+    fn duplicate_doc_id_same_source_uses_best_rank() {
         let config = RrfConfig::default();
         // Same doc_id appearing twice in lexical results
         let lexical = vec![
@@ -909,9 +938,9 @@ mod tests {
         let results = rrf_fuse(&lexical, &[], 10, 0, &config);
 
         let dup_hit = results.iter().find(|r| r.doc_id == "dup").unwrap();
-        // HashMap entry: first insertion at rank 0 gives 1/61,
-        // second occurrence at rank 2 adds 1/63 via and_modify
-        let expected = rank_contribution(60.0, 0) + rank_contribution(60.0, 2);
+        // HashMap entry: first insertion at rank 0 gives 1/61.
+        // second occurrence at rank 2 is ignored by dedup logic.
+        let expected = rank_contribution(60.0, 0);
         assert!(
             (dup_hit.rrf_score - expected).abs() < 1e-12,
             "expected {expected}, got {}",

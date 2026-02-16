@@ -18,6 +18,8 @@ pub mod circuit_breaker;
 pub mod conformal;
 pub mod federated;
 pub mod feedback;
+#[cfg(feature = "graph")]
+pub mod graph_rank;
 pub mod incremental;
 pub mod interaction_lanes;
 pub mod interaction_oracles;
@@ -54,6 +56,8 @@ pub use conformal::{
 };
 pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
+#[cfg(feature = "graph")]
+pub use graph_rank::GraphRanker;
 pub use incremental::{IncrementalConfig, IncrementalSearcher, SearchPlan, SearchStrategy};
 pub use interaction_lanes::{
     CalibratorChoice, CorpusSlice, ExpectedPhase, FeatureToggles, FixtureQuery, InteractionLane,

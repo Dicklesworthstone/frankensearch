@@ -1,22 +1,21 @@
 //! Optional HNSW approximate nearest-neighbor index (`ann` feature).
 //!
-//! This module wraps `hnsw_rs` behind a frankensearch-native API and a
-//! deterministic on-disk `CHSW` format.
+//! This module wraps `hnsw_rs` behind a frankensearch-native API.
+//!
+//! # Persistence
+//!
+//! This implementation is currently in-memory only. The `hnsw_rs` graph is
+//! rebuilt from the source `VectorIndex` on startup. Previous versions attempted
+//! a custom "CHSW" persistence format that merely dumped vectors, causing
+//! slow "loads" (rebuilds) and double RAM usage. Until graph serialization
+//! is properly implemented, in-memory build is cleaner and more efficient.
 
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use hnsw_rs::prelude::{DistDot, Hnsw};
 
 use crate::VectorIndex;
-
-/// Magic bytes for serialized ANN indices.
-pub const HNSW_MAGIC: [u8; 4] = *b"CHSW";
-/// Supported ANN file version.
-pub const HNSW_VERSION: u16 = 1;
 
 /// Default HNSW `M` (max connections per node).
 pub const HNSW_DEFAULT_M: usize = 16;
@@ -27,17 +26,6 @@ pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
 /// Default HNSW max layer depth.
 pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
 const DIST_DOT_SHRINK: f32 = 0.999_999;
-
-/// Maximum dimension allowed in CHSW files. No real embedding model
-/// exceeds 8192 dimensions; 65536 provides ample headroom while
-/// preventing OOM from malformed/malicious files.
-const CHSW_MAX_DIMENSION: usize = 65_536;
-/// Maximum `doc_id` byte length in CHSW files.
-const CHSW_MAX_DOC_ID_LEN: usize = 65_536;
-/// Pre-allocation cap for record vectors, preventing OOM from
-/// malicious `record_count` values. Actual records are read
-/// incrementally and will fail with EOF if the file is truncated.
-const CHSW_MAX_PREALLOC_RECORDS: usize = 1_024 * 1_024;
 
 /// ANN construction/runtime parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +76,6 @@ pub struct AnnSearchStats {
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistDot>,
     doc_ids: Vec<String>,
-    vectors: Vec<Vec<f32>>,
     dimension: usize,
     config: HnswConfig,
 }
@@ -98,7 +85,6 @@ impl std::fmt::Debug for HnswIndex {
         f.debug_struct("HnswIndex")
             .field("points", &self.hnsw.get_nb_point())
             .field("doc_ids", &self.doc_ids.len())
-            .field("vectors", &self.vectors.len())
             .field("dimension", &self.dimension)
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -122,152 +108,6 @@ impl HnswIndex {
             vectors.push(index.vector_at_f32(i)?);
         }
         Self::build_from_parts(doc_ids, vectors, dimension, config)
-    }
-
-    /// Load an ANN index from disk and rebuild the in-memory HNSW graph.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError::IndexCorrupted` for malformed data.
-    pub fn load(path: &Path) -> SearchResult<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut magic = [0_u8; 4];
-        read_exact_or_corrupted(&mut reader, &mut magic, path, "magic")?;
-        if magic != HNSW_MAGIC {
-            return Err(ann_corrupted(
-                path,
-                format!("invalid magic bytes: expected {HNSW_MAGIC:?}, found {magic:?}"),
-            ));
-        }
-
-        let version = read_u16(&mut reader, path, "version")?;
-        if version != HNSW_VERSION {
-            return Err(ann_corrupted(
-                path,
-                format!("unsupported CHSW version: {version}"),
-            ));
-        }
-
-        let dimension = usize::try_from(read_u32(&mut reader, path, "dimension")?)
-            .map_err(|_| ann_corrupted(path, "dimension field does not fit in usize"))?;
-        if dimension == 0 || dimension > CHSW_MAX_DIMENSION {
-            return Err(ann_corrupted(
-                path,
-                format!("dimension {dimension} out of valid range 1..={CHSW_MAX_DIMENSION}"),
-            ));
-        }
-
-        let record_count = usize::try_from(read_u32(&mut reader, path, "record_count")?)
-            .map_err(|_| ann_corrupted(path, "record_count field does not fit in usize"))?;
-
-        // Each record needs at minimum 4 bytes (doc_id_len) + dimension × 4 bytes (vector).
-        // Validate that the implied total doesn't overflow or exceed a sane ceiling.
-        let per_record_min = dimension.checked_mul(4).and_then(|v| v.checked_add(4));
-        let total_data_min = per_record_min.and_then(|pr| record_count.checked_mul(pr));
-        match total_data_min {
-            Some(total) if total > 4 * 1024 * 1024 * 1024 => {
-                return Err(ann_corrupted(
-                    path,
-                    format!(
-                        "record_count {record_count} × dimension {dimension} implies \
-                         {total} bytes, exceeding 4 GiB safety limit"
-                    ),
-                ));
-            }
-            None => {
-                return Err(ann_corrupted(
-                    path,
-                    format!(
-                        "record_count {record_count} × dimension {dimension} overflows \
-                         when computing minimum data size"
-                    ),
-                ));
-            }
-            _ => {}
-        }
-
-        let config = HnswConfig {
-            m: usize::try_from(read_u32(&mut reader, path, "m")?)
-                .map_err(|_| ann_corrupted(path, "m field does not fit in usize"))?,
-            ef_construction: usize::try_from(read_u32(&mut reader, path, "ef_construction")?)
-                .map_err(|_| ann_corrupted(path, "ef_construction field does not fit in usize"))?,
-            ef_search: usize::try_from(read_u32(&mut reader, path, "ef_search")?)
-                .map_err(|_| ann_corrupted(path, "ef_search field does not fit in usize"))?,
-            max_layer: usize::try_from(read_u32(&mut reader, path, "max_layer")?)
-                .map_err(|_| ann_corrupted(path, "max_layer field does not fit in usize"))?,
-        };
-
-        let mut doc_ids = Vec::with_capacity(record_count.min(CHSW_MAX_PREALLOC_RECORDS));
-        let mut vectors = Vec::with_capacity(record_count.min(CHSW_MAX_PREALLOC_RECORDS));
-        for _ in 0..record_count {
-            let doc_id_len = usize::try_from(read_u32(&mut reader, path, "doc_id_len")?)
-                .map_err(|_| ann_corrupted(path, "doc_id_len does not fit in usize"))?;
-            if doc_id_len > CHSW_MAX_DOC_ID_LEN {
-                return Err(ann_corrupted(
-                    path,
-                    format!("doc_id_len {doc_id_len} exceeds maximum {CHSW_MAX_DOC_ID_LEN}"),
-                ));
-            }
-            let mut doc_id_bytes = vec![0_u8; doc_id_len];
-            read_exact_or_corrupted(&mut reader, &mut doc_id_bytes, path, "doc_id")?;
-            let doc_id = String::from_utf8(doc_id_bytes)
-                .map_err(|error| ann_corrupted(path, format!("invalid UTF-8 doc_id: {error}")))?;
-            doc_ids.push(doc_id);
-
-            let mut vector = Vec::with_capacity(dimension);
-            for _ in 0..dimension {
-                let value = read_f32(&mut reader, path, "vector_value")?;
-                vector.push(value);
-            }
-            vectors.push(vector);
-        }
-
-        Self::build_from_parts(doc_ids, vectors, dimension, config)
-    }
-
-    /// Persist ANN index data as deterministic `CHSW` bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError::Io` on write/flush/sync failures.
-    pub fn save(&self, path: &Path) -> SearchResult<()> {
-        let parent = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-
-        let tmp_path = path.with_extension("tmp");
-        let file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-
-        writer.write_all(&HNSW_MAGIC)?;
-        writer.write_all(&HNSW_VERSION.to_le_bytes())?;
-        write_u32(&mut writer, self.dimension, "dimension")?;
-        write_u32(&mut writer, self.doc_ids.len(), "record_count")?;
-        write_u32(&mut writer, self.config.m, "m")?;
-        write_u32(&mut writer, self.config.ef_construction, "ef_construction")?;
-        write_u32(&mut writer, self.config.ef_search, "ef_search")?;
-        write_u32(&mut writer, self.config.max_layer, "max_layer")?;
-
-        for (doc_id, vector) in self.doc_ids.iter().zip(&self.vectors) {
-            write_u32(&mut writer, doc_id.len(), "doc_id_len")?;
-            writer.write_all(doc_id.as_bytes())?;
-            for value in vector {
-                writer.write_all(&value.to_le_bytes())?;
-            }
-        }
-
-        writer.flush()?;
-        let file = writer
-            .into_inner()
-            .map_err(|error| SearchError::Io(error.into_error()))?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(tmp_path, path)?;
-        Ok(())
     }
 
     /// Run ANN query and return hits plus query diagnostics.
@@ -466,7 +306,7 @@ impl HnswIndex {
         Ok(Self {
             hnsw,
             doc_ids,
-            vectors: normalized_vectors,
+            // vectors field removed to save RAM
             dimension,
             config,
         })
@@ -510,56 +350,6 @@ fn validate_config(config: HnswConfig) -> SearchResult<()> {
         });
     }
     Ok(())
-}
-
-fn read_exact_or_corrupted<R: Read>(
-    reader: &mut R,
-    buffer: &mut [u8],
-    path: &Path,
-    field: &str,
-) -> SearchResult<()> {
-    reader.read_exact(buffer).map_err(|error| {
-        if error.kind() == ErrorKind::UnexpectedEof {
-            ann_corrupted(path, format!("unexpected EOF while reading {field}"))
-        } else {
-            SearchError::Io(error)
-        }
-    })
-}
-
-fn read_u16<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<u16> {
-    let mut bytes = [0_u8; 2];
-    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u32<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<u32> {
-    let mut bytes = [0_u8; 4];
-    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_f32<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<f32> {
-    let mut bytes = [0_u8; 4];
-    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
-    Ok(f32::from_le_bytes(bytes))
-}
-
-fn write_u32<W: Write>(writer: &mut W, value: usize, field: &str) -> SearchResult<()> {
-    let value_u32 = u32::try_from(value).map_err(|_| SearchError::InvalidConfig {
-        field: field.to_owned(),
-        value: value.to_string(),
-        reason: "value does not fit in u32".to_owned(),
-    })?;
-    writer.write_all(&value_u32.to_le_bytes())?;
-    Ok(())
-}
-
-fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
-    SearchError::IndexCorrupted {
-        path: path.to_path_buf(),
-        detail: detail.into(),
-    }
 }
 
 fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
@@ -678,33 +468,6 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-0000");
-    }
-
-    #[test]
-    fn serialization_round_trip_restores_searchability() {
-        let fsvi_path = temp_path("serialize", "fsvi");
-        let vectors: Vec<Vec<f32>> = (0..64).map(|i| normalized_vector(i, 48)).collect();
-        let index = write_index(&fsvi_path, &vectors).expect("index");
-        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
-        let query = normalized_vector(999, 48);
-        let original = ann
-            .knn_search(&query, 10, HNSW_DEFAULT_EF_SEARCH)
-            .expect("original search");
-        let exact = index.search_top_k(&query, 10, None).expect("exact");
-
-        let chsw_path = temp_path("serialize", "chsw");
-        ann.save(&chsw_path).expect("save");
-        let loaded = HnswIndex::load(&chsw_path).expect("load");
-        let reloaded = loaded.knn_search(&query, 10, 256).expect("reloaded search");
-
-        assert_eq!(original.len(), reloaded.len());
-        assert!(
-            loaded
-                .matches_vector_index(&index)
-                .expect("index alignment")
-        );
-        assert!(recall_at_k(&original, &exact) >= 0.8);
-        assert!(recall_at_k(&reloaded, &exact) >= 0.8);
     }
 
     #[test]
@@ -978,48 +741,6 @@ mod tests {
             .knn_search(&normalized_vector(999, 16), 100, HNSW_DEFAULT_EF_SEARCH)
             .expect("search");
         assert_eq!(hits.len(), 5);
-    }
-
-    // ── Serialization corruption ────────────────────────────────────────
-
-    #[test]
-    fn load_rejects_wrong_magic_bytes() {
-        let path = temp_path("badmagic", "chsw");
-        let mut data = vec![0_u8; 64];
-        data[0..4].copy_from_slice(b"XXXX");
-        fs::write(&path, &data).expect("write");
-        let error = HnswIndex::load(&path).unwrap_err();
-        assert!(
-            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("magic")),
-            "expected IndexCorrupted for magic, got {error:?}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_unsupported_version() {
-        let path = temp_path("badver", "chsw");
-        let mut data = Vec::new();
-        data.extend_from_slice(&HNSW_MAGIC);
-        data.extend_from_slice(&99_u16.to_le_bytes()); // unsupported version
-        data.extend_from_slice(&[0; 56]); // padding
-        fs::write(&path, &data).expect("write");
-        let error = HnswIndex::load(&path).unwrap_err();
-        assert!(
-            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("version")),
-            "expected IndexCorrupted for version, got {error:?}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_truncated_file() {
-        let path = temp_path("trunc", "chsw");
-        // Write only magic (4 bytes) — not enough for version
-        fs::write(&path, HNSW_MAGIC).expect("write");
-        let error = HnswIndex::load(&path).unwrap_err();
-        assert!(
-            matches!(error, SearchError::IndexCorrupted { ref detail, .. } if detail.contains("EOF")),
-            "expected IndexCorrupted for EOF, got {error:?}"
-        );
     }
 
     // ── matches_vector_index edge cases ─────────────────────────────────

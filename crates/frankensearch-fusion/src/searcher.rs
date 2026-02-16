@@ -51,6 +51,8 @@ use crate::blend::{
     blend_two_tier, build_borrowed_rank_map, compute_rank_changes_with_maps,
     kendall_tau_with_refined_rank,
 };
+#[cfg(feature = "graph")]
+use crate::graph_rank::GraphRanker;
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -407,8 +409,13 @@ impl TwoTierSearcher {
 
         // Phase 2: Quality refinement (optional).
         // Runs even if Phase 1 was lexical-only (fast_score is None), effectively
-        // performing a "lexical -> quality rerank" flow.
-        if self.should_run_quality() && !initial_hits.is_empty() {
+        // performing a "lexical -> quality rerank" flow.  Skipped when fast
+        // embedding failed entirely (phase1_vectors_searched == 0) because the
+        // embedding pipeline is degraded and quality refinement would be unreliable.
+        if self.should_run_quality()
+            && !initial_hits.is_empty()
+            && metrics.phase1_vectors_searched > 0
+        {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
 
@@ -642,7 +649,7 @@ impl TwoTierSearcher {
         &self,
         cx: &Cx,
         semantic_query: &str,
-        parsed_query: &ParsedQuery,
+        _parsed_query: &ParsedQuery,
         normalized_exclusions: Option<&NormalizedExclusions>,
         k: usize,
         query_class: QueryClass,
@@ -709,6 +716,20 @@ impl TwoTierSearcher {
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
                 metrics.phase1_vectors_searched = self.index.doc_count();
+
+                let _graph_candidates: Option<Vec<frankensearch_core::types::ScoredResult>> =
+                    if self.config.graph_ranking_enabled && self.config.graph_ranking_weight > 0.0 {
+                        #[cfg(feature = "graph")]
+                        {
+                            GraphRanker::new().rank_phase1(cx, semantic_query, semantic_budget)
+                        }
+                        #[cfg(not(feature = "graph"))]
+                        {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
@@ -848,7 +869,7 @@ impl TwoTierSearcher {
         // Look up indices in the fast index for quality scoring.
         let fast_indices: Vec<usize> = fast_hits
             .iter()
-            .filter_map(|h| self.index.fast_index_for_doc_id(&h.doc_id))
+            .filter_map(|h| self.index.fast_index_for_doc_id(&h.doc_id).ok().flatten())
             .collect();
         metrics.phase2_vectors_searched = fast_indices.len();
 
@@ -858,12 +879,11 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         // Build quality VectorHits for blending.
-        let doc_ids = self.index.doc_ids();
         let quality_hits: Vec<VectorHit> = fast_indices
             .iter()
             .zip(quality_scores.iter())
             .filter_map(|(&idx, &score)| {
-                let doc_id = doc_ids.get(idx)?.clone();
+                let doc_id = self.index.doc_id_at(idx).ok()?.to_owned();
                 Some(VectorHit {
                     #[allow(clippy::cast_possible_truncation)]
                     index: idx as u32,
@@ -2456,6 +2476,47 @@ mod tests {
 
             assert_eq!(phase_count, 1, "fast_only should skip quality phase");
             assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+        });
+    }
+
+    #[test]
+    fn graph_ranking_enabled_stub_is_noop() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let config = TwoTierConfig {
+                graph_ranking_enabled: true,
+                graph_ranking_weight: 0.9,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast, config).with_lexical(lexical);
+
+            let mut saw_initial = false;
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "graph ranking stub query",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            saw_initial = true;
+                            assert!(
+                                !results.is_empty(),
+                                "phase-1 results should still be present"
+                            );
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed with stubbed graph path");
+
+            assert!(saw_initial, "phase-1 callback should fire");
+            assert!(
+                metrics.phase1_total_ms >= 0.0,
+                "phase-1 latency should remain well-formed"
+            );
         });
     }
 
@@ -4257,8 +4318,12 @@ mod tests {
     fn should_exclude_document_returns_false_when_text_doesnt_match() {
         let parsed = ParsedQuery::parse("query -unsafe");
         let exclusions = to_exclusions(&parsed);
-        let result =
-            should_exclude_document("doc-1", &exclusions, &|_| Some("safe code".to_owned()), "test");
+        let result = should_exclude_document(
+            "doc-1",
+            &exclusions,
+            &|_| Some("safe code".to_owned()),
+            "test",
+        );
         assert!(!result);
     }
 

@@ -720,45 +720,7 @@ impl PersistentJobQueue {
     }
 
     pub fn queue_depth(&self) -> SearchResult<QueueDepth> {
-        let mut depth = QueueDepth::default();
-        let rows = self
-            .storage
-            .connection()
-            .query("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
-            .map_err(map_storage_error)?;
-        for row in &rows {
-            let status = row_text(row, 0, "embedding_jobs.status")?;
-            let count = i64_to_usize(row_i64(row, 1, "embedding_jobs.count")?)?;
-            match JobStatus::from_str(status) {
-                Some(JobStatus::Pending) => depth.pending = count,
-                Some(JobStatus::Processing) => depth.processing = count,
-                Some(JobStatus::Completed) => depth.completed = count,
-                Some(JobStatus::Failed) => depth.failed = count,
-                Some(JobStatus::Skipped) => depth.skipped = count,
-                None => {
-                    return Err(queue_error(
-                        QueueErrorKind::Validation,
-                        format!("unknown queue status value: {status:?}"),
-                    ));
-                }
-            }
-        }
-
-        let now_ms = unix_timestamp_ms()?;
-        let ready_params = [SqliteValue::Integer(now_ms)];
-        let ready_rows = self
-            .storage
-            .connection()
-            .query_with_params(
-                "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
-                &ready_params,
-            )
-            .map_err(map_storage_error)?;
-        if let Some(row) = ready_rows.first() {
-            depth.ready_pending = i64_to_usize(row_i64(row, 0, "embedding_jobs.ready_pending")?)?;
-        }
-
-        Ok(depth)
+        fetch_queue_depth(self.storage.connection())
     }
 
     fn record_enqueue_outcome(&self, outcome: EnqueueOutcome) {
@@ -773,6 +735,44 @@ impl PersistentJobQueue {
             }
         }
     }
+}
+
+pub(crate) fn fetch_queue_depth(conn: &Connection) -> SearchResult<QueueDepth> {
+    let mut depth = QueueDepth::default();
+    let rows = conn
+        .query("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
+        .map_err(map_storage_error)?;
+    for row in &rows {
+        let status = row_text(row, 0, "embedding_jobs.status")?;
+        let count = i64_to_usize(row_i64(row, 1, "embedding_jobs.count")?)?;
+        match JobStatus::from_str(status) {
+            Some(JobStatus::Pending) => depth.pending = count,
+            Some(JobStatus::Processing) => depth.processing = count,
+            Some(JobStatus::Completed) => depth.completed = count,
+            Some(JobStatus::Failed) => depth.failed = count,
+            Some(JobStatus::Skipped) => depth.skipped = count,
+            None => {
+                return Err(queue_error(
+                    QueueErrorKind::Validation,
+                    format!("unknown queue status value: {status:?}"),
+                ));
+            }
+        }
+    }
+
+    let now_ms = unix_timestamp_ms()?;
+    let ready_params = [SqliteValue::Integer(now_ms)];
+    let ready_rows = conn
+        .query_with_params(
+            "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
+            &ready_params,
+        )
+        .map_err(map_storage_error)?;
+    if let Some(row) = ready_rows.first() {
+        depth.ready_pending = i64_to_usize(row_i64(row, 0, "embedding_jobs.ready_pending")?)?;
+    }
+
+    Ok(depth)
 }
 
 impl BatchEnqueueResult {
