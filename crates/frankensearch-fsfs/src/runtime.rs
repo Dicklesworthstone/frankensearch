@@ -1791,9 +1791,9 @@ impl FsfsRuntime {
             VectorSchedulingTier::LexicalFallback => "vector.plan.lexical_fallback",
             VectorSchedulingTier::Skip => "vector.skip.unspecified",
         };
-        let invalidate_revisions_through = input.previous_indexed_revision.filter(|revision| {
-            *revision >= 0 && input.content_hash_changed && input.observed_revision > *revision
-        });
+        let invalidate_revisions_through = input
+            .previous_indexed_revision
+            .filter(|revision| *revision >= 0 && input.content_hash_changed);
         let chunk_count = if matches!(tier, VectorSchedulingTier::LexicalFallback) {
             0
         } else {
@@ -6551,6 +6551,28 @@ mod tests {
         assert_eq!(plans[1].reason_code, "vector.skip.out_of_order_revision");
         assert_eq!(plans[2].tier, VectorSchedulingTier::Skip);
         assert_eq!(plans[2].reason_code, "vector.skip.revision_unchanged");
+    }
+
+    #[test]
+    fn vector_plan_invalidates_equal_revision_when_hash_changed() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let plans = runtime.plan_vector_pipeline(
+            &[VectorPipelineInput {
+                file_key: "doc/mtime-collision.md".to_owned(),
+                observed_revision: 9,
+                previous_indexed_revision: Some(9),
+                ingestion_class: IngestionClass::FullSemanticLexical,
+                content_len_bytes: 1_024,
+                content_hash_changed: true,
+            }],
+            EmbedderAvailability::Full,
+        );
+
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.tier, VectorSchedulingTier::FastAndQuality);
+        assert_eq!(plan.reason_code, "vector.plan.fast_quality");
+        assert_eq!(plan.invalidate_revisions_through, Some(9));
     }
 
     #[test]
