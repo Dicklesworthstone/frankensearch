@@ -1,10 +1,11 @@
 //! Optional document-graph model for graph-aware ranking extensions.
 //!
 //! This module intentionally provides only zero-dependency core types.
-//! Fusion/ranking algorithms (e.g. query-biased PageRank) are implemented
+//! Fusion/ranking algorithms (e.g. query-biased `PageRank`) are implemented
 //! in higher-level crates when graph features are enabled.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +34,7 @@ pub struct GraphEdge {
 
 impl GraphEdge {
     #[must_use]
-    pub fn new(neighbor_doc_id: GraphDocId, edge_type: EdgeType, weight: f32) -> Self {
+    pub const fn new(neighbor_doc_id: GraphDocId, edge_type: EdgeType, weight: f32) -> Self {
         Self {
             neighbor_doc_id,
             edge_type,
@@ -110,13 +111,15 @@ impl DocumentGraph {
         let from_doc_id = from_doc_id.into();
         let to_doc_id = to_doc_id.into();
 
-        self.add_node(from_doc_id.clone());
         self.add_node(to_doc_id.clone());
 
-        let edges = self
-            .adjacency
-            .get_mut(&from_doc_id)
-            .expect("source node inserted above");
+        let edges = match self.adjacency.entry(from_doc_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                self.node_count += 1;
+                entry.insert(Vec::new())
+            }
+        };
         if let Some(existing) = edges
             .iter_mut()
             .find(|edge| edge.neighbor_doc_id == to_doc_id && edge.edge_type == edge_type)

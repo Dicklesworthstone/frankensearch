@@ -263,10 +263,9 @@ impl VectorIndex {
 
         match self.quantization() {
             Quantization::F16 => {
-                let stride = dim * 2;
-                let mut vector_offset = self.vectors_offset + start * stride;
                 // Flags are at offset 14 in 16-byte record
                 let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut scratch = take_f16_scratch(dim);
 
                 for index in start..end {
                     // Check flags directly from mapped memory
@@ -275,55 +274,32 @@ impl VectorIndex {
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
                     if (flags & 0x0001) == 0 {
-                        // Not deleted. Score it.
-                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        
-                        // SAFETY: 
-                        // 1. vector_bytes length is stride (dim * 2).
-                        // 2. vectors_offset is 64-byte aligned (FSVI spec).
-                        // 3. stride is even. start * stride is even.
-                        // 4. vector_offset is thus even (2-byte aligned).
-                        // 5. cast to &[f16] is valid for 2-byte aligned data.
-                        let score = unsafe {
-                            let ptr = vector_bytes.as_ptr().cast::<f16>();
-                            let slice = std::slice::from_raw_parts(ptr, dim);
-                            dot_product_f16_f32(slice, query)?
-                        };
+                        let score = self.score_f16(index, query, scratch.as_mut_slice())?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
-                    vector_offset += stride;
                     flags_offset += 16;
                 }
+
+                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
-                let stride = dim * 4;
-                let mut vector_offset = self.vectors_offset + start * stride;
                 let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
                     if (flags & 0x0001) == 0 {
-                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                        // SAFETY:
-                        // 1. vector_bytes length is stride (dim * 4).
-                        // 2. vectors_offset is 64-byte aligned.
-                        // 3. stride is multiple of 4. start * stride is multiple of 4.
-                        // 4. vector_offset is 4-byte aligned.
-                        // 5. cast to &[f32] is valid.
-                        let score = unsafe {
-                            let ptr = vector_bytes.as_ptr().cast::<f32>();
-                            let slice = std::slice::from_raw_parts(ptr, dim);
-                            dot_product_f32_f32(slice, query)?
-                        };
+                        let score = self.score_f32(index, query, scratch.as_mut_slice())?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
-                    vector_offset += stride;
                     flags_offset += 16;
                 }
+
+                return_f32_scratch(scratch);
             }
         }
         Ok(heap)
@@ -342,48 +318,32 @@ impl VectorIndex {
 
         match self.quantization() {
             Quantization::F16 => {
-                let stride = dim * 2;
-                let mut vector_offset = self.vectors_offset + start * stride;
-                
-                // We still use passes_search_filter for robust filtering, 
-                // but we optimize the scoring part to avoid copy.
+                let mut scratch = take_f16_scratch(dim);
+
                 for index in start..end {
                     if !self.passes_search_filter(Some(filter), index)? {
-                        vector_offset += stride;
                         continue;
                     }
-                    
-                    let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                    let score = unsafe {
-                        let ptr = vector_bytes.as_ptr().cast::<f16>();
-                        let slice = std::slice::from_raw_parts(ptr, dim);
-                        dot_product_f16_f32(slice, query)?
-                    };
+
+                    let score = self.score_f16(index, query, scratch.as_mut_slice())?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
-                    
-                    vector_offset += stride;
                 }
+
+                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
-                let stride = dim * 4;
-                let mut vector_offset = self.vectors_offset + start * stride;
+                let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
                     if !self.passes_search_filter(Some(filter), index)? {
-                        vector_offset += stride;
                         continue;
                     }
 
-                    let vector_bytes = &self.data[vector_offset..vector_offset + stride];
-                    let score = unsafe {
-                        let ptr = vector_bytes.as_ptr().cast::<f32>();
-                        let slice = std::slice::from_raw_parts(ptr, dim);
-                        dot_product_f32_f32(slice, query)?
-                    };
+                    let score = self.score_f32(index, query, scratch.as_mut_slice())?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
-
-                    vector_offset += stride;
                 }
+
+                return_f32_scratch(scratch);
             }
         }
         Ok(heap)

@@ -643,6 +643,7 @@ impl TwoTierSearcher {
         cx: &Cx,
         semantic_query: &str,
         parsed_query: &ParsedQuery,
+        normalized_exclusions: Option<&NormalizedExclusions>,
         k: usize,
         query_class: QueryClass,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
@@ -671,10 +672,10 @@ impl TwoTierSearcher {
         let mut lexical_results = self
             .run_lexical(cx, semantic_query, lexical_budget, metrics)
             .await?;
-        if parsed_query.has_negations() {
+        if let Some(exclusions) = normalized_exclusions {
             lexical_results = lexical_results.map(|results| {
                 let filtered =
-                    filter_scored_results_by_negations(results, parsed_query, text_fn, "lexical");
+                    filter_scored_results_by_negations(results, exclusions, text_fn, "lexical");
                 metrics.lexical_candidates = filtered.len();
                 filtered
             });
@@ -700,8 +701,8 @@ impl TwoTierSearcher {
                 // Vector search.
                 let search_start = Instant::now();
                 let fast_hits = self.index.search_fast(&query_vec, semantic_budget)?;
-                let fast_hits = if parsed_query.has_negations() {
-                    filter_vector_hits_by_negations(fast_hits, parsed_query, text_fn, "semantic")
+                let fast_hits = if let Some(exclusions) = normalized_exclusions {
+                    filter_vector_hits_by_negations(fast_hits, exclusions, text_fn, "semantic")
                 } else {
                     fast_hits
                 };
@@ -1723,37 +1724,37 @@ fn vector_hits_to_scored_results(
 
 fn filter_scored_results_by_negations(
     results: Vec<ScoredResult>,
-    parsed_query: &ParsedQuery,
+    exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> Vec<ScoredResult> {
     results
         .into_iter()
-        .filter(|result| !should_exclude_document(&result.doc_id, parsed_query, text_fn, source))
+        .filter(|result| !should_exclude_document(&result.doc_id, exclusions, text_fn, source))
         .collect()
 }
 
 fn filter_vector_hits_by_negations(
     hits: Vec<VectorHit>,
-    parsed_query: &ParsedQuery,
+    exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> Vec<VectorHit> {
     hits.into_iter()
-        .filter(|hit| !should_exclude_document(&hit.doc_id, parsed_query, text_fn, source))
+        .filter(|hit| !should_exclude_document(&hit.doc_id, exclusions, text_fn, source))
         .collect()
 }
 
 fn should_exclude_document(
     doc_id: &str,
-    parsed_query: &ParsedQuery,
+    exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> bool {
     let Some(text) = text_fn(doc_id) else {
         return false;
     };
-    let Some(matched_clause) = find_negative_match(&text, parsed_query) else {
+    let Some(matched_clause) = find_negative_match(&text, exclusions) else {
         return false;
     };
     tracing::debug!(
@@ -1765,18 +1766,15 @@ fn should_exclude_document(
     true
 }
 
-fn find_negative_match(text: &str, parsed_query: &ParsedQuery) -> Option<String> {
+fn find_negative_match(text: &str, exclusions: &NormalizedExclusions) -> Option<String> {
     let normalized_text = normalize_for_negation_match(text);
-    for term in &parsed_query.negative_terms {
-        let normalized_term = normalize_for_negation_match(term);
-        if !normalized_term.is_empty() && contains_negative_term(&normalized_text, &normalized_term)
-        {
+    for term in &exclusions.terms {
+        if !term.is_empty() && contains_negative_term(&normalized_text, term) {
             return Some(term.clone());
         }
     }
-    for phrase in &parsed_query.negative_phrases {
-        let normalized_phrase = normalize_for_negation_match(phrase);
-        if !normalized_phrase.is_empty() && normalized_text.contains(&normalized_phrase) {
+    for phrase in &exclusions.phrases {
+        if !phrase.is_empty() && normalized_text.contains(phrase) {
             return Some(phrase.clone());
         }
     }
