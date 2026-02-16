@@ -2938,7 +2938,7 @@ mod tests {
             );
             assert_eq!(
                 metrics.skip_reason.as_deref(),
-                Some("no_fast_phase_candidates")
+                Some("vector_index_unavailable")
             );
         });
     }

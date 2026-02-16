@@ -339,7 +339,7 @@ impl MountTable {
 
         for entry in &self.entries {
             let mp = &entry.mount_point;
-            if path.starts_with(mp) {
+            if path.strip_prefix(mp).is_ok() {
                 let len = mp.as_os_str().len();
                 if len > best_len {
                     best_len = len;
@@ -823,6 +823,33 @@ user@host:/home /mnt/sshfs fuse.sshfs rw,nosuid,nodev 0 0
 
         // A file under /home should match the root mount.
         let (entry, _) = table.lookup(Path::new("/home/user/code.rs")).unwrap();
+        assert_eq!(entry.category, FsCategory::Local);
+    }
+
+    #[test]
+    fn mount_table_lookup_respects_path_boundaries() {
+        let entries = vec![
+            MountEntry {
+                device: "/dev/sda1".into(),
+                mount_point: PathBuf::from("/"),
+                fstype: "ext4".into(),
+                category: FsCategory::Local,
+                options: "rw".into(),
+            },
+            MountEntry {
+                device: "server:/export".into(),
+                mount_point: PathBuf::from("/mnt/nfs"),
+                fstype: "nfs4".into(),
+                category: FsCategory::Nfs,
+                options: "rw".into(),
+            },
+        ];
+
+        let table = MountTable::new(entries, &HashMap::new());
+
+        // A file whose path only shares the textual prefix (but is outside the mount)
+        // should not match the `/mnt/nfs` policy.
+        let (entry, _) = table.lookup(Path::new("/mnt/nfs-shared/file.txt")).unwrap();
         assert_eq!(entry.category, FsCategory::Local);
     }
 

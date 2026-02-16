@@ -716,7 +716,7 @@ impl PersistentJobQueue {
 
     pub fn is_backpressured(&self) -> SearchResult<bool> {
         let depth = self.queue_depth()?;
-        Ok(depth.pending > self.config.backpressure_threshold)
+        Ok(depth.ready_pending > self.config.backpressure_threshold)
     }
 
     pub fn queue_depth(&self) -> SearchResult<QueueDepth> {
@@ -1719,6 +1719,7 @@ mod tests {
     #[test]
     fn queue_depth_tracks_ready_pending_for_delayed_retries() {
         let (queue, storage) = queue_fixture(JobQueueConfig {
+            backpressure_threshold: 0,
             max_retries: 3,
             retry_base_delay_ms: 1_000,
             ..JobQueueConfig::default()
@@ -1744,10 +1745,16 @@ mod tests {
             depth.ready_pending, 0,
             "delayed retry should not appear as ready pending yet"
         );
+        assert!(
+            !queue
+                .is_backpressured()
+                .expect("backpressure check should succeed"),
+            "delayed-only pending jobs should not trigger backpressure when ready_pending is zero"
+        );
     }
 
     #[test]
-    fn backpressure_trips_only_when_pending_exceeds_threshold() {
+    fn backpressure_trips_only_when_ready_pending_exceeds_threshold() {
         let (queue, storage) = queue_fixture(JobQueueConfig {
             backpressure_threshold: 2,
             ..JobQueueConfig::default()
@@ -1764,7 +1771,7 @@ mod tests {
             queue
                 .is_backpressured()
                 .expect("backpressure check should work"),
-            "3 pending jobs should exceed threshold 2"
+            "3 ready pending jobs should exceed threshold 2"
         );
 
         let _ = queue
@@ -1774,7 +1781,7 @@ mod tests {
             !queue
                 .is_backpressured()
                 .expect("backpressure check should work"),
-            "2 pending jobs should not exceed threshold 2"
+            "2 ready pending jobs should not exceed threshold 2"
         );
     }
 

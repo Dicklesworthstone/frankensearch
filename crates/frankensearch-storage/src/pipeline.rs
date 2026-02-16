@@ -379,9 +379,9 @@ impl StorageBackedJobRunner {
             }
 
             let depth = fetch_queue_depth(conn)?;
-            if depth.pending > self.queue.config().backpressure_threshold {
+            if depth.ready_pending > self.queue.config().backpressure_threshold {
                 return Err(SearchError::QueueFull {
-                    pending: depth.pending,
+                    pending: depth.ready_pending,
                     capacity: self.queue.config().backpressure_threshold,
                 });
             }
@@ -1152,7 +1152,7 @@ mod tests {
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
 
-    use crate::job_queue::JobQueueConfig;
+    use crate::job_queue::{FailResult, JobQueueConfig};
 
     use super::*;
 
@@ -1819,6 +1819,57 @@ mod tests {
             }
             other => panic!("expected QueueFull error, received {other:?}"),
         }
+    }
+
+    #[test]
+    fn ingest_allows_new_docs_when_only_delayed_pending_jobs_exist() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig {
+                backpressure_threshold: 0,
+                retry_base_delay_ms: 60_000,
+                ..JobQueueConfig::default()
+            },
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let _ = runner
+            .ingest(IngestRequest::new("doc-delayed", "first"))
+            .expect("first ingest should seed queue");
+        let claimed = runner
+            .queue
+            .claim_batch("worker-delayed", 1)
+            .expect("claim should succeed");
+        assert_eq!(claimed.len(), 1);
+
+        let fail_result = runner
+            .queue
+            .fail(claimed[0].job_id, "transient")
+            .expect("fail should schedule retry");
+        assert!(
+            matches!(fail_result, FailResult::Retried { .. }),
+            "first failure should schedule a retry, got {fail_result:?}"
+        );
+
+        let depth = runner
+            .queue
+            .queue_depth()
+            .expect("queue depth should succeed");
+        assert_eq!(depth.pending, 1, "one delayed pending retry should exist");
+        assert_eq!(
+            depth.ready_pending, 0,
+            "delayed pending retry must not count as ready pending"
+        );
+
+        let result = runner
+            .ingest(IngestRequest::new("doc-fresh", "second"))
+            .expect("ingest should not be blocked by delayed-only pending jobs");
+        assert_eq!(result.action, IngestAction::New);
+        assert!(result.fast_job_enqueued);
     }
 
     #[test]

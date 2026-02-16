@@ -4213,8 +4213,8 @@ impl FsfsRuntime {
             if !lexical_batch.is_empty() {
                 lexical_index.index_documents(cx, &lexical_batch).await?;
             }
-            lexical_elapsed_ms = lexical_elapsed_ms
-                .saturating_add(lexical_start.elapsed().as_millis());
+            lexical_elapsed_ms =
+                lexical_elapsed_ms.saturating_add(lexical_start.elapsed().as_millis());
 
             // Semantic Embedding & Vector Writing
             let semantic_docs = chunk_docs
@@ -4231,8 +4231,8 @@ impl FsfsRuntime {
 
                 let embed_start = Instant::now();
                 let embeddings_result = embedder.embed_batch(cx, &semantic_texts).await;
-                embedding_elapsed_ms = embedding_elapsed_ms
-                    .saturating_add(embed_start.elapsed().as_millis());
+                embedding_elapsed_ms =
+                    embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
 
                 match embeddings_result {
                     Ok(embeddings) => {
@@ -4251,8 +4251,8 @@ impl FsfsRuntime {
                         for (doc, embedding) in semantic_docs.iter().zip(embeddings.into_iter()) {
                             vector_writer.write_record(&doc.id, &embedding)?;
                         }
-                        vector_elapsed_ms = vector_elapsed_ms
-                            .saturating_add(vector_start.elapsed().as_millis());
+                        vector_elapsed_ms =
+                            vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
                     }
                     Err(error) => {
                         // If embedding fails for a chunk, we skip vector indexing for this chunk
@@ -4272,13 +4272,13 @@ impl FsfsRuntime {
         // 4. Commit and Finish
         let lexical_commit_start = Instant::now();
         lexical_index.commit(cx).await?;
-        lexical_elapsed_ms = lexical_elapsed_ms
-            .saturating_add(lexical_commit_start.elapsed().as_millis());
+        lexical_elapsed_ms =
+            lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
         vector_writer.finish()?;
-        vector_elapsed_ms = vector_elapsed_ms
-            .saturating_add(vector_finish_start.elapsed().as_millis());
+        vector_elapsed_ms =
+            vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
 
         manifests.sort_by(|left, right| left.file_key.cmp(&right.file_key));
         let source_hash_hex = index_source_hash_hex(&manifests);
@@ -4344,7 +4344,6 @@ impl FsfsRuntime {
 
         Ok(())
     }
-
 
     fn resolve_target_root(&self) -> SearchResult<PathBuf> {
         let raw = self
