@@ -72,14 +72,25 @@ fn sanitize_rrf_k(k: f64) -> f64 {
     }
 }
 
+#[inline]
+fn sanitize_graph_weight(weight: f64) -> f64 {
+    if weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug)]
 struct FusedHitScratch<'a> {
     doc_id: &'a str,
     rrf_score: f64,
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
+    graph_rank: Option<usize>,
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
+    graph_score: Option<f32>,
     in_both_sources: bool,
 }
 
@@ -151,9 +162,38 @@ pub fn rrf_fuse(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
+    rrf_fuse_with_graph(lexical, semantic, &[], 0.0, limit, offset, config)
+}
+
+/// Fuse lexical, semantic, and optional graph-ranked results with weighted RRF.
+#[must_use]
+#[instrument(
+    name = "frankensearch::rrf_fuse_with_graph",
+    skip(lexical, semantic, graph),
+    fields(
+        lexical_count = lexical.len(),
+        semantic_count = semantic.len(),
+        graph_count = graph.len(),
+        graph_weight,
+        k = config.k,
+        limit,
+        offset,
+    )
+)]
+pub fn rrf_fuse_with_graph(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
+    let graph_weight = sanitize_graph_weight(graph_weight);
     // Adjusted for typical ~50% overlap to reduce over-allocation.
-    let capacity = (lexical.len() + semantic.len()) * 3 / 4;
+    let graph_len = if graph_weight > 0.0 { graph.len() } else { 0 };
+    let capacity = (lexical.len() + semantic.len() + graph_len) * 3 / 4 + 1;
     let mut hits: HashMap<&str, FusedHitScratch<'_>> = HashMap::with_capacity(capacity);
 
     // Score lexical results.
@@ -179,8 +219,10 @@ pub fn rrf_fuse(
                 rrf_score: rrf_contribution,
                 lexical_rank: Some(rank),
                 semantic_rank: None,
+                graph_rank: None,
                 lexical_score: Some(result.score),
                 semantic_score: None,
+                graph_score: None,
                 in_both_sources: false,
             });
     }
@@ -207,10 +249,42 @@ pub fn rrf_fuse(
                 rrf_score: rrf_contribution,
                 lexical_rank: None,
                 semantic_rank: Some(rank),
+                graph_rank: None,
                 lexical_score: None,
                 semantic_score: Some(hit.score),
+                graph_score: None,
                 in_both_sources: false,
             });
+    }
+
+    if graph_weight > 0.0 {
+        for (rank, result) in graph.iter().enumerate() {
+            // If we've already seen this doc in this source (graph), skip it.
+            if let Some(existing) = hits.get(result.doc_id.as_str())
+                && existing.graph_rank.is_some()
+            {
+                continue;
+            }
+
+            let rrf_contribution = rank_contribution(k, rank) * graph_weight;
+            hits.entry(result.doc_id.as_str())
+                .and_modify(|hit| {
+                    hit.rrf_score += rrf_contribution;
+                    hit.graph_rank = Some(rank);
+                    hit.graph_score = Some(result.score);
+                })
+                .or_insert_with(|| FusedHitScratch {
+                    doc_id: result.doc_id.as_str(),
+                    rrf_score: rrf_contribution,
+                    lexical_rank: None,
+                    semantic_rank: None,
+                    graph_rank: Some(rank),
+                    lexical_score: None,
+                    semantic_score: None,
+                    graph_score: Some(result.score),
+                    in_both_sources: false,
+                });
+        }
     }
 
     let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
@@ -295,6 +369,20 @@ mod tests {
             index: 0,
             score,
             doc_id: doc_id.into(),
+        }
+    }
+
+    fn graph_hit(doc_id: &str, score: f32) -> ScoredResult {
+        ScoredResult {
+            doc_id: doc_id.into(),
+            score,
+            source: frankensearch_core::ScoreSource::SemanticFast,
+            fast_score: Some(score),
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
         }
     }
 
@@ -392,6 +480,36 @@ mod tests {
         // "shared" should be first (highest combined score)
         assert_eq!(results[0].doc_id, "shared");
         assert!(results[0].in_both_sources);
+    }
+
+    #[test]
+    fn graph_channel_can_promote_document_with_weighted_rrf() {
+        let config = RrfConfig::default();
+        let semantic = vec![semantic_hit("a", 0.9), semantic_hit("b", 0.8)];
+        let graph = vec![graph_hit("b", 1.0)];
+
+        let results = rrf_fuse_with_graph(&[], &semantic, &graph, 1.0, 10, 0, &config);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].doc_id, "b",
+            "graph contribution should promote b above semantic rank-0 doc a"
+        );
+    }
+
+    #[test]
+    fn zero_graph_weight_matches_two_source_rrf() {
+        let config = RrfConfig::default();
+        let lexical = vec![lexical_hit("a", 10.0)];
+        let semantic = vec![semantic_hit("b", 0.9)];
+        let graph = vec![graph_hit("b", 1.0)];
+
+        let base = rrf_fuse(&lexical, &semantic, 10, 0, &config);
+        let weighted = rrf_fuse_with_graph(&lexical, &semantic, &graph, 0.0, 10, 0, &config);
+
+        assert_eq!(weighted.len(), base.len());
+        assert_eq!(weighted[0].doc_id, base[0].doc_id);
+        assert!((weighted[0].rrf_score - base[0].rrf_score).abs() < 1e-12);
     }
 
     // ─── Single-source fusion ───────────────────────────────────────────

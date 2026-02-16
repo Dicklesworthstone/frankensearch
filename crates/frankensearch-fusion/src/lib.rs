@@ -84,5 +84,5 @@ pub use queue::{
     EmbeddingJob, EmbeddingQueue, EmbeddingQueueConfig, EmbeddingRequest, JobOutcome, QueueMetrics,
 };
 pub use refresh::{RefreshMetrics, RefreshMetricsSnapshot, RefreshWorker, RefreshWorkerConfig};
-pub use rrf::{RrfConfig, candidate_count, rrf_fuse};
+pub use rrf::{RrfConfig, candidate_count, rrf_fuse, rrf_fuse_with_graph};
 pub use searcher::TwoTierSearcher;
