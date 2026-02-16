@@ -180,7 +180,7 @@ impl HnswIndex {
 
     /// Persist ANN index to disk.
     ///
-    /// Writes metadata to `path` and graph/vector payloads via hnsw_rs
+    /// Writes metadata to `path` and graph/vector payloads via `hnsw_rs`
     /// sidecar files in the same directory.
     ///
     /// # Errors
