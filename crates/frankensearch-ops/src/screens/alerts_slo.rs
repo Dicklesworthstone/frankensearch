@@ -18,6 +18,7 @@ use frankensearch_tui::input::InputEvent;
 use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 
 use crate::state::{AppState, ControlPlaneHealth, LifecycleEvent};
+use crate::theme::SemanticPalette;
 
 const TARGET_P95_US: u64 = 3_000;
 const BURN_WARN: f64 = 0.8;
@@ -127,6 +128,7 @@ pub struct AlertsSloScreen {
     project_screen_id: ScreenId,
     live_stream_screen_id: ScreenId,
     timeline_screen_id: ScreenId,
+    palette: SemanticPalette,
 }
 
 impl AlertsSloScreen {
@@ -144,6 +146,7 @@ impl AlertsSloScreen {
             project_screen_id: ScreenId::new("ops.project"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
             timeline_screen_id: ScreenId::new("ops.timeline"),
+            palette: SemanticPalette::dark(),
         }
     }
 
@@ -168,6 +171,10 @@ impl AlertsSloScreen {
         self.state = state.clone();
         self.clamp_filter_indices();
         self.restore_selected_alert(focused);
+    }
+
+    pub fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     /// Selected project in the filtered alert table.

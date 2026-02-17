@@ -17,6 +17,7 @@ use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 
 use crate::presets::ViewState;
 use crate::state::AppState;
+use crate::theme::SemanticPalette;
 
 /// Fleet overview screen showing all discovered instances.
 pub struct FleetOverviewScreen {
@@ -27,6 +28,7 @@ pub struct FleetOverviewScreen {
     analytics_screen_id: ScreenId,
     state: AppState,
     view: ViewState,
+    palette: SemanticPalette,
     selected_row: usize,
 }
 
@@ -42,6 +44,7 @@ impl FleetOverviewScreen {
             analytics_screen_id: ScreenId::new("ops.analytics"),
             state: AppState::new(),
             view: ViewState::default(),
+            palette: SemanticPalette::dark(),
             selected_row: 0,
         }
     }
@@ -76,6 +79,11 @@ impl FleetOverviewScreen {
         } else if self.selected_row >= visible {
             self.selected_row = visible - 1;
         }
+    }
+
+    /// Update the semantic palette for theme-aware rendering.
+    pub fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     fn visible_instances(&self) -> Vec<&crate::state::InstanceInfo> {

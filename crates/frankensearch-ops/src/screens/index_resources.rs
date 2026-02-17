@@ -17,6 +17,7 @@ use frankensearch_tui::input::InputEvent;
 use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 
 use crate::state::AppState;
+use crate::theme::SemanticPalette;
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -73,6 +74,7 @@ pub struct IndexResourceScreen {
     selected_row: usize,
     project_filter_index: usize,
     comparison_window: ComparisonWindow,
+    palette: SemanticPalette,
 }
 
 impl IndexResourceScreen {
@@ -85,6 +87,7 @@ impl IndexResourceScreen {
             selected_row: 0,
             project_filter_index: 0,
             comparison_window: ComparisonWindow::CurrentVsPreviousHourEstimate,
+            palette: SemanticPalette::dark(),
         }
     }
 
@@ -93,6 +96,10 @@ impl IndexResourceScreen {
         self.state = state.clone();
         self.clamp_filter_index();
         self.clamp_selected_row();
+    }
+
+    pub fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     fn project_filters(&self) -> Vec<String> {

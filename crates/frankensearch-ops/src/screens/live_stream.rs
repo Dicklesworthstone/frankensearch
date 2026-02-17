@@ -18,6 +18,7 @@ use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 
 use crate::data_source::TimeWindow;
 use crate::state::{AppState, ControlPlaneHealth};
+use crate::theme::SemanticPalette;
 
 #[derive(Clone)]
 struct StreamRowData {
@@ -113,6 +114,7 @@ pub struct LiveSearchStreamScreen {
     host_filter_index: usize,
     severity_filter: StreamSeverityFilter,
     degraded_only: bool,
+    palette: SemanticPalette,
 }
 
 impl LiveSearchStreamScreen {
@@ -127,6 +129,7 @@ impl LiveSearchStreamScreen {
             host_filter_index: 0,
             severity_filter: StreamSeverityFilter::All,
             degraded_only: false,
+            palette: SemanticPalette::dark(),
         }
     }
 
@@ -137,6 +140,11 @@ impl LiveSearchStreamScreen {
         self.clamp_selected_row();
     }
 
+
+    /// Update the semantic palette for theme-aware rendering.
+    pub fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
+    }
     /// Apply a project filter by value, defaulting to `all` when absent.
     pub fn set_project_filter(&mut self, project: &str) {
         self.project_filter_index = self

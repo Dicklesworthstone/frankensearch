@@ -19,6 +19,7 @@ use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 
 use crate::data_source::TimeWindow;
 use crate::state::{AppState, LifecycleEvent};
+use crate::theme::SemanticPalette;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventSeverity {
@@ -146,6 +147,7 @@ pub struct HistoricalAnalyticsScreen {
     project_screen_id: ScreenId,
     live_stream_screen_id: ScreenId,
     timeline_screen_id: ScreenId,
+    palette: SemanticPalette,
 }
 
 impl HistoricalAnalyticsScreen {
@@ -168,6 +170,7 @@ impl HistoricalAnalyticsScreen {
             project_screen_id: ScreenId::new("ops.project"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
             timeline_screen_id: ScreenId::new("ops.timeline"),
+            palette: SemanticPalette::dark(),
         }
     }
 
@@ -195,6 +198,10 @@ impl HistoricalAnalyticsScreen {
         self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_row(focused);
+    }
+
+    pub fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     /// Selected project from the evidence table.
