@@ -43,6 +43,8 @@ use frankensearch_core::traits::{Embedder, SearchFuture};
 ))]
 use frankensearch_core::traits::{ModelCategory, ModelTier};
 
+#[cfg(feature = "bundled-default-models")]
+use crate::bundled_default_models::ensure_default_semantic_models;
 #[cfg(all(feature = "download", feature = "fastembed"))]
 use crate::fastembed_embedder::DEFAULT_DIMENSION as MINILM_DIMENSION;
 #[cfg(feature = "fastembed")]
@@ -311,6 +313,7 @@ impl EmbedderStack {
         model_root: Option<&Path>,
         policy: DownloadPolicy,
     ) -> SearchResult<Self> {
+        materialize_bundled_default_models(model_root);
         let quality = detect_quality_embedder(model_root)
             .or_else(|| maybe_lazy_quality_embedder(model_root, policy));
         let fast = detect_fast_embedder(model_root)
@@ -336,6 +339,7 @@ impl EmbedderStack {
         any(feature = "model2vec", feature = "fastembed")
     )))]
     fn auto_detect_with_policy(model_root: Option<&Path>) -> SearchResult<Self> {
+        materialize_bundled_default_models(model_root);
         let quality = detect_quality_embedder(model_root);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
@@ -430,6 +434,7 @@ impl EmbedderStack {
     ///
     /// Includes actionable suggestions for resolving degraded states:
     /// cache directory paths, manual download URLs, environment variable hints.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn diagnose(&self) -> ModelAvailabilityDiagnostic {
         let cache_dir = crate::model_cache::resolve_cache_root();
@@ -479,6 +484,7 @@ impl EmbedderStack {
 
         let mut suggestions = Vec::new();
         if self.availability.is_degraded() {
+            #[cfg(not(feature = "bundled-default-models"))]
             if offline {
                 suggestions.push(
                     "Unset FRANKENSEARCH_OFFLINE to allow automatic model downloads.".to_owned(),
@@ -490,7 +496,13 @@ impl EmbedderStack {
             ));
 
             if matches!(self.availability, TwoTierAvailability::HashOnly) {
+                #[cfg(all(feature = "bundled-default-models", feature = "model2vec"))]
+                suggestions.push(
+                    "Default semantic models are bundled in fsfs. If still unavailable, ensure the model cache path is writable and run `fsfs status`."
+                        .to_owned(),
+                );
                 #[cfg(feature = "model2vec")]
+                #[cfg(not(feature = "bundled-default-models"))]
                 suggestions.push(
                     "Download potion-multilingual-128M from https://huggingface.co/minishlab/potion-multilingual-128M and place in cache dir."
                         .to_owned(),
@@ -502,7 +514,13 @@ impl EmbedderStack {
                 );
             }
             if self.quality.is_none() {
+                #[cfg(all(feature = "bundled-default-models", feature = "fastembed"))]
+                suggestions.push(
+                    "Quality model should be bundled by default. Check cache permissions and verify `all-MiniLM-L6-v2` exists under the model directory."
+                        .to_owned(),
+                );
                 #[cfg(feature = "fastembed")]
+                #[cfg(not(feature = "bundled-default-models"))]
                 suggestions.push(
                     "Download all-MiniLM-L6-v2 from https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2 and place in cache dir."
                         .to_owned(),
@@ -513,8 +531,14 @@ impl EmbedderStack {
                         .to_owned(),
                 );
             }
+            #[cfg(not(feature = "bundled-default-models"))]
             suggestions.push(
                 "For air-gapped environments: run `fsfs download-models --output ./models/` on a networked machine, then copy to target."
+                    .to_owned(),
+            );
+            #[cfg(feature = "bundled-default-models")]
+            suggestions.push(
+                "Optional: use `fsfs download-models` only when you want alternate semantic models beyond the bundled defaults."
                     .to_owned(),
             );
         }
@@ -736,8 +760,9 @@ fn download_policy_from_environment() -> DownloadPolicy {
     let consent = if offline {
         DownloadConsent::denied(Some(ConsentSource::Environment))
     } else {
-        // Default to "allowed" unless explicitly denied via FRANKENSEARCH_ALLOW_DOWNLOAD.
-        resolve_download_consent(None, None, Some(true))
+        // Default to "denied" unless explicitly allowed via FRANKENSEARCH_ALLOW_DOWNLOAD=1.
+        // This keeps first-run search offline-safe and avoids surprise network fetches.
+        resolve_download_consent(None, None, Some(false))
     };
     DownloadPolicy {
         consent,
@@ -779,7 +804,7 @@ fn maybe_lazy_fast_embedder(
     policy: DownloadPolicy,
 ) -> Option<Arc<dyn Embedder>> {
     if !policy.can_download() {
-        warn!(
+        info!(
             model = POTION_MODEL_NAME,
             tier = "fast",
             reason = %policy.blocked_reason(),
@@ -821,7 +846,7 @@ fn maybe_lazy_quality_embedder(
     policy: DownloadPolicy,
 ) -> Option<Arc<dyn Embedder>> {
     if !policy.can_download() {
-        warn!(
+        info!(
             model = MINILM_MODEL_NAME,
             tier = "quality",
             reason = %policy.blocked_reason(),
@@ -956,7 +981,7 @@ struct LazyModel2VecEmbedder {
 
 #[cfg(all(feature = "download", feature = "model2vec"))]
 impl LazyModel2VecEmbedder {
-    const fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
+    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
         Self {
             model_root,
             policy,
@@ -1053,7 +1078,7 @@ struct LazyFastEmbedEmbedder {
 
 #[cfg(all(feature = "download", feature = "fastembed"))]
 impl LazyFastEmbedEmbedder {
-    const fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
+    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
         Self {
             model_root,
             policy,
@@ -1396,7 +1421,7 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
         }
     }
 
-    warn!(
+    info!(
         model = POTION_MODEL_NAME,
         tier = "fast",
         checked_paths = ?checked_paths,
@@ -1457,7 +1482,7 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
         }
     }
 
-    warn!(
+    info!(
         model = MINILM_MODEL_NAME,
         tier = "quality",
         checked_paths = ?checked_paths,
@@ -1481,6 +1506,31 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
     None
 }
+
+#[cfg(feature = "bundled-default-models")]
+fn materialize_bundled_default_models(model_root: Option<&Path>) {
+    match ensure_default_semantic_models(model_root) {
+        Ok(summary) => {
+            if summary.models_written > 0 {
+                info!(
+                    model_root = %summary.model_root.display(),
+                    models_written = summary.models_written,
+                    bytes_written = summary.bytes_written,
+                    "materialized bundled default semantic models"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to materialize bundled default semantic models; continuing with normal detection"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "bundled-default-models"))]
+fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
 
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
 fn manifest_files_exist(manifest: &ModelManifest, model_dir: &Path) -> bool {

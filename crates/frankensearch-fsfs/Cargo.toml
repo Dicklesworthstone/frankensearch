@@ -18,11 +18,19 @@ path = "src/main.rs"
 
 [dependencies]
 frankensearch-core = { workspace = true }
-frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "model2vec", "fastembed", "download"] }
+frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "model2vec", "fastembed", "download", "bundled-default-models"] }
 frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true }
 frankensearch-storage = { workspace = true }
 frankensearch-tui = { workspace = true }
+ftui-core = { workspace = true }
+ftui-layout = { workspace = true }
+ftui-render = { workspace = true }
+ftui-style = { workspace = true }
+ftui-text = { workspace = true }
+ftui-widgets = { workspace = true }
+ftui-tty = { workspace = true }
+ftui-backend = { workspace = true }
 asupersync = { workspace = true }
 fsqlite = { path = "../../../frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "../../../frankensqlite/crates/fsqlite-types" }

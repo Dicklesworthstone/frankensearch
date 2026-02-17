@@ -10,6 +10,8 @@
 
 pub mod auto_detect;
 pub mod batch_coalescer;
+#[cfg(feature = "bundled-default-models")]
+pub mod bundled_default_models;
 pub mod cached_embedder;
 pub mod model_cache;
 pub mod model_manifest;
@@ -20,6 +22,8 @@ pub use auto_detect::{
 pub use batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
 };
+#[cfg(feature = "bundled-default-models")]
+pub use bundled_default_models::{EmbeddedModelInstallSummary, ensure_default_semantic_models};
 pub use cached_embedder::{CacheStats, CachedEmbedder};
 pub use model_cache::{
     ENV_DATA_DIR, ENV_MODEL_DIR, KnownModel, MODEL_CACHE_LAYOUT_VERSION, ModelCacheLayout,

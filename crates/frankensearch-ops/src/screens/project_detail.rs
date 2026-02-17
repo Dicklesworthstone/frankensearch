@@ -6,6 +6,7 @@
 use std::any::Any;
 
 use frankensearch_core::LifecycleState;
+use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
 use ftui_render::frame::Frame;
 use ftui_style::Style;
@@ -155,6 +156,212 @@ impl ProjectDetailScreen {
         bar.push_str(&"=".repeat(filled));
         bar.push_str(&"-".repeat(width.saturating_sub(filled)));
         bar
+    }
+
+    fn ratio_percent_u64(numer: u64, denom: u64) -> u8 {
+        if denom == 0 {
+            return 0;
+        }
+        let rounded = numer
+            .saturating_mul(100)
+            .saturating_add(denom / 2)
+            .saturating_div(denom)
+            .min(100);
+        u8::try_from(rounded).unwrap_or(100)
+    }
+
+    fn clamp_percent(value: f64) -> u8 {
+        if !value.is_finite() {
+            return 0;
+        }
+        let bounded = value.clamp(0.0, 100.0).round();
+        let mut percent = 0u8;
+        while percent < 100 && f64::from(percent) < bounded {
+            percent = percent.saturating_add(1);
+        }
+        percent
+    }
+
+    fn spark_char(percent: u8) -> char {
+        const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let idx = (u16::from(percent).saturating_mul(7).saturating_add(50)) / 100;
+        BINS[usize::from(idx.min(7))]
+    }
+
+    fn sparkline(values: &[u8]) -> String {
+        values
+            .iter()
+            .map(|value| Self::spark_char(*value))
+            .collect()
+    }
+
+    fn row_pulse_percent(
+        instance: &crate::state::InstanceInfo,
+        fleet: &crate::state::FleetSnapshot,
+    ) -> u8 {
+        let pending_pressure = Self::ratio_percent_u64(instance.pending_jobs.min(1_500), 1_500);
+        let p95_pressure = fleet.search_metrics.get(&instance.id).map_or(0, |metrics| {
+            Self::ratio_percent_u64(metrics.p95_latency_us.min(6_000), 6_000)
+        });
+        let cpu_pressure = fleet
+            .resources
+            .get(&instance.id)
+            .map_or(0, |metrics| Self::clamp_percent(metrics.cpu_percent));
+        let weighted = (u16::from(pending_pressure).saturating_mul(4))
+            .saturating_add(u16::from(p95_pressure).saturating_mul(4))
+            .saturating_add(u16::from(cpu_pressure).saturating_mul(2))
+            .saturating_div(10)
+            .min(100);
+        let mut pressure = u8::try_from(weighted).unwrap_or(100);
+        if !instance.healthy {
+            pressure = pressure.saturating_add(20).min(100);
+        }
+        if let Some(lifecycle) = fleet.lifecycle_for(&instance.id)
+            && matches!(
+                lifecycle.state,
+                LifecycleState::Degraded
+                    | LifecycleState::Recovering
+                    | LifecycleState::Stale
+                    | LifecycleState::Stopped
+            )
+        {
+            pressure = pressure.saturating_add(10).min(100);
+        }
+        pressure
+    }
+
+    const fn row_pulse_label(percent: u8) -> &'static str {
+        if percent >= 85 {
+            "CRIT"
+        } else if percent >= 60 {
+            "HOT"
+        } else if percent >= 35 {
+            "WATCH"
+        } else {
+            "CALM"
+        }
+    }
+
+    fn row_pulse(
+        instance: &crate::state::InstanceInfo,
+        fleet: &crate::state::FleetSnapshot,
+    ) -> String {
+        let pressure = Self::row_pulse_percent(instance, fleet);
+        let label = Self::row_pulse_label(pressure);
+        format!("{label}:{pressure:>3}%")
+    }
+
+    fn summary_pulse_strip_line(
+        instances: &[&crate::state::InstanceInfo],
+        fleet: &crate::state::FleetSnapshot,
+    ) -> String {
+        if instances.is_empty() {
+            return "pulse strip: (no rows)".to_owned();
+        }
+        let values: Vec<u8> = instances
+            .iter()
+            .take(24)
+            .map(|instance| Self::row_pulse_percent(instance, fleet))
+            .collect();
+        format!("pulse strip: {}", Self::sparkline(&values))
+    }
+
+    fn hotspot_line(
+        instances: &[&crate::state::InstanceInfo],
+        fleet: &crate::state::FleetSnapshot,
+    ) -> String {
+        let hotspot = instances
+            .iter()
+            .map(|instance| (*instance, Self::row_pulse_percent(instance, fleet)))
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.0.id.cmp(&right.0.id))
+            });
+        let Some((instance, pressure)) = hotspot else {
+            return "hotspot: none".to_owned();
+        };
+        let label = Self::row_pulse_label(pressure);
+        format!(
+            "hotspot: {}::{} pulse={label}:{pressure}%",
+            instance.project, instance.id
+        )
+    }
+
+    fn selected_focus_line(
+        &self,
+        instances: &[&crate::state::InstanceInfo],
+        fleet: &crate::state::FleetSnapshot,
+    ) -> String {
+        let selected = instances
+            .get(self.selected_row)
+            .copied()
+            .or_else(|| instances.first().copied());
+        let Some(instance) = selected else {
+            return "focus: none".to_owned();
+        };
+        let pressure = Self::row_pulse_percent(instance, fleet);
+        let label = Self::row_pulse_label(pressure);
+        let p95 = fleet
+            .search_metrics
+            .get(&instance.id)
+            .map_or(0, |metrics| metrics.p95_latency_us);
+        format!(
+            "focus: {}::{} pulse={label}:{pressure}% pending={} p95={}us",
+            instance.project, instance.id, instance.pending_jobs, p95
+        )
+    }
+
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let project = self.selected_project().unwrap_or("<none>");
+        let fleet = self.state.fleet();
+        let instances = self.project_instances();
+        let mut lines = vec![
+            Line::from("Project Detail"),
+            Line::from(format!("project={project}")),
+        ];
+        if instances.is_empty() {
+            lines.push(Line::from(
+                "No visible instances for this project in current filters.",
+            ));
+        } else {
+            let unhealthy = instances
+                .iter()
+                .filter(|instance| !instance.healthy)
+                .count();
+            let docs: u64 = instances.iter().map(|instance| instance.doc_count).sum();
+            let pending: u64 = instances.iter().map(|instance| instance.pending_jobs).sum();
+            lines.push(Line::from(format!(
+                "inst={} unhealthy={} docs={} pending={}",
+                instances.len(),
+                unhealthy,
+                docs,
+                pending
+            )));
+            lines.push(Line::from(Self::summary_pulse_strip_line(
+                &instances, fleet,
+            )));
+            lines.push(Line::from(Self::hotspot_line(&instances, fleet)));
+            lines.push(Line::from(self.selected_focus_line(&instances, fleet)));
+        }
+        lines.push(Line::from(
+            "keys: Esc fleet | s stream | t timeline | a analytics",
+        ));
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Project Detail "),
+            )
+            .render(area, frame);
     }
 
     fn phase_latency_lines(
@@ -386,6 +593,9 @@ impl ProjectDetailScreen {
                 self.state.control_plane_health().badge(),
                 self.state.control_plane_health()
             )),
+            Line::from(Self::summary_pulse_strip_line(&instances, fleet)),
+            Line::from(Self::hotspot_line(&instances, fleet)),
+            Line::from(self.selected_focus_line(&instances, fleet)),
         ];
         lines.extend(Self::phase_latency_lines(&instances, fleet));
         lines.extend(Self::anomaly_lines(&instances, fleet));
@@ -419,6 +629,7 @@ impl ProjectDetailScreen {
                     || "-".to_owned(),
                     |lifecycle| format!("{:?}", lifecycle.state),
                 );
+                let pulse = Self::row_pulse(instance, fleet);
                 let style = if index == self.selected_row {
                     self.palette.style_highlight().bold()
                 } else if !instance.healthy {
@@ -436,6 +647,7 @@ impl ProjectDetailScreen {
                     cpu_percent,
                     attribution,
                     lifecycle,
+                    pulse,
                 ])
                 .style(style)
             })
@@ -464,6 +676,10 @@ impl Screen for ProjectDetailScreen {
 
     fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
         let area = frame.bounds();
+        if area.width < 108 || area.height < 14 {
+            self.render_compact(frame, area);
+            return;
+        }
         let p = &self.palette;
         let border_style = p.style_border();
         let summary_lines = self.summary_lines();
@@ -529,6 +745,7 @@ impl Screen for ProjectDetailScreen {
                 Constraint::Fixed(8),
                 Constraint::Fixed(8),
                 Constraint::Fixed(12),
+                Constraint::Fixed(10),
             ],
         )
         .header(
@@ -541,6 +758,7 @@ impl Screen for ProjectDetailScreen {
                 "CPU",
                 "Attr",
                 "Lifecycle",
+                "Pulse",
             ])
             .style(Style::new().fg(p.accent).bold()),
         )
@@ -763,6 +981,25 @@ mod tests {
     }
 
     #[test]
+    fn summary_includes_pulse_strip_hotspot_and_focus() {
+        let mut screen = ProjectDetailScreen::new();
+        let mut view = ViewState::default();
+        view.set_project_filter("cass");
+        screen.update_state(&sample_state(), &view);
+
+        let summary = screen
+            .summary_lines()
+            .iter()
+            .map(Line::to_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(summary.contains("pulse strip:"));
+        assert!(summary.contains("hotspot:"));
+        assert!(summary.contains("focus:"));
+    }
+
+    #[test]
     fn summary_anomaly_cards_surface_high_risk_instances() {
         let mut screen = ProjectDetailScreen::new();
         let mut view = ViewState::default();
@@ -779,6 +1016,20 @@ mod tests {
         assert!(summary.contains("WARN cass-2"));
         assert!(summary.contains("unhealthy"));
         assert!(summary.contains("p95=2500us"));
+    }
+
+    #[test]
+    fn row_pulse_marks_unhealthy_instance_as_elevated() {
+        let mut screen = ProjectDetailScreen::new();
+        let mut view = ViewState::default();
+        view.set_project_filter("cass");
+        screen.update_state(&sample_state(), &view);
+
+        let instances = screen.project_instances();
+        let pulse = ProjectDetailScreen::row_pulse(instances[1], screen.state.fleet());
+        assert!(
+            pulse.starts_with("WATCH:") || pulse.starts_with("HOT:") || pulse.starts_with("CRIT:")
+        );
     }
 
     #[test]

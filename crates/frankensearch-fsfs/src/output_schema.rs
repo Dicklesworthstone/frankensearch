@@ -769,13 +769,14 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
 
     match err {
         SearchError::EmbedderUnavailable { model, .. } => Some(format!(
-            "Run: fsfs download-models --model {model}\n\
-             Or set FRANKENSEARCH_MODEL_DIR to a directory containing pre-downloaded models.\n\
-             For offline use: set FRANKENSEARCH_OFFLINE=1 to use hash-only fallback."
+            "Default semantic models are bundled and should auto-install on first use.\n\
+             If this failed, set FRANKENSEARCH_MODEL_DIR to a writable directory.\n\
+             Optional: fsfs download-models --model {model} (for alternate model sets)."
         )),
         SearchError::ModelNotFound { name } => Some(format!(
-            "Run: fsfs download-models --model {name}\n\
-             Or manually download the model and set FRANKENSEARCH_MODEL_DIR.\n\
+            "Default semantic models are bundled but not available in the active cache path.\n\
+             Ensure FRANKENSEARCH_MODEL_DIR is writable and run: fsfs status\n\
+             Optional override: fsfs download-models --model {name}\n\
              Check cache: fsfs doctor --check-models"
         )),
         SearchError::ModelLoadFailed { path, .. } => Some(format!(
@@ -809,7 +810,7 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
         )),
         SearchError::Io(_) => Some(
             "Check file permissions and available disk space.\n\
-             Models require ~200MB, search indices vary by corpus size."
+             Bundled default semantic models require ~600MB in the model cache; search indices vary by corpus size."
                 .to_owned(),
         ),
         SearchError::SearchTimeout {
@@ -853,8 +854,8 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
                 .to_owned(),
         ),
         SearchError::ModelNotFound { .. } => Some(
-            "Search models are downloaded on first use (~200MB total). \
-             In offline environments, pre-populate the cache with fsfs download-models."
+            "Default semantic models are bundled in fsfs and materialized into the local cache on first use. \
+             If models are still missing, check model-dir permissions and cache path selection."
                 .to_owned(),
         ),
         SearchError::ModelLoadFailed { .. } => Some(

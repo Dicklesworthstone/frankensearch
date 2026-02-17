@@ -12,6 +12,7 @@ hash = []
 model2vec = ["dep:safetensors", "dep:tokenizers"]
 fastembed = ["dep:fastembed"]
 download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
+bundled-default-models = ["model2vec", "fastembed"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -32,6 +33,9 @@ asupersync = { workspace = true }
 tempfile = "3"
 safetensors = { workspace = true }
 tokenizers = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

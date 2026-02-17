@@ -5,6 +5,7 @@
 
 use std::any::Any;
 
+use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
 use ftui_render::frame::Frame;
 use ftui_style::Style;
@@ -401,6 +402,150 @@ impl FleetOverviewScreen {
             .collect()
     }
 
+    fn row_pulse_percent(
+        instance: &crate::state::InstanceInfo,
+        search: Option<&crate::state::SearchMetrics>,
+        resource: Option<&crate::state::ResourceMetrics>,
+    ) -> u8 {
+        let pending_pressure = Self::ratio_percent_u64(instance.pending_jobs.min(2_000), 2_000);
+        let p95_pressure = search.map_or(0, |metrics| {
+            Self::ratio_percent_u64(metrics.p95_latency_us.min(8_000), 8_000)
+        });
+        let cpu_pressure = resource.map_or(0, |metrics| Self::clamp_percent(metrics.cpu_percent));
+
+        let weighted = (u16::from(pending_pressure).saturating_mul(4))
+            .saturating_add(u16::from(p95_pressure).saturating_mul(3))
+            .saturating_add(u16::from(cpu_pressure).saturating_mul(2))
+            .saturating_div(9)
+            .min(100);
+        let mut pressure = u8::try_from(weighted).unwrap_or(100);
+        if !instance.healthy {
+            pressure = pressure.saturating_add(20).min(100);
+        }
+        pressure
+    }
+
+    const fn row_pulse_label(percent: u8) -> &'static str {
+        if percent >= 85 {
+            "CRIT"
+        } else if percent >= 60 {
+            "HOT"
+        } else if percent >= 35 {
+            "WATCH"
+        } else {
+            "CALM"
+        }
+    }
+
+    fn row_pulse(
+        instance: &crate::state::InstanceInfo,
+        search: Option<&crate::state::SearchMetrics>,
+        resource: Option<&crate::state::ResourceMetrics>,
+    ) -> String {
+        let pressure = Self::row_pulse_percent(instance, search, resource);
+        let label = Self::row_pulse_label(pressure);
+        format!("{label}:{pressure:>3}%")
+    }
+
+    fn fleet_pulse_strip_line(&self) -> String {
+        let fleet = self.state.fleet();
+        let visible = self.visible_instances();
+        if visible.is_empty() {
+            return "fleet pulse strip: (no rows)".to_owned();
+        }
+        let values: Vec<u8> = visible
+            .iter()
+            .take(24)
+            .map(|instance| {
+                Self::row_pulse_percent(
+                    instance,
+                    fleet.search_metrics.get(&instance.id),
+                    fleet.resources.get(&instance.id),
+                )
+            })
+            .collect();
+        format!("fleet pulse strip: {}", Self::sparkline(&values))
+    }
+
+    fn hotspot_line(&self) -> String {
+        let fleet = self.state.fleet();
+        let hotspot = self
+            .visible_instances()
+            .into_iter()
+            .map(|instance| {
+                let pressure = Self::row_pulse_percent(
+                    instance,
+                    fleet.search_metrics.get(&instance.id),
+                    fleet.resources.get(&instance.id),
+                );
+                (instance, pressure)
+            })
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.0.id.cmp(&right.0.id))
+            });
+        let Some((instance, pressure)) = hotspot else {
+            return "hotspot: none".to_owned();
+        };
+        let label = Self::row_pulse_label(pressure);
+        format!(
+            "hotspot: {}::{} pulse={label}:{pressure}%",
+            instance.project, instance.id
+        )
+    }
+
+    fn selected_context_line(&self) -> String {
+        let Some(instance) = self.selected_instance() else {
+            return "focus: none".to_owned();
+        };
+        let fleet = self.state.fleet();
+        let search = fleet.search_metrics.get(&instance.id);
+        let resource = fleet.resources.get(&instance.id);
+        let pressure = Self::row_pulse_percent(instance, search, resource);
+        let label = Self::row_pulse_label(pressure);
+        let p95 = search.map_or(0, |metrics| metrics.p95_latency_us);
+        format!(
+            "focus: {}::{} pulse={label}:{pressure}% pending={} p95={}us",
+            instance.project, instance.id, instance.pending_jobs, p95
+        )
+    }
+
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let fleet = self.state.fleet();
+        let visible = self.visible_instances();
+        let visible_count = visible.len();
+        let healthy = visible.iter().filter(|instance| instance.healthy).count();
+        let docs: u64 = visible.iter().map(|instance| instance.doc_count).sum();
+        let pending: u64 = visible.iter().map(|instance| instance.pending_jobs).sum();
+        let mut lines = vec![
+            Line::from("Fleet Overview"),
+            Line::from(format!(
+                "vis={visible_count}/{} healthy={healthy} docs={docs} pending={pending}",
+                fleet.instance_count()
+            )),
+            Line::from(self.fleet_pulse_strip_line()),
+            Line::from(self.hotspot_line()),
+            Line::from(self.selected_context_line()),
+            Line::from("keys: Enter project | s stream | t timeline | a analytics"),
+        ];
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Fleet Overview "),
+            )
+            .render(area, frame);
+    }
+
     fn kpi_tile_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let visible = self.visible_instances();
@@ -711,6 +856,9 @@ impl FleetOverviewScreen {
     fn dashboard_signal_lines(&self) -> Vec<Line> {
         let mut lines = Vec::new();
         lines.extend(self.selected_monitor_lines());
+        lines.push(Line::from(self.fleet_pulse_strip_line()));
+        lines.push(Line::from(self.hotspot_line()));
+        lines.push(Line::from(self.selected_context_line()));
         lines.push(Line::from(String::new()));
         lines.push(Line::from("Project Summary Cards"));
         lines.extend(self.project_summary_lines());
@@ -736,14 +884,15 @@ impl FleetOverviewScreen {
                 } else {
                     "[!!] degraded"
                 };
-                let resources = fleet
-                    .resources
-                    .get(&inst.id)
-                    .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r.cpu_percent));
+                let resource = fleet.resources.get(&inst.id);
+                let search = fleet.search_metrics.get(&inst.id);
+                let resources =
+                    resource.map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r.cpu_percent));
                 let attribution = fleet.attribution_for(&inst.id).map_or_else(
                     || "n/a".to_owned(),
                     |value| format!("{}%", value.confidence_score),
                 );
+                let pulse = Self::row_pulse(inst, search, resource);
 
                 let style = if i == self.selected_row {
                     self.palette.style_highlight().bold()
@@ -762,6 +911,7 @@ impl FleetOverviewScreen {
                         format!("{}", inst.pending_jobs),
                         resources,
                         attribution,
+                        pulse,
                     ]
                 } else {
                     vec![
@@ -771,6 +921,7 @@ impl FleetOverviewScreen {
                         format!("{}", inst.doc_count),
                         format!("{}", inst.pending_jobs),
                         attribution,
+                        pulse,
                     ]
                 };
 
@@ -813,11 +964,15 @@ impl Screen for FleetOverviewScreen {
     #[allow(clippy::too_many_lines)]
     fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
         let area = frame.bounds();
+        if area.width < 108 || area.height < 15 {
+            self.render_compact(frame, area);
+            return;
+        }
         let p = &self.palette;
         let border_style = p.style_border();
 
         let chunks = Flex::vertical()
-            .constraints([Constraint::Fixed(4), Constraint::Min(5)])
+            .constraints([Constraint::Fixed(5), Constraint::Min(5)])
             .split(area);
 
         // Header with summary stats.
@@ -839,6 +994,11 @@ impl Screen for FleetOverviewScreen {
                 Span::styled(summary, Style::new().fg(p.fg)),
             ]),
             Line::from("legend: [!!] degraded rows are high-priority | keys: Enter/s/t/a"),
+            Line::from(format!(
+                "{} | {}",
+                self.fleet_pulse_strip_line(),
+                self.hotspot_line()
+            )),
         ]))
         .block(
             Block::new()
@@ -896,12 +1056,12 @@ impl Screen for FleetOverviewScreen {
         let header_style = Style::new().fg(p.accent).bold();
         let header_row = if show_metrics {
             Row::new(vec![
-                "Health", "Project", "Instance", "Docs", "Pending", "CPU", "Attr",
+                "Health", "Project", "Instance", "Docs", "Pending", "CPU", "Attr", "Pulse",
             ])
             .style(header_style)
         } else {
             Row::new(vec![
-                "Health", "Project", "Instance", "Docs", "Pending", "Attr",
+                "Health", "Project", "Instance", "Docs", "Pending", "Attr", "Pulse",
             ])
             .style(header_style)
         };
@@ -932,6 +1092,7 @@ impl Screen for FleetOverviewScreen {
                         Constraint::Fixed(10),
                         Constraint::Fixed(8),
                         Constraint::Fixed(8),
+                        Constraint::Fixed(10),
                     ],
                 )
                 .header(header_row)
@@ -946,6 +1107,7 @@ impl Screen for FleetOverviewScreen {
                         Constraint::Fixed(10),
                         Constraint::Fixed(10),
                         Constraint::Fixed(8),
+                        Constraint::Fixed(10),
                     ],
                 )
                 .header(header_row)
@@ -1723,6 +1885,99 @@ mod tests {
         assert!(text.contains("R=50%"));
         assert!(text.contains("D=95%"));
         assert!(text.contains("X=70%"));
+    }
+
+    #[test]
+    fn pulse_strip_hotspot_and_focus_are_emitted() {
+        let mut screen = FleetOverviewScreen::new();
+        let mut state = AppState::new();
+        let mut fleet = FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "steady".to_owned(),
+                    project: "cass".to_owned(),
+                    pid: None,
+                    healthy: true,
+                    doc_count: 100,
+                    pending_jobs: 10,
+                },
+                crate::state::InstanceInfo {
+                    id: "spiky".to_owned(),
+                    project: "xf".to_owned(),
+                    pid: None,
+                    healthy: false,
+                    doc_count: 90,
+                    pending_jobs: 1_200,
+                },
+            ],
+            ..FleetSnapshot::default()
+        };
+        fleet.search_metrics.insert(
+            "steady".to_owned(),
+            SearchMetrics {
+                total_searches: 30,
+                avg_latency_us: 500,
+                p95_latency_us: 1_000,
+                refined_count: 10,
+            },
+        );
+        fleet.search_metrics.insert(
+            "spiky".to_owned(),
+            SearchMetrics {
+                total_searches: 30,
+                avg_latency_us: 1_000,
+                p95_latency_us: 7_000,
+                refined_count: 5,
+            },
+        );
+        fleet.resources.insert(
+            "spiky".to_owned(),
+            ResourceMetrics {
+                cpu_percent: 90.0,
+                memory_bytes: 500 * 1024 * 1024,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+            },
+        );
+        state.update_fleet(fleet);
+        screen.update_state(&state, &ViewState::default());
+        screen.selected_row = 1;
+
+        let strip = screen.fleet_pulse_strip_line();
+        let hotspot = screen.hotspot_line();
+        let focus = screen.selected_context_line();
+
+        assert!(strip.starts_with("fleet pulse strip: "));
+        assert!(hotspot.contains("hotspot: xf::spiky"));
+        assert!(focus.contains("focus: xf::spiky"));
+        assert!(focus.contains("pulse="));
+    }
+
+    #[test]
+    fn row_pulse_marks_high_pressure_rows() {
+        let instance = crate::state::InstanceInfo {
+            id: "hot".to_owned(),
+            project: "demo".to_owned(),
+            pid: None,
+            healthy: false,
+            doc_count: 10,
+            pending_jobs: 1_900,
+        };
+        let search = SearchMetrics {
+            total_searches: 1,
+            avg_latency_us: 100,
+            p95_latency_us: 7_500,
+            refined_count: 0,
+        };
+        let resource = ResourceMetrics {
+            cpu_percent: 95.0,
+            memory_bytes: 0,
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+        };
+
+        let pulse = FleetOverviewScreen::row_pulse(&instance, Some(&search), Some(&resource));
+        assert!(pulse.starts_with("HOT:") || pulse.starts_with("CRIT:"));
     }
 
     // ── percentile_rank_u64 tests ────────────────────────────────────

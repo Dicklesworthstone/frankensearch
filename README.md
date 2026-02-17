@@ -80,7 +80,7 @@ Result: responsive first answers plus better final ranking without blocking the 
 
 ## Core Features
 
-- Auto-download and model fallback chain (`fastembed`/`model2vec`/`hash`)
+- Bundled default semantic models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) with optional alternate-model downloads
 - Progressive search phases (`Initial`, `Refined`, `RefinementFailed`)
 - Agent-friendly streaming (`--stream`) with machine-readable output
 - Result explanation surfaces (`fsfs explain <result-id>`)
@@ -728,7 +728,7 @@ Use both: keep `rg` for exact matches and use `fsfs` for intent-level retrieval.
 ## FAQ
 
 ### Does it run fully local?
-Yes. Search/indexing runs on your machine. Network access is only needed when downloading models.
+Yes. Search/indexing runs on your machine. Network access is only needed for optional alternate-model downloads and update checks.
 
 ### Can I use only the library and skip `fsfs`?
 Yes. Add `frankensearch` as a dependency and wire your own app/runtime.

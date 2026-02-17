@@ -1,7 +1,7 @@
-use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use frankensearch_core::{
 };
 use frankensearch_embed::{
     ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
-    ModelLifecycle, ModelManifest,
+    ModelLifecycle, ModelManifest, ensure_default_semantic_models,
 };
 use frankensearch_index::VectorIndex;
 use frankensearch_lexical::{SnippetConfig, TantivyIndex};
@@ -24,6 +24,25 @@ use frankensearch_storage::{
     StorageConfig as PipelineStorageConfig,
 };
 use fsqlite_types::value::SqliteValue;
+use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_core::event::{Event, KeyCode, Modifiers};
+use ftui_layout::{Constraint, Flex};
+use ftui_render::buffer::Buffer;
+use ftui_render::cell::PackedRgba;
+use ftui_render::diff::BufferDiff;
+use ftui_render::frame::Frame;
+use ftui_render::grapheme_pool::GraphemePool;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text, WrapMode};
+use ftui_tty::{TtyBackend, TtySessionOptions};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    progress::ProgressBar,
+    sparkline::Sparkline,
+};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -283,6 +302,16 @@ const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
 const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
+const ROOT_PROBE_MAX_DEPTH: usize = 3;
+const ROOT_PROBE_MAX_ENTRIES_PER_DIR: usize = 2_048;
+const ROOT_PROBE_MAX_TOTAL_ENTRIES: usize = 50_000;
+const ROOT_PROBE_MAX_PROPOSALS: usize = 5;
+const INDEXING_TUI_MIN_RENDER_INTERVAL_MS: u64 = 120;
+const INDEXING_TUI_RATE_HISTORY_LIMIT: usize = 96;
+const INDEXING_TUI_SPARKLINE_WIDTH: usize = 28;
+const INDEXING_TUI_EMA_ALPHA: f64 = 0.24;
+const FSFS_TUI_POLL_INTERVAL_MS: u64 = 120;
+const FSFS_TUI_STATUS_REFRESH_MS: u64 = 900;
 
 #[derive(Debug, Clone)]
 struct IndexCandidate {
@@ -321,6 +350,336 @@ struct IndexSentinel {
     reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RootProbeStats {
+    candidate_files: usize,
+    code_files: usize,
+    doc_files: usize,
+    repo_markers: usize,
+    candidate_bytes: u64,
+    scanned_dirs: usize,
+    scanned_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexRootProposal {
+    path: PathBuf,
+    score: i64,
+    stats: RootProbeStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingProgressStage {
+    Discovering,
+    Indexing,
+    Finalizing,
+    Completed,
+}
+
+impl IndexingProgressStage {
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Discovering => "Discovering Files",
+            Self::Indexing => "Indexing Content",
+            Self::Finalizing => "Finalizing Artifacts",
+            Self::Completed => "Completed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexingProgressSnapshot {
+    stage: IndexingProgressStage,
+    target_root: PathBuf,
+    index_root: PathBuf,
+    discovered_files: usize,
+    candidate_files: usize,
+    processed_files: usize,
+    skipped_files: usize,
+    semantic_files: usize,
+    canonical_bytes: u64,
+    canonical_lines: u64,
+    index_size_bytes: u64,
+    discovery_elapsed_ms: u128,
+    lexical_elapsed_ms: u128,
+    embedding_elapsed_ms: u128,
+    vector_elapsed_ms: u128,
+    total_elapsed_ms: u128,
+    active_file: Option<String>,
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+impl IndexingProgressSnapshot {
+    #[must_use]
+    fn elapsed_seconds(&self) -> f64 {
+        if self.total_elapsed_ms == 0 {
+            0.0
+        } else {
+            self.total_elapsed_ms as f64 / 1_000.0
+        }
+    }
+
+    #[must_use]
+    fn files_per_second(&self) -> f64 {
+        let elapsed = self.elapsed_seconds();
+        if elapsed <= f64::EPSILON {
+            0.0
+        } else {
+            self.processed_files as f64 / elapsed
+        }
+    }
+
+    #[must_use]
+    fn lines_per_second(&self) -> f64 {
+        let elapsed = self.elapsed_seconds();
+        if elapsed <= f64::EPSILON {
+            0.0
+        } else {
+            self.canonical_lines as f64 / elapsed
+        }
+    }
+
+    #[must_use]
+    fn mb_per_second(&self) -> f64 {
+        let elapsed = self.elapsed_seconds();
+        if elapsed <= f64::EPSILON {
+            0.0
+        } else {
+            (self.canonical_bytes as f64 / (1024.0 * 1024.0)) / elapsed
+        }
+    }
+
+    #[must_use]
+    fn index_growth_bytes_per_second(&self) -> f64 {
+        let elapsed = self.elapsed_seconds();
+        if elapsed <= f64::EPSILON {
+            0.0
+        } else {
+            self.index_size_bytes as f64 / elapsed
+        }
+    }
+
+    #[must_use]
+    fn completion_ratio(&self) -> f64 {
+        if self.candidate_files == 0 {
+            0.0
+        } else {
+            (self.processed_files as f64 / self.candidate_files as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    #[must_use]
+    fn eta_seconds(&self) -> Option<u64> {
+        if self.candidate_files <= self.processed_files {
+            return Some(0);
+        }
+        let files_per_second = self.files_per_second();
+        if files_per_second <= f64::EPSILON {
+            return None;
+        }
+        let remaining = (self.candidate_files - self.processed_files) as f64;
+        Some((remaining / files_per_second).ceil() as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IndexingRenderState {
+    last_snapshot: Option<IndexingProgressSnapshot>,
+    completion_history: VecDeque<f64>,
+    files_rate_history: VecDeque<f64>,
+    growth_rate_history: VecDeque<f64>,
+    files_rate_ema: f64,
+    lines_rate_ema: f64,
+    mb_rate_ema: f64,
+    growth_rate_ema: f64,
+    eta_ema_seconds: Option<f64>,
+    instant_files_per_second: f64,
+    instant_lines_per_second: f64,
+    instant_mb_per_second: f64,
+    instant_growth_kb_per_second: f64,
+}
+
+impl Default for IndexingRenderState {
+    fn default() -> Self {
+        Self {
+            last_snapshot: None,
+            completion_history: VecDeque::with_capacity(INDEXING_TUI_RATE_HISTORY_LIMIT),
+            files_rate_history: VecDeque::with_capacity(INDEXING_TUI_RATE_HISTORY_LIMIT),
+            growth_rate_history: VecDeque::with_capacity(INDEXING_TUI_RATE_HISTORY_LIMIT),
+            files_rate_ema: 0.0,
+            lines_rate_ema: 0.0,
+            mb_rate_ema: 0.0,
+            growth_rate_ema: 0.0,
+            eta_ema_seconds: None,
+            instant_files_per_second: 0.0,
+            instant_lines_per_second: 0.0,
+            instant_mb_per_second: 0.0,
+            instant_growth_kb_per_second: 0.0,
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+impl IndexingRenderState {
+    fn observe(&mut self, snapshot: &IndexingProgressSnapshot) {
+        let files_per_second = snapshot.files_per_second();
+        let lines_per_second = snapshot.lines_per_second();
+        let mb_per_second = snapshot.mb_per_second();
+        let growth_kb_per_second = snapshot.index_growth_bytes_per_second() / 1024.0;
+
+        let mut instant_files_per_second = files_per_second;
+        let mut instant_lines_per_second = lines_per_second;
+        let mut instant_mb_per_second = mb_per_second;
+        let mut instant_growth_kb_per_second = growth_kb_per_second;
+
+        if let Some(previous) = self.last_snapshot.as_ref() {
+            let delta_ms = snapshot
+                .total_elapsed_ms
+                .saturating_sub(previous.total_elapsed_ms);
+            if delta_ms > 0 {
+                let delta_secs = delta_ms as f64 / 1_000.0;
+                if delta_secs > f64::EPSILON {
+                    let delta_files = snapshot
+                        .processed_files
+                        .saturating_sub(previous.processed_files)
+                        as f64;
+                    let delta_lines = snapshot
+                        .canonical_lines
+                        .saturating_sub(previous.canonical_lines)
+                        as f64;
+                    let delta_mebibytes = snapshot
+                        .canonical_bytes
+                        .saturating_sub(previous.canonical_bytes)
+                        as f64
+                        / (1024.0 * 1024.0);
+                    let delta_growth_kb = snapshot
+                        .index_size_bytes
+                        .saturating_sub(previous.index_size_bytes)
+                        as f64
+                        / 1024.0;
+                    instant_files_per_second = delta_files / delta_secs;
+                    instant_lines_per_second = delta_lines / delta_secs;
+                    instant_mb_per_second = delta_mebibytes / delta_secs;
+                    instant_growth_kb_per_second = delta_growth_kb / delta_secs;
+                }
+            }
+        }
+
+        self.instant_files_per_second = instant_files_per_second.max(0.0);
+        self.instant_lines_per_second = instant_lines_per_second.max(0.0);
+        self.instant_mb_per_second = instant_mb_per_second.max(0.0);
+        self.instant_growth_kb_per_second = instant_growth_kb_per_second.max(0.0);
+
+        self.files_rate_ema = ema(
+            self.files_rate_ema,
+            files_per_second,
+            INDEXING_TUI_EMA_ALPHA,
+        );
+        self.lines_rate_ema = ema(
+            self.lines_rate_ema,
+            lines_per_second,
+            INDEXING_TUI_EMA_ALPHA,
+        );
+        self.mb_rate_ema = ema(self.mb_rate_ema, mb_per_second, INDEXING_TUI_EMA_ALPHA);
+        self.growth_rate_ema = ema(
+            self.growth_rate_ema,
+            growth_kb_per_second,
+            INDEXING_TUI_EMA_ALPHA,
+        );
+
+        Self::push_history(&mut self.completion_history, snapshot.completion_ratio());
+        Self::push_history(&mut self.files_rate_history, files_per_second);
+        Self::push_history(&mut self.growth_rate_history, growth_kb_per_second);
+
+        self.eta_ema_seconds = if snapshot.candidate_files <= snapshot.processed_files {
+            Some(0.0)
+        } else if self.files_rate_ema > f64::EPSILON {
+            let remaining = (snapshot.candidate_files - snapshot.processed_files) as f64;
+            let smoothed_eta = remaining / self.files_rate_ema;
+            Some(self.eta_ema_seconds.map_or(smoothed_eta, |previous_eta| {
+                ema(previous_eta, smoothed_eta, INDEXING_TUI_EMA_ALPHA)
+            }))
+        } else {
+            None
+        };
+
+        self.last_snapshot = Some(snapshot.clone());
+    }
+
+    fn completion_sparkline(&self, width: usize) -> String {
+        render_sparkline(&self.completion_history, width)
+    }
+
+    fn files_rate_sparkline(&self, width: usize) -> String {
+        render_sparkline(&self.files_rate_history, width)
+    }
+
+    fn growth_rate_sparkline(&self, width: usize) -> String {
+        render_sparkline(&self.growth_rate_history, width)
+    }
+
+    fn smoothed_eta_seconds(&self) -> Option<u64> {
+        self.eta_ema_seconds
+            .map(|seconds| seconds.max(0.0).ceil() as u64)
+    }
+
+    fn push_history(history: &mut VecDeque<f64>, value: f64) {
+        if history.len() >= INDEXING_TUI_RATE_HISTORY_LIMIT {
+            let _ = history.pop_front();
+        }
+        history.push_back(value.max(0.0));
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_sparkline(values: &VecDeque<f64>, width: usize) -> String {
+    const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if width == 0 {
+        return String::new();
+    }
+    if values.is_empty() {
+        return "·".repeat(width);
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).max(f64::EPSILON);
+    let count = values.len();
+    let mut out = String::with_capacity(width);
+
+    for idx in 0..width {
+        let sample = idx.saturating_mul(count) / width;
+        let value = values[sample.min(count.saturating_sub(1))];
+        let normalized = ((value - min) / span).clamp(0.0, 1.0);
+        let bin = (normalized * (BINS.len().saturating_sub(1)) as f64).round() as usize;
+        out.push(BINS[bin.min(BINS.len().saturating_sub(1))]);
+    }
+    out
+}
+
+fn ema(previous: f64, sample: f64, alpha: f64) -> f64 {
+    if previous <= f64::EPSILON {
+        sample.max(0.0)
+    } else {
+        previous
+            .mul_add(1.0 - alpha, sample.max(0.0) * alpha)
+            .max(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2999,8 +3358,17 @@ impl FsfsRuntime {
             return self.run_search_stream_command(cx, query, limit).await;
         }
 
+        let mut search_runtime = self.clone();
+        if let Some(index_override) = self.ensure_search_index_ready(cx).await? {
+            let mut cli_input = search_runtime.cli_input.clone();
+            cli_input.index_dir = Some(index_override);
+            search_runtime = search_runtime.with_cli_input(cli_input);
+        }
+
         let started = Instant::now();
-        let payload = self.execute_search_payload(cx, query, limit).await?;
+        let payload = search_runtime
+            .execute_search_payload(cx, query, limit)
+            .await?;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             phase = "display",
@@ -3021,6 +3389,9 @@ impl FsfsRuntime {
         );
 
         if self.cli_input.format == OutputFormat::Table {
+            if let Some(mode_hint) = search_runtime.search_mode_hint()? {
+                println!("{}", paint(&mode_hint, "38;5;244", self.cli_input.no_color));
+            }
             let table = crate::adapters::format_emitter::render_search_table_for_cli(
                 &payload,
                 Some(elapsed_ms),
@@ -3046,6 +3417,82 @@ impl FsfsRuntime {
                 })?;
         }
         Ok(())
+    }
+
+    async fn ensure_search_index_ready(&self, cx: &Cx) -> SearchResult<Option<PathBuf>> {
+        if self.index_artifacts_exist()? {
+            return Ok(None);
+        }
+
+        let interactive_terminal =
+            std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        if !interactive_terminal || self.cli_input.format != OutputFormat::Table {
+            return Err(self.missing_index_error());
+        }
+
+        println!(
+            "{}",
+            paint(
+                "No index found for this location. Starting guided first-run indexing setup.",
+                "38;5;220",
+                self.cli_input.no_color,
+            )
+        );
+        let proposals = self.discover_index_root_proposals()?;
+        let Some(selected_root) = self.prompt_first_run_index_root(&proposals)? else {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: String::new(),
+                reason: "no index found and setup was cancelled; run `fsfs index <path>` first"
+                    .to_owned(),
+            });
+        };
+        let index_root = self.resolve_index_root(&selected_root)?;
+        self.run_first_run_indexing_tui(cx, selected_root).await?;
+        Ok(Some(index_root))
+    }
+
+    fn missing_index_error(&self) -> SearchError {
+        let index_path = self.resolve_status_index_root().map_or_else(
+            |_| self.config.storage.index_dir.clone(),
+            |path| path.display().to_string(),
+        );
+        SearchError::InvalidConfig {
+            field: "cli.index_dir".to_owned(),
+            value: index_path,
+            reason: "no index found; run `fsfs` for guided setup or `fsfs index <dir>` first"
+                .to_owned(),
+        }
+    }
+
+    fn search_mode_hint(&self) -> SearchResult<Option<String>> {
+        let models = self.collect_model_statuses()?;
+        let fast_cached = models
+            .iter()
+            .any(|model| model.tier == "fast" && model.cached);
+        let quality_cached = models
+            .iter()
+            .any(|model| model.tier == "quality" && model.cached);
+
+        if fast_cached && quality_cached && !self.config.search.fast_only {
+            return Ok(None);
+        }
+        if fast_cached {
+            if self.config.search.fast_only {
+                return Ok(Some(
+                    "Search mode: fast semantic tier only (quality disabled by `fast_only=true`)."
+                        .to_owned(),
+                ));
+            }
+            return Ok(Some(
+                "Search mode: fast semantic tier active; quality model missing, so refinement is skipped."
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(
+            "Search mode: built-in hash + lexical fallback. Default semantic models are bundled; if this persists, check model-dir permissions and run `fsfs status`."
+                .to_owned(),
+        ))
     }
 
     async fn run_search_stream_command(
@@ -3530,7 +3977,7 @@ impl FsfsRuntime {
             match self.resolve_fast_embedder() {
                 Ok(embedder) => fast_embedder = Some(embedder),
                 Err(error) if lexical_available => {
-                    warn!(
+                    info!(
                         error = %error,
                         "fsfs search falling back to lexical-only mode after fast embedder init failure"
                     );
@@ -3545,7 +3992,7 @@ impl FsfsRuntime {
                 Ok(Some(embedder)) => quality_embedder = Some(embedder),
                 Ok(None) => {}
                 Err(error) if lexical_available => {
-                    warn!(
+                    info!(
                         error = %error,
                         "fsfs search continuing without quality embedder after initialization failure"
                     );
@@ -3628,7 +4075,7 @@ impl FsfsRuntime {
                                 .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                                 .collect::<Vec<_>>(),
                             Err(error) if lexical_available => {
-                                warn!(
+                                info!(
                                     error = %error,
                                     "fsfs search falling back to lexical-only mode after vector search failure"
                                 );
@@ -3638,7 +4085,7 @@ impl FsfsRuntime {
                         }
                     }
                     Err(error) if lexical_available => {
-                        warn!(
+                        info!(
                             error = %error,
                             "fsfs search falling back to lexical-only mode after query embedding failure"
                         );
@@ -3724,7 +4171,7 @@ impl FsfsRuntime {
                         });
                     }
                     Err(error) => {
-                        warn!(
+                        info!(
                             error = %error,
                             "fsfs quality refinement failed; falling back to initial phase payload"
                         );
@@ -4529,6 +4976,13 @@ impl FsfsRuntime {
 
     fn collect_model_statuses(&self) -> SearchResult<Vec<FsfsModelStatus>> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        if let Err(error) = ensure_default_semantic_models(Some(&model_root)) {
+            warn!(
+                model_root = %model_root.display(),
+                error = %error,
+                "failed to materialize bundled semantic models while collecting status"
+            );
+        }
         Ok(vec![
             Self::collect_model_status("fast", &self.config.indexing.fast_model, &model_root)?,
             Self::collect_model_status(
@@ -4546,13 +5000,16 @@ impl FsfsRuntime {
     ) -> SearchResult<FsfsModelStatus> {
         let direct_path = model_root.join(model_name);
         if direct_path.exists() {
-            return Ok(FsfsModelStatus {
-                tier: tier.to_owned(),
-                name: model_name.to_owned(),
-                cache_path: direct_path.display().to_string(),
-                cached: true,
-                size_bytes: Self::path_bytes(&direct_path)?,
-            });
+            let size_bytes = Self::path_bytes(&direct_path)?;
+            if size_bytes > 0 {
+                return Ok(FsfsModelStatus {
+                    tier: tier.to_owned(),
+                    name: model_name.to_owned(),
+                    cache_path: direct_path.display().to_string(),
+                    cached: true,
+                    size_bytes,
+                });
+            }
         }
 
         let mut candidates = Vec::new();
@@ -4580,6 +5037,16 @@ impl FsfsRuntime {
         }
 
         let size_bytes = Self::total_bytes_for_paths(&candidates)?;
+        if size_bytes == 0 {
+            return Ok(FsfsModelStatus {
+                tier: tier.to_owned(),
+                name: model_name.to_owned(),
+                cache_path: direct_path.display().to_string(),
+                cached: false,
+                size_bytes: 0,
+            });
+        }
+
         Ok(FsfsModelStatus {
             tier: tier.to_owned(),
             name: model_name.to_owned(),
@@ -4591,7 +5058,21 @@ impl FsfsRuntime {
 
     #[allow(clippy::too_many_lines)]
     async fn run_one_shot_index_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
-        const BATCH_SIZE: usize = 512;
+        self.run_one_shot_index_scaffold_with_progress(cx, command, |_| Ok(()))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_one_shot_index_scaffold_with_progress<F>(
+        &self,
+        cx: &Cx,
+        command: CliCommand,
+        mut on_progress: F,
+    ) -> SearchResult<()>
+    where
+        F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
+    {
+        const BATCH_SIZE: usize = 256;
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
@@ -4627,13 +5108,33 @@ impl FsfsRuntime {
             stats.skipped_files
         );
 
+        on_progress(&IndexingProgressSnapshot {
+            stage: IndexingProgressStage::Discovering,
+            target_root: target_root.clone(),
+            index_root: index_root.clone(),
+            discovered_files: stats.discovered_files,
+            candidate_files: candidates.len(),
+            processed_files: 0,
+            skipped_files: stats.skipped_files,
+            semantic_files: 0,
+            canonical_bytes: 0,
+            canonical_lines: 0,
+            index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+            discovery_elapsed_ms,
+            lexical_elapsed_ms: 0,
+            embedding_elapsed_ms: 0,
+            vector_elapsed_ms: 0,
+            total_elapsed_ms: total_start.elapsed().as_millis(),
+            active_file: None,
+        })?;
+
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
 
         // 1. Resolve and probe embedder
         let mut embedder = self.resolve_fast_embedder()?;
         if let Err(error) = embedder.embed(cx, "probe").await {
-            warn!(
+            info!(
                 embedder = embedder.id(),
                 error = %error,
                 "fsfs semantic embedder probe failed; falling back to hash embeddings"
@@ -4659,6 +5160,9 @@ impl FsfsRuntime {
         let mut semantic_doc_count = 0_usize;
         let mut content_skipped_files = 0_usize;
         let mut processed_files = 0_usize;
+        let mut canonical_bytes_total = 0_u64;
+        let mut canonical_line_count = 0_u64;
+        let mut last_active_file = None;
 
         let canonicalize_start = Instant::now();
         // We'll track cumulative timings for the batched phases
@@ -4700,6 +5204,9 @@ impl FsfsRuntime {
                 }
 
                 let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
+                canonical_bytes_total = canonical_bytes_total.saturating_add(canonical_bytes);
+                canonical_line_count =
+                    canonical_line_count.saturating_add(count_non_empty_lines(&canonical));
                 let ingestion_class =
                     format!("{:?}", candidate.ingestion_class).to_ascii_lowercase();
                 let reason_code = match candidate.ingestion_class {
@@ -4737,6 +5244,7 @@ impl FsfsRuntime {
                     semantic_doc_count = semantic_doc_count.saturating_add(1);
                 }
                 processed_files = processed_files.saturating_add(1);
+                last_active_file = Some(candidate.file_path.display().to_string());
                 chunk_docs.push((candidate.ingestion_class, doc));
             }
 
@@ -4804,9 +5312,49 @@ impl FsfsRuntime {
                     }
                 }
             }
+
+            on_progress(&IndexingProgressSnapshot {
+                stage: IndexingProgressStage::Indexing,
+                target_root: target_root.clone(),
+                index_root: index_root.clone(),
+                discovered_files: stats.discovered_files,
+                candidate_files: candidates.len(),
+                processed_files,
+                skipped_files: stats.skipped_files.saturating_add(content_skipped_files),
+                semantic_files: semantic_doc_count,
+                canonical_bytes: canonical_bytes_total,
+                canonical_lines: canonical_line_count,
+                index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+                discovery_elapsed_ms,
+                lexical_elapsed_ms,
+                embedding_elapsed_ms,
+                vector_elapsed_ms,
+                total_elapsed_ms: total_start.elapsed().as_millis(),
+                active_file: last_active_file.clone(),
+            })?;
         }
 
         let canonicalize_elapsed_ms = canonicalize_start.elapsed().as_millis();
+
+        on_progress(&IndexingProgressSnapshot {
+            stage: IndexingProgressStage::Finalizing,
+            target_root: target_root.clone(),
+            index_root: index_root.clone(),
+            discovered_files: stats.discovered_files,
+            candidate_files: candidates.len(),
+            processed_files,
+            skipped_files: stats.skipped_files.saturating_add(content_skipped_files),
+            semantic_files: semantic_doc_count,
+            canonical_bytes: canonical_bytes_total,
+            canonical_lines: canonical_line_count,
+            index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+            discovery_elapsed_ms,
+            lexical_elapsed_ms,
+            embedding_elapsed_ms,
+            vector_elapsed_ms,
+            total_elapsed_ms: total_start.elapsed().as_millis(),
+            active_file: last_active_file.clone(),
+        })?;
 
         // 4. Commit and Finish
         let lexical_commit_start = Instant::now();
@@ -4823,9 +5371,7 @@ impl FsfsRuntime {
         let source_hash_hex = index_source_hash_hex(&manifests);
         let indexed_files = processed_files;
         let skipped_files = stats.discovered_files.saturating_sub(indexed_files);
-        let total_canonical_bytes = manifests.iter().fold(0_u64, |acc, entry| {
-            acc.saturating_add(entry.canonical_bytes)
-        });
+        let total_canonical_bytes = canonical_bytes_total;
 
         self.write_index_artifacts(&index_root, &manifests)?;
         let sentinel = IndexSentinel {
@@ -4850,6 +5396,26 @@ impl FsfsRuntime {
             embedding_cache_roots: vec![index_root.join("cache")],
         })?;
         let elapsed_ms = total_start.elapsed().as_millis();
+
+        on_progress(&IndexingProgressSnapshot {
+            stage: IndexingProgressStage::Completed,
+            target_root: target_root.clone(),
+            index_root: index_root.clone(),
+            discovered_files: stats.discovered_files,
+            candidate_files: candidates.len(),
+            processed_files: indexed_files,
+            skipped_files,
+            semantic_files: semantic_doc_count,
+            canonical_bytes: total_canonical_bytes,
+            canonical_lines: canonical_line_count,
+            index_size_bytes: storage_usage.total_bytes(),
+            discovery_elapsed_ms,
+            lexical_elapsed_ms,
+            embedding_elapsed_ms,
+            vector_elapsed_ms,
+            total_elapsed_ms: elapsed_ms,
+            active_file: None,
+        })?;
 
         info!(
             command = ?command,
@@ -5179,13 +5745,12 @@ impl FsfsRuntime {
         }
     }
 
-    /// TUI runtime lane scaffold.
+    /// TUI runtime lane.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError` when downstream TUI runtime logic fails.
-    #[allow(clippy::unused_async)]
-    pub async fn run_tui(&self, _cx: &Cx) -> SearchResult<()> {
+    /// Returns `SearchError` when onboarding/indexing flow cannot complete.
+    pub async fn run_tui(&self, cx: &Cx) -> SearchResult<()> {
         let shell_model = FsfsTuiShellModel::from_config(&self.config);
         shell_model
             .validate()
@@ -5205,6 +5770,727 @@ impl FsfsRuntime {
             palette_action_count = palette.len(),
             "fsfs tui shell model initialized"
         );
+
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            info!("fsfs tui requested without interactive terminal; falling back to status output");
+            return self.run_status_command();
+        }
+
+        if self.index_artifacts_exist()? {
+            self.render_existing_index_dashboard()?;
+            return Ok(());
+        }
+
+        let proposals = self.discover_index_root_proposals()?;
+        let Some(selected_root) = self.prompt_first_run_index_root(&proposals)? else {
+            println!("No indexing started. Run `fsfs index <path>` any time.");
+            return Ok(());
+        };
+        self.run_first_run_indexing_tui(cx, selected_root).await?;
+        Ok(())
+    }
+
+    fn index_artifacts_exist(&self) -> SearchResult<bool> {
+        let index_root = self.resolve_status_index_root()?;
+        if !index_root.exists() {
+            return Ok(false);
+        }
+        if Self::read_index_sentinel(&index_root)?.is_some() {
+            return Ok(true);
+        }
+        Ok(index_root.join(FSFS_VECTOR_INDEX_FILE).exists()
+            || index_root.join("lexical").exists()
+            || index_root.join(FSFS_VECTOR_MANIFEST_FILE).exists()
+            || index_root.join(FSFS_LEXICAL_MANIFEST_FILE).exists())
+    }
+
+    fn collect_root_probe_candidates(&self) -> SearchResult<Vec<PathBuf>> {
+        let cwd = std::env::current_dir().map_err(SearchError::Io)?;
+        let home = home_dir();
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+
+        let mut push_candidate = |path: PathBuf| {
+            if !path.exists() || !path.is_dir() {
+                return;
+            }
+            let canonical = fs::canonicalize(&path).unwrap_or(path);
+            if seen.insert(canonical.clone()) {
+                candidates.push(canonical);
+            }
+        };
+
+        push_candidate(cwd.clone());
+        if let Some(parent) = cwd.parent() {
+            push_candidate(parent.to_path_buf());
+        }
+
+        if let Some(home_path) = home.as_ref() {
+            push_candidate(home_path.clone());
+            for suffix in [
+                "projects",
+                "code",
+                "workspace",
+                "workspaces",
+                "work",
+                "src",
+                "Documents",
+            ] {
+                push_candidate(home_path.join(suffix));
+            }
+        }
+
+        for absolute in ["/data/projects", "/workspaces", "/opt/projects"] {
+            push_candidate(PathBuf::from(absolute));
+        }
+
+        for root in &self.config.discovery.roots {
+            let candidate = PathBuf::from(root);
+            if candidate.is_absolute() {
+                push_candidate(candidate);
+            } else {
+                push_candidate(cwd.join(candidate));
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    fn discover_index_root_proposals(&self) -> SearchResult<Vec<IndexRootProposal>> {
+        let home = home_dir();
+        let mut proposals = self
+            .collect_root_probe_candidates()?
+            .into_iter()
+            .filter_map(|path| match Self::probe_index_root(&path) {
+                Ok(stats)
+                    if stats.candidate_files > 0
+                        || stats.repo_markers > 0
+                        || stats.candidate_bytes > 0 =>
+                {
+                    let score = score_index_root(&path, &stats, home.as_deref());
+                    Some(IndexRootProposal { path, score, stats })
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to probe potential index root"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if proposals.is_empty() {
+            let fallback_root = std::env::current_dir().map_err(SearchError::Io)?;
+            let fallback_stats = Self::probe_index_root(&fallback_root).unwrap_or_default();
+            proposals.push(IndexRootProposal {
+                score: score_index_root(&fallback_root, &fallback_stats, home.as_deref()),
+                path: fallback_root,
+                stats: fallback_stats,
+            });
+        }
+
+        proposals.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.stats.candidate_files.cmp(&left.stats.candidate_files))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        proposals.truncate(ROOT_PROBE_MAX_PROPOSALS);
+        Ok(proposals)
+    }
+
+    fn probe_index_root(root: &Path) -> SearchResult<RootProbeStats> {
+        let mut stats = RootProbeStats::default();
+        let mut queue = VecDeque::from([(root.to_path_buf(), 0_usize)]);
+
+        while let Some((dir_path, depth)) = queue.pop_front() {
+            stats.scanned_dirs = stats.scanned_dirs.saturating_add(1);
+            let entries = match fs::read_dir(&dir_path) {
+                Ok(entries) => entries,
+                Err(error) if is_ignorable_index_walk_error(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
+
+            let mut pending_children = Vec::new();
+            for (index, entry_result) in entries.enumerate() {
+                if index >= ROOT_PROBE_MAX_ENTRIES_PER_DIR
+                    || stats.scanned_entries >= ROOT_PROBE_MAX_TOTAL_ENTRIES
+                {
+                    break;
+                }
+                let Ok(entry) = entry_result else {
+                    continue;
+                };
+                stats.scanned_entries = stats.scanned_entries.saturating_add(1);
+
+                let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+
+                if file_type.is_dir() {
+                    if file_name == ".git" {
+                        stats.repo_markers = stats.repo_markers.saturating_add(1);
+                    }
+                    if depth < ROOT_PROBE_MAX_DEPTH && !is_probe_excluded_dir_name(&file_name) {
+                        pending_children.push(entry.path());
+                    }
+                    continue;
+                }
+
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                if is_repo_marker_filename(&file_name) {
+                    stats.repo_markers = stats.repo_markers.saturating_add(1);
+                }
+
+                if let Some(file_class) = classify_probe_file(&entry.path(), &file_name) {
+                    stats.candidate_files = stats.candidate_files.saturating_add(1);
+                    match file_class {
+                        RootProbeFileClass::Code => {
+                            stats.code_files = stats.code_files.saturating_add(1);
+                        }
+                        RootProbeFileClass::Document => {
+                            stats.doc_files = stats.doc_files.saturating_add(1);
+                        }
+                    }
+                    if let Ok(metadata) = entry.metadata() {
+                        stats.candidate_bytes =
+                            stats.candidate_bytes.saturating_add(metadata.len());
+                    }
+                }
+            }
+
+            for child in pending_children {
+                queue.push_back((child, depth + 1));
+            }
+            if stats.scanned_entries >= ROOT_PROBE_MAX_TOTAL_ENTRIES {
+                break;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prompt_first_run_index_root(
+        &self,
+        proposals: &[IndexRootProposal],
+    ) -> SearchResult<Option<PathBuf>> {
+        if let Ok(mut session) = FtuiSession::enter() {
+            match self.prompt_first_run_index_root_ftui(proposals, &mut session) {
+                Ok(selected) => return Ok(selected),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "interactive ftui root selector failed; falling back to ansi prompt"
+                    );
+                }
+            }
+        }
+
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let width = tui_terminal_width().clamp(88, 160);
+        let rule = "═".repeat(width);
+        let mut stdout = std::io::stdout();
+
+        write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{} {}",
+            paint("fsfs", "1;38;5;45", no_color),
+            paint("First-Run Index Setup", "1;37", no_color)
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{}",
+            paint(
+                "No index detected. Pick the root that best represents your code and documents.",
+                "38;5;250",
+                no_color
+            )
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{} depth<= {}  per-dir<= {}  scanned entries<= {}",
+            paint("probe budget:", "38;5;244", no_color),
+            ROOT_PROBE_MAX_DEPTH,
+            ROOT_PROBE_MAX_ENTRIES_PER_DIR,
+            ROOT_PROBE_MAX_TOTAL_ENTRIES
+        )
+        .map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+        writeln!(stdout).map_err(tui_io_error)?;
+
+        for (idx, proposal) in proposals.iter().enumerate() {
+            let is_recommended = idx == 0;
+            let candidate_files = proposal.stats.candidate_files.max(1);
+            let code_pct = ratio_percent_usize(proposal.stats.code_files, candidate_files);
+            let doc_pct = ratio_percent_usize(proposal.stats.doc_files, candidate_files);
+            let fit = describe_root_probe_fit(&proposal.path, &proposal.stats);
+            let rank_color = if is_recommended {
+                "1;38;5;46"
+            } else {
+                "1;38;5;39"
+            };
+            let badge = if is_recommended {
+                paint("RECOMMENDED", "30;102", no_color)
+            } else {
+                paint("candidate", "38;5;244", no_color)
+            };
+            writeln!(
+                stdout,
+                "{} {}  {}",
+                paint(&format!("[{}]", idx + 1), rank_color, no_color),
+                truncate_middle(
+                    &proposal.path.display().to_string(),
+                    width.saturating_sub(26)
+                ),
+                badge
+            )
+            .map_err(tui_io_error)?;
+            writeln!(
+                stdout,
+                "    fit={} score={} repos={} files={} data={}",
+                fit,
+                proposal.score,
+                proposal.stats.repo_markers,
+                proposal.stats.candidate_files,
+                humanize_bytes(proposal.stats.candidate_bytes)
+            )
+            .map_err(tui_io_error)?;
+            writeln!(
+                stdout,
+                "    composition: code={:.1}% docs={:.1}%   scanned={} dirs / {} entries",
+                code_pct, doc_pct, proposal.stats.scanned_dirs, proposal.stats.scanned_entries
+            )
+            .map_err(tui_io_error)?;
+            writeln!(stdout).map_err(tui_io_error)?;
+        }
+
+        writeln!(
+            stdout,
+            "{}",
+            paint(
+                &format!(
+                    "Choose [1-{}], press Enter for recommended, or type q to cancel.",
+                    proposals.len()
+                ),
+                "1;38;5;220",
+                no_color
+            )
+        )
+        .map_err(tui_io_error)?;
+        write!(stdout, "{} ", paint("selection>", "1;38;5;45", no_color)).map_err(tui_io_error)?;
+        stdout.flush().map_err(tui_io_error)?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(SearchError::Io)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(proposals.first().map(|proposal| proposal.path.clone()));
+        }
+        if matches!(trimmed, "q" | "Q" | "n" | "N" | "no" | "No" | "NO") {
+            return Ok(None);
+        }
+        let selected = trimmed
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| proposals.get(index.saturating_sub(1)))
+            .map(|proposal| proposal.path.clone());
+        if selected.is_none() {
+            writeln!(
+                stdout,
+                "{}",
+                paint("Invalid selection. Using recommended root.", "33", no_color)
+            )
+            .map_err(tui_io_error)?;
+            stdout.flush().map_err(tui_io_error)?;
+        }
+        Ok(selected.or_else(|| proposals.first().map(|proposal| proposal.path.clone())))
+    }
+
+    fn prompt_first_run_index_root_ftui(
+        &self,
+        proposals: &[IndexRootProposal],
+        session: &mut FtuiSession,
+    ) -> SearchResult<Option<PathBuf>> {
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let mut selected = 0_usize;
+
+        loop {
+            session.render(|frame| {
+                render_root_selector_frame(frame, proposals, selected, no_color);
+            })?;
+
+            let Some(event) =
+                session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+            else {
+                continue;
+            };
+
+            if let Event::Key(key) = event {
+                match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        selected = selected.saturating_add(1).min(proposals.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('k') if key.modifiers == Modifiers::NONE => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Char('j') if key.modifiers == Modifiers::NONE => {
+                        selected = selected.saturating_add(1).min(proposals.len().saturating_sub(1));
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+                    KeyCode::Enter => {
+                        return Ok(proposals.get(selected).map(|proposal| proposal.path.clone()));
+                    }
+                    KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                        if let Some(digit) = ch.to_digit(10)
+                            && let Ok(raw_index) = usize::try_from(digit)
+                            && raw_index > 0
+                            && raw_index <= proposals.len()
+                        {
+                            selected = raw_index.saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_existing_index_dashboard(&self) -> SearchResult<()> {
+        if let Ok(mut session) = FtuiSession::enter() {
+            match self.render_existing_index_dashboard_ftui(&mut session) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "interactive ftui dashboard failed; falling back to ansi dashboard"
+                    );
+                }
+            }
+        }
+
+        let payload = self.collect_status_payload()?;
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let width = tui_terminal_width().clamp(88, 160);
+        let rule = "═".repeat(width);
+        let indexed_files = payload.index.indexed_files.unwrap_or(0);
+        let discovered_files = payload.index.discovered_files.unwrap_or(indexed_files);
+        let skipped_files = payload.index.skipped_files.unwrap_or(0);
+        let stale_files = payload.index.stale_files.unwrap_or(0);
+        let indexed_ratio = ratio_percent_usize(indexed_files, discovered_files.max(1));
+        let last_indexed = payload
+            .index
+            .last_indexed_iso_utc
+            .as_deref()
+            .unwrap_or("unknown");
+        let vector_pct = if payload.index.size_bytes == 0 {
+            0.0
+        } else {
+            ratio_percent(payload.index.vector_index_bytes, payload.index.size_bytes)
+        };
+        let lexical_pct = if payload.index.size_bytes == 0 {
+            0.0
+        } else {
+            ratio_percent(payload.index.lexical_index_bytes, payload.index.size_bytes)
+        };
+        let avg_bytes_per_file = if indexed_files == 0 {
+            0_u64
+        } else {
+            payload.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
+        };
+        let fast_cached = payload
+            .models
+            .iter()
+            .find(|model| model.tier == "fast")
+            .is_some_and(|model| model.cached);
+        let quality_cached = payload
+            .models
+            .iter()
+            .find(|model| model.tier == "quality")
+            .is_some_and(|model| model.cached);
+        let mode_summary = if fast_cached && quality_cached && !self.config.search.fast_only {
+            paint("full hybrid (fast + quality semantic)", "32", no_color)
+        } else if fast_cached {
+            paint(
+                "fast semantic + lexical (quality unavailable)",
+                "33",
+                no_color,
+            )
+        } else {
+            paint(
+                "hash + lexical fallback (offline-safe default)",
+                "38;5;214",
+                no_color,
+            )
+        };
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{} {}",
+            paint("fsfs", "1;38;5;45", no_color),
+            paint("Search Control Deck", "1;37", no_color)
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{} {}   {} {}",
+            paint("status:", "38;5;244", no_color),
+            paint("ready", "1;32", no_color),
+            paint("search mode:", "38;5;244", no_color),
+            mode_summary
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "index root: {}",
+            truncate_middle(&payload.index.path, width.saturating_sub(14))
+        )
+        .map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint("CORPUS", "1;38;5;81", no_color)).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  files indexed={}  discovered={}  skipped={}  coverage={indexed_ratio:.1}%",
+            format_count_usize(indexed_files),
+            format_count_usize(discovered_files),
+            format_count_usize(skipped_files),
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  index size={}  avg/indexed_file={}  stale={}",
+            humanize_bytes(payload.index.size_bytes),
+            humanize_bytes(avg_bytes_per_file),
+            format_count_usize(stale_files),
+        )
+        .map_err(tui_io_error)?;
+        writeln!(stdout, "  last indexed={last_indexed}").map_err(tui_io_error)?;
+        if let Some(hash) = payload.index.source_hash_hex.as_deref() {
+            writeln!(stdout, "  source hash={hash}").map_err(tui_io_error)?;
+        }
+        writeln!(stdout).map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint("LAYOUT", "1;38;5;111", no_color)).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  vector={} ({:.1}%)  lexical={} ({:.1}%)",
+            humanize_bytes(payload.index.vector_index_bytes),
+            vector_pct,
+            humanize_bytes(payload.index.lexical_index_bytes),
+            lexical_pct,
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  metadata={}  cache={}",
+            humanize_bytes(payload.index.metadata_bytes),
+            humanize_bytes(payload.index.embedding_cache_bytes),
+        )
+        .map_err(tui_io_error)?;
+        writeln!(stdout).map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint("MODELS", "1;38;5;214", no_color)).map_err(tui_io_error)?;
+        if !payload.models.is_empty() {
+            for model in &payload.models {
+                let state = if model.cached {
+                    paint("cached", "32", no_color)
+                } else {
+                    paint("missing", "31", no_color)
+                };
+                writeln!(
+                    stdout,
+                    "  {:<7} {:<30} {:<8} {}",
+                    format!("{}:", model.tier),
+                    model.name,
+                    state,
+                    humanize_bytes(model.size_bytes)
+                )
+                .map_err(tui_io_error)?;
+            }
+        }
+        writeln!(stdout).map_err(tui_io_error)?;
+        writeln!(stdout, "{}", paint("QUICK ACTIONS", "1;38;5;220", no_color))
+            .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  1) fsfs search \"your query\" --limit 10 --format table     # interactive results"
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  2) fsfs search \"your query\" --stream --format jsonl        # agent/pipeline mode"
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  3) fsfs download-models --list                              # inspect semantic models"
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  4) fsfs index <path> --watch                              # keep corpus fresh"
+        )
+        .map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "  5) fsfs status --format json                              # machine status payload"
+        )
+        .map_err(tui_io_error)?;
+        writeln!(stdout).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "{}",
+            paint("Press Enter to exit.", "38;5;244", no_color)
+        )
+        .map_err(tui_io_error)?;
+        stdout.flush().map_err(tui_io_error)?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(SearchError::Io)?;
+        Ok(())
+    }
+
+    fn render_existing_index_dashboard_ftui(&self, session: &mut FtuiSession) -> SearchResult<()> {
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let mut payload = self.collect_status_payload()?;
+        let mut last_refresh = Instant::now();
+
+        loop {
+            session.render(|frame| {
+                render_existing_index_dashboard_frame(
+                    frame,
+                    &payload,
+                    self.config.search.fast_only,
+                    no_color,
+                );
+            })?;
+
+            if let Some(event) = session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+                && let Event::Key(key) = event
+            {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        return Ok(());
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        payload = self.collect_status_payload()?;
+                        last_refresh = Instant::now();
+                    }
+                    _ => {}
+                }
+            }
+
+            if last_refresh.elapsed() >= Duration::from_millis(FSFS_TUI_STATUS_REFRESH_MS) {
+                payload = self.collect_status_payload()?;
+                last_refresh = Instant::now();
+            }
+        }
+    }
+
+    async fn run_first_run_indexing_tui(
+        &self,
+        cx: &Cx,
+        selected_root: PathBuf,
+    ) -> SearchResult<()> {
+        let mut index_input = self.cli_input.clone();
+        index_input.command = CliCommand::Index;
+        index_input.target_path = Some(selected_root);
+        index_input.watch = false;
+        index_input.overrides.allow_background_indexing = Some(false);
+
+        let runtime = Self::new(self.config.clone()).with_cli_input(index_input);
+        let no_color = runtime.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let mut ftui_session = FtuiSession::enter().ok();
+        let _ansi_guard = if ftui_session.is_none() {
+            Some(TerminalRenderGuard::enter()?)
+        } else {
+            None
+        };
+        let mut last_render = Instant::now();
+        let mut latest = None;
+        let mut render_state = IndexingRenderState::default();
+        runtime
+            .run_one_shot_index_scaffold_with_progress(cx, CliCommand::Index, |snapshot| {
+                render_state.observe(snapshot);
+                let now = Instant::now();
+                let force_render = latest.is_none()
+                    || matches!(
+                        snapshot.stage,
+                        IndexingProgressStage::Discovering
+                            | IndexingProgressStage::Finalizing
+                            | IndexingProgressStage::Completed
+                    )
+                    || now.duration_since(last_render)
+                        >= Duration::from_millis(INDEXING_TUI_MIN_RENDER_INTERVAL_MS);
+                if force_render {
+                    if let Some(session) = ftui_session.as_mut() {
+                        render_indexing_progress_screen_ftui(
+                            session,
+                            snapshot,
+                            &render_state,
+                            no_color,
+                        )?;
+                    } else {
+                        render_indexing_progress_screen(snapshot, &render_state, no_color)?;
+                    }
+                    last_render = now;
+                }
+                latest = Some(snapshot.clone());
+                Ok(())
+            })
+            .await?;
+
+        if let Some(snapshot) = latest.as_ref() {
+            if let Some(session) = ftui_session.as_mut() {
+                render_indexing_progress_screen_ftui(session, snapshot, &render_state, no_color)?;
+            } else {
+                render_indexing_progress_screen(snapshot, &render_state, no_color)?;
+            }
+        }
+
+        if let Some(session) = ftui_session.as_mut() {
+            return wait_for_ftui_dismiss(
+                session,
+                "Initial indexing finished. Press Enter, Esc, or q to return.",
+                no_color,
+            );
+        }
+
+        let mut stdout = std::io::stdout();
+        writeln!(stdout).map_err(tui_io_error)?;
+        writeln!(
+            stdout,
+            "Initial indexing finished. Press Enter to return to the shell."
+        )
+        .map_err(tui_io_error)?;
+        stdout.flush().map_err(tui_io_error)?;
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(SearchError::Io)?;
         Ok(())
     }
 
@@ -5272,6 +6558,9 @@ impl FsfsRuntime {
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
         self.run_tui(cx).await?;
+        if self.cli_input.command == CliCommand::Tui {
+            return Ok(());
+        }
         let reason = self.await_shutdown(cx, shutdown, None, None).await;
         self.finalize_shutdown(cx, reason).await
     }
@@ -5668,51 +6957,1566 @@ fn normalize_model_token(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootProbeFileClass {
+    Code,
+    Document,
+}
+
+struct TerminalRenderGuard;
+
+impl TerminalRenderGuard {
+    fn enter() -> SearchResult<Self> {
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\u{1b}[?25l").map_err(tui_io_error)?;
+        stdout.flush().map_err(tui_io_error)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalRenderGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = write!(stdout, "\u{1b}[?25h\u{1b}[0m");
+        let _ = stdout.flush();
+    }
+}
+
+struct FtuiSession {
+    backend: TtyBackend,
+    grapheme_pool: GraphemePool,
+    previous_buffer: Option<Buffer>,
+}
+
+impl FtuiSession {
+    fn enter() -> SearchResult<Self> {
+        let options = TtySessionOptions {
+            alternate_screen: true,
+            features: BackendFeatures {
+                mouse_capture: true,
+                ..BackendFeatures::default()
+            },
+        };
+        let backend = TtyBackend::open(80, 24, options)
+            .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        Ok(Self {
+            backend,
+            grapheme_pool: GraphemePool::new(),
+            previous_buffer: None,
+        })
+    }
+
+    fn render(&mut self, renderer: impl FnOnce(&mut Frame)) -> SearchResult<()> {
+        let (width, height) = self
+            .backend
+            .size()
+            .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        let mut frame = Frame::new(width, height, &mut self.grapheme_pool);
+        renderer(&mut frame);
+        let diff = self
+            .previous_buffer
+            .as_ref()
+            .map(|previous| BufferDiff::compute(previous, &frame.buffer));
+        self.backend
+            .presenter()
+            .present_ui(&frame.buffer, diff.as_ref(), false)
+            .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        self.previous_buffer = Some(frame.buffer);
+        Ok(())
+    }
+
+    fn poll_event(&mut self, timeout: Duration) -> SearchResult<Option<Event>> {
+        let has_event = self
+            .backend
+            .poll_event(timeout)
+            .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        if !has_event {
+            return Ok(None);
+        }
+        self.backend
+            .read_event()
+            .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))
+    }
+}
+
+fn tui_subsystem_error(subsystem: &'static str, message: String) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem,
+        source: Box::new(std::io::Error::other(message)),
+    }
+}
+
+fn tui_io_error(source: std::io::Error) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "fsfs.tui",
+        source: Box::new(source),
+    }
+}
+
+fn is_probe_excluded_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".jj"
+            | "node_modules"
+            | "target"
+            | "__pycache__"
+            | ".venv"
+            | ".cache"
+            | ".npm"
+            | ".cargo"
+            | ".idea"
+            | ".vscode"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".frankensearch"
+    )
+}
+
+fn is_repo_marker_filename(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "cargo.toml"
+            | "package.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "go.mod"
+            | "pyproject.toml"
+            | "requirements.txt"
+            | "pom.xml"
+            | "build.gradle"
+            | "readme.md"
+    )
+}
+
+fn classify_probe_file(path: &Path, file_name: &str) -> Option<RootProbeFileClass> {
+    if matches!(
+        file_name,
+        "readme"
+            | "readme.md"
+            | "readme.txt"
+            | "license"
+            | "license.md"
+            | "changelog.md"
+            | "notes.txt"
+    ) {
+        return Some(RootProbeFileClass::Document);
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)?;
+
+    if matches!(
+        extension.as_str(),
+        "rs" | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "cs"
+            | "swift"
+            | "rb"
+            | "php"
+            | "scala"
+            | "sql"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "json"
+            | "md"
+            | "txt"
+            | "rst"
+    ) {
+        if matches!(extension.as_str(), "md" | "txt" | "rst") {
+            Some(RootProbeFileClass::Document)
+        } else {
+            Some(RootProbeFileClass::Code)
+        }
+    } else {
+        None
+    }
+}
+
+fn score_index_root(root: &Path, stats: &RootProbeStats, home: Option<&Path>) -> i64 {
+    let lower_path = root.to_string_lossy().to_ascii_lowercase();
+    let mut score = 0_i64;
+
+    if lower_path.contains("/data/projects") {
+        score += 2_000;
+    }
+    if lower_path.ends_with("/projects")
+        || lower_path.ends_with("/code")
+        || lower_path.ends_with("/workspace")
+        || lower_path.ends_with("/workspaces")
+        || lower_path.ends_with("/src")
+    {
+        score += 1_000;
+    }
+    if lower_path.contains("/documents") {
+        score += 350;
+    }
+    if home.is_some_and(|home_path| root == home_path) {
+        score -= 400;
+    }
+
+    score = score
+        .saturating_add(i64::try_from(stats.repo_markers).unwrap_or(i64::MAX / 4) * 900)
+        .saturating_add(i64::try_from(stats.code_files).unwrap_or(i64::MAX / 4) * 5)
+        .saturating_add(i64::try_from(stats.doc_files).unwrap_or(i64::MAX / 4) * 3)
+        .saturating_add(i64::try_from(stats.candidate_files).unwrap_or(i64::MAX / 4));
+    let size_bonus = i64::try_from(stats.candidate_bytes / (8 * 1024 * 1024)).unwrap_or(0);
+    score.saturating_add(size_bonus.min(2_000))
+}
+
+#[allow(clippy::naive_bytecount)]
+fn count_non_empty_lines(content: &str) -> u64 {
+    if content.is_empty() {
+        return 0;
+    }
+    let newline_count = content
+        .as_bytes()
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    u64::try_from(newline_count.saturating_add(1)).unwrap_or(u64::MAX)
+}
+
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    if max_chars < 5 {
+        return text.chars().take(max_chars).collect();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_owned();
+    }
+    let left = (max_chars - 3) / 2;
+    let right = max_chars - 3 - left;
+    let prefix = chars.iter().take(left).collect::<String>();
+    let suffix = chars
+        .iter()
+        .skip(chars.len().saturating_sub(right))
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn format_eta(seconds: Option<u64>) -> String {
+    seconds.map_or_else(|| "--".to_owned(), humanize_duration_seconds)
+}
+
+fn humanize_duration_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let mins = seconds / 60;
+    let secs = seconds % 60;
+    if mins < 60 {
+        return format!("{mins}m {secs}s");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    format!("{hours}h {rem_mins}m")
+}
+
+fn tui_terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 60)
+        .unwrap_or(120)
+}
+
+fn describe_root_probe_fit(path: &Path, stats: &RootProbeStats) -> &'static str {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower.contains("/data/projects")
+        || lower.ends_with("/projects")
+        || lower.ends_with("/workspace")
+        || lower.ends_with("/workspaces")
+    {
+        "workspace-heavy"
+    } else if stats.repo_markers >= 20 {
+        "repo-dense"
+    } else if stats.code_files >= stats.doc_files.saturating_mul(2) {
+        "code-centric"
+    } else if stats.doc_files > stats.code_files {
+        "document-centric"
+    } else {
+        "mixed corpus"
+    }
+}
+
+#[must_use]
+fn indexing_spinner_frame(elapsed_ms: u128) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame_count = u128::try_from(FRAMES.len()).unwrap_or(1);
+    let idx = usize::try_from((elapsed_ms / 110) % frame_count).unwrap_or(0);
+    FRAMES[idx]
+}
+
+#[must_use]
+const fn stage_color_code(stage: IndexingProgressStage) -> &'static str {
+    match stage {
+        IndexingProgressStage::Discovering => "1;38;5;220",
+        IndexingProgressStage::Indexing => "1;38;5;45",
+        IndexingProgressStage::Finalizing => "1;38;5;208",
+        IndexingProgressStage::Completed => "1;32",
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio_percent(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio_percent_usize(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn timing_ratio_percent(part_ms: u128, total_ms: u128) -> f64 {
+    if total_ms == 0 {
+        0.0
+    } else {
+        part_ms as f64 * 100.0 / total_ms as f64
+    }
+}
+
+fn format_count_u64(value: u64) -> String {
+    let source = value.to_string();
+    let mut out = String::with_capacity(source.len().saturating_add(source.len() / 3));
+    for (idx, ch) in source.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_count_usize(value: usize) -> String {
+    format_count_u64(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_progress_bar(ratio: f64, width: usize) -> String {
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64).round() as usize;
+    let mut bar = String::with_capacity(width);
+    bar.push_str(&"█".repeat(filled.min(width)));
+    bar.push_str(&"░".repeat(width.saturating_sub(filled.min(width))));
+    bar
+}
+
+fn ui_fg(no_color: bool, color: PackedRgba) -> Style {
+    if no_color {
+        Style::new()
+    } else {
+        Style::new().fg(color)
+    }
+}
+
+fn ui_fg_bg(no_color: bool, fg: PackedRgba, bg: PackedRgba) -> Style {
+    if no_color {
+        Style::new().bold()
+    } else {
+        Style::new().fg(fg).bg(bg).bold()
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: ftui_core::geometry::Rect) -> ftui_core::geometry::Rect {
+    let vertical = Flex::vertical()
+        .constraints([
+            Constraint::Percentage(f32::from(100_u16.saturating_sub(percent_y)) / 2.0),
+            Constraint::Percentage(f32::from(percent_y)),
+            Constraint::Percentage(f32::from(100_u16.saturating_sub(percent_y)) / 2.0),
+        ])
+        .split(area);
+    Flex::horizontal()
+        .constraints([
+            Constraint::Percentage(f32::from(100_u16.saturating_sub(percent_x)) / 2.0),
+            Constraint::Percentage(f32::from(percent_x)),
+            Constraint::Percentage(f32::from(100_u16.saturating_sub(percent_x)) / 2.0),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn wait_for_ftui_dismiss(
+    session: &mut FtuiSession,
+    message: &str,
+    no_color: bool,
+) -> SearchResult<()> {
+    loop {
+        session.render(|frame| {
+            let area = frame.bounds();
+            let popup = centered_rect(70, 30, area);
+            let block = Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+                .title(" fsfs ");
+            let body = Paragraph::new(Text::from_lines(vec![
+                Line::from(Span::styled(
+                    message,
+                    ui_fg(no_color, PackedRgba::rgb(224, 234, 255)),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter / Esc / q to continue",
+                    ui_fg(no_color, PackedRgba::rgb(160, 176, 205)),
+                )),
+            ]))
+            .wrap(WrapMode::Word)
+            .block(block);
+            body.render(popup, frame);
+        })?;
+
+        if let Some(event) = session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+            && let Event::Key(key) = event
+            && matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+            )
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn render_root_selector_frame(
+    frame: &mut Frame,
+    proposals: &[IndexRootProposal],
+    selected_index: usize,
+    no_color: bool,
+) {
+    if proposals.is_empty() {
+        return;
+    }
+    let area = frame.bounds();
+    if area.is_empty() {
+        return;
+    }
+
+    let selected_index = selected_index.min(proposals.len().saturating_sub(1));
+    let selected = &proposals[selected_index];
+    let layout = Flex::vertical()
+        .constraints([Constraint::Fixed(5), Constraint::Fill, Constraint::Fixed(3)])
+        .split(area);
+    let body = Flex::horizontal()
+        .constraints([Constraint::Percentage(62.0), Constraint::Percentage(38.0)])
+        .split(layout[1]);
+
+    let header = Paragraph::new(Text::from_lines(vec![
+        Line::from_spans(vec![
+            Span::styled(
+                "fsfs",
+                ui_fg(no_color, PackedRgba::rgb(90, 188, 255)).bold(),
+            ),
+            Span::styled(
+                "  First-Run Index Setup",
+                ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "No index was found. Choose the root that best matches your code + documents.",
+            ui_fg(no_color, PackedRgba::rgb(180, 198, 224)),
+        )),
+    ]))
+    .wrap(WrapMode::Word)
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+            .title(" onboarding "),
+    );
+    header.render(layout[0], frame);
+
+    let mut candidate_lines = Vec::new();
+    for (idx, proposal) in proposals.iter().enumerate() {
+        let is_selected = idx == selected_index;
+        let prefix_style = if is_selected {
+            ui_fg_bg(
+                no_color,
+                PackedRgba::rgb(16, 30, 48),
+                PackedRgba::rgb(122, 219, 255),
+            )
+        } else {
+            ui_fg(no_color, PackedRgba::rgb(138, 156, 190)).bold()
+        };
+        let path_style = if is_selected {
+            ui_fg(no_color, PackedRgba::rgb(224, 244, 255))
+        } else {
+            ui_fg(no_color, PackedRgba::rgb(197, 210, 232))
+        };
+        let badge_style = if idx == 0 {
+            ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
+        } else {
+            ui_fg(no_color, PackedRgba::rgb(138, 156, 190))
+        };
+        let path_width = usize::from(body[0].width).saturating_sub(28);
+        candidate_lines.push(Line::from_spans(vec![
+            Span::styled(
+                format!(" {} {} ", if is_selected { "▸" } else { " " }, idx + 1),
+                prefix_style,
+            ),
+            Span::styled(
+                truncate_middle(&proposal.path.display().to_string(), path_width.max(24)),
+                path_style,
+            ),
+            Span::styled(
+                if idx == 0 {
+                    "  RECOMMENDED"
+                } else {
+                    "  candidate"
+                },
+                badge_style,
+            ),
+        ]));
+        candidate_lines.push(Line::from(Span::styled(
+            format!(
+                "    fit={}  score={}  repos={}  files={}  data={}",
+                describe_root_probe_fit(&proposal.path, &proposal.stats),
+                format_count_u64(u64::try_from(proposal.score.max(0)).unwrap_or_default()),
+                format_count_usize(proposal.stats.repo_markers),
+                format_count_usize(proposal.stats.candidate_files),
+                humanize_bytes(proposal.stats.candidate_bytes),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(150, 170, 204)),
+        )));
+        if idx + 1 < proposals.len() {
+            candidate_lines.push(Line::from(""));
+        }
+    }
+    Paragraph::new(Text::from_lines(candidate_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(85, 123, 194)))
+                .title(" suggested roots "),
+        )
+        .render(body[0], frame);
+
+    let detail_lines = vec![
+        Line::from(Span::styled(
+            truncate_middle(&selected.path.display().to_string(), usize::from(body[1].width).saturating_sub(6)),
+            ui_fg(no_color, PackedRgba::rgb(224, 240, 255)).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "fit: {}",
+                describe_root_probe_fit(&selected.path, &selected.stats)
+            ),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+        Line::from(Span::styled(
+            format!("score: {}", format_count_u64(u64::try_from(selected.score.max(0)).unwrap_or_default())),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+        Line::from(Span::styled(
+            format!("repos: {}", format_count_usize(selected.stats.repo_markers)),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+        Line::from(Span::styled(
+            format!("candidate files: {}", format_count_usize(selected.stats.candidate_files)),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+        Line::from(Span::styled(
+            format!("code/doc split: {:.1}% / {:.1}%", ratio_percent_usize(selected.stats.code_files, selected.stats.candidate_files.max(1)), ratio_percent_usize(selected.stats.doc_files, selected.stats.candidate_files.max(1))),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+        Line::from(Span::styled(
+            format!("estimated corpus: {}", humanize_bytes(selected.stats.candidate_bytes)),
+            ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
+        )),
+    ];
+    Paragraph::new(Text::from_lines(detail_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(104, 166, 255)))
+                .title(" selected profile "),
+        )
+        .render(body[1], frame);
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "↑/↓ or j/k move   •   Enter confirm   •   q/Esc cancel",
+            ui_fg(no_color, PackedRgba::rgb(160, 180, 213)),
+        )),
+        Line::from(Span::styled(
+            "Number keys 1-9 jump directly to a candidate",
+            ui_fg(no_color, PackedRgba::rgb(131, 151, 186)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(72, 98, 149)))
+            .title(" controls "),
+    )
+    .render(layout[2], frame);
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn render_existing_index_dashboard_frame(
+    frame: &mut Frame,
+    payload: &FsfsStatusPayload,
+    fast_only: bool,
+    no_color: bool,
+) {
+    let area = frame.bounds();
+    if area.is_empty() {
+        return;
+    }
+    let layout = Flex::vertical()
+        .constraints([Constraint::Fixed(5), Constraint::Fill, Constraint::Fixed(3)])
+        .split(area);
+    let body = Flex::horizontal()
+        .constraints([Constraint::Percentage(57.0), Constraint::Percentage(43.0)])
+        .split(layout[1]);
+    let left = Flex::vertical()
+        .constraints([Constraint::Percentage(54.0), Constraint::Percentage(46.0)])
+        .split(body[0]);
+    let right = Flex::vertical()
+        .constraints([Constraint::Percentage(48.0), Constraint::Percentage(52.0)])
+        .split(body[1]);
+
+    let indexed_files = payload.index.indexed_files.unwrap_or(0);
+    let discovered_files = payload.index.discovered_files.unwrap_or(indexed_files);
+    let skipped_files = payload.index.skipped_files.unwrap_or(0);
+    let stale_files = payload.index.stale_files.unwrap_or(0);
+    let coverage_ratio = if discovered_files == 0 {
+        0.0
+    } else {
+        indexed_files as f64 / discovered_files as f64
+    };
+    let vector_ratio = if payload.index.size_bytes == 0 {
+        0.0
+    } else {
+        payload.index.vector_index_bytes as f64 / payload.index.size_bytes as f64
+    };
+    let lexical_ratio = if payload.index.size_bytes == 0 {
+        0.0
+    } else {
+        payload.index.lexical_index_bytes as f64 / payload.index.size_bytes as f64
+    };
+    let fast_cached = payload
+        .models
+        .iter()
+        .find(|model| model.tier == "fast")
+        .is_some_and(|model| model.cached);
+    let quality_cached = payload
+        .models
+        .iter()
+        .find(|model| model.tier == "quality")
+        .is_some_and(|model| model.cached);
+    let mode_label = if fast_cached && quality_cached && !fast_only {
+        "full hybrid semantic + lexical"
+    } else if fast_cached {
+        "fast semantic + lexical"
+    } else {
+        "hash + lexical fallback"
+    };
+    let mode_style = if fast_cached && quality_cached && !fast_only {
+        ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
+    } else if fast_cached {
+        ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold()
+    } else {
+        ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold()
+    };
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from_spans(vec![
+            Span::styled(
+                "fsfs",
+                ui_fg(no_color, PackedRgba::rgb(90, 188, 255)).bold(),
+            ),
+            Span::styled(
+                "  Search Control Deck",
+                ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
+            ),
+        ]),
+        Line::from_spans(vec![
+            Span::styled("mode: ", ui_fg(no_color, PackedRgba::rgb(164, 184, 219))),
+            Span::styled(mode_label, mode_style),
+        ]),
+        Line::from(Span::styled(
+            truncate_middle(&payload.index.path, usize::from(layout[0].width).saturating_sub(10)),
+            ui_fg(no_color, PackedRgba::rgb(175, 195, 229)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+            .title(" index ready "),
+    )
+    .render(layout[0], frame);
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            format!(
+                "indexed={}  discovered={}  skipped={}  stale={}",
+                format_count_usize(indexed_files),
+                format_count_usize(discovered_files),
+                format_count_usize(skipped_files),
+                format_count_usize(stale_files),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(220, 233, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "size={}  vector={}  lexical={}  metadata={}",
+                humanize_bytes(payload.index.size_bytes),
+                humanize_bytes(payload.index.vector_index_bytes),
+                humanize_bytes(payload.index.lexical_index_bytes),
+                humanize_bytes(payload.index.metadata_bytes),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "last indexed={}",
+                payload
+                    .index
+                    .last_indexed_iso_utc
+                    .as_deref()
+                    .unwrap_or("unknown"),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(89, 126, 196)))
+            .title(" corpus "),
+    )
+    .render(left[0], frame);
+
+    let composition_block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(95, 144, 208)))
+        .title(" composition ");
+    composition_block.render(left[1], frame);
+    let composition_inner = composition_block.inner(left[1]);
+    let composition_rows = Flex::vertical()
+        .constraints([Constraint::Fixed(3), Constraint::Fixed(3), Constraint::Fixed(3)])
+        .split(composition_inner);
+    let coverage_label = format!("coverage {:>5.1}%", coverage_ratio * 100.0);
+    ProgressBar::new()
+        .ratio(coverage_ratio)
+        .label(&coverage_label)
+        .style(ui_fg(no_color, PackedRgba::rgb(34, 46, 70)))
+        .gauge_style(ui_fg_bg(
+            no_color,
+            PackedRgba::rgb(12, 28, 40),
+            PackedRgba::rgb(122, 219, 255),
+        ))
+        .render(composition_rows[0], frame);
+    let vector_label = format!("vector {:>5.1}%", vector_ratio * 100.0);
+    ProgressBar::new()
+        .ratio(vector_ratio)
+        .label(&vector_label)
+        .style(ui_fg(no_color, PackedRgba::rgb(34, 46, 70)))
+        .gauge_style(ui_fg_bg(
+            no_color,
+            PackedRgba::rgb(12, 24, 40),
+            PackedRgba::rgb(131, 231, 157),
+        ))
+        .render(composition_rows[1], frame);
+    let lexical_label = format!("lexical {:>5.1}%", lexical_ratio * 100.0);
+    ProgressBar::new()
+        .ratio(lexical_ratio)
+        .label(&lexical_label)
+        .style(ui_fg(no_color, PackedRgba::rgb(34, 46, 70)))
+        .gauge_style(ui_fg_bg(
+            no_color,
+            PackedRgba::rgb(12, 24, 40),
+            PackedRgba::rgb(255, 202, 123),
+        ))
+        .render(composition_rows[2], frame);
+
+    let mut model_lines = Vec::new();
+    for model in &payload.models {
+        let state_style = if model.cached {
+            ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
+        } else {
+            ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold()
+        };
+        model_lines.push(Line::from_spans(vec![
+            Span::styled(
+                format!("{:<8}", format!("{}:", model.tier)),
+                ui_fg(no_color, PackedRgba::rgb(164, 184, 219)),
+            ),
+            Span::styled(
+                truncate_middle(&model.name, usize::from(right[0].width).saturating_sub(24)),
+                ui_fg(no_color, PackedRgba::rgb(216, 231, 255)),
+            ),
+            Span::styled(
+                if model.cached { " cached" } else { " missing" },
+                state_style,
+            ),
+        ]));
+    }
+    Paragraph::new(Text::from_lines(model_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(104, 166, 255)))
+                .title(" model health "),
+        )
+        .render(right[0], frame);
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "fsfs search \"query\" --limit 10",
+            ui_fg(no_color, PackedRgba::rgb(224, 238, 255)),
+        )),
+        Line::from(Span::styled(
+            "fsfs search \"query\" --stream --format jsonl",
+            ui_fg(no_color, PackedRgba::rgb(224, 238, 255)),
+        )),
+        Line::from(Span::styled(
+            "fsfs index <path> --watch",
+            ui_fg(no_color, PackedRgba::rgb(224, 238, 255)),
+        )),
+        Line::from(Span::styled(
+            "fsfs status --format json",
+            ui_fg(no_color, PackedRgba::rgb(224, 238, 255)),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press r to refresh this dashboard.",
+            ui_fg(no_color, PackedRgba::rgb(161, 178, 208)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(137, 110, 212)))
+            .title(" quick actions "),
+    )
+    .render(right[1], frame);
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "Enter / Esc / q exit  •  r refresh",
+            ui_fg(no_color, PackedRgba::rgb(165, 183, 216)),
+        )),
+        Line::from(Span::styled(
+            "Bundled semantic defaults are materialized automatically at runtime.",
+            ui_fg(no_color, PackedRgba::rgb(132, 151, 184)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(72, 98, 149)))
+            .title(" controls "),
+    )
+    .render(layout[2], frame);
+}
+
+fn render_indexing_progress_screen_ftui(
+    session: &mut FtuiSession,
+    snapshot: &IndexingProgressSnapshot,
+    render_state: &IndexingRenderState,
+    no_color: bool,
+) -> SearchResult<()> {
+    session.render(|frame| {
+        render_indexing_progress_frame(frame, snapshot, render_state, no_color);
+    })
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn render_indexing_progress_frame(
+    frame: &mut Frame,
+    snapshot: &IndexingProgressSnapshot,
+    render_state: &IndexingRenderState,
+    no_color: bool,
+) {
+    let area = frame.bounds();
+    if area.is_empty() {
+        return;
+    }
+    let layout = Flex::vertical()
+        .constraints([Constraint::Fixed(5), Constraint::Fixed(4), Constraint::Fill, Constraint::Fixed(3)])
+        .split(area);
+    let body = Flex::horizontal()
+        .constraints([Constraint::Percentage(58.0), Constraint::Percentage(42.0)])
+        .split(layout[2]);
+    let left = Flex::vertical()
+        .constraints([Constraint::Percentage(55.0), Constraint::Percentage(45.0)])
+        .split(body[0]);
+    let right = Flex::vertical()
+        .constraints([Constraint::Percentage(58.0), Constraint::Percentage(42.0)])
+        .split(body[1]);
+
+    let ratio = snapshot.completion_ratio();
+    let percent = ratio * 100.0;
+    let elapsed_secs = u64::try_from(snapshot.total_elapsed_ms / 1_000).unwrap_or(u64::MAX);
+    let elapsed = humanize_duration_seconds(elapsed_secs);
+    let raw_eta = format_eta(snapshot.eta_seconds());
+    let smooth_eta = format_eta(render_state.smoothed_eta_seconds());
+    let pending_files = snapshot
+        .candidate_files
+        .saturating_sub(snapshot.processed_files);
+    let stage_style = match snapshot.stage {
+        IndexingProgressStage::Discovering => ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold(),
+        IndexingProgressStage::Indexing => ui_fg(no_color, PackedRgba::rgb(122, 219, 255)).bold(),
+        IndexingProgressStage::Finalizing => ui_fg(no_color, PackedRgba::rgb(253, 188, 128)).bold(),
+        IndexingProgressStage::Completed => ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
+    };
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from_spans(vec![
+            Span::styled(
+                "fsfs",
+                ui_fg(no_color, PackedRgba::rgb(90, 188, 255)).bold(),
+            ),
+            Span::styled(
+                "  Initial Indexing",
+                ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
+            ),
+            Span::styled(
+                format!("  {} {}", indexing_spinner_frame(snapshot.total_elapsed_ms), snapshot.stage.label()),
+                stage_style,
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "target: {}",
+                truncate_middle(
+                    &snapshot.target_root.display().to_string(),
+                    usize::from(layout[0].width).saturating_sub(10),
+                )
+            ),
+            ui_fg(no_color, PackedRgba::rgb(175, 195, 229)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "index:  {}",
+                truncate_middle(
+                    &snapshot.index_root.display().to_string(),
+                    usize::from(layout[0].width).saturating_sub(10),
+                )
+            ),
+            ui_fg(no_color, PackedRgba::rgb(175, 195, 229)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+            .title(" indexing cockpit "),
+    )
+    .render(layout[0], frame);
+
+    let progress_label = format!(
+        "{:>5.1}%  queue={}  elapsed={}  eta(raw={} smooth={})",
+        percent,
+        format_count_usize(pending_files),
+        elapsed,
+        raw_eta,
+        smooth_eta
+    );
+    ProgressBar::new()
+        .ratio(ratio)
+        .label(&progress_label)
+        .style(ui_fg(no_color, PackedRgba::rgb(34, 46, 70)))
+        .gauge_style(ui_fg_bg(
+            no_color,
+            PackedRgba::rgb(12, 24, 40),
+            PackedRgba::rgb(122, 219, 255),
+        ))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(83, 124, 190)))
+                .title(" progress "),
+        )
+        .render(layout[1], frame);
+
+    let files_history = render_state
+        .files_rate_history
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let growth_history = render_state
+        .growth_rate_history
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let throughput_block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(92, 147, 214)))
+        .title(" throughput ");
+    throughput_block.render(left[0], frame);
+    let throughput_inner = throughput_block.inner(left[0]);
+    let throughput_rows = Flex::vertical()
+        .constraints([Constraint::Fill, Constraint::Fixed(1), Constraint::Fixed(1)])
+        .split(throughput_inner);
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            format!(
+                "instant: {:.1} files/s  {:.1} lines/s  {:.2} MB/s",
+                render_state.instant_files_per_second,
+                render_state.instant_lines_per_second,
+                render_state.instant_mb_per_second
+            ),
+            ui_fg(no_color, PackedRgba::rgb(221, 233, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "average: {:.1} files/s  {:.1} lines/s  {:.2} MB/s",
+                snapshot.files_per_second(),
+                snapshot.lines_per_second(),
+                snapshot.mb_per_second()
+            ),
+            ui_fg(no_color, PackedRgba::rgb(170, 190, 222)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "smoothed: {:.1} files/s  {:.1} lines/s  {:.2} MB/s",
+                render_state.files_rate_ema,
+                render_state.lines_rate_ema,
+                render_state.mb_rate_ema
+            ),
+            ui_fg(no_color, PackedRgba::rgb(170, 190, 222)),
+        )),
+    ]))
+    .render(throughput_rows[0], frame);
+    Sparkline::new(&files_history)
+        .style(ui_fg(no_color, PackedRgba::rgb(122, 219, 255)))
+        .render(throughput_rows[1], frame);
+    Sparkline::new(&growth_history)
+        .style(ui_fg(no_color, PackedRgba::rgb(131, 231, 157)))
+        .render(throughput_rows[2], frame);
+
+    let lines_per_file = if snapshot.processed_files == 0 {
+        0.0
+    } else {
+        snapshot.canonical_lines as f64 / snapshot.processed_files as f64
+    };
+    let bytes_per_line = if snapshot.canonical_lines == 0 {
+        0.0
+    } else {
+        snapshot.canonical_bytes as f64 / snapshot.canonical_lines as f64
+    };
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            format!(
+                "discovered={}  candidates={}  indexed={}  skipped={}",
+                format_count_usize(snapshot.discovered_files),
+                format_count_usize(snapshot.candidate_files),
+                format_count_usize(snapshot.processed_files),
+                format_count_usize(snapshot.skipped_files),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(220, 233, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "semantic={}  lines={}  data={}",
+                format_count_usize(snapshot.semantic_files),
+                format_count_u64(snapshot.canonical_lines),
+                humanize_bytes(snapshot.canonical_bytes),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "index size={}  lines/file={:.1}  bytes/line={:.1}",
+                humanize_bytes(snapshot.index_size_bytes),
+                lines_per_file,
+                bytes_per_line,
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(112, 119, 194)))
+            .title(" corpus load "),
+    )
+    .render(left[1], frame);
+
+    let accounted_ms = snapshot
+        .discovery_elapsed_ms
+        .saturating_add(snapshot.lexical_elapsed_ms)
+        .saturating_add(snapshot.embedding_elapsed_ms)
+        .saturating_add(snapshot.vector_elapsed_ms);
+    let orchestration_ms = snapshot.total_elapsed_ms.saturating_sub(accounted_ms);
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            format!(
+                "discovery={}ms ({:.1}%)",
+                snapshot.discovery_elapsed_ms,
+                timing_ratio_percent(snapshot.discovery_elapsed_ms, snapshot.total_elapsed_ms),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(220, 233, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "lexical={}ms ({:.1}%)  embed={}ms ({:.1}%)",
+                snapshot.lexical_elapsed_ms,
+                timing_ratio_percent(snapshot.lexical_elapsed_ms, snapshot.total_elapsed_ms),
+                snapshot.embedding_elapsed_ms,
+                timing_ratio_percent(snapshot.embedding_elapsed_ms, snapshot.total_elapsed_ms),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "vector={}ms ({:.1}%)  orchestration={}ms ({:.1}%)",
+                snapshot.vector_elapsed_ms,
+                timing_ratio_percent(snapshot.vector_elapsed_ms, snapshot.total_elapsed_ms),
+                orchestration_ms,
+                timing_ratio_percent(orchestration_ms, snapshot.total_elapsed_ms),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+        Line::from(Span::styled(
+            format!("index growth {:.1} KB/s (ema {:.1})", render_state.instant_growth_kb_per_second, render_state.growth_rate_ema),
+            ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(177, 128, 218)))
+            .title(" stage timings "),
+    )
+    .render(right[0], frame);
+
+    let active_file_line = snapshot
+        .active_file
+        .as_deref()
+        .map_or_else(|| "waiting for active file…".to_owned(), |value| {
+            truncate_middle(value, usize::from(right[1].width).saturating_sub(10))
+        });
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            active_file_line,
+            ui_fg(no_color, PackedRgba::rgb(222, 236, 255)),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "trend completion: {}",
+                render_state.completion_sparkline(INDEXING_TUI_SPARKLINE_WIDTH)
+            ),
+            ui_fg(no_color, PackedRgba::rgb(164, 184, 219)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "trend files/s:   {}",
+                render_state.files_rate_sparkline(INDEXING_TUI_SPARKLINE_WIDTH)
+            ),
+            ui_fg(no_color, PackedRgba::rgb(164, 184, 219)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(97, 162, 234)))
+            .title(" active file "),
+    )
+    .render(right[1], frame);
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "Indexing is streaming live stats. Ctrl+C cancels safely.",
+            ui_fg(no_color, PackedRgba::rgb(166, 186, 219)),
+        )),
+        Line::from(Span::styled(
+            "Re-run with `fsfs index <path>` at any time to continue.",
+            ui_fg(no_color, PackedRgba::rgb(132, 151, 184)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(72, 98, 149)))
+            .title(" notes "),
+    )
+    .render(layout[3], frame);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_indexing_progress_screen(
+    snapshot: &IndexingProgressSnapshot,
+    render_state: &IndexingRenderState,
+    no_color: bool,
+) -> SearchResult<()> {
+    let width = tui_terminal_width().clamp(88, 168);
+    let rule = "─".repeat(width);
+    let stage_color = stage_color_code(snapshot.stage);
+    let ratio = snapshot.completion_ratio();
+    let pct = ratio * 100.0;
+    let progress_bar_width = width.saturating_sub(54).clamp(20, 72);
+    let bar = render_progress_bar(ratio, progress_bar_width);
+    let elapsed_secs = u64::try_from(snapshot.total_elapsed_ms / 1_000).unwrap_or(u64::MAX);
+    let elapsed = humanize_duration_seconds(elapsed_secs);
+    let raw_eta = format_eta(snapshot.eta_seconds());
+    let smooth_eta = format_eta(render_state.smoothed_eta_seconds());
+    let finish_at = render_state.smoothed_eta_seconds().map_or_else(
+        || "--".to_owned(),
+        |seconds| {
+            format_epoch_ms_utc(
+                pressure_timestamp_ms().saturating_add(seconds.saturating_mul(1_000)),
+            )
+        },
+    );
+    let pending_files = snapshot
+        .candidate_files
+        .saturating_sub(snapshot.processed_files);
+    let candidate_ratio = ratio_percent_usize(snapshot.candidate_files, snapshot.discovered_files);
+    let skipped_ratio = ratio_percent_usize(snapshot.skipped_files, snapshot.discovered_files);
+    let semantic_ratio = ratio_percent_usize(snapshot.semantic_files, snapshot.processed_files);
+    let lines_per_file = if snapshot.processed_files == 0 {
+        0.0
+    } else {
+        snapshot.canonical_lines as f64 / snapshot.processed_files as f64
+    };
+    let bytes_per_line = if snapshot.canonical_lines == 0 {
+        0.0
+    } else {
+        snapshot.canonical_bytes as f64 / snapshot.canonical_lines as f64
+    };
+    let index_amplification = if snapshot.canonical_bytes == 0 {
+        0.0
+    } else {
+        snapshot.index_size_bytes as f64 / snapshot.canonical_bytes as f64
+    };
+    let accounted_ms = snapshot
+        .discovery_elapsed_ms
+        .saturating_add(snapshot.lexical_elapsed_ms)
+        .saturating_add(snapshot.embedding_elapsed_ms)
+        .saturating_add(snapshot.vector_elapsed_ms);
+    let orchestration_ms = snapshot.total_elapsed_ms.saturating_sub(accounted_ms);
+
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
+    writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} {}  {} {}",
+        paint("fsfs", "1;38;5;45", no_color),
+        paint("Initial Indexing", "1;37", no_color),
+        paint(
+            indexing_spinner_frame(snapshot.total_elapsed_ms),
+            stage_color,
+            no_color
+        ),
+        paint(snapshot.stage.label(), stage_color, no_color)
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} {}",
+        paint("target:", "38;5;244", no_color),
+        truncate_middle(
+            &snapshot.target_root.display().to_string(),
+            width.saturating_sub(10)
+        )
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{}  {}",
+        paint("index:", "38;5;244", no_color),
+        truncate_middle(
+            &snapshot.index_root.display().to_string(),
+            width.saturating_sub(10)
+        )
+    )
+    .map_err(tui_io_error)?;
+    writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} [{}] {:>5.1}%  queue={}  elapsed={}  eta(raw={} smooth={})",
+        paint("progress", "1;38;5;220", no_color),
+        bar,
+        pct,
+        format_count_usize(pending_files),
+        elapsed,
+        raw_eta,
+        smooth_eta
+    )
+    .map_err(tui_io_error)?;
+    writeln!(stdout, "finish estimate (smoothed): {finish_at}").map_err(tui_io_error)?;
+    writeln!(stdout).map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} discovered={} candidates={} indexed={} skipped={} semantic={}",
+        paint("workload:", "1;38;5;81", no_color),
+        format_count_usize(snapshot.discovered_files),
+        format_count_usize(snapshot.candidate_files),
+        format_count_usize(snapshot.processed_files),
+        format_count_usize(snapshot.skipped_files),
+        format_count_usize(snapshot.semantic_files)
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "          candidate_ratio={candidate_ratio:.1}%  skipped_ratio={skipped_ratio:.1}%  semantic_ratio={semantic_ratio:.1}%"
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} lines={} ({:.1} lines/file)  data={}  index_size={}  amp={:.2}x  bytes/line={:.1}",
+        paint("content:", "1;38;5;111", no_color),
+        format_count_u64(snapshot.canonical_lines),
+        lines_per_file,
+        humanize_bytes(snapshot.canonical_bytes),
+        humanize_bytes(snapshot.index_size_bytes),
+        index_amplification,
+        bytes_per_line
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} instant: {:.1} files/s  {:.1} lines/s  {:.2} MB/s  growth {:.1} KB/s",
+        paint("rates:", "1;38;5;214", no_color),
+        render_state.instant_files_per_second,
+        render_state.instant_lines_per_second,
+        render_state.instant_mb_per_second,
+        render_state.instant_growth_kb_per_second
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "       average: {:.1} files/s  {:.1} lines/s  {:.2} MB/s  growth {:.1} KB/s",
+        snapshot.files_per_second(),
+        snapshot.lines_per_second(),
+        snapshot.mb_per_second(),
+        snapshot.index_growth_bytes_per_second() / 1024.0
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "       smoothed: {:.1} files/s  {:.1} lines/s  {:.2} MB/s  growth {:.1} KB/s",
+        render_state.files_rate_ema,
+        render_state.lines_rate_ema,
+        render_state.mb_rate_ema,
+        render_state.growth_rate_ema
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "       trend: completion {}  files/s {}  growth {}",
+        render_state.completion_sparkline(INDEXING_TUI_SPARKLINE_WIDTH),
+        render_state.files_rate_sparkline(INDEXING_TUI_SPARKLINE_WIDTH),
+        render_state.growth_rate_sparkline(INDEXING_TUI_SPARKLINE_WIDTH)
+    )
+    .map_err(tui_io_error)?;
+    writeln!(
+        stdout,
+        "{} discovery={}ms ({:.1}%)  lexical={}ms ({:.1}%)  embedding={}ms ({:.1}%)  vector={}ms ({:.1}%)  orchestration={}ms ({:.1}%)",
+        paint("timings:", "1;38;5;177", no_color),
+        snapshot.discovery_elapsed_ms,
+        timing_ratio_percent(snapshot.discovery_elapsed_ms, snapshot.total_elapsed_ms),
+        snapshot.lexical_elapsed_ms,
+        timing_ratio_percent(snapshot.lexical_elapsed_ms, snapshot.total_elapsed_ms),
+        snapshot.embedding_elapsed_ms,
+        timing_ratio_percent(snapshot.embedding_elapsed_ms, snapshot.total_elapsed_ms),
+        snapshot.vector_elapsed_ms
+            ,
+        timing_ratio_percent(snapshot.vector_elapsed_ms, snapshot.total_elapsed_ms),
+        orchestration_ms,
+        timing_ratio_percent(orchestration_ms, snapshot.total_elapsed_ms)
+    )
+    .map_err(tui_io_error)?;
+    if let Some(active_file) = snapshot.active_file.as_deref() {
+        writeln!(
+            stdout,
+            "{} {}",
+            paint("active:", "1;38;5;51", no_color),
+            truncate_middle(active_file, width.saturating_sub(9))
+        )
+        .map_err(tui_io_error)?;
+    }
+    writeln!(
+        stdout,
+        "{}",
+        paint(
+            "Tip: Ctrl+C cancels safely. You can rerun with `fsfs index <path>` any time.",
+            "38;5;244",
+            no_color
+        )
+    )
+    .map_err(tui_io_error)?;
+    stdout.flush().map_err(tui_io_error)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     let now_ms = pressure_timestamp_ms();
+    let width = tui_terminal_width().clamp(88, 160);
+    let rule = "─".repeat(width);
 
     let stale_label = match status.index.stale_files {
         Some(0) => paint("up-to-date", "32", no_color),
-        Some(count) => paint(&format!("stale ({count})"), "33", no_color),
+        Some(count) => paint(
+            &format!("stale ({})", format_count_usize(count)),
+            "33",
+            no_color,
+        ),
         None => paint("unknown", "90", no_color),
     };
     let index_exists = if status.index.exists {
-        paint("present", "32", no_color)
+        paint("ready", "32", no_color)
     } else {
         paint("missing", "31", no_color)
     };
+    let vector_pct = ratio_percent(
+        status.index.vector_index_bytes,
+        status.index.size_bytes.max(1),
+    );
+    let lexical_pct = ratio_percent(
+        status.index.lexical_index_bytes,
+        status.index.size_bytes.max(1),
+    );
+    let indexed_files = status.index.indexed_files.unwrap_or(0);
+    let discovered_files = status.index.discovered_files.unwrap_or(0);
+    let skipped_files = status.index.skipped_files.unwrap_or(0);
+    let avg_index_bytes_per_file = if indexed_files == 0 {
+        0_u64
+    } else {
+        status.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
+    };
+    let fast_cached = status
+        .models
+        .iter()
+        .find(|model| model.tier == "fast")
+        .is_some_and(|model| model.cached);
+    let quality_cached = status
+        .models
+        .iter()
+        .find(|model| model.tier == "quality")
+        .is_some_and(|model| model.cached);
+    let search_mode_line = if fast_cached && quality_cached && !status.config.fast_only {
+        paint(
+            "  mode: full hybrid (fast + quality semantic)",
+            "32",
+            no_color,
+        )
+    } else if fast_cached {
+        if status.config.fast_only {
+            paint(
+                "  mode: fast semantic only (fast_only=true)",
+                "33",
+                no_color,
+            )
+        } else {
+            paint(
+                "  mode: fast semantic + lexical (quality model missing)",
+                "33",
+                no_color,
+            )
+        }
+    } else {
+        paint(
+            "  mode: hash + lexical fallback (no semantic model cache)",
+            "38;5;214",
+            no_color,
+        )
+    };
 
-    let _ = writeln!(out, "frankensearch {}", status.version);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Index:");
-    let _ = writeln!(out, "  path: {}", status.index.path);
-    let _ = writeln!(out, "  state: {index_exists}");
-    if let Some(indexed_files) = status.index.indexed_files {
-        let _ = writeln!(out, "  files indexed: {indexed_files}");
-    }
-    if let Some(discovered_files) = status.index.discovered_files {
-        let _ = writeln!(out, "  files discovered: {discovered_files}");
-    }
-    if let Some(skipped_files) = status.index.skipped_files {
-        let _ = writeln!(out, "  files skipped: {skipped_files}");
-    }
     let _ = writeln!(
         out,
-        "  size: {} (vector {}, lexical {}, metadata {}, cache {})",
+        "{} {} {}",
+        paint("frankensearch", "1;38;5;45", no_color),
+        status.version,
+        paint("| fsfs status", "38;5;244", no_color)
+    );
+    let _ = writeln!(out, "{}", paint(&rule, "38;5;24", no_color));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", paint("INDEX", "1;38;5;81", no_color));
+    let _ = writeln!(
+        out,
+        "  root: {}",
+        truncate_middle(&status.index.path, width.saturating_sub(10))
+    );
+    let _ = writeln!(out, "  state: {index_exists}");
+    let _ = writeln!(
+        out,
+        "  files: indexed={}  discovered={}  skipped={}",
+        format_count_usize(indexed_files),
+        format_count_usize(discovered_files),
+        format_count_usize(skipped_files)
+    );
+    let _ = writeln!(
+        out,
+        "  size: total={}  avg/indexed_file={}  cache={}",
         humanize_bytes(status.index.size_bytes),
-        humanize_bytes(status.index.vector_index_bytes),
-        humanize_bytes(status.index.lexical_index_bytes),
-        humanize_bytes(status.index.metadata_bytes),
+        humanize_bytes(avg_index_bytes_per_file),
         humanize_bytes(status.index.embedding_cache_bytes),
+    );
+    let _ = writeln!(
+        out,
+        "        vector={} ({:.1}%)  lexical={} ({:.1}%)  metadata={}",
+        humanize_bytes(status.index.vector_index_bytes),
+        vector_pct,
+        humanize_bytes(status.index.lexical_index_bytes),
+        lexical_pct,
+        humanize_bytes(status.index.metadata_bytes),
     );
     if let Some(last_indexed_ms) = status.index.last_indexed_ms {
         let _ = writeln!(
             out,
-            "  last indexed: {} ({})",
+            "  last indexed: {}  ({})",
             humanize_age(now_ms, last_indexed_ms),
             status
                 .index
@@ -5727,7 +8531,7 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     }
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "Models:");
+    let _ = writeln!(out, "{}", paint("MODELS", "1;38;5;214", no_color));
     for model in &status.models {
         let state = if model.cached {
             paint("cached", "32", no_color)
@@ -5736,20 +8540,29 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         };
         let _ = writeln!(
             out,
-            "  {}: {} ({}, {}, path {})",
+            "  {}: {}  {}  size={} ",
             model.tier,
             model.name,
             state,
             humanize_bytes(model.size_bytes),
-            model.cache_path,
+        );
+        let _ = writeln!(
+            out,
+            "      path: {}",
+            truncate_middle(&model.cache_path, width.saturating_sub(13))
         );
     }
+    let _ = writeln!(out, "{search_mode_line}");
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "Config:");
+    let _ = writeln!(out, "{}", paint("CONFIG", "1;38;5;177", no_color));
     let _ = writeln!(out, "  source: {}", status.config.source);
     let _ = writeln!(out, "  index dir: {}", status.config.index_dir);
-    let _ = writeln!(out, "  model dir: {}", status.config.model_dir);
+    let _ = writeln!(
+        out,
+        "  model dir: {}",
+        truncate_middle(&status.config.model_dir, width.saturating_sub(13))
+    );
     let _ = writeln!(out, "  rrf k: {}", status.config.rrf_k);
     let _ = writeln!(out, "  quality weight: {}", status.config.quality_weight);
     let _ = writeln!(
@@ -5765,7 +8578,7 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     );
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "Runtime:");
+    let _ = writeln!(out, "{}", paint("RUNTIME", "1;38;5;111", no_color));
     let _ = writeln!(
         out,
         "  disk budget stage: {}",
@@ -5796,17 +8609,34 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     if let Some(index_bytes) = status.runtime.tracked_index_bytes {
         let _ = writeln!(
             out,
-            "  tracked index bytes: {}",
-            humanize_bytes(index_bytes)
+            "  tracked index bytes: {} ({})",
+            humanize_bytes(index_bytes),
+            format_count_u64(index_bytes)
         );
     }
     if let Some(budget_bytes) = status.runtime.disk_budget_bytes {
-        let _ = writeln!(out, "  disk budget bytes: {}", humanize_bytes(budget_bytes));
+        let _ = writeln!(
+            out,
+            "  disk budget bytes: {} ({})",
+            humanize_bytes(budget_bytes),
+            format_count_u64(budget_bytes)
+        );
     }
     let _ = writeln!(
         out,
         "  storage pressure emergency: {}",
         status.runtime.storage_pressure_emergency
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        paint(
+            "NEXT: fsfs search \"your query\" --limit 10  |  fsfs search \"query\" --stream --format jsonl",
+            "38;5;244",
+            no_color
+        )
     );
 
     out
@@ -8174,7 +11004,7 @@ mod tests {
         assert_eq!(payload.models[0].tier, "fast");
         assert!(payload.models[0].cached);
         assert_eq!(payload.models[1].tier, "quality");
-        assert!(!payload.models[1].cached);
+        assert!(payload.models[1].cached);
         assert_eq!(
             payload.runtime.tracked_index_bytes,
             Some(payload.index.size_bytes)
@@ -9179,5 +12009,68 @@ mod tests {
             triple.contains("linux") || triple.contains("darwin") || triple.contains("windows"),
             "triple should contain OS: {triple}"
         );
+    }
+
+    #[test]
+    fn probe_helpers_detect_expected_signals() {
+        assert!(super::is_probe_excluded_dir_name("node_modules"));
+        assert!(super::is_repo_marker_filename("cargo.toml"));
+        assert_eq!(
+            super::classify_probe_file(Path::new("/tmp/demo.rs"), "demo.rs"),
+            Some(super::RootProbeFileClass::Code)
+        );
+        assert_eq!(
+            super::classify_probe_file(Path::new("/tmp/README.md"), "readme.md"),
+            Some(super::RootProbeFileClass::Document)
+        );
+    }
+
+    #[test]
+    fn score_index_root_prefers_projects_layout() {
+        let stats = super::RootProbeStats {
+            candidate_files: 1_200,
+            code_files: 980,
+            doc_files: 220,
+            repo_markers: 80,
+            candidate_bytes: 512 * 1024 * 1024,
+            scanned_dirs: 200,
+            scanned_entries: 10_000,
+        };
+        let projects_score = super::score_index_root(
+            Path::new("/data/projects"),
+            &stats,
+            Some(Path::new("/home/u")),
+        );
+        let home_score =
+            super::score_index_root(Path::new("/home/u"), &stats, Some(Path::new("/home/u")));
+        assert!(projects_score > home_score);
+    }
+
+    #[test]
+    fn indexing_progress_snapshot_reports_eta() {
+        let snapshot = super::IndexingProgressSnapshot {
+            stage: super::IndexingProgressStage::Indexing,
+            target_root: PathBuf::from("/data/projects"),
+            index_root: PathBuf::from("/data/projects/.frankensearch"),
+            discovered_files: 1_000,
+            candidate_files: 800,
+            processed_files: 400,
+            skipped_files: 100,
+            semantic_files: 300,
+            canonical_bytes: 400 * 1024 * 1024,
+            canonical_lines: 8_000_000,
+            index_size_bytes: 128 * 1024 * 1024,
+            discovery_elapsed_ms: 1_000,
+            lexical_elapsed_ms: 2_000,
+            embedding_elapsed_ms: 5_000,
+            vector_elapsed_ms: 3_000,
+            total_elapsed_ms: 20_000,
+            active_file: None,
+        };
+        assert!(snapshot.files_per_second() > 0.0);
+        assert!(snapshot.lines_per_second() > 0.0);
+        assert!(snapshot.mb_per_second() > 0.0);
+        assert!(snapshot.index_growth_bytes_per_second() > 0.0);
+        assert!(snapshot.eta_seconds().is_some());
     }
 }
