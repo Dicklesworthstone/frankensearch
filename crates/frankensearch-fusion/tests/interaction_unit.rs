@@ -124,6 +124,7 @@ impl LexicalSearch for StubLexical {
                         doc_id: format!("doc-{doc_idx}"),
                         score: (count - i) as f32 / count as f32,
                         source: ScoreSource::Lexical,
+                        index: None,
                         fast_score: None,
                         quality_score: None,
                         lexical_score: Some((count - i) as f32 / count as f32),

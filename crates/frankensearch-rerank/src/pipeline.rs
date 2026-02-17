@@ -320,6 +320,7 @@ mod tests {
                 doc_id: format!("doc-{i}"),
                 score: (i as f32).mul_add(-0.1, 1.0),
                 source: ScoreSource::Hybrid,
+                index: None,
                 fast_score: None,
                 quality_score: None,
                 lexical_score: None,

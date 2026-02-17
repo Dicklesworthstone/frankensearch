@@ -47,14 +47,21 @@ use frankensearch_core::{
     TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
 use frankensearch_embed::CachedEmbedder;
-use frankensearch_index::TwoTierIndex;
+use frankensearch_index::{SearchParams, TwoTierIndex};
 
+use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
     blend_two_tier, build_borrowed_rank_map, compute_rank_changes_with_maps,
     kendall_tau_with_refined_rank,
 };
+use crate::calibration::CalibratorConfig;
+use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
+use crate::conformal::{AdaptiveConformalState, ConformalSearchCalibration};
 #[cfg(feature = "graph")]
 use crate::graph_rank::GraphRanker;
+use crate::mmr::{MmrConfig, mmr_rerank};
+use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
+use crate::prf::{PrfConfig, prf_expand};
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse, rrf_fuse_with_graph};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -115,6 +122,15 @@ pub struct TwoTierSearcher {
     live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
     canonicalizer: Box<dyn Canonicalizer>,
     config: TwoTierConfig,
+    prf_config: PrfConfig,
+    mmr_config: MmrConfig,
+    adaptive_fusion: Option<Arc<AdaptiveFusion>>,
+    score_calibrator: Option<CalibratorConfig>,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
+    phase_gate: Option<Mutex<PhaseGate>>,
+    conformal_calibration: Option<ConformalSearchCalibration>,
+    adaptive_conformal_state: Option<Mutex<AdaptiveConformalState>>,
+    search_params: Option<SearchParams>,
     #[cfg(feature = "graph")]
     document_graph: Option<Arc<DocumentGraph>>,
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
@@ -141,6 +157,15 @@ impl TwoTierSearcher {
             live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
             canonicalizer: Box::new(DefaultCanonicalizer::default()),
             config,
+            prf_config: PrfConfig::default(),
+            mmr_config: MmrConfig::default(),
+            adaptive_fusion: None,
+            score_calibrator: None,
+            circuit_breaker: None,
+            phase_gate: None,
+            conformal_calibration: None,
+            adaptive_conformal_state: None,
+            search_params: None,
             #[cfg(feature = "graph")]
             document_graph: None,
             embedding_cache_capacity: None,
@@ -174,6 +199,94 @@ impl TwoTierSearcher {
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
         self
+    }
+
+    /// Configure pseudo-relevance feedback for quality query expansion.
+    #[must_use]
+    pub const fn with_prf_config(mut self, config: PrfConfig) -> Self {
+        self.prf_config = config;
+        self
+    }
+
+    /// Configure MMR diversity reranking for final results.
+    #[must_use]
+    pub const fn with_mmr_config(mut self, config: MmrConfig) -> Self {
+        self.mmr_config = config;
+        self
+    }
+
+    /// Attach adaptive fusion posteriors used for dynamic RRF-K and blend weights.
+    ///
+    /// The adaptive state is shared so callers can feed explicit feedback events.
+    #[must_use]
+    pub fn with_adaptive_fusion(mut self, adaptive_fusion: Arc<AdaptiveFusion>) -> Self {
+        self.adaptive_fusion = Some(adaptive_fusion);
+        self
+    }
+
+    /// Calibrate semantic scores before blending/refinement.
+    #[must_use]
+    pub fn with_score_calibrator(mut self, calibrator: CalibratorConfig) -> Self {
+        self.score_calibrator = Some(calibrator);
+        self
+    }
+
+    /// Enable a quality-tier circuit breaker for automatic Phase-2 skipping.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, circuit_breaker: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(circuit_breaker);
+        self
+    }
+
+    /// Enable sequential-testing phase gating for automatic Phase-2 skipping.
+    #[must_use]
+    pub const fn with_phase_gate(mut self, phase_gate: PhaseGate) -> Self {
+        self.phase_gate = Some(Mutex::new(phase_gate));
+        self
+    }
+
+    /// Configure phase gating directly from a gate config.
+    #[must_use]
+    pub const fn with_phase_gate_config(self, config: PhaseGateConfig) -> Self {
+        self.with_phase_gate(PhaseGate::new(config))
+    }
+
+    /// Attach conformal calibration used to scale candidate budgets.
+    #[must_use]
+    pub fn with_conformal_calibration(mut self, calibration: ConformalSearchCalibration) -> Self {
+        self.conformal_calibration = Some(calibration);
+        self
+    }
+
+    /// Attach adaptive conformal state used with conformal candidate budgeting.
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub fn with_adaptive_conformal_state(mut self, state: AdaptiveConformalState) -> Self {
+        self.adaptive_conformal_state = Some(Mutex::new(state));
+        self
+    }
+
+    /// Override brute-force vector-search parallelism parameters for Phase 1.
+    ///
+    /// ANN retrieval remains unchanged; overrides are applied when the fast tier
+    /// uses brute-force scanning.
+    #[must_use]
+    pub const fn with_search_params(mut self, params: SearchParams) -> Self {
+        self.search_params = Some(params);
+        self
+    }
+
+    /// Convert a single searcher into a federated searcher seed.
+    ///
+    /// This provides a direct wiring path from `TwoTierSearcher` into
+    /// `FederatedSearcher` without requiring callers to manually bridge types.
+    #[must_use]
+    pub fn into_federated(
+        self: Arc<Self>,
+        name: impl Into<String>,
+        weight: f32,
+    ) -> crate::federated::FederatedSearcher {
+        crate::federated::FederatedSearcher::new().add_index(name, self, weight)
     }
 
     /// Attach an optional document graph used for phase-1 graph ranking.
@@ -426,7 +539,20 @@ impl TwoTierSearcher {
         // performing a "lexical -> quality rerank" flow.  Skipped when fast
         // embedding failed entirely (phase1_vectors_searched == 0) because the
         // embedding pipeline is degraded and quality refinement would be unreliable.
+        let quality_circuit_open = if self.should_run_quality()
+            && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
+        {
+            let (skip, _evidence) = circuit_breaker.should_skip_quality();
+            skip
+        } else {
+            false
+        };
+        let quality_phase_gate_skip =
+            self.should_run_quality() && self.phase_gate_should_skip_quality();
+
         if self.should_run_quality()
+            && !quality_circuit_open
+            && !quality_phase_gate_skip
             && !initial_hits.is_empty()
             && metrics.phase1_vectors_searched > 0
         {
@@ -436,6 +562,7 @@ impl TwoTierSearcher {
             let phase2_future = Box::pin(self.run_phase2(
                 cx,
                 semantic_query,
+                query_class,
                 k,
                 &initial_hits,
                 &text_fn,
@@ -454,12 +581,20 @@ impl TwoTierSearcher {
                 Err(_elapsed) => {
                     let phase2_latency = phase2_start.elapsed();
                     metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
+                    let phase2_latency_ms =
+                        u64::try_from(phase2_latency.as_millis()).unwrap_or(u64::MAX);
                     let timeout_error = SearchError::SearchTimeout {
-                        elapsed_ms: u64::try_from(phase2_latency.as_millis()).unwrap_or(u64::MAX),
+                        elapsed_ms: phase2_latency_ms,
                         budget_ms: self.config.quality_timeout_ms,
                     };
                     metrics.skip_reason = Some(timeout_error.to_string());
                     self.export_error(&timeout_error);
+                    if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                        let outcome = QualityOutcome::Slow {
+                            latency_ms: phase2_latency_ms,
+                        };
+                        let _ = circuit_breaker.record_outcome(&outcome);
+                    }
                     if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                         let refinement_failed_event_id = self.emit_search_telemetry(
                             semantic_query,
@@ -492,6 +627,19 @@ impl TwoTierSearcher {
                         let phase2_latency = phase2_start.elapsed();
                         let refined_count = refined_results.len();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
+                        self.maybe_record_phase_gate_observation(
+                            &initial_hits,
+                            &refined_results,
+                            query_class,
+                        );
+                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                            let outcome = QualityOutcome::Success {
+                                latency_ms: u64::try_from(phase2_latency.as_millis())
+                                    .unwrap_or(u64::MAX),
+                                tau_improvement: metrics.kendall_tau.unwrap_or(0.0),
+                            };
+                            let _ = circuit_breaker.record_outcome(&outcome);
+                        }
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             let refined_event_id = self.emit_search_telemetry(
                                 semantic_query,
@@ -531,6 +679,9 @@ impl TwoTierSearcher {
                         });
                     }
                     Err(SearchError::Cancelled { phase, reason }) => {
+                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                            let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
+                        }
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             self.emit_session_stop_telemetry(
                                 root_request_id,
@@ -548,6 +699,9 @@ impl TwoTierSearcher {
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         metrics.skip_reason = Some(format!("{err}"));
                         self.export_error(&err);
+                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                            let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
+                        }
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                             let refinement_failed_event_id = self.emit_search_telemetry(
                                 semantic_query,
@@ -579,7 +733,11 @@ impl TwoTierSearcher {
                 },
             }
         } else if self.should_run_quality() {
-            if initial_hits.is_empty() {
+            if quality_circuit_open {
+                metrics.skip_reason = Some("circuit_breaker_open".to_owned());
+            } else if quality_phase_gate_skip {
+                metrics.skip_reason = Some("phase_gate_skip_quality".to_owned());
+            } else if initial_hits.is_empty() {
                 metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
             } else {
                 metrics.skip_reason = Some("vector_index_unavailable".to_owned());
@@ -675,7 +833,9 @@ impl TwoTierSearcher {
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let base_candidates = candidate_count(k, 0, self.config.candidate_multiplier);
+        let candidate_target = self.conformal_candidate_target(k);
+        let base_candidates =
+            candidate_count(candidate_target, 0, self.config.candidate_multiplier);
 
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
         let semantic_budget =
@@ -684,7 +844,7 @@ impl TwoTierSearcher {
             scaled_budget(base_candidates, query_class.lexical_budget_multiplier());
 
         let rrf_config = RrfConfig {
-            k: self.config.rrf_k,
+            k: self.effective_rrf_k(query_class),
         };
 
         // Fast embedding.
@@ -725,7 +885,12 @@ impl TwoTierSearcher {
                 }
                 // Vector search.
                 let search_start = Instant::now();
-                let fast_hits = self.index.search_fast(&query_vec, semantic_budget)?;
+                let mut fast_hits = self.index.search_fast_with_params(
+                    &query_vec,
+                    semantic_budget,
+                    self.search_params,
+                )?;
+                self.apply_score_calibration_to_hits(&mut fast_hits);
                 let fast_hits = if let Some(exclusions) = normalized_exclusions {
                     filter_vector_hits_by_negations(fast_hits, exclusions, text_fn, "semantic")
                 } else {
@@ -795,7 +960,7 @@ impl TwoTierSearcher {
                                     &[],
                                     self.config.explain,
                                     self.fast_embedder.id(),
-                                    self.config.rrf_k,
+                                    rrf_config.k,
                                 )
                             },
                         )
@@ -820,7 +985,7 @@ impl TwoTierSearcher {
                             lexical,
                             self.config.explain,
                             self.fast_embedder.id(),
-                            self.config.rrf_k,
+                            rrf_config.k,
                         )
                     },
                 );
@@ -868,6 +1033,7 @@ impl TwoTierSearcher {
         &self,
         cx: &Cx,
         query: &str,
+        query_class: QueryClass,
         k: usize,
         initial_results: &[ScoredResult],
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
@@ -885,7 +1051,7 @@ impl TwoTierSearcher {
 
         // Quality embedding.
         let embed_start = Instant::now();
-        let quality_vec = match quality_embedder.embed(cx, query).await {
+        let mut quality_vec = match quality_embedder.embed(cx, query).await {
             Ok(quality_vec) => {
                 let quality_embed_elapsed = embed_start.elapsed();
                 metrics.quality_embed_ms = quality_embed_elapsed.as_secs_f64() * 1000.0;
@@ -928,9 +1094,46 @@ impl TwoTierSearcher {
             }
         };
 
+        if self.prf_config.should_expand(&query_class) {
+            let mut feedback_embeddings = Vec::new();
+            for result in initial_results.iter().take(self.prf_config.top_k_feedback) {
+                match self.index.semantic_vector_for_doc_id(&result.doc_id) {
+                    Ok(Some(embedding)) => {
+                        let weight = if self.prf_config.score_weighted {
+                            f64::from(result.score.max(0.0))
+                        } else {
+                            1.0
+                        };
+                        feedback_embeddings.push((embedding, weight));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        self.export_error(&err);
+                        tracing::warn!(
+                            error = %err,
+                            doc_id = %result.doc_id,
+                            "prf feedback vector lookup failed; continuing with remaining candidates"
+                        );
+                    }
+                }
+            }
+
+            if feedback_embeddings.len() >= self.prf_config.min_feedback_docs {
+                let refs = feedback_embeddings
+                    .iter()
+                    .map(|(embedding, weight)| (embedding.as_slice(), *weight))
+                    .collect::<Vec<_>>();
+                if let Some(expanded) =
+                    prf_expand(&quality_vec, &refs, self.prf_config.clamped_alpha())
+                {
+                    quality_vec = expanded;
+                }
+            }
+        }
+
         // Get quality scores for top candidates from initial phase.
         let search_start = Instant::now();
-        let fast_hits: Vec<VectorHit> = initial_results
+        let mut fast_hits: Vec<VectorHit> = initial_results
             .iter()
             .enumerate()
             .map(|(i, r)| VectorHit {
@@ -942,6 +1145,7 @@ impl TwoTierSearcher {
                 doc_id: r.doc_id.clone(),
             })
             .collect();
+        self.apply_score_calibration_to_hits(&mut fast_hits);
 
         // Look up indices in the fast index for quality scoring.
         let mut fast_indices = Vec::with_capacity(fast_hits.len());
@@ -968,11 +1172,11 @@ impl TwoTierSearcher {
                 doc_id,
             });
         }
+        self.apply_score_calibration_to_hits(&mut quality_hits);
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
-        #[allow(clippy::cast_possible_truncation)]
-        let blend_factor = self.config.quality_weight as f32;
+        let blend_factor = self.effective_blend_factor(query_class);
         let blended = blend_two_tier(&fast_hits, &quality_hits, blend_factor);
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -984,6 +1188,16 @@ impl TwoTierSearcher {
         let tau = kendall_tau_with_refined_rank(&fast_hits, &refined_rank);
         metrics.kendall_tau = tau;
         metrics.rank_changes = rank_changes;
+        if let Some(adaptive_fusion) = self.adaptive_fusion.as_ref() {
+            let success = tau.is_some_and(|value| value < 0.98);
+            let signal = if success {
+                SignalSource::Click
+            } else {
+                SignalSource::Skip
+            };
+            let _ = adaptive_fusion.update_blend(query_class, success, signal);
+        }
+        self.maybe_update_adaptive_conformal(tau);
 
         let initial_by_doc: HashMap<&str, &ScoredResult> = initial_results
             .iter()
@@ -1126,6 +1340,46 @@ impl TwoTierSearcher {
             }
         }
 
+        if self.mmr_config.enabled && results.len() > 1 {
+            let pool = results.len().min(self.mmr_config.candidate_pool.max(1));
+            if pool > 1 {
+                let mut embeddings = Vec::with_capacity(pool);
+                let mut scores = Vec::with_capacity(pool);
+                let mut complete_pool = true;
+
+                for result in results.iter().take(pool) {
+                    if let Some(embedding) =
+                        self.index.semantic_vector_for_doc_id(&result.doc_id)?
+                    {
+                        embeddings.push(embedding);
+                        scores.push(f64::from(result.score));
+                    } else {
+                        complete_pool = false;
+                        break;
+                    }
+                }
+
+                if complete_pool {
+                    let refs = embeddings
+                        .iter()
+                        .map(std::vec::Vec::as_slice)
+                        .collect::<Vec<_>>();
+                    let order = mmr_rerank(&scores, &refs, pool, &self.mmr_config);
+                    if order.len() == pool {
+                        let head = results.iter().take(pool).cloned().collect::<Vec<_>>();
+                        let mut reranked = Vec::with_capacity(results.len());
+                        for idx in order {
+                            if let Some(item) = head.get(idx) {
+                                reranked.push(item.clone());
+                            }
+                        }
+                        reranked.extend(results.into_iter().skip(pool));
+                        results = reranked;
+                    }
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -1220,6 +1474,128 @@ impl TwoTierSearcher {
     /// Whether quality refinement should run.
     fn should_run_quality(&self) -> bool {
         !self.config.fast_only && self.quality_embedder.is_some()
+    }
+
+    fn phase_gate_should_skip_quality(&self) -> bool {
+        let Some(phase_gate) = self.phase_gate.as_ref() else {
+            return false;
+        };
+        phase_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .should_skip_quality()
+    }
+
+    fn maybe_record_phase_gate_observation(
+        &self,
+        initial_results: &[ScoredResult],
+        refined_results: &[ScoredResult],
+        query_class: QueryClass,
+    ) {
+        let Some(phase_gate) = self.phase_gate.as_ref() else {
+            return;
+        };
+        let (Some(initial_top), Some(refined_top)) =
+            (initial_results.first(), refined_results.first())
+        else {
+            return;
+        };
+
+        let evidence = {
+            let mut phase_gate = phase_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            phase_gate.update(&PhaseObservation {
+                fast_score: f64::from(initial_top.score),
+                quality_score: f64::from(refined_top.score),
+                user_signal: None,
+            })
+        };
+        for record in evidence {
+            tracing::debug!(
+                reason_code = %record.reason_code,
+                event_type = %record.event_type,
+                pipeline_state = %record.pipeline_state,
+                query_class = ?query_class,
+                source_component = %record.source_component,
+                "{}",
+                record.reason_human
+            );
+        }
+    }
+
+    fn effective_rrf_k(&self, query_class: QueryClass) -> f64 {
+        self.adaptive_fusion
+            .as_ref()
+            .map_or(self.config.rrf_k, |adaptive| adaptive.rrf_k(query_class))
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn effective_blend_factor(&self, query_class: QueryClass) -> f32 {
+        self.adaptive_fusion.as_ref().map_or_else(
+            || self.config.quality_weight as f32,
+            |adaptive| adaptive.blend_factor(query_class) as f32,
+        )
+    }
+
+    fn conformal_candidate_target(&self, requested_k: usize) -> usize {
+        let Some(calibration) = self.conformal_calibration.as_ref() else {
+            return requested_k;
+        };
+        let alpha = self.adaptive_conformal_state.as_ref().map_or(0.1, |state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .alpha
+        });
+        match calibration.required_k_checked(alpha) {
+            Ok(required) => requested_k.max(required),
+            Err(error) => {
+                self.export_error(&error);
+                requested_k
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply_score_calibration_to_hits(&self, hits: &mut [VectorHit]) {
+        let Some(calibrator) = self.score_calibrator.as_ref() else {
+            return;
+        };
+        for hit in hits {
+            let calibrated = calibrator.calibrate(f64::from(hit.score));
+            hit.score = calibrated as f32;
+            if !hit.score.is_finite() {
+                hit.score = 0.0;
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn maybe_update_adaptive_conformal(&self, tau: Option<f64>) {
+        let Some(calibration) = self.conformal_calibration.as_ref() else {
+            return;
+        };
+        let Some(state_lock) = self.adaptive_conformal_state.as_ref() else {
+            return;
+        };
+
+        let observed_error_rate = tau.map_or(0.5_f32, |value| {
+            let normalized = value.midpoint(1.0).clamp(0.0, 1.0);
+            (1.0 - normalized) as f32
+        });
+
+        let mut state = state_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = state.update(observed_error_rate, calibration) {
+            self.export_error(&error);
+            tracing::warn!(
+                error = %error,
+                observed_error_rate,
+                "adaptive conformal update failed"
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2189,6 +2565,7 @@ mod tests {
                         doc_id: format!("lex-doc-{i}"),
                         score: (3 - i) as f32,
                         source: ScoreSource::Lexical,
+                        index: None,
                         fast_score: None,
                         quality_score: None,
                         lexical_score: Some((3 - i) as f32),
@@ -2615,6 +2992,109 @@ mod tests {
 
             assert_eq!(phase_count, 1, "fast_only should skip quality phase");
             assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
+        });
+    }
+
+    #[test]
+    fn phase_gate_can_preempt_quality_phase() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let mut phase_gate = PhaseGate::new(PhaseGateConfig {
+                timeout_queries: 1,
+                ..PhaseGateConfig::default()
+            });
+            let _ = phase_gate.update(&PhaseObservation {
+                fast_score: 1.0,
+                quality_score: 0.0,
+                user_signal: Some(false),
+            });
+            assert!(phase_gate.should_skip_quality());
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_phase_gate(phase_gate);
+
+            let mut phase_count = 0;
+            let metrics = searcher
+                .search(&cx, "test", 5, |_| None, |_| phase_count += 1)
+                .await
+                .expect("search should succeed");
+
+            assert_eq!(phase_count, 1, "phase gate should skip quality phase");
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("phase_gate_skip_quality")
+            );
+        });
+    }
+
+    #[test]
+    fn phase_gate_updates_after_refinement_and_can_skip_later_queries() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_phase_gate_config(PhaseGateConfig {
+                    timeout_queries: 1,
+                    ..PhaseGateConfig::default()
+                });
+
+            let mut first_phase_count = 0;
+            let first_metrics = searcher
+                .search(&cx, "test", 5, |_| None, |_| first_phase_count += 1)
+                .await
+                .expect("first search should succeed");
+            assert_eq!(
+                first_phase_count, 2,
+                "first query should still run refinement before the gate learns"
+            );
+            assert!(
+                first_metrics.skip_reason.is_none(),
+                "first query should not report skip"
+            );
+
+            let mut second_phase_count = 0;
+            let second_metrics = searcher
+                .search(&cx, "test", 5, |_| None, |_| second_phase_count += 1)
+                .await
+                .expect("second search should succeed");
+            assert_eq!(
+                second_phase_count, 1,
+                "second query should reflect the learned gate decision"
+            );
+            assert_eq!(
+                second_metrics.skip_reason.as_deref(),
+                Some("phase_gate_skip_quality")
+            );
+        });
+    }
+
+    #[test]
+    fn search_params_override_plumbs_through_phase1_vector_scan() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index.clone(), fast, TwoTierConfig::default())
+                .with_search_params(SearchParams {
+                    parallel_enabled: false,
+                    parallel_threshold: usize::MAX,
+                    parallel_chunk_size: 1,
+                });
+
+            let (results, metrics) = searcher
+                .search_collect(&cx, "test", 5)
+                .await
+                .expect("search should succeed");
+            assert!(!results.is_empty());
+            assert_eq!(
+                metrics.phase1_vectors_searched,
+                index.doc_count(),
+                "phase-1 should still scan the same candidate set with override params"
+            );
         });
     }
 
@@ -3365,6 +3845,7 @@ mod tests {
                 rrf_score: 1.5,
                 lexical_rank: Some(0),
                 semantic_rank: None,
+                semantic_index: None,
                 lexical_score: Some(3.0),
                 semantic_score: None,
                 in_both_sources: false,
@@ -3374,6 +3855,7 @@ mod tests {
                 rrf_score: 1.0,
                 lexical_rank: None,
                 semantic_rank: Some(0),
+                semantic_index: Some(0),
                 lexical_score: None,
                 semantic_score: Some(0.8),
                 in_both_sources: false,
@@ -3383,6 +3865,7 @@ mod tests {
             doc_id: "lex-doc-1".to_owned(),
             score: 3.0,
             source: ScoreSource::Lexical,
+            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: Some(3.0),
@@ -4409,6 +4892,7 @@ mod tests {
             rrf_score: 2.0,
             lexical_rank: Some(0),
             semantic_rank: Some(1),
+            semantic_index: Some(1),
             lexical_score: Some(3.0),
             semantic_score: Some(0.8),
             in_both_sources: true,
@@ -4426,6 +4910,7 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: Some(0),
+            semantic_index: Some(0),
             lexical_score: None,
             semantic_score: Some(0.9),
             in_both_sources: false,
@@ -4441,6 +4926,7 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: Some(0),
             semantic_rank: None,
+            semantic_index: None,
             lexical_score: Some(2.5),
             semantic_score: None,
             in_both_sources: false,
@@ -4456,6 +4942,7 @@ mod tests {
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: None,
+            semantic_index: None,
             lexical_score: None,
             semantic_score: None,
             in_both_sources: false,
@@ -4471,6 +4958,7 @@ mod tests {
             rrf_score: 1.25,
             lexical_rank: Some(1),
             semantic_rank: Some(3),
+            semantic_index: Some(3),
             lexical_score: Some(2.0),
             semantic_score: Some(0.5),
             in_both_sources: true,

@@ -21,10 +21,51 @@ use std::collections::{HashMap, HashSet};
 use frankensearch_core::{RankChanges, VectorHit};
 use tracing::{debug, instrument};
 
-use crate::normalize::min_max_normalize;
-
 const DEFAULT_BLEND_FACTOR: f32 = 0.7;
 const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
+
+fn robust_normalize(scores: &mut [f32]) {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut saw_finite = false;
+
+    for &value in scores.iter() {
+        if value.is_finite() {
+            min = min.min(value);
+            max = max.max(value);
+            saw_finite = true;
+        }
+    }
+
+    if !saw_finite {
+        scores.fill(NON_FINITE_SCORE_FALLBACK);
+        return;
+    }
+
+    let range = max - min;
+    // If range is significant, use min-max to align distributions.
+    // If range is tiny (e.g. single result or all identical), preserve absolute value
+    // but clamp to [0, 1] (assuming cosine-ish input).
+    if range > 0.01 {
+        for score in scores.iter_mut() {
+            if score.is_finite() {
+                *score = ((*score - min) / range).clamp(0.0, 1.0);
+            } else {
+                *score = NON_FINITE_SCORE_FALLBACK;
+            }
+        }
+    } else {
+        // Fallback: clamp to [0, 1].
+        // This avoids turning "0.99" into "0.5" just because it's the only result.
+        for score in scores.iter_mut() {
+            if score.is_finite() {
+                *score = score.clamp(0.0, 1.0);
+            } else {
+                *score = NON_FINITE_SCORE_FALLBACK;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ScorePair {
@@ -63,8 +104,8 @@ pub fn blend_two_tier(
 
     let mut fast_scores: Vec<f32> = fast_results.iter().map(|hit| hit.score).collect();
     let mut quality_scores: Vec<f32> = quality_results.iter().map(|hit| hit.score).collect();
-    min_max_normalize(&mut fast_scores);
-    min_max_normalize(&mut quality_scores);
+    robust_normalize(&mut fast_scores);
+    robust_normalize(&mut quality_scores);
 
     let mut merged: HashMap<&str, ScorePair> =
         HashMap::with_capacity(fast_results.len() + quality_results.len());
@@ -381,9 +422,9 @@ mod tests {
         let fast_only = score_for("fast-only", &blended);
         let quality_only = score_for("quality-only", &blended);
 
-        // Degenerate single-entry normalization -> 0.5 for each source.
-        assert!((fast_only - 0.15).abs() <= EPSILON);
-        assert!((quality_only - 0.35).abs() <= EPSILON);
+        // Degenerate single-entry normalization clamps source scores to 1.0.
+        assert!((fast_only - 0.3).abs() <= EPSILON);
+        assert!((quality_only - 0.7).abs() <= EPSILON);
     }
 
     #[test]
@@ -392,7 +433,7 @@ mod tests {
         let quality = vec![hit("same", 2.0, 0), hit("other", 2.0, 1)];
         let blended = blend_two_tier(&fast, &quality, 0.7);
 
-        assert!((score_for("same", &blended) - 0.5).abs() <= EPSILON);
+        assert!((score_for("same", &blended) - 1.0).abs() <= EPSILON);
     }
 
     #[test]

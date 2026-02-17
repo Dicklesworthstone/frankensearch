@@ -145,6 +145,9 @@ impl Default for KPosterior {
 impl KPosterior {
     /// Update the posterior with an observation of optimal K.
     pub fn update(&mut self, observed_k: f64) {
+        if !observed_k.is_finite() {
+            return;
+        }
         let precision_prior = 1.0 / self.sigma_sq;
         let precision_obs = 1.0 / self.sigma_obs_sq;
         let precision_post = precision_prior + precision_obs;

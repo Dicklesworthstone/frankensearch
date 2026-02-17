@@ -1276,6 +1276,7 @@ mod tests {
                 doc_id: "doc-test".into(),
                 score: 0.9,
                 source: frankensearch_core::ScoreSource::SemanticFast,
+                index: Some(0),
                 fast_score: Some(0.9),
                 quality_score: None,
                 lexical_score: None,
