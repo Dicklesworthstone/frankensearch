@@ -6149,17 +6149,23 @@ impl FsfsRuntime {
                         selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        selected = selected.saturating_add(1).min(proposals.len().saturating_sub(1));
+                        selected = selected
+                            .saturating_add(1)
+                            .min(proposals.len().saturating_sub(1));
                     }
                     KeyCode::Char('k') if key.modifiers == Modifiers::NONE => {
                         selected = selected.saturating_sub(1);
                     }
                     KeyCode::Char('j') if key.modifiers == Modifiers::NONE => {
-                        selected = selected.saturating_add(1).min(proposals.len().saturating_sub(1));
+                        selected = selected
+                            .saturating_add(1)
+                            .min(proposals.len().saturating_sub(1));
                     }
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+                    KeyCode::Escape | KeyCode::Char('q' | 'Q') => return Ok(None),
                     KeyCode::Enter => {
-                        return Ok(proposals.get(selected).map(|proposal| proposal.path.clone()));
+                        return Ok(proposals
+                            .get(selected)
+                            .map(|proposal| proposal.path.clone()));
                     }
                     KeyCode::Char(ch) if ch.is_ascii_digit() => {
                         if let Some(digit) = ch.to_digit(10)
@@ -6388,14 +6394,15 @@ impl FsfsRuntime {
                 );
             })?;
 
-            if let Some(event) = session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+            if let Some(event) =
+                session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
                 && let Event::Key(key) = event
             {
                 match key.code {
-                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q' | 'Q') => {
                         return Ok(());
                     }
-                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                    KeyCode::Char('r' | 'R') => {
                         payload = self.collect_status_payload()?;
                         last_refresh = Instant::now();
                     }
@@ -7346,7 +7353,11 @@ fn ui_fg_bg(no_color: bool, fg: PackedRgba, bg: PackedRgba) -> Style {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: ftui_core::geometry::Rect) -> ftui_core::geometry::Rect {
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    area: ftui_core::geometry::Rect,
+) -> ftui_core::geometry::Rect {
     let vertical = Flex::vertical()
         .constraints([
             Constraint::Percentage(f32::from(100_u16.saturating_sub(percent_y)) / 2.0),
@@ -7397,7 +7408,7 @@ fn wait_for_ftui_dismiss(
             && let Event::Key(key) = event
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q' | 'Q')
             )
         {
             return Ok(());
@@ -7405,6 +7416,7 @@ fn wait_for_ftui_dismiss(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_root_selector_frame(
     frame: &mut Frame,
     proposals: &[IndexRootProposal],
@@ -7522,7 +7534,10 @@ fn render_root_selector_frame(
 
     let detail_lines = vec![
         Line::from(Span::styled(
-            truncate_middle(&selected.path.display().to_string(), usize::from(body[1].width).saturating_sub(6)),
+            truncate_middle(
+                &selected.path.display().to_string(),
+                usize::from(body[1].width).saturating_sub(6),
+            ),
             ui_fg(no_color, PackedRgba::rgb(224, 240, 255)).bold(),
         )),
         Line::from(""),
@@ -7534,7 +7549,10 @@ fn render_root_selector_frame(
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
         Line::from(Span::styled(
-            format!("score: {}", format_count_u64(u64::try_from(selected.score.max(0)).unwrap_or_default())),
+            format!(
+                "score: {}",
+                format_count_u64(u64::try_from(selected.score.max(0)).unwrap_or_default())
+            ),
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
         Line::from(Span::styled(
@@ -7542,15 +7560,31 @@ fn render_root_selector_frame(
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
         Line::from(Span::styled(
-            format!("candidate files: {}", format_count_usize(selected.stats.candidate_files)),
+            format!(
+                "candidate files: {}",
+                format_count_usize(selected.stats.candidate_files)
+            ),
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
         Line::from(Span::styled(
-            format!("code/doc split: {:.1}% / {:.1}%", ratio_percent_usize(selected.stats.code_files, selected.stats.candidate_files.max(1)), ratio_percent_usize(selected.stats.doc_files, selected.stats.candidate_files.max(1))),
+            format!(
+                "code/doc split: {:.1}% / {:.1}%",
+                ratio_percent_usize(
+                    selected.stats.code_files,
+                    selected.stats.candidate_files.max(1)
+                ),
+                ratio_percent_usize(
+                    selected.stats.doc_files,
+                    selected.stats.candidate_files.max(1)
+                )
+            ),
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
         Line::from(Span::styled(
-            format!("estimated corpus: {}", humanize_bytes(selected.stats.candidate_bytes)),
+            format!(
+                "estimated corpus: {}",
+                humanize_bytes(selected.stats.candidate_bytes)
+            ),
             ui_fg(no_color, PackedRgba::rgb(172, 193, 227)),
         )),
     ];
@@ -7668,7 +7702,10 @@ fn render_existing_index_dashboard_frame(
             Span::styled(mode_label, mode_style),
         ]),
         Line::from(Span::styled(
-            truncate_middle(&payload.index.path, usize::from(layout[0].width).saturating_sub(10)),
+            truncate_middle(
+                &payload.index.path,
+                usize::from(layout[0].width).saturating_sub(10),
+            ),
             ui_fg(no_color, PackedRgba::rgb(175, 195, 229)),
         )),
     ]))
@@ -7731,7 +7768,11 @@ fn render_existing_index_dashboard_frame(
     composition_block.render(left[1], frame);
     let composition_inner = composition_block.inner(left[1]);
     let composition_rows = Flex::vertical()
-        .constraints([Constraint::Fixed(3), Constraint::Fixed(3), Constraint::Fixed(3)])
+        .constraints([
+            Constraint::Fixed(3),
+            Constraint::Fixed(3),
+            Constraint::Fixed(3),
+        ])
         .split(composition_inner);
     let coverage_label = format!("coverage {:>5.1}%", coverage_ratio * 100.0);
     ProgressBar::new()
@@ -7874,7 +7915,12 @@ fn render_indexing_progress_frame(
         return;
     }
     let layout = Flex::vertical()
-        .constraints([Constraint::Fixed(5), Constraint::Fixed(4), Constraint::Fill, Constraint::Fixed(3)])
+        .constraints([
+            Constraint::Fixed(5),
+            Constraint::Fixed(4),
+            Constraint::Fill,
+            Constraint::Fixed(3),
+        ])
         .split(area);
     let body = Flex::horizontal()
         .constraints([Constraint::Percentage(58.0), Constraint::Percentage(42.0)])
@@ -7896,7 +7942,9 @@ fn render_indexing_progress_frame(
         .candidate_files
         .saturating_sub(snapshot.processed_files);
     let stage_style = match snapshot.stage {
-        IndexingProgressStage::Discovering => ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold(),
+        IndexingProgressStage::Discovering => {
+            ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold()
+        }
         IndexingProgressStage::Indexing => ui_fg(no_color, PackedRgba::rgb(122, 219, 255)).bold(),
         IndexingProgressStage::Finalizing => ui_fg(no_color, PackedRgba::rgb(253, 188, 128)).bold(),
         IndexingProgressStage::Completed => ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
@@ -7913,7 +7961,11 @@ fn render_indexing_progress_frame(
                 ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
             ),
             Span::styled(
-                format!("  {} {}", indexing_spinner_frame(snapshot.total_elapsed_ms), snapshot.stage.label()),
+                format!(
+                    "  {} {}",
+                    indexing_spinner_frame(snapshot.total_elapsed_ms),
+                    snapshot.stage.label()
+                ),
                 stage_style,
             ),
         ]),
@@ -8015,9 +8067,7 @@ fn render_indexing_progress_frame(
         Line::from(Span::styled(
             format!(
                 "smoothed: {:.1} files/s  {:.1} lines/s  {:.2} MB/s",
-                render_state.files_rate_ema,
-                render_state.lines_rate_ema,
-                render_state.mb_rate_ema
+                render_state.files_rate_ema, render_state.lines_rate_ema, render_state.mb_rate_ema
             ),
             ui_fg(no_color, PackedRgba::rgb(170, 190, 222)),
         )),
@@ -8115,7 +8165,10 @@ fn render_indexing_progress_frame(
             ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
         )),
         Line::from(Span::styled(
-            format!("index growth {:.1} KB/s (ema {:.1})", render_state.instant_growth_kb_per_second, render_state.growth_rate_ema),
+            format!(
+                "index growth {:.1} KB/s (ema {:.1})",
+                render_state.instant_growth_kb_per_second, render_state.growth_rate_ema
+            ),
             ui_fg(no_color, PackedRgba::rgb(173, 193, 226)),
         )),
     ]))
@@ -8128,12 +8181,10 @@ fn render_indexing_progress_frame(
     )
     .render(right[0], frame);
 
-    let active_file_line = snapshot
-        .active_file
-        .as_deref()
-        .map_or_else(|| "waiting for active file…".to_owned(), |value| {
-            truncate_middle(value, usize::from(right[1].width).saturating_sub(10))
-        });
+    let active_file_line = snapshot.active_file.as_deref().map_or_else(
+        || "waiting for active file…".to_owned(),
+        |value| truncate_middle(value, usize::from(right[1].width).saturating_sub(10)),
+    );
     Paragraph::new(Text::from_lines(vec![
         Line::from(Span::styled(
             active_file_line,
