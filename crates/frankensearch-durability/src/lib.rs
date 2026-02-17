@@ -25,8 +25,9 @@ pub mod repair_trailer;
 pub mod tantivy_wrapper;
 
 pub use codec::{
-    CodecFacade, DecodeFailureClass, DecodedPayload, EncodedData, EncodedPayload, RepairCodec,
-    RepairCodecConfig, RepairData, VerifyResult, classify_decode_failure,
+    CodecFacade, DecodeFailureClass, DecodedPayload, DefaultSymbolCodec, EncodedData,
+    EncodedPayload, RepairCodec, RepairCodecConfig, RepairData, VerifyResult,
+    classify_decode_failure,
 };
 pub use config::DurabilityConfig;
 pub use file_protector::{

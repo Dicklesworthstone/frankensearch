@@ -354,7 +354,17 @@ pub(crate) fn append_wal_batch(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // File exists — open in write mode (not append) so we can
             // seek and truncate in-place without releasing the handle.
-            let mut file = OpenOptions::new().write(true).open(wal_path)?;
+            //
+            // We use .create(true) here to handle the TOCTOU race where the file
+            // is deleted by another process (e.g. compaction) between our
+            // create_new check above and this open. If that happens, we create
+            // a new empty file, which `existing_len` check below will catch
+            // and initialize with a header.
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(wal_path)?;
             let existing_len = file.metadata()?.len();
             if existing_len < WAL_HEADER_SIZE as u64 {
                 // Empty or truncated file — the creator likely crashed before
@@ -504,7 +514,7 @@ mod tests {
 
         append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
 
-        let (loaded, generation) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, generation, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(generation, 0);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].doc_id, "doc-0");
@@ -539,7 +549,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded, generation) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, generation, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(generation, 0);
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].doc_id, "doc-0");
@@ -571,7 +581,7 @@ mod tests {
         data.extend_from_slice(&[0xFF; 3]); // truncated entry
         std::fs::write(&path, &data).unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1, "only the good batch should survive");
         assert_eq!(loaded[0].doc_id, "doc-good");
 
@@ -608,7 +618,7 @@ mod tests {
         data[last_byte] ^= 0xFF;
         std::fs::write(&path, &data).unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(
             loaded.len(),
             1,
@@ -622,7 +632,7 @@ mod tests {
     #[test]
     fn nonexistent_wal_returns_empty() {
         let path = temp_wal_path("nonexistent");
-        let (loaded, _) = read_wal(&path, 4, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -653,7 +663,7 @@ mod tests {
 
         append_wal_batch(&path, &entries, dim, Quantization::F32, 0, false).unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F32).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F32).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(
             (loaded[0].embedding[0] - 0.123_456).abs() < f32::EPSILON,
@@ -729,7 +739,7 @@ mod tests {
     fn wal_too_small_returns_empty() {
         let path = temp_wal_path("too-small");
         std::fs::write(&path, [0u8; 10]).unwrap();
-        let (loaded, _) = read_wal(&path, 4, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
         std::fs::remove_file(&path).ok();
     }
@@ -825,7 +835,7 @@ mod tests {
         let path = temp_wal_path("empty-batch");
         let dim = 4;
         append_wal_batch(&path, &[], dim, Quantization::F16, 0, false).unwrap();
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
         std::fs::remove_file(&path).ok();
     }
@@ -962,7 +972,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-sync");
         std::fs::remove_file(&path).ok();
@@ -1001,7 +1011,7 @@ mod tests {
         // File should be larger
         assert!(data_after_second.len() > data_after_first.len());
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 2);
         std::fs::remove_file(&path).ok();
     }
@@ -1026,7 +1036,7 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         std::fs::write(&path, &data).unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-good");
         std::fs::remove_file(&path).ok();
@@ -1043,7 +1053,7 @@ mod tests {
         }];
 
         append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         // F16 has ~3 decimal digits of precision
         assert!((loaded[0].embedding[0] - 0.123_456).abs() < 0.001);
@@ -1063,7 +1073,7 @@ mod tests {
         }];
 
         append_wal_batch(&path, &entries, dim, Quantization::F32, 0, false).unwrap();
-        let (loaded, _) = read_wal(&path, dim, Quantization::F32).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F32).unwrap();
         assert!((loaded[0].embedding[0] - val).abs() < f32::EPSILON);
         assert!((loaded[0].embedding[1] + val).abs() < f32::EPSILON);
         assert!(loaded[0].embedding[2].abs() < f32::EPSILON);
@@ -1089,7 +1099,7 @@ mod tests {
         }];
         append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
 
-        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-0");
         std::fs::remove_file(&path).ok();

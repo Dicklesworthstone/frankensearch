@@ -74,12 +74,13 @@ impl QueryClass {
             return true;
         }
 
-        // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456)
+        // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456, my-project-789)
         if !s.chars().any(char::is_whitespace) && s.contains('-') {
-            let parts: Vec<&str> = s.splitn(2, '-').collect();
+            let parts: Vec<&str> = s.rsplitn(2, '-').collect();
             if parts.len() == 2
-                && parts[0].chars().all(|c| c.is_ascii_alphanumeric())
-                && parts[1].chars().all(|c| c.is_ascii_digit())
+                // parts[0] is the suffix (digits), parts[1] is the prefix
+                && parts[0].chars().all(|c| c.is_ascii_digit())
+                && parts[1].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 && !parts[0].is_empty()
                 && !parts[1].is_empty()
             {
@@ -182,6 +183,18 @@ mod tests {
     fn classify_issue_id() {
         assert_eq!(QueryClass::classify("bd-123"), QueryClass::Identifier);
         assert_eq!(QueryClass::classify("JIRA-456"), QueryClass::Identifier);
+    }
+
+    #[test]
+    fn classify_hyphenated_prefix_issue_id() {
+        assert_eq!(
+            QueryClass::classify("my-project-123"),
+            QueryClass::Identifier
+        );
+        assert_eq!(
+            QueryClass::classify("repo_name-789"),
+            QueryClass::Identifier
+        );
     }
 
     #[test]

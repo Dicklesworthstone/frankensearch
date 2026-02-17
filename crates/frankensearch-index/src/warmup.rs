@@ -85,6 +85,58 @@ impl WarmUpConfig {
             ..Self::default()
         }
     }
+
+    /// Build warm-up config from environment variables.
+    ///
+    /// Supported variables:
+    /// - `FRANKENSEARCH_WARMUP_STRATEGY`: `none|header|full|adaptive`
+    /// - `FRANKENSEARCH_WARMUP_MAX_BYTES`: positive integer byte budget
+    /// - `FRANKENSEARCH_WARMUP_PARALLEL_READERS`: positive integer
+    /// - `FRANKENSEARCH_WARMUP_MIN_HEAT`: adaptive threshold in `[0.0, 1.0]`
+    /// - `FRANKENSEARCH_WARMUP_HEAT_DECAY`: adaptive decay in `[0.0, 1.0]`
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        if let Ok(strategy) = std::env::var("FRANKENSEARCH_WARMUP_STRATEGY") {
+            match strategy.trim().to_ascii_lowercase().as_str() {
+                "" | "none" => config.strategy = WarmUpStrategy::None,
+                "header" | "header_only" => config.strategy = WarmUpStrategy::Header,
+                "full" => config.strategy = WarmUpStrategy::Full,
+                "adaptive" => config.strategy = WarmUpStrategy::Adaptive(AdaptiveConfig::default()),
+                _ => {}
+            }
+        }
+
+        if let Ok(raw) = std::env::var("FRANKENSEARCH_WARMUP_MAX_BYTES")
+            && let Ok(parsed) = raw.parse::<usize>()
+            && parsed > 0
+        {
+            config.max_bytes = parsed;
+        }
+
+        if let Ok(raw) = std::env::var("FRANKENSEARCH_WARMUP_PARALLEL_READERS")
+            && let Ok(parsed) = raw.parse::<usize>()
+            && parsed > 0
+        {
+            config.parallel_readers = parsed;
+        }
+
+        if let WarmUpStrategy::Adaptive(ref mut adaptive) = config.strategy {
+            if let Ok(raw) = std::env::var("FRANKENSEARCH_WARMUP_MIN_HEAT")
+                && let Ok(parsed) = raw.parse::<f64>()
+            {
+                adaptive.min_heat = parsed;
+            }
+            if let Ok(raw) = std::env::var("FRANKENSEARCH_WARMUP_HEAT_DECAY")
+                && let Ok(parsed) = raw.parse::<f64>()
+            {
+                adaptive.heat_decay = parsed;
+            }
+        }
+
+        config
+    }
 }
 
 /// Prefaulting strategy.

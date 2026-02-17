@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
-use crate::{VectorIndex, dot_product_f32_f32};
+use crate::{SearchParams, VectorIndex, dot_product_f32_f32};
 
 /// Preferred fast-tier index filename.
 pub const VECTOR_INDEX_FAST_FILENAME: &str = "vector.fast.idx";
@@ -260,6 +260,25 @@ impl TwoTierIndex {
     /// Propagates errors from `HnswIndex::knn_search` (when ANN is selected)
     /// or `VectorIndex::search_top_k` (brute-force fallback).
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.search_fast_with_params(query_vec, k, None)
+    }
+
+    /// Search the fast tier with optional brute-force parallelism overrides.
+    ///
+    /// When ANN is active for the fast tier, ANN continues to own candidate
+    /// retrieval and `params` is ignored. When brute-force search is used,
+    /// `params` controls the Rayon threshold/chunking path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from `HnswIndex::knn_search` (when ANN is selected)
+    /// or `VectorIndex::search_top_k_with_params` / `search_top_k`.
+    pub fn search_fast_with_params(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<Vec<VectorHit>> {
         #[cfg(feature = "ann")]
         if let Some(ann) = &self.fast_ann {
             // Fetch a few extra candidates to buffer against soft-deleted records.
@@ -267,17 +286,24 @@ impl TwoTierIndex {
             let fetch_k = k.saturating_add(10);
             let mut hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
 
-            // Filter soft-deleted records from ANN results (HNSW index is static).
-            // NOTE: hit.index is the compact HNSW d_id, NOT the VectorIndex position.
-            // After tombstone-aware HNSW rebuild, these diverge. Use doc_id lookup
-            // to find the real VectorIndex position for the tombstone check.
-            hits.retain(|hit| {
+            // Filter soft-deleted records from ANN results and resolve real VectorIndex positions.
+            // NOTE: hit.index from ANN is the compact HNSW d_id, NOT the VectorIndex position.
+            // We map it back to the canonical position so downstream consumers (like quality scoring)
+            // get valid indices.
+            let mut resolved_hits = Vec::with_capacity(hits.len());
+            for mut hit in hits {
                 match self.fast_index.find_index_by_doc_id(&hit.doc_id) {
-                    Ok(Some(pos)) => !self.fast_index.is_deleted(pos),
+                    Ok(Some(pos)) => {
+                        if !self.fast_index.is_deleted(pos) {
+                            hit.index = u32::try_from(pos).unwrap_or(u32::MAX);
+                            resolved_hits.push(hit);
+                        }
+                    }
                     // doc_id missing or decode error → treat as deleted
-                    _ => false,
+                    _ => {}
                 }
-            });
+            }
+            let mut hits = resolved_hits;
 
             // Merge WAL entries (not yet in ANN).
             if !self.fast_index.wal_entries.is_empty() {
@@ -308,7 +334,13 @@ impl TwoTierIndex {
             }
             return Ok(hits);
         }
-        self.fast_index.search_top_k(query_vec, k, None)
+        params.map_or_else(
+            || self.fast_index.search_top_k(query_vec, k, None),
+            |params| {
+                self.fast_index
+                    .search_top_k_with_params(query_vec, k, None, params)
+            },
+        )
     }
 
     /// Compute quality-tier scores for fast-index document positions.
@@ -394,6 +426,52 @@ impl TwoTierIndex {
         self.fast_index.find_index_by_doc_id(doc_id)
     }
 
+    /// Fast-tier vector for the given document id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if index access fails.
+    pub fn fast_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? else {
+            return Ok(None);
+        };
+        self.fast_index.vector_at_f32(index).map(Some)
+    }
+
+    /// Quality-tier vector for the given document id when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if index access fails.
+    pub fn quality_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        let Some(quality_index) = self.quality_index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(fast_index) = self.fast_index.find_index_by_doc_id(doc_id)? else {
+            return Ok(None);
+        };
+        let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) else {
+            return Ok(None);
+        };
+
+        quality_index.vector_at_f32(quality_index_pos).map(Some)
+    }
+
+    /// Semantic vector for the given document id, preferring quality tier.
+    ///
+    /// Falls back to the fast-tier vector when the quality tier is unavailable
+    /// or missing for this document.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if index access fails.
+    pub fn semantic_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        if let Some(quality) = self.quality_vector_for_doc_id(doc_id)? {
+            return Ok(Some(quality));
+        }
+        self.fast_vector_for_doc_id(doc_id)
+    }
+
     /// Whether the fast-tier document at `index` has a quality-tier vector.
     #[must_use]
     pub fn has_quality_for_index(&self, index: usize) -> bool {
@@ -436,6 +514,14 @@ impl TwoTierIndex {
         let quality_vector = quality_index.vector_at_f32(quality_idx)?;
 
         dot_product_f32_f32(&quality_vector, query_vec)
+    }
+
+    fn quality_index_for_fast_index(&self, fast_idx: usize) -> Option<usize> {
+        match &self.quality_alignment {
+            QualityAlignment::None => None,
+            QualityAlignment::Aligned => Some(fast_idx),
+            QualityAlignment::Mapping(map) => map.get(fast_idx).copied().flatten(),
+        }
     }
 }
 
@@ -761,6 +847,60 @@ mod tests {
             .search_fast(&[1.0, 0.0, 0.0, 0.0], 1)
             .expect("fast search");
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[test]
+    fn search_fast_with_params_matches_default_path() {
+        let dir = temp_index_dir("search-params-default-match");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open two-tier");
+        let baseline = index
+            .search_fast(&[1.0, 0.0, 0.0, 0.0], 2)
+            .expect("baseline");
+        let overridden = index
+            .search_fast_with_params(&[1.0, 0.0, 0.0, 0.0], 2, Some(SearchParams::default()))
+            .expect("search with params");
+        assert_eq!(baseline, overridden);
+    }
+
+    #[test]
+    fn search_fast_with_params_accepts_explicit_sequential_override() {
+        let dir = temp_index_dir("search-params-seq-override");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-d", &[0.0, 0.0, 0.0, 1.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open two-tier");
+        let params = SearchParams {
+            parallel_enabled: false,
+            parallel_threshold: usize::MAX,
+            parallel_chunk_size: 2,
+        };
+        let hits = index
+            .search_fast_with_params(&[1.0, 0.0, 0.0, 0.0], 3, Some(params))
+            .expect("sequential override search");
+        assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].doc_id, "doc-a");
     }
 

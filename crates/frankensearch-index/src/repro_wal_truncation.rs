@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::wal::{append_wal_batch, read_wal, wal_path_for, WalEntry};
     use crate::Quantization;
+    use crate::wal::{WalEntry, append_wal_batch, read_wal};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +43,7 @@ mod tests {
 
         // 2. Simulate a partial write (Batch B crashed halfway)
         let valid_len = fs::metadata(&path).unwrap().len();
-        
+
         // Append a valid batch...
         append_wal_batch(
             &path,
@@ -54,7 +54,7 @@ mod tests {
             true,
         )
         .unwrap();
-        
+
         // ...then truncate it to be corrupt/partial
         let full_len = fs::metadata(&path).unwrap().len();
         let corrupted_len = valid_len + (full_len - valid_len) / 2;
@@ -91,8 +91,12 @@ mod tests {
         // 5. Read WAL again
         // Expected behavior (FIXED): Batch A and Batch C are visible.
         let (loaded_final, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
-        
-        assert_eq!(loaded_final.len(), 2, "Batch C should be visible after auto-truncation");
+
+        assert_eq!(
+            loaded_final.len(),
+            2,
+            "Batch C should be visible after auto-truncation"
+        );
         assert_eq!(loaded_final[0].doc_id, "doc-a");
         assert_eq!(loaded_final[1].doc_id, "doc-c");
 

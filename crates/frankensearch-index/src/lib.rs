@@ -46,13 +46,13 @@
 pub mod hnsw;
 pub mod mrl;
 pub mod quantization;
+mod repro_soft_delete_rollback;
+mod repro_wal_truncation;
 pub mod search;
 pub mod simd;
 pub mod two_tier;
 pub mod wal;
 pub mod warmup;
-mod repro_soft_delete_rollback;
-mod repro_wal_truncation;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -190,7 +190,7 @@ impl VectorIndex {
     ///
     /// Returns `SearchError::IndexNotFound` if the file does not exist and
     /// `SearchError::IndexCorrupted` when header/layout validation fails.
-    #[allow(unsafe_code)] // MmapMut::map_mut requires unsafe for memory-mapped I/O.
+    #[allow(unsafe_code, clippy::too_many_lines)] // MmapMut::map_mut requires unsafe for memory-mapped I/O.
     pub fn open(path: &Path) -> SearchResult<Self> {
         if !path.exists() {
             return Err(SearchError::IndexNotFound {
@@ -242,17 +242,49 @@ impl VectorIndex {
             ));
         }
 
+        let warm_up_config = WarmUpConfig::from_env();
+        if !matches!(warm_up_config.strategy, WarmUpStrategy::None) {
+            let warm_up = warmup::warm_up_bytes(&data, header_len, &warm_up_config, None);
+            debug!(
+                target: "frankensearch.warmup",
+                path = %path.display(),
+                strategy = %warm_up.strategy_name,
+                pages_touched = warm_up.pages_touched,
+                bytes_touched = warm_up.bytes_touched,
+                budget_exhausted = warm_up.budget_exhausted,
+                "index warm-up complete"
+            );
+        }
+
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
         let (mut wal_entries, wal_compaction_gen, valid_len) =
             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
 
-        // If the WAL file has trailing garbage (e.g. from a crash during append),
-        // truncate it to the valid length so future appends are contiguous.
-        if wal_path.exists() {
-            let actual_len = std::fs::metadata(&wal_path)
-                .map_err(SearchError::Io)?
-                .len();
+        let is_stale = if valid_len > 0 {
+            if wal_compaction_gen == 0 {
+                metadata.compaction_gen > 0
+            } else {
+                let expected = next_generation(metadata.compaction_gen);
+                wal_compaction_gen != expected
+            }
+        } else {
+            false
+        };
+
+        if is_stale {
+            tracing::warn!(
+                path = %path.display(),
+                main_gen = metadata.compaction_gen,
+                wal_gen = wal_compaction_gen,
+                "discarding stale/mismatched WAL entries and removing file"
+            );
+            wal_entries.clear();
+            if wal_path.exists() {
+                let _ = std::fs::remove_file(&wal_path);
+            }
+        } else if wal_path.exists() {
+            let actual_len = std::fs::metadata(&wal_path).map_err(SearchError::Io)?.len();
             if actual_len > valid_len {
                 tracing::warn!(
                     path = %wal_path.display(),
@@ -260,37 +292,12 @@ impl VectorIndex {
                     valid_len,
                     "truncating corrupted WAL trailer"
                 );
-                let file = OpenOptions::new().write(true).open(&wal_path).map_err(SearchError::Io)?;
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&wal_path)
+                    .map_err(SearchError::Io)?;
                 file.set_len(valid_len).map_err(SearchError::Io)?;
                 file.sync_all().map_err(SearchError::Io)?;
-            }
-        }
-
-        // Stale WAL detection:
-        //
-        // A valid WAL must have a generation of `next_generation(main_gen)`.
-        // If WAL.gen == Main.gen, it means the WAL was already compacted into Main
-        // but not deleted (crash during compaction).
-        //
-        // Special handling for legacy files (gen 0):
-        // - If Main=0 and WAL=0, it's a valid pre-upgrade state.
-        // - If Main>0 and WAL=0, the WAL is stale (we compacted Main0->Main1 and crashed).
-        if !wal_entries.is_empty() {
-            let is_stale = if wal_compaction_gen == 0 {
-                metadata.compaction_gen > 0
-            } else {
-                let expected = next_generation(metadata.compaction_gen);
-                wal_compaction_gen != expected
-            };
-
-            if is_stale {
-                tracing::warn!(
-                    path = %path.display(),
-                    main_gen = metadata.compaction_gen,
-                    wal_gen = wal_compaction_gen,
-                    "discarding stale/mismatched WAL entries"
-                );
-                wal_entries.clear();
             }
         }
 
@@ -555,7 +562,7 @@ impl VectorIndex {
             }
         }
 
-        self.rewrite_index(&mut sources, self.metadata.compaction_gen)?;
+        self.rewrite_index(&sources, self.metadata.compaction_gen)?;
 
         let records_after = self.record_count();
         let bytes_reclaimed = bytes_before.saturating_sub(self.data.len());
@@ -696,7 +703,7 @@ impl VectorIndex {
         });
 
         // Perform the rewrite.
-        self.rewrite_index(&mut sources, next_generation(self.metadata.compaction_gen))?;
+        self.rewrite_index(&sources, next_generation(self.metadata.compaction_gen))?;
 
         // Remove WAL sidecar.
         let wal_path = wal::wal_path_for(&self.path);
@@ -730,8 +737,12 @@ impl VectorIndex {
             MergeSource::Main(idx) => {
                 // These unwraps are safe because we only create Main(idx) for valid indices
                 // and the index is immutable during compaction.
-                let entry = self.record_at(*idx).expect("index corrupted during compaction");
-                let id = self.doc_id_at(*idx).expect("index corrupted during compaction");
+                let entry = self
+                    .record_at(*idx)
+                    .expect("index corrupted during compaction");
+                let id = self
+                    .doc_id_at(*idx)
+                    .expect("index corrupted during compaction");
                 (entry.doc_id_hash, id)
             }
             MergeSource::Wal(idx) => {
@@ -742,11 +753,7 @@ impl VectorIndex {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn rewrite_index(
-        &mut self,
-        sources: &mut [MergeSource],
-        new_gen: u8,
-    ) -> SearchResult<()> {
+    fn rewrite_index(&mut self, sources: &[MergeSource], new_gen: u8) -> SearchResult<()> {
         let record_count = sources.len();
         let records_bytes = record_count.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
             SearchError::InvalidConfig {
@@ -764,18 +771,20 @@ impl VectorIndex {
         let mut current_string_offset = 0u32;
         let mut string_table_len = 0u64;
 
-        for source in sources.iter() {
+        for source in sources {
             let (doc_id_hash, doc_id) = self.resolve_sort_key(source);
             let doc_id_len = doc_id.len();
-            
+
             // Validation
             let len_u16 = u16::try_from(doc_id_len).map_err(|_| SearchError::InvalidConfig {
                 field: "doc_id_len".to_owned(),
                 value: doc_id_len.to_string(),
                 reason: "doc_id length exceeds u16".to_owned(),
             })?;
-            if current_string_offset.checked_add(doc_id_len as u32).is_none() {
-                 return Err(SearchError::InvalidConfig {
+            let len_u32 = u32::from(len_u16);
+            let len_u64 = u64::from(len_u16);
+            if current_string_offset.checked_add(len_u32).is_none() {
+                return Err(SearchError::InvalidConfig {
                     field: "doc_id_offset".to_owned(),
                     value: "overflow".to_owned(),
                     reason: "string table offset exceeds u32".to_owned(),
@@ -788,8 +797,8 @@ impl VectorIndex {
             record_table.extend_from_slice(&len_u16.to_le_bytes());
             record_table.extend_from_slice(&0u16.to_le_bytes()); // Flags cleared (tombstones gone)
 
-            current_string_offset += doc_id_len as u32;
-            string_table_len += doc_id_len as u64;
+            current_string_offset += len_u32;
+            string_table_len += len_u64;
         }
 
         // Calculate layout
@@ -813,9 +822,15 @@ impl VectorIndex {
                 value: "overflow".to_owned(),
                 reason: "layout offset overflow".to_owned(),
             })?;
-        
+
         let vectors_offset = align_up(pre_vector, VECTOR_ALIGN_BYTES)?;
-        let padding_len = (vectors_offset - pre_vector) as usize;
+        let padding_len = usize::try_from(vectors_offset - pre_vector).map_err(|_| {
+            SearchError::InvalidConfig {
+                field: "padding_len".to_owned(),
+                value: (vectors_offset - pre_vector).to_string(),
+                reason: "padding length exceeds usize".to_owned(),
+            }
+        })?;
 
         // Open temp file
         let tmp_path = temporary_output_path(&self.path);
@@ -839,12 +854,12 @@ impl VectorIndex {
             )?;
             let header_crc = crc32(&header_prefix);
             header_prefix.extend_from_slice(&header_crc.to_le_bytes());
-            
+
             writer.write_all(&header_prefix)?;
             writer.write_all(&record_table)?;
 
             // Pass 3: Write String Table
-            for source in sources.iter() {
+            for source in sources {
                 let (_, doc_id) = self.resolve_sort_key(source);
                 writer.write_all(doc_id.as_bytes())?;
             }
@@ -857,7 +872,7 @@ impl VectorIndex {
             // Pass 4: Write Vectors
             match self.quantization() {
                 Quantization::F16 => {
-                    for source in sources.iter() {
+                    for source in sources {
                         match source {
                             MergeSource::Main(idx) => {
                                 // Fast path: copy raw bytes
@@ -877,7 +892,7 @@ impl VectorIndex {
                     }
                 }
                 Quantization::F32 => {
-                    for source in sources.iter() {
+                    for source in sources {
                         match source {
                             MergeSource::Main(idx) => {
                                 // Fast path: copy raw bytes
@@ -915,7 +930,7 @@ impl VectorIndex {
         // WAL entries are cleared by caller if compacting, or preserved if vacuuming
         // But vacuum preserves WAL on disk, so open() loads them.
         // Vacuum caller ignores the reloaded WAL entries? No, vacuum preserves them.
-        // self.vacuum() impl: 
+        // self.vacuum() impl:
         //   writer.finish()
         //   Self::open() -> loads WAL entries
         //   self.wal_entries = reloaded.wal_entries
@@ -927,7 +942,6 @@ impl VectorIndex {
     }
 
     /// Resolve the document id at `index`.
-
     ///
     /// # Errors
     ///

@@ -411,6 +411,15 @@ impl TantivyIndex {
         self.path.as_deref()
     }
 
+    /// Cloneable handle to the underlying Tantivy index.
+    ///
+    /// This is primarily used by durability wrappers that protect/verify
+    /// segment artifacts outside the lexical crate.
+    #[must_use]
+    pub fn index_handle(&self) -> Index {
+        self.index.clone()
+    }
+
     /// Truncate an overlong query and log a warning.
     fn truncate_query(query: &str) -> &str {
         if query.len() <= MAX_QUERY_LENGTH {

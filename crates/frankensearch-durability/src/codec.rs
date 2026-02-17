@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite_core::raptorq_integration::{CodecDecodeResult, DecodeFailureReason, SymbolCodec};
+use fsqlite_core::raptorq_integration::{
+    CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
+};
 use tracing::{debug, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -30,6 +32,167 @@ pub type RepairCodec = CodecFacade;
 
 /// Alias matching the bead wording.
 pub type RepairCodecConfig = DurabilityConfig;
+
+/// Default in-process symbol codec used by frankensearch durability wiring.
+///
+/// This codec keeps compatibility with the `SymbolCodec` interface while
+/// avoiding any external runtime initialization requirements.
+#[derive(Debug, Clone, Default)]
+pub struct DefaultSymbolCodec;
+
+impl SymbolCodec for DefaultSymbolCodec {
+    fn encode(
+        &self,
+        source_data: &[u8],
+        symbol_size: u32,
+        repair_overhead: f64,
+    ) -> fsqlite_error::Result<CodecEncodeResult> {
+        let symbol_size =
+            usize::try_from(symbol_size).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
+                what: "symbol_size as usize".to_owned(),
+                value: symbol_size.to_string(),
+            })?;
+        if symbol_size == 0 {
+            return Err(fsqlite_error::FrankenError::OutOfRange {
+                what: "symbol_size".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+
+        let k_source = source_data.len().div_ceil(symbol_size).max(1);
+        let k_source_u32 =
+            u32::try_from(k_source).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
+                what: "k_source as u32".to_owned(),
+                value: k_source.to_string(),
+            })?;
+
+        let mut source_symbols = Vec::with_capacity(k_source);
+        for symbol_idx in 0..k_source {
+            let start = symbol_idx.saturating_mul(symbol_size);
+            let end = start.saturating_add(symbol_size).min(source_data.len());
+            let mut symbol = vec![0_u8; symbol_size];
+            if start < end {
+                symbol[..end - start].copy_from_slice(&source_data[start..end]);
+            }
+            source_symbols.push((
+                u32::try_from(symbol_idx).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
+                    what: "source symbol index as u32".to_owned(),
+                    value: symbol_idx.to_string(),
+                })?,
+                symbol,
+            ));
+        }
+
+        let requested_repair = if repair_overhead.is_finite() && repair_overhead > 0.0 {
+            let requested = (f64::from(k_source_u32) * repair_overhead).ceil();
+            format!("{requested:.0}").parse::<usize>().map_err(|_| {
+                fsqlite_error::FrankenError::OutOfRange {
+                    what: "requested_repair as usize".to_owned(),
+                    value: requested.to_string(),
+                }
+            })?
+        } else {
+            0
+        };
+
+        let mut repair_symbols = Vec::with_capacity(requested_repair);
+        for repair_idx in 0..requested_repair {
+            let source_idx = repair_idx % k_source;
+            let esi = k_source_u32.saturating_add(u32::try_from(repair_idx).map_err(|_| {
+                fsqlite_error::FrankenError::OutOfRange {
+                    what: "repair symbol index as u32".to_owned(),
+                    value: repair_idx.to_string(),
+                }
+            })?);
+            repair_symbols.push((esi, source_symbols[source_idx].1.clone()));
+        }
+
+        Ok(CodecEncodeResult {
+            source_symbols,
+            repair_symbols,
+            k_source: k_source_u32,
+        })
+    }
+
+    fn decode(
+        &self,
+        symbols: &[(u32, Vec<u8>)],
+        k_source: u32,
+        symbol_size: u32,
+    ) -> fsqlite_error::Result<CodecDecodeResult> {
+        if k_source == 0 {
+            return Ok(CodecDecodeResult::Failure {
+                reason: DecodeFailureReason::InsufficientSymbols,
+                symbols_received: 0,
+                k_required: 0,
+            });
+        }
+
+        let symbol_size =
+            usize::try_from(symbol_size).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
+                what: "symbol_size as usize".to_owned(),
+                value: symbol_size.to_string(),
+            })?;
+        if symbol_size == 0 {
+            return Ok(CodecDecodeResult::Failure {
+                reason: DecodeFailureReason::SymbolSizeMismatch,
+                symbols_received: 0,
+                k_required: k_source,
+            });
+        }
+
+        let k_source_usize =
+            usize::try_from(k_source).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
+                what: "k_source as usize".to_owned(),
+                value: k_source.to_string(),
+            })?;
+        let mut slots = vec![None::<Vec<u8>>; k_source_usize];
+
+        for (esi, payload) in symbols {
+            if payload.len() != symbol_size {
+                return Ok(CodecDecodeResult::Failure {
+                    reason: DecodeFailureReason::SymbolSizeMismatch,
+                    symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                    k_required: k_source,
+                });
+            }
+
+            let target = if *esi < k_source {
+                usize::try_from(*esi).ok()
+            } else {
+                let offset = esi.saturating_sub(k_source);
+                usize::try_from(offset).ok().map(|idx| idx % k_source_usize)
+            };
+
+            if let Some(target) = target
+                && slots[target].is_none()
+            {
+                slots[target] = Some(payload.clone());
+            }
+        }
+
+        let available = slots.iter().filter(|slot| slot.is_some()).count();
+        if available < k_source_usize {
+            return Ok(CodecDecodeResult::Failure {
+                reason: DecodeFailureReason::InsufficientSymbols,
+                symbols_received: u32::try_from(available).unwrap_or(u32::MAX),
+                k_required: k_source,
+            });
+        }
+
+        let mut data = Vec::with_capacity(k_source_usize.saturating_mul(symbol_size));
+        for symbol in slots.into_iter().flatten() {
+            data.extend(symbol);
+        }
+
+        Ok(CodecDecodeResult::Success {
+            data,
+            symbols_used: u32::try_from(available).unwrap_or(u32::MAX),
+            peeled_count: 0,
+            inactivated_count: 0,
+        })
+    }
+}
 
 /// Persistable repair symbols plus reproducibility metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
