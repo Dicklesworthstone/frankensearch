@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{CommandPalette, PaletteState};
@@ -100,6 +100,10 @@ pub fn default_help_entries() -> Vec<HelpEntry> {
             description: "Page navigation",
         },
         HelpEntry {
+            key: "Ctrl+T",
+            description: "Cycle theme",
+        },
+        HelpEntry {
             key: "Ctrl+Y",
             description: "Copy to clipboard",
         },
@@ -128,6 +132,8 @@ pub fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
             .title(" Keyboard Shortcuts ")
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
@@ -147,6 +153,8 @@ pub fn render_alert_overlay(frame: &mut Frame<'_>, area: Rect, request: &Overlay
     let content = Paragraph::new(body_text).wrap(Wrap { trim: true }).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
             .title(format!(" {} ", request.title))
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
@@ -189,6 +197,8 @@ pub fn render_confirm_overlay(frame: &mut Frame<'_>, area: Rect, request: &Overl
     let content = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
             .title(format!(" {} ", request.title))
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
@@ -232,6 +242,8 @@ pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &Comma
     let input = Paragraph::new(Span::styled(query_display, input_style)).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
             .title(" Command Palette ")
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
@@ -266,6 +278,7 @@ pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &Comma
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ratatui::style::Color::DarkGray)),
     );
     frame.render_widget(list, chunks[1]);

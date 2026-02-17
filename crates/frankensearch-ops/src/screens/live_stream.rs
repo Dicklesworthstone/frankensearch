@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
@@ -532,6 +532,7 @@ impl Screen for LiveSearchStreamScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Live Search Stream "),
         );
         frame.render_widget(header, chunks[0]);
@@ -559,7 +560,12 @@ impl Screen for LiveSearchStreamScreen {
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(" Activity "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Activity "),
+        );
         frame.render_widget(table, chunks[1]);
     }
 

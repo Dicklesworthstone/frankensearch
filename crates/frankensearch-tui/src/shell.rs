@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{CachedLayout, CachedTabState};
@@ -311,6 +311,11 @@ impl AppShell {
                         self.palette.toggle();
                         return false;
                     }
+                    KeyAction::CycleTheme => {
+                        self.config.theme = Theme::from_preset(self.config.theme.preset.next());
+                        self.cached_tabs.invalidate();
+                        return false;
+                    }
                     _ => {}
                 }
             }
@@ -428,28 +433,35 @@ impl AppShell {
                 );
             }
 
-            let tab_titles: Vec<Line<'_>> = self
-                .cached_tabs
-                .titles
-                .iter()
-                .map(|t| Line::from(t.as_str()))
-                .collect();
+            let mut tab_spans: Vec<Span<'_>> = Vec::new();
+            for (i, title) in self.cached_tabs.titles.iter().enumerate() {
+                if i > 0 {
+                    tab_spans.push(Span::styled(
+                        " \u{2502} ",
+                        Style::default().fg(self.config.theme.border.to_ratatui()),
+                    ));
+                }
+                if i == self.cached_tabs.selected {
+                    tab_spans.push(Span::styled(
+                        format!(" {title} "),
+                        Style::default()
+                            .fg(self.config.theme.highlight_fg.to_ratatui())
+                            .bg(self.config.theme.accent.to_ratatui())
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    tab_spans.push(Span::styled(
+                        format!(" {title} "),
+                        Style::default()
+                            .fg(self.config.theme.muted.to_ratatui())
+                            .bg(self.config.theme.bg.to_ratatui()),
+                    ));
+                }
+            }
+            let tab_line = Paragraph::new(Line::from(tab_spans))
+                .style(Style::default().bg(self.config.theme.bg.to_ratatui()));
 
-            let tabs = Tabs::new(tab_titles)
-                .select(self.cached_tabs.selected)
-                .highlight_style(
-                    Style::default()
-                        .fg(self.config.theme.highlight_fg.to_ratatui())
-                        .bg(self.config.theme.highlight_bg.to_ratatui())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(
-                    Style::default()
-                        .fg(self.config.theme.muted.to_ratatui())
-                        .bg(self.config.theme.bg.to_ratatui()),
-                );
-
-            frame.render_widget(tabs, bc_rect);
+            frame.render_widget(tab_line, bc_rect);
         }
 
         // Main content area.
@@ -461,6 +473,7 @@ impl AppShell {
             // No screen active — render placeholder.
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(self.config.theme.border.to_ratatui()))
                 .style(
                     Style::default()
@@ -476,8 +489,19 @@ impl AppShell {
             let status_text = if self.status_line.center.is_empty() {
                 format!(" {} ", self.config.title)
             } else {
-                format!(" {} │ {} ", self.config.title, self.status_line.center)
+                format!(
+                    " {} \u{2502} {} ",
+                    self.config.title, self.status_line.center
+                )
             };
+
+            let hints = Self::status_bar_hints(sb_rect.width);
+            let left_content_len =
+                self.status_line.left.len() + status_text.len() + self.status_line.right.len();
+            let pad_width = (sb_rect.width as usize).saturating_sub(left_content_len + hints.len());
+            let padding = " ".repeat(pad_width);
+
+            let muted_style = Style::default().fg(self.config.theme.muted.to_ratatui());
 
             let status_spans = vec![
                 Span::styled(
@@ -494,12 +518,25 @@ impl AppShell {
                     &self.status_line.right,
                     Style::default().fg(self.config.theme.status_bar_fg.to_ratatui()),
                 ),
+                Span::raw(padding),
+                Span::styled(hints, muted_style),
             ];
 
             let status = Paragraph::new(Line::from(status_spans))
                 .style(Style::default().bg(self.config.theme.status_bar_bg.to_ratatui()));
 
             frame.render_widget(status, sb_rect);
+        }
+    }
+
+    /// Build right-aligned keybinding hints for the status bar.
+    fn status_bar_hints(width: u16) -> String {
+        if width < 60 {
+            String::new()
+        } else if width < 90 {
+            "Tab:Nav  ?:Help  ^T:Theme ".to_string()
+        } else {
+            "Tab:Nav  ?:Help  ^P:Cmd  ^T:Theme  q:Quit ".to_string()
         }
     }
 }

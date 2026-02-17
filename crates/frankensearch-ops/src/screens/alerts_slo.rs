@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
@@ -803,6 +803,7 @@ impl Screen for AlertsSloScreen {
         "Alerts + SLO + Capacity"
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
         let alerts = self.filtered_alerts();
         let project_rows = self.project_slo_rows();
@@ -833,6 +834,7 @@ impl Screen for AlertsSloScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Alerts + SLO + Capacity "),
         );
         frame.render_widget(summary, chunks[0]);
@@ -866,6 +868,7 @@ impl Screen for AlertsSloScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Active Alerts "),
         );
         frame.render_widget(alerts_table, chunks[1]);
@@ -903,6 +906,7 @@ impl Screen for AlertsSloScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" SLO + Capacity by Scope "),
         );
         frame.render_widget(slo_table, chunks[2]);

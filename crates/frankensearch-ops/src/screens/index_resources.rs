@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
@@ -412,13 +412,18 @@ impl Screen for IndexResourceScreen {
         let summary = Paragraph::new(self.summary_lines(&rows)).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Index + Embedding + Resources "),
         );
         frame.render_widget(summary, chunks[0]);
 
         if rows.is_empty() {
-            let empty = Paragraph::new("No index/resource rows available for this filter.")
-                .block(Block::default().borders(Borders::ALL).title(" Inventory "));
+            let empty = Paragraph::new("No index/resource rows available for this filter.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Inventory "),
+            );
             frame.render_widget(empty, chunks[1]);
             return;
         }
@@ -446,7 +451,12 @@ impl Screen for IndexResourceScreen {
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(" Inventory "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Inventory "),
+        );
         frame.render_widget(table, chunks[1]);
     }
 

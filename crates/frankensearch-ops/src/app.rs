@@ -255,11 +255,7 @@ impl OpsApp {
                 );
             }
             "settings.theme" => {
-                self.shell.config.theme = if self.shell.config.theme == Theme::dark() {
-                    Theme::light()
-                } else {
-                    Theme::dark()
-                };
+                self.shell.config.theme = Theme::from_preset(self.shell.config.theme.preset.next());
             }
             "settings.contrast" => {
                 self.preferences.toggle_contrast();
@@ -426,9 +422,9 @@ impl OpsApp {
                 ActionCategory::Debug,
             )
             .with_description("Show internal health metrics and degradation status"),
-            Action::new("settings.theme", "Toggle Theme", ActionCategory::Settings)
-                .with_shortcut("T")
-                .with_description("Switch between dark and light theme"),
+            Action::new("settings.theme", "Cycle Theme", ActionCategory::Settings)
+                .with_shortcut("Ctrl+T")
+                .with_description("Cycle through all 6 theme presets"),
             Action::new(
                 "settings.contrast",
                 "Toggle High Contrast",

@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
@@ -795,6 +795,7 @@ impl Screen for FleetOverviewScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Fleet Overview "),
         );
         frame.render_widget(header, chunks[0]);
@@ -823,6 +824,7 @@ impl Screen for FleetOverviewScreen {
         let kpi_tiles = Paragraph::new(self.kpi_tile_lines()).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" KPI Tile Grid "),
         );
         frame.render_widget(kpi_tiles, primary_chunks[0]);
@@ -830,6 +832,7 @@ impl Screen for FleetOverviewScreen {
         let sparkline = Paragraph::new(self.status_sparkline_lines()).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Status Sparkline Strip "),
         );
         frame.render_widget(sparkline, primary_chunks[1]);
@@ -850,8 +853,12 @@ impl Screen for FleetOverviewScreen {
 
         let rows = self.build_rows();
         if rows.is_empty() {
-            let empty = Paragraph::new(self.empty_state_message())
-                .block(Block::default().borders(Borders::ALL).title(" Instances "));
+            let empty = Paragraph::new(self.empty_state_message()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Instances "),
+            );
             frame.render_widget(empty, primary_chunks[2]);
         } else {
             let table = if show_metrics {
@@ -868,7 +875,12 @@ impl Screen for FleetOverviewScreen {
                     ],
                 )
                 .header(header_row)
-                .block(Block::default().borders(Borders::ALL).title(" Instances "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Instances "),
+                )
             } else {
                 Table::new(
                     rows,
@@ -882,7 +894,12 @@ impl Screen for FleetOverviewScreen {
                     ],
                 )
                 .header(header_row)
-                .block(Block::default().borders(Borders::ALL).title(" Instances "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Instances "),
+                )
             };
 
             frame.render_widget(table, primary_chunks[2]);
@@ -891,6 +908,7 @@ impl Screen for FleetOverviewScreen {
         let details = Paragraph::new(self.dashboard_signal_lines()).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Fleet Dashboard Signals "),
         );
         frame.render_widget(details, body_chunks[1]);

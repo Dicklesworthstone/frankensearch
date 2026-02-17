@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
@@ -441,6 +441,7 @@ impl Screen for ProjectDetailScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Project Detail "),
         );
         frame.render_widget(header, chunks[0]);
@@ -448,6 +449,7 @@ impl Screen for ProjectDetailScreen {
         let summary = Paragraph::new(summary_lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Summary Cards "),
         );
         frame.render_widget(summary, chunks[1]);
@@ -460,6 +462,7 @@ impl Screen for ProjectDetailScreen {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .title(" Instances "),
             );
             frame.render_widget(empty, chunks[2]);
@@ -492,7 +495,12 @@ impl Screen for ProjectDetailScreen {
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(" Instances "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Instances "),
+        );
         frame.render_widget(table, chunks[2]);
     }
 

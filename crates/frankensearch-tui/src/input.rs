@@ -45,6 +45,8 @@ pub enum KeyAction {
     PrevScreen,
     /// Toggle help overlay.
     ToggleHelp,
+    /// Cycle to the next theme preset.
+    CycleTheme,
     /// Dismiss current overlay / cancel.
     Dismiss,
 
@@ -151,6 +153,12 @@ impl Keymap {
         bindings.insert((KeyCode::PageDown, KeyModifiers::NONE), KeyAction::PageDown);
         bindings.insert((KeyCode::Home, KeyModifiers::NONE), KeyAction::Home);
         bindings.insert((KeyCode::End, KeyModifiers::NONE), KeyAction::End);
+
+        // Theme cycling
+        bindings.insert(
+            (KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyAction::CycleTheme,
+        );
 
         // Interaction
         bindings.insert((KeyCode::Enter, KeyModifiers::NONE), KeyAction::Confirm);
@@ -285,6 +293,7 @@ mod tests {
         for action in [
             KeyAction::Quit,
             KeyAction::TogglePalette,
+            KeyAction::CycleTheme,
             KeyAction::Up,
             KeyAction::Custom("test".to_string()),
         ] {

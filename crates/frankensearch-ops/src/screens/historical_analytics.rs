@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
@@ -919,6 +919,7 @@ impl Screen for HistoricalAnalyticsScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Historical Analytics + Explainability "),
         );
         frame.render_widget(header, chunks[0]);
@@ -948,6 +949,7 @@ impl Screen for HistoricalAnalyticsScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Anomaly/Event Correlation "),
         );
         frame.render_widget(correlation_table, chunks[1]);
@@ -981,6 +983,7 @@ impl Screen for HistoricalAnalyticsScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Evidence Log + Replay Handles "),
         );
         frame.render_widget(evidence_table, chunks[2]);

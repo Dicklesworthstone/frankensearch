@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
@@ -612,6 +612,7 @@ impl Screen for ActionTimelineScreen {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Action Timeline "),
         );
         frame.render_widget(header, chunks[0]);
@@ -642,7 +643,12 @@ impl Screen for ActionTimelineScreen {
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(" Events "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Events "),
+        );
         frame.render_widget(table, chunks[1]);
     }
 

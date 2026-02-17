@@ -17,6 +17,45 @@ pub enum ThemePreset {
     Dark,
     /// Light background theme.
     Light,
+    /// Deep purple bg, neon cyan fg, hot pink accent.
+    CyberpunkAurora,
+    /// IntelliJ-style dark gray, soft blue fg, blue accent.
+    Darcula,
+    /// Nord-palette blue-gray bg, white fg, cool blue accent.
+    NordicFrost,
+    /// Warm white bg, dark text, amber accent.
+    LumenLight,
+}
+
+impl ThemePreset {
+    /// All presets in cycling order.
+    pub const ALL: [Self; 6] = [
+        Self::Dark,
+        Self::Light,
+        Self::CyberpunkAurora,
+        Self::Darcula,
+        Self::NordicFrost,
+        Self::LumenLight,
+    ];
+
+    /// Whether this preset uses a light background.
+    #[must_use]
+    pub const fn is_light(self) -> bool {
+        matches!(self, Self::Light | Self::LumenLight)
+    }
+
+    /// Advance to the next preset (wrapping).
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::CyberpunkAurora,
+            Self::CyberpunkAurora => Self::Darcula,
+            Self::Darcula => Self::NordicFrost,
+            Self::NordicFrost => Self::LumenLight,
+            Self::LumenLight => Self::Dark,
+        }
+    }
 }
 
 impl std::fmt::Display for ThemePreset {
@@ -24,6 +63,10 @@ impl std::fmt::Display for ThemePreset {
         match self {
             Self::Dark => write!(f, "dark"),
             Self::Light => write!(f, "light"),
+            Self::CyberpunkAurora => write!(f, "cyberpunk_aurora"),
+            Self::Darcula => write!(f, "darcula"),
+            Self::NordicFrost => write!(f, "nordic_frost"),
+            Self::LumenLight => write!(f, "lumen_light"),
         }
     }
 }
@@ -59,6 +102,18 @@ pub trait ColorScheme {
     fn success(&self) -> Color;
     /// Info/accent color.
     fn info(&self) -> Color;
+    /// Accent color for active tabs and focused borders.
+    fn accent(&self) -> Color {
+        self.info()
+    }
+    /// Elevated surface background (cards, panels).
+    fn surface(&self) -> Color {
+        self.bg()
+    }
+    /// Dimmed/inactive surface background.
+    fn surface_dim(&self) -> Color {
+        self.bg()
+    }
 }
 
 // ─── Theme ──────────────────────────────────────────────────────────────────
@@ -79,6 +134,9 @@ pub struct Theme {
     pub warning: SerColor,
     pub success: SerColor,
     pub info: SerColor,
+    pub accent: SerColor,
+    pub surface: SerColor,
+    pub surface_dim: SerColor,
 }
 
 /// Serializable wrapper around `ratatui::style::Color`.
@@ -120,6 +178,9 @@ impl Theme {
             warning: SerColor::new(0xe0, 0xaf, 0x68), // orange
             success: SerColor::new(0x9e, 0xce, 0x6a), // green
             info: SerColor::new(0x7d, 0xcf, 0xff), // cyan
+            accent: SerColor::new(0x7d, 0xcf, 0xff), // cyan (same as info)
+            surface: SerColor::new(0x24, 0x28, 0x3b), // elevated surface
+            surface_dim: SerColor::new(0x1a, 0x1b, 0x26), // dimmed (same as bg)
         }
     }
 
@@ -140,6 +201,101 @@ impl Theme {
             warning: SerColor::new(0x96, 0x5f, 0x00),
             success: SerColor::new(0x40, 0x7f, 0x00),
             info: SerColor::new(0x00, 0x6f, 0xaf),
+            accent: SerColor::new(0x00, 0x6f, 0xaf), // blue (same as info)
+            surface: SerColor::new(0xff, 0xff, 0xff), // white elevated
+            surface_dim: SerColor::new(0xf5, 0xf5, 0xf5), // dimmed (same as bg)
+        }
+    }
+
+    /// Cyberpunk Aurora theme preset.
+    #[must_use]
+    pub const fn cyberpunk_aurora() -> Self {
+        Self {
+            preset: ThemePreset::CyberpunkAurora,
+            bg: SerColor::new(0x13, 0x05, 0x2a), // deep purple
+            fg: SerColor::new(0x00, 0xf0, 0xd0), // neon cyan
+            status_bar_bg: SerColor::new(0x1e, 0x0a, 0x3e), // slightly lighter purple
+            status_bar_fg: SerColor::new(0xff, 0x6e, 0xb4), // hot pink
+            highlight_bg: SerColor::new(0x3a, 0x15, 0x6a), // vivid purple
+            highlight_fg: SerColor::new(0xff, 0xff, 0xff), // white
+            border: SerColor::new(0x2d, 0x10, 0x52), // mid purple
+            muted: SerColor::new(0x6a, 0x4c, 0x93), // lavender gray
+            error: SerColor::new(0xff, 0x30, 0x60), // neon red
+            warning: SerColor::new(0xff, 0xd7, 0x00), // gold
+            success: SerColor::new(0x39, 0xff, 0x14), // neon green
+            info: SerColor::new(0x00, 0xf0, 0xd0), // neon cyan
+            accent: SerColor::new(0xff, 0x6e, 0xb4), // hot pink
+            surface: SerColor::new(0x1e, 0x0a, 0x3e), // elevated purple
+            surface_dim: SerColor::new(0x13, 0x05, 0x2a), // dimmed (same as bg)
+        }
+    }
+
+    /// Darcula theme preset (IntelliJ-inspired).
+    #[must_use]
+    pub const fn darcula() -> Self {
+        Self {
+            preset: ThemePreset::Darcula,
+            bg: SerColor::new(0x2b, 0x2b, 0x2b), // dark gray
+            fg: SerColor::new(0xa9, 0xb7, 0xc6), // soft blue-gray
+            status_bar_bg: SerColor::new(0x3c, 0x3f, 0x41), // lighter gray
+            status_bar_fg: SerColor::new(0x68, 0x97, 0xbb), // soft blue
+            highlight_bg: SerColor::new(0x21, 0x4a, 0x83), // selection blue
+            highlight_fg: SerColor::new(0xff, 0xff, 0xff), // white
+            border: SerColor::new(0x4b, 0x4b, 0x4b), // mid gray
+            muted: SerColor::new(0x78, 0x78, 0x78), // dim gray
+            error: SerColor::new(0xbc, 0x35, 0x51), // muted red
+            warning: SerColor::new(0xbb, 0xb5, 0x29), // olive yellow
+            success: SerColor::new(0x6a, 0x87, 0x59), // forest green
+            info: SerColor::new(0x68, 0x97, 0xbb), // soft blue
+            accent: SerColor::new(0x68, 0x97, 0xbb), // soft blue
+            surface: SerColor::new(0x31, 0x31, 0x35), // elevated dark
+            surface_dim: SerColor::new(0x2b, 0x2b, 0x2b), // dimmed (same as bg)
+        }
+    }
+
+    /// Nordic Frost theme preset (Nord-inspired).
+    #[must_use]
+    pub const fn nordic_frost() -> Self {
+        Self {
+            preset: ThemePreset::NordicFrost,
+            bg: SerColor::new(0x2e, 0x34, 0x40), // nord0 polar night
+            fg: SerColor::new(0xec, 0xef, 0xf4), // nord6 snow storm
+            status_bar_bg: SerColor::new(0x3b, 0x42, 0x52), // nord1
+            status_bar_fg: SerColor::new(0x88, 0xc0, 0xd0), // nord8 frost
+            highlight_bg: SerColor::new(0x43, 0x4c, 0x5e), // nord2
+            highlight_fg: SerColor::new(0xec, 0xef, 0xf4), // nord6
+            border: SerColor::new(0x4c, 0x56, 0x6a), // nord3
+            muted: SerColor::new(0x61, 0x6e, 0x88), // dimmed nord3
+            error: SerColor::new(0xbf, 0x61, 0x6a), // nord11 red
+            warning: SerColor::new(0xeb, 0xcb, 0x8b), // nord13 yellow
+            success: SerColor::new(0xa3, 0xbe, 0x8c), // nord14 green
+            info: SerColor::new(0x88, 0xc0, 0xd0), // nord8 frost
+            accent: SerColor::new(0x5e, 0x81, 0xac), // nord10 cool blue
+            surface: SerColor::new(0x3b, 0x42, 0x52), // nord1 elevated
+            surface_dim: SerColor::new(0x2e, 0x34, 0x40), // dimmed (same as bg)
+        }
+    }
+
+    /// Lumen Light theme preset.
+    #[must_use]
+    pub const fn lumen_light() -> Self {
+        Self {
+            preset: ThemePreset::LumenLight,
+            bg: SerColor::new(0xfd, 0xf6, 0xe3), // warm cream
+            fg: SerColor::new(0x3b, 0x38, 0x30), // dark brown
+            status_bar_bg: SerColor::new(0xee, 0xe8, 0xd5), // muted cream
+            status_bar_fg: SerColor::new(0xcb, 0x76, 0x16), // amber
+            highlight_bg: SerColor::new(0xf5, 0xdc, 0xa0), // soft amber highlight
+            highlight_fg: SerColor::new(0x2a, 0x27, 0x20), // dark
+            border: SerColor::new(0xd6, 0xd0, 0xc0), // warm gray
+            muted: SerColor::new(0x93, 0xa1, 0xa1), // cool gray
+            error: SerColor::new(0xdc, 0x32, 0x2f), // red
+            warning: SerColor::new(0xcb, 0x76, 0x16), // amber
+            success: SerColor::new(0x85, 0x99, 0x00), // olive green
+            info: SerColor::new(0x26, 0x8b, 0xd2), // blue
+            accent: SerColor::new(0xcb, 0x76, 0x16), // amber
+            surface: SerColor::new(0xff, 0xff, 0xf0), // warm white
+            surface_dim: SerColor::new(0xfd, 0xf6, 0xe3), // dimmed (same as bg)
         }
     }
 
@@ -149,6 +305,10 @@ impl Theme {
         match preset {
             ThemePreset::Dark => Self::dark(),
             ThemePreset::Light => Self::light(),
+            ThemePreset::CyberpunkAurora => Self::cyberpunk_aurora(),
+            ThemePreset::Darcula => Self::darcula(),
+            ThemePreset::NordicFrost => Self::nordic_frost(),
+            ThemePreset::LumenLight => Self::lumen_light(),
         }
     }
 }
@@ -190,6 +350,15 @@ impl ColorScheme for Theme {
     fn info(&self) -> Color {
         self.info.to_ratatui()
     }
+    fn accent(&self) -> Color {
+        self.accent.to_ratatui()
+    }
+    fn surface(&self) -> Color {
+        self.surface.to_ratatui()
+    }
+    fn surface_dim(&self) -> Color {
+        self.surface_dim.to_ratatui()
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +388,7 @@ mod tests {
 
     #[test]
     fn preset_serde_roundtrip() {
-        for preset in [ThemePreset::Dark, ThemePreset::Light] {
+        for preset in ThemePreset::ALL {
             let json = serde_json::to_string(&preset).unwrap();
             let decoded: ThemePreset = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, preset);
@@ -230,6 +399,19 @@ mod tests {
     fn from_preset_matches_direct() {
         assert_eq!(Theme::from_preset(ThemePreset::Dark), Theme::dark());
         assert_eq!(Theme::from_preset(ThemePreset::Light), Theme::light());
+        assert_eq!(
+            Theme::from_preset(ThemePreset::CyberpunkAurora),
+            Theme::cyberpunk_aurora()
+        );
+        assert_eq!(Theme::from_preset(ThemePreset::Darcula), Theme::darcula());
+        assert_eq!(
+            Theme::from_preset(ThemePreset::NordicFrost),
+            Theme::nordic_frost()
+        );
+        assert_eq!(
+            Theme::from_preset(ThemePreset::LumenLight),
+            Theme::lumen_light()
+        );
     }
 
     #[test]
@@ -244,5 +426,50 @@ mod tests {
         // Verify trait methods work
         assert_ne!(theme.bg(), theme.error());
         assert_ne!(theme.success(), theme.warning());
+    }
+
+    #[test]
+    fn preset_cycling_wraps() {
+        let mut preset = ThemePreset::Dark;
+        for _ in 0..ThemePreset::ALL.len() {
+            preset = preset.next();
+        }
+        assert_eq!(
+            preset,
+            ThemePreset::Dark,
+            "cycling should wrap back to start"
+        );
+    }
+
+    #[test]
+    fn preset_cycling_visits_all() {
+        let mut visited = std::collections::HashSet::new();
+        let mut preset = ThemePreset::Dark;
+        for _ in 0..ThemePreset::ALL.len() {
+            visited.insert(preset);
+            preset = preset.next();
+        }
+        assert_eq!(visited.len(), ThemePreset::ALL.len());
+    }
+
+    #[test]
+    fn accent_colors_distinct_per_theme() {
+        let accents: Vec<SerColor> = ThemePreset::ALL
+            .iter()
+            .map(|p| Theme::from_preset(*p).accent)
+            .collect();
+        // At least 4 distinct accents out of 6 themes
+        let unique: std::collections::HashSet<_> =
+            accents.iter().map(|c| (c.r, c.g, c.b)).collect();
+        assert!(
+            unique.len() >= 4,
+            "expected at least 4 distinct accents, got {}",
+            unique.len()
+        );
+    }
+
+    #[test]
+    fn all_presets_have_all_const() {
+        assert_eq!(ThemePreset::ALL.len(), 6);
     }
 }
