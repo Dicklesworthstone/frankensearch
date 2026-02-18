@@ -313,28 +313,38 @@ const INDEXING_TUI_RATE_HISTORY_LIMIT: usize = 96;
 const INDEXING_TUI_SPARKLINE_WIDTH: usize = 28;
 const INDEXING_TUI_EMA_ALPHA: f64 = 0.24;
 const FSFS_TUI_POLL_INTERVAL_MS: u64 = 120;
-const FSFS_TUI_SEARCH_POLL_INTERVAL_MS: u64 = 12;
+const FSFS_TUI_SEARCH_POLL_INTERVAL_MS: u64 = 8;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 900;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 8;
-const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 140;
-const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 480;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 4;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS: u64 = 32;
-const FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS: u64 = 8;
-const FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS: u64 = 80;
-const FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS: u64 = 360;
-const FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS: u64 = 260;
-const FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS: u64 = 960;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 6;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 36;
+const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 160;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 3;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS: u64 = 20;
+const FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS: u64 = 6;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS: u64 = 24;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS: u64 = 180;
+const FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS: u64 = 120;
+const FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS: u64 = 640;
 const FSFS_TUI_TYPING_INTERVAL_MIN_MS: u64 = 20;
 const FSFS_TUI_TYPING_INTERVAL_MAX_MS: u64 = 1_500;
-const FSFS_TUI_TYPING_CADENCE_DEFAULT_MS: u64 = 72;
+const FSFS_TUI_TYPING_CADENCE_DEFAULT_MS: u64 = 64;
 const FSFS_TUI_TYPING_CADENCE_ALPHA_PER_MILLE: u64 = 350;
-const FSFS_TUI_LATENCY_FAST_PATH_MS: u64 = 45;
-const FSFS_TUI_LATENCY_SLOW_PATH_MS: u64 = 110;
+const FSFS_TUI_LATENCY_FAST_PATH_MS: u64 = 30;
+const FSFS_TUI_LATENCY_SLOW_PATH_MS: u64 = 90;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_FAST_TRIM_MS: u64 = 10;
+const FSFS_TUI_QUALITY_DEBOUNCE_FAST_TRIM_MS: u64 = 40;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_SLOW_BUMP_MS: u64 = 24;
+const FSFS_TUI_QUALITY_DEBOUNCE_SLOW_BUMP_MS: u64 = 90;
+const FSFS_TUI_SEMANTIC_IDLE_GATE_MIN_MS: u64 = 96;
+const FSFS_TUI_SEMANTIC_IDLE_GATE_MAX_MS: u64 = 260;
+const FSFS_TUI_QUALITY_IDLE_GATE_MIN_MS: u64 = 220;
+const FSFS_TUI_QUALITY_IDLE_GATE_MAX_MS: u64 = 900;
 const FSFS_TUI_SEARCH_HISTORY_LIMIT: usize = 72;
+const FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS: usize = 120;
 const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 2;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 2;
+const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
@@ -409,6 +419,28 @@ impl SearchExecutionResources {
             },
             rerank: CapabilityState::Disabled,
         }
+    }
+
+    #[must_use]
+    fn quality_stage_viable(&self, fast_only: bool) -> bool {
+        if fast_only {
+            return false;
+        }
+        let Some(index) = self.vector_index.as_ref() else {
+            return false;
+        };
+        if index.dimension() != FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION {
+            return false;
+        }
+        if let Some(fast_embedder) = self.fast_embedder.as_ref()
+            && index.embedder_id().eq_ignore_ascii_case(fast_embedder.id())
+        {
+            return false;
+        }
+        if self.quality_embedder_attempted {
+            return self.quality_embedder.is_some();
+        }
+        true
     }
 }
 
@@ -529,6 +561,13 @@ impl SearchDashboardState {
             .unwrap_or(now);
         self.pending_quality_refresh = false;
         self.quality_pending_since = now;
+        let refresh_gate = self
+            .quality_idle_gate_ms()
+            .max(self.quality_debounce_window_ms);
+        self.last_query_edit_at = Some(
+            now.checked_sub(Duration::from_millis(refresh_gate))
+                .unwrap_or(now),
+        );
     }
 
     #[must_use]
@@ -543,6 +582,8 @@ impl SearchDashboardState {
         self.pending_semantic_refresh
             && self.semantic_pending_since.elapsed()
                 >= Duration::from_millis(self.semantic_debounce_window_ms)
+            && self.elapsed_since_last_query_edit()
+                >= Duration::from_millis(self.semantic_idle_gate_ms())
     }
 
     #[must_use]
@@ -550,6 +591,8 @@ impl SearchDashboardState {
         self.pending_quality_refresh
             && self.quality_pending_since.elapsed()
                 >= Duration::from_millis(self.quality_debounce_window_ms)
+            && self.elapsed_since_last_query_edit()
+                >= Duration::from_millis(self.quality_idle_gate_ms())
     }
 
     fn schedule_quality_refresh(&mut self) {
@@ -656,47 +699,87 @@ impl SearchDashboardState {
                 FSFS_TUI_TYPING_INTERVAL_MIN_MS,
                 FSFS_TUI_TYPING_INTERVAL_MAX_MS,
             );
-        let mut lexical = cadence_ms.div_ceil(6).clamp(
+        let mut lexical = cadence_ms.div_ceil(10).clamp(
             FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
             FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
         );
         if self.query_input.value().chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
             lexical = lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS);
         }
-        let mut semantic = lexical.saturating_mul(12).clamp(
+        let mut semantic = lexical.saturating_mul(4).saturating_add(8).clamp(
             FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
             FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
         );
-        let mut quality = semantic.saturating_mul(3).saturating_add(40).clamp(
+        let mut quality = semantic.saturating_mul(2).saturating_add(48).clamp(
             FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
             FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
         );
 
         if let Some(latency_ms) = self.last_search_elapsed_ms {
             if latency_ms >= FSFS_TUI_LATENCY_SLOW_PATH_MS {
-                semantic = semantic.saturating_add(40).clamp(
-                    FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
-                    FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
-                );
-                quality = quality.saturating_add(120).clamp(
-                    FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
-                    FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
-                );
+                semantic = semantic
+                    .saturating_add(FSFS_TUI_SEMANTIC_DEBOUNCE_SLOW_BUMP_MS)
+                    .clamp(
+                        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+                        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+                    );
+                quality = quality
+                    .saturating_add(FSFS_TUI_QUALITY_DEBOUNCE_SLOW_BUMP_MS)
+                    .clamp(
+                        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+                        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+                    );
             } else if latency_ms <= FSFS_TUI_LATENCY_FAST_PATH_MS {
-                semantic = semantic.saturating_sub(20).clamp(
-                    FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
-                    FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
-                );
-                quality = quality.saturating_sub(80).clamp(
-                    FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
-                    FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
-                );
+                semantic = semantic
+                    .saturating_sub(FSFS_TUI_SEMANTIC_DEBOUNCE_FAST_TRIM_MS)
+                    .clamp(
+                        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+                        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+                    );
+                quality = quality
+                    .saturating_sub(FSFS_TUI_QUALITY_DEBOUNCE_FAST_TRIM_MS)
+                    .clamp(
+                        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+                        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+                    );
             }
         }
 
         self.lexical_debounce_window_ms = lexical;
         self.semantic_debounce_window_ms = semantic;
         self.quality_debounce_window_ms = quality;
+    }
+
+    #[must_use]
+    fn elapsed_since_last_query_edit(&self) -> Duration {
+        self.last_query_edit_at
+            .map_or(Duration::MAX, |instant| instant.elapsed())
+    }
+
+    #[must_use]
+    fn semantic_idle_gate_ms(&self) -> u64 {
+        let cadence_ms = self
+            .typing_cadence_ewma_ms
+            .unwrap_or(FSFS_TUI_TYPING_CADENCE_DEFAULT_MS)
+            .clamp(
+                FSFS_TUI_TYPING_INTERVAL_MIN_MS,
+                FSFS_TUI_TYPING_INTERVAL_MAX_MS,
+            );
+        cadence_ms.saturating_mul(2).clamp(
+            FSFS_TUI_SEMANTIC_IDLE_GATE_MIN_MS,
+            FSFS_TUI_SEMANTIC_IDLE_GATE_MAX_MS,
+        )
+    }
+
+    #[must_use]
+    fn quality_idle_gate_ms(&self) -> u64 {
+        self.semantic_idle_gate_ms()
+            .saturating_mul(2)
+            .saturating_add(40)
+            .clamp(
+                FSFS_TUI_QUALITY_IDLE_GATE_MIN_MS,
+                FSFS_TUI_QUALITY_IDLE_GATE_MAX_MS,
+            )
     }
 
     #[must_use]
@@ -4454,6 +4537,15 @@ impl FsfsRuntime {
         let lexical_budget =
             if matches!(mode, SearchExecutionMode::LexicalOnly) && filter_expr.is_none() {
                 limit.saturating_mul(2).max(limit)
+            } else if matches!(mode, SearchExecutionMode::FastOnly) && filter_expr.is_none() {
+                let planned_budget = plan.lexical_stage.candidate_budget.max(limit);
+                let fast_stage_cap = limit
+                    .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
+                    .max(limit);
+                short_query_budget_cap.map_or_else(
+                    || planned_budget.min(fast_stage_cap),
+                    |cap| planned_budget.min(fast_stage_cap).min(cap),
+                )
             } else {
                 let planned_budget = plan.lexical_stage.candidate_budget.max(limit);
                 if filter_expr.is_none() {
@@ -4462,7 +4554,10 @@ impl FsfsRuntime {
                     planned_budget
                 }
             };
-        let snippet_config = SnippetConfig::default();
+        let mut snippet_config = SnippetConfig::default();
+        if !matches!(mode, SearchExecutionMode::Full) {
+            snippet_config.max_chars = FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS;
+        }
         let mut snippets_by_doc = HashMap::new();
         let lexical_candidates = if plan.lexical_stage.enabled {
             if let Some(lexical) = resources.lexical_index.as_ref() {
@@ -4497,10 +4592,11 @@ impl FsfsRuntime {
                 .max(limit)
                 .min(short_query_cap)
         } else if matches!(mode, SearchExecutionMode::FastOnly) {
-            plan.semantic_stage
-                .candidate_budget
-                .max(limit)
-                .min(limit.saturating_mul(3).max(limit))
+            plan.semantic_stage.candidate_budget.max(limit).min(
+                limit
+                    .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
+                    .max(limit),
+            )
         } else {
             plan.semantic_stage.candidate_budget.max(limit)
         };
@@ -7108,23 +7204,6 @@ impl FsfsRuntime {
         let mut last_status_refresh = Instant::now();
 
         loop {
-            if state.should_refresh_lexical() {
-                self.refresh_search_dashboard_lexical(cx, state, resources)
-                    .await;
-            }
-            if state.should_refresh_semantic() {
-                self.refresh_search_dashboard_semantic_fast(cx, state, resources)
-                    .await;
-            }
-            if state.should_refresh_quality() {
-                self.refresh_search_dashboard_quality(cx, state, resources)
-                    .await;
-            }
-
-            session.render(|frame| {
-                render_search_dashboard_frame(frame, state, no_color);
-            })?;
-
             let mut force_status_refresh = false;
             if let Some(event) =
                 session.poll_event(Duration::from_millis(FSFS_TUI_SEARCH_POLL_INTERVAL_MS))?
@@ -7213,6 +7292,23 @@ impl FsfsRuntime {
                 state.mode_hint = self.search_mode_hint()?;
                 last_status_refresh = Instant::now();
             }
+
+            // Keep interaction responsive by prioritizing input and then executing
+            // only one refresh tier per loop iteration.
+            if state.should_refresh_lexical() {
+                self.refresh_search_dashboard_lexical(cx, state, resources)
+                    .await;
+            } else if state.should_refresh_semantic() {
+                self.refresh_search_dashboard_semantic_fast(cx, state, resources)
+                    .await;
+            } else if state.should_refresh_quality() {
+                self.refresh_search_dashboard_quality(cx, state, resources)
+                    .await;
+            }
+
+            session.render(|frame| {
+                render_search_dashboard_frame(frame, state, no_color);
+            })?;
         }
     }
 
@@ -7402,7 +7498,8 @@ impl FsfsRuntime {
                 });
                 let can_run_quality = !self.config.search.fast_only
                     && has_semantic_hits
-                    && state.quality_model_cached();
+                    && state.quality_model_cached()
+                    && resources.quality_stage_viable(self.config.search.fast_only);
                 let stages = if can_run_quality {
                     vec![
                         DashboardSearchStage::Lexical,
@@ -7438,6 +7535,9 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
     ) {
         state.clear_pending_quality_refresh();
+        if !resources.quality_stage_viable(self.config.search.fast_only) {
+            return;
+        }
         if state.query_input.value().trim().is_empty() {
             return;
         }
@@ -11147,6 +11247,25 @@ mod tests {
     }
 
     #[test]
+    fn search_dashboard_adaptive_debounce_trims_when_latency_is_fast() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        state.query_input.set_value("rust".to_owned());
+        state.typing_cadence_ewma_ms = Some(70);
+        state.last_search_elapsed_ms = Some(18);
+        state.push_latency_sample(18.0);
+        state.recompute_adaptive_debounce();
+
+        assert!(
+            (FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS..=FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS)
+                .contains(&state.lexical_debounce_window_ms)
+        );
+        assert!(
+            state.semantic_debounce_window_ms < FSFS_TUI_SEMANTIC_DEBOUNCE_MS,
+            "fast-path latency should trim semantic debounce"
+        );
+    }
+
+    #[test]
     fn search_dashboard_adaptive_debounce_backs_off_when_latency_is_slow() {
         let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
         state
@@ -11179,6 +11298,46 @@ mod tests {
             .expect("cadence ewma should be set");
         assert!(cadence >= 35);
         assert!(cadence <= 60);
+    }
+
+    #[test]
+    fn search_dashboard_semantic_refresh_waits_for_idle_gate() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        state.query_input.set_value("rust".to_owned());
+        state.mark_query_dirty();
+        state.semantic_pending_since = Instant::now()
+            .checked_sub(Duration::from_millis(
+                state.semantic_debounce_window_ms.saturating_add(10),
+            ))
+            .expect("semantic pending timestamp should backdate");
+
+        assert!(
+            !state.should_refresh_semantic(),
+            "semantic refresh should wait until typing goes idle"
+        );
+
+        let idle_gate_ms = state.semantic_idle_gate_ms();
+        state.last_query_edit_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(idle_gate_ms.saturating_add(10)))
+                .expect("query edit timestamp should backdate"),
+        );
+        assert!(
+            state.should_refresh_semantic(),
+            "semantic refresh should trigger after idle gate passes"
+        );
+    }
+
+    #[test]
+    fn search_dashboard_force_refresh_bypasses_idle_gate() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        state.query_input.set_value("rust".to_owned());
+        state.mark_query_dirty();
+        state.force_refresh_now();
+        assert!(
+            state.should_refresh_semantic(),
+            "explicit refresh should trigger semantic tier immediately"
+        );
     }
 
     #[test]
