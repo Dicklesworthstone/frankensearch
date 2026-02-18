@@ -203,7 +203,7 @@ impl FlashRankReranker {
     /// Run ONNX inference on a batch of tokenized pairs and return sigmoid-activated scores.
     #[allow(clippy::cast_possible_wrap)]
     fn infer_batch(
-        session: &Session,
+        session: &mut Session,
         pairs: &[TokenizedPair],
         model_name: &str,
     ) -> SearchResult<Vec<f32>> {
@@ -246,22 +246,18 @@ impl FlashRankReranker {
         })?;
         let shape = [batch_i64, seq_i64];
 
-        let input_ids_tensor =
-            ort::value::Tensor::from_array((shape.as_slice(), flat_input_ids.as_slice()))
-                .map_err(|e| rerank_ort_error(model_name, "input_ids tensor", &e))?;
-        let attention_mask_tensor =
-            ort::value::Tensor::from_array((shape.as_slice(), flat_attention_mask.as_slice()))
-                .map_err(|e| rerank_ort_error(model_name, "attention_mask tensor", &e))?;
-        let token_type_ids_tensor =
-            ort::value::Tensor::from_array((shape.as_slice(), flat_token_type_ids.as_slice()))
-                .map_err(|e| rerank_ort_error(model_name, "token_type_ids tensor", &e))?;
+        let input_ids_tensor = ort::value::Tensor::from_array((shape, flat_input_ids))
+            .map_err(|e| rerank_ort_error(model_name, "input_ids tensor", &e))?;
+        let attention_mask_tensor = ort::value::Tensor::from_array((shape, flat_attention_mask))
+            .map_err(|e| rerank_ort_error(model_name, "attention_mask tensor", &e))?;
+        let token_type_ids_tensor = ort::value::Tensor::from_array((shape, flat_token_type_ids))
+            .map_err(|e| rerank_ort_error(model_name, "token_type_ids tensor", &e))?;
 
         let inputs = ort::inputs! {
             "input_ids" => input_ids_tensor,
             "attention_mask" => attention_mask_tensor,
             "token_type_ids" => token_type_ids_tensor,
-        }
-        .map_err(|e| rerank_ort_error(model_name, "building inputs", &e))?;
+        };
 
         let outputs = session.run(inputs).map_err(|e| SearchError::RerankFailed {
             model: model_name.to_owned(),
@@ -301,7 +297,7 @@ impl Reranker for FlashRankReranker {
             }
 
             // Acquire ONNX session (cancel-aware)
-            let session = self
+            let mut session = self
                 .session
                 .lock(cx)
                 .await
@@ -310,7 +306,7 @@ impl Reranker for FlashRankReranker {
             // Run inference in batches
             let mut all_scores = Vec::with_capacity(documents.len());
             for chunk in all_pairs.chunks(INFERENCE_BATCH_SIZE) {
-                let batch_scores = Self::infer_batch(&session, chunk, &self.name)?;
+                let batch_scores = Self::infer_batch(&mut session, chunk, &self.name)?;
                 all_scores.extend(batch_scores);
             }
 
@@ -403,24 +399,24 @@ const fn sanitize_score(score: f32) -> f32 {
 /// Uses `try_extract_raw_tensor::<f32>()` which returns `(&[i64], &[f32])`.
 #[allow(clippy::cast_sign_loss)]
 fn extract_logits(
-    outputs: &ort::session::SessionOutputs<'_, '_>,
+    outputs: &ort::session::SessionOutputs<'_>,
     model_name: &str,
     batch_size: usize,
 ) -> SearchResult<Vec<f32>> {
     // Try named output tensors in priority order (use .get() to avoid panicking)
     for name in &OUTPUT_TENSOR_CANDIDATES {
         if let Some(value) = outputs.get(*name)
-            && let Ok(raw) = value.try_extract_raw_tensor::<f32>()
+            && let Ok((shape, data)) = value.try_extract_tensor::<f32>()
         {
-            return extract_scores_from_raw(raw, batch_size, model_name);
+            return extract_scores_from_raw((&**shape, data), batch_size, model_name);
         }
     }
 
     // Fallback: use first output by index
     if let Some((_, value)) = outputs.iter().next()
-        && let Ok(raw) = value.try_extract_raw_tensor::<f32>()
+        && let Ok((shape, data)) = value.try_extract_tensor::<f32>()
     {
-        return extract_scores_from_raw(raw, batch_size, model_name);
+        return extract_scores_from_raw((&**shape, data), batch_size, model_name);
     }
 
     Err(SearchError::RerankFailed {

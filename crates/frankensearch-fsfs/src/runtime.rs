@@ -33,12 +33,14 @@ use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
 use ftui_render::grapheme_pool::GraphemePool;
 use ftui_style::Style;
+use ftui_text::search::search_ascii_case_insensitive;
 use ftui_text::{Line, Span, Text, WrapMode};
 use ftui_tty::{TtyBackend, TtySessionOptions};
 use ftui_widgets::{
     Widget,
     block::Block,
     borders::{BorderType, Borders},
+    input::TextInput,
     paragraph::Paragraph,
     progress::ProgressBar,
     sparkline::Sparkline,
@@ -312,6 +314,247 @@ const INDEXING_TUI_SPARKLINE_WIDTH: usize = 28;
 const INDEXING_TUI_EMA_ALPHA: f64 = 0.24;
 const FSFS_TUI_POLL_INTERVAL_MS: u64 = 120;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 900;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 32;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 220;
+const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 320;
+const FSFS_TUI_SEARCH_HISTORY_LIMIT: usize = 72;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardSearchStage {
+    Idle,
+    Lexical,
+    SemanticFast,
+    QualitySkipped,
+    QualityRefined,
+    QualityRefinementFailed,
+}
+
+impl DashboardSearchStage {
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Lexical => "lexical",
+            Self::SemanticFast => "semantic_fast",
+            Self::QualitySkipped => "quality_skipped",
+            Self::QualityRefined => "quality_refined",
+            Self::QualityRefinementFailed => "quality_refinement_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchExecutionMode {
+    Full,
+    FastOnly,
+    LexicalOnly,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct SearchDashboardState {
+    status_payload: FsfsStatusPayload,
+    mode_hint: Option<String>,
+    query_input: TextInput,
+    search_active: bool,
+    pending_lexical_refresh: bool,
+    lexical_pending_since: Instant,
+    pending_semantic_refresh: bool,
+    semantic_pending_since: Instant,
+    pending_quality_refresh: bool,
+    quality_pending_since: Instant,
+    phase_payloads: Vec<SearchPayload>,
+    stage_chain: Vec<DashboardSearchStage>,
+    active_hit_index: usize,
+    last_error: Option<String>,
+    last_search_elapsed_ms: Option<u64>,
+    search_invocations: u64,
+    latency_history_ms: VecDeque<f64>,
+    hits_history: VecDeque<f64>,
+    result_limit: usize,
+}
+
+impl SearchDashboardState {
+    fn new(
+        status_payload: FsfsStatusPayload,
+        mode_hint: Option<String>,
+        result_limit: usize,
+        no_color: bool,
+    ) -> Self {
+        let query_input = TextInput::new()
+            .with_placeholder("Search indexed files... (/ focus, Esc blur)")
+            .with_focused(true)
+            .with_style(ui_fg(no_color, PackedRgba::rgb(224, 236, 255)))
+            .with_placeholder_style(ui_fg(no_color, PackedRgba::rgb(139, 161, 198)))
+            .with_cursor_style(ui_fg_bg(
+                no_color,
+                PackedRgba::rgb(12, 24, 40),
+                PackedRgba::rgb(122, 219, 255),
+            ));
+
+        let now = Instant::now();
+        Self {
+            status_payload,
+            mode_hint,
+            query_input,
+            search_active: true,
+            pending_lexical_refresh: false,
+            lexical_pending_since: now,
+            pending_semantic_refresh: false,
+            semantic_pending_since: now,
+            pending_quality_refresh: false,
+            quality_pending_since: now,
+            phase_payloads: Vec::new(),
+            stage_chain: vec![DashboardSearchStage::Idle],
+            active_hit_index: 0,
+            last_error: None,
+            last_search_elapsed_ms: None,
+            search_invocations: 0,
+            latency_history_ms: VecDeque::with_capacity(FSFS_TUI_SEARCH_HISTORY_LIMIT),
+            hits_history: VecDeque::with_capacity(FSFS_TUI_SEARCH_HISTORY_LIMIT),
+            result_limit: result_limit.max(1),
+        }
+    }
+
+    #[must_use]
+    fn latest_payload(&self) -> Option<&SearchPayload> {
+        self.phase_payloads.last()
+    }
+
+    #[must_use]
+    fn latest_hits(&self) -> &[SearchHitPayload] {
+        if let Some(payload) = self.latest_payload() {
+            payload.hits.as_slice()
+        } else {
+            &[]
+        }
+    }
+
+    fn set_focus(&mut self, focused: bool) {
+        self.search_active = focused;
+        self.query_input.set_focused(focused);
+    }
+
+    fn mark_query_dirty(&mut self) {
+        let now = Instant::now();
+        self.pending_lexical_refresh = true;
+        self.lexical_pending_since = now;
+        self.pending_semantic_refresh = true;
+        self.semantic_pending_since = now;
+        self.pending_quality_refresh = false;
+        self.quality_pending_since = now;
+    }
+
+    fn force_refresh_now(&mut self) {
+        let now = Instant::now();
+        self.pending_lexical_refresh = true;
+        self.lexical_pending_since = now
+            .checked_sub(Duration::from_millis(FSFS_TUI_LEXICAL_DEBOUNCE_MS))
+            .unwrap_or(now);
+        self.pending_semantic_refresh = true;
+        self.semantic_pending_since = now
+            .checked_sub(Duration::from_millis(FSFS_TUI_SEMANTIC_DEBOUNCE_MS))
+            .unwrap_or(now);
+        self.pending_quality_refresh = false;
+        self.quality_pending_since = now;
+    }
+
+    #[must_use]
+    fn should_refresh_lexical(&self) -> bool {
+        self.pending_lexical_refresh
+            && self.lexical_pending_since.elapsed()
+                >= Duration::from_millis(FSFS_TUI_LEXICAL_DEBOUNCE_MS)
+    }
+
+    #[must_use]
+    fn should_refresh_semantic(&self) -> bool {
+        self.pending_semantic_refresh
+            && self.semantic_pending_since.elapsed()
+                >= Duration::from_millis(FSFS_TUI_SEMANTIC_DEBOUNCE_MS)
+    }
+
+    #[must_use]
+    fn should_refresh_quality(&self) -> bool {
+        self.pending_quality_refresh
+            && self.quality_pending_since.elapsed()
+                >= Duration::from_millis(FSFS_TUI_QUALITY_DEBOUNCE_MS)
+    }
+
+    fn schedule_quality_refresh(&mut self) {
+        self.pending_quality_refresh = true;
+        self.quality_pending_since = Instant::now();
+    }
+
+    const fn clear_pending_quality_refresh(&mut self) {
+        self.pending_quality_refresh = false;
+    }
+
+    fn clear_search_results(&mut self) {
+        self.phase_payloads.clear();
+        self.stage_chain.clear();
+        self.stage_chain.push(DashboardSearchStage::Idle);
+        self.active_hit_index = 0;
+        self.last_error = None;
+        self.last_search_elapsed_ms = None;
+    }
+
+    fn next_hit(&mut self) {
+        let len = self.latest_hits().len();
+        if len > 0 {
+            self.active_hit_index = (self.active_hit_index + 1) % len;
+        }
+    }
+
+    fn prev_hit(&mut self) {
+        let len = self.latest_hits().len();
+        if len > 0 {
+            self.active_hit_index = (self.active_hit_index + len - 1) % len;
+        }
+    }
+
+    fn clamp_active_hit(&mut self) {
+        let len = self.latest_hits().len();
+        if len == 0 {
+            self.active_hit_index = 0;
+        } else {
+            self.active_hit_index = self.active_hit_index.min(len - 1);
+        }
+    }
+
+    fn push_latency_sample(&mut self, value: f64) {
+        if self.latency_history_ms.len() >= FSFS_TUI_SEARCH_HISTORY_LIMIT {
+            let _ = self.latency_history_ms.pop_front();
+        }
+        self.latency_history_ms.push_back(value.max(0.0));
+    }
+
+    fn push_hit_sample(&mut self, value: f64) {
+        if self.hits_history.len() >= FSFS_TUI_SEARCH_HISTORY_LIMIT {
+            let _ = self.hits_history.pop_front();
+        }
+        self.hits_history.push_back(value.max(0.0));
+    }
+
+    #[must_use]
+    fn quality_model_cached(&self) -> bool {
+        self.status_payload
+            .models
+            .iter()
+            .any(|model| model.tier.eq_ignore_ascii_case("quality") && model.cached)
+    }
+
+    fn set_phase_payloads(
+        &mut self,
+        payloads: Vec<SearchPayload>,
+        stages: Vec<DashboardSearchStage>,
+    ) {
+        self.phase_payloads = payloads;
+        self.stage_chain = if stages.is_empty() {
+            vec![DashboardSearchStage::Idle]
+        } else {
+            stages
+        };
+    }
+}
 
 #[derive(Debug, Clone)]
 struct IndexCandidate {
@@ -3869,8 +4112,19 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        self.execute_search_payloads_with_mode(cx, query, limit, SearchExecutionMode::Full)
+            .await
+    }
+
+    async fn execute_search_payloads_with_mode(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<Vec<SearchPayload>> {
         let artifacts = self
-            .execute_search_phase_artifacts(cx, query, limit)
+            .execute_search_phase_artifacts_with_mode(cx, query, limit, mode)
             .await?;
         Ok(artifacts
             .into_iter()
@@ -3910,11 +4164,12 @@ impl FsfsRuntime {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute_search_phase_artifacts(
+    async fn execute_search_phase_artifacts_with_mode(
         &self,
         cx: &Cx,
         query: &str,
         limit: usize,
+        mode: SearchExecutionMode,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let normalized_query = query
             .split_whitespace()
@@ -3973,7 +4228,7 @@ impl FsfsRuntime {
         }
 
         let mut fast_embedder = None;
-        if vector_index.is_some() {
+        if vector_index.is_some() && !matches!(mode, SearchExecutionMode::LexicalOnly) {
             match self.resolve_fast_embedder() {
                 Ok(embedder) => fast_embedder = Some(embedder),
                 Err(error) if lexical_available => {
@@ -3987,7 +4242,10 @@ impl FsfsRuntime {
         }
 
         let mut quality_embedder = None;
-        if vector_index.is_some() && !self.config.search.fast_only {
+        if vector_index.is_some()
+            && matches!(mode, SearchExecutionMode::Full)
+            && !self.config.search.fast_only
+        {
             match self.resolve_quality_embedder() {
                 Ok(Some(embedder)) => quality_embedder = Some(embedder),
                 Ok(None) => {}
@@ -4007,12 +4265,18 @@ impl FsfsRuntime {
             } else {
                 CapabilityState::Disabled
             },
-            fast_semantic: if vector_index.is_some() && fast_embedder.is_some() {
+            fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
+                && vector_index.is_some()
+                && fast_embedder.is_some()
+            {
                 CapabilityState::Enabled
             } else {
                 CapabilityState::Disabled
             },
-            quality_semantic: if vector_index.is_some() && quality_embedder.is_some() {
+            quality_semantic: if matches!(mode, SearchExecutionMode::Full)
+                && vector_index.is_some()
+                && quality_embedder.is_some()
+            {
                 CapabilityState::Enabled
             } else {
                 CapabilityState::Disabled
@@ -4028,6 +4292,7 @@ impl FsfsRuntime {
             intent = ?plan.intent.intent,
             fallback = ?plan.intent.fallback,
             confidence_per_mille = plan.intent.confidence_per_mille,
+            mode_override = ?mode,
             execution_mode = ?plan.mode,
             reason_code = plan.reason_code,
             "fsfs search query planned"
@@ -5777,7 +6042,7 @@ impl FsfsRuntime {
         }
 
         if self.index_artifacts_exist()? {
-            self.render_existing_index_dashboard()?;
+            self.run_search_dashboard_tui(cx).await?;
             return Ok(());
         }
 
@@ -5786,7 +6051,15 @@ impl FsfsRuntime {
             println!("No indexing started. Run `fsfs index <path>` any time.");
             return Ok(());
         };
-        self.run_first_run_indexing_tui(cx, selected_root).await?;
+        self.run_first_run_indexing_tui(cx, selected_root.clone())
+            .await?;
+
+        let selected_index_root = self.resolve_index_root(&selected_root)?;
+        let mut next_runtime = self.clone();
+        let mut next_cli = next_runtime.cli_input.clone();
+        next_cli.index_dir = Some(selected_index_root);
+        next_runtime = next_runtime.with_cli_input(next_cli);
+        next_runtime.run_search_dashboard_tui(cx).await?;
         Ok(())
     }
 
@@ -6182,7 +6455,7 @@ impl FsfsRuntime {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(dead_code, clippy::too_many_lines)]
     fn render_existing_index_dashboard(&self) -> SearchResult<()> {
         if let Ok(mut session) = FtuiSession::enter() {
             match self.render_existing_index_dashboard_ftui(&mut session) {
@@ -6379,6 +6652,7 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn render_existing_index_dashboard_ftui(&self, session: &mut FtuiSession) -> SearchResult<()> {
         let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let mut payload = self.collect_status_payload()?;
@@ -6414,6 +6688,433 @@ impl FsfsRuntime {
                 payload = self.collect_status_payload()?;
                 last_refresh = Instant::now();
             }
+        }
+    }
+
+    async fn run_search_dashboard_tui(&self, cx: &Cx) -> SearchResult<()> {
+        let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
+        let status_payload = self.collect_status_payload()?;
+        let mode_hint = self.search_mode_hint()?;
+        let result_limit = self
+            .cli_input
+            .overrides
+            .limit
+            .unwrap_or(self.config.search.default_limit)
+            .max(1);
+        let mut state =
+            SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
+
+        match FtuiSession::enter() {
+            Ok(mut session) => {
+                self.run_search_dashboard_ftui(cx, &mut session, &mut state, no_color)
+                    .await
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "interactive fsfs search cockpit unavailable; falling back to ansi interaction"
+                );
+                self.run_search_dashboard_ansi(cx, &mut state, no_color)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_search_dashboard_ftui(
+        &self,
+        cx: &Cx,
+        session: &mut FtuiSession,
+        state: &mut SearchDashboardState,
+        no_color: bool,
+    ) -> SearchResult<()> {
+        let mut last_status_refresh = Instant::now();
+
+        loop {
+            if state.should_refresh_lexical() {
+                self.refresh_search_dashboard_lexical(cx, state).await;
+            }
+            if state.should_refresh_semantic() {
+                self.refresh_search_dashboard_semantic_fast(cx, state).await;
+            }
+            if state.should_refresh_quality() {
+                self.refresh_search_dashboard_quality(cx, state).await;
+            }
+
+            session.render(|frame| {
+                render_search_dashboard_frame(frame, state, no_color);
+            })?;
+
+            let mut force_status_refresh = false;
+            if let Some(event) =
+                session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+            {
+                if state.search_active {
+                    match &event {
+                        Event::Key(key) => match (key.code, key.modifiers) {
+                            (KeyCode::Escape, _) => state.set_focus(false),
+                            (KeyCode::Enter | KeyCode::Tab | KeyCode::Down, _) => {
+                                if state.latest_hits().is_empty()
+                                    && !state.query_input.value().trim().is_empty()
+                                {
+                                    state.force_refresh_now();
+                                } else {
+                                    state.next_hit();
+                                }
+                            }
+                            (KeyCode::Up | KeyCode::BackTab, _) => {
+                                state.prev_hit();
+                            }
+                            _ => {
+                                if state.query_input.handle_event(&event) {
+                                    state.active_hit_index = 0;
+                                    state.mark_query_dirty();
+                                }
+                            }
+                        },
+                        Event::Paste(_) => {
+                            if state.query_input.handle_event(&event) {
+                                state.active_hit_index = 0;
+                                state.mark_query_dirty();
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Event::Key(key) = &event {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Escape | KeyCode::Char('q' | 'Q'), _) => return Ok(()),
+                        (KeyCode::Char('/'), Modifiers::NONE) => {
+                            state.set_focus(true);
+                        }
+                        (KeyCode::Char('f'), modifiers) if modifiers.contains(Modifiers::CTRL) => {
+                            state.set_focus(true);
+                        }
+                        (KeyCode::Char('r' | 'R'), _) => {
+                            force_status_refresh = true;
+                        }
+                        (KeyCode::Char('l'), modifiers) if modifiers.contains(Modifiers::CTRL) => {
+                            state.query_input.clear();
+                            state.mark_query_dirty();
+                            state.set_focus(true);
+                        }
+                        (KeyCode::Enter | KeyCode::Tab | KeyCode::Down, _)
+                        | (KeyCode::Char('n'), Modifiers::NONE) => {
+                            state.next_hit();
+                        }
+                        (KeyCode::Up | KeyCode::BackTab, _)
+                        | (KeyCode::Char('N'), Modifiers::NONE)
+                        | (KeyCode::Char('n'), Modifiers::SHIFT) => {
+                            state.prev_hit();
+                        }
+                        (KeyCode::Home, _) | (KeyCode::Char('g'), Modifiers::NONE) => {
+                            state.active_hit_index = 0;
+                        }
+                        (KeyCode::End, _) | (KeyCode::Char('G'), Modifiers::NONE) => {
+                            let len = state.latest_hits().len();
+                            state.active_hit_index = len.saturating_sub(1);
+                        }
+                        (KeyCode::Char(ch), Modifiers::NONE) if !ch.is_control() => {
+                            state.set_focus(true);
+                            if state.query_input.handle_event(&event) {
+                                state.active_hit_index = 0;
+                                state.mark_query_dirty();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if force_status_refresh
+                || last_status_refresh.elapsed()
+                    >= Duration::from_millis(FSFS_TUI_STATUS_REFRESH_MS)
+            {
+                state.status_payload = self.collect_status_payload()?;
+                state.mode_hint = self.search_mode_hint()?;
+                last_status_refresh = Instant::now();
+            }
+        }
+    }
+
+    async fn run_search_dashboard_ansi(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        no_color: bool,
+    ) -> SearchResult<()> {
+        let width = tui_terminal_width().clamp(88, 168);
+        let rule = "═".repeat(width);
+        let mut stdout = std::io::stdout();
+
+        loop {
+            state.status_payload = self.collect_status_payload()?;
+            state.mode_hint = self.search_mode_hint()?;
+
+            write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
+            writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+            writeln!(
+                stdout,
+                "{} {}",
+                paint("fsfs", "1;38;5;45", no_color),
+                paint("Search Cockpit (ANSI fallback)", "1;37", no_color)
+            )
+            .map_err(tui_io_error)?;
+            writeln!(
+                stdout,
+                "index: {}",
+                truncate_middle(&state.status_payload.index.path, width.saturating_sub(8),)
+            )
+            .map_err(tui_io_error)?;
+            if let Some(mode_hint) = state.mode_hint.as_deref() {
+                writeln!(stdout, "{}", paint(mode_hint, "38;5;244", no_color))
+                    .map_err(tui_io_error)?;
+            }
+            writeln!(stdout, "{}", paint(&rule, "38;5;24", no_color)).map_err(tui_io_error)?;
+
+            if let Some(error) = state.last_error.as_deref() {
+                writeln!(
+                    stdout,
+                    "{} {}",
+                    paint("search error:", "1;31", no_color),
+                    error
+                )
+                .map_err(tui_io_error)?;
+                writeln!(stdout).map_err(tui_io_error)?;
+            } else if let Some(payload) = state.latest_payload() {
+                let rendered = crate::adapters::format_emitter::render_search_table_for_cli(
+                    payload,
+                    state.last_search_elapsed_ms,
+                    no_color,
+                );
+                writeln!(stdout, "{rendered}").map_err(tui_io_error)?;
+            } else {
+                writeln!(
+                    stdout,
+                    "{}",
+                    paint(
+                        "Type a query to search. Use `q` or `quit` to exit.",
+                        "38;5;250",
+                        no_color
+                    )
+                )
+                .map_err(tui_io_error)?;
+            }
+
+            write!(stdout, "{} ", paint("search>", "1;38;5;45", no_color)).map_err(tui_io_error)?;
+            stdout.flush().map_err(tui_io_error)?;
+
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(SearchError::Io)?;
+            let trimmed = input.trim();
+            if matches!(trimmed, "q" | "Q" | "quit" | "QUIT" | "exit" | "EXIT") {
+                return Ok(());
+            }
+
+            state.query_input.set_value(trimmed.to_owned());
+            state.mark_query_dirty();
+            self.refresh_search_dashboard_full(cx, state).await;
+        }
+    }
+
+    async fn refresh_search_dashboard_mode(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let query = state.query_input.value().trim().to_owned();
+        if query.is_empty() {
+            state.clear_search_results();
+            return Ok(Vec::new());
+        }
+
+        let started = Instant::now();
+        let result = self
+            .execute_search_payloads_with_mode(cx, &query, state.result_limit, mode)
+            .await;
+
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        state.last_search_elapsed_ms = Some(elapsed_ms);
+        state.search_invocations = state.search_invocations.saturating_add(1);
+        let elapsed_sample = f64::from(u32::try_from(elapsed_ms).unwrap_or(u32::MAX));
+        state.push_latency_sample(elapsed_sample);
+
+        match result {
+            Ok(payloads) => {
+                state.last_error = None;
+                let hit_sample = f64::from(
+                    u32::try_from(
+                        payloads
+                            .last()
+                            .map_or(0_usize, |payload| payload.hits.len()),
+                    )
+                    .unwrap_or(u32::MAX),
+                );
+                state.push_hit_sample(hit_sample);
+                Ok(payloads)
+            }
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                state.push_hit_sample(0.0);
+                Err(error)
+            }
+        }
+    }
+
+    async fn refresh_search_dashboard_lexical(&self, cx: &Cx, state: &mut SearchDashboardState) {
+        state.pending_lexical_refresh = false;
+        state.clear_pending_quality_refresh();
+        if state.query_input.value().trim().is_empty() {
+            state.pending_semantic_refresh = false;
+            state.clear_search_results();
+            return;
+        }
+
+        if let Ok(payloads) = self
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::LexicalOnly)
+            .await
+        {
+            state.set_phase_payloads(payloads, vec![DashboardSearchStage::Lexical]);
+            state.clamp_active_hit();
+        } else {
+            state.phase_payloads.clear();
+            state.stage_chain = vec![DashboardSearchStage::Lexical];
+            state.active_hit_index = 0;
+            state.pending_semantic_refresh = false;
+        }
+    }
+
+    async fn refresh_search_dashboard_semantic_fast(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+    ) {
+        state.pending_semantic_refresh = false;
+        if state.query_input.value().trim().is_empty() {
+            state.clear_pending_quality_refresh();
+            return;
+        }
+
+        match self
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::FastOnly)
+            .await
+        {
+            Ok(payloads) => {
+                let has_semantic_hits = payloads.last().is_some_and(|payload| {
+                    payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+                });
+                let can_run_quality = !self.config.search.fast_only
+                    && has_semantic_hits
+                    && state.quality_model_cached();
+                let stages = if can_run_quality {
+                    vec![
+                        DashboardSearchStage::Lexical,
+                        DashboardSearchStage::SemanticFast,
+                    ]
+                } else if has_semantic_hits && !self.config.search.fast_only {
+                    vec![
+                        DashboardSearchStage::Lexical,
+                        DashboardSearchStage::SemanticFast,
+                        DashboardSearchStage::QualitySkipped,
+                    ]
+                } else {
+                    vec![DashboardSearchStage::Lexical]
+                };
+                state.set_phase_payloads(payloads, stages);
+                state.clamp_active_hit();
+                if can_run_quality {
+                    state.schedule_quality_refresh();
+                } else {
+                    state.clear_pending_quality_refresh();
+                }
+            }
+            Err(_) => {
+                state.clear_pending_quality_refresh();
+            }
+        }
+    }
+
+    async fn refresh_search_dashboard_quality(&self, cx: &Cx, state: &mut SearchDashboardState) {
+        state.clear_pending_quality_refresh();
+        if state.query_input.value().trim().is_empty() {
+            return;
+        }
+
+        match self
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full)
+            .await
+        {
+            Ok(payloads) => {
+                let has_semantic_hits = payloads.last().is_some_and(|payload| {
+                    payload.hits.iter().any(|hit| hit.semantic_rank.is_some())
+                });
+                let quality_stage = match payloads.last().map(|payload| payload.phase) {
+                    Some(SearchOutputPhase::Refined) => DashboardSearchStage::QualityRefined,
+                    Some(SearchOutputPhase::Initial) => DashboardSearchStage::QualitySkipped,
+                    Some(SearchOutputPhase::RefinementFailed) => {
+                        DashboardSearchStage::QualityRefinementFailed
+                    }
+                    None => DashboardSearchStage::QualityRefinementFailed,
+                };
+                let stages = if has_semantic_hits {
+                    vec![
+                        DashboardSearchStage::Lexical,
+                        DashboardSearchStage::SemanticFast,
+                        quality_stage,
+                    ]
+                } else {
+                    vec![DashboardSearchStage::Lexical]
+                };
+                state.set_phase_payloads(payloads, stages);
+                state.clamp_active_hit();
+            }
+            Err(_) => {
+                state.stage_chain = vec![
+                    DashboardSearchStage::Lexical,
+                    DashboardSearchStage::SemanticFast,
+                    DashboardSearchStage::QualityRefinementFailed,
+                ];
+            }
+        }
+    }
+
+    async fn refresh_search_dashboard_full(&self, cx: &Cx, state: &mut SearchDashboardState) {
+        if state.query_input.value().trim().is_empty() {
+            state.clear_search_results();
+            return;
+        }
+
+        if let Ok(payloads) = self
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full)
+            .await
+        {
+            let has_semantic_hits = payloads
+                .last()
+                .is_some_and(|payload| payload.hits.iter().any(|hit| hit.semantic_rank.is_some()));
+            let mut stages = vec![DashboardSearchStage::Lexical];
+            if has_semantic_hits {
+                stages.push(DashboardSearchStage::SemanticFast);
+                if let Some(phase) = payloads.last().map(|payload| payload.phase) {
+                    match phase {
+                        SearchOutputPhase::Initial => {
+                            stages.push(DashboardSearchStage::QualitySkipped);
+                        }
+                        SearchOutputPhase::Refined => {
+                            stages.push(DashboardSearchStage::QualityRefined);
+                        }
+                        SearchOutputPhase::RefinementFailed => {
+                            stages.push(DashboardSearchStage::QualityRefinementFailed);
+                        }
+                    }
+                }
+            }
+            state.set_phase_payloads(payloads, stages);
+            state.clamp_active_hit();
+        } else {
+            state.phase_payloads.clear();
+            state.active_hit_index = 0;
         }
     }
 
@@ -6481,7 +7182,7 @@ impl FsfsRuntime {
         if let Some(session) = ftui_session.as_mut() {
             return wait_for_ftui_dismiss(
                 session,
-                "Initial indexing finished. Press Enter, Esc, or q to return.",
+                "Initial indexing finished. Press Enter, Esc, or q to open search cockpit.",
                 no_color,
             );
         }
@@ -6490,7 +7191,7 @@ impl FsfsRuntime {
         writeln!(stdout).map_err(tui_io_error)?;
         writeln!(
             stdout,
-            "Initial indexing finished. Press Enter to return to the shell."
+            "Initial indexing finished. Press Enter to open the search cockpit."
         )
         .map_err(tui_io_error)?;
         stdout.flush().map_err(tui_io_error)?;
@@ -7217,6 +7918,21 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     format!("{prefix}...{suffix}")
 }
 
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    if max_chars < 2 {
+        return text.chars().take(max_chars).collect();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_owned();
+    }
+    let prefix = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{prefix}…")
+}
+
 fn format_eta(seconds: Option<u64>) -> String {
     seconds.map_or_else(|| "--".to_owned(), humanize_duration_seconds)
 }
@@ -7618,7 +8334,7 @@ fn render_root_selector_frame(
     .render(layout[2], frame);
 }
 
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+#[allow(dead_code, clippy::too_many_lines, clippy::cast_precision_loss)]
 fn render_existing_index_dashboard_frame(
     frame: &mut Frame,
     payload: &FsfsStatusPayload,
@@ -7890,6 +8606,828 @@ fn render_existing_index_dashboard_frame(
             .title(" controls "),
     )
     .render(layout[2], frame);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::option_if_let_else,
+    clippy::or_fun_call
+)]
+fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState, no_color: bool) {
+    let area = frame.bounds();
+    if area.is_empty() {
+        return;
+    }
+    if area.width < 92 || area.height < 22 {
+        render_search_dashboard_compact(frame, state, no_color);
+        return;
+    }
+
+    let query_terms = collect_search_query_terms(state.query_input.value());
+    let latest_payload = state.latest_payload();
+    let latest_stage = state
+        .stage_chain
+        .last()
+        .copied()
+        .unwrap_or(DashboardSearchStage::Idle)
+        .label()
+        .replace('_', " ");
+    let returned_hits = state.latest_hits().len();
+    let total_candidates = latest_payload.map_or(0, |payload| payload.total_candidates);
+    let elapsed_label = state
+        .last_search_elapsed_ms
+        .map_or_else(|| "--".to_owned(), |ms| format!("{ms}ms"));
+
+    let layout = Flex::vertical()
+        .constraints([Constraint::Fixed(5), Constraint::Fill, Constraint::Fixed(3)])
+        .split(area);
+    let body = Flex::horizontal()
+        .constraints([Constraint::Percentage(64.0), Constraint::Percentage(36.0)])
+        .split(layout[1]);
+    let left = Flex::vertical()
+        .constraints([Constraint::Fixed(3), Constraint::Fill, Constraint::Fixed(5)])
+        .split(body[0]);
+    let right = Flex::vertical()
+        .constraints([Constraint::Fixed(8), Constraint::Fixed(8), Constraint::Fill])
+        .split(body[1]);
+
+    let header_lines = vec![
+        Line::from_spans(vec![
+            Span::styled(
+                "fsfs",
+                ui_fg(no_color, PackedRgba::rgb(90, 188, 255)).bold(),
+            ),
+            Span::styled(
+                "  Search Cockpit",
+                ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
+            ),
+            Span::styled(
+                format!("  stage: {latest_stage}"),
+                ui_fg(no_color, PackedRgba::rgb(163, 185, 222)),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "query latency={}  hits={}  candidates={}  searches this session={}",
+                elapsed_label,
+                format_count_usize(returned_hits),
+                format_count_usize(total_candidates),
+                format_count_u64(state.search_invocations)
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
+        )),
+        Line::from(Span::styled(
+            truncate_middle(
+                &state.status_payload.index.path,
+                usize::from(layout[0].width).saturating_sub(8),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(163, 185, 222)),
+        )),
+    ];
+    Paragraph::new(Text::from_lines(header_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+                .title(" index + query runtime "),
+        )
+        .render(layout[0], frame);
+
+    let search_block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(87, 130, 199)))
+        .title(" live query ");
+    search_block.render(left[0], frame);
+    let search_inner = search_block.inner(left[0]);
+    let search_cols = Flex::horizontal()
+        .constraints([Constraint::Min(18), Constraint::Fixed(24)])
+        .split(search_inner);
+    state.query_input.render(search_cols[0], frame);
+    let match_label = if returned_hits == 0 {
+        if state.query_input.value().trim().is_empty() {
+            "Type to search".to_owned()
+        } else {
+            "No matches".to_owned()
+        }
+    } else {
+        format!(
+            "{}/{} matches",
+            state.active_hit_index.saturating_add(1),
+            returned_hits
+        )
+    };
+    let focus_label = if state.search_active {
+        "search focus"
+    } else {
+        "browse focus"
+    };
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            match_label,
+            ui_fg(no_color, PackedRgba::rgb(223, 236, 255)).bold(),
+        )),
+        Line::from(Span::styled(
+            focus_label,
+            ui_fg(no_color, PackedRgba::rgb(136, 157, 193)),
+        )),
+    ]))
+    .render(search_cols[1], frame);
+
+    render_search_results_panel(frame, left[1], state, no_color, &query_terms);
+
+    let active_detail_lines = if let Some(hit) = state.latest_hits().get(state.active_hit_index) {
+        let lexical_rank = hit
+            .lexical_rank
+            .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
+        let semantic_rank = hit
+            .semantic_rank
+            .map_or_else(|| "–".to_owned(), |rank| format_count_usize(rank + 1));
+        let source = search_hit_source_label(hit);
+        vec![
+            Line::from(Span::styled(
+                truncate_middle(
+                    &hit.path,
+                    usize::from(left[2].width).saturating_sub(10).max(24),
+                ),
+                ui_fg(no_color, PackedRgba::rgb(224, 238, 255)).bold(),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "score={:.3}  source={}  lexical#={}  semantic#={}",
+                    hit.score, source, lexical_rank, semantic_rank
+                ),
+                ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
+            )),
+            Line::from(Span::styled(
+                hit.snippet.as_deref().map_or(
+                    "No snippet available for this match.".to_owned(),
+                    |snippet| {
+                        truncate_tail(
+                            snippet.trim(),
+                            usize::from(left[2].width).saturating_sub(8).max(26),
+                        )
+                    },
+                ),
+                ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+            )),
+        ]
+    } else if let Some(error) = state.last_error.as_deref() {
+        vec![
+            Line::from(Span::styled(
+                "Search failed",
+                ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold(),
+            )),
+            Line::from(Span::styled(
+                truncate_tail(error, usize::from(left[2].width).saturating_sub(6).max(24)),
+                ui_fg(no_color, PackedRgba::rgb(255, 201, 201)),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "No active match",
+                ui_fg(no_color, PackedRgba::rgb(173, 194, 229)).bold(),
+            )),
+            Line::from(Span::styled(
+                "Use / or Ctrl+F to focus query input, then type to search instantly.",
+                ui_fg(no_color, PackedRgba::rgb(148, 170, 205)),
+            )),
+        ]
+    };
+    Paragraph::new(Text::from_lines(active_detail_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(97, 153, 223)))
+                .title(" active match "),
+        )
+        .wrap(WrapMode::Word)
+        .render(left[2], frame);
+
+    let indexed_files = state.status_payload.index.indexed_files.unwrap_or(0);
+    let discovered_files = state
+        .status_payload
+        .index
+        .discovered_files
+        .unwrap_or(indexed_files);
+    let skipped_files = state.status_payload.index.skipped_files.unwrap_or(0);
+    let stale_files = state.status_payload.index.stale_files.unwrap_or(0);
+    let coverage = ratio_percent_usize(indexed_files, discovered_files.max(1));
+    let mode_hint = state
+        .mode_hint
+        .as_deref()
+        .unwrap_or("Search mode: full hybrid semantic + lexical.");
+    let corpus_lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "indexed={}  discovered={}  skipped={}  stale={}",
+                format_count_usize(indexed_files),
+                format_count_usize(discovered_files),
+                format_count_usize(skipped_files),
+                format_count_usize(stale_files),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(224, 237, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "coverage={coverage:.1}%  index size={}  vector={}  lexical={}",
+                humanize_bytes(state.status_payload.index.size_bytes),
+                humanize_bytes(state.status_payload.index.vector_index_bytes),
+                humanize_bytes(state.status_payload.index.lexical_index_bytes),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
+        )),
+        Line::from(Span::styled(
+            truncate_tail(
+                mode_hint,
+                usize::from(right[0].width).saturating_sub(6).max(20),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(141, 163, 199)),
+        )),
+    ];
+    Paragraph::new(Text::from_lines(corpus_lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(103, 161, 230)))
+                .title(" corpus health "),
+        )
+        .wrap(WrapMode::Word)
+        .render(right[0], frame);
+
+    let source_both = state
+        .latest_hits()
+        .iter()
+        .filter(|hit| hit.in_both_sources)
+        .count();
+    let source_lexical = state
+        .latest_hits()
+        .iter()
+        .filter(|hit| hit.lexical_rank.is_some() && hit.semantic_rank.is_none())
+        .count();
+    let source_semantic = state
+        .latest_hits()
+        .iter()
+        .filter(|hit| hit.semantic_rank.is_some() && hit.lexical_rank.is_none())
+        .count();
+    let phase_chain = render_phase_chain(&state.stage_chain);
+    let telemetry_block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(118, 131, 212)))
+        .title(" query telemetry ");
+    telemetry_block.render(right[1], frame);
+    let telemetry_inner = telemetry_block.inner(right[1]);
+    let telemetry_rows = Flex::vertical()
+        .constraints([
+            Constraint::Fixed(4),
+            Constraint::Fixed(1),
+            Constraint::Fixed(1),
+        ])
+        .split(telemetry_inner);
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            format!(
+                "stage chain: {phase_chain}  •  elapsed: {elapsed_label}  •  limit: {}",
+                format_count_usize(state.result_limit)
+            ),
+            ui_fg(no_color, PackedRgba::rgb(220, 234, 255)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "sources => both={} lexical_only={} semantic_only={}",
+                format_count_usize(source_both),
+                format_count_usize(source_lexical),
+                format_count_usize(source_semantic),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(168, 191, 228)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "invocations={}  returned_hits={}  candidates={}",
+                format_count_u64(state.search_invocations),
+                format_count_usize(returned_hits),
+                format_count_usize(total_candidates),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(148, 170, 207)),
+        )),
+    ]))
+    .render(telemetry_rows[0], frame);
+    let latency_spark = if state.latency_history_ms.is_empty() {
+        vec![0.0]
+    } else {
+        state.latency_history_ms.iter().copied().collect::<Vec<_>>()
+    };
+    Sparkline::new(&latency_spark)
+        .style(ui_fg(no_color, PackedRgba::rgb(122, 219, 255)))
+        .render(telemetry_rows[1], frame);
+    let hit_spark = if state.hits_history.is_empty() {
+        vec![0.0]
+    } else {
+        state.hits_history.iter().copied().collect::<Vec<_>>()
+    };
+    Sparkline::new(&hit_spark)
+        .style(ui_fg(no_color, PackedRgba::rgb(131, 231, 157)))
+        .render(telemetry_rows[2], frame);
+
+    let context_block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(94, 152, 220)))
+        .title(" context radar ");
+    context_block.render(right[2], frame);
+    let context_inner = context_block.inner(right[2]);
+    let context_rows = Flex::vertical()
+        .constraints([Constraint::Fixed(2), Constraint::Fixed(1), Constraint::Fill])
+        .split(context_inner);
+    let score_spark = if state.latest_hits().is_empty() {
+        vec![0.0]
+    } else {
+        state
+            .latest_hits()
+            .iter()
+            .take(72)
+            .map(|hit| hit.score.max(0.0))
+            .collect::<Vec<_>>()
+    };
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "result score density (left→right rank order)",
+            ui_fg(no_color, PackedRgba::rgb(165, 187, 223)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "active rank={} / {}",
+                format_count_usize(state.active_hit_index.saturating_add(1)),
+                format_count_usize(returned_hits.max(1))
+            ),
+            ui_fg(no_color, PackedRgba::rgb(145, 168, 205)),
+        )),
+    ]))
+    .render(context_rows[0], frame);
+    Sparkline::new(&score_spark)
+        .style(ui_fg(no_color, PackedRgba::rgb(255, 202, 123)))
+        .render(context_rows[1], frame);
+    if let Some(active_hit) = state.latest_hits().get(state.active_hit_index) {
+        let snippet = active_hit
+            .snippet
+            .as_deref()
+            .unwrap_or("No snippet available for this hit.");
+        let snippet = truncate_tail(
+            snippet.trim(),
+            usize::from(context_rows[2].width).saturating_mul(3).max(64),
+        );
+        let snippet_spans = highlight_text_spans(
+            &snippet,
+            &query_terms,
+            ui_fg(no_color, PackedRgba::rgb(215, 230, 255)),
+            ui_fg_bg(
+                no_color,
+                PackedRgba::rgb(8, 22, 34),
+                PackedRgba::rgb(255, 202, 123),
+            ),
+        );
+        Paragraph::new(Text::from_lines(vec![
+            Line::from(Span::styled(
+                truncate_middle(
+                    &active_hit.path,
+                    usize::from(context_rows[2].width).saturating_sub(4).max(18),
+                ),
+                ui_fg(no_color, PackedRgba::rgb(224, 239, 255)).bold(),
+            )),
+            Line::from(""),
+            Line::from_spans(snippet_spans),
+        ]))
+        .wrap(WrapMode::Word)
+        .render(context_rows[2], frame);
+    } else {
+        Paragraph::new(Text::from_lines(vec![
+            Line::from(Span::styled(
+                "No context yet.",
+                ui_fg(no_color, PackedRgba::rgb(177, 199, 233)),
+            )),
+            Line::from(Span::styled(
+                "Type a query to populate ranked matches and context excerpts.",
+                ui_fg(no_color, PackedRgba::rgb(145, 168, 205)),
+            )),
+        ]))
+        .wrap(WrapMode::Word)
+        .render(context_rows[2], frame);
+    }
+
+    Paragraph::new(Text::from_lines(vec![
+        Line::from(Span::styled(
+            "/ or Ctrl+F focus  •  Esc blur/exit  •  Enter/Tab/↓ next  •  ↑/Shift+Tab prev",
+            ui_fg(no_color, PackedRgba::rgb(165, 183, 216)),
+        )),
+        Line::from(Span::styled(
+            "n/N navigate  •  Ctrl+L clear query  •  r refresh corpus health  •  q exit",
+            ui_fg(no_color, PackedRgba::rgb(132, 151, 184)),
+        )),
+    ]))
+    .block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(ui_fg(no_color, PackedRgba::rgb(72, 98, 149)))
+            .title(" controls "),
+    )
+    .render(layout[2], frame);
+}
+
+fn render_search_dashboard_compact(
+    frame: &mut Frame,
+    state: &SearchDashboardState,
+    no_color: bool,
+) {
+    let area = frame.bounds();
+    if area.is_empty() {
+        return;
+    }
+    let query_terms = collect_search_query_terms(state.query_input.value());
+    let latest_stage = state
+        .stage_chain
+        .last()
+        .copied()
+        .unwrap_or(DashboardSearchStage::Idle)
+        .label()
+        .replace('_', " ");
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans(vec![
+        Span::styled(
+            "fsfs",
+            ui_fg(no_color, PackedRgba::rgb(90, 188, 255)).bold(),
+        ),
+        Span::styled(
+            format!("  Search ({latest_stage})"),
+            ui_fg(no_color, PackedRgba::rgb(236, 244, 255)).bold(),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "query: {}",
+            if state.query_input.value().trim().is_empty() {
+                "(empty)"
+            } else {
+                state.query_input.value()
+            }
+        ),
+        ui_fg(no_color, PackedRgba::rgb(172, 194, 230)),
+    )));
+    if let Some(error) = state.last_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            ui_fg(no_color, PackedRgba::rgb(255, 156, 156)),
+        )));
+    }
+    for (idx, hit) in state.latest_hits().iter().take(4).enumerate() {
+        let marker = if idx == state.active_hit_index {
+            "▸"
+        } else {
+            " "
+        };
+        let path = truncate_middle(
+            &hit.path,
+            usize::from(area.width).saturating_sub(26).max(18),
+        );
+        lines.push(Line::from_spans(vec![
+            Span::styled(
+                format!("{marker} {:>2}. ", hit.rank),
+                ui_fg(no_color, PackedRgba::rgb(130, 179, 238)),
+            ),
+            Span::styled(path, ui_fg(no_color, PackedRgba::rgb(220, 236, 255))),
+            Span::styled(
+                format!("  {:.3}", hit.score),
+                dashboard_score_style(hit.score, no_color, idx == state.active_hit_index),
+            ),
+        ]));
+        if let Some(snippet) = hit.snippet.as_deref() {
+            lines.push(Line::from_spans(highlight_text_spans(
+                &truncate_tail(
+                    snippet.trim(),
+                    usize::from(area.width).saturating_sub(8).max(20),
+                ),
+                &query_terms,
+                ui_fg(no_color, PackedRgba::rgb(146, 168, 204)),
+                ui_fg_bg(
+                    no_color,
+                    PackedRgba::rgb(8, 22, 34),
+                    PackedRgba::rgb(255, 202, 123),
+                ),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "/ focus • Enter/Tab next • ↑ prev • q exit",
+        ui_fg(no_color, PackedRgba::rgb(165, 183, 216)),
+    )));
+
+    Paragraph::new(Text::from_lines(lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(ui_fg(no_color, PackedRgba::rgb(67, 160, 255)))
+                .title(" fsfs search "),
+        )
+        .wrap(WrapMode::Word)
+        .render(area, frame);
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_search_results_panel(
+    frame: &mut Frame,
+    area: ftui_core::geometry::Rect,
+    state: &SearchDashboardState,
+    no_color: bool,
+    query_terms: &[String],
+) {
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ui_fg(no_color, PackedRgba::rgb(95, 144, 208)))
+        .title(" ranked results ");
+    block.render(area, frame);
+    let inner = block.inner(area);
+    if inner.is_empty() {
+        return;
+    }
+
+    if let Some(error) = state.last_error.as_deref() {
+        Paragraph::new(Text::from_lines(vec![
+            Line::from(Span::styled(
+                "Search failed",
+                ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold(),
+            )),
+            Line::from(Span::styled(
+                truncate_tail(error, usize::from(inner.width).saturating_mul(3).max(42)),
+                ui_fg(no_color, PackedRgba::rgb(255, 209, 209)),
+            )),
+        ]))
+        .wrap(WrapMode::Word)
+        .render(inner, frame);
+        return;
+    }
+
+    let query = state.query_input.value().trim();
+    let hits = state.latest_hits();
+    if query.is_empty() {
+        Paragraph::new(Text::from_lines(vec![
+            Line::from(Span::styled(
+                "Search-as-you-type is enabled.",
+                ui_fg(no_color, PackedRgba::rgb(198, 218, 248)).bold(),
+            )),
+            Line::from(Span::styled(
+                "Press / or Ctrl+F, type a query, and results update live.",
+                ui_fg(no_color, PackedRgba::rgb(153, 175, 212)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Tips: Enter/Tab/↓ next match • ↑/Shift+Tab previous • n/N jump",
+                ui_fg(no_color, PackedRgba::rgb(133, 154, 190)),
+            )),
+        ]))
+        .wrap(WrapMode::Word)
+        .render(inner, frame);
+        return;
+    }
+    if hits.is_empty() {
+        Paragraph::new(Text::from_lines(vec![
+            Line::from(Span::styled(
+                "No matches found.",
+                ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold(),
+            )),
+            Line::from(Span::styled(
+                "Try broader terms or remove filter constraints.",
+                ui_fg(no_color, PackedRgba::rgb(169, 190, 225)),
+            )),
+        ]))
+        .wrap(WrapMode::Word)
+        .render(inner, frame);
+        return;
+    }
+
+    let rows_per_hit = 2usize;
+    let visible_hits = (usize::from(inner.height) / rows_per_hit).max(1);
+    let mut start = state.active_hit_index.saturating_sub(visible_hits / 2);
+    if start + visible_hits > hits.len() {
+        start = hits.len().saturating_sub(visible_hits);
+    }
+    let end = (start + visible_hits).min(hits.len());
+
+    for (slot, hit_idx) in (start..end).enumerate() {
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(slot.saturating_mul(rows_per_hit)).unwrap_or(u16::MAX));
+        if y >= inner.bottom() {
+            break;
+        }
+        let row_height = if y.saturating_add(1) < inner.bottom() {
+            2
+        } else {
+            1
+        };
+        let row_area = ftui_core::geometry::Rect::new(inner.x, y, inner.width, row_height);
+        let hit = &hits[hit_idx];
+        let is_active = hit_idx == state.active_hit_index;
+        let path_budget = usize::from(inner.width).saturating_sub(32).max(14);
+        let snippet_budget = usize::from(inner.width).saturating_sub(8).max(18);
+        let path = truncate_middle(&hit.path, path_budget);
+        let source_label = search_hit_source_label(hit);
+
+        let mut line_one_spans = Vec::new();
+        line_one_spans.push(Span::styled(
+            format!("{} ", if is_active { "▸" } else { " " }),
+            if is_active {
+                ui_fg_bg(
+                    no_color,
+                    PackedRgba::rgb(8, 24, 40),
+                    PackedRgba::rgb(122, 219, 255),
+                )
+            } else {
+                ui_fg(no_color, PackedRgba::rgb(130, 149, 182))
+            },
+        ));
+        line_one_spans.push(Span::styled(
+            format!("{:>3}. ", hit.rank),
+            if is_active {
+                ui_fg(no_color, PackedRgba::rgb(224, 240, 255)).bold()
+            } else {
+                ui_fg(no_color, PackedRgba::rgb(173, 194, 229))
+            },
+        ));
+        let path_spans = highlight_text_spans(
+            &path,
+            query_terms,
+            if is_active {
+                ui_fg(no_color, PackedRgba::rgb(236, 247, 255)).bold()
+            } else {
+                ui_fg(no_color, PackedRgba::rgb(214, 230, 255))
+            },
+            if is_active {
+                ui_fg_bg(
+                    no_color,
+                    PackedRgba::rgb(10, 24, 36),
+                    PackedRgba::rgb(255, 202, 123),
+                )
+            } else {
+                ui_fg_bg(
+                    no_color,
+                    PackedRgba::rgb(8, 20, 30),
+                    PackedRgba::rgb(181, 223, 255),
+                )
+            },
+        );
+        line_one_spans.extend(path_spans);
+        line_one_spans.push(Span::styled(
+            format!("  {:.3}", hit.score),
+            dashboard_score_style(hit.score, no_color, is_active),
+        ));
+        line_one_spans.push(Span::styled(
+            format!("  [{source_label}]"),
+            if is_active {
+                ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
+            } else {
+                ui_fg(no_color, PackedRgba::rgb(148, 170, 205))
+            },
+        ));
+
+        let mut lines = vec![Line::from_spans(line_one_spans)];
+        if row_height > 1 {
+            let snippet_line = hit.snippet.as_deref().map_or_else(
+                || {
+                    vec![Span::styled(
+                        "no snippet",
+                        ui_fg(no_color, PackedRgba::rgb(140, 162, 197)),
+                    )]
+                },
+                |snippet| {
+                    highlight_text_spans(
+                        &truncate_tail(snippet.trim(), snippet_budget),
+                        query_terms,
+                        ui_fg(no_color, PackedRgba::rgb(151, 173, 211)),
+                        ui_fg_bg(
+                            no_color,
+                            PackedRgba::rgb(9, 23, 36),
+                            PackedRgba::rgb(255, 202, 123),
+                        ),
+                    )
+                },
+            );
+            lines.push(Line::from_spans(snippet_line));
+        }
+        Paragraph::new(Text::from_lines(lines)).render(row_area, frame);
+    }
+}
+
+fn collect_search_query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 2)
+        .collect()
+}
+
+const fn search_hit_source_label(hit: &SearchHitPayload) -> &'static str {
+    if hit.in_both_sources {
+        "both"
+    } else if hit.lexical_rank.is_some() {
+        "lexical"
+    } else if hit.semantic_rank.is_some() {
+        "semantic"
+    } else {
+        "unknown"
+    }
+}
+
+fn render_phase_chain(stages: &[DashboardSearchStage]) -> String {
+    if stages.is_empty() {
+        return "idle".to_owned();
+    }
+    let mut out = String::new();
+    for (idx, stage) in stages.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(" -> ");
+        }
+        out.push_str(stage.label());
+    }
+    out
+}
+
+fn dashboard_score_style(score: f64, no_color: bool, is_active: bool) -> Style {
+    let base = if score >= 0.8 {
+        ui_fg(no_color, PackedRgba::rgb(131, 231, 157))
+    } else if score >= 0.5 {
+        ui_fg(no_color, PackedRgba::rgb(255, 202, 123))
+    } else {
+        ui_fg(no_color, PackedRgba::rgb(255, 156, 156))
+    };
+    if is_active { base.bold() } else { base }
+}
+
+fn highlight_text_spans(
+    text: &str,
+    query_terms: &[String],
+    base_style: Style,
+    highlight_style: Style,
+) -> Vec<Span<'static>> {
+    if text.is_empty() || query_terms.is_empty() {
+        return vec![Span::styled(text.to_owned(), base_style)];
+    }
+
+    let mut ranges = Vec::new();
+    for term in query_terms {
+        for result in search_ascii_case_insensitive(text, term) {
+            let start = result.range.start.min(text.len());
+            let end = result.range.end.min(text.len());
+            if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                continue;
+            }
+            ranges.push((start, end));
+        }
+    }
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_owned(), base_style)];
+    }
+
+    ranges.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            if end > last.1 {
+                last.1 = end;
+            }
+            continue;
+        }
+        merged.push((start, end));
+    }
+
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        if start > cursor && text.is_char_boundary(cursor) && text.is_char_boundary(start) {
+            spans.push(Span::styled(text[cursor..start].to_owned(), base_style));
+        }
+        if text.is_char_boundary(start) && text.is_char_boundary(end) {
+            spans.push(Span::styled(text[start..end].to_owned(), highlight_style));
+            cursor = end;
+        }
+    }
+    if cursor < text.len() && text.is_char_boundary(cursor) {
+        spans.push(Span::styled(text[cursor..].to_owned(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_owned(), base_style));
+    }
+    spans
 }
 
 fn render_indexing_progress_screen_ftui(

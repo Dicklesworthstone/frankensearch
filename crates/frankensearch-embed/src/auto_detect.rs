@@ -2455,7 +2455,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let encoded = safetensors::tensor::serialize(&tensors, &None).unwrap();
+        let encoded = safetensors::tensor::serialize(&tensors, None).unwrap();
         fs::write(dir.join("model.safetensors"), encoded).unwrap();
     }
 }

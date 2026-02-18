@@ -43,7 +43,7 @@ dirs = { workspace = true }
 toml = { workspace = true }
 signal-hook = "0.3"
 sysinfo = { workspace = true }
-notify = "7.0"
+notify = "*"
 ignore = "0.4"
 sha2 = { workspace = true }
 

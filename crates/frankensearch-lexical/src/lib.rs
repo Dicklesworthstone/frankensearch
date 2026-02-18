@@ -29,7 +29,9 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
+};
 use tracing::{debug, instrument, warn};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -142,6 +144,105 @@ pub struct LexicalHit {
     pub query_type: QueryExplanation,
     /// Arbitrary document metadata.
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Raw lexical hit containing BM25 score and Tantivy doc address.
+///
+/// This is useful for callers that need custom field extraction from stored
+/// documents while still reusing frankensearch's query execution helpers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LexicalDocHit {
+    /// BM25 relevance score returned by Tantivy.
+    pub bm25_score: f32,
+    /// 0-based rank in the returned page.
+    pub rank: usize,
+    /// Tantivy document address inside a segment.
+    pub doc_address: DocAddress,
+}
+
+/// Execute a pre-built Tantivy query with offset pagination.
+///
+/// This helper centralizes error mapping and result-shape normalization so
+/// downstream callers can keep custom query construction while reusing the
+/// lexical execution core from this crate.
+///
+/// # Errors
+///
+/// Returns [`SearchError::SubsystemError`] when Tantivy search fails.
+#[instrument(skip(searcher, query), fields(limit = limit, offset = offset))]
+pub fn execute_query_with_offset(
+    searcher: &Searcher,
+    query: &dyn tantivy::query::Query,
+    limit: usize,
+    offset: usize,
+) -> SearchResult<Vec<LexicalDocHit>> {
+    let top_docs = searcher
+        .search(query, &TopDocs::with_limit(limit).and_offset(offset))
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(e),
+        })?;
+
+    Ok(top_docs
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (bm25_score, doc_address))| LexicalDocHit {
+            bm25_score,
+            rank,
+            doc_address,
+        })
+        .collect())
+}
+
+/// Load a stored Tantivy document by address.
+///
+/// # Errors
+///
+/// Returns [`SearchError::SubsystemError`] when document loading fails.
+pub fn load_doc(searcher: &Searcher, doc_address: DocAddress) -> SearchResult<TantivyDocument> {
+    searcher
+        .doc(doc_address)
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(e),
+        })
+}
+
+/// Try to build a snippet generator for a query/content field pair.
+///
+/// Returns `None` if snippet generation cannot be initialized. This mirrors the
+/// tolerant behavior used by `search_with_snippets`.
+#[must_use]
+pub fn try_build_snippet_generator(
+    searcher: &Searcher,
+    query: &dyn tantivy::query::Query,
+    content_field: Field,
+    snippet_config: &SnippetConfig,
+) -> Option<tantivy::snippet::SnippetGenerator> {
+    match tantivy::snippet::SnippetGenerator::create(searcher, query, content_field) {
+        Ok(mut generator) => {
+            generator.set_max_num_chars(snippet_config.max_chars);
+            Some(generator)
+        }
+        Err(e) => {
+            debug!(error = %e, "failed to create snippet generator, snippets will be absent");
+            None
+        }
+    }
+}
+
+/// Render snippet HTML for a document with caller-specified highlight tags.
+#[must_use]
+pub fn render_snippet_html(
+    snippet_generator: &tantivy::snippet::SnippetGenerator,
+    doc: &TantivyDocument,
+    highlight_prefix: &str,
+    highlight_postfix: &str,
+) -> Option<String> {
+    let mut snippet = snippet_generator.snippet_from_doc(doc);
+    snippet.set_snippet_prefix_postfix(highlight_prefix, highlight_postfix);
+    let html = snippet.to_html();
+    if html.is_empty() { None } else { Some(html) }
 }
 
 // ─── Schema fields ──────────────────────────────────────────────────────────
@@ -465,28 +566,9 @@ impl TantivyIndex {
         let parsed = self.parse_query_lenient(query);
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(&*parsed, &TopDocs::with_limit(limit))
-            .map_err(|e| SearchError::SubsystemError {
-                subsystem: "tantivy",
-                source: Box::new(e),
-            })?;
-
-        // Build snippet generator for the content field.
-        let snippet_gen = match tantivy::snippet::SnippetGenerator::create(
-            &searcher,
-            &*parsed,
-            self.fields.content,
-        ) {
-            Ok(mut sg) => {
-                sg.set_max_num_chars(snippet_config.max_chars);
-                Some(sg)
-            }
-            Err(e) => {
-                debug!(error = %e, "failed to create snippet generator, snippets will be absent");
-                None
-            }
-        };
+        let top_docs = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
+        let snippet_gen =
+            try_build_snippet_generator(&searcher, &*parsed, self.fields.content, snippet_config);
 
         debug!(
             hits = top_docs.len(),
@@ -495,14 +577,8 @@ impl TantivyIndex {
         );
 
         let mut results = Vec::with_capacity(top_docs.len());
-        for (rank, (bm25_score, doc_address)) in top_docs.into_iter().enumerate() {
-            let doc: TantivyDocument =
-                searcher
-                    .doc(doc_address)
-                    .map_err(|e| SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(e),
-                    })?;
+        for hit in top_docs {
+            let doc = load_doc(&searcher, hit.doc_address)?;
 
             let doc_id = doc
                 .get_first(self.fields.id)
@@ -525,20 +601,19 @@ impl TantivyIndex {
                 });
 
             // Generate snippet from the document.
-            let snippet = snippet_gen.as_ref().and_then(|sg| {
-                let mut s = sg.snippet_from_doc(&doc);
-                s.set_snippet_prefix_postfix(
+            let snippet = snippet_gen.as_ref().and_then(|generator| {
+                render_snippet_html(
+                    generator,
+                    &doc,
                     &snippet_config.highlight_prefix,
                     &snippet_config.highlight_postfix,
-                );
-                let html = s.to_html();
-                if html.is_empty() { None } else { Some(html) }
+                )
             });
 
             results.push(LexicalHit {
                 doc_id,
-                bm25_score,
-                rank,
+                bm25_score: hit.bm25_score,
+                rank: hit.rank,
                 snippet,
                 query_type: explanation,
                 metadata,

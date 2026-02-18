@@ -3,10 +3,11 @@
 //! Run with:
 //!   cargo bench -p frankensearch-durability
 
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_durability::config::DurabilityConfig;
 use frankensearch_durability::file_protector::FileProtector;
 use frankensearch_durability::metrics::DurabilityMetrics;

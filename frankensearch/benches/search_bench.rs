@@ -10,9 +10,10 @@
 //! 5. Score normalization (various sizes)
 //! 6. Vector index I/O (write/open)
 
+use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};

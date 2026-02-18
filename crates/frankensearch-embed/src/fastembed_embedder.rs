@@ -124,7 +124,7 @@ impl FastEmbedEmbedder {
         user_model.pooling = Some(Pooling::Mean);
 
         let init_options = InitOptionsUserDefined::new();
-        let text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
+        let mut text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_dir.clone(),
                 source: format!("failed to initialize FastEmbed model: {e}").into(),
@@ -164,7 +164,7 @@ impl FastEmbedEmbedder {
 
     /// Embed a single non-empty string.
     async fn embed_non_empty(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
-        let model = self
+        let mut model = self
             .model
             .lock(cx)
             .await
@@ -202,7 +202,7 @@ impl FastEmbedEmbedder {
 
     /// Embed a batch of non-empty strings.
     async fn embed_batch_non_empty(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-        let model = self
+        let mut model = self
             .model
             .lock(cx)
             .await
@@ -210,7 +210,7 @@ impl FastEmbedEmbedder {
 
         let mut embeddings =
             model
-                .embed(texts.to_vec(), None)
+                .embed(texts, None)
                 .map_err(|e| SearchError::EmbeddingFailed {
                     model: self.name.clone(),
                     source: format!("fastembed batch inference failed: {e}").into(),

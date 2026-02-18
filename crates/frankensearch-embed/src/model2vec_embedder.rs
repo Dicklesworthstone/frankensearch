@@ -333,7 +333,7 @@ fn discover_tensor_name(safetensors: &SafeTensors<'_>) -> Option<String> {
 
     // Try known candidate names
     for candidate in &TENSOR_NAME_CANDIDATES {
-        if names.iter().any(|n| n.as_str() == *candidate) {
+        if names.iter().any(|n| n == candidate) {
             return Some((*candidate).to_owned());
         }
     }
@@ -541,7 +541,7 @@ mod tests {
             .unwrap(),
         );
 
-        let serialized = safetensors::tensor::serialize(&tensors, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(&tensors, None).unwrap();
         fs::write(dir.join("model.safetensors"), serialized).unwrap();
     }
 
@@ -787,7 +787,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let serialized = safetensors::tensor::serialize(&tensors, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(&tensors, None).unwrap();
         fs::write(dir.path().join("model.safetensors"), serialized).unwrap();
 
         // Should fall back to the single tensor

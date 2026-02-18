@@ -63,15 +63,15 @@ wide = "0.7"
 memmap2 = "0.9"
 
 # Embedder dependencies (feature-gated per crate)
-fastembed = "4.9"
-safetensors = "0.5"
-tokenizers = "0.21"
+fastembed = "*"
+safetensors = "*"
+tokenizers = "*"
 
 # Full-text search
-tantivy = "0.22"
+tantivy = "0.25"
 
 # ONNX Runtime for cross-encoder reranking
-ort = "2.0.0-rc.9"
+ort = "2.0.0-rc.10"
 ndarray = "0.16"
 
 # HNSW approximate nearest neighbors
@@ -87,20 +87,20 @@ unicode-normalization = "0.1"
 dirs = "6"
 
 # TOML parsing for configuration surfaces
-toml = "0.8"
+toml = "*"
 
 # SHA-256 verification for model manifests
 sha2 = "0.10"
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "*", features = ["html_reports"] }
 proptest = "1.6"
 
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # System information (CPU, memory, etc.)
-sysinfo = "0.33"
+sysinfo = "*"
 
 # FrankenTUI terminal UI framework
 ftui-core = { version = "0.2.0", path = "../frankentui/crates/ftui-core" }
