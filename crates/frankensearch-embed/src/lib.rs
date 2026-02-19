@@ -57,7 +57,7 @@ pub use model2vec_embedder::{Model2VecEmbedder, find_model_dir};
 pub mod fastembed_embedder;
 
 #[cfg(feature = "fastembed")]
-pub use fastembed_embedder::FastEmbedEmbedder;
+pub use fastembed_embedder::{FastEmbedEmbedder, OnnxEmbedderConfig};
 
 #[cfg(feature = "download")]
 pub mod model_download;

@@ -1,7 +1,12 @@
-//! FastEmbed-based quality-tier embedder (`all-MiniLM-L6-v2`).
+//! FastEmbed-based ONNX embedders.
 //!
-//! This embedder loads ONNX + tokenizer assets from a local model directory and
+//! This module loads ONNX + tokenizer assets from a local model directory and
 //! performs semantic embedding inference through `fastembed`.
+//!
+//! Supports multiple models via [`OnnxEmbedderConfig`]:
+//! - MiniLM (baseline, 384 dimensions)
+//! - Snowflake Arctic Embed S (bake-off candidate, 384 dimensions)
+//! - Nomic Embed Text v1.5 (bake-off candidate, 768 dimensions)
 //!
 //! Required files:
 //! - `onnx/model.onnx` (preferred, current layout) OR `model.onnx` (legacy layout)
@@ -34,6 +39,55 @@ pub const DEFAULT_HF_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 /// Expected `MiniLM` output dimension.
 pub const DEFAULT_DIMENSION: usize = 384;
 
+/// Configuration for loading an ONNX embedder with custom parameters.
+#[derive(Debug, Clone)]
+pub struct OnnxEmbedderConfig {
+    /// Unique embedder ID (e.g., `"minilm-384"`).
+    pub embedder_id: String,
+    /// Model identifier for logging (e.g., `"all-minilm-l6-v2"`).
+    pub model_id: String,
+    /// Output embedding dimension.
+    pub dimension: usize,
+    /// Pooling strategy.
+    pub pooling: Pooling,
+}
+
+impl Default for OnnxEmbedderConfig {
+    fn default() -> Self {
+        Self {
+            embedder_id: "minilm-384".to_string(),
+            model_id: DEFAULT_MODEL_NAME.to_string(),
+            dimension: DEFAULT_DIMENSION,
+            pooling: Pooling::Mean,
+        }
+    }
+}
+
+impl OnnxEmbedderConfig {
+    /// Return a config for a known embedder name, or `None` for unknown names.
+    ///
+    /// Recognised names: `"minilm"`, `"snowflake-arctic-s"`, `"nomic-embed"`.
+    #[must_use]
+    pub fn for_name(embedder_name: &str) -> Option<Self> {
+        match embedder_name {
+            "minilm" => Some(Self::default()),
+            "snowflake-arctic-s" => Some(Self {
+                embedder_id: "snowflake-arctic-s-384".to_string(),
+                model_id: "snowflake-arctic-embed-s".to_string(),
+                dimension: 384,
+                pooling: Pooling::Mean,
+            }),
+            "nomic-embed" => Some(Self {
+                embedder_id: "nomic-embed-768".to_string(),
+                model_id: "nomic-embed-text-v1.5".to_string(),
+                dimension: 768,
+                pooling: Pooling::Mean,
+            }),
+            _ => None,
+        }
+    }
+}
+
 const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
 const MODEL_ONNX_LEGACY: &str = "model.onnx";
 
@@ -49,13 +103,15 @@ const REQUIRED_NON_MODEL_FILES: [&str; 4] = [
     TOKENIZER_CONFIG_JSON,
 ];
 
-/// FastEmbed-backed `MiniLM` embedder.
+/// FastEmbed-backed ONNX embedder.
 ///
+/// Supports any ONNX model that produces fixed-dimension embeddings.
 /// `TextEmbedding` is wrapped in a cancel-aware `asupersync::sync::Mutex`
 /// because ONNX sessions are not safe for concurrent mutable access.
 pub struct FastEmbedEmbedder {
     model: Mutex<TextEmbedding>,
     name: String,
+    dimension: usize,
     model_dir: PathBuf,
 }
 
@@ -63,7 +119,7 @@ impl fmt::Debug for FastEmbedEmbedder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FastEmbedEmbedder")
             .field("name", &self.name)
-            .field("dimension", &DEFAULT_DIMENSION)
+            .field("dimension", &self.dimension)
             .field("model_dir", &self.model_dir)
             .finish_non_exhaustive()
     }
@@ -87,11 +143,35 @@ impl FastEmbedEmbedder {
 
     /// Load a `FastEmbed` model with a custom model directory name.
     ///
+    /// Uses the default `MiniLM` configuration (384 dimensions, mean pooling).
+    ///
     /// # Errors
     ///
     /// Returns `SearchError::ModelNotFound` when required files are missing.
     /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
     pub fn load_with_name(model_dir: impl AsRef<Path>, name: &str) -> SearchResult<Self> {
+        Self::load_with_config(model_dir, OnnxEmbedderConfig {
+            embedder_id: name.to_owned(),
+            model_id: name.to_owned(),
+            ..OnnxEmbedderConfig::default()
+        })
+    }
+
+    /// Load an ONNX embedder with custom configuration.
+    ///
+    /// This is the most flexible constructor, allowing callers to specify
+    /// dimension, pooling strategy, and identifiers for any supported model.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::ModelNotFound` when required files are missing.
+    /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
+    pub fn load_with_config(
+        model_dir: impl AsRef<Path>,
+        config: OnnxEmbedderConfig,
+    ) -> SearchResult<Self> {
+        let name = &config.model_id;
+        let expected_dim = config.dimension;
         let model_dir = resolve_model_dir(model_dir.as_ref(), name)?;
         let model_file =
             select_model_file(&model_dir).ok_or_else(|| SearchError::ModelNotFound {
@@ -121,7 +201,7 @@ impl FastEmbedEmbedder {
         };
 
         let mut user_model = UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files);
-        user_model.pooling = Some(Pooling::Mean);
+        user_model.pooling = Some(config.pooling);
 
         let init_options = InitOptionsUserDefined::new();
         let mut text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
@@ -138,11 +218,11 @@ impl FastEmbedEmbedder {
                 source: format!("failed to run embedding probe: {e}").into(),
             })?;
         let probe_dim = probe.first().map_or(0, Vec::len);
-        if probe_dim != DEFAULT_DIMENSION {
+        if probe_dim != expected_dim {
             return Err(SearchError::ModelLoadFailed {
                 path: model_dir,
                 source: format!(
-                    "dimension mismatch for {name}: expected {DEFAULT_DIMENSION}, got {probe_dim}"
+                    "dimension mismatch for {name}: expected {expected_dim}, got {probe_dim}"
                 )
                 .into(),
             });
@@ -150,14 +230,15 @@ impl FastEmbedEmbedder {
 
         tracing::info!(
             model = %name,
-            dimension = DEFAULT_DIMENSION,
+            dimension = expected_dim,
             model_dir = %model_dir.display(),
-            "FastEmbed quality model loaded"
+            "FastEmbed model loaded"
         );
 
         Ok(Self {
             model: Mutex::new(text_embedding),
-            name: name.to_owned(),
+            name: config.embedder_id,
+            dimension: expected_dim,
             model_dir,
         })
     }
@@ -185,11 +266,12 @@ impl FastEmbedEmbedder {
                 source: "fastembed returned no embedding".into(),
             })?;
 
-        if embedding.len() != DEFAULT_DIMENSION {
+        if embedding.len() != self.dimension {
             return Err(SearchError::EmbeddingFailed {
                 model: self.name.clone(),
                 source: format!(
-                    "dimension mismatch: expected {DEFAULT_DIMENSION}, got {}",
+                    "dimension mismatch: expected {}, got {}",
+                    self.dimension,
                     embedding.len()
                 )
                 .into(),
@@ -229,11 +311,12 @@ impl FastEmbedEmbedder {
         }
 
         for embedding in &mut embeddings {
-            if embedding.len() != DEFAULT_DIMENSION {
+            if embedding.len() != self.dimension {
                 return Err(SearchError::EmbeddingFailed {
                     model: self.name.clone(),
                     source: format!(
-                        "dimension mismatch: expected {DEFAULT_DIMENSION}, got {}",
+                        "dimension mismatch: expected {}, got {}",
+                        self.dimension,
                         embedding.len()
                     )
                     .into(),
@@ -267,7 +350,7 @@ impl Embedder for FastEmbedEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             if text.is_empty() {
-                return Ok(vec![0.0; DEFAULT_DIMENSION]);
+                return Ok(vec![0.0; self.dimension]);
             }
             self.embed_non_empty(cx, text).await
         })
@@ -283,7 +366,7 @@ impl Embedder for FastEmbedEmbedder {
                 return Ok(Vec::new());
             }
 
-            let mut output = vec![vec![0.0; DEFAULT_DIMENSION]; texts.len()];
+            let mut output = vec![vec![0.0; self.dimension]; texts.len()];
             let mut non_empty_indices = Vec::with_capacity(texts.len());
             let mut non_empty_texts = Vec::with_capacity(texts.len());
 
@@ -307,7 +390,7 @@ impl Embedder for FastEmbedEmbedder {
     }
 
     fn dimension(&self) -> usize {
-        DEFAULT_DIMENSION
+        self.dimension
     }
 
     fn id(&self) -> &str {
@@ -604,5 +687,33 @@ mod tests {
             }
             _ => panic!("expected ModelNotFound variant"),
         }
+    }
+
+    #[test]
+    fn onnx_config_default_is_minilm() {
+        let config = OnnxEmbedderConfig::default();
+        assert_eq!(config.embedder_id, "minilm-384");
+        assert_eq!(config.dimension, 384);
+    }
+
+    #[test]
+    fn onnx_config_for_name_known_models() {
+        let minilm = OnnxEmbedderConfig::for_name("minilm").unwrap();
+        assert_eq!(minilm.embedder_id, "minilm-384");
+        assert_eq!(minilm.dimension, 384);
+
+        let snowflake = OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap();
+        assert_eq!(snowflake.embedder_id, "snowflake-arctic-s-384");
+        assert_eq!(snowflake.dimension, 384);
+
+        let nomic = OnnxEmbedderConfig::for_name("nomic-embed").unwrap();
+        assert_eq!(nomic.embedder_id, "nomic-embed-768");
+        assert_eq!(nomic.dimension, 768);
+    }
+
+    #[test]
+    fn onnx_config_for_name_unknown_returns_none() {
+        assert!(OnnxEmbedderConfig::for_name("unknown-model").is_none());
+        assert!(OnnxEmbedderConfig::for_name("").is_none());
     }
 }
