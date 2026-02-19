@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+shopt -s lastpipe 2>/dev/null || true
+umask 022
 
 SCRIPT_NAME="$(basename "$0")"
 INSTALL_LOCK_DIR="${TMPDIR:-/tmp}/frankensearch-fsfs-install.lock"
@@ -35,6 +37,7 @@ RESOLVED_VERSION=""
 TEMP_DIR=""
 HAVE_GUM=false
 USE_COLOR=false
+PROXY_ARGS=()
 
 AGENT_NAMES=()
 AGENT_DETECTED=()
@@ -65,8 +68,8 @@ Options:
   --offline              Disable network checks and remote version lookup
   --quiet                Reduce log output
   --no-gum               Disable gum formatting even when gum exists
-  --no-configure         Skip shell configuration stage
   --easy-mode            Auto-configure detected agent integrations without prompts
+  --no-configure         Skip all post-install configuration steps (PATH, completions, daemon service)
   --checksum <sha256>    Expected SHA-256 for release artifact
   --yes-i-want-to-run-as-root
                          Allow execution as root
@@ -76,6 +79,15 @@ EOF
 
 has_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+setup_proxy() {
+  PROXY_ARGS=()
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    PROXY_ARGS=(--proxy "${HTTPS_PROXY}")
+  elif [[ -n "${HTTP_PROXY:-}" ]]; then
+    PROXY_ARGS=(--proxy "${HTTP_PROXY}")
+  fi
 }
 
 log_gum() {
@@ -329,6 +341,7 @@ detect_platform() {
   case "${uname_s}" in
     Linux) TARGET_OS="unknown-linux-musl" ;;
     Darwin) TARGET_OS="apple-darwin" ;;
+    MINGW*|MSYS*|CYGWIN*) TARGET_OS="pc-windows-msvc" ;;
     *)
       die "Unsupported operating system: ${uname_s}"
       ;;
@@ -344,6 +357,10 @@ detect_platform() {
 
   TARGET_TRIPLE="${TARGET_ARCH}-${TARGET_OS}"
   ok "Detected platform ${TARGET_TRIPLE}"
+
+  if [[ "${TARGET_OS}" == "unknown-linux-musl" ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+    warn "WSL detected; Linux install will proceed, but shell/path integration may differ from native Linux."
+  fi
 }
 
 check_not_root() {
@@ -413,7 +430,7 @@ check_network_connectivity() {
   local endpoint
   for endpoint in "${checks[@]}"; do
     if has_cmd curl; then
-      curl --silent --show-error --location --head --max-time 8 "${endpoint}" >/dev/null \
+      curl --silent --show-error --location --head --max-time 8 "${PROXY_ARGS[@]}" "${endpoint}" >/dev/null \
         || die "Network connectivity check failed for ${endpoint}"
     elif has_cmd wget; then
       wget --spider --timeout=8 "${endpoint}" >/dev/null 2>&1 \
@@ -632,9 +649,17 @@ should_configure_agent() {
 LAST_CONFIG_RESULT=""
 
 resolve_fsfs_binary_for_completion() {
-  local dest_candidate="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
-  if [[ -x "${dest_candidate}" ]]; then
+  local binary_name
+  binary_name="$(binary_filename)"
+  local dest_candidate="${DEST_DIR}/${binary_name}"
+  if [[ -f "${dest_candidate}" ]]; then
     printf '%s' "${dest_candidate}"
+    return 0
+  fi
+
+  local legacy_candidate="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
+  if [[ -f "${legacy_candidate}" ]]; then
+    printf '%s' "${legacy_candidate}"
     return 0
   fi
 
@@ -917,6 +942,183 @@ maybe_run_post_install_doctor() {
   run_post_install_doctor
 }
 
+install_systemd_user_daemon_service() {
+  local fsfs_bin="$1"
+  local service_name="frankensearch-fsfs-daemon.service"
+  local systemd_user_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+  local service_path="${systemd_user_dir}/${service_name}"
+
+  mkdir -p "${systemd_user_dir}" || {
+    warn "Could not create ${systemd_user_dir}; skipping daemon service install."
+    return 0
+  }
+
+  backup_file_if_present "${service_path}" || {
+    warn "Could not backup existing service file ${service_path}; skipping daemon service install."
+    return 0
+  }
+
+  cat > "${service_path}" <<EOF
+[Unit]
+Description=frankensearch fsfs daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=${fsfs_bin} serve --daemon --format jsonl --no-color
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if ! has_cmd systemctl; then
+    warn "systemctl not found; wrote ${service_path} but did not enable service."
+    return 0
+  fi
+
+  if ! systemctl --user daemon-reload >/dev/null 2>&1; then
+    warn "systemctl --user daemon-reload failed; service file written to ${service_path}."
+    warn "Run manually: systemctl --user daemon-reload && systemctl --user enable --now ${service_name}"
+    return 0
+  fi
+
+  if ! systemctl --user enable --now "${service_name}" >/dev/null 2>&1; then
+    warn "Failed to enable/start ${service_name}; service file written to ${service_path}."
+    warn "Run manually: systemctl --user enable --now ${service_name}"
+    return 0
+  fi
+
+  ok "Installed and started user systemd service ${service_name}"
+}
+
+install_launchd_user_daemon_service() {
+  local fsfs_bin="$1"
+  local launchd_label="com.frankensearch.fsfs.daemon"
+  local launchd_dir="${HOME}/Library/LaunchAgents"
+  local plist_path="${launchd_dir}/${launchd_label}.plist"
+  local log_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/frankensearch/logs"
+
+  mkdir -p "${launchd_dir}" "${log_dir}" || {
+    warn "Could not create launchd/log directories; skipping daemon service install."
+    return 0
+  }
+
+  backup_file_if_present "${plist_path}" || {
+    warn "Could not backup existing launchd plist ${plist_path}; skipping daemon service install."
+    return 0
+  }
+
+  cat > "${plist_path}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${launchd_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${fsfs_bin}</string>
+      <string>serve</string>
+      <string>--daemon</string>
+      <string>--format</string>
+      <string>jsonl</string>
+      <string>--no-color</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${log_dir}/fsfs-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>${log_dir}/fsfs-daemon.err.log</string>
+  </dict>
+</plist>
+EOF
+
+  if ! has_cmd launchctl; then
+    warn "launchctl not found; wrote ${plist_path} but did not load service."
+    return 0
+  fi
+
+  launchctl unload "${plist_path}" >/dev/null 2>&1 || true
+  if ! launchctl load "${plist_path}" >/dev/null 2>&1; then
+    warn "Failed to load launchd agent ${plist_path}."
+    warn "Run manually: launchctl load ${plist_path}"
+    return 0
+  fi
+
+  ok "Installed and loaded launchd agent ${launchd_label}"
+}
+
+install_windows_user_daemon_service() {
+  local fsfs_bin="$1"
+  local task_name="frankensearch-fsfs-daemon"
+  local windows_bin="${fsfs_bin}"
+
+  if has_cmd cygpath; then
+    windows_bin="$(cygpath -w "${fsfs_bin}" 2>/dev/null || printf '%s' "${fsfs_bin}")"
+  fi
+
+  local task_action="\"${windows_bin}\" serve --daemon --format jsonl --no-color"
+
+  if ! has_cmd schtasks; then
+    warn "schtasks not found; skipping daemon service install on Windows."
+    warn "Run manually in PowerShell: schtasks /Create /TN \"${task_name}\" /SC ONLOGON /TR '${task_action}' /F"
+    return 0
+  fi
+
+  if ! schtasks /Create /TN "${task_name}" /SC ONLOGON /TR "${task_action}" /F >/dev/null 2>&1; then
+    warn "Failed to create scheduled task ${task_name}."
+    warn "Run manually in PowerShell: schtasks /Create /TN \"${task_name}\" /SC ONLOGON /TR '${task_action}' /F"
+    return 0
+  fi
+
+  if ! schtasks /Run /TN "${task_name}" >/dev/null 2>&1; then
+    warn "Scheduled task ${task_name} created but could not be started immediately."
+    warn "It will run at next logon. Start manually: schtasks /Run /TN \"${task_name}\""
+    return 0
+  fi
+
+  ok "Installed and started scheduled task ${task_name}"
+}
+
+install_daemon_service() {
+  local fsfs_bin=""
+  if ! fsfs_bin="$(resolve_fsfs_binary_for_completion)"; then
+    warn "Could not locate installed fsfs binary; skipping daemon service install."
+    return 0
+  fi
+
+  case "$(uname -s)" in
+    Linux)
+      install_systemd_user_daemon_service "${fsfs_bin}"
+      ;;
+    Darwin)
+      install_launchd_user_daemon_service "${fsfs_bin}"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      install_windows_user_daemon_service "${fsfs_bin}"
+      ;;
+    *)
+      warn "Daemon service install is not implemented for this OS."
+      ;;
+  esac
+}
+
+maybe_install_daemon_service() {
+  if ! should_run_config_step \
+    "daemon service install" \
+    "Install and start a background fsfs daemon service for faster searches?" \
+    "yes"; then
+    return 0
+  fi
+
+  install_daemon_service
+}
+
 configure_claude_code() {
   local fsfs_bin="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
   local claude_root="${HOME}/.claude"
@@ -1156,7 +1358,7 @@ resolve_version() {
   local tag_name=""
 
   if has_cmd curl; then
-    tag_name="$(curl --silent --show-error --location --max-time 10 "${api_url}" \
+    tag_name="$(curl --silent --show-error --location --max-time 10 "${PROXY_ARGS[@]}" "${api_url}" \
       | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   elif has_cmd wget; then
     tag_name="$(wget -qO- "${api_url}" \
@@ -1173,7 +1375,11 @@ resolve_version() {
 }
 
 artifact_name() {
-  printf '%s-%s.tar.xz' "${DEFAULT_BINARY_NAME}" "${TARGET_TRIPLE}"
+  if is_windows_target; then
+    printf '%s-%s.zip' "${DEFAULT_BINARY_NAME}" "${TARGET_TRIPLE}"
+  else
+    printf '%s-%s.tar.xz' "${DEFAULT_BINARY_NAME}" "${TARGET_TRIPLE}"
+  fi
 }
 
 checksum_file_name() {
@@ -1223,6 +1429,18 @@ run_preflight_checks() {
   check_existing_installation
 }
 
+is_windows_target() {
+  [[ "${TARGET_OS}" == "pc-windows-msvc" ]]
+}
+
+binary_filename() {
+  if is_windows_target; then
+    printf '%s.exe' "${DEFAULT_BINARY_NAME}"
+  else
+    printf '%s' "${DEFAULT_BINARY_NAME}"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Binary download, verification, extraction, and installation
 # ---------------------------------------------------------------------------
@@ -1234,6 +1452,7 @@ http_download() {
   if has_cmd curl; then
     curl --fail --silent --show-error --location --max-time 120 \
       --retry 3 --retry-delay 2 \
+      "${PROXY_ARGS[@]}" \
       -o "${output}" "${url}"
   elif has_cmd wget; then
     wget --quiet --tries=3 --timeout=120 \
@@ -1397,27 +1616,33 @@ extract_archive() {
 
   # Locate the binary inside the extracted tree.
   local binary_path=""
+  local expected_binary
+  expected_binary="$(binary_filename)"
 
   # Direct in extract dir.
-  if [[ -f "${extract_dir}/${DEFAULT_BINARY_NAME}" ]]; then
+  if [[ -f "${extract_dir}/${expected_binary}" ]]; then
+    binary_path="${extract_dir}/${expected_binary}"
+  elif [[ -f "${extract_dir}/${DEFAULT_BINARY_NAME}" ]]; then
     binary_path="${extract_dir}/${DEFAULT_BINARY_NAME}"
   else
     # Search one level deep (archives often have a top-level directory).
-    binary_path="$(find "${extract_dir}" -maxdepth 2 -name "${DEFAULT_BINARY_NAME}" -type f | head -n 1)"
+    binary_path="$(find "${extract_dir}" -maxdepth 2 \( -name "${expected_binary}" -o -name "${DEFAULT_BINARY_NAME}" \) -type f | head -n 1)"
   fi
 
   if [[ -z "${binary_path}" || ! -f "${binary_path}" ]]; then
-    die "Could not find '${DEFAULT_BINARY_NAME}' binary inside the extracted archive"
+    die "Could not find '${expected_binary}' binary inside the extracted archive"
   fi
 
   # Stage the binary for installation.
-  cp "${binary_path}" "${TEMP_DIR}/${DEFAULT_BINARY_NAME}" || die "Failed to stage binary"
-  ok "Extracted binary: ${DEFAULT_BINARY_NAME}"
+  cp "${binary_path}" "${TEMP_DIR}/${expected_binary}" || die "Failed to stage binary"
+  ok "Extracted binary: ${expected_binary}"
 }
 
 install_binary() {
-  local staged_binary="${TEMP_DIR}/${DEFAULT_BINARY_NAME}"
-  local target_binary="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
+  local binary_name
+  binary_name="$(binary_filename)"
+  local staged_binary="${TEMP_DIR}/${binary_name}"
+  local target_binary="${DEST_DIR}/${binary_name}"
 
   if [[ ! -f "${staged_binary}" ]]; then
     die "Staged binary not found at ${staged_binary}"
@@ -1435,16 +1660,22 @@ install_binary() {
     chmod 0755 "${target_binary}" || die "Failed to set permissions on ${target_binary}"
   fi
 
-  # Verify the installed binary is executable.
-  if [[ ! -x "${target_binary}" ]]; then
+  # Verify the installed binary is present and runnable.
+  if is_windows_target; then
+    if [[ ! -f "${target_binary}" ]]; then
+      die "Installed binary was not found: ${target_binary}"
+    fi
+  elif [[ ! -x "${target_binary}" ]]; then
     die "Installed binary is not executable: ${target_binary}"
   fi
 
-  ok "Installed ${DEFAULT_BINARY_NAME} to ${target_binary}"
+  ok "Installed ${binary_name} to ${target_binary}"
 }
 
 verify_installation() {
-  local target_binary="${DEST_DIR}/${DEFAULT_BINARY_NAME}"
+  local binary_name
+  binary_name="$(binary_filename)"
+  local target_binary="${DEST_DIR}/${binary_name}"
 
   info "Verifying installation..."
 
@@ -1580,14 +1811,16 @@ build_from_source() {
   ok "Build completed."
 
   # Locate the built binary.
-  local built_binary="${source_dir}/target/release/${DEFAULT_BINARY_NAME}"
+  local built_binary_name
+  built_binary_name="$(binary_filename)"
+  local built_binary="${source_dir}/target/release/${built_binary_name}"
   if [[ ! -f "${built_binary}" ]]; then
     err "Expected binary not found at ${built_binary}"
     return 1
   fi
 
   # Stage the binary for installation (same as download path).
-  cp "${built_binary}" "${TEMP_DIR}/${DEFAULT_BINARY_NAME}" || {
+  cp "${built_binary}" "${TEMP_DIR}/${built_binary_name}" || {
     err "Failed to stage built binary."
     return 1
   }
@@ -1610,7 +1843,7 @@ install_rust_toolchain() {
   fi
 
   if has_cmd curl; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
+    curl --proto '=https' --tlsv1.2 -sSf "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
   elif has_cmd wget; then
     wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
   fi
@@ -1657,6 +1890,7 @@ run_install() {
     # Post-install configuration.
     maybe_configure_shell_path
     maybe_install_shell_completion
+    maybe_install_daemon_service
 
     detect_agent_integrations
     configure_detected_agents
@@ -1694,6 +1928,7 @@ run_install() {
   # Post-install configuration stages.
   maybe_configure_shell_path
   maybe_install_shell_completion
+  maybe_install_daemon_service
 
   detect_agent_integrations
   configure_detected_agents
@@ -1708,6 +1943,7 @@ run_install() {
 main() {
   parse_args "$@"
   configure_output
+  setup_proxy
   validate_checksum
 
   if [[ "${OFFLINE}" == false ]] && ! has_cmd curl && ! has_cmd wget; then

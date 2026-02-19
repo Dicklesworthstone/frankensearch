@@ -430,6 +430,7 @@ run_installer_fn() {
     # Skip post-install steps that require real environment.
     maybe_configure_shell_path() { :; }
     maybe_install_shell_completion() { :; }
+    maybe_install_daemon_service() { :; }
     detect_agent_integrations() { :; }
     configure_detected_agents() { :; }
     print_agent_report_table() { :; }
@@ -585,4 +586,152 @@ run_installer_fn() {
     grep -F -- "--max-time 120" "'"${TEST_ROOT}"'/curl-args.txt" >/dev/null
   '
   [ "$status" -eq 0 ]
+}
+
+@test "setup_proxy prefers HTTPS_PROXY and http_download forwards proxy args" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    export HTTPS_PROXY="http://proxy.example:3128"
+    export HTTP_PROXY="http://fallback.example:8080"
+    setup_proxy
+    has_cmd() { [[ "${1:-}" == "curl" ]]; }
+    curl() {
+      printf "%s\n" "$*" > "'"${TEST_ROOT}"'/curl-proxy-args.txt"
+      return 0
+    }
+    http_download "https://example.invalid/fsfs.tar.xz" "'"${TEST_ROOT}"'/out.tar.xz"
+    grep -F -- "--proxy http://proxy.example:3128" "'"${TEST_ROOT}"'/curl-proxy-args.txt" >/dev/null
+  '
+  [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Windows installer behavior
+# ---------------------------------------------------------------------------
+
+@test "detect_platform resolves MINGW x86_64 to pc-windows-msvc" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    ok() { :; }
+    uname() {
+      case "${1:-}" in
+        -s) printf "MINGW64_NT-10.0\n" ;;
+        -m) printf "x86_64\n" ;;
+        *) command uname "$@" ;;
+      esac
+    }
+    detect_platform
+    printf "%s" "${TARGET_TRIPLE}"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"x86_64-pc-windows-msvc"* ]]
+}
+
+@test "install_daemon_service dispatches to Windows scheduled-task installer on MINGW" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    called=""
+    resolve_fsfs_binary_for_completion() { printf "/c/Users/test/bin/fsfs.exe"; }
+    install_systemd_user_daemon_service() { called="linux"; }
+    install_launchd_user_daemon_service() { called="mac"; }
+    install_windows_user_daemon_service() { called="win:$1"; }
+    uname() { printf "MINGW64_NT-10.0\n"; }
+    install_daemon_service
+    printf "%s" "${called}"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"win:/c/Users/test/bin/fsfs.exe"* ]]
+}
+
+@test "install_windows_user_daemon_service warns when schtasks is missing" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    QUIET=false
+    USE_COLOR=false
+    HAVE_GUM=false
+    has_cmd() {
+      case "${1:-}" in
+        cygpath|schtasks) return 1 ;;
+        *) return 1 ;;
+      esac
+    }
+    install_windows_user_daemon_service "/c/Users/test/bin/fsfs.exe"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"schtasks not found"* ]]
+}
+
+@test "install_windows_user_daemon_service creates and runs scheduled task" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    QUIET=false
+    USE_COLOR=false
+    HAVE_GUM=false
+    LOG_PATH="'"${TEST_ROOT}"'/schtasks-args.log"
+    : > "${LOG_PATH}"
+    has_cmd() {
+      case "${1:-}" in
+        cygpath|schtasks) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    cygpath() { printf "C:\\Users\\test\\bin\\fsfs.exe"; }
+    schtasks() {
+      printf "%s\n" "$*" >> "${LOG_PATH}"
+      return 0
+    }
+    install_windows_user_daemon_service "/c/Users/test/bin/fsfs.exe"
+    grep -F "/Create /TN frankensearch-fsfs-daemon /SC ONLOGON" "${LOG_PATH}" >/dev/null
+    grep -F "/Run /TN frankensearch-fsfs-daemon" "${LOG_PATH}" >/dev/null
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Installed and started scheduled task frankensearch-fsfs-daemon"* ]]
+}
+
+@test "run_install allows Windows prebuilt mode when artifact steps succeed" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    TARGET_OS="pc-windows-msvc"
+    TARGET_ARCH="x86_64"
+    TARGET_TRIPLE="x86_64-pc-windows-msvc"
+    FROM_SOURCE=false
+    download_artifact() { :; }
+    verify_artifact_checksum() { :; }
+    extract_archive() { :; }
+    install_binary() { :; }
+    verify_installation() { return 0; }
+    maybe_configure_shell_path() { :; }
+    maybe_install_shell_completion() { :; }
+    maybe_install_daemon_service() { :; }
+    detect_agent_integrations() { :; }
+    configure_detected_agents() { :; }
+    print_agent_report_table() { :; }
+    maybe_run_initial_model_download() { :; }
+    maybe_run_post_install_doctor() { :; }
+    run_install
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Installation completed successfully."* ]]
+}
+
+@test "artifact_name uses zip extension for Windows targets" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    TARGET_OS="pc-windows-msvc"
+    TARGET_ARCH="x86_64"
+    TARGET_TRIPLE="x86_64-pc-windows-msvc"
+    artifact_name
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "fsfs-x86_64-pc-windows-msvc.zip" ]]
+}
+
+@test "binary_filename resolves fsfs.exe on Windows target" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    TARGET_OS="pc-windows-msvc"
+    binary_filename
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "fsfs.exe" ]]
 }
