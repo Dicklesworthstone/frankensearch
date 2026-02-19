@@ -2,7 +2,12 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHa
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +31,9 @@ use frankensearch_storage::{
 use fsqlite_types::value::SqliteValue;
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
 use ftui_core::event::{Event, KeyCode, Modifiers};
+use ftui_extras::markdown::{
+    MarkdownDetection, MarkdownRenderer, MarkdownTheme, is_likely_markdown,
+};
 use ftui_layout::{Constraint, Flex};
 use ftui_render::buffer::Buffer;
 use ftui_render::cell::PackedRgba;
@@ -356,10 +364,16 @@ const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 5;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 1;
 const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
 const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = 0;
-const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 256;
-const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 64;
-const FSFS_SEARCH_UNBOUNDED_VECTOR_FALLBACK_LIMIT: usize = 4_096;
-const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 200;
+// This controls fast-phase head breadth, not final output cardinality.
+const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
+const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
+const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v1";
+const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v1";
+const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
+const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
+const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
@@ -390,6 +404,30 @@ enum SearchExecutionMode {
     Full,
     FastOnly,
     LexicalOnly,
+}
+
+impl SearchExecutionMode {
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::FastOnly => "fast_only",
+            Self::LexicalOnly => "lexical_only",
+        }
+    }
+}
+
+fn parse_search_execution_mode(raw: Option<&str>) -> SearchResult<SearchExecutionMode> {
+    match raw {
+        None | Some("full") => Ok(SearchExecutionMode::Full),
+        Some("fast" | "fast_only") => Ok(SearchExecutionMode::FastOnly),
+        Some("lexical" | "lexical_only") => Ok(SearchExecutionMode::LexicalOnly),
+        Some(value) => Err(SearchError::InvalidConfig {
+            field: "cli.serve.mode".to_owned(),
+            value: value.to_owned(),
+            reason: "expected full|fast_only|lexical_only".to_owned(),
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,7 +477,7 @@ impl SearchExecutionResources {
             },
             fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
                 && self.vector_index.is_some()
-                && self.fast_embedder.is_some()
+                && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
             {
                 CapabilityState::Enabled
             } else {
@@ -447,8 +485,7 @@ impl SearchExecutionResources {
             },
             quality_semantic: if matches!(mode, SearchExecutionMode::Full)
                 && !fast_only
-                && self.vector_index.is_some()
-                && self.quality_embedder.is_some()
+                && self.quality_stage_viable(fast_only)
             {
                 CapabilityState::Enabled
             } else {
@@ -481,6 +518,76 @@ impl SearchExecutionResources {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SearchExecutionFlags {
+    include_snippets: bool,
+    persist_explain_session: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct SearchCacheKey {
+    query: String,
+    requested_limit: usize,
+    mode: String,
+    filter: Option<String>,
+    fast_only: bool,
+    rrf_k_milli: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchCacheRecord {
+    schema_version: String,
+    index_fingerprint: String,
+    key: SearchCacheKey,
+    payloads: Vec<SearchPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchServeRequest {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchServeResponse {
+    ok: bool,
+    query: String,
+    mode: String,
+    cached: bool,
+    payloads: Vec<SearchPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[cfg(unix)]
+struct SocketPathGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticRecallDecisionInput {
+    requested_limit: usize,
+    output_limit: usize,
+    planning_limit: usize,
+    semantic_stage_enabled: bool,
+    semantic_index_available: bool,
+    lexical_stage_enabled: bool,
+    lexical_head_count: usize,
+    lexical_full_count: usize,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct SearchDashboardState {
     status_payload: FsfsStatusPayload,
@@ -496,6 +603,7 @@ struct SearchDashboardState {
     phase_payloads: Vec<SearchPayload>,
     stage_chain: Vec<DashboardSearchStage>,
     active_hit_index: usize,
+    context_scroll: u16,
     last_error: Option<String>,
     last_search_elapsed_ms: Option<u64>,
     search_invocations: u64,
@@ -542,6 +650,7 @@ impl SearchDashboardState {
             phase_payloads: Vec::new(),
             stage_chain: vec![DashboardSearchStage::Idle],
             active_hit_index: 0,
+            context_scroll: 0,
             last_error: None,
             last_search_elapsed_ms: None,
             search_invocations: 0,
@@ -578,6 +687,7 @@ impl SearchDashboardState {
     fn mark_query_dirty(&mut self) {
         let now = Instant::now();
         self.record_query_edit(now);
+        self.context_scroll = 0;
         self.pending_lexical_refresh = true;
         self.lexical_pending_since = now;
         self.pending_semantic_refresh = true;
@@ -588,6 +698,7 @@ impl SearchDashboardState {
 
     fn force_refresh_now(&mut self) {
         let now = Instant::now();
+        self.context_scroll = 0;
         self.pending_lexical_refresh = true;
         self.lexical_pending_since = now
             .checked_sub(Duration::from_millis(self.lexical_debounce_window_ms))
@@ -659,6 +770,7 @@ impl SearchDashboardState {
         self.stage_chain.clear();
         self.stage_chain.push(DashboardSearchStage::Idle);
         self.active_hit_index = 0;
+        self.context_scroll = 0;
         self.last_error = None;
         self.last_search_elapsed_ms = None;
     }
@@ -667,6 +779,7 @@ impl SearchDashboardState {
         let len = self.latest_hits().len();
         if len > 0 {
             self.active_hit_index = (self.active_hit_index + 1) % len;
+            self.context_scroll = 0;
         }
     }
 
@@ -674,6 +787,7 @@ impl SearchDashboardState {
         let len = self.latest_hits().len();
         if len > 0 {
             self.active_hit_index = (self.active_hit_index + len - 1) % len;
+            self.context_scroll = 0;
         }
     }
 
@@ -681,9 +795,18 @@ impl SearchDashboardState {
         let len = self.latest_hits().len();
         if len == 0 {
             self.active_hit_index = 0;
+            self.context_scroll = 0;
         } else {
             self.active_hit_index = self.active_hit_index.min(len - 1);
         }
+    }
+
+    fn scroll_context_up(&mut self, lines: u16) {
+        self.context_scroll = self.context_scroll.saturating_sub(lines.max(1));
+    }
+
+    fn scroll_context_down(&mut self, lines: u16) {
+        self.context_scroll = self.context_scroll.saturating_add(lines.max(1));
     }
 
     fn push_latency_sample(&mut self, value: f64) {
@@ -3856,6 +3979,10 @@ impl FsfsRuntime {
             self.run_search_command(cx).await?;
             return Ok(());
         }
+        if command == CliCommand::Serve {
+            self.run_search_serve_command(cx).await?;
+            return Ok(());
+        }
         if command == CliCommand::Explain {
             self.run_explain_command()?;
             return Ok(());
@@ -3963,9 +4090,16 @@ impl FsfsRuntime {
         }
 
         let started = Instant::now();
-        let payload = search_runtime
-            .execute_search_payload(cx, query, limit)
-            .await?;
+        let payloads = if search_runtime.cli_input.daemon {
+            search_runtime.search_payloads_via_daemon(query, limit)?
+        } else {
+            search_runtime
+                .execute_search_payloads_cached_for_cli(cx, query, limit)
+                .await?
+        };
+        let payload = payloads.last().cloned().unwrap_or_else(|| {
+            SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
+        });
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             phase = "display",
@@ -4121,7 +4255,10 @@ impl FsfsRuntime {
         let mut seq = 0_u64;
 
         self.emit_search_stream_started(query, &stream_id, &mut seq, &mut stdout)?;
-        match self.execute_search_payloads(cx, query, limit).await {
+        match self
+            .execute_search_payloads_cached_for_cli(cx, query, limit)
+            .await
+        {
             Ok(payloads) => {
                 let payload = payloads.last().cloned().unwrap_or_else(|| {
                     SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
@@ -4153,6 +4290,405 @@ impl FsfsRuntime {
                 Err(error)
             }
         }
+    }
+
+    async fn run_search_serve_command(&self, cx: &Cx) -> SearchResult<()> {
+        #[cfg(unix)]
+        if self.cli_input.daemon_socket.is_some() {
+            return self.run_search_serve_socket_command(cx).await;
+        }
+
+        self.run_search_serve_stdio_command(cx).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_search_serve_stdio_command(&self, cx: &Cx) -> SearchResult<()> {
+        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
+        let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+
+        let ready = serde_json::json!({
+            "ok": true,
+            "event": "ready",
+            "schema_version": FSFS_SEARCH_SERVE_SCHEMA_VERSION,
+            "pid": std::process::id(),
+            "format": self.cli_input.format.to_string(),
+        });
+        Self::emit_search_serve_json_line(&ready)?;
+
+        loop {
+            line.clear();
+            let read = stdin.read_line(&mut line).map_err(SearchError::Io)?;
+            if read == 0 {
+                break;
+            }
+            let raw = line.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if matches!(raw, "quit" | "exit" | ":quit" | ":exit") {
+                break;
+            }
+
+            let request = Self::parse_search_serve_request(raw)?;
+            let response = self
+                .execute_search_serve_request(
+                    cx,
+                    request,
+                    &mut resources,
+                    &mut hot_cache,
+                    hot_cache_enabled,
+                )
+                .await?;
+            Self::emit_search_serve_json_line(&response)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::future_not_send,
+        clippy::significant_drop_tightening
+    )]
+    async fn run_search_serve_socket_command(&self, cx: &Cx) -> SearchResult<()> {
+        let socket_path = self.resolve_daemon_socket_path()?;
+        if let Some(parent) = socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        if socket_path.exists() {
+            match UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.daemon_socket".to_owned(),
+                        value: socket_path.display().to_string(),
+                        reason: "a daemon is already listening on this socket".to_owned(),
+                    });
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&socket_path);
+                }
+            }
+        }
+
+        let listener = UnixListener::bind(&socket_path).map_err(SearchError::Io)?;
+
+        let _socket_guard = SocketPathGuard {
+            path: socket_path.clone(),
+        };
+
+        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
+        let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+
+        loop {
+            let (mut stream, _) = listener.accept().map_err(SearchError::Io)?;
+            let mut raw_request = String::new();
+            stream
+                .read_to_string(&mut raw_request)
+                .map_err(SearchError::Io)?;
+            let raw = raw_request.trim();
+            if raw.is_empty() {
+                continue;
+            }
+
+            if matches!(raw, "quit" | "exit" | ":quit" | ":exit" | ":shutdown") {
+                break;
+            }
+
+            let request = Self::parse_search_serve_request(raw)?;
+            let response = self
+                .execute_search_serve_request(
+                    cx,
+                    request,
+                    &mut resources,
+                    &mut hot_cache,
+                    hot_cache_enabled,
+                )
+                .await?;
+
+            let response_bytes =
+                serde_json::to_vec(&response).map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.search.serve",
+                    source: Box::new(source),
+                })?;
+            stream.write_all(&response_bytes).map_err(SearchError::Io)?;
+            stream.write_all(b"\n").map_err(SearchError::Io)?;
+            stream.flush().map_err(SearchError::Io)?;
+        }
+
+        Ok(())
+    }
+
+    fn parse_search_serve_request(raw: &str) -> SearchResult<SearchServeRequest> {
+        if raw.starts_with('{') {
+            serde_json::from_str::<SearchServeRequest>(raw).map_err(|source| {
+                SearchError::InvalidConfig {
+                    field: "cli.serve.request".to_owned(),
+                    value: raw.to_owned(),
+                    reason: format!("invalid serve request json: {source}"),
+                }
+            })
+        } else {
+            Ok(SearchServeRequest {
+                query: raw.to_owned(),
+                limit: None,
+                mode: None,
+                filter: None,
+            })
+        }
+    }
+
+    async fn execute_search_serve_request(
+        &self,
+        cx: &Cx,
+        request: SearchServeRequest,
+        resources: &mut SearchExecutionResources,
+        hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
+        hot_cache_enabled: bool,
+    ) -> SearchResult<SearchServeResponse> {
+        let mode = parse_search_execution_mode(request.mode.as_deref())?;
+        let requested_limit = request.limit.unwrap_or_else(|| {
+            self.cli_input
+                .overrides
+                .limit
+                .unwrap_or(self.config.search.default_limit)
+        });
+        let mut runtime = self.clone();
+        let mut cli = runtime.cli_input.clone();
+        cli.filter = request.filter.clone();
+        runtime = runtime.with_cli_input(cli);
+        let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode);
+
+        let (cached, payloads) = if hot_cache_enabled {
+            if let Some(cached_payloads) = hot_cache.get(&cache_key) {
+                (true, cached_payloads.clone())
+            } else {
+                let payloads = runtime
+                    .execute_search_payloads_with_mode_using_resources(
+                        cx,
+                        &request.query,
+                        requested_limit,
+                        mode,
+                        resources,
+                        SearchExecutionFlags {
+                            include_snippets: true,
+                            persist_explain_session: false,
+                        },
+                    )
+                    .await?;
+                hot_cache.insert(cache_key, payloads.clone());
+                (false, payloads)
+            }
+        } else {
+            let payloads = runtime
+                .execute_search_payloads_with_mode_using_resources(
+                    cx,
+                    &request.query,
+                    requested_limit,
+                    mode,
+                    resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                )
+                .await?;
+            (false, payloads)
+        };
+
+        Ok(SearchServeResponse {
+            ok: true,
+            query: request.query,
+            mode: mode.label().to_owned(),
+            cached,
+            payloads,
+            error: None,
+        })
+    }
+
+    fn emit_search_serve_json_line<T: Serialize>(value: &T) -> SearchResult<()> {
+        let stdout = std::io::stdout();
+        let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+        serde_json::to_writer(&mut writer, value).map_err(|source| {
+            SearchError::SubsystemError {
+                subsystem: "fsfs.search.serve",
+                source: Box::new(source),
+            }
+        })?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.search.serve",
+                source: Box::new(source),
+            })?;
+        writer
+            .flush()
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.search.serve",
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    fn search_payloads_via_daemon(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        #[cfg(unix)]
+        {
+            let socket_path = self.resolve_daemon_socket_path()?;
+            let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
+                stream
+            } else {
+                self.spawn_search_daemon(&socket_path)?;
+                Self::wait_for_daemon_connection(&socket_path)?
+            };
+
+            let request = SearchServeRequest {
+                query: query.to_owned(),
+                limit: Some(limit),
+                mode: Some("full".to_owned()),
+                filter: self.cli_input.filter.clone(),
+            };
+            let request_json =
+                serde_json::to_vec(&request).map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.search.daemon",
+                    source: Box::new(source),
+                })?;
+            stream.write_all(&request_json).map_err(SearchError::Io)?;
+            stream.write_all(b"\n").map_err(SearchError::Io)?;
+            stream.flush().map_err(SearchError::Io)?;
+            let _ = stream.shutdown(Shutdown::Write);
+
+            let mut raw_response = String::new();
+            stream
+                .read_to_string(&mut raw_response)
+                .map_err(SearchError::Io)?;
+            let response = serde_json::from_str::<SearchServeResponse>(raw_response.trim())
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.search.daemon",
+                    source: Box::new(source),
+                })?;
+            if !response.ok {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.daemon".to_owned(),
+                    value: "search".to_owned(),
+                    reason: response
+                        .error
+                        .unwrap_or_else(|| "daemon search request failed".to_owned()),
+                });
+            }
+            if let Err(error) =
+                self.persist_explain_session_for_cached_payloads(query, &response.payloads)
+            {
+                warn!(
+                    error = %error,
+                    "fsfs daemon-backed search could not persist explain-session context"
+                );
+            }
+            Ok(response.payloads)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (query, limit);
+            Err(SearchError::InvalidConfig {
+                field: "cli.daemon".to_owned(),
+                value: "search".to_owned(),
+                reason: "daemon transport is only supported on unix platforms".to_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
+        if let Some(parent) = socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let binary_path = std::env::current_exe().map_err(SearchError::Io)?;
+        let mut command = Command::new(binary_path);
+        command
+            .arg("serve")
+            .arg("--daemon-socket")
+            .arg(socket_path)
+            .arg("--format")
+            .arg("jsonl")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(index_dir) = self.cli_input.index_dir.as_deref() {
+            command.arg("--index-dir").arg(index_dir);
+        }
+        if let Some(config_path) = self.cli_input.overrides.config_path.as_deref() {
+            command.arg("--config").arg(config_path);
+        }
+        if self.cli_input.verbose {
+            command.arg("--verbose");
+        }
+        if self.cli_input.quiet {
+            command.arg("--quiet");
+        }
+        if self.cli_input.no_color {
+            command.arg("--no-color");
+        }
+        command.spawn().map_err(SearchError::Io)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn wait_for_daemon_connection(socket_path: &Path) -> SearchResult<UnixStream> {
+        let mut last_error: Option<std::io::Error> = None;
+        for _ in 0..FSFS_DAEMON_CONNECT_MAX_ATTEMPTS {
+            match UnixStream::connect(socket_path) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    last_error = Some(error);
+                    std::thread::sleep(Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS));
+                }
+            }
+        }
+
+        Err(SearchError::InvalidConfig {
+            field: "cli.daemon_socket".to_owned(),
+            value: socket_path.display().to_string(),
+            reason: format!(
+                "daemon did not become ready: {}",
+                last_error.map_or_else(
+                    || "unknown startup error".to_owned(),
+                    |error| error.to_string()
+                )
+            ),
+        })
+    }
+
+    #[cfg(unix)]
+    fn resolve_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        if let Some(path) = self.cli_input.daemon_socket.as_deref() {
+            return absolutize_path(path);
+        }
+        self.default_daemon_socket_path()
+    }
+
+    #[cfg(unix)]
+    fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        let index_root = self
+            .resolve_status_index_root()
+            .or_else(|_| std::env::current_dir().map_err(SearchError::Io))?;
+        let mut hasher = Sha256::new();
+        hasher.update(index_root.display().to_string().as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
+        Ok(std::env::temp_dir().join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
     }
 
     fn emit_search_stream_started<W: Write>(
@@ -4454,6 +4990,7 @@ impl FsfsRuntime {
         Ok(Some(session))
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_lines)]
     async fn execute_search_payload(
         &self,
@@ -4467,6 +5004,7 @@ impl FsfsRuntime {
         }))
     }
 
+    #[cfg(test)]
     async fn execute_search_payloads(
         &self,
         cx: &Cx,
@@ -4500,24 +5038,220 @@ impl FsfsRuntime {
         limit: usize,
         mode: SearchExecutionMode,
         resources: &mut SearchExecutionResources,
-        include_snippets: bool,
-        persist_explain_session: bool,
+        flags: SearchExecutionFlags,
     ) -> SearchResult<Vec<SearchPayload>> {
         let artifacts = self
             .execute_search_phase_artifacts_with_mode_using_resources(
-                cx,
-                query,
-                limit,
-                mode,
-                resources,
-                include_snippets,
-                persist_explain_session,
+                cx, query, limit, mode, resources, flags,
             )
             .await?;
         Ok(artifacts
             .into_iter()
             .map(|artifact| artifact.payload)
             .collect())
+    }
+
+    async fn execute_search_payloads_cached_for_cli(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let mode = SearchExecutionMode::Full;
+        let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+        if !cache_enabled {
+            return self
+                .execute_search_payloads_with_mode(cx, query, limit, mode)
+                .await;
+        }
+        let key = self.search_cache_key(query, limit, mode);
+        match self.try_load_search_payload_cache(&key) {
+            Ok(Some(payloads)) => {
+                if let Err(error) =
+                    self.persist_explain_session_for_cached_payloads(query, &payloads)
+                {
+                    warn!(
+                        error = %error,
+                        "fsfs cached search could not persist explain-session context"
+                    );
+                }
+                return Ok(payloads);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "fsfs search cache read failed; continuing with uncached execution"
+                );
+            }
+        }
+
+        let payloads = self
+            .execute_search_payloads_with_mode(cx, query, limit, mode)
+            .await?;
+        if let Err(error) = self.write_search_payload_cache(&key, &payloads) {
+            warn!(
+                error = %error,
+                "fsfs search cache write failed; continuing without cache persistence"
+            );
+        }
+        Ok(payloads)
+    }
+
+    #[must_use]
+    fn normalize_search_query(query: &str) -> String {
+        query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_owned()
+    }
+
+    #[must_use]
+    fn search_cache_key(
+        &self,
+        query: &str,
+        requested_limit: usize,
+        mode: SearchExecutionMode,
+    ) -> SearchCacheKey {
+        SearchCacheKey {
+            query: Self::normalize_search_query(query),
+            requested_limit,
+            mode: mode.label().to_owned(),
+            filter: self.cli_input.filter.clone(),
+            fast_only: self.config.search.fast_only,
+            rrf_k_milli: u64::from(f64_to_per_mille(self.config.search.rrf_k)),
+        }
+    }
+
+    #[must_use]
+    fn search_cache_key_hash(key: &SearchCacheKey) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(key.query.as_bytes());
+        hasher.update(key.requested_limit.to_le_bytes());
+        hasher.update(key.mode.as_bytes());
+        hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
+        hasher.update([u8::from(key.fast_only)]);
+        hasher.update(key.rrf_k_milli.to_le_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn search_cache_path(&self, key: &SearchCacheKey) -> SearchResult<PathBuf> {
+        let index_root = self.resolve_status_index_root()?;
+        let file_name = format!("{}.json", Self::search_cache_key_hash(key));
+        Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
+    }
+
+    fn search_index_fingerprint(&self) -> SearchResult<String> {
+        let index_root = self.resolve_status_index_root()?;
+        let mut hasher = Sha256::new();
+
+        if let Some(sentinel) = Self::read_index_sentinel(&index_root)? {
+            hasher.update(sentinel.source_hash_hex.as_bytes());
+            hasher.update(sentinel.generated_at_ms.to_le_bytes());
+        }
+
+        for rel in [
+            FSFS_VECTOR_INDEX_FILE,
+            FSFS_VECTOR_MANIFEST_FILE,
+            FSFS_LEXICAL_MANIFEST_FILE,
+            FSFS_SENTINEL_FILE,
+            "lexical",
+        ] {
+            let path = index_root.join(rel);
+            hasher.update(rel.as_bytes());
+            match fs::metadata(&path) {
+                Ok(metadata) => {
+                    hasher.update([1]);
+                    hasher.update(metadata.len().to_le_bytes());
+                    let modified_ms = metadata.modified().ok().map_or(0, system_time_to_ms);
+                    hasher.update(modified_ms.to_le_bytes());
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    hasher.update([0]);
+                }
+                Err(error) => return Err(SearchError::Io(error)),
+            }
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn try_load_search_payload_cache(
+        &self,
+        key: &SearchCacheKey,
+    ) -> SearchResult<Option<Vec<SearchPayload>>> {
+        let cache_path = self.search_cache_path(key)?;
+        let raw = match fs::read_to_string(&cache_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SearchError::Io(error)),
+        };
+
+        let record = serde_json::from_str::<SearchCacheRecord>(&raw).map_err(|source| {
+            SearchError::SubsystemError {
+                subsystem: "fsfs.search.cache",
+                source: Box::new(source),
+            }
+        })?;
+        if record.schema_version != FSFS_SEARCH_CACHE_SCHEMA_VERSION || record.key != *key {
+            return Ok(None);
+        }
+        if record.index_fingerprint != self.search_index_fingerprint()? {
+            return Ok(None);
+        }
+        Ok(Some(record.payloads))
+    }
+
+    fn write_search_payload_cache(
+        &self,
+        key: &SearchCacheKey,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<()> {
+        let cache_path = self.search_cache_path(key)?;
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let record = SearchCacheRecord {
+            schema_version: FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
+            index_fingerprint: self.search_index_fingerprint()?,
+            key: key.clone(),
+            payloads: payloads.to_vec(),
+        };
+        let json = serde_json::to_vec(&record).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.search.cache",
+            source: Box::new(source),
+        })?;
+        fs::write(cache_path, json).map_err(SearchError::Io)?;
+        Ok(())
+    }
+
+    fn persist_explain_session_for_cached_payloads(
+        &self,
+        query: &str,
+        payloads: &[SearchPayload],
+    ) -> SearchResult<()> {
+        let Some(last) = payloads.last() else {
+            return Ok(());
+        };
+        let fused = last
+            .hits
+            .iter()
+            .map(|hit| FusedCandidate {
+                doc_id: hit.path.clone(),
+                fused_score: hit.score,
+                prior_boost: 0.0,
+                lexical_rank: hit.lexical_rank,
+                semantic_rank: hit.semantic_rank,
+                lexical_score: None,
+                semantic_score: None,
+                in_both_sources: hit.in_both_sources,
+            })
+            .collect::<Vec<_>>();
+        let index_root = self.resolve_status_index_root()?;
+        self.persist_explain_session(&index_root, query, last.phase, &fused)
     }
 
     fn apply_search_filter(
@@ -4556,13 +5290,32 @@ impl FsfsRuntime {
     }
 
     #[must_use]
-    fn resolve_output_limit(requested_limit: usize, lexical_index: Option<&TantivyIndex>) -> usize {
+    fn resolve_output_limit(
+        requested_limit: usize,
+        lexical_doc_count: Option<usize>,
+        vector_doc_count: Option<usize>,
+    ) -> usize {
         if requested_limit != FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
             return requested_limit.max(1);
         }
-        lexical_index.map_or(FSFS_SEARCH_UNBOUNDED_VECTOR_FALLBACK_LIMIT, |index| {
-            index.doc_count().max(1)
-        })
+        lexical_doc_count
+            .unwrap_or(0)
+            .max(vector_doc_count.unwrap_or(0))
+            .max(1)
+    }
+
+    #[must_use]
+    const fn should_force_full_semantic_recall(input: SemanticRecallDecisionInput) -> bool {
+        if !input.semantic_stage_enabled || !input.semantic_index_available {
+            return false;
+        }
+        if input.requested_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            return true;
+        }
+        input.output_limit > input.planning_limit
+            && (!input.lexical_stage_enabled
+                || input.lexical_head_count == 0
+                || input.lexical_full_count < input.output_limit)
     }
 
     #[must_use]
@@ -4727,6 +5480,44 @@ impl FsfsRuntime {
         merged
     }
 
+    #[must_use]
+    fn merge_with_fallback_tail(
+        refined_head: &[FusedCandidate],
+        fallback_ordered: &[FusedCandidate],
+        output_limit: usize,
+    ) -> Vec<FusedCandidate> {
+        let effective_limit = if output_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            usize::MAX
+        } else {
+            output_limit
+        };
+        if effective_limit != usize::MAX && refined_head.len() >= effective_limit {
+            return refined_head
+                .iter()
+                .take(effective_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+        }
+
+        let mut merged =
+            Vec::with_capacity(refined_head.len().saturating_add(fallback_ordered.len()));
+        let mut seen = HashSet::with_capacity(refined_head.len());
+        for candidate in refined_head {
+            seen.insert(candidate.doc_id.as_str());
+            merged.push(candidate.clone());
+        }
+        for candidate in fallback_ordered {
+            if effective_limit != usize::MAX && merged.len() >= effective_limit {
+                break;
+            }
+            if seen.contains(candidate.doc_id.as_str()) {
+                continue;
+            }
+            merged.push(candidate.clone());
+        }
+        merged
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_search_phase_artifacts_with_mode(
         &self,
@@ -4742,8 +5533,10 @@ impl FsfsRuntime {
             limit,
             mode,
             &mut resources,
-            true,
-            true,
+            SearchExecutionFlags {
+                include_snippets: true,
+                persist_explain_session: true,
+            },
         )
         .await
     }
@@ -4756,15 +5549,9 @@ impl FsfsRuntime {
         limit: usize,
         mode: SearchExecutionMode,
         resources: &mut SearchExecutionResources,
-        include_snippets: bool,
-        persist_explain_session: bool,
+        flags: SearchExecutionFlags,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
-        let normalized_query = query
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_owned();
+        let normalized_query = Self::normalize_search_query(query);
         let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
             return Ok(vec![SearchPhaseArtifact {
@@ -4779,48 +5566,19 @@ impl FsfsRuntime {
             }]);
         }
 
-        let output_limit = Self::resolve_output_limit(limit, resources.lexical_index.as_ref());
+        let lexical_doc_count = resources
+            .lexical_index
+            .as_ref()
+            .map(TantivyIndex::doc_count);
+        let vector_doc_count = resources.vector_index.as_ref().map(|index| {
+            index
+                .record_count()
+                .saturating_add(index.wal_record_count())
+        });
+        let output_limit = Self::resolve_output_limit(limit, lexical_doc_count, vector_doc_count);
         let planning_limit = output_limit.clamp(1, FSFS_SEARCH_SEMANTIC_HEAD_LIMIT);
         let search_start = Instant::now();
         let lexical_available = resources.lexical_index.is_some();
-        if !matches!(mode, SearchExecutionMode::LexicalOnly) && resources.vector_index.is_some() {
-            self.maybe_prepare_fast_embedder(resources, lexical_available)?;
-        }
-        if matches!(mode, SearchExecutionMode::Full)
-            && !self.config.search.fast_only
-            && resources.vector_index.is_some()
-        {
-            if let Some(index) = resources.vector_index.as_ref()
-                && index.dimension() != FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION
-            {
-                resources.quality_embedder = None;
-                resources.quality_embedder_attempted = true;
-                info!(
-                    index_dimension = index.dimension(),
-                    expected_quality_dimension = FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION,
-                    "fsfs search skipping quality semantic tier because vector index dimension targets non-quality embedding"
-                );
-            } else if let (Some(index), Some(fast_embedder)) = (
-                resources.vector_index.as_ref(),
-                resources.fast_embedder.as_ref(),
-            ) && index.embedder_id().eq_ignore_ascii_case(fast_embedder.id())
-            {
-                resources.quality_embedder = None;
-                resources.quality_embedder_attempted = true;
-                info!(
-                    index_embedder_id = index.embedder_id(),
-                    fast_embedder_id = fast_embedder.id(),
-                    "fsfs search skipping quality semantic tier because vector index targets fast-tier embedder"
-                );
-            }
-        }
-        if matches!(mode, SearchExecutionMode::Full)
-            && !self.config.search.fast_only
-            && resources.vector_index.is_some()
-            && !resources.quality_embedder_attempted
-        {
-            self.maybe_prepare_quality_embedder(resources, lexical_available)?;
-        }
 
         let capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
         let planner = QueryPlanner::from_fsfs(&self.config);
@@ -4878,7 +5636,7 @@ impl FsfsRuntime {
         let mut snippets_by_doc = HashMap::new();
         let (lexical_candidates, lexical_head_candidates) = if plan.lexical_stage.enabled {
             if let Some(lexical) = resources.lexical_index.as_ref() {
-                if include_snippets {
+                if flags.include_snippets {
                     let snippet_limit = lexical_budget.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
                     let snippet_hits = lexical.search_with_snippets(
                         cx,
@@ -4939,22 +5697,44 @@ impl FsfsRuntime {
         let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
 
         let semantic_start = Instant::now();
-        let semantic_budget = if let Some(short_query_cap) = short_query_budget_cap {
+        let force_full_semantic_recall =
+            Self::should_force_full_semantic_recall(SemanticRecallDecisionInput {
+                requested_limit: limit,
+                output_limit,
+                planning_limit,
+                semantic_stage_enabled: plan.semantic_stage.enabled,
+                semantic_index_available: resources.vector_index.is_some(),
+                lexical_stage_enabled: plan.lexical_stage.enabled,
+                lexical_head_count: lexical_head_candidates.len(),
+                lexical_full_count: lexical_candidates.len(),
+            });
+        let semantic_budget_floor = if force_full_semantic_recall {
+            output_limit
+        } else {
+            planning_limit
+        };
+        let semantic_budget = if force_full_semantic_recall {
             plan.semantic_stage
                 .candidate_budget
-                .max(planning_limit)
+                .max(semantic_budget_floor)
+        } else if let Some(short_query_cap) = short_query_budget_cap {
+            plan.semantic_stage
+                .candidate_budget
+                .max(semantic_budget_floor)
                 .min(short_query_cap)
         } else if matches!(mode, SearchExecutionMode::FastOnly) {
             plan.semantic_stage
                 .candidate_budget
-                .max(planning_limit)
+                .max(semantic_budget_floor)
                 .min(
                     planning_limit
                         .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
                         .max(planning_limit),
                 )
         } else {
-            plan.semantic_stage.candidate_budget.max(planning_limit)
+            plan.semantic_stage
+                .candidate_budget
+                .max(semantic_budget_floor)
         };
         let semantic_decision = if !plan.semantic_stage.enabled {
             SemanticVoiDecision {
@@ -4982,6 +5762,7 @@ impl FsfsRuntime {
             lexical_head_candidates = lexical_head_candidates.len(),
             semantic_budget,
             output_limit,
+            force_full_semantic_recall,
             run_semantic = semantic_decision.run_semantic,
             posterior_useful_per_mille = f64_to_per_mille(semantic_decision.posterior_useful),
             expected_loss_run_per_mille = f64_to_per_mille(semantic_decision.expected_loss_run),
@@ -4989,6 +5770,16 @@ impl FsfsRuntime {
             reason_code = semantic_decision.reason_code,
             "fsfs semantic-stage VOI decision"
         );
+
+        if plan.semantic_stage.enabled
+            && semantic_decision.run_semantic
+            && !matches!(mode, SearchExecutionMode::LexicalOnly)
+            && resources.vector_index.is_some()
+            && resources.fast_embedder.is_none()
+            && !resources.fast_embedder_attempted
+        {
+            self.maybe_prepare_fast_embedder(resources, lexical_available)?;
+        }
 
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
             if let (Some(index), Some(embedder)) = (
@@ -5072,11 +5863,24 @@ impl FsfsRuntime {
         }];
 
         if plan.quality_stage.enabled {
+            if matches!(mode, SearchExecutionMode::Full)
+                && !self.config.search.fast_only
+                && resources.vector_index.is_some()
+                && resources.quality_embedder.is_none()
+                && !resources.quality_embedder_attempted
+            {
+                self.maybe_prepare_quality_embedder(resources, lexical_available)?;
+            }
             if let (Some(index), Some(embedder)) = (
                 resources.vector_index.as_ref(),
                 resources.quality_embedder.as_ref(),
             ) {
-                let quality_budget = plan.quality_stage.candidate_budget.max(planning_limit);
+                let quality_budget_floor = planning_limit;
+                let quality_budget = plan
+                    .quality_stage
+                    .candidate_budget
+                    .max(quality_budget_floor)
+                    .min(output_limit);
                 let quality_outcome = match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         match index.search_top_k(&query_embedding, quality_budget, None) {
@@ -5100,17 +5904,11 @@ impl FsfsRuntime {
                         );
                         let filtered_refined_head =
                             Self::apply_search_filter(&fused_refined_head, filter_expr.as_ref());
-                        let fused_refined = if output_limit > filtered_refined_head.len()
-                            && !lexical_candidates.is_empty()
-                        {
-                            Self::merge_with_lexical_tail(
-                                &filtered_refined_head,
-                                &lexical_candidates,
-                                filter_expr.as_ref(),
-                            )
-                        } else {
-                            filtered_refined_head
-                        };
+                        let fused_refined = Self::merge_with_fallback_tail(
+                            &filtered_refined_head,
+                            &fused_initial,
+                            output_limit,
+                        );
                         let refined_payload = Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -5171,21 +5969,20 @@ impl FsfsRuntime {
             }
         }
 
-        if persist_explain_session {
-            if let Some(last) = artifacts.last()
-                && let Err(error) = self.persist_explain_session(
-                    &resources.index_root,
-                    &normalized_query,
-                    last.phase,
-                    &last.fused,
-                )
-            {
-                warn!(
-                    error = %error,
-                    path = %Self::explain_session_path(&resources.index_root).display(),
-                    "failed to persist explain-session context for follow-up `fsfs explain`"
-                );
-            }
+        if flags.persist_explain_session
+            && let Some(last) = artifacts.last()
+            && let Err(error) = self.persist_explain_session(
+                &resources.index_root,
+                &normalized_query,
+                last.phase,
+                &last.fused,
+            )
+        {
+            warn!(
+                error = %error,
+                path = %Self::explain_session_path(&resources.index_root).display(),
+                "failed to persist explain-session context for follow-up `fsfs explain`"
+            );
         }
 
         let final_payload = artifacts
@@ -7661,6 +8458,7 @@ impl FsfsRuntime {
                             _ => {
                                 if state.query_input.handle_event(&event) {
                                     state.active_hit_index = 0;
+                                    state.context_scroll = 0;
                                     state.mark_query_dirty();
                                     interaction_changed = true;
                                 }
@@ -7669,6 +8467,7 @@ impl FsfsRuntime {
                         Event::Paste(_) => {
                             if state.query_input.handle_event(&event) {
                                 state.active_hit_index = 0;
+                                state.context_scroll = 0;
                                 state.mark_query_dirty();
                                 interaction_changed = true;
                             }
@@ -7709,17 +8508,36 @@ impl FsfsRuntime {
                         }
                         (KeyCode::Home, _) | (KeyCode::Char('g'), Modifiers::NONE) => {
                             state.active_hit_index = 0;
+                            state.context_scroll = 0;
                             interaction_changed = true;
                         }
                         (KeyCode::End, _) | (KeyCode::Char('G'), Modifiers::NONE) => {
                             let len = state.latest_hits().len();
                             state.active_hit_index = len.saturating_sub(1);
+                            state.context_scroll = 0;
+                            interaction_changed = true;
+                        }
+                        (KeyCode::Char('['), Modifiers::NONE) => {
+                            state.scroll_context_up(1);
+                            interaction_changed = true;
+                        }
+                        (KeyCode::Char(']'), Modifiers::NONE) => {
+                            state.scroll_context_down(1);
+                            interaction_changed = true;
+                        }
+                        (KeyCode::PageUp, _) => {
+                            state.scroll_context_up(8);
+                            interaction_changed = true;
+                        }
+                        (KeyCode::PageDown, _) => {
+                            state.scroll_context_down(8);
                             interaction_changed = true;
                         }
                         (KeyCode::Char(ch), Modifiers::NONE) if !ch.is_control() => {
                             state.set_focus(true);
                             if state.query_input.handle_event(&event) {
                                 state.active_hit_index = 0;
+                                state.context_scroll = 0;
                                 state.mark_query_dirty();
                                 interaction_changed = true;
                             }
@@ -7915,8 +8733,10 @@ impl FsfsRuntime {
                 search_limit.max(1),
                 mode,
                 resources,
-                include_snippets,
-                false,
+                SearchExecutionFlags {
+                    include_snippets,
+                    persist_explain_session: false,
+                },
             )
             .await;
 
@@ -7980,6 +8800,7 @@ impl FsfsRuntime {
             state.phase_payloads.clear();
             state.stage_chain = vec![DashboardSearchStage::Lexical];
             state.active_hit_index = 0;
+            state.context_scroll = 0;
             state.pending_semantic_refresh = false;
         }
     }
@@ -8004,10 +8825,7 @@ impl FsfsRuntime {
         if Self::tui_prefers_lexical_only_query(&query) {
             // Keep the interactive fast lane bounded to the visible lexical head.
             // Full-limit hydration is deferred to the delayed quality gate.
-            let fast_limit = state
-                .result_limit
-                .max(1)
-                .min(FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
+            let fast_limit = state.result_limit.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
             if let Ok(payloads) = self
                 .refresh_search_dashboard_mode_with_limit(
                     cx,
@@ -8192,6 +9010,7 @@ impl FsfsRuntime {
         } else {
             state.phase_payloads.clear();
             state.active_hit_index = 0;
+            state.context_scroll = 0;
         }
     }
 
@@ -8514,6 +9333,7 @@ fn print_cli_help() {
     println!();
     println!("Commands:");
     println!("  search <query>            Search indexed corpus");
+    println!("  serve                     Run long-lived query server over stdin/stdout");
     println!("  index [path]              Build/update index");
     println!("  watch [path]              Alias for index --watch");
     println!("  explain <result-id>       Explain ranking details");
@@ -8533,16 +9353,16 @@ fn print_cli_help() {
 const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search index watch explain status config download-models download doctor update completions uninstall help version\" fsfs"
+            "complete -W \"search serve index watch explain status config download-models download doctor update completions uninstall help version\" fsfs"
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search index watch explain status config download-models download doctor update completions uninstall help version))\"' fsfs"
+            "compdef '_arguments \"1: :((search serve index watch explain status config download-models download doctor update completions uninstall help version))\"' fsfs"
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search index watch explain status config download-models download doctor update completions uninstall help version\""
+            "complete -c fsfs -f -a \"search serve index watch explain status config download-models download doctor update completions uninstall help version\""
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
 }
@@ -9837,8 +10657,17 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                 hit.snippet.as_deref().map_or(
                     "No snippet available for this match.".to_owned(),
                     |snippet| {
+                        let snippet_trimmed = snippet.trim();
+                        let detection = is_likely_markdown(snippet_trimmed);
+                        let preview_format =
+                            detect_context_preview_format(snippet_trimmed, detection);
+                        let snippet_text = if preview_format == ContextPreviewFormat::Html {
+                            normalize_html_fragment_for_markdown(snippet_trimmed)
+                        } else {
+                            snippet_trimmed.to_owned()
+                        };
                         truncate_tail(
-                            snippet.trim(),
+                            &snippet_text,
                             usize::from(left[2].width).saturating_sub(8).max(26),
                         )
                     },
@@ -10029,7 +10858,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     context_block.render(right[2], frame);
     let context_inner = context_block.inner(right[2]);
     let context_rows = Flex::vertical()
-        .constraints([Constraint::Fixed(2), Constraint::Fixed(1), Constraint::Fill])
+        .constraints([Constraint::Fixed(3), Constraint::Fixed(1), Constraint::Fill])
         .split(context_inner);
     let score_spark = if state.latest_hits().is_empty() {
         vec![0.0]
@@ -10041,6 +10870,39 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             .map(|hit| hit.score.max(0.0))
             .collect::<Vec<_>>()
     };
+    let active_context_meta = state
+        .latest_hits()
+        .get(state.active_hit_index)
+        .map(|active_hit| {
+            let raw_snippet = active_hit
+                .snippet
+                .as_deref()
+                .unwrap_or("No snippet available for this hit.")
+                .trim()
+                .to_owned();
+            let preview_source = truncate_tail(
+                &raw_snippet,
+                usize::from(context_rows[2].width)
+                    .saturating_mul(24)
+                    .max(256),
+            );
+            let markdown_detection = is_likely_markdown(&preview_source);
+            let preview_format = detect_context_preview_format(&preview_source, markdown_detection);
+            (preview_source, preview_format, markdown_detection)
+        });
+    let mode_line = active_context_meta.as_ref().map_or_else(
+        || "render mode=waiting for match".to_owned(),
+        |(_, preview_format, markdown_detection)| match preview_format {
+            ContextPreviewFormat::Markdown => format!(
+                "render mode=streaming gfm markdown  indicators={}",
+                markdown_detection.indicators
+            ),
+            ContextPreviewFormat::Html => {
+                "render mode=html fragment -> streaming gfm markdown".to_owned()
+            }
+            ContextPreviewFormat::Plain => "render mode=plain text + query highlights".to_owned(),
+        },
+    );
     Paragraph::new(Text::from_lines(vec![
         Line::from(Span::styled(
             "result score density (left→right rank order)",
@@ -10058,43 +10920,68 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             ),
             ui_fg(no_color, PackedRgba::rgb(145, 168, 205)),
         )),
+        Line::from(Span::styled(
+            truncate_tail(
+                &mode_line,
+                usize::from(context_rows[0].width).saturating_sub(2),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(131, 154, 191)),
+        )),
     ]))
     .render(context_rows[0], frame);
     Sparkline::new(&score_spark)
         .style(ui_fg(no_color, PackedRgba::rgb(255, 202, 123)))
         .render(context_rows[1], frame);
     if let Some(active_hit) = state.latest_hits().get(state.active_hit_index) {
-        let snippet = active_hit
-            .snippet
-            .as_deref()
-            .unwrap_or("No snippet available for this hit.");
-        let snippet = truncate_tail(
-            snippet.trim(),
-            usize::from(context_rows[2].width).saturating_mul(3).max(64),
-        );
-        let snippet_spans = highlight_text_spans(
-            &snippet,
-            &query_terms,
-            ui_fg(no_color, PackedRgba::rgb(215, 230, 255)),
-            ui_fg_bg(
-                no_color,
-                PackedRgba::rgb(8, 22, 34),
-                PackedRgba::rgb(255, 202, 123),
+        let path_line = Line::from(Span::styled(
+            truncate_middle(
+                &active_hit.path,
+                usize::from(context_rows[2].width).saturating_sub(4).max(18),
             ),
-        );
-        Paragraph::new(Text::from_lines(vec![
-            Line::from(Span::styled(
-                truncate_middle(
-                    &active_hit.path,
-                    usize::from(context_rows[2].width).saturating_sub(4).max(18),
-                ),
-                ui_fg(no_color, PackedRgba::rgb(224, 239, 255)).bold(),
-            )),
-            Line::from(""),
-            Line::from_spans(snippet_spans),
-        ]))
-        .wrap(WrapMode::Word)
-        .render(context_rows[2], frame);
+            ui_fg(no_color, PackedRgba::rgb(224, 239, 255)).bold(),
+        ));
+
+        let mut rendered_lines = vec![path_line, Line::from("")];
+        let mut wrap_mode = WrapMode::Word;
+        if let Some((preview_source, preview_format, _)) = active_context_meta.as_ref() {
+            match preview_format {
+                ContextPreviewFormat::Plain => {
+                    for line in preview_source.lines() {
+                        let spans = highlight_text_spans(
+                            line,
+                            &query_terms,
+                            ui_fg(no_color, PackedRgba::rgb(215, 230, 255)),
+                            ui_fg_bg(
+                                no_color,
+                                PackedRgba::rgb(8, 22, 34),
+                                PackedRgba::rgb(255, 202, 123),
+                            ),
+                        );
+                        rendered_lines.push(Line::from_spans(spans));
+                    }
+                }
+                ContextPreviewFormat::Markdown | ContextPreviewFormat::Html => {
+                    let markdown_text = render_context_radar_markdown_text(
+                        preview_source,
+                        *preview_format,
+                        no_color,
+                        context_rows[2].width.saturating_sub(1),
+                    );
+                    rendered_lines.extend(markdown_text.lines().iter().cloned());
+                    wrap_mode = WrapMode::None;
+                }
+            }
+        }
+        if rendered_lines.len() <= 2 {
+            rendered_lines.push(Line::from(Span::styled(
+                "No snippet available for this hit.",
+                ui_fg(no_color, PackedRgba::rgb(177, 199, 233)),
+            )));
+        }
+        Paragraph::new(Text::from_lines(rendered_lines))
+            .wrap(wrap_mode)
+            .scroll((state.context_scroll, 0))
+            .render(context_rows[2], frame);
     } else {
         Paragraph::new(Text::from_lines(vec![
             Line::from(Span::styled(
@@ -10116,7 +11003,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             ui_fg(no_color, PackedRgba::rgb(165, 183, 216)),
         )),
         Line::from(Span::styled(
-            "n/N navigate  •  Ctrl+L clear query  •  r refresh corpus health  •  q exit",
+            "n/N navigate  •  [ / ] + PgUp/PgDn scroll context  •  Ctrl+L clear query  •  r refresh corpus health  •  q exit",
             ui_fg(no_color, PackedRgba::rgb(132, 151, 184)),
         )),
     ]))
@@ -10207,9 +11094,17 @@ fn render_search_dashboard_compact(
             ),
         ]));
         if let Some(snippet) = hit.snippet.as_deref() {
+            let snippet_trimmed = snippet.trim();
+            let detection = is_likely_markdown(snippet_trimmed);
+            let preview_format = detect_context_preview_format(snippet_trimmed, detection);
+            let compact_snippet = if preview_format == ContextPreviewFormat::Html {
+                normalize_html_fragment_for_markdown(snippet_trimmed)
+            } else {
+                snippet_trimmed.to_owned()
+            };
             lines.push(Line::from_spans(highlight_text_spans(
                 &truncate_tail(
-                    snippet.trim(),
+                    &compact_snippet,
                     usize::from(area.width).saturating_sub(8).max(20),
                 ),
                 &query_terms,
@@ -10424,6 +11319,214 @@ fn render_search_results_panel(
         }
         Paragraph::new(Text::from_lines(lines)).render(row_area, frame);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPreviewFormat {
+    Plain,
+    Markdown,
+    Html,
+}
+
+const HTML_FRAGMENT_MARKERS: [&str; 25] = [
+    "<!doctype",
+    "<html",
+    "<body",
+    "<div",
+    "<span",
+    "<p>",
+    "<p ",
+    "<br",
+    "<hr",
+    "<pre",
+    "<code",
+    "<em>",
+    "<strong>",
+    "<b>",
+    "<b ",
+    "<i>",
+    "<ul",
+    "<ol",
+    "<li",
+    "<table",
+    "<tr",
+    "<td",
+    "<th",
+    "<a ",
+    "<img",
+];
+
+fn detect_context_preview_format(
+    content: &str,
+    markdown_detection: MarkdownDetection,
+) -> ContextPreviewFormat {
+    if is_likely_html_fragment(content) {
+        ContextPreviewFormat::Html
+    } else if markdown_detection.is_likely() {
+        ContextPreviewFormat::Markdown
+    } else {
+        ContextPreviewFormat::Plain
+    }
+}
+
+fn is_likely_html_fragment(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.len() < 4 || !trimmed.contains('<') || !trimmed.contains('>') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    HTML_FRAGMENT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn render_context_radar_markdown_text(
+    source: &str,
+    preview_format: ContextPreviewFormat,
+    no_color: bool,
+    width: u16,
+) -> Text {
+    let width = width.max(12);
+    let markdown_source = if preview_format == ContextPreviewFormat::Html {
+        normalize_html_fragment_for_markdown(source)
+    } else {
+        source.to_owned()
+    };
+    let rendered = MarkdownRenderer::new(context_radar_markdown_theme(no_color))
+        .rule_width(width.min(42))
+        .table_max_width(width)
+        .render_streaming(&markdown_source);
+    wrap_markdown_for_context_panel(&rendered, width)
+}
+
+fn context_radar_markdown_theme(no_color: bool) -> MarkdownTheme {
+    MarkdownTheme {
+        h1: ui_fg(no_color, PackedRgba::rgb(224, 239, 255)).bold(),
+        h2: ui_fg(no_color, PackedRgba::rgb(210, 229, 255)).bold(),
+        h3: ui_fg(no_color, PackedRgba::rgb(198, 218, 248)).bold(),
+        h4: ui_fg(no_color, PackedRgba::rgb(183, 205, 236)).bold(),
+        h5: ui_fg(no_color, PackedRgba::rgb(170, 191, 228)).bold(),
+        h6: ui_fg(no_color, PackedRgba::rgb(158, 179, 213)).bold(),
+        code_inline: ui_fg(no_color, PackedRgba::rgb(255, 202, 123)),
+        code_block: ui_fg(no_color, PackedRgba::rgb(196, 218, 247)),
+        blockquote: ui_fg(no_color, PackedRgba::rgb(153, 175, 212)).italic(),
+        link: ui_fg(no_color, PackedRgba::rgb(132, 201, 255)).underline(),
+        list_bullet: ui_fg(no_color, PackedRgba::rgb(120, 184, 245)),
+        horizontal_rule: ui_fg(no_color, PackedRgba::rgb(120, 141, 177)).dim(),
+        task_done: ui_fg(no_color, PackedRgba::rgb(131, 231, 157)),
+        task_todo: ui_fg(no_color, PackedRgba::rgb(255, 202, 123)),
+        math_inline: ui_fg(no_color, PackedRgba::rgb(168, 191, 228)).italic(),
+        math_block: ui_fg(no_color, PackedRgba::rgb(183, 205, 236)).bold(),
+        footnote_ref: ui_fg(no_color, PackedRgba::rgb(141, 163, 199)).dim(),
+        footnote_def: ui_fg(no_color, PackedRgba::rgb(163, 185, 222)),
+        admonition_note: ui_fg(no_color, PackedRgba::rgb(122, 219, 255)).bold(),
+        admonition_tip: ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
+        admonition_important: ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold(),
+        admonition_warning: ui_fg(no_color, PackedRgba::rgb(255, 191, 108)).bold(),
+        admonition_caution: ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold(),
+        ..MarkdownTheme::default()
+    }
+}
+
+fn normalize_html_fragment_for_markdown(source: &str) -> String {
+    let normalized = source
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("<hr />", "\n---\n")
+        .replace("<hr/>", "\n---\n")
+        .replace("<hr>", "\n---\n")
+        .replace("<p>", "")
+        .replace("</p>", "\n\n")
+        .replace("<div>", "")
+        .replace("</div>", "\n")
+        .replace("<strong>", "**")
+        .replace("</strong>", "**")
+        .replace("<b>", "**")
+        .replace("</b>", "**")
+        .replace("<em>", "*")
+        .replace("</em>", "*")
+        .replace("<i>", "*")
+        .replace("</i>", "*")
+        .replace("<code>", "`")
+        .replace("</code>", "`")
+        .replace("<pre>", "```\n")
+        .replace("</pre>", "\n```")
+        .replace("<ul>", "")
+        .replace("</ul>", "\n")
+        .replace("<ol>", "")
+        .replace("</ol>", "\n")
+        .replace("<li>", "- ")
+        .replace("</li>", "\n");
+    let without_tags = strip_html_tags(&normalized);
+    decode_basic_html_entities(&without_tags)
+}
+
+fn strip_html_tags(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_tag = false;
+    for ch in source.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_basic_html_entities(source: &str) -> String {
+    source
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn wrap_markdown_for_context_panel(text: &Text, width: u16) -> Text {
+    let width = usize::from(width);
+    if width == 0 {
+        return text.clone();
+    }
+
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let plain = line.to_plain_text();
+        let table_like = is_markdown_table_line(&plain) || is_markdown_table_like_line(&plain);
+        if table_like || line.width() <= width {
+            lines.push(line.clone());
+            continue;
+        }
+
+        for wrapped in line.wrap(width, WrapMode::Word) {
+            if wrapped.width() <= width {
+                lines.push(wrapped);
+            } else {
+                let mut wrapped_text = Text::from_lines([wrapped]);
+                wrapped_text.truncate(width, None);
+                lines.extend(wrapped_text.lines().iter().cloned());
+            }
+        }
+    }
+
+    Text::from_lines(lines)
+}
+
+fn is_markdown_table_line(plain: &str) -> bool {
+    plain.chars().any(|c| {
+        matches!(
+            c,
+            '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | '│' | '─'
+        )
+    })
+}
+
+fn is_markdown_table_like_line(plain: &str) -> bool {
+    let trimmed = plain.trim_start();
+    trimmed.starts_with('|') && trimmed.chars().filter(|&c| c == '|').count() >= 2
 }
 
 fn collect_search_query_terms(query: &str) -> Vec<String> {
@@ -11715,16 +12818,18 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        EmbedderAvailability, FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+        ContextPreviewFormat, EmbedderAvailability, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
+        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
         FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
         FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
         FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
         FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
         FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsIndexStatus, FsfsModelStatus,
         FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, InterfaceMode,
-        LiveIngestPipeline, SearchDashboardState, SearchExecutionMode, VectorIndexWriteAction,
-        VectorPipelineInput, VectorSchedulingTier, degradation_controller_config_for_profile,
-        render_status_table,
+        LiveIngestPipeline, SearchDashboardState, SearchExecutionMode, SemanticRecallDecisionInput,
+        VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
+        degradation_controller_config_for_profile, detect_context_preview_format,
+        is_likely_html_fragment, normalize_html_fragment_for_markdown, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -11972,6 +13077,40 @@ mod tests {
     }
 
     #[test]
+    fn context_preview_detection_identifies_markdown() {
+        let snippet = "# heading\n\n- [x] done\n`code`";
+        let detection = super::is_likely_markdown(snippet);
+        assert!(detection.is_likely());
+        assert_eq!(
+            detect_context_preview_format(snippet, detection),
+            ContextPreviewFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn context_preview_detection_prefers_html_over_markdown() {
+        let snippet = "<p><b>auth</b> middleware checks token</p>";
+        let detection = super::is_likely_markdown(snippet);
+        assert!(is_likely_html_fragment(snippet));
+        assert_eq!(
+            detect_context_preview_format(snippet, detection),
+            ContextPreviewFormat::Html
+        );
+    }
+
+    #[test]
+    fn normalize_html_fragment_for_markdown_maps_common_markup() {
+        let html =
+            "<p><b>Auth</b> &amp; <code>Token</code></p><ul><li>first</li><li>second</li></ul>";
+        let normalized = normalize_html_fragment_for_markdown(html);
+        assert!(normalized.contains("**Auth**"));
+        assert!(normalized.contains('&'));
+        assert!(normalized.contains("`Token`"));
+        assert!(normalized.contains("- first"));
+        assert!(normalized.contains("- second"));
+    }
+
+    #[test]
     fn tui_prefers_lexical_only_for_single_token_queries() {
         assert!(FsfsRuntime::tui_prefers_lexical_only_query("test"));
         assert!(FsfsRuntime::tui_prefers_lexical_only_query("rustfmt"));
@@ -12016,6 +13155,152 @@ mod tests {
         );
         assert!(decision.run_semantic);
         assert!(decision.expected_loss_run <= decision.expected_loss_skip);
+    }
+
+    #[test]
+    fn resolve_output_limit_preserves_explicit_limit() {
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(42, Some(1_000), Some(2_000)),
+            42
+        );
+    }
+
+    #[test]
+    fn resolve_output_limit_unbounded_uses_max_index_cardinality() {
+        assert_eq!(FsfsRuntime::resolve_output_limit(0, Some(7), Some(9)), 9);
+        assert_eq!(FsfsRuntime::resolve_output_limit(0, Some(11), Some(4)), 11);
+    }
+
+    #[test]
+    fn resolve_output_limit_unbounded_uses_vector_count_without_lexical() {
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(
+                FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                None,
+                Some(6_543),
+            ),
+            6_543
+        );
+    }
+
+    #[test]
+    fn resolve_output_limit_unbounded_defaults_to_one_when_no_index_available() {
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, None, None),
+            1
+        );
+    }
+
+    #[test]
+    fn should_force_full_semantic_recall_when_unbounded_requested() {
+        assert!(FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: true,
+                lexical_stage_enabled: true,
+                lexical_head_count: 24,
+                lexical_full_count: 5_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_force_full_semantic_recall_when_lexical_stage_disabled() {
+        assert!(FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 5_000,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: true,
+                lexical_stage_enabled: false,
+                lexical_head_count: 0,
+                lexical_full_count: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_force_full_semantic_recall_when_lexical_head_is_empty() {
+        assert!(FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 5_000,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: true,
+                lexical_stage_enabled: true,
+                lexical_head_count: 0,
+                lexical_full_count: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_not_force_full_semantic_recall_when_within_head_budget() {
+        assert!(!FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 800,
+                output_limit: 800,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: true,
+                lexical_stage_enabled: false,
+                lexical_head_count: 0,
+                lexical_full_count: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_not_force_full_semantic_recall_when_lexical_coverage_is_complete() {
+        assert!(!FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 5_000,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: true,
+                lexical_stage_enabled: true,
+                lexical_head_count: 24,
+                lexical_full_count: 5_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_not_force_full_semantic_recall_when_semantic_stage_disabled() {
+        assert!(!FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 5_000,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: false,
+                semantic_index_available: true,
+                lexical_stage_enabled: false,
+                lexical_head_count: 0,
+                lexical_full_count: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn should_not_force_full_semantic_recall_without_semantic_index() {
+        assert!(!FsfsRuntime::should_force_full_semantic_recall(
+            SemanticRecallDecisionInput {
+                requested_limit: 5_000,
+                output_limit: 5_000,
+                planning_limit: 1_000,
+                semantic_stage_enabled: true,
+                semantic_index_available: false,
+                lexical_stage_enabled: false,
+                lexical_head_count: 0,
+                lexical_full_count: 0,
+            }
+        ));
     }
 
     #[test]
@@ -12090,6 +13375,128 @@ mod tests {
             .map(|candidate| candidate.doc_id.as_str())
             .collect();
         assert_eq!(ordered_ids, vec!["src/head.rs", "src/tail.rs"]);
+    }
+
+    #[test]
+    fn merge_with_fallback_tail_preserves_refined_head_and_appends_remaining_tail() {
+        let refined_head = vec![
+            FusedCandidate {
+                doc_id: "doc-b".to_owned(),
+                fused_score: 0.95,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                lexical_score: None,
+                semantic_score: Some(0.95),
+                in_both_sources: false,
+            },
+            FusedCandidate {
+                doc_id: "doc-a".to_owned(),
+                fused_score: 0.90,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: Some(1),
+                lexical_score: Some(12.0),
+                semantic_score: Some(0.90),
+                in_both_sources: true,
+            },
+        ];
+        let fallback = vec![
+            FusedCandidate {
+                doc_id: "doc-a".to_owned(),
+                fused_score: 0.90,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: Some(1),
+                lexical_score: Some(12.0),
+                semantic_score: Some(0.90),
+                in_both_sources: true,
+            },
+            FusedCandidate {
+                doc_id: "doc-b".to_owned(),
+                fused_score: 0.85,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+                lexical_score: None,
+                semantic_score: Some(0.95),
+                in_both_sources: false,
+            },
+            FusedCandidate {
+                doc_id: "doc-c".to_owned(),
+                fused_score: 0.10,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(2),
+                lexical_score: None,
+                semantic_score: Some(0.10),
+                in_both_sources: false,
+            },
+            FusedCandidate {
+                doc_id: "doc-d".to_owned(),
+                fused_score: 0.05,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(3),
+                lexical_score: None,
+                semantic_score: Some(0.05),
+                in_both_sources: false,
+            },
+        ];
+
+        let merged = FsfsRuntime::merge_with_fallback_tail(&refined_head, &fallback, 10);
+        let ordered_ids: Vec<&str> = merged
+            .iter()
+            .map(|candidate| candidate.doc_id.as_str())
+            .collect();
+        assert_eq!(ordered_ids, vec!["doc-b", "doc-a", "doc-c", "doc-d"]);
+    }
+
+    #[test]
+    fn merge_with_fallback_tail_respects_output_limit() {
+        let refined_head = vec![
+            FusedCandidate {
+                doc_id: "doc-1".to_owned(),
+                fused_score: 1.0,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                lexical_score: Some(10.0),
+                semantic_score: Some(1.0),
+                in_both_sources: true,
+            },
+            FusedCandidate {
+                doc_id: "doc-2".to_owned(),
+                fused_score: 0.9,
+                prior_boost: 0.0,
+                lexical_rank: Some(1),
+                semantic_rank: Some(1),
+                lexical_score: Some(9.0),
+                semantic_score: Some(0.9),
+                in_both_sources: true,
+            },
+        ];
+        let fallback = vec![
+            refined_head[0].clone(),
+            refined_head[1].clone(),
+            FusedCandidate {
+                doc_id: "doc-3".to_owned(),
+                fused_score: 0.1,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: Some(2),
+                lexical_score: None,
+                semantic_score: Some(0.1),
+                in_both_sources: false,
+            },
+        ];
+
+        let merged = FsfsRuntime::merge_with_fallback_tail(&refined_head, &fallback, 2);
+        let ordered_ids: Vec<&str> = merged
+            .iter()
+            .map(|candidate| candidate.doc_id.as_str())
+            .collect();
+        assert_eq!(ordered_ids, vec!["doc-1", "doc-2"]);
     }
 
     #[test]
@@ -15133,5 +16540,82 @@ mod tests {
         assert!(snapshot.mb_per_second() > 0.0);
         assert!(snapshot.index_growth_bytes_per_second() > 0.0);
         assert!(snapshot.eta_seconds().is_some());
+    }
+
+    #[test]
+    fn search_execution_mode_parser_accepts_known_values() {
+        assert_eq!(
+            super::parse_search_execution_mode(None).unwrap(),
+            super::SearchExecutionMode::Full
+        );
+        assert_eq!(
+            super::parse_search_execution_mode(Some("full")).unwrap(),
+            super::SearchExecutionMode::Full
+        );
+        assert_eq!(
+            super::parse_search_execution_mode(Some("fast_only")).unwrap(),
+            super::SearchExecutionMode::FastOnly
+        );
+        assert_eq!(
+            super::parse_search_execution_mode(Some("lexical_only")).unwrap(),
+            super::SearchExecutionMode::LexicalOnly
+        );
+        let err = super::parse_search_execution_mode(Some("nope")).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("expected full|fast_only|lexical_only")
+        );
+    }
+
+    #[test]
+    fn search_payload_cache_roundtrip_and_invalidates_on_index_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        std::fs::create_dir_all(&index_root).expect("create index root");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            index_dir: Some(index_root.clone()),
+            filter: Some("ext:rs".to_owned()),
+            ..CliInput::default()
+        });
+        let key = runtime.search_cache_key("cache me", 25, super::SearchExecutionMode::Full);
+        let payloads = vec![SearchPayload::new(
+            "cache me",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "src/lib.rs".to_owned(),
+                score: 0.75,
+                snippet: Some("cached snippet".to_owned()),
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                in_both_sources: true,
+            }],
+        )];
+
+        runtime
+            .write_search_payload_cache(&key, &payloads)
+            .expect("write cache");
+        let cached = runtime
+            .try_load_search_payload_cache(&key)
+            .expect("read cache")
+            .expect("cache hit");
+        assert_eq!(cached, payloads);
+
+        let vector_dir = index_root.join("vector");
+        std::fs::create_dir_all(&vector_dir).expect("create vector dir");
+        std::fs::write(vector_dir.join("index.fsvi"), b"mutated").expect("touch vector index");
+
+        let stale = runtime
+            .try_load_search_payload_cache(&key)
+            .expect("cache read after mutation");
+        assert!(
+            stale.is_none(),
+            "cache should invalidate after index changes"
+        );
     }
 }

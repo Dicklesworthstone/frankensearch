@@ -137,12 +137,15 @@ pub enum CliCommand {
     Tui,
     /// Show version and build info.
     Version,
+    /// Run long-lived query server mode over stdin/stdout.
+    Serve,
 }
 
 impl CliCommand {
     /// All valid command names for help text.
     pub const ALL_NAMES: &'static [&'static str] = &[
         "search",
+        "serve",
         "index",
         "watch",
         "status",
@@ -193,6 +196,10 @@ pub struct CliInput {
     pub result_id: Option<String>,
     /// Filter expression (for search command).
     pub filter: Option<String>,
+    /// Route search requests through a long-lived daemon transport.
+    pub daemon: bool,
+    /// Optional daemon socket override (search/serve commands).
+    pub daemon_socket: Option<PathBuf>,
     /// Whether `--stream` was requested.
     pub stream: bool,
     /// Whether `--watch` was requested (for index command).
@@ -432,6 +439,29 @@ where
                 input.stream = true;
                 idx += 1;
             }
+            "--daemon" => {
+                if command != CliCommand::Search {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--daemon".into(),
+                        reason: "--daemon is only valid for the search command".into(),
+                    });
+                }
+                input.daemon = true;
+                idx += 1;
+            }
+            "--daemon-socket" => {
+                if !matches!(command, CliCommand::Search | CliCommand::Serve) {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--daemon-socket".into(),
+                        reason: "--daemon-socket is only valid for search or serve commands".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--daemon-socket")?;
+                input.daemon_socket = Some(PathBuf::from(value));
+                idx += 2;
+            }
             "--watch" => {
                 input.watch = true;
                 idx += 1;
@@ -668,6 +698,13 @@ fn validate_required_args(input: &CliInput) -> SearchResult<()> {
             reason: "use either --list or --verify, not both".into(),
         });
     }
+    if input.command == CliCommand::Search && input.stream && input.daemon {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.search.mode".into(),
+            value: "--stream --daemon".into(),
+            reason: "stream mode is not supported with daemon transport".into(),
+        });
+    }
     Ok(())
 }
 
@@ -715,6 +752,7 @@ fn extract_command(tokens: &[String]) -> SearchResult<(CliCommand, usize, Comman
 fn parse_command(token: &str) -> SearchResult<CliCommand> {
     match token {
         "search" | "s" => Ok(CliCommand::Search),
+        "serve" | "srv" => Ok(CliCommand::Serve),
         "index" | "idx" => Ok(CliCommand::Index),
         "watch" | "w" => Ok(CliCommand::Watch),
         "status" | "st" => Ok(CliCommand::Status),
@@ -851,6 +889,8 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--explain"
             | "-e"
             | "--stream"
+            | "--daemon"
+            | "--daemon-socket"
             | "--watch"
             | "--model"
             | "--list"
@@ -933,6 +973,10 @@ mod tests {
             CliCommand::Download
         );
         assert_eq!(
+            parse_cli_args(["serve"]).unwrap().command,
+            CliCommand::Serve
+        );
+        assert_eq!(
             parse_cli_args(["doctor"]).unwrap().command,
             CliCommand::Doctor
         );
@@ -966,6 +1010,7 @@ mod tests {
             parse_cli_args(["s", "q"]).unwrap().command,
             CliCommand::Search
         );
+        assert_eq!(parse_cli_args(["srv"]).unwrap().command, CliCommand::Serve);
         assert_eq!(parse_cli_args(["idx"]).unwrap().command, CliCommand::Index);
         assert_eq!(parse_cli_args(["w"]).unwrap().command, CliCommand::Watch);
         assert_eq!(parse_cli_args(["st"]).unwrap().command, CliCommand::Status);
@@ -1035,6 +1080,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_daemon_flags_for_search() {
+        let input = parse_cli_args([
+            "search",
+            "query",
+            "--daemon",
+            "--daemon-socket",
+            "/tmp/fsfs-query.sock",
+        ])
+        .unwrap();
+        assert!(input.daemon);
+        assert_eq!(
+            input.daemon_socket,
+            Some(PathBuf::from("/tmp/fsfs-query.sock"))
+        );
+    }
+
+    #[test]
     fn parse_stream_flag() {
         let input = parse_cli_args(["search", "test", "--stream"]).unwrap();
         assert!(input.stream);
@@ -1056,6 +1118,25 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("stream mode is only supported for the search command")
+        );
+    }
+
+    #[test]
+    fn parse_daemon_rejects_non_search_command() {
+        let err = parse_cli_args(["status", "--daemon"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("--daemon is only valid for the search command")
+        );
+    }
+
+    #[test]
+    fn parse_stream_and_daemon_together_rejected() {
+        let err =
+            parse_cli_args(["search", "query", "--stream", "--daemon"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("stream mode is not supported with daemon transport")
         );
     }
 
