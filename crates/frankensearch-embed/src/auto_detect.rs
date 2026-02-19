@@ -1530,7 +1530,7 @@ fn materialize_bundled_default_models(model_root: Option<&Path>) {
 }
 
 #[cfg(not(feature = "bundled-default-models"))]
-fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
+const fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
 
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
 fn manifest_files_exist(manifest: &ModelManifest, model_dir: &Path) -> bool {

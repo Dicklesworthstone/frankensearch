@@ -284,7 +284,7 @@ impl TwoTierIndex {
             // Fetch a few extra candidates to buffer against soft-deleted records.
             // This isn't perfect but helps maintain recall when tombstones exist.
             let fetch_k = k.saturating_add(10);
-            let mut hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
+            let hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
 
             // Filter soft-deleted records from ANN results and resolve real VectorIndex positions.
             // NOTE: hit.index from ANN is the compact HNSW d_id, NOT the VectorIndex position.

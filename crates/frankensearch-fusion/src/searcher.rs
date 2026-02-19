@@ -1147,29 +1147,33 @@ impl TwoTierSearcher {
             .collect();
         self.apply_score_calibration_to_hits(&mut fast_hits);
 
-        // Look up indices in the fast index for quality scoring.
-        let mut fast_indices = Vec::with_capacity(fast_hits.len());
+        // Look up indices once and keep doc_ids alongside them to avoid
+        // repeated doc_id table decoding during quality-hit reconstruction.
+        let mut indexed_fast_hits = Vec::with_capacity(fast_hits.len());
         for hit in &fast_hits {
             if let Some(index) = self.index.fast_index_for_doc_id(&hit.doc_id)? {
-                fast_indices.push(index);
+                indexed_fast_hits.push((index, hit.doc_id.clone()));
             }
         }
-        metrics.phase2_vectors_searched = fast_indices.len();
+        metrics.phase2_vectors_searched = indexed_fast_hits.len();
 
+        let fast_indices = indexed_fast_hits
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
         let quality_scores = self
             .index
             .quality_scores_for_indices(&quality_vec, &fast_indices)?;
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         // Build quality VectorHits for blending.
-        let mut quality_hits = Vec::with_capacity(fast_indices.len());
-        for (&idx, &score) in fast_indices.iter().zip(quality_scores.iter()) {
-            let doc_id = self.index.doc_id_at(idx)?.to_owned();
+        let mut quality_hits = Vec::with_capacity(indexed_fast_hits.len());
+        for ((idx, doc_id), &score) in indexed_fast_hits.iter().zip(quality_scores.iter()) {
             quality_hits.push(VectorHit {
                 #[allow(clippy::cast_possible_truncation)]
-                index: idx as u32,
+                index: *idx as u32,
                 score,
-                doc_id,
+                doc_id: doc_id.clone(),
             });
         }
         self.apply_score_calibration_to_hits(&mut quality_hits);
@@ -1317,16 +1321,18 @@ impl TwoTierSearcher {
             #[cfg(feature = "rerank")]
             {
                 let rerank_start = Instant::now();
-                if let Err(err) = frankensearch_rerank::pipeline::rerank_step(
-                    cx,
-                    reranker.as_ref(),
-                    query,
-                    &mut results,
-                    text_fn,
-                    k.min(100),
-                    5,
-                )
-                .await
+                let rerank_budget = k.min(results.len());
+                if rerank_budget > 0
+                    && let Err(err) = frankensearch_rerank::pipeline::rerank_step(
+                        cx,
+                        reranker.as_ref(),
+                        query,
+                        &mut results,
+                        text_fn,
+                        rerank_budget,
+                        5,
+                    )
+                    .await
                 {
                     self.export_error(&err);
                     return Err(err);

@@ -159,6 +159,28 @@ impl VectorIndex {
         }
         let chunk_size = parallel_chunk_size.max(1);
         let use_parallel = parallel_enabled && self.record_count() >= parallel_threshold;
+        let total_candidate_upper_bound =
+            self.record_count().saturating_add(self.wal_entries.len());
+
+        // Full-recall requests should avoid top-k heap churn.
+        // When the caller asks for all available candidates (`k >= total`),
+        // collect-and-sort is measurably faster than maintaining a size-k heap.
+        if filter.is_none() && limit >= total_candidate_upper_bound {
+            let mut winners = if has_main {
+                if use_parallel {
+                    self.scan_parallel_collect_all(query, chunk_size)?
+                } else {
+                    self.scan_range_collect_all(0, self.record_count(), query)?
+                }
+            } else {
+                Vec::new()
+            };
+            if has_wal {
+                self.scan_wal_collect_all(query, &mut winners)?;
+            }
+            winners.sort_by(compare_best_first);
+            return self.resolve_sorted_entries(winners);
+        }
 
         let mut heap = if has_main {
             if use_parallel {
@@ -216,33 +238,53 @@ impl VectorIndex {
         Ok(merge_partial_heaps(partial_heaps?, limit))
     }
 
-    fn scan_range_chunk(
+    fn scan_parallel_collect_all(
+        &self,
+        query: &[f32],
+        chunk_size: usize,
+    ) -> SearchResult<Vec<HeapEntry>> {
+        let chunk_count = self.record_count().div_ceil(chunk_size);
+        let partial: SearchResult<Vec<Vec<HeapEntry>>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_index| {
+                let start = chunk_index * chunk_size;
+                let end = (start + chunk_size).min(self.record_count());
+                self.scan_range_collect_all(start, end, query)
+            })
+            .collect();
+
+        let partial = partial?;
+        let total = partial.iter().map(std::vec::Vec::len).sum();
+        let mut merged = Vec::with_capacity(total);
+        for mut chunk in partial {
+            merged.append(&mut chunk);
+        }
+        Ok(merged)
+    }
+
+    fn scan_range_collect_all(
         &self,
         start: usize,
         end: usize,
         query: &[f32],
-        limit: usize,
-    ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+    ) -> SearchResult<Vec<HeapEntry>> {
+        let mut winners = Vec::with_capacity(end.saturating_sub(start));
         let dim = self.dimension();
 
         match self.quantization() {
             Quantization::F16 => {
                 let stride = dim * 2;
-                // Flags are at offset 14 in 16-byte record
                 let mut flags_offset = self.records_offset + start * 16 + 14;
                 let mut vector_offset = self.vectors_offset + start * stride;
 
                 for index in start..end {
-                    // Check flags directly from mapped memory
-                    // SAFETY: offset arithmetic is bounded by record_count checks in open()
                     let flags_bytes = &self.data[flags_offset..flags_offset + 2];
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
                     if (flags & 0x0001) == 0 {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                         let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
-                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        winners.push(HeapEntry::new(index, score));
                     }
 
                     flags_offset += 16;
@@ -261,7 +303,78 @@ impl VectorIndex {
                     if (flags & 0x0001) == 0 {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                         let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
-                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        winners.push(HeapEntry::new(index, score));
+                    }
+
+                    flags_offset += 16;
+                    vector_offset += stride;
+                }
+            }
+        }
+        Ok(winners)
+    }
+
+    fn scan_range_chunk(
+        &self,
+        start: usize,
+        end: usize,
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let dim = self.dimension();
+        let mut cutoff = f32::NEG_INFINITY;
+
+        match self.quantization() {
+            Quantization::F16 => {
+                let stride = dim * 2;
+                // Flags are at offset 14 in 16-byte record
+                let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut vector_offset = self.vectors_offset + start * stride;
+
+                for index in start..end {
+                    // Check flags directly from mapped memory
+                    // SAFETY: offset arithmetic is bounded by record_count checks in open()
+                    let flags_bytes = &self.data[flags_offset..flags_offset + 2];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) == 0 {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
+                        if heap.len() < limit || score_key(score) >= cutoff {
+                            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = score_key(worst.score);
+                            }
+                        }
+                    }
+
+                    flags_offset += 16;
+                    vector_offset += stride;
+                }
+            }
+            Quantization::F32 => {
+                let stride = dim * 4;
+                let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut vector_offset = self.vectors_offset + start * stride;
+
+                for index in start..end {
+                    let flags_bytes = &self.data[flags_offset..flags_offset + 2];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) == 0 {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
+                        if heap.len() < limit || score_key(score) >= cutoff {
+                            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = score_key(worst.score);
+                            }
+                        }
                     }
 
                     flags_offset += 16;
@@ -282,6 +395,7 @@ impl VectorIndex {
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         let dim = self.dimension();
+        let mut cutoff = f32::NEG_INFINITY;
 
         match self.quantization() {
             Quantization::F16 => {
@@ -321,7 +435,14 @@ impl VectorIndex {
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                         let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
-                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        if heap.len() < limit || score_key(score) >= cutoff {
+                            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = score_key(worst.score);
+                            }
+                        }
                     }
 
                     record_offset += 16;
@@ -365,7 +486,14 @@ impl VectorIndex {
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + stride];
                         let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
-                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        if heap.len() < limit || score_key(score) >= cutoff {
+                            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = score_key(worst.score);
+                            }
+                        }
                     }
 
                     record_offset += 16;
@@ -404,6 +532,22 @@ impl VectorIndex {
         Ok(())
     }
 
+    fn scan_wal_collect_all(
+        &self,
+        query: &[f32],
+        winners: &mut Vec<HeapEntry>,
+    ) -> SearchResult<()> {
+        winners.reserve(self.wal_entries.len());
+        for (idx, entry) in self.wal_entries.iter().enumerate() {
+            let score = dot_product_f32_f32(&entry.embedding, query)?;
+            if !score.is_finite() {
+                continue;
+            }
+            winners.push(HeapEntry::new(to_wal_index(idx), score));
+        }
+        Ok(())
+    }
+
     fn resolve_hits(&self, heap: BinaryHeap<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
         if heap.is_empty() {
             return Ok(Vec::new());
@@ -411,7 +555,10 @@ impl VectorIndex {
 
         let mut winners = heap.into_vec();
         winners.sort_by(compare_best_first);
+        self.resolve_sorted_entries(winners)
+    }
 
+    fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             if is_wal_index(winner.index) {
@@ -492,7 +639,7 @@ impl VectorIndex {
     }
 }
 
-const fn score_key(score: f32) -> f32 {
+pub(crate) const fn score_key(score: f32) -> f32 {
     if score.is_nan() {
         f32::NEG_INFINITY
     } else {
@@ -971,6 +1118,101 @@ mod tests {
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 20, None)
             .expect("search");
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn full_recall_collect_all_matches_heap_prefix_main_only() {
+        let path = temp_index_path("collect-all-main");
+        let mut rows = Vec::new();
+        for i in 0..80 {
+            let score = f32::from(u16::try_from(80 - i).expect("test index must fit in u16"));
+            rows.push((format!("doc-{i:03}"), vec![score, 0.0, 0.0, 0.0]));
+        }
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vec)| (doc_id.as_str(), vec.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let total = index.record_count();
+        let heap_limit = total.saturating_sub(7);
+
+        let collect_all = index
+            .search_top_k_internal(&query, total, None, 1, 8, true)
+            .expect("collect-all");
+        let heap_top = index
+            .search_top_k_internal(
+                &query,
+                heap_limit,
+                None,
+                usize::MAX,
+                PARALLEL_CHUNK_SIZE,
+                true,
+            )
+            .expect("heap-top");
+
+        assert_eq!(collect_all.len(), total);
+        assert_eq!(heap_top.len(), heap_limit);
+        for (heap_hit, full_hit) in heap_top.iter().zip(collect_all.iter()) {
+            assert_eq!(heap_hit.doc_id, full_hit.doc_id);
+            assert_eq!(heap_hit.index, full_hit.index);
+            assert!((heap_hit.score - full_hit.score).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn full_recall_collect_all_matches_heap_prefix_with_wal() {
+        let path = temp_index_path("collect-all-wal");
+        let mut rows = Vec::new();
+        for i in 0..48 {
+            let score = f32::from(u16::try_from(48 - i).expect("test index must fit in u16"));
+            rows.push((format!("doc-{i:03}"), vec![score, 0.0, 0.0, 0.0]));
+        }
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vec)| (doc_id.as_str(), vec.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let mut index = VectorIndex::open(&path).expect("open index");
+        index
+            .append_batch(&[
+                ("wal-top".to_owned(), vec![200.0, 0.0, 0.0, 0.0]),
+                ("wal-mid".to_owned(), vec![24.5, 0.0, 0.0, 0.0]),
+                ("wal-tail".to_owned(), vec![-1.0, 0.0, 0.0, 0.0]),
+            ])
+            .expect("append wal batch");
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let total = index
+            .record_count()
+            .saturating_add(index.wal_record_count());
+        let heap_limit = total.saturating_sub(5);
+
+        let collect_all = index
+            .search_top_k_internal(&query, total.saturating_add(10), None, 1, 8, true)
+            .expect("collect-all with wal");
+        let heap_top = index
+            .search_top_k_internal(
+                &query,
+                heap_limit,
+                None,
+                usize::MAX,
+                PARALLEL_CHUNK_SIZE,
+                true,
+            )
+            .expect("heap-top with wal");
+
+        assert_eq!(collect_all.len(), total);
+        assert_eq!(collect_all[0].doc_id, "wal-top");
+        assert_eq!(heap_top.len(), heap_limit);
+        for (heap_hit, full_hit) in heap_top.iter().zip(collect_all.iter()) {
+            assert_eq!(heap_hit.doc_id, full_hit.doc_id);
+            assert_eq!(heap_hit.index, full_hit.index);
+            assert!((heap_hit.score - full_hit.score).abs() < 1e-6);
+        }
     }
 
     #[test]
