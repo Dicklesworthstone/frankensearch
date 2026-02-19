@@ -439,6 +439,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             build_tool: cargo
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            build_tool: cargo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -515,8 +518,15 @@ jobs:
           TARGET_TRIPLE: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          binary_path="target/${TARGET_TRIPLE}/release/fsfs"
-          if [[ ! -x "${binary_path}" ]]; then
+          binary_name="fsfs"
+          archive_extension="tar.xz"
+          if [[ "${TARGET_TRIPLE}" == *"windows"* ]]; then
+            binary_name="fsfs.exe"
+            archive_extension="zip"
+          fi
+
+          binary_path="target/${TARGET_TRIPLE}/release/${binary_name}"
+          if [[ ! -f "${binary_path}" ]]; then
             echo "Expected binary not found: ${binary_path}" >&2
             exit 1
           fi
@@ -529,12 +539,32 @@ jobs:
 
           archive_base="fsfs-${TAG_NAME}-${TARGET_TRIPLE}"
           mkdir -p dist
-          cp "${binary_path}" dist/fsfs
-          tar -C dist -cJf "dist/${archive_base}.tar.xz" fsfs
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
+          cp "${binary_path}" "dist/${binary_name}"
+          if [[ "${archive_extension}" == "zip" ]]; then
+            if command -v zip >/dev/null 2>&1; then
+              (cd dist && zip -q "${archive_base}.zip" "${binary_name}")
+            elif command -v powershell.exe >/dev/null 2>&1; then
+              powershell.exe -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'dist/${binary_name}' -DestinationPath 'dist/${archive_base}.zip' -Force"
+            elif command -v pwsh >/dev/null 2>&1; then
+              pwsh -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'dist/${binary_name}' -DestinationPath 'dist/${archive_base}.zip' -Force"
+            else
+              echo "Neither zip nor PowerShell compression tooling is available." >&2
+              exit 1
+            fi
           else
-            shasum -a 256 "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
+            tar -C dist -cJf "dist/${archive_base}.tar.xz" "${binary_name}"
+          fi
+          archive_path="dist/${archive_base}.${archive_extension}"
+          installer_archive_path="dist/fsfs-${TARGET_TRIPLE}.${archive_extension}"
+          cp "${archive_path}" "${installer_archive_path}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive_path}" > "${archive_path}.sha256"
+            sha256sum "${installer_archive_path}" > "${installer_archive_path}.sha256"
+          else
+            shasum -a 256 "${archive_path}" > "${archive_path}.sha256"
+            shasum -a 256 "${installer_archive_path}" > "${installer_archive_path}.sha256"
           fi
 
           build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -543,12 +573,12 @@ jobs:
           {
             "tag": "${TAG_NAME}",
             "target": "${TARGET_TRIPLE}",
-            "binary": "fsfs",
+            "binary": "${binary_name}",
             "build_timestamp_utc": "${build_timestamp}",
             "rustc": "${rustc_version}"
           }
           EOF
-          rm -f dist/fsfs
+          rm -f "dist/${binary_name}"
 
       - name: Install cosign (optional signing)
         uses: sigstore/cosign-installer@v3.8.1
@@ -559,7 +589,8 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
-          for archive in dist/*.tar.xz; do
+          for archive in dist/*.tar.xz dist/*.zip; do
+            [[ -f "${archive}" ]] || continue
             cosign sign-blob --yes \
               --output-signature "${archive}.sig" \
               --output-certificate "${archive}.pem" \
