@@ -422,7 +422,7 @@ impl LiveSearchStreamScreen {
         format!("p95 heatstrip: {}", Self::sparkline(&values))
     }
 
-    fn severity_pills_line(&self) -> Line {
+    fn severity_pills_line(&self) -> Line<'_> {
         let mut spans = vec![
             Span::styled("severity:", self.palette.style_muted()),
             Span::raw(" "),

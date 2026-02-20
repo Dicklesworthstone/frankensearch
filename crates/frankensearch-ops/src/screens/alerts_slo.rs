@@ -847,7 +847,7 @@ impl AlertsSloScreen {
         format!("density: {}", Self::sparkline(&normalized))
     }
 
-    fn incident_badge_line(&self, alerts: &[AlertRow], project_rows: &[SloProjectRow]) -> Line {
+    fn incident_badge_line(&self, alerts: &[AlertRow], project_rows: &[SloProjectRow]) -> Line<'_> {
         let incident = if alerts
             .iter()
             .any(|alert| matches!(alert.severity, AlertSeverity::Critical))
@@ -880,7 +880,7 @@ impl AlertsSloScreen {
         ])
     }
 
-    fn severity_pills_line(&self) -> Line {
+    fn severity_pills_line(&self) -> Line<'_> {
         let mut spans = vec![
             Span::styled("filters:", self.palette.style_muted()),
             Span::raw(" "),

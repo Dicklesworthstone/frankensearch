@@ -893,7 +893,7 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
 
 fn parse_search_limit(value: &str) -> SearchResult<usize> {
     if value.eq_ignore_ascii_case("all") {
-        return Ok(0);
+        return Ok(usize::MAX);
     }
     parse_usize(value, "search.default_limit")
 }
@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn parse_limit_all_alias() {
         let input = parse_cli_args(["search", "query", "--limit", "all"]).unwrap();
-        assert_eq!(input.overrides.limit, Some(0));
+        assert_eq!(input.overrides.limit, Some(usize::MAX));
     }
 
     #[test]

@@ -25,6 +25,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self, Box<dyn Error>> {
         let options = TtySessionOptions {
             alternate_screen: true,
+            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()

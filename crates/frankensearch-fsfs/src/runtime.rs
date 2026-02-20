@@ -363,7 +363,7 @@ const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 5;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 1;
 const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
-const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = 0;
+const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = usize::MAX;
 // This controls fast-phase head breadth, not final output cardinality.
 const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
 // Progressive widening step (sqrt(output_limit - semantic_head_limit) * step).
@@ -5461,7 +5461,7 @@ impl FsfsRuntime {
         vector_doc_count: Option<usize>,
     ) -> usize {
         if requested_limit != FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
-            return requested_limit.max(1);
+            return requested_limit;
         }
         lexical_doc_count
             .unwrap_or(0)
@@ -9828,6 +9828,7 @@ impl FtuiSession {
     fn enter() -> SearchResult<Self> {
         let options = TtySessionOptions {
             alternate_screen: true,
+            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()
@@ -11622,7 +11623,7 @@ fn render_context_radar_markdown_text(
     preview_format: ContextPreviewFormat,
     no_color: bool,
     width: u16,
-) -> Text {
+) -> Text<'static> {
     let width = width.max(12);
     let markdown_source = if preview_format == ContextPreviewFormat::Html {
         normalize_html_fragment_for_markdown(source)
@@ -11633,7 +11634,7 @@ fn render_context_radar_markdown_text(
         .rule_width(width.min(42))
         .table_max_width(width)
         .render_streaming(&markdown_source);
-    wrap_markdown_for_context_panel(&rendered, width)
+    wrap_markdown_for_context_panel(rendered, width)
 }
 
 fn context_radar_markdown_theme(no_color: bool) -> MarkdownTheme {
@@ -11723,10 +11724,10 @@ fn decode_basic_html_entities(source: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn wrap_markdown_for_context_panel(text: &Text, width: u16) -> Text {
+fn wrap_markdown_for_context_panel(text: Text<'static>, width: u16) -> Text<'static> {
     let width = usize::from(width);
     if width == 0 {
-        return text.clone();
+        return text;
     }
 
     let mut lines = Vec::new();
@@ -13524,8 +13525,22 @@ mod tests {
 
     #[test]
     fn resolve_output_limit_unbounded_uses_max_index_cardinality() {
-        assert_eq!(FsfsRuntime::resolve_output_limit(0, Some(7), Some(9)), 9);
-        assert_eq!(FsfsRuntime::resolve_output_limit(0, Some(11), Some(4)), 11);
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(
+                FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                Some(7),
+                Some(9),
+            ),
+            9
+        );
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(
+                FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                Some(11),
+                Some(4),
+            ),
+            11
+        );
     }
 
     #[test]

@@ -848,7 +848,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_limit: 0,
+            default_limit: usize::MAX,
             quality_weight: 0.7,
             rrf_k: 60.0,
             quality_timeout_ms: 500,
@@ -1785,7 +1785,11 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
 
     if let Some(search) = patch.search {
         if let Some(default_limit) = search.default_limit {
-            config.search.default_limit = default_limit;
+            config.search.default_limit = if default_limit == 0 {
+                usize::MAX
+            } else {
+                default_limit
+            };
         }
         if let Some(quality_weight) = search.quality_weight {
             config.search.quality_weight = quality_weight;
@@ -1925,7 +1929,8 @@ fn apply_env_overrides(
         "FRANKENSEARCH_SEARCH_DEFAULT_LIMIT",
         "FSFS_SEARCH_DEFAULT_LIMIT",
     ) {
-        config.search.default_limit = parse_usize(value, "search.default_limit")?;
+        let parsed = parse_usize(value, "search.default_limit")?;
+        config.search.default_limit = if parsed == 0 { usize::MAX } else { parsed };
         keys_used.push(key.into());
     }
 
@@ -2398,7 +2403,7 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
         });
     }
 
-    if config.search.default_limit > 1_000_000 {
+    if config.search.default_limit > 1_000_000 && config.search.default_limit != usize::MAX {
         return Err(SearchError::InvalidConfig {
             field: "search.default_limit".into(),
             value: config.search.default_limit.to_string(),
@@ -3445,7 +3450,7 @@ mod tests {
         assert_eq!(result.config.discovery.roots, vec![".".to_string()]);
         assert!(!result.config.discovery.follow_symlinks);
         assert_eq!(result.config.storage.index_dir, ".frankensearch");
-        assert_eq!(result.config.search.default_limit, 0);
+        assert_eq!(result.config.search.default_limit, usize::MAX);
     }
 
     #[test]
@@ -4185,7 +4190,7 @@ mod tests {
         let config = super::FsfsConfig::default();
         assert_eq!(config.discovery.roots, vec![".".to_string()]);
         assert_eq!(config.indexing.fast_model, "potion-multilingual-128M");
-        assert_eq!(config.search.default_limit, 0);
+        assert_eq!(config.search.default_limit, usize::MAX);
         assert_eq!(config.pressure.profile, super::PressureProfile::Performance);
         assert_eq!(config.tui.theme, super::TuiTheme::Dark);
         assert_eq!(config.storage.index_dir, ".frankensearch");
@@ -4205,7 +4210,7 @@ mod tests {
     #[test]
     fn search_config_default_values() {
         let cfg = super::SearchConfig::default();
-        assert_eq!(cfg.default_limit, 0);
+        assert_eq!(cfg.default_limit, usize::MAX);
         assert!((cfg.quality_weight - 0.7).abs() < f64::EPSILON);
         assert!((cfg.rrf_k - 60.0).abs() < f64::EPSILON);
         assert_eq!(cfg.quality_timeout_ms, 500);
