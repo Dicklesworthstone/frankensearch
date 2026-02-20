@@ -20,7 +20,7 @@ members = [
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankensearch"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Internal crates
@@ -63,7 +63,7 @@ wide = "1.1.1"
 memmap2 = "0.9"
 
 # Embedder dependencies (feature-gated per crate)
-fastembed = "5.9.0"
+fastembed = "5.11.0"
 safetensors = "0.7.0"
 tokenizers = "0.22.2"
 

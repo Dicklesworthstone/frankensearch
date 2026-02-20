@@ -1170,14 +1170,13 @@ impl SearchInteractionState {
         self.results = results;
         self.list.set_total_items(self.results.len());
 
-        if let Some(selected_doc_id) = selected_doc_id {
-            if let Some(selected_index) = self
+        if let Some(selected_doc_id) = selected_doc_id
+            && let Some(selected_index) = self
                 .results
                 .iter()
                 .position(|entry| entry.doc_id == selected_doc_id)
-            {
-                self.list.select_index(selected_index);
-            }
+        {
+            self.list.select_index(selected_index);
         }
     }
 

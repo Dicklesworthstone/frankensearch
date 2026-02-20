@@ -224,13 +224,13 @@ impl CommandPalette {
 
     /// Number of registered actions.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.actions.len()
     }
 
     /// Whether the palette has no actions.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
 }

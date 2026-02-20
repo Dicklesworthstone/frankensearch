@@ -661,7 +661,7 @@ fn event_count_for_tick(
         WorkloadProfile::EmbeddingWave => 4_u64,
         WorkloadProfile::Restarting => 2_u64,
     };
-    let burst_bonus = if workload == WorkloadProfile::Burst && tick_index % 4 == 0 {
+    let burst_bonus = if workload == WorkloadProfile::Burst && tick_index.is_multiple_of(4) {
         8
     } else {
         0

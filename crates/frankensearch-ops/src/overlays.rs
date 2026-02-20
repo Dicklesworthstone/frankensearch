@@ -108,14 +108,14 @@ pub fn render_help_overlay(
     }
     let title = format!(" {} ", request.title);
     let items: Vec<ListItem> = entries
-        .iter()
+        .into_iter()
         .map(|e| {
             ListItem::new(Line::from_spans(vec![
                 Span::styled(
                     format!("{:<18}", e.key),
                     Style::new().fg(palette.accent).bold(),
                 ),
-                Span::styled(e.description.as_str(), Style::new().fg(palette.fg)),
+                Span::styled(e.description, Style::new().fg(palette.fg)),
             ]))
         })
         .collect();
@@ -142,7 +142,10 @@ pub fn render_alert_overlay(
 ) {
     let popup = centered_rect(50, 30, area);
 
-    let body_text = request.body.as_deref().unwrap_or("(no details)");
+    let body_text = request
+        .body
+        .clone()
+        .unwrap_or_else(|| "(no details)".to_owned());
 
     let title = format!(" {} ", request.title);
     let content = Paragraph::new(Line::from(Span::styled(
@@ -172,10 +175,10 @@ pub fn render_confirm_overlay(
 ) {
     let popup = centered_rect(50, 30, area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(body) = &request.body {
         lines.push(Line::from(Span::styled(
-            body.as_str(),
+            body.clone(),
             Style::new().fg(palette.fg),
         )));
         lines.push(Line::from(""));
@@ -273,7 +276,7 @@ pub fn render_palette_overlay(
                 Style::new().fg(sem.fg)
             };
 
-            let mut spans = vec![Span::styled(&action.label, style)];
+            let mut spans = vec![Span::styled(action.label.clone(), style)];
             if let Some(shortcut) = &action.shortcut {
                 spans.push(Span::styled(
                     format!("  ({shortcut})"),

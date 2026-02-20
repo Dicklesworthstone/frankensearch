@@ -827,7 +827,7 @@ pub struct FleetSnapshot {
 impl FleetSnapshot {
     /// Number of discovered instances.
     #[must_use]
-    pub fn instance_count(&self) -> usize {
+    pub const fn instance_count(&self) -> usize {
         self.instances.len()
     }
 

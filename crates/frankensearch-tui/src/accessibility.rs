@@ -113,7 +113,7 @@ impl FocusManager {
     }
 
     /// Move focus in the given direction.
-    pub fn move_focus(&mut self, direction: FocusDirection) {
+    pub const fn move_focus(&mut self, direction: FocusDirection) {
         if self.widgets.is_empty() {
             return;
         }
@@ -144,13 +144,13 @@ impl FocusManager {
 
     /// Number of focusable widgets.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.widgets.len()
     }
 
     /// Whether there are no focusable widgets.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.widgets.is_empty()
     }
 

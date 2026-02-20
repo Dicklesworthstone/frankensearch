@@ -9,6 +9,7 @@ mod tests {
             doc_id: doc_id.into(),
             score,
             source: ScoreSource::Lexical,
+            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: Some(score),

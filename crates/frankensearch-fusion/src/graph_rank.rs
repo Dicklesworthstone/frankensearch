@@ -61,6 +61,7 @@ impl GraphRanker {
                     doc_id,
                     score: score_f32,
                     source: ScoreSource::SemanticFast,
+                    index: None,
                     fast_score: Some(score_f32),
                     quality_score: None,
                     lexical_score: None,

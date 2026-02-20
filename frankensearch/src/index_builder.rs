@@ -294,7 +294,7 @@ impl IndexBuilder {
 
         #[cfg(feature = "durability")]
         {
-            if let Err(error) = Self::protect_durability_sidecars(&self.data_dir) {
+            if let Err(error) = protect_durability_sidecars(&self.data_dir) {
                 export_error(metrics_exporter.as_ref(), &error);
                 return Err(error);
             }

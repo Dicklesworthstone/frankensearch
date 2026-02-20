@@ -826,10 +826,10 @@ impl StorageBackedJobRunner {
         if self.fast_embedder.id() == embedder_id {
             return Ok(Arc::clone(&self.fast_embedder));
         }
-        if let Some(quality) = self.quality_embedder.as_ref() {
-            if quality.id() == embedder_id {
-                return Ok(Arc::clone(quality));
-            }
+        if let Some(quality) = self.quality_embedder.as_ref()
+            && quality.id() == embedder_id
+        {
+            return Ok(Arc::clone(quality));
         }
         Err(pipeline_error(format!(
             "no embedder configured for queued embedder_id {embedder_id:?}"

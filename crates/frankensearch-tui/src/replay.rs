@@ -181,13 +181,13 @@ impl ReplayRecorder {
 
     /// Number of recorded events.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.records.len()
     }
 
     /// Whether no events have been recorded.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
@@ -305,7 +305,7 @@ impl ReplayPlayer {
 
     /// Total number of events.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.records.len()
     }
 
@@ -317,7 +317,7 @@ impl ReplayPlayer {
 
     /// Whether playback is complete.
     #[must_use]
-    pub fn is_done(&self) -> bool {
+    pub const fn is_done(&self) -> bool {
         self.position >= self.records.len()
     }
 

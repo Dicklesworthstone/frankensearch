@@ -150,10 +150,8 @@ impl FrameBudget {
             timestamp: start,
         };
 
-        if is_jank {
-            if let Some(cb) = &self.jank_callback {
-                cb(&metrics);
-            }
+        if is_jank && let Some(cb) = &self.jank_callback {
+            cb(&metrics);
         }
 
         metrics

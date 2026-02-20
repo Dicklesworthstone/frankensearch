@@ -537,10 +537,10 @@ fn upsert_document_with_outcome(
     validate_document(doc)?;
 
     let existing_hash = fetch_content_hash(conn, &doc.doc_id)?;
-    if let Some(hash) = existing_hash {
-        if hash == doc.content_hash {
-            return Ok(UpsertOutcome::Unchanged);
-        }
+    if let Some(hash) = existing_hash
+        && hash == doc.content_hash
+    {
+        return Ok(UpsertOutcome::Unchanged);
     }
 
     upsert_document(conn, doc)?;

@@ -114,13 +114,13 @@ impl OverlayManager {
 
     /// Whether any overlay is active.
     #[must_use]
-    pub fn has_active(&self) -> bool {
+    pub const fn has_active(&self) -> bool {
         !self.stack.is_empty()
     }
 
     /// Number of active overlays.
     #[must_use]
-    pub fn depth(&self) -> usize {
+    pub const fn depth(&self) -> usize {
         self.stack.len()
     }
 }

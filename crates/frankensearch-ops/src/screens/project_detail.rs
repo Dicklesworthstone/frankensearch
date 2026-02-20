@@ -367,7 +367,7 @@ impl ProjectDetailScreen {
     fn phase_latency_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line> {
+    ) -> Vec<Line<'static>> {
         let mut weighted_count = 0_u64;
         let mut weighted_avg_sum = 0_u128;
         let mut weighted_p95_sum = 0_u128;
@@ -424,7 +424,7 @@ impl ProjectDetailScreen {
     fn anomaly_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line> {
+    ) -> Vec<Line<'static>> {
         let mut cards: Vec<(u32, String, String)> = Vec::new();
         for instance in instances {
             let mut score = 0_u32;
@@ -503,7 +503,7 @@ impl ProjectDetailScreen {
         lines
     }
 
-    fn summary_lines(&self) -> Vec<Line> {
+    fn summary_lines(&self) -> Vec<Line<'static>> {
         let Some(project) = self.selected_project() else {
             return vec![Line::from(
                 "No project selected. Press Enter on a fleet row to open Project Detail.",

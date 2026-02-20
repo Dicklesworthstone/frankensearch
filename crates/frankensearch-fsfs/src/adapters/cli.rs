@@ -549,11 +549,11 @@ where
                 }
                 input.update_rollback = true;
                 // Optional version argument (e.g. --rollback v0.1.0).
-                if let Some(next) = tokens.get(idx + 1) {
-                    if !next.starts_with('-') {
-                        input.update_rollback_version = Some(next.clone());
-                        idx += 1;
-                    }
+                if let Some(next) = tokens.get(idx + 1)
+                    && !next.starts_with('-')
+                {
+                    input.update_rollback_version = Some(next.clone());
+                    idx += 1;
                 }
                 idx += 1;
             }

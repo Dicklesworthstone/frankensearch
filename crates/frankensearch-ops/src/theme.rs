@@ -265,7 +265,7 @@ impl SemanticPalette {
     /// Base striped row style (alternates background for readability).
     #[must_use]
     pub fn style_row_base(&self, index: usize) -> Style {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             Style::new().fg(self.fg).bg(self.bg)
         } else {
             Style::new().fg(self.fg).bg(self.bg_surface)

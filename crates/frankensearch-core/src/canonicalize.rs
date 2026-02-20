@@ -685,10 +685,10 @@ mod tests {
         let canon = DefaultCanonicalizer::default();
         let input = "Check [link](url( unbalanced. Next sentence.";
         let result = canon.canonicalize(input);
-        assert!(result.contains("Next sentence"), "Should not swallow content");
         assert!(
-            result.contains("unbalanced"),
+            result.contains("Next sentence"),
             "Should not swallow content"
         );
+        assert!(result.contains("unbalanced"), "Should not swallow content");
     }
 }

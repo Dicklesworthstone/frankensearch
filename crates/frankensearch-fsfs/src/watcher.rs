@@ -1174,10 +1174,10 @@ impl PendingEvents {
         // BTreeMap remove is safe.
         for ts in timestamps_to_remove {
             // Check again if empty, because we might have added it multiple times
-            if let Some(paths) = self.by_time.get(&ts) {
-                if paths.is_empty() {
-                    self.by_time.remove(&ts);
-                }
+            if let Some(paths) = self.by_time.get(&ts)
+                && paths.is_empty()
+            {
+                self.by_time.remove(&ts);
             }
         }
 

@@ -306,7 +306,7 @@ pub struct KeyboardParityAudit {
 impl KeyboardParityAudit {
     /// Whether full keyboard parity is achieved (no uncovered actions).
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.uncovered.is_empty()
     }
 

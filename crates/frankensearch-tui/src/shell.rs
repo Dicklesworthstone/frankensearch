@@ -193,19 +193,19 @@ impl AppShell {
 
     /// Navigate to the next screen in tab order.
     pub fn next_screen(&mut self) {
-        if let Some(current) = &self.active_screen {
-            if let Some(next) = self.registry.next_screen(current).cloned() {
-                self.navigate_to(&next);
-            }
+        if let Some(current) = &self.active_screen
+            && let Some(next) = self.registry.next_screen(current).cloned()
+        {
+            self.navigate_to(&next);
         }
     }
 
     /// Navigate to the previous screen in tab order.
     pub fn prev_screen(&mut self) {
-        if let Some(current) = &self.active_screen {
-            if let Some(prev) = self.registry.prev_screen(current).cloned() {
-                self.navigate_to(&prev);
-            }
+        if let Some(current) = &self.active_screen
+            && let Some(prev) = self.registry.prev_screen(current).cloned()
+        {
+            self.navigate_to(&prev);
         }
     }
 
@@ -291,56 +291,55 @@ impl AppShell {
 
         // If an overlay is active, let it handle first.
         if self.overlays.has_active() {
-            if let InputEvent::Key(key, mods) = event {
-                if let Some(action) = self.keymap.resolve(*key, *mods) {
-                    if action == &KeyAction::Dismiss {
-                        self.overlays.dismiss();
-                        return false;
-                    }
-                }
+            if let InputEvent::Key(key, mods) = event
+                && let Some(action) = self.keymap.resolve(*key, *mods)
+                && action == &KeyAction::Dismiss
+            {
+                self.overlays.dismiss();
+                return false;
             }
             return false;
         }
 
         // Resolve key actions.
-        if let InputEvent::Key(key, mods) = event {
-            if let Some(action) = self.keymap.resolve(*key, *mods).cloned() {
-                match action {
-                    KeyAction::Quit => {
-                        self.should_quit = true;
-                        return true;
-                    }
-                    KeyAction::NextScreen => {
-                        self.next_screen();
-                        return false;
-                    }
-                    KeyAction::PrevScreen => {
-                        self.prev_screen();
-                        return false;
-                    }
-                    KeyAction::ToggleHelp => {
-                        if self
-                            .overlays
-                            .top()
-                            .is_some_and(|o| o.kind == crate::overlay::OverlayKind::Help)
-                        {
-                            self.overlays.dismiss();
-                        } else {
-                            self.overlays.push(self.build_help_overlay_request());
-                        }
-                        return false;
-                    }
-                    KeyAction::TogglePalette => {
-                        self.palette.toggle();
-                        return false;
-                    }
-                    KeyAction::CycleTheme => {
-                        self.config.theme = Theme::from_preset(self.config.theme.preset.next());
-                        self.cached_tabs.invalidate();
-                        return false;
-                    }
-                    _ => {}
+        if let InputEvent::Key(key, mods) = event
+            && let Some(action) = self.keymap.resolve(*key, *mods).cloned()
+        {
+            match action {
+                KeyAction::Quit => {
+                    self.should_quit = true;
+                    return true;
                 }
+                KeyAction::NextScreen => {
+                    self.next_screen();
+                    return false;
+                }
+                KeyAction::PrevScreen => {
+                    self.prev_screen();
+                    return false;
+                }
+                KeyAction::ToggleHelp => {
+                    if self
+                        .overlays
+                        .top()
+                        .is_some_and(|o| o.kind == crate::overlay::OverlayKind::Help)
+                    {
+                        self.overlays.dismiss();
+                    } else {
+                        self.overlays.push(self.build_help_overlay_request());
+                    }
+                    return false;
+                }
+                KeyAction::TogglePalette => {
+                    self.palette.toggle();
+                    return false;
+                }
+                KeyAction::CycleTheme => {
+                    self.config.theme = Theme::from_preset(self.config.theme.preset.next());
+                    self.cached_tabs.invalidate();
+                    return false;
+                }
+                _ => {}
             }
         }
 
@@ -537,7 +536,7 @@ impl AppShell {
 
             let status_spans = vec![
                 Span::styled(
-                    &self.status_line.left,
+                    self.status_line.left.clone(),
                     Style::new().fg(self.config.theme.status_bar_fg.to_color()),
                 ),
                 Span::styled(
@@ -547,7 +546,7 @@ impl AppShell {
                         .bold(),
                 ),
                 Span::styled(
-                    &self.status_line.right,
+                    self.status_line.right.clone(),
                     Style::new().fg(self.config.theme.status_bar_fg.to_color()),
                 ),
                 Span::raw(padding),

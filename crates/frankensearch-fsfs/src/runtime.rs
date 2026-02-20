@@ -3665,11 +3665,11 @@ impl FsfsRuntime {
             let verify = std::process::Command::new(&current_exe)
                 .arg("--version")
                 .output();
-            if let Ok(out) = verify {
-                if out.status.success() {
-                    let version_out = String::from_utf8_lossy(&out.stdout);
-                    notes.push(format!("verified: {}", version_out.trim()));
-                }
+            if let Ok(out) = verify
+                && out.status.success()
+            {
+                let version_out = String::from_utf8_lossy(&out.stdout);
+                notes.push(format!("verified: {}", version_out.trim()));
             }
         }
 
@@ -10235,7 +10235,7 @@ fn wait_for_ftui_dismiss(
                 .title(" fsfs ");
             let body = Paragraph::new(Text::from_lines(vec![
                 Line::from(Span::styled(
-                    message,
+                    message.to_owned(),
                     ui_fg(no_color, PackedRgba::rgb(224, 234, 255)),
                 )),
                 Line::from(""),
@@ -11622,7 +11622,7 @@ fn render_context_radar_markdown_text(
     preview_format: ContextPreviewFormat,
     no_color: bool,
     width: u16,
-) -> Text {
+) -> Text<'static> {
     let width = width.max(12);
     let markdown_source = if preview_format == ContextPreviewFormat::Html {
         normalize_html_fragment_for_markdown(source)
@@ -11723,7 +11723,7 @@ fn decode_basic_html_entities(source: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn wrap_markdown_for_context_panel(text: &Text, width: u16) -> Text {
+fn wrap_markdown_for_context_panel(text: &Text<'static>, width: u16) -> Text<'static> {
     let width = usize::from(width);
     if width == 0 {
         return text.clone();

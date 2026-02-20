@@ -4,7 +4,7 @@
 //! performs semantic embedding inference through `fastembed`.
 //!
 //! Supports multiple models via [`OnnxEmbedderConfig`]:
-//! - MiniLM (baseline, 384 dimensions)
+//! - `MiniLM` (baseline, 384 dimensions)
 //! - Snowflake Arctic Embed S (bake-off candidate, 384 dimensions)
 //! - Nomic Embed Text v1.5 (bake-off candidate, 768 dimensions)
 //!
@@ -150,11 +150,14 @@ impl FastEmbedEmbedder {
     /// Returns `SearchError::ModelNotFound` when required files are missing.
     /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
     pub fn load_with_name(model_dir: impl AsRef<Path>, name: &str) -> SearchResult<Self> {
-        Self::load_with_config(model_dir, OnnxEmbedderConfig {
-            embedder_id: name.to_owned(),
-            model_id: name.to_owned(),
-            ..OnnxEmbedderConfig::default()
-        })
+        Self::load_with_config(
+            model_dir,
+            OnnxEmbedderConfig {
+                embedder_id: name.to_owned(),
+                model_id: name.to_owned(),
+                ..OnnxEmbedderConfig::default()
+            },
+        )
     }
 
     /// Load an ONNX embedder with custom configuration.

@@ -105,10 +105,10 @@ fn resolve_db_path(raw: &str) -> PathBuf {
     if raw == ":memory:" {
         return PathBuf::from(raw);
     }
-    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(raw)
 }
@@ -175,14 +175,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let timeout = refresh_every.saturating_sub(last_refresh.elapsed());
 
-        if terminal.backend.poll_event(timeout)? {
-            if let Some(event) = terminal.backend.read_event()? {
-                if let Some(input) = map_event(&event) {
-                    let quit = app.handle_input(&input);
-                    if quit || app.should_quit() {
-                        break;
-                    }
-                }
+        if terminal.backend.poll_event(timeout)?
+            && let Some(event) = terminal.backend.read_event()?
+            && let Some(input) = map_event(&event)
+        {
+            let quit = app.handle_input(&input);
+            if quit || app.should_quit() {
+                break;
             }
         }
 

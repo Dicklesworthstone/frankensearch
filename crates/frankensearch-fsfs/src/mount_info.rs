@@ -160,7 +160,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Watch,
             stat_timeout: Duration::from_secs(5),
             max_concurrent_io: 64,
-            poll_interval: Duration::from_secs(5 * 60),
+            poll_interval: Duration::from_mins(5),
             enabled: true,
             available: true,
         }
@@ -173,7 +173,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Poll,
             stat_timeout: Duration::from_secs(2),
             max_concurrent_io: 8,
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Duration::from_mins(1),
             enabled: true,
             available: true,
         }
@@ -186,7 +186,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Poll,
             stat_timeout: Duration::from_secs(5),
             max_concurrent_io: 4,
-            poll_interval: Duration::from_secs(2 * 60),
+            poll_interval: Duration::from_mins(2),
             enabled: true,
             available: true,
         }
@@ -199,7 +199,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Poll,
             stat_timeout: Duration::from_secs(3),
             max_concurrent_io: 4,
-            poll_interval: Duration::from_secs(2 * 60),
+            poll_interval: Duration::from_mins(2),
             enabled: true,
             available: true,
         }
@@ -212,7 +212,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Poll,
             stat_timeout: Duration::from_secs(2),
             max_concurrent_io: 8,
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Duration::from_mins(1),
             enabled: true,
             available: true,
         }
@@ -225,7 +225,7 @@ impl MountPolicy {
             change_detection: ChangeDetectionStrategy::Static,
             stat_timeout: Duration::from_millis(500),
             max_concurrent_io: 1,
-            poll_interval: Duration::from_secs(3600),
+            poll_interval: Duration::from_hours(1),
             enabled: false,
             available: true,
         }

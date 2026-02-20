@@ -1377,7 +1377,13 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(feature = "model2vec")]
 fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> {
     let manifest = ModelManifest::potion_128m();
-    let discovered = find_model2vec_model_dir(POTION_MODEL_NAME, POTION_HF_ID);
+    // When an explicit model_root is provided, skip system-wide discovery
+    // to ensure test isolation and deterministic behavior.
+    let discovered = if model_root.is_some() {
+        None
+    } else {
+        find_model2vec_model_dir(POTION_MODEL_NAME, POTION_HF_ID)
+    };
     let candidates = candidate_directories(model_root, POTION_MODEL_NAME, discovered.as_deref());
     let checked_paths: Vec<String> = candidates
         .iter()
@@ -1438,7 +1444,13 @@ fn detect_fast_embedder(_model_root: Option<&Path>) -> Option<Arc<dyn Embedder>>
 #[cfg(feature = "fastembed")]
 fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> {
     let manifest = ModelManifest::minilm_v2();
-    let discovered = find_fastembed_model_dir(MINILM_MODEL_NAME, MINILM_HF_ID);
+    // When an explicit model_root is provided, skip system-wide discovery
+    // to ensure test isolation and deterministic behavior.
+    let discovered = if model_root.is_some() {
+        None
+    } else {
+        find_fastembed_model_dir(MINILM_MODEL_NAME, MINILM_HF_ID)
+    };
     let candidates = candidate_directories(model_root, MINILM_MODEL_NAME, discovered.as_deref());
     let checked_paths: Vec<String> = candidates
         .iter()
@@ -1573,7 +1585,7 @@ mod tests {
     use super::*;
     use frankensearch_core::traits::ModelCategory;
 
-    #[cfg(feature = "hash")]
+    #[cfg(all(feature = "hash", not(feature = "bundled-default-models")))]
     #[test]
     fn auto_detect_hash_only_when_no_models_present() {
         let temp = tempfile::tempdir().unwrap();
@@ -1600,7 +1612,11 @@ mod tests {
         assert!(stack.quality().is_none());
     }
 
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(
+        feature = "model2vec",
+        feature = "hash",
+        not(feature = "bundled-default-models")
+    ))]
     #[test]
     fn auto_detect_fast_only_when_model2vec_is_available() {
         let temp = tempfile::tempdir().unwrap();
@@ -1636,7 +1652,11 @@ mod tests {
         assert_eq!(stack.fast().id(), POTION_MODEL_NAME);
     }
 
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(
+        feature = "model2vec",
+        feature = "hash",
+        not(feature = "bundled-default-models")
+    ))]
     #[test]
     fn corrupted_model2vec_falls_back_to_hash() {
         let temp = tempfile::tempdir().unwrap();
@@ -1929,7 +1949,14 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("FRANKENSEARCH_MODEL_DIR"))
         );
+        #[cfg(not(feature = "bundled-default-models"))]
         assert!(diag.suggestions.iter().any(|s| s.contains("air-gapped")));
+        #[cfg(feature = "bundled-default-models")]
+        assert!(
+            diag.suggestions
+                .iter()
+                .any(|s| s.contains("download-models"))
+        );
     }
 
     #[cfg(feature = "hash")]

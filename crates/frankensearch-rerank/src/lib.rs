@@ -448,9 +448,11 @@ fn extract_scores_from_raw(
 
     match shape {
         // [batch, 1] — single logit per sample
-        [n, 1] if dim_eq(n) => Ok(data.to_vec()),
+        [n, 1] if dim_eq(n) && data.len() >= batch_size => Ok(data[..batch_size].to_vec()),
         // [batch, 2] — binary classification, take positive class (index 1)
-        [n, 2] if dim_eq(n) => Ok(data.chunks_exact(2).map(|pair| pair[1]).collect()),
+        [n, 2] if dim_eq(n) && data.len() == batch_size * 2 => {
+            Ok(data.chunks_exact(2).map(|pair| pair[1]).collect())
+        }
         // [batch] — flat logits
         [n] if dim_eq(n) => Ok(data.to_vec()),
         // [1, batch] — transposed single-row output

@@ -231,12 +231,11 @@ impl StorageBackedStaleness {
         }
 
         // Check index age if configured.
-        if let Some(max_age_secs) = self.config.max_index_age_secs {
-            if index_age > Duration::from_secs(max_age_secs)
-                && !reasons.contains(&StalenessReason::AgeExceeded)
-            {
-                reasons.push(StalenessReason::AgeExceeded);
-            }
+        if let Some(max_age_secs) = self.config.max_index_age_secs
+            && index_age > Duration::from_secs(max_age_secs)
+            && !reasons.contains(&StalenessReason::AgeExceeded)
+        {
+            reasons.push(StalenessReason::AgeExceeded);
         }
 
         // Determine severity level.
