@@ -56,6 +56,9 @@ target-codex*/
 # Compiler crash reports
 rustc-ice-*.txt
 
+# Destructive Command Guard local state
+.dcg/
+
 # Agent coordination config
 .agent-mail.yaml
 
