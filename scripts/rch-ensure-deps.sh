@@ -3,8 +3,8 @@
 #
 # When rch syncs frankensearch to a remote worker via rsync, it only syncs
 # the project directory itself. The workspace Cargo.toml references sibling
-# path dependencies (asupersync, frankensqlite, fast_cmaes) that don't exist
-# on workers by default.
+# path dependencies (asupersync, frankensqlite, fast_cmaes, frankentui)
+# that don't exist on workers by default.
 #
 # Local usage:
 #   scripts/rch-ensure-deps.sh              # Auto-detect and fix if needed
@@ -35,6 +35,9 @@ FRANKENSQLITE_REF="5c99eeb93d789c1309d5c46a540289369ff39535"
 
 FAST_CMAES_REPO="https://github.com/Dicklesworthstone/fast_cmaes.git"
 FAST_CMAES_REF="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+FRANKENTUI_REPO="https://github.com/Dicklesworthstone/frankentui.git"
+FRANKENTUI_REF="abbb39cd88277de40e88734e40a41a575935a863"
 
 RCH_REMOTE_DEPS_DIR="${RCH_REMOTE_DEPS_DIR:-/tmp/rch/frankensearch}"
 
@@ -174,6 +177,7 @@ run_local_bootstrap() {
         check_dep "${DEPS_DIR}/asupersync"    || missing=$((missing + 1))
         check_dep "${DEPS_DIR}/frankensqlite" || missing=$((missing + 1))
         check_dep "${DEPS_DIR}/fast_cmaes"    || missing=$((missing + 1))
+        check_dep "${DEPS_DIR}/frankentui"    || missing=$((missing + 1))
 
         if needs_path_rewrite; then
             echo "  NOTE: Cargo.toml files contain /data/projects/ paths that need rewriting"
@@ -193,6 +197,7 @@ run_local_bootstrap() {
         [[ -d "${DEPS_DIR}/asupersync" ]]    || all_present=false
         [[ -d "${DEPS_DIR}/frankensqlite" ]] || all_present=false
         [[ -d "${DEPS_DIR}/fast_cmaes" ]]    || all_present=false
+        [[ -d "${DEPS_DIR}/frankentui" ]]    || all_present=false
 
         if ${all_present} && ! needs_path_rewrite; then
             log_info "All sibling deps present and paths resolve. Nothing to do."
@@ -204,6 +209,7 @@ run_local_bootstrap() {
     clone_or_update "${ASUPERSYNC_REPO}"    "${DEPS_DIR}/asupersync"    "${ASUPERSYNC_REF}" "${mode}"
     clone_or_update "${FRANKENSQLITE_REPO}" "${DEPS_DIR}/frankensqlite" "${FRANKENSQLITE_REF}" "${mode}"
     clone_or_update "${FAST_CMAES_REPO}"    "${DEPS_DIR}/fast_cmaes"    "${FAST_CMAES_REF}" "${mode}"
+    clone_or_update "${FRANKENTUI_REPO}"    "${DEPS_DIR}/frankentui"    "${FRANKENTUI_REF}" "${mode}"
 
     if needs_path_rewrite; then
         rewrite_absolute_paths
@@ -236,7 +242,8 @@ bootstrap_remote_worker() {
         bash -s -- "${MODE}" "${RCH_REMOTE_DEPS_DIR}" \
         "${ASUPERSYNC_REPO}" "${ASUPERSYNC_REF}" \
         "${FRANKENSQLITE_REPO}" "${FRANKENSQLITE_REF}" \
-        "${FAST_CMAES_REPO}" "${FAST_CMAES_REF}" <<'EOF'
+        "${FAST_CMAES_REPO}" "${FAST_CMAES_REF}" \
+        "${FRANKENTUI_REPO}" "${FRANKENTUI_REF}" <<'EOF'
 set -euo pipefail
 
 mode="$1"
@@ -247,6 +254,8 @@ frankensqlite_repo="$5"
 frankensqlite_ref="$6"
 fast_cmaes_repo="$7"
 fast_cmaes_ref="$8"
+frankentui_repo="${9:-}"
+frankentui_ref="${10:-}"
 
 log()  { echo "[rch-deps][remote] $*"; }
 warn() { echo "[rch-deps][remote] WARNING: $*" >&2; }
@@ -295,6 +304,7 @@ if [[ "${mode}" == "--check" ]]; then
     check_dep_remote "${deps_dir}/asupersync" || missing=$((missing + 1))
     check_dep_remote "${deps_dir}/frankensqlite" || missing=$((missing + 1))
     check_dep_remote "${deps_dir}/fast_cmaes" || missing=$((missing + 1))
+    check_dep_remote "${deps_dir}/frankentui" || missing=$((missing + 1))
     if [[ "${missing}" -gt 0 ]]; then
         warn "${missing} issue(s) found"
         exit 1
@@ -307,6 +317,9 @@ log "Ensuring remote sibling dependencies in ${deps_dir}..."
 clone_or_update_remote "${asupersync_repo}" "${deps_dir}/asupersync" "${asupersync_ref}"
 clone_or_update_remote "${frankensqlite_repo}" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
 clone_or_update_remote "${fast_cmaes_repo}" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+if [[ -n "${frankentui_repo}" && -n "${frankentui_ref}" ]]; then
+    clone_or_update_remote "${frankentui_repo}" "${deps_dir}/frankentui" "${frankentui_ref}"
+fi
 log "Done."
 EOF
 }
