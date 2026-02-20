@@ -192,7 +192,7 @@ impl FleetOverviewScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn selected_monitor_lines(&self) -> Vec<Line<'static>> {
+    fn selected_monitor_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let Some(instance) = self.selected_instance() else {
             return vec![Line::from("No instance selected")];
@@ -546,7 +546,7 @@ impl FleetOverviewScreen {
             .render(area, frame);
     }
 
-    fn kpi_tile_lines(&self) -> Vec<Line<'static>> {
+    fn kpi_tile_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let visible = self.visible_instances();
         let visible_count = visible.len();
@@ -615,7 +615,7 @@ impl FleetOverviewScreen {
         ]
     }
 
-    fn status_sparkline_lines(&self) -> Vec<Line<'static>> {
+    fn status_sparkline_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let metrics = self.state.control_plane_metrics();
         let visible = self.visible_instances();
@@ -676,7 +676,7 @@ impl FleetOverviewScreen {
         ]
     }
 
-    fn project_summary_lines(&self) -> Vec<Line<'static>> {
+    fn project_summary_lines(&self) -> Vec<Line> {
         #[derive(Default)]
         struct ProjectAccumulator {
             instance_count: usize,
@@ -772,7 +772,7 @@ impl FleetOverviewScreen {
             .collect()
     }
 
-    fn pipeline_health_lines(&self) -> Vec<Line<'static>> {
+    fn pipeline_health_lines(&self) -> Vec<Line> {
         let metrics = self.state.control_plane_metrics();
         let health = self.state.control_plane_health();
         let (badge, phase, error_hint, recovery) = match health {
@@ -853,7 +853,7 @@ impl FleetOverviewScreen {
         }
     }
 
-    fn dashboard_signal_lines(&self) -> Vec<Line<'static>> {
+    fn dashboard_signal_lines(&self) -> Vec<Line> {
         let mut lines = Vec::new();
         lines.extend(self.selected_monitor_lines());
         lines.push(Line::from(self.fleet_pulse_strip_line()));

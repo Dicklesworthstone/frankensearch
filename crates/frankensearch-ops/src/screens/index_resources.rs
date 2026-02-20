@@ -307,7 +307,7 @@ impl IndexResourceScreen {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn summary_lines(&self, rows: &[MonitorRow]) -> Vec<Line<'static>> {
+    fn summary_lines(&self, rows: &[MonitorRow]) -> Vec<Line> {
         if rows.is_empty() {
             return vec![
                 Line::from("No rows for current project filter."),
@@ -447,7 +447,7 @@ impl IndexResourceScreen {
         )
     }
 
-    fn comparison_pills_line(&self) -> Line<'static> {
+    fn comparison_pills_line(&self) -> Line {
         let mut spans = vec![
             Span::styled("window:", self.palette.style_muted()),
             Span::raw(" "),

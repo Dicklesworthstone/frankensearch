@@ -34,10 +34,10 @@ FRANKENSQLITE_REPO="https://github.com/Dicklesworthstone/frankensqlite.git"
 FRANKENSQLITE_REF="5c99eeb93d789c1309d5c46a540289369ff39535"
 
 FAST_CMAES_REPO="https://github.com/Dicklesworthstone/fast_cmaes.git"
-FAST_CMAES_REF="17f633e2c24bdd0c358310949066e5922b9e17b5"
+FAST_CMAES_REF="9406d5ec9512767106c9639628e30902ef7eae32"
 
 FRANKENTUI_REPO="https://github.com/Dicklesworthstone/frankentui.git"
-FRANKENTUI_REF="abbb39cd88277de40e88734e40a41a575935a863"
+FRANKENTUI_REF="4f2803a7c99d4fc439f3503e93c69e9ca68f354c"
 
 RCH_REMOTE_DEPS_DIR="${RCH_REMOTE_DEPS_DIR:-/tmp/rch/frankensearch}"
 

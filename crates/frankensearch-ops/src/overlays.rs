@@ -175,7 +175,7 @@ pub fn render_confirm_overlay(
 ) {
     let popup = centered_rect(50, 30, area);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
     if let Some(body) = &request.body {
         lines.push(Line::from(Span::styled(
             body.clone(),
