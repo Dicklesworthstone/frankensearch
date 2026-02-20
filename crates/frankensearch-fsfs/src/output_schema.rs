@@ -1645,8 +1645,8 @@ mod tests {
         let out = output_error_from(&err);
         let context = out.context.unwrap();
         assert!(
-            context.contains("200MB"),
-            "context should mention download size: {context}"
+            context.contains("bundled"),
+            "context should mention bundled models: {context}"
         );
     }
 

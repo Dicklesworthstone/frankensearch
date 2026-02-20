@@ -15282,7 +15282,7 @@ mod tests {
             fs::create_dir_all(project.join("docs")).expect("create docs dir");
             fs::write(
                 project.join("src/auth.rs"),
-                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+                "/// Authentication middleware for validating bearer tokens.\npub fn authentication_middleware(token: &str) -> bool { !token.is_empty() }\n",
             )
             .expect("write auth source");
             fs::write(

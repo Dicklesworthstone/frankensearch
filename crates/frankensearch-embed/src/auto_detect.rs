@@ -1576,7 +1576,7 @@ fn candidate_directories(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(feature = "model2vec", feature = "hash", not(feature = "bundled-default-models")))]
     use std::fs;
 
     #[cfg(all(feature = "download", feature = "model2vec"))]
@@ -1760,7 +1760,7 @@ mod tests {
         assert_eq!(progress_percent_x100(&progress), 3_750);
     }
 
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(feature = "model2vec", feature = "hash", not(feature = "bundled-default-models")))]
     fn create_test_model2vec_layout(dir: &Path, vocab_size: usize, dimensions: usize) {
         let tokenizer_json = serde_json::json!({
             "version": "1.0",
@@ -1793,7 +1793,7 @@ mod tests {
         create_test_safetensors(dir, vocab_size, dimensions);
     }
 
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(feature = "model2vec", feature = "hash", not(feature = "bundled-default-models")))]
     fn create_test_vocab(vocab_size: usize) -> serde_json::Value {
         let mut vocab = serde_json::Map::new();
         vocab.insert("[UNK]".to_owned(), serde_json::Value::from(0));
@@ -2459,7 +2459,7 @@ mod tests {
 
     // ─── bd-1il3 tests end ───
 
-    #[cfg(all(feature = "model2vec", feature = "hash"))]
+    #[cfg(all(feature = "model2vec", feature = "hash", not(feature = "bundled-default-models")))]
     fn create_test_safetensors(dir: &Path, vocab_size: usize, dimensions: usize) {
         use std::collections::HashMap;
 
