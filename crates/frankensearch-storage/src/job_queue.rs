@@ -13,6 +13,7 @@ use crate::connection::{Storage, map_storage_error};
 
 const SUBSYSTEM: &str = "storage";
 const HASH_EMBEDDER_PREFIX: &str = "fnv1a-";
+const JL_EMBEDDER_PREFIX: &str = "jl-";
 const MAX_BACKOFF_EXPONENT: u32 = 20;
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 
@@ -959,7 +960,9 @@ fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
 }
 
 fn is_hash_embedder(embedder_id: &str) -> bool {
-    embedder_id.starts_with(HASH_EMBEDDER_PREFIX) || embedder_id == "hash/fnv1a"
+    embedder_id.starts_with(HASH_EMBEDDER_PREFIX)
+        || embedder_id.starts_with(JL_EMBEDDER_PREFIX)
+        || embedder_id == "hash/fnv1a"
 }
 
 fn compute_retry_delay_ms(base_delay_ms: u64, exponent: u32) -> u64 {
