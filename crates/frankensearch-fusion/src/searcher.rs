@@ -1929,8 +1929,6 @@ fn next_telemetry_identifier(prefix: &str) -> String {
     const TIMESTAMP_SHIFTS: [u32; 10] = [45, 40, 35, 30, 25, 20, 15, 10, 5, 0];
     const RANDOM_SHIFTS: [u32; 16] = [75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5, 0];
 
-    let _ = prefix;
-
     // ULID timestamp component is 48 bits of milliseconds since Unix epoch.
     let timestamp_ms = telemetry_timestamp_ms() & 0x0000_FFFF_FFFF_FFFF;
 
@@ -1948,7 +1946,12 @@ fn next_telemetry_identifier(prefix: &str) -> String {
         .iter()
         .fold(0_u128, |acc, byte| (acc << 8) | u128::from(*byte));
 
-    let mut id = String::with_capacity(26);
+    let mut id = String::with_capacity(prefix.len() + 1 + 26);
+    if !prefix.is_empty() {
+        id.push_str(prefix);
+        id.push('_');
+    }
+
     for shift in TIMESTAMP_SHIFTS {
         let index = usize::try_from((timestamp_ms >> shift) & 0x1F).unwrap_or_default();
         id.push(char::from(CROCKFORD_BASE32[index]));
@@ -2404,10 +2407,15 @@ mod tests {
     use super::*;
 
     fn is_valid_ulid_like(candidate: &str) -> bool {
-        if candidate.len() != 26 {
+        let ulid = if let Some((_, suffix)) = candidate.rsplit_once('_') {
+            suffix
+        } else {
+            candidate
+        };
+        if ulid.len() != 26 {
             return false;
         }
-        candidate.bytes().all(|byte| {
+        ulid.bytes().all(|byte| {
             matches!(
                 byte,
                 b'0'..=b'9'

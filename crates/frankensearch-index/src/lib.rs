@@ -258,8 +258,18 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        let (mut wal_entries, wal_compaction_gen, valid_len) =
+        let (wal_entries_raw, wal_compaction_gen, valid_len) =
             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+
+        let mut deduped_wal = Vec::with_capacity(wal_entries_raw.len());
+        let mut seen_ids = std::collections::HashSet::new();
+        for entry in wal_entries_raw.into_iter().rev() {
+            if seen_ids.insert(entry.doc_id.clone()) {
+                deduped_wal.push(entry);
+            }
+        }
+        deduped_wal.reverse();
+        let mut wal_entries = deduped_wal;
 
         let is_stale = if valid_len > 0 {
             if wal_compaction_gen == 0 {
@@ -696,6 +706,10 @@ impl VectorIndex {
             self.wal_config.fsync_on_write,
         )?;
 
+        // Deduplicate existing WAL entries by doc_id before extending.
+        for new_entry in &wal_entries {
+            self.wal_entries.retain(|existing| existing.doc_id != new_entry.doc_id);
+        }
         // Add to in-memory entries (immediately searchable).
         self.wal_entries.extend(wal_entries);
 
