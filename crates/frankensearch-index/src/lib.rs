@@ -767,8 +767,25 @@ impl VectorIndex {
             hash_a.cmp(&hash_b).then(id_a.cmp(id_b))
         });
 
+        // Deduplicate sources by doc_id, keeping the latest (WAL over Main).
+        // Since `sources` is sorted, duplicates are adjacent and the stable sort
+        // ensures that newer sources (WAL) appear after older sources (Main).
+        let mut deduped_sources = Vec::with_capacity(sources.len());
+        for source in sources {
+            if let Some(last) = deduped_sources.last() {
+                let (last_hash, last_id) = self.resolve_sort_key(last);
+                let (hash, id) = self.resolve_sort_key(&source);
+                if hash == last_hash && id == last_id {
+                    // Overwrite the older entry with the newer one
+                    *deduped_sources.last_mut().unwrap() = source;
+                    continue;
+                }
+            }
+            deduped_sources.push(source);
+        }
+
         // Perform the rewrite.
-        self.rewrite_index(&sources, next_generation(self.metadata.compaction_gen))?;
+        self.rewrite_index(&deduped_sources, next_generation(self.metadata.compaction_gen))?;
 
         // Remove WAL sidecar.
         let wal_path = wal::wal_path_for(&self.path);
@@ -827,7 +844,13 @@ impl VectorIndex {
                 reason: "record table size overflow".to_owned(),
             }
         })?;
-        let records_bytes_u64 = u64::try_from(records_bytes).unwrap(); // fits if usize fits
+        let records_bytes_u64 = u64::try_from(records_bytes).map_err(|_| {
+            SearchError::InvalidConfig {
+                field: "record_count".to_owned(),
+                value: record_count.to_string(),
+                reason: "record table size does not fit in u64".to_owned(),
+            }
+        })?;
 
         // Pass 1: Build Record Table and calculate layout.
         // We buffer the Record Table in memory (16 bytes * N).
@@ -877,7 +900,13 @@ impl VectorIndex {
             0,
         )?;
         let header_len = provisional_header.len() + 4; // + CRC
-        let header_len_u64 = u64::try_from(header_len).unwrap();
+        let header_len_u64 = u64::try_from(header_len).map_err(|_| {
+            SearchError::InvalidConfig {
+                field: "header".to_owned(),
+                value: header_len.to_string(),
+                reason: "header length does not fit in u64".to_owned(),
+            }
+        })?;
 
         let pre_vector = header_len_u64
             .checked_add(records_bytes_u64)

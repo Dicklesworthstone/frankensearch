@@ -525,6 +525,9 @@ impl TwoTierIndex {
     /// Whether the fast-tier document at `index` has a quality-tier vector.
     #[must_use]
     pub fn has_quality_for_index(&self, index: usize) -> bool {
+        if index >= self.doc_count() {
+            return false;
+        }
         match &self.quality_alignment {
             QualityAlignment::None => false,
 
@@ -549,6 +552,9 @@ impl TwoTierIndex {
 
         fast_idx: usize,
     ) -> SearchResult<Option<f32>> {
+        if fast_idx >= self.doc_count() {
+            return Ok(None);
+        }
         let quality_idx = match &self.quality_alignment {
             QualityAlignment::None => return Ok(None),
 

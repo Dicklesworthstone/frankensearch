@@ -492,23 +492,39 @@ impl FsWatcher {
         observed_at_ms: u64,
     ) -> Vec<WatchEvent> {
         let mut events = Vec::new();
-        let mut all_paths = BTreeSet::new();
-        all_paths.extend(previous.keys().cloned());
-        all_paths.extend(current.keys().cloned());
+        let mut prev_iter = previous.iter();
+        let mut curr_iter = current.iter();
+        let mut p_next = prev_iter.next();
+        let mut c_next = curr_iter.next();
 
-        for path in all_paths {
-            match (previous.get(&path), current.get(&path)) {
-                (None, Some(_)) => {
-                    events.push(WatchEvent::created(path, observed_at_ms, None));
+        while let (Some((p_path, p_time)), Some((c_path, c_time))) = (p_next, c_next) {
+            match p_path.cmp(c_path) {
+                std::cmp::Ordering::Less => {
+                    events.push(WatchEvent::deleted(p_path, observed_at_ms));
+                    p_next = prev_iter.next();
                 }
-                (Some(_), None) => {
-                    events.push(WatchEvent::deleted(path, observed_at_ms));
+                std::cmp::Ordering::Greater => {
+                    events.push(WatchEvent::created(c_path, observed_at_ms, None));
+                    c_next = curr_iter.next();
                 }
-                (Some(before), Some(after)) if before != after => {
-                    events.push(WatchEvent::modified(path, observed_at_ms, None));
+                std::cmp::Ordering::Equal => {
+                    if p_time != c_time {
+                        events.push(WatchEvent::modified(c_path, observed_at_ms, None));
+                    }
+                    p_next = prev_iter.next();
+                    c_next = curr_iter.next();
                 }
-                _ => {}
             }
+        }
+
+        while let Some((p_path, _)) = p_next {
+            events.push(WatchEvent::deleted(p_path, observed_at_ms));
+            p_next = prev_iter.next();
+        }
+
+        while let Some((c_path, _)) = c_next {
+            events.push(WatchEvent::created(c_path, observed_at_ms, None));
+            c_next = curr_iter.next();
         }
 
         events

@@ -125,13 +125,19 @@ pub fn mmr_rerank(
     let (min_score, max_score) = scores[..n]
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &s| {
-            (mn.min(s), mx.max(s))
+            if s.is_finite() {
+                (mn.min(s), mx.max(s))
+            } else {
+                (mn, mx)
+            }
         });
     let score_range = max_score - min_score;
     let norm_scores: Vec<f64> = scores[..n]
         .iter()
         .map(|&s| {
-            if score_range < f64::EPSILON {
+            if !s.is_finite() {
+                0.0 // fallback for non-finite scores
+            } else if score_range < f64::EPSILON {
                 1.0 // all scores equal
             } else {
                 (s - min_score) / score_range
@@ -143,11 +149,20 @@ pub fn mmr_rerank(
     let mut remaining: Vec<bool> = vec![true; n];
 
     // Select first document: pure relevance (highest score).
+    // Use `fold` instead of `max_by` to ensure we pick the *first* occurrence
+    // of the maximum score, preserving stable ordering for ties.
     let first = norm_scores[..n]
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map_or(0, |(i, _)| i);
+        .fold((0, f64::NEG_INFINITY), |(best_i, best_s), (i, &s)| {
+            // > ensures we only update if strictly greater, keeping the first max.
+            if s > best_s {
+                (i, s)
+            } else {
+                (best_i, best_s)
+            }
+        })
+        .0;
 
     selected.push(first);
     remaining[first] = false;

@@ -608,6 +608,16 @@ impl StorageBackedJobRunner {
                     }
                 }
             } else {
+                if doc.content_length > MAX_CONTENT_PREVIEW_CHARS {
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "process_batch",
+                        worker_id,
+                        doc_id = %job.doc_id,
+                        content_length = doc.content_length,
+                        "document has no source_path and exceeds preview length; embedding will be truncated"
+                    );
+                }
                 std::borrow::Cow::Borrowed(doc.content_preview.as_str())
             };
             let text = text_cow.as_ref();
