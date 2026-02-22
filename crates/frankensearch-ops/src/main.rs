@@ -40,9 +40,7 @@ const fn map_event(event: &Event) -> Option<InputEvent> {
         Event::Key(key) => Some(InputEvent::Key(key.code, key.modifiers)),
         Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse.kind, mouse.x, mouse.y)),
         Event::Resize { width, height } => Some(InputEvent::Resize(*width, *height)),
-        Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Tick => {
-            None
-        }
+        Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Tick => None,
     }
 }
 
