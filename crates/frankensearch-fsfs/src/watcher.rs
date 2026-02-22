@@ -407,9 +407,7 @@ impl FsWatcher {
                         Ok(()) => break,
                         Err(error) => {
                             worker_stats.add_error();
-                            worker_stats
-                                .worker_restarts
-                                .fetch_add(1, Ordering::Relaxed);
+                            worker_stats.worker_restarts.fetch_add(1, Ordering::Relaxed);
                             restarts = restarts.saturating_add(1);
                             if worker_context.stop_flag.load(Ordering::Acquire) {
                                 debug!(
@@ -426,9 +424,9 @@ impl FsWatcher {
                                 );
                                 break;
                             }
-                            let backoff_ms =
-                                MIN_BACKOFF_MS.saturating_mul(1_u64 << restarts.min(6))
-                                    .min(MAX_BACKOFF_MS);
+                            let backoff_ms = MIN_BACKOFF_MS
+                                .saturating_mul(1_u64 << restarts.min(6))
+                                .min(MAX_BACKOFF_MS);
                             warn!(
                                 error = %error,
                                 restart_attempt = restarts,
@@ -665,13 +663,10 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             if dropped > 0 {
                 events_were_dropped = true;
                 context.stats.add_skipped(dropped);
-                context
-                    .stats
-                    .events_dropped_pressure
-                    .fetch_add(
-                        u64::try_from(dropped).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
+                context.stats.events_dropped_pressure.fetch_add(
+                    u64::try_from(dropped).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 debug!(
                     dropped,
                     pressure_state = ?pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
@@ -818,7 +813,9 @@ fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option
     }
 
     let byte_len = event.byte_len.unwrap_or_else(|| {
-        std::fs::symlink_metadata(&event.path).map(|m| m.len()).unwrap_or(0)
+        std::fs::symlink_metadata(&event.path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     });
     let mut candidate =
         DiscoveryCandidate::new(&event.path, byte_len).with_symlink(event.is_symlink);
@@ -1086,7 +1083,8 @@ fn collect_snapshot_for_root(
             }
 
             if metadata.is_dir() {
-                let mut directory_candidate = DiscoveryCandidate::new(&path, 0).with_symlink(is_symlink);
+                let mut directory_candidate =
+                    DiscoveryCandidate::new(&path, 0).with_symlink(is_symlink);
                 if let Some(category) = lookup_mount_category(mount_table, &path) {
                     directory_candidate = directory_candidate.with_mount_category(category);
                 }

@@ -469,7 +469,8 @@ fn run_fsfs(args: &[&str], config_path: &Path) -> (String, String, i32) {
 
     let timeout_completed_index =
         command == "index" && stdout.contains("Discovered ") && stdout.contains("Indexed ");
-    let timeout_completed_search = command == "search" && stdout.contains('{') && stdout.contains("\"ok\"");
+    let timeout_completed_search =
+        command == "search" && stdout.contains('{') && stdout.contains("\"ok\"");
 
     let code = if timed_out && (timeout_completed_index || timeout_completed_search) {
         0

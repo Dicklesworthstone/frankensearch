@@ -314,9 +314,9 @@ const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
 const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
-const ROOT_PROBE_MAX_DEPTH: usize = 3;
-const ROOT_PROBE_MAX_ENTRIES_PER_DIR: usize = 2_048;
-const ROOT_PROBE_MAX_TOTAL_ENTRIES: usize = 50_000;
+const ROOT_PROBE_MAX_DEPTH: usize = 2;
+const ROOT_PROBE_MAX_ENTRIES_PER_DIR: usize = 512;
+const ROOT_PROBE_MAX_TOTAL_ENTRIES: usize = 10_000;
 const ROOT_PROBE_MAX_PROPOSALS: usize = 5;
 const INDEXING_TUI_MIN_RENDER_INTERVAL_MS: u64 = 120;
 const INDEXING_TUI_RATE_HISTORY_LIMIT: usize = 96;
@@ -7013,12 +7013,23 @@ impl FsfsRuntime {
 
     fn collect_model_statuses(&self) -> SearchResult<Vec<FsfsModelStatus>> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
-        if let Err(error) = ensure_default_semantic_models(Some(&model_root)) {
-            warn!(
-                model_root = %model_root.display(),
-                error = %error,
-                "failed to materialize bundled semantic models while collecting status"
-            );
+        info!(model_root = %model_root.display(), "materializing bundled semantic models");
+        match ensure_default_semantic_models(Some(&model_root)) {
+            Ok(summary) if summary.bytes_written > 0 => {
+                info!(
+                    models_written = summary.models_written,
+                    bytes_written = summary.bytes_written,
+                    "bundled semantic models materialized"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    model_root = %model_root.display(),
+                    error = %error,
+                    "failed to materialize bundled semantic models while collecting status"
+                );
+            }
+            _ => {}
         }
         Ok(vec![
             Self::collect_model_status("fast", &self.config.indexing.fast_model, &model_root)?,
@@ -7155,17 +7166,16 @@ impl FsfsRuntime {
         let mut deferred_semantic_file_keys: Vec<String> = Vec::new();
 
         // Helper to push a warning, keeping at most 8 recent entries
-        let push_warning =
-            |warnings: &mut Vec<IndexingWarning>, severity, message: String| {
-                warnings.push(IndexingWarning {
-                    severity,
-                    message,
-                    timestamp_ms: pressure_timestamp_ms(),
-                });
-                if warnings.len() > 8 {
-                    warnings.remove(0);
-                }
-            };
+        let push_warning = |warnings: &mut Vec<IndexingWarning>, severity, message: String| {
+            warnings.push(IndexingWarning {
+                severity,
+                message,
+                timestamp_ms: pressure_timestamp_ms(),
+            });
+            if warnings.len() > 8 {
+                warnings.remove(0);
+            }
+        };
 
         // make_snapshot closure captures mutable state via explicit params
         let make_snapshot = |stage: IndexingProgressStage,
@@ -7469,7 +7479,13 @@ impl FsfsRuntime {
                 }
                 processed_files = processed_files.saturating_add(1);
                 last_active_file = Some(candidate.file_path.display().to_string());
-                chunk_docs.push((candidate.ingestion_class, candidate.file_key.clone(), ingestion_class, canonical_bytes, doc));
+                chunk_docs.push((
+                    candidate.ingestion_class,
+                    candidate.file_key.clone(),
+                    ingestion_class,
+                    canonical_bytes,
+                    doc,
+                ));
             }
 
             // Lexical Indexing
@@ -7599,8 +7615,8 @@ impl FsfsRuntime {
                                 for (key, _) in &semantic_docs {
                                     deferred_semantic_file_keys.push(key.clone());
                                 }
-                                semantic_deferred_files = semantic_deferred_files
-                                    .saturating_add(semantic_docs.len());
+                                semantic_deferred_files =
+                                    semantic_deferred_files.saturating_add(semantic_docs.len());
                             }
                         }
                     }
@@ -8374,7 +8390,10 @@ impl FsfsRuntime {
             return Ok(());
         }
 
+        eprint!("Scanning for indexable directories...");
+        let _ = std::io::stderr().flush();
         let proposals = self.discover_index_root_proposals()?;
+        eprintln!(" found {} candidate(s).", proposals.len());
         let Some(selected_root) = self.prompt_first_run_index_root(&proposals)? else {
             println!("No indexing started. Run `fsfs index <path>` any time.");
             return Ok(());
@@ -10335,6 +10354,28 @@ fn is_probe_excluded_dir_name(name: &str) -> bool {
             | "build"
             | ".next"
             | ".frankensearch"
+            // macOS system/media dirs — large, never contain indexable code
+            | "library"
+            | "pictures"
+            | "movies"
+            | "music"
+            | "photos library.photoslibrary"
+            | ".trash"
+            | "applications"
+            | ".spotlight-v100"
+            | ".fseventsd"
+            | ".documentrevisions-v100"
+            // Windows system dirs
+            | "appdata"
+            | "windows"
+            | "program files"
+            | "program files (x86)"
+            // Common large non-code dirs
+            | ".local"
+            | ".rustup"
+            | ".bun"
+            | ".nvm"
+            | ".pyenv"
     )
 }
 
@@ -13069,10 +13110,7 @@ fn render_indexing_progress_screen(
         )
         .map_err(tui_io_error)?;
     }
-    let tip_msg = if matches!(
-        snapshot.stage,
-        IndexingProgressStage::CompletedDegraded
-    ) {
+    let tip_msg = if matches!(snapshot.stage, IndexingProgressStage::CompletedDegraded) {
         "Tip: semantic embeddings will be upgraded on next run. Re-run `fsfs index <path>` when model is available."
     } else {
         "Tip: Ctrl+C cancels safely. You can rerun with `fsfs index <path>` any time."
@@ -17715,10 +17753,7 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize checkpoint");
         assert_eq!(decoded, checkpoint);
         assert_eq!(decoded.files.len(), 2);
-        assert_eq!(
-            decoded.files["src/main.rs"].canonical_bytes,
-            1024
-        );
+        assert_eq!(decoded.files["src/main.rs"].canonical_bytes, 1024);
         assert!(!decoded.files["src/main.rs"].semantic_indexed);
         assert!(decoded.files["src/lib.rs"].semantic_indexed);
     }
@@ -17832,7 +17867,10 @@ mod tests {
             }],
         };
 
-        assert_eq!(snapshot.stage, super::IndexingProgressStage::CompletedDegraded);
+        assert_eq!(
+            snapshot.stage,
+            super::IndexingProgressStage::CompletedDegraded
+        );
         assert_eq!(snapshot.embedding_retries, 3);
         assert_eq!(snapshot.embedding_failures, 1);
         assert!(snapshot.embedder_degraded);
