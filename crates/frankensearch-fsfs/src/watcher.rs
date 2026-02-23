@@ -1169,7 +1169,7 @@ const fn pressure_state_from_code(code: u8) -> PressureState {
 #[derive(Default)]
 struct PendingEvents {
     by_path: HashMap<PathBuf, WatchEvent>,
-    by_time: BTreeMap<u64, HashSet<PathBuf>>,
+    by_time: BTreeMap<u64, BTreeSet<PathBuf>>,
 }
 
 impl PendingEvents {
