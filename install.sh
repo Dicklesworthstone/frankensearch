@@ -491,8 +491,15 @@ else
   echo -e "  \033[1;32m╭─────────────────────────────────────────╮\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[1;32m✓ Installation complete!\033[0m                 \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
-  echo -e "  \033[1;32m│\033[0m  Binary:  \033[1m$DEST/${BINARY_NAME}\033[0m"
-  echo -e "  \033[1;32m│\033[0m  Version: \033[1m${VERSION}\033[0m"
+  BINARY_LINE="  Binary:  $DEST/${BINARY_NAME}"
+  VERSION_LINE="  Version: ${VERSION}"
+  BOX_WIDTH=41
+  BPAD=$(( BOX_WIDTH - ${#BINARY_LINE} ))
+  VPAD=$(( BOX_WIDTH - ${#VERSION_LINE} ))
+  [ "$BPAD" -lt 1 ] && BPAD=1
+  [ "$VPAD" -lt 1 ] && VPAD=1
+  echo -e "  \033[1;32m│\033[0m  Binary:  \033[1m$DEST/${BINARY_NAME}\033[0m$(printf '%*s' "$BPAD" '')\033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  Version: \033[1m${VERSION}\033[0m$(printf '%*s' "$VPAD" '')\033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[1;36mQuick start:\033[0m                          \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs index /path/to/files\033[0m           \033[1;32m│\033[0m"

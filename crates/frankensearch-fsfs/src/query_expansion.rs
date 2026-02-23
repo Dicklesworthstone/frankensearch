@@ -190,7 +190,7 @@ fn make_agent() -> ureq::Agent {
 /// Call the Anthropic Messages API with Claude Haiku.
 fn call_anthropic(api_key: &str, prompt: &str) -> Result<String, String> {
     let body = serde_json::json!({
-        "model": "claude-haiku-4-20250514",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": MAX_EXPANSION_TOKENS,
         "messages": [
             {

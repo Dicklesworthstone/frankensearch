@@ -1851,13 +1851,11 @@ impl LiveIngestPipeline {
                     return Ok(true);
                 }
             }
+        } else if is_probably_binary(&bytes) {
+            self.prune_indexes(cx, &rel_key).await?;
+            Self::purge_storage_document(storage_ctx, &rel_key)?;
+            return Ok(true);
         } else {
-            if is_probably_binary(&bytes) {
-                self.prune_indexes(cx, &rel_key).await?;
-                Self::purge_storage_document(storage_ctx, &rel_key)?;
-                return Ok(true);
-            }
-
             let raw_text = String::from_utf8_lossy(&bytes);
             self.canonicalizer.canonicalize(&raw_text)
         };
@@ -4224,6 +4222,12 @@ impl FsfsRuntime {
         }
 
         let started = Instant::now();
+        if search_runtime.cli_input.expand && search_runtime.cli_input.daemon {
+            warn!(
+                "both --expand and --daemon were set; --expand takes precedence, --daemon is ignored"
+            );
+        }
+
         let payloads = if search_runtime.cli_input.expand {
             search_runtime
                 .execute_expanded_search(cx, query, limit)
@@ -5396,6 +5400,9 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        // NOTE: `expand_query` makes a blocking HTTP call via `ureq`. This is
+        // acceptable because the asupersync runtime is cooperative/single-threaded
+        // and all file/network I/O in this codebase is synchronous within async fns.
         let env_map: HashMap<String, String> = std::env::vars().collect();
         let expansion = query_expansion::expand_query(query, &env_map);
 
@@ -5416,7 +5423,7 @@ impl FsfsRuntime {
 
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
-        let expansion_limit = limit.saturating_mul(2).max(limit);
+        let expansion_limit = (limit.saturating_mul(2)).max(20);
         let mut all_payloads: Vec<SearchPayload> = Vec::new();
 
         for expanded in &expansion.queries {
@@ -7652,14 +7659,12 @@ impl FsfsRuntime {
                             continue;
                         }
                     }
+                } else if is_probably_binary(&bytes) {
+                    observed_reason_codes
+                        .insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
+                    content_skipped_files = content_skipped_files.saturating_add(1);
+                    continue;
                 } else {
-                    if is_probably_binary(&bytes) {
-                        observed_reason_codes
-                            .insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
-                        content_skipped_files = content_skipped_files.saturating_add(1);
-                        continue;
-                    }
-
                     let raw_text = String::from_utf8_lossy(&bytes);
                     canonicalizer.canonicalize(&raw_text)
                 };
@@ -13950,7 +13955,22 @@ fn is_pdf_file(path: &Path) -> bool {
 /// encrypted, corrupt, or extraction otherwise fails. Failures are logged
 /// at the `warn` level and the file is silently skipped.
 fn try_extract_pdf_text(bytes: &[u8], path: &Path) -> Option<String> {
-    match pdf_extract::extract_text_from_mem(bytes) {
+    // `pdf_extract` can panic on malformed PDFs; catch any panic so we
+    // degrade gracefully instead of aborting the whole indexing run.
+    let extraction = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
+
+    let result = match extraction {
+        Ok(inner) => inner,
+        Err(_panic) => {
+            warn!(
+                path = %path.display(),
+                "PDF text extraction panicked (malformed PDF?); skipping"
+            );
+            return None;
+        }
+    };
+
+    match result {
         Ok(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
