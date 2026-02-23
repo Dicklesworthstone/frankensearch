@@ -1419,6 +1419,31 @@ impl TwoTierSearcher {
             }
         }
 
+        if self.config.explain {
+            for (final_rank, result) in results.iter_mut().enumerate() {
+                if let Some(ref mut explanation) = result.explanation {
+                    if let Some(ref mut movement) = explanation.rank_movement {
+                        movement.refined_rank = final_rank;
+                        let refined_i64 = i64::try_from(final_rank).unwrap_or(i64::MAX);
+                        let initial_i64 = i64::try_from(movement.initial_rank).unwrap_or(i64::MAX);
+                        let delta_i64 = refined_i64.saturating_sub(initial_i64);
+                        movement.delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
+                            if delta_i64.is_negative() {
+                                i32::MIN
+                            } else {
+                                i32::MAX
+                            }
+                        });
+                        movement.reason = match movement.delta.cmp(&0) {
+                            std::cmp::Ordering::Less => "promoted".to_owned(),
+                            std::cmp::Ordering::Greater => "demoted".to_owned(),
+                            std::cmp::Ordering::Equal => "stable".to_owned(),
+                        };
+                    }
+                }
+            }
+        }
+
         Ok(results)
     }
 
