@@ -2392,7 +2392,11 @@ fn detect_target_triple() -> String {
 /// Build the download URL for a release asset.
 fn release_asset_url(tag: &str, triple: &str) -> String {
     let version = tag.strip_prefix('v').unwrap_or(tag);
-    let ext = if triple.contains("windows") { "zip" } else { "tar.xz" };
+    let ext = if triple.contains("windows") {
+        "zip"
+    } else {
+        "tar.xz"
+    };
     format!(
         "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{version}-{triple}.{ext}"
     )
@@ -2400,9 +2404,7 @@ fn release_asset_url(tag: &str, triple: &str) -> String {
 
 /// Build the download URL for the release-level SHA256SUMS file.
 fn release_checksum_url(tag: &str) -> String {
-    format!(
-        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/SHA256SUMS"
-    )
+    format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/SHA256SUMS")
 }
 
 /// Extract the expected SHA-256 hash for a given asset filename from a
@@ -3555,7 +3557,11 @@ impl FsfsRuntime {
         let asset_url = release_asset_url(&tag, &triple);
         let checksum_url = release_checksum_url(&tag);
         let version = tag.strip_prefix('v').unwrap_or(&tag);
-        let ext = if triple.contains("windows") { "zip" } else { "tar.xz" };
+        let ext = if triple.contains("windows") {
+            "zip"
+        } else {
+            "tar.xz"
+        };
         let asset_filename = format!("fsfs-{version}-{triple}.{ext}");
 
         let temp_dir = create_secure_update_temp_dir()?;
@@ -8436,7 +8442,9 @@ impl FsfsRuntime {
                 eprintln!("fsfs: search dashboard error: {error}");
                 eprintln!("hint: run `fsfs status` or `fsfs search <query>` as an alternative");
             } else if start.elapsed() < std::time::Duration::from_secs(2) {
-                eprintln!("fsfs: search dashboard exited. Run `fsfs search <query>` for CLI search.");
+                eprintln!(
+                    "fsfs: search dashboard exited. Run `fsfs search <query>` for CLI search."
+                );
             }
             return result;
         }
@@ -17077,16 +17085,14 @@ mod tests {
     #[test]
     fn extract_hash_from_sums_finds_matching_entry() {
         let sums = "abc123  fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\ndef456  fsfs-1.0.0-aarch64-apple-darwin.tar.xz\n";
-        let hash =
-            super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
+        let hash = super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
         assert_eq!(hash, Some("def456".to_owned()));
     }
 
     #[test]
     fn extract_hash_from_sums_returns_none_for_missing() {
         let sums = "abc123  fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\n";
-        let hash =
-            super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
+        let hash = super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
         assert_eq!(hash, None);
     }
 
