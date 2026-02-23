@@ -2391,15 +2391,8 @@ fn detect_target_triple() -> String {
 
 /// Build the download URL for a release asset.
 fn release_asset_url(tag: &str, triple: &str) -> String {
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    let ext = if triple.contains("windows") {
-        "zip"
-    } else {
-        "tar.xz"
-    };
-    format!(
-        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{version}-{triple}.{ext}"
-    )
+    let filename = release_asset_filename(tag, triple);
+    format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/{filename}")
 }
 
 /// Build the download URL for the release-level SHA256SUMS file.
@@ -2407,15 +2400,34 @@ fn release_checksum_url(tag: &str) -> String {
     format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/SHA256SUMS")
 }
 
+/// Construct the asset filename for a given version and target triple.
+fn release_asset_filename(tag: &str, triple: &str) -> String {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let ext = if triple.contains("windows") { "zip" } else { "tar.xz" };
+    format!("fsfs-{version}-{triple}.{ext}")
+}
+
 /// Extract the expected SHA-256 hash for a given asset filename from a
 /// SHA256SUMS-format file (each line: `<hash>  <filename>`).
+///
+/// Handles standard `sha256sum` output quirks: optional `./` prefix,
+/// optional binary-mode `*` prefix.
 fn extract_hash_from_sums(sums_content: &str, asset_filename: &str) -> Option<String> {
     for line in sums_content.lines() {
         let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
         if parts.len() == 2 {
             let hash = parts[0].trim();
             let name = parts[1].trim();
-            if name == asset_filename || name.ends_with(asset_filename) {
+            // Exact match.
+            if name == asset_filename {
+                return Some(hash.to_owned());
+            }
+            // Handle `./filename` (common sha256sum output) or `*filename` (binary mode).
+            let stripped = name
+                .strip_prefix("./")
+                .or_else(|| name.strip_prefix('*'))
+                .unwrap_or(name);
+            if stripped == asset_filename {
                 return Some(hash.to_owned());
             }
         }
@@ -3556,13 +3568,8 @@ impl FsfsRuntime {
         let triple = detect_target_triple();
         let asset_url = release_asset_url(&tag, &triple);
         let checksum_url = release_checksum_url(&tag);
-        let version = tag.strip_prefix('v').unwrap_or(&tag);
-        let ext = if triple.contains("windows") {
-            "zip"
-        } else {
-            "tar.xz"
-        };
-        let asset_filename = format!("fsfs-{version}-{triple}.{ext}");
+        let asset_filename = release_asset_filename(&tag, &triple);
+        let is_zip = triple.contains("windows");
 
         let temp_dir = create_secure_update_temp_dir()?;
 
@@ -3601,7 +3608,6 @@ impl FsfsRuntime {
             source: Box::new(e),
         })?;
 
-        let is_zip = ext == "zip";
         if !is_zip {
             validate_tar_archive_paths(&archive_path)?;
             let tar_status = std::process::Command::new("tar")
@@ -17094,6 +17100,34 @@ mod tests {
         let sums = "abc123  fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\n";
         let hash = super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
         assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn extract_hash_from_sums_handles_dot_slash_prefix() {
+        let sums = "abc123  ./fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\n";
+        let hash =
+            super::extract_hash_from_sums(sums, "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz");
+        assert_eq!(hash, Some("abc123".to_owned()));
+    }
+
+    #[test]
+    fn extract_hash_from_sums_rejects_suffix_only_match() {
+        let sums = "badhash  evil-fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\n";
+        let hash =
+            super::extract_hash_from_sums(sums, "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz");
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn release_asset_filename_includes_version_and_triple() {
+        assert_eq!(
+            super::release_asset_filename("v1.1.2", "x86_64-unknown-linux-musl"),
+            "fsfs-1.1.2-x86_64-unknown-linux-musl.tar.xz"
+        );
+        assert_eq!(
+            super::release_asset_filename("v1.1.2", "x86_64-pc-windows-msvc"),
+            "fsfs-1.1.2-x86_64-pc-windows-msvc.zip"
+        );
     }
 
     #[test]
