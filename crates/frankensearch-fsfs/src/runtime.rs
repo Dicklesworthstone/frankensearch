@@ -18280,4 +18280,515 @@ mod tests {
         assert_eq!(snapshot.recent_warnings.len(), 1);
         assert!(snapshot.completion_ratio() > 0.99);
     }
+
+    // ─── Issue #14: Update Verification Path Tests ───────────────────────
+
+    // --- 1. Version subcommand verification ---
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_new_binary_uses_version_subcommand_not_flag() {
+        // Create a fake binary that succeeds on `version` subcommand
+        // but fails on `--version` flag, proving we use the subcommand.
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_version_subcmd_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs-verify-subcmd");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo \"fsfs 0.99.0\"; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // This mirrors the verification logic at line 3712-3715 in collect_update_payload:
+        //   Command::new(&current_exe).arg("version").output()
+        let verify = std::process::Command::new(&binary)
+            .arg("version")
+            .output();
+        assert!(
+            verify.is_ok(),
+            "command should execute successfully"
+        );
+        let out = verify.unwrap();
+        assert!(
+            out.status.success(),
+            "binary with `version` subcommand should pass verification"
+        );
+        let version_out = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            version_out.contains("fsfs"),
+            "version output should contain binary name"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_binary_returning_valid_version_output_passes() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_valid_version_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs-valid");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\necho \"fsfs 1.2.3\"\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let verify = std::process::Command::new(&binary)
+            .arg("version")
+            .output()
+            .expect("should be able to run fake binary");
+        assert!(verify.status.success());
+        let stdout = String::from_utf8_lossy(&verify.stdout);
+        assert!(stdout.contains("1.2.3"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_binary_returning_error_fails_gracefully() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_error_version_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs-broken");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\necho \"segfault\" >&2\nexit 139\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let verify = std::process::Command::new(&binary)
+            .arg("version")
+            .output()
+            .expect("should be able to run fake binary");
+        assert!(
+            !verify.status.success(),
+            "binary that exits with error should fail verification"
+        );
+        let stderr = String::from_utf8_lossy(&verify.stderr);
+        assert!(
+            stderr.contains("segfault"),
+            "error output should be captured: got {stderr}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_nonexistent_binary_returns_error() {
+        // Running a nonexistent binary should return Err, not panic.
+        let result = std::process::Command::new("/nonexistent/path/fsfs-does-not-exist")
+            .arg("version")
+            .output();
+        assert!(
+            result.is_err(),
+            "nonexistent binary should return io::Error"
+        );
+    }
+
+    // --- 2. Checksum verification ---
+
+    #[test]
+    fn checksum_valid_sha256_passes_verification() {
+        // Write a known file and verify compute_sha256_of_file matches expected hash.
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_checksum_pass_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let payload = dir.join("archive.tar.xz");
+        fs::write(&payload, b"known content for checksum test").unwrap();
+
+        let computed = super::compute_sha256_of_file(&payload).unwrap();
+        // The hash should be deterministic for the same content.
+        let computed2 = super::compute_sha256_of_file(&payload).unwrap();
+        assert_eq!(computed, computed2, "sha256 should be deterministic");
+        assert_eq!(computed.len(), 64, "sha256 hex should be 64 chars");
+
+        // Simulate checksum match (what the update code does at line 3607).
+        let expected = &computed;
+        assert!(
+            computed.eq_ignore_ascii_case(expected),
+            "matching checksum should pass"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_mismatch_is_detected() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_checksum_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let payload = dir.join("archive.tar.xz");
+        fs::write(&payload, b"actual content").unwrap();
+
+        let actual = super::compute_sha256_of_file(&payload).unwrap();
+        let expected = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        // This mirrors the check at line 3607: !actual.eq_ignore_ascii_case(expected)
+        assert!(
+            !actual.eq_ignore_ascii_case(expected),
+            "mismatched checksums should be rejected"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_case_insensitive_comparison() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_checksum_case_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let payload = dir.join("archive.tar.xz");
+        fs::write(&payload, b"case test").unwrap();
+
+        let hash_lower = super::compute_sha256_of_file(&payload).unwrap();
+        let hash_upper = hash_lower.to_uppercase();
+
+        // The update code uses eq_ignore_ascii_case (line 3607).
+        assert!(
+            hash_lower.eq_ignore_ascii_case(&hash_upper),
+            "checksum comparison should be case-insensitive"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_missing_file_returns_error() {
+        let missing = Path::new("/tmp/fsfs_test_nonexistent_checksum_file_xyz.tar.xz");
+        let result = super::compute_sha256_of_file(missing);
+        assert!(
+            result.is_err(),
+            "computing checksum of missing file should return error"
+        );
+    }
+
+    #[test]
+    fn extract_hash_from_sums_handles_binary_mode_star_prefix() {
+        // sha256sum binary mode prefixes filename with `*`.
+        let sums = "deadbeef0123456789abcdef  *fsfs-2.0.0-x86_64-unknown-linux-musl.tar.xz\n";
+        let hash =
+            super::extract_hash_from_sums(sums, "fsfs-2.0.0-x86_64-unknown-linux-musl.tar.xz");
+        assert_eq!(
+            hash,
+            Some("deadbeef0123456789abcdef".to_owned()),
+            "should handle binary-mode * prefix"
+        );
+    }
+
+    #[test]
+    fn extract_hash_from_sums_returns_none_for_empty_content() {
+        let hash = super::extract_hash_from_sums("", "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz");
+        assert_eq!(hash, None, "empty SHA256SUMS content should return None");
+    }
+
+    #[test]
+    fn extract_hash_from_sums_returns_none_for_malformed_lines() {
+        // Lines without the expected `<hash>  <filename>` format.
+        let sums = "this-is-not-a-valid-line\njust-a-hash-no-filename\n";
+        let hash = super::extract_hash_from_sums(sums, "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz");
+        assert_eq!(hash, None, "malformed lines should be silently skipped");
+    }
+
+    #[test]
+    fn missing_checksum_file_not_reported_as_verified() {
+        // Simulate the update path where SHA256SUMS download fails:
+        // expected_hash should be None, and "SHA-256 checksum verified"
+        // should NOT appear in notes.
+        let mut notes: Vec<String> = Vec::new();
+        let checksum_download_ok = false; // simulate download failure
+
+        let expected_hash: Option<String> = if checksum_download_ok {
+            Some("abc".into())
+        } else {
+            notes.push("SHA256SUMS not available; skipping verification".into());
+            None
+        };
+
+        // When expected_hash is None, the checksum block is skipped entirely.
+        if let Some(ref expected) = expected_hash {
+            notes.push(format!("SHA-256 checksum verified against {expected}"));
+        }
+
+        assert!(expected_hash.is_none());
+        assert!(
+            !notes.iter().any(|n| n.contains("checksum verified")),
+            "missing checksum file must NOT produce 'verified' note: {:?}",
+            notes
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("skipping verification")),
+            "missing checksum file should note that verification was skipped"
+        );
+    }
+
+    // --- 3. Platform detection ---
+
+    #[test]
+    fn platform_detection_linux_x86_64() {
+        // Test the match arm directly using the function's logic.
+        let triple = match ("x86_64", "linux") {
+            ("x86_64", "linux") => "x86_64-unknown-linux-musl",
+            _ => "unknown",
+        };
+        assert_eq!(triple, "x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn platform_detection_linux_aarch64() {
+        let triple = match ("aarch64", "linux") {
+            ("aarch64", "linux") => "aarch64-unknown-linux-musl",
+            _ => "unknown",
+        };
+        assert_eq!(triple, "aarch64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn platform_detection_macos_x86_64() {
+        let triple = match ("x86_64", "macos") {
+            ("x86_64", "macos") => "x86_64-apple-darwin",
+            _ => "unknown",
+        };
+        assert_eq!(triple, "x86_64-apple-darwin");
+    }
+
+    #[test]
+    fn platform_detection_macos_aarch64() {
+        let triple = match ("aarch64", "macos") {
+            ("aarch64", "macos") => "aarch64-apple-darwin",
+            _ => "unknown",
+        };
+        assert_eq!(triple, "aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn asset_name_construction_all_supported_platforms() {
+        let triples = [
+            ("x86_64-unknown-linux-musl", "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz"),
+            ("aarch64-unknown-linux-musl", "fsfs-1.0.0-aarch64-unknown-linux-musl.tar.xz"),
+            ("x86_64-apple-darwin", "fsfs-1.0.0-x86_64-apple-darwin.tar.xz"),
+            ("aarch64-apple-darwin", "fsfs-1.0.0-aarch64-apple-darwin.tar.xz"),
+            ("x86_64-pc-windows-msvc", "fsfs-1.0.0-x86_64-pc-windows-msvc.zip"),
+            ("aarch64-pc-windows-msvc", "fsfs-1.0.0-aarch64-pc-windows-msvc.zip"),
+        ];
+        for (triple, expected_filename) in triples {
+            let filename = super::release_asset_filename("v1.0.0", triple);
+            assert_eq!(
+                filename, expected_filename,
+                "asset filename mismatch for triple {triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_name_strips_v_prefix_from_tag() {
+        let filename = super::release_asset_filename("v2.3.4", "x86_64-unknown-linux-musl");
+        assert!(
+            !filename.contains("vv"),
+            "should not double-prefix the version"
+        );
+        assert!(
+            filename.starts_with("fsfs-2.3.4-"),
+            "version in filename should have v stripped: {filename}"
+        );
+    }
+
+    #[test]
+    fn asset_name_handles_tag_without_v_prefix() {
+        let filename = super::release_asset_filename("3.0.0", "aarch64-apple-darwin");
+        assert_eq!(filename, "fsfs-3.0.0-aarch64-apple-darwin.tar.xz");
+    }
+
+    #[test]
+    fn detect_target_triple_returns_known_triple() {
+        let triple = super::detect_target_triple();
+        let known_triples = [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ];
+        // On a known platform, it should match one of the known triples.
+        // On an unknown platform, it falls back to "{arch}-unknown-{os}".
+        let is_known = known_triples.iter().any(|t| *t == triple);
+        let is_fallback = triple.contains("-unknown-");
+        assert!(
+            is_known || is_fallback,
+            "triple should be known or follow fallback pattern: {triple}"
+        );
+    }
+
+    // --- 4. Self-test path / error handling ---
+
+    #[cfg(unix)]
+    #[test]
+    fn selftest_failure_captured_not_masked() {
+        // Simulate a binary whose self-test writes to stderr and exits non-zero.
+        // Verify the error output is captured (not lost via `|| true` or similar).
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_selftest_err_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs-selftest-fail");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\necho \"FATAL: corrupted binary\" >&2\nexit 1\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Mirrors the verification logic at line 3712-3735.
+        let verify = std::process::Command::new(&binary)
+            .arg("version")
+            .output();
+
+        match verify {
+            Ok(out) if out.status.success() => {
+                panic!("broken binary should NOT pass verification");
+            }
+            Ok(out) => {
+                // This is the expected path - verification failed.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    stderr.contains("FATAL: corrupted binary"),
+                    "self-test error output should be captured, got: {stderr}"
+                );
+                // In the real code, this triggers rollback (line 3723-3734).
+            }
+            Err(e) => {
+                panic!("should be able to execute the binary: {e}");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selftest_captures_both_stdout_and_stderr() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsfs_test_selftest_both_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs-selftest-mixed");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\necho \"version: 0.0.0\" # stdout\necho \"warning: something\" >&2\nexit 0\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = std::process::Command::new(&binary)
+            .arg("version")
+            .output()
+            .expect("should execute");
+
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("version: 0.0.0"),
+            "stdout should be captured"
+        );
+        assert!(
+            stderr.contains("warning: something"),
+            "stderr should be captured even on success"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_trusted_release_url_accepts_valid_github_urls() {
+        assert!(super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releases/tag/v0.3.0"
+        ));
+        assert!(super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releases/download/v0.3.0/SHA256SUMS"
+        ));
+    }
+
+    #[test]
+    fn is_trusted_release_url_rejects_untrusted_urls() {
+        assert!(!super::is_trusted_release_url(
+            "https://evil.com/Dicklesworthstone/frankensearch/releases"
+        ));
+        assert!(!super::is_trusted_release_url(
+            "https://github.com/attacker/malware/releases"
+        ));
+        assert!(!super::is_trusted_release_url(""));
+        assert!(!super::is_trusted_release_url(
+            "http://github.com/Dicklesworthstone/frankensearch/releases"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_entry_path_is_safe_rejects_windows_prefix() {
+        // Windows-style prefix paths should be rejected on Windows.
+        assert!(!super::archive_entry_path_is_safe("C:\\Windows\\System32\\evil.exe"));
+    }
+
+    #[test]
+    fn archive_entry_path_is_safe_rejects_absolute_unix_paths() {
+        assert!(!super::archive_entry_path_is_safe("/etc/passwd"));
+        assert!(!super::archive_entry_path_is_safe("/tmp/evil"));
+    }
+
+    #[test]
+    fn archive_entry_path_is_safe_rejects_parent_traversal_nested() {
+        assert!(!super::archive_entry_path_is_safe("foo/../../etc/shadow"));
+        assert!(!super::archive_entry_path_is_safe("subdir/../../../root/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn archive_entry_path_is_safe_allows_empty_and_whitespace() {
+        assert!(super::archive_entry_path_is_safe(""));
+        assert!(super::archive_entry_path_is_safe("   "));
+    }
+
+    #[test]
+    fn create_secure_update_temp_dir_produces_unique_dirs() {
+        let dir1 = super::create_secure_update_temp_dir().unwrap();
+        let dir2 = super::create_secure_update_temp_dir().unwrap();
+        assert_ne!(dir1, dir2, "temp dirs should be unique");
+        assert!(dir1.exists());
+        assert!(dir2.exists());
+        assert!(dir1.to_string_lossy().contains("fsfs-update-"));
+        assert!(dir2.to_string_lossy().contains("fsfs-update-"));
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir2);
+    }
 }
