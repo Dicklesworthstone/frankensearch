@@ -151,6 +151,7 @@ Common environment variables:
 
 | Variable | Purpose | Example |
 |---|---|---|
+| `FRANKENSEARCH_INDEX_DIR` | Override index/data directory | `~/.local/share/frankensearch` |
 | `FRANKENSEARCH_MODEL_DIR` | Override model location | `~/.cache/frankensearch/models` |
 | `FRANKENSEARCH_FAST_ONLY` | Skip quality refinement | `true` |
 | `FRANKENSEARCH_QUALITY_WEIGHT` | Blend quality vs fast tier | `0.7` |
