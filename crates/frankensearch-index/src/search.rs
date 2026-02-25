@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
