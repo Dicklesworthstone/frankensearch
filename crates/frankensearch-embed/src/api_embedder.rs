@@ -3,6 +3,7 @@
 //! Wraps any [`super::api_provider::ApiProvider`] with HTTP transport, retry
 //! logic, rate limiting, and L2 normalization. Gated behind the `api` feature.
 
+use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -86,7 +87,9 @@ impl RateLimiter {
             state.tokens -= 1.0;
             None
         } else {
-            let wait_secs = (1.0 - state.tokens) / (self.requests_per_minute as f64 / 60.0);
+            let deficit = 1.0 - state.tokens;
+            state.tokens = 0.0; // consume all partial tokens
+            let wait_secs = deficit / (self.requests_per_minute as f64 / 60.0);
             Some(Duration::from_secs_f64(wait_secs))
         }
     }
@@ -113,8 +116,6 @@ impl fmt::Debug for ApiEmbedder {
             .finish()
     }
 }
-
-use std::fmt;
 
 impl ApiEmbedder {
     /// Create a new API embedder with the given provider and configuration.

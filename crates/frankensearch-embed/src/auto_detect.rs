@@ -1548,15 +1548,22 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
                     _ => Box::new(GeminiProvider::text_embedding_004(key)),
                 }
             }
-            Some("openai") | None => {
-                let key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())?;
-
-                // If we got a Gemini key but no explicit provider, use Gemini.
-                if std::env::var("OPENAI_API_KEY").is_err() {
-                    Box::new(GeminiProvider::text_embedding_004(key))
-                } else {
+            Some("openai") => {
+                // Explicit OpenAI — require OPENAI_API_KEY.
+                let key = std::env::var("OPENAI_API_KEY").ok()?;
+                match explicit_model.as_deref() {
+                    Some("text-embedding-3-large") => {
+                        Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
+                    }
+                    _ => {
+                        Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim))
+                    }
+                }
+            }
+            None => {
+                // Auto-detect: prefer OpenAI if OPENAI_API_KEY is set,
+                // otherwise fall back to Gemini if GEMINI_API_KEY is set.
+                if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                     match explicit_model.as_deref() {
                         Some("text-embedding-3-large") => {
                             Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
@@ -1565,6 +1572,13 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
                             Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim))
                         }
                     }
+                } else if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+                    match explicit_model.as_deref() {
+                        Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
+                        _ => Box::new(GeminiProvider::text_embedding_004(key)),
+                    }
+                } else {
+                    return None;
                 }
             }
             Some(other) => {
