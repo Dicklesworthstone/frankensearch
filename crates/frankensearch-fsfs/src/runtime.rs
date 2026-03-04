@@ -10730,6 +10730,20 @@ fn print_cli_help() {
     println!("  help                      Show this help");
     println!("  version                   Show version");
     println!();
+    println!("Index Management:");
+    println!(
+        "  append-batch [--file <path>]             Append documents to index via WAL (aliases: append, ab)"
+    );
+    println!(
+        "  delete <id>... [--prefix]                Soft-delete documents by ID or prefix (alias: del)"
+    );
+    println!(
+        "  compact                                  Merge WAL into main index and vacuum tombstones"
+    );
+    println!(
+        "  daemon [--daemon-poll-ms <ms>]            Long-running process that auto-compacts when WAL grows"
+    );
+    println!();
     println!("Global flags: --verbose/-v --quiet/-q --no-color --format --config");
     println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
@@ -10737,16 +10751,16 @@ fn print_cli_help() {
 const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search serve index watch explain status config download-models download doctor update completions uninstall help version\" fsfs"
+            "complete -W \"search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon\" fsfs"
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search serve index watch explain status config download-models download doctor update completions uninstall help version))\"' fsfs"
+            "compdef '_arguments \"1: :((search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon))\"' fsfs"
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search serve index watch explain status config download-models download doctor update completions uninstall help version\""
+            "complete -c fsfs -f -a \"search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon\""
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
 }
