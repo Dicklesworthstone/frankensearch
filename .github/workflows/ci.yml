@@ -420,7 +420,6 @@ jobs:
   release-build:
     name: Release build (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: quality
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
@@ -436,10 +435,10 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             build_tool: zigbuild
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             build_tool: cargo
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             build_tool: cargo
           - os: windows-latest
@@ -610,7 +609,6 @@ jobs:
   release-build-lite:
     name: Release build lite (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: quality
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
@@ -625,10 +623,10 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             build_tool: zigbuild
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             build_tool: cargo
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             build_tool: cargo
     steps:
