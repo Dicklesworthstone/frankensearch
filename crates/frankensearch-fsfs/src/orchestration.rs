@@ -457,7 +457,9 @@ impl OrchestrationState {
                 }
             }
             WorkKind::Replay => {
-                self.phase = OrchestrationPhase::Recovering;
+                if matches!(self.phase, OrchestrationPhase::Bootstrap) {
+                    self.phase = OrchestrationPhase::Recovering;
+                }
             }
         }
     }
