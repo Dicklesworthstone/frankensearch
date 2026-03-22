@@ -541,6 +541,21 @@ impl PersistentJobQueue {
             let delay_ms =
                 compute_retry_delay_ms(retry_base_delay_ms, retry_count.saturating_sub(1));
             let next_attempt_at_ms = now_ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+
+            // Delete any existing pending row for the same (doc_id, embedder_id)
+            // to avoid UNIQUE constraint violation when updating status to pending.
+            let delete_params = [
+                SqliteValue::Text(state.doc_id.clone()),
+                SqliteValue::Text(state.embedder_id.clone()),
+                SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
+            ];
+            conn.execute_with_params(
+                "DELETE FROM embedding_jobs \
+                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+                &delete_params,
+            )
+            .map_err(map_storage_error)?;
+
             let params = [
                 SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
                 SqliteValue::Integer(i64::from(retry_count)),
@@ -711,7 +726,8 @@ impl PersistentJobQueue {
                     let updated = conn
                         .execute_with_params(
                             "UPDATE embedding_jobs \
-                             SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3 \
+                             SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3, \
+                                 retry_count = retry_count + 1 \
                              WHERE job_id = ?4 AND status = 'processing';",
                             &update_params,
                         )
@@ -779,8 +795,8 @@ impl PersistentJobQueue {
             let count = conn
                 .execute_with_params(
                     "UPDATE embedding_jobs \
-                     SET status = 'pending', retry_count = 0, error = NULL, \
-                         started_at = NULL, next_attempt_at = ?2 \
+                     SET status = 'pending', retry_count = 0, error_message = NULL, \
+                         started_at = NULL, submitted_at = ?2 \
                      WHERE embedder_id = ?1 AND status = 'failed';",
                     &params,
                 )
