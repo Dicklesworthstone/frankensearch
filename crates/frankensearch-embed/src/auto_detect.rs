@@ -898,7 +898,7 @@ fn install_destination_dir(model_root: Option<&Path>, model_name: &str) -> Searc
     any(feature = "model2vec", feature = "fastembed")
 ))]
 async fn download_and_install_manifest(
-    _cx: &Cx,
+    cx: &Cx,
     manifest: &ModelManifest,
     destination_dir: &Path,
     policy: DownloadPolicy,
@@ -925,7 +925,7 @@ async fn download_and_install_manifest(
     );
 
     let staged = match downloader
-        .download_model(manifest, &staging_root, &mut lifecycle, move |progress| {
+        .download_model(cx, manifest, &staging_root, &mut lifecycle, move |progress| {
             reporter_for_cb.report(progress);
         })
         .await

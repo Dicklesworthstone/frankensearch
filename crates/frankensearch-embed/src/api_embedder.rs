@@ -76,7 +76,7 @@ impl RateLimiter {
         if self.requests_per_minute == 0 {
             return None;
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
         let refill = elapsed * (self.requests_per_minute as f64 / 60.0);
@@ -157,7 +157,7 @@ impl ApiEmbedder {
     }
 
     /// Make a single API request for a batch of texts, with retry.
-    async fn request_batch(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+    async fn request_batch(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
         let body = self.provider.serialize_request(texts)?;
         let headers = self.provider.request_headers();
 
@@ -184,6 +184,7 @@ impl ApiEmbedder {
             let response = self
                 .client
                 .request_streaming(
+                    cx,
                     Method::Post,
                     &url,
                     headers
@@ -278,9 +279,9 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 impl Embedder for ApiEmbedder {
-    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
-            let results = self.request_batch(&[text]).await?;
+            let results = self.request_batch(cx, &[text]).await?;
             results
                 .into_iter()
                 .next()
@@ -297,7 +298,7 @@ impl Embedder for ApiEmbedder {
 
     fn embed_batch<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
@@ -309,7 +310,7 @@ impl Embedder for ApiEmbedder {
             let mut all_embeddings = Vec::with_capacity(texts.len());
 
             for chunk in texts.chunks(batch_size) {
-                let mut batch = self.request_batch(chunk).await?;
+                let mut batch = self.request_batch(cx, chunk).await?;
                 for v in &mut batch {
                     l2_normalize(v);
                 }

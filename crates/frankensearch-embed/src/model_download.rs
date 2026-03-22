@@ -19,6 +19,7 @@ use asupersync::http::body::{Body, Frame};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use asupersync::Cx;
 use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, Method, RedirectPolicy};
 use frankensearch_core::error::{SearchError, SearchResult};
 
@@ -147,6 +148,7 @@ impl ModelDownloader {
     /// Returns `SearchError` on network failure, hash mismatch, or I/O error.
     pub async fn download_model(
         &self,
+        cx: &Cx,
         manifest: &ModelManifest,
         dest_dir: &Path,
         lifecycle: &mut ModelLifecycle,
@@ -213,7 +215,7 @@ impl ModelDownloader {
             );
 
             if let Err(err) = self
-                .download_file_with_retry(&url, &file_dest, file, idx, files_total, &on_progress)
+                .download_file_with_retry(cx, &url, &file_dest, file, idx, files_total, &on_progress)
                 .await
             {
                 lifecycle.fail_verification(format!("download failed for '{}': {err}", file.name));
@@ -251,6 +253,7 @@ impl ModelDownloader {
     /// Download a single file with retry logic.
     async fn download_file_with_retry(
         &self,
+        cx: &Cx,
         url: &str,
         dest: &Path,
         file: &ModelFile,
@@ -273,7 +276,7 @@ impl ModelDownloader {
             }
 
             match self
-                .download_single_file(url, dest, file, file_idx, files_total, on_progress)
+                .download_single_file(cx, url, dest, file, file_idx, files_total, on_progress)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -299,6 +302,7 @@ impl ModelDownloader {
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     async fn download_single_file(
         &self,
+        cx: &Cx,
         url: &str,
         dest: &Path,
         file: &ModelFile,
@@ -322,7 +326,7 @@ impl ModelDownloader {
         // Stream directly into a temp file to keep memory bounded.
         let mut response = self
             .client
-            .request_streaming(Method::Get, url, Vec::new(), Vec::new())
+            .request_streaming(cx, Method::Get, url, Vec::new(), Vec::new())
             .await
             .map_err(|e| client_error_to_search(e, url))?;
 
@@ -769,9 +773,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             downloader
-                .download_single_file(&url, &dest_for_task, &file, 0, 1, &|p| {
+                .download_single_file(&cx, &url, &dest_for_task, &file, 0, 1, &|p| {
                     progress_for_cb.lock().unwrap().push(p.clone());
                 })
                 .await
@@ -826,9 +830,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             downloader
-                .download_file_with_retry(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .download_file_with_retry(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
                 .await
                 .unwrap();
         });
@@ -870,9 +874,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let err = downloader
-                .download_file_with_retry(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .download_file_with_retry(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
                 .await
                 .unwrap_err();
             assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
@@ -910,9 +914,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let err = downloader
-                .download_single_file(&url, &dest_for_task, &file, 0, 1, &|_| {})
+                .download_single_file(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
                 .await
                 .unwrap_err();
             assert!(matches!(err, SearchError::HashMismatch { .. }));
@@ -957,9 +961,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let err = downloader
-                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .download_model(&cx, &manifest, dest.path(), &mut lifecycle, |_| {})
                 .await
                 .unwrap_err();
             assert!(matches!(err, SearchError::ModelLoadFailed { .. }));
@@ -1202,9 +1206,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let err = downloader
-                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .download_model(&cx, &manifest, dest.path(), &mut lifecycle, |_| {})
                 .await
                 .unwrap_err();
             assert!(matches!(err, SearchError::InvalidConfig { .. }));
@@ -1232,9 +1236,9 @@ mod tests {
             max_redirects: 0,
         });
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let err = downloader
-                .download_model(&manifest, dest.path(), &mut lifecycle, |_| {})
+                .download_model(&cx, &manifest, dest.path(), &mut lifecycle, |_| {})
                 .await
                 .unwrap_err();
             assert!(matches!(
