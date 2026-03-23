@@ -6681,12 +6681,19 @@ impl FsfsRuntime {
                             DownloadConsent::granted(ConsentSource::Programmatic),
                         );
                         let downloader = ModelDownloader::with_defaults();
+                        let cx = Cx::for_request();
                         let staged = downloader
-                            .download_model(&manifest, &model_root, &mut lifecycle, |progress| {
-                                if show_progress {
-                                    eprintln!("{progress}");
-                                }
-                            })
+                            .download_model(
+                                &cx,
+                                &manifest,
+                                &model_root,
+                                &mut lifecycle,
+                                |progress| {
+                                    if show_progress {
+                                        eprintln!("{progress}");
+                                    }
+                                },
+                            )
                             .await?;
                         manifest.promote_verified_installation(&staged, &destination)?;
                         Self::download_model_entry(
@@ -15765,7 +15772,7 @@ mod tests {
             SqliteValue::Text("home:/tmp/old.txt".to_owned().into()),
             SqliteValue::Text("home".to_owned().into()),
             SqliteValue::Text("/tmp/old.txt".to_owned().into()),
-            SqliteValue::Blob(vec![1_u8; 32]),
+            SqliteValue::Blob(vec![1_u8; 32].into()),
             SqliteValue::Integer(1),
             SqliteValue::Text("full_semantic_lexical".to_owned().into()),
             SqliteValue::Text("tombstoned".to_owned().into()),
@@ -15787,7 +15794,7 @@ mod tests {
             SqliteValue::Text("home:/tmp/fresh.txt".to_owned().into()),
             SqliteValue::Text("home".to_owned().into()),
             SqliteValue::Text("/tmp/fresh.txt".to_owned().into()),
-            SqliteValue::Blob(vec![2_u8; 32]),
+            SqliteValue::Blob(vec![2_u8; 32].into()),
             SqliteValue::Integer(1),
             SqliteValue::Text("full_semantic_lexical".to_owned().into()),
             SqliteValue::Text("tombstoned".to_owned().into()),

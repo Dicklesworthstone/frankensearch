@@ -775,7 +775,9 @@ fn row_optional_f64(row: &Row, index: usize) -> SearchResult<Option<f64>> {
 }
 
 fn sqlite_text_opt(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |v| SqliteValue::Text(v.to_owned().into()))
+    value.map_or(SqliteValue::Null, |v| {
+        SqliteValue::Text(v.to_owned().into())
+    })
 }
 
 fn sqlite_i64_opt(value: Option<i64>) -> SqliteValue {

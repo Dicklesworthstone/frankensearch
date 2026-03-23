@@ -12,6 +12,7 @@ use frankensearch_durability::config::DurabilityConfig;
 use frankensearch_durability::file_protector::FileProtector;
 use frankensearch_durability::metrics::DurabilityMetrics;
 use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+use fsqlite_types::cx::Cx;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Mock codec that mimics `RaptorQ` behavior for benchmarking the pipeline
@@ -22,6 +23,7 @@ struct BenchCodec;
 impl SymbolCodec for BenchCodec {
     fn encode(
         &self,
+        _cx: &Cx,
         source_data: &[u8],
         symbol_size: u32,
         _repair_overhead: f64,
@@ -50,6 +52,7 @@ impl SymbolCodec for BenchCodec {
 
     fn decode(
         &self,
+        _cx: &Cx,
         symbols: &[(u32, Vec<u8>)],
         k_source: u32,
         _symbol_size: u32,

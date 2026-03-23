@@ -621,19 +621,31 @@ impl InteractionSnapshot {
         // Tag each optional field so None vs Some are distinguishable.
         match self.selected_index {
             None => buf.push(0u8),
-            Some(idx) => { buf.push(1u8); buf.extend_from_slice(&idx.to_le_bytes()); }
+            Some(idx) => {
+                buf.push(1u8);
+                buf.extend_from_slice(&idx.to_le_bytes());
+            }
         }
         match self.scroll_offset {
             None => buf.push(0u8),
-            Some(off) => { buf.push(1u8); buf.extend_from_slice(&off.to_le_bytes()); }
+            Some(off) => {
+                buf.push(1u8);
+                buf.extend_from_slice(&off.to_le_bytes());
+            }
         }
         match self.visible_count {
             None => buf.push(0u8),
-            Some(cnt) => { buf.push(1u8); buf.extend_from_slice(&cnt.to_le_bytes()); }
+            Some(cnt) => {
+                buf.push(1u8);
+                buf.extend_from_slice(&cnt.to_le_bytes());
+            }
         }
         match self.query_text {
             None => buf.push(0u8),
-            Some(ref q) => { buf.push(1u8); buf.extend_from_slice(q.as_bytes()); }
+            Some(ref q) => {
+                buf.push(1u8);
+                buf.extend_from_slice(q.as_bytes());
+            }
         }
         // Write filter count + length-prefixed entries to delimit boundaries.
         #[allow(clippy::cast_possible_truncation)]
@@ -645,7 +657,10 @@ impl InteractionSnapshot {
         }
         match self.follow_mode {
             None => buf.push(0u8),
-            Some(follow) => { buf.push(1u8); buf.push(u8::from(follow)); }
+            Some(follow) => {
+                buf.push(1u8);
+                buf.push(u8::from(follow));
+            }
         }
         buf.extend_from_slice(&(self.degradation_mode as u8).to_le_bytes());
         fnv1a_64(&buf)

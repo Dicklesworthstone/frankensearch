@@ -3,10 +3,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use frankensearch_core::{Cx, SearchError, SearchResult};
+use frankensearch_core::{SearchError, SearchResult};
 use fsqlite_core::raptorq_integration::{
     CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
 };
+use fsqlite_types::cx::Cx;
 use tracing::{debug, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -282,7 +283,7 @@ impl CodecFacade {
 
     pub fn encode(&self, source_data: &[u8]) -> SearchResult<EncodedPayload> {
         let t0 = Instant::now();
-        let cx = Cx::for_testing();
+        let cx = Cx::new();
         let mut result = self
             .codec
             .encode(
@@ -414,7 +415,7 @@ impl CodecFacade {
             ));
         }
 
-        let cx = Cx::for_testing();
+        let cx = Cx::new();
         let outcome = self
             .codec
             .decode(&cx, symbols, k_source, symbol_size)

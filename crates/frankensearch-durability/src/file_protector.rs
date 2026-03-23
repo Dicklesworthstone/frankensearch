@@ -1186,8 +1186,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use frankensearch_core::Cx;
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+    use fsqlite_types::cx::Cx;
 
     use super::{
         DurabilityProvider, FileHealth, FileProtector, FileRepairOutcome, NoopDurability,
@@ -1965,8 +1965,8 @@ mod e2e_tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use frankensearch_core::Cx;
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+    use fsqlite_types::cx::Cx;
 
     use super::{FileHealth, FileProtector, RepairPipelineConfig};
     use crate::config::DurabilityConfig;

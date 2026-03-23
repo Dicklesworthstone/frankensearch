@@ -629,7 +629,9 @@ fn ensure_non_empty(value: &str, field: &'static str) -> SearchResult<()> {
 }
 
 fn sqlite_text_opt(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |v| SqliteValue::Text(v.to_owned().into()))
+    value.map_or(SqliteValue::Null, |v| {
+        SqliteValue::Text(v.to_owned().into())
+    })
 }
 
 fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {

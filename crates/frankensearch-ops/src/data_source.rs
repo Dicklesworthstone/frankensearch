@@ -725,7 +725,7 @@ fn row_text<'a>(
     field: &str,
 ) -> frankensearch_core::SearchResult<&'a str> {
     match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value.as_str()),
+        Some(SqliteValue::Text(value)) => Ok(&**value),
         Some(other) => Err(frankensearch_core::SearchError::SubsystemError {
             subsystem: "ops-data-source",
             source: Box::new(io::Error::other(format!(
@@ -745,7 +745,7 @@ fn row_opt_text<'a>(
     field: &str,
 ) -> frankensearch_core::SearchResult<Option<&'a str>> {
     match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.as_str())),
+        Some(SqliteValue::Text(value)) => Ok(Some(&**value)),
         Some(SqliteValue::Null) | None => Ok(None),
         Some(other) => Err(frankensearch_core::SearchError::SubsystemError {
             subsystem: "ops-data-source",

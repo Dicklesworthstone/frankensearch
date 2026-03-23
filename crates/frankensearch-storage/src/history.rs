@@ -144,7 +144,10 @@ pub fn search_history_prefix(
     limit: i64,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
     let pattern = format!("{prefix}%");
-    let params = [SqliteValue::Text(pattern.into()), SqliteValue::Integer(limit)];
+    let params = [
+        SqliteValue::Text(pattern.into()),
+        SqliteValue::Integer(limit),
+    ];
     let rows = conn
         .query_with_params(
             "SELECT id, query, query_class, result_count, phase1_latency_ms, \
@@ -430,7 +433,9 @@ fn parse_bookmark_row(row: &fsqlite::Row) -> SearchResult<Bookmark> {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn opt_text(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.to_owned().into()))
+    value.map_or(SqliteValue::Null, |s| {
+        SqliteValue::Text(s.to_owned().into())
+    })
 }
 
 fn opt_i64(value: Option<i64>) -> SqliteValue {

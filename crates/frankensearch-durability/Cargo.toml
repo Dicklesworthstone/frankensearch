@@ -11,6 +11,7 @@ rust-version.workspace = true
 frankensearch-core = { workspace = true }
 fsqlite-core = "0.1.2"
 fsqlite-error = "0.1.2"
+fsqlite-types = "0.1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }

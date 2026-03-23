@@ -471,8 +471,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use frankensearch_core::Cx;
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+    use fsqlite_types::cx::Cx;
     use tantivy::Index;
     use tantivy::schema::{STORED, STRING, Schema, TEXT};
 

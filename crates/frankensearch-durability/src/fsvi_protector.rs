@@ -346,8 +346,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use frankensearch_core::Cx;
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+    use fsqlite_types::cx::Cx;
 
     use super::{FsviProtector, FsviVerifyResult};
     use crate::config::DurabilityConfig;

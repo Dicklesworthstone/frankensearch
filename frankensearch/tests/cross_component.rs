@@ -207,10 +207,9 @@ fn two_tier_index_fast_and_quality_alignment() {
     assert_eq!(fast_hits[0].doc_id, "shared-1");
 
     // Quality scores for fast-tier hits
-    let indices: Vec<usize> = fast_hits.iter().map(|h| h.index as usize).collect();
     let query_quality = normalize_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     let quality_scores = index
-        .quality_scores_for_indices(&query_quality, &indices)
+        .quality_scores_for_hits(&query_quality, &fast_hits)
         .expect("quality scores");
     // shared-1 should have highest quality score (its quality embedding is close to query)
     assert!(quality_scores[0] > quality_scores[1]);
