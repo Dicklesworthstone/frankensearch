@@ -507,10 +507,14 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          extra_features=""
+          if [[ "${target}" == *"-musl"* ]] || [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
+            extra_features="--features vendored-openssl"
+          fi
           if [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
-            cargo zigbuild -p frankensearch-fsfs --release --target "${target}"
+            cargo zigbuild -p frankensearch-fsfs --release --target "${target}" ${extra_features}
           else
-            cargo build -p frankensearch-fsfs --release --target "${target}"
+            cargo build -p frankensearch-fsfs --release --target "${target}" ${extra_features}
           fi
 
       - name: Package archive + checksum
@@ -692,10 +696,14 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          extra_features=""
+          if [[ "${target}" == *"-musl"* ]] || [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
+            extra_features="--features vendored-openssl"
+          fi
           if [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
-            cargo zigbuild -p frankensearch-fsfs --release --target "${target}" --no-default-features
+            cargo zigbuild -p frankensearch-fsfs --release --target "${target}" --no-default-features ${extra_features}
           else
-            cargo build -p frankensearch-fsfs --release --target "${target}" --no-default-features
+            cargo build -p frankensearch-fsfs --release --target "${target}" --no-default-features ${extra_features}
           fi
 
       - name: Package lite archive + checksum

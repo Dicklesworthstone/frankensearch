@@ -471,10 +471,6 @@ fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "fastembed mutex poisoned".into(),
         },
-        _ => SearchError::EmbeddingFailed {
-            model: model.to_owned(),
-            source: "fastembed mutex lock failed".into(),
-        },
     }
 }
 
