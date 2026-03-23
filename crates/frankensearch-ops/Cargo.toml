@@ -14,8 +14,8 @@ path = "src/main.rs"
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
-fsqlite = "0.1.0"
-fsqlite-types = "0.1.0"
+fsqlite = "=0.1.1"
+fsqlite-types = "=0.1.1"
 
 # Terminal UI rendering (FrankenTUI)
 ftui-core = { workspace = true }

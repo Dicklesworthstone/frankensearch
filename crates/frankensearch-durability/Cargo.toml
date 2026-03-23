@@ -9,8 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 frankensearch-core = { workspace = true }
-fsqlite-core = "0.1.0"
-fsqlite-error = "0.1.0"
+fsqlite-core = "=0.1.1"
+fsqlite-error = "=0.1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }

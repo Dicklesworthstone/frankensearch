@@ -37,8 +37,8 @@ ftui-tty = { workspace = true }
 ftui-backend = { workspace = true }
 ftui-extras = { workspace = true, features = ["markdown"] }
 asupersync = { workspace = true }
-fsqlite = "0.1.0"
-fsqlite-types = "0.1.0"
+fsqlite = "=0.1.1"
+fsqlite-types = "=0.1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toon-rust = { workspace = true }
