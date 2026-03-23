@@ -618,23 +618,34 @@ impl InteractionSnapshot {
         buf.extend_from_slice(self.screen.id().as_bytes());
         buf.extend_from_slice(&self.tick.to_le_bytes());
         buf.extend_from_slice(self.focused_panel.to_string().as_bytes());
-        if let Some(idx) = self.selected_index {
-            buf.extend_from_slice(&idx.to_le_bytes());
+        // Tag each optional field so None vs Some are distinguishable.
+        match self.selected_index {
+            None => buf.push(0u8),
+            Some(idx) => { buf.push(1u8); buf.extend_from_slice(&idx.to_le_bytes()); }
         }
-        if let Some(off) = self.scroll_offset {
-            buf.extend_from_slice(&off.to_le_bytes());
+        match self.scroll_offset {
+            None => buf.push(0u8),
+            Some(off) => { buf.push(1u8); buf.extend_from_slice(&off.to_le_bytes()); }
         }
-        if let Some(cnt) = self.visible_count {
-            buf.extend_from_slice(&cnt.to_le_bytes());
+        match self.visible_count {
+            None => buf.push(0u8),
+            Some(cnt) => { buf.push(1u8); buf.extend_from_slice(&cnt.to_le_bytes()); }
         }
-        if let Some(ref q) = self.query_text {
-            buf.extend_from_slice(q.as_bytes());
+        match self.query_text {
+            None => buf.push(0u8),
+            Some(ref q) => { buf.push(1u8); buf.extend_from_slice(q.as_bytes()); }
         }
+        // Write filter count + length-prefixed entries to delimit boundaries.
+        #[allow(clippy::cast_possible_truncation)]
+        buf.extend_from_slice(&(self.active_filters.len() as u32).to_le_bytes());
         for filter in &self.active_filters {
+            #[allow(clippy::cast_possible_truncation)]
+            buf.extend_from_slice(&(filter.len() as u32).to_le_bytes());
             buf.extend_from_slice(filter.as_bytes());
         }
-        if let Some(follow) = self.follow_mode {
-            buf.push(u8::from(follow));
+        match self.follow_mode {
+            None => buf.push(0u8),
+            Some(follow) => { buf.push(1u8); buf.push(u8::from(follow)); }
         }
         buf.extend_from_slice(&(self.degradation_mode as u8).to_le_bytes());
         fnv1a_64(&buf)
