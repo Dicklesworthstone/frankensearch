@@ -1699,6 +1699,7 @@ mod tests {
                 "search" => parse_cli_args(["search", "q"]),
                 "explain" => parse_cli_args(["explain", "result-id"]),
                 "completions" => parse_cli_args(["completions", "bash"]),
+                "delete" => parse_cli_args(["delete", "doc-id"]),
                 _ => parse_cli_args([*name]),
             };
             let _input = parsed.expect(name);
