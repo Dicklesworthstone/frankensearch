@@ -572,7 +572,10 @@ impl VectorIndex {
                 let doc_id = self.doc_id_at(winner.index)?.to_owned();
                 // Skip if a WAL entry for the same doc exists (WAL is newer).
                 let doc_id_hash = crate::fnv1a_hash(doc_id.as_bytes());
-                let has_wal_entry = self.wal_entries.iter().any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);
+                let has_wal_entry = self
+                    .wal_entries
+                    .iter()
+                    .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);
                 if has_wal_entry {
                     continue;
                 }
@@ -1538,7 +1541,8 @@ mod tests {
     fn stale_main_entry_shadowed_by_wal() {
         let path = temp_index_path("stale-shadow");
         // Create main index with [1.0, 0.0]
-        let mut writer = VectorIndex::create_with_revision(&path, "test", "r1", 2, Quantization::F32).unwrap();
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", 2, Quantization::F32).unwrap();
         writer.write_record("doc-a", &[1.0, 0.0]).unwrap();
         writer.finish().unwrap();
 
@@ -1553,7 +1557,11 @@ mod tests {
         let hits = index.search_top_k(&[1.0, 0.0], 1, None).unwrap();
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].score, 0.0, "Expected score 0.0 from WAL entry, but got leaked score {}", hits[0].score);
+        assert_eq!(
+            hits[0].score, 0.0,
+            "Expected score 0.0 from WAL entry, but got leaked score {}",
+            hits[0].score
+        );
     }
 
     #[test]

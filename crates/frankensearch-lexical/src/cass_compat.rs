@@ -329,7 +329,12 @@ impl CassTantivyIndex {
         .map_err(tantivy_err)?;
 
         let actual_schema = index.schema();
-        let writer = index.writer(50_000_000).map_err(tantivy_err)?;
+        // cass rebuilds feed documents from a single producer thread. A single
+        // Tantivy indexing worker keeps memory use bounded and makes rebuild
+        // checkpoints materially more predictable on very large session corpora.
+        let writer = index
+            .writer_with_num_threads(1, 50_000_000)
+            .map_err(tantivy_err)?;
         let fields = cass_fields_from_schema(&actual_schema)?;
         Ok(Self {
             index,

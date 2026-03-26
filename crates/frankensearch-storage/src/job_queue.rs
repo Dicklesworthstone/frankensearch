@@ -1931,19 +1931,26 @@ mod tests {
         let new_hash = [101_u8; 32];
 
         // 1. Enqueue original version
-        queue.enqueue("doc-race", "all-MiniLM-L6-v2", &old_hash, 0).unwrap();
-        
+        queue
+            .enqueue("doc-race", "all-MiniLM-L6-v2", &old_hash, 0)
+            .unwrap();
+
         // 2. Worker claims it (now it's 'processing')
         let claim = claim_single(&queue, "worker-1");
         assert_eq!(claim.content_hash, Some(old_hash));
 
         // 3. User updates document, enqueues new version.
         // This creates a NEW 'pending' job because the old one is 'processing'.
-        queue.enqueue("doc-race", "all-MiniLM-L6-v2", &new_hash, 0).unwrap();
+        queue
+            .enqueue("doc-race", "all-MiniLM-L6-v2", &new_hash, 0)
+            .unwrap();
 
         // 4. Worker fails to process the OLD version.
         let fail_result = queue.fail(claim.job_id, "transient network error").unwrap();
-        assert!(matches!(fail_result, FailResult::TerminalFailed { .. }), "Old job should be terminally failed because a newer pending job exists");
+        assert!(
+            matches!(fail_result, FailResult::TerminalFailed { .. }),
+            "Old job should be terminally failed because a newer pending job exists"
+        );
 
         // 5. The pending job should STILL be the NEW version, not the old one retrying!
         let new_claim = claim_single(&queue, "worker-2");
@@ -2512,10 +2519,7 @@ mod tests {
         let err = queue
             .complete(job_id)
             .expect_err("completing pending job should fail");
-        assert!(
-            err.to_string().contains("not processing"),
-            "error: {err}"
-        );
+        assert!(err.to_string().contains("not processing"), "error: {err}");
     }
 
     #[test]
