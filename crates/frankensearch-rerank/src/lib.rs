@@ -474,6 +474,7 @@ fn extract_scores_from_raw(
     }
 }
 
+#[allow(unreachable_patterns)]
 fn map_lock_error(model: &str, error: LockError) -> SearchError {
     match error {
         LockError::Cancelled => SearchError::Cancelled {
@@ -483,6 +484,10 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
         LockError::Poisoned => SearchError::RerankFailed {
             model: model.to_owned(),
             source: "reranker mutex poisoned".into(),
+        },
+        other => SearchError::RerankFailed {
+            model: model.to_owned(),
+            source: std::io::Error::other(format!("reranker mutex lock failed: {other}")).into(),
         },
     }
 }

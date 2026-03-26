@@ -461,6 +461,7 @@ pub fn find_model_dir_with_hf_id(model_name: &str, hf_id: &str) -> Option<PathBu
     candidates.into_iter().find(|dir| has_required_files(dir))
 }
 
+#[allow(unreachable_patterns)]
 fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
     match error {
         LockError::Cancelled => SearchError::Cancelled {
@@ -470,6 +471,13 @@ fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
         LockError::Poisoned => SearchError::EmbeddingFailed {
             model: model.to_owned(),
             source: "fastembed mutex poisoned".into(),
+        },
+        other => SearchError::EmbeddingFailed {
+            model: model.to_owned(),
+            source: std::io::Error::other(format!(
+                "fastembed mutex lock failed during {phase}: {other}"
+            ))
+            .into(),
         },
     }
 }
