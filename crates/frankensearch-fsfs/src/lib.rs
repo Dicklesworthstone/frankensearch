@@ -3,7 +3,7 @@
 //! This crate establishes the standalone fsfs binary surface with explicit
 //! separation between reusable runtime/config logic and UX adapters.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // deny (not forbid) so concurrency/lifecycle can #[allow] for kill(2)
 
 pub mod adapters;
 pub mod agent_ergonomics;
