@@ -2109,6 +2109,7 @@ fn read_proc_load_avg_1m() -> Option<f64> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_total_jiffies(raw: &str) -> Option<u64> {
     let cpu_line = raw.lines().find(|line| line.starts_with("cpu "))?;
     let mut total_jiffies = 0_u64;
@@ -2119,6 +2120,7 @@ fn parse_proc_total_jiffies(raw: &str) -> Option<u64> {
     Some(total_jiffies)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_process_jiffies(raw: &str) -> Option<u64> {
     let close_paren = raw.rfind(')')?;
     let stats_after_comm = raw.get(close_paren + 2..)?;
@@ -2128,6 +2130,7 @@ fn parse_proc_process_jiffies(raw: &str) -> Option<u64> {
     utime.checked_add(stime)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_status_rss_bytes(raw: &str) -> Option<u64> {
     let line = raw
         .lines()
@@ -2136,6 +2139,7 @@ fn parse_proc_status_rss_bytes(raw: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_io_bytes(raw: &str) -> Option<(u64, u64)> {
     let mut read_bytes = None;
     let mut write_bytes = None;
@@ -2152,6 +2156,7 @@ fn parse_proc_io_bytes(raw: &str) -> Option<(u64, u64)> {
     Some((read_bytes?, write_bytes?))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_load_avg_1m(raw: &str) -> Option<f64> {
     let value = raw.split_whitespace().next()?.parse::<f64>().ok()?;
     if value.is_finite() && value >= 0.0 {

@@ -7,7 +7,9 @@
 //! - Derive `normal`/`constrained`/`degraded`/`emergency` states.
 //! - Apply hysteresis + anti-flap consecutive-reading guards.
 
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
+#[cfg(any(target_os = "linux", test))]
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,6 +24,7 @@ const DEFAULT_EWMA_ALPHA: f64 = 0.3;
 const DEFAULT_HYSTERESIS_PCT: f64 = 5.0;
 const DEFAULT_CONSECUTIVE_REQUIRED: u8 = 3;
 const DEFAULT_IO_CEILING_MIB_PER_SEC: f64 = 64.0;
+#[cfg(any(target_os = "linux", test))]
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
 /// Stable control states consumed by scheduler and UX layers.
@@ -1274,6 +1277,7 @@ impl HostPressureCollector {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     #[allow(clippy::cast_precision_loss)]
     fn io_pct_for_interval(&self, interval: Duration, current: ProcIoCounters) -> f64 {
         let Some(previous) = self.previous_io else {
@@ -1374,6 +1378,7 @@ fn read_load_avg_1m(path: &Path) -> SearchResult<f64> {
     parse_load_avg_1m(&contents)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_load_avg_1m(contents: &str) -> SearchResult<f64> {
     let first = contents
         .split_whitespace()
@@ -1392,6 +1397,7 @@ fn parse_load_avg_1m(contents: &str) -> SearchResult<f64> {
         })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_u64_field(field: &str, value: &str) -> SearchResult<u64> {
     value
         .parse::<u64>()

@@ -810,6 +810,7 @@ fn read_procfs_counters(sampled_at_ms: u64) -> Option<RawPressureCounters> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn parse_proc_stat_cpu_line(contents: &str) -> Option<CpuCounters> {
     let line = contents.lines().find(|line| line.starts_with("cpu "))?;
@@ -830,6 +831,7 @@ fn parse_proc_stat_cpu_line(contents: &str) -> Option<CpuCounters> {
     Some(CpuCounters { total, idle })
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn parse_proc_meminfo(contents: &str) -> Option<(u64, u64)> {
     let mut total_kb = None;
@@ -854,6 +856,7 @@ fn parse_proc_meminfo(contents: &str) -> Option<(u64, u64)> {
     Some((total.saturating_mul(1024), available.saturating_mul(1024)))
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn parse_proc_self_io(contents: &str) -> Option<IoCounters> {
     let mut read_bytes = None;
@@ -879,6 +882,7 @@ fn parse_proc_self_io(contents: &str) -> Option<IoCounters> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn parse_proc_loadavg(contents: &str) -> Option<f64> {
     contents

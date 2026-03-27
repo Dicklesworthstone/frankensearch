@@ -8233,7 +8233,7 @@ impl FsfsRuntime {
                             }
                             let vector_start = Instant::now();
                             for ((_, doc), embedding) in
-                                semantic_docs.iter().zip(embeddings.into_iter())
+                                semantic_docs.iter().zip(embeddings)
                             {
                                 if let Some(writer) = vector_writer.as_mut() {
                                     writer.write_record(&doc.id, &embedding)?;

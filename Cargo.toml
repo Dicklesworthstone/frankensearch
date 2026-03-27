@@ -176,6 +176,8 @@ manual_is_multiple_of = "allow"
 duration_suboptimal_units = "allow"
 # async fns without await are fine as trait implementations / future-proofing.
 unused_async = "allow"
+# Separate multiply-then-add is intentional; fused mul_add changes semantics slightly.
+suboptimal_flops = "allow"
 
 [profile.release]
 opt-level = 3
