@@ -565,7 +565,7 @@ impl TwoTierSearcher {
                 semantic_query,
                 query_class,
                 k,
-                &initial_hits,
+                &display_hits,
                 &text_fn,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
