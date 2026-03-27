@@ -7,9 +7,9 @@
 //! - Derive `normal`/`constrained`/`degraded`/`emergency` states.
 //! - Apply hysteresis + anti-flap consecutive-reading guards.
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::time::Duration;
 

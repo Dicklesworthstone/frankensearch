@@ -8232,9 +8232,7 @@ impl FsfsRuntime {
                                 });
                             }
                             let vector_start = Instant::now();
-                            for ((_, doc), embedding) in
-                                semantic_docs.iter().zip(embeddings)
-                            {
+                            for ((_, doc), embedding) in semantic_docs.iter().zip(embeddings) {
                                 if let Some(writer) = vector_writer.as_mut() {
                                     writer.write_record(&doc.id, &embedding)?;
                                 }
@@ -14615,9 +14613,9 @@ mod tests {
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
     use crate::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
-    use crate::pressure::{
-        DegradationStage, HostPressureCollector, PressureSignal, PressureState, QueryCapabilityMode,
-    };
+    #[cfg(target_os = "linux")]
+    use crate::pressure::HostPressureCollector;
+    use crate::pressure::{DegradationStage, PressureSignal, PressureState, QueryCapabilityMode};
     use crate::query_execution::{FusedCandidate, LexicalCandidate};
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
