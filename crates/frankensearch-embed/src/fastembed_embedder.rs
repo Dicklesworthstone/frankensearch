@@ -385,7 +385,7 @@ impl Embedder for FastEmbedEmbedder {
             }
 
             let normalized = self.embed_batch_non_empty(cx, &non_empty_texts).await?;
-            for (slot_idx, embedding) in non_empty_indices.into_iter().zip(normalized.into_iter()) {
+            for (slot_idx, embedding) in non_empty_indices.into_iter().zip(normalized) {
                 output[slot_idx] = embedding;
             }
             Ok(output)
