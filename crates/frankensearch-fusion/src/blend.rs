@@ -28,7 +28,7 @@ const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
 /// Pre-computed normalization bounds for a score set.
 ///
 /// Extracted from `robust_normalize` so normalization can be applied inline
-/// during HashMap insertion without materializing an intermediate `Vec<f32>`.
+/// during `HashMap` insertion without materializing an intermediate `Vec<f32>`.
 /// Inspired by fff.nvim's pattern of never creating temporary collections
 /// when the operation can be fused into the consumer loop.
 #[derive(Debug, Clone, Copy)]
