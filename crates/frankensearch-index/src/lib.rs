@@ -2869,13 +2869,12 @@ mod tests {
             .expect("append duplicate");
         assert_eq!(index.wal_record_count(), 1);
 
-        // Both entries should appear (WAL doesn't deduplicate).
+        // WAL entry shadows the main-index entry (WAL is newer).
         let hits = index
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
             .expect("search");
-        assert_eq!(hits.len(), 2);
-        let doc_ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
-        assert!(doc_ids.iter().all(|id| *id == "doc-a"));
+        assert_eq!(hits.len(), 1, "WAL shadows main — only WAL entry should appear");
+        assert_eq!(hits[0].doc_id, "doc-a");
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();

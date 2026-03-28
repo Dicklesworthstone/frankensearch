@@ -526,6 +526,11 @@ impl VectorIndex {
                 }
             }
             let score = dot_product_f32_f32(&entry.embedding, query)?;
+            // Guard: corrupt WAL embeddings can produce NaN/Inf scores that
+            // poison the top-k sort. Skip them (matches two_tier ANN path).
+            if !score.is_finite() {
+                continue;
+            }
             insert_candidate(heap, HeapEntry::new(to_wal_index(idx), score), limit);
         }
         Ok(())
@@ -539,6 +544,9 @@ impl VectorIndex {
         winners.reserve(self.wal_entries.len());
         for (idx, entry) in self.wal_entries.iter().enumerate() {
             let score = dot_product_f32_f32(&entry.embedding, query)?;
+            if !score.is_finite() {
+                continue;
+            }
             winners.push(HeapEntry::new(to_wal_index(idx), score));
         }
         Ok(())
