@@ -2873,7 +2873,11 @@ mod tests {
         let hits = index
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
             .expect("search");
-        assert_eq!(hits.len(), 1, "WAL shadows main — only WAL entry should appear");
+        assert_eq!(
+            hits.len(),
+            1,
+            "WAL shadows main — only WAL entry should appear"
+        );
         assert_eq!(hits[0].doc_id, "doc-a");
 
         std::fs::remove_file(&path).ok();
