@@ -848,16 +848,49 @@ impl TwoTierSearcher {
             k: self.effective_rrf_k(query_class),
         };
 
-        // Fast embedding.
-        let embed_start = Instant::now();
-        let fast_embed_result = self.fast_embedder.embed(cx, semantic_query).await;
-        let fast_embed_elapsed = embed_start.elapsed();
+        // Run embedding and lexical search in parallel via rayon::join.
+        // Both trait methods are sync-in-async (complete on first poll), so
+        // rayon gives true thread-level parallelism without an async runtime.
+        // rayon::join is scoped — closures borrow from the parent directly,
+        // no Arc clone or String allocation needed.
+        let (embed_timed, lexical_timed) = rayon::join(
+            || {
+                let start = Instant::now();
+                let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query));
+                (result, start.elapsed())
+            },
+            || {
+                if let Some(ref lex) = self.lexical {
+                    let start = Instant::now();
+                    let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget));
+                    (Some(result), start.elapsed())
+                } else {
+                    (None, Duration::ZERO)
+                }
+            },
+        );
+
+        let (fast_embed_result, fast_embed_elapsed) = embed_timed;
         metrics.fast_embed_ms = fast_embed_elapsed.as_secs_f64() * 1000.0;
 
-        // Lexical search (runs regardless of embedding success).
-        let mut lexical_results = self
-            .run_lexical(cx, semantic_query, lexical_budget, metrics)
-            .await?;
+        let mut lexical_results: Option<Vec<ScoredResult>> = match lexical_timed {
+            (Some(Ok(results)), elapsed) => {
+                metrics.lexical_search_ms = elapsed.as_secs_f64() * 1000.0;
+                metrics.lexical_candidates = results.len();
+                Some(results)
+            }
+            (Some(Err(e)), elapsed) => {
+                metrics.lexical_search_ms = elapsed.as_secs_f64() * 1000.0;
+                // Propagate cancellation errors — the caller must see them.
+                if matches!(e, SearchError::Cancelled { .. }) {
+                    return Err(e);
+                }
+                self.export_error(&e);
+                tracing::warn!(error = %e, "lexical search failed, continuing without lexical");
+                None
+            }
+            (None, _) => None,
+        };
         if let Some(exclusions) = normalized_exclusions {
             lexical_results = lexical_results.map(|results| {
                 let filtered =
@@ -1457,6 +1490,7 @@ impl TwoTierSearcher {
     }
 
     /// Run optional lexical search, returning results or None.
+    #[allow(dead_code)]
     async fn run_lexical(
         &self,
         cx: &Cx,
@@ -2425,6 +2459,32 @@ fn contains_term_with_word_boundaries(text: &str, term: &str) -> bool {
         search_from = end;
     }
     false
+}
+
+/// Poll an immediately-ready future to completion without an async runtime.
+///
+/// All frankensearch `Embedder::embed` and `LexicalSearch::search` implementations
+/// are synchronous code wrapped in `Box::pin(async move { ... })` — they complete
+/// on the first poll. This helper exploits that property to call them from
+/// synchronous contexts (e.g., `rayon::join` threads).
+///
+/// # Panics
+///
+/// Panics if the future is not immediately ready (i.e., actually yields `Pending`).
+fn poll_immediate<T>(
+    mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
+) -> T {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(val) => val,
+        std::task::Poll::Pending => {
+            panic!(
+                "poll_immediate: future yielded Pending — only use with sync-in-async \
+                 implementations (hash/model2vec embedders, Tantivy lexical)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
