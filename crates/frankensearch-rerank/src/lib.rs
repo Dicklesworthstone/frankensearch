@@ -474,7 +474,6 @@ fn extract_scores_from_raw(
     }
 }
 
-#[allow(unreachable_patterns)]
 fn map_lock_error(model: &str, error: LockError) -> SearchError {
     match error {
         LockError::Cancelled => SearchError::Cancelled {
@@ -485,9 +484,9 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "reranker mutex poisoned".into(),
         },
-        other => SearchError::RerankFailed {
+        LockError::PolledAfterCompletion => SearchError::RerankFailed {
             model: model.to_owned(),
-            source: std::io::Error::other(format!("reranker mutex lock failed: {other}")).into(),
+            source: std::io::Error::other("reranker mutex future reused after completion").into(),
         },
     }
 }
@@ -721,6 +720,17 @@ mod tests {
     fn lock_poisoned_maps_to_rerank_failed() {
         let err = map_lock_error("flashrank", LockError::Poisoned);
         assert!(matches!(err, SearchError::RerankFailed { .. }));
+    }
+
+    #[test]
+    fn lock_polled_after_completion_maps_to_rerank_failed() {
+        let err = map_lock_error("flashrank", LockError::PolledAfterCompletion);
+        match err {
+            SearchError::RerankFailed { source, .. } => {
+                assert!(source.to_string().contains("future reused after completion"));
+            }
+            other => panic!("expected rerank failure, got {other:?}"),
+        }
     }
 
     // ─── num_cpus ───────────────────────────────────────────────────────

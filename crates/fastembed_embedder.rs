@@ -471,9 +471,12 @@ fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "fastembed mutex poisoned".into(),
         },
-        _ => SearchError::EmbeddingFailed {
+        LockError::PolledAfterCompletion => SearchError::EmbeddingFailed {
             model: model.to_owned(),
-            source: "fastembed mutex lock failed".into(),
+            source: std::io::Error::other(format!(
+                "fastembed mutex future reused after completion during {phase}"
+            ))
+            .into(),
         },
     }
 }
@@ -595,6 +598,21 @@ mod tests {
     fn map_lock_error_poisoned_to_embedding_failed() {
         let err = map_lock_error("all-MiniLM-L6-v2", "fastembed.embed", LockError::Poisoned);
         assert!(matches!(err, SearchError::EmbeddingFailed { .. }));
+    }
+
+    #[test]
+    fn map_lock_error_polled_after_completion_to_embedding_failed() {
+        let err = map_lock_error(
+            "all-MiniLM-L6-v2",
+            "fastembed.embed",
+            LockError::PolledAfterCompletion,
+        );
+        match err {
+            SearchError::EmbeddingFailed { source, .. } => {
+                assert!(source.to_string().contains("future reused after completion"));
+            }
+            other => panic!("expected EmbeddingFailed variant, got {other:?}"),
+        }
     }
 
     #[test]

@@ -381,7 +381,6 @@ impl std::fmt::Debug for TantivyIndex {
 }
 
 impl TantivyIndex {
-    #[allow(unreachable_patterns)]
     fn map_writer_lock_error(phase: &str, error: asupersync::sync::LockError) -> SearchError {
         match error {
             asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
@@ -392,10 +391,10 @@ impl TantivyIndex {
                 phase: phase.into(),
                 reason: "writer lock cancelled".into(),
             },
-            other => SearchError::SubsystemError {
+            asupersync::sync::LockError::PolledAfterCompletion => SearchError::SubsystemError {
                 subsystem: "tantivy",
                 source: Box::new(std::io::Error::other(format!(
-                    "writer mutex lock failed during {phase}: {other}"
+                    "writer mutex future reused after completion during {phase}"
                 ))),
             },
         }
@@ -986,6 +985,24 @@ mod tests {
     }
 
     // ─── Indexing tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn map_writer_lock_error_polled_after_completion_maps_to_subsystem_error() {
+        let err = TantivyIndex::map_writer_lock_error(
+            "tantivy.index",
+            asupersync::sync::LockError::PolledAfterCompletion,
+        );
+        match err {
+            SearchError::SubsystemError { source, .. } => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("writer mutex future reused after completion during tantivy.index")
+                );
+            }
+            other => panic!("expected subsystem error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn index_single_document() {

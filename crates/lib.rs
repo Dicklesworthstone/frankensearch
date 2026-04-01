@@ -381,6 +381,24 @@ impl std::fmt::Debug for TantivyIndex {
 }
 
 impl TantivyIndex {
+    fn map_writer_lock_error(phase: &str, error: asupersync::sync::LockError) -> SearchError {
+        match error {
+            asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(std::io::Error::other("writer mutex poisoned")),
+            },
+            asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
+                phase: phase.into(),
+                reason: "writer lock cancelled".into(),
+            },
+            asupersync::sync::LockError::PolledAfterCompletion => SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(std::io::Error::other(format!(
+                    "writer mutex future reused after completion during {phase}"
+                ))),
+            },
+        }
+    }
     /// Create a new Tantivy index at the given directory path.
     ///
     /// If the directory does not exist, it will be created.
@@ -541,22 +559,7 @@ impl TantivyIndex {
         self.writer
             .lock(cx)
             .await
-            .map_err(|e| match e {
-                asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(std::io::Error::other("writer mutex poisoned")),
-                },
-                asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
-                    phase: "tantivy.delete".into(),
-                    reason: "writer lock cancelled".into(),
-                },
-                _ => {
-                    SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other("writer mutex lock failed")),
-                    }
-                }
-            })?
+            .map_err(|e| Self::map_writer_lock_error("tantivy.delete", e))?
             .delete_term(term);
         Ok(())
     }
@@ -812,22 +815,11 @@ impl LexicalSearch for TantivyIndex {
             let tantivy_doc = self.to_tantivy_doc(doc);
 
             {
-                let writer = self.writer.lock(cx).await.map_err(|e| match e {
-                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
-                    },
-                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
-                        phase: "tantivy.index".into(),
-                        reason: "writer lock cancelled".into(),
-                    },
-                    _ => {
-                        SearchError::SubsystemError {
-                            subsystem: "tantivy",
-                            source: Box::new(std::io::Error::other("writer mutex lock failed")),
-                        }
-                    }
-                })?;
+                let writer = self
+                    .writer
+                    .lock(cx)
+                    .await
+                    .map_err(|e| Self::map_writer_lock_error("tantivy.index", e))?;
 
                 // Delete any existing document with same ID (upsert semantics).
                 let term = Term::from_field_text(self.fields.id, &doc.id);
@@ -852,22 +844,11 @@ impl LexicalSearch for TantivyIndex {
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let writer = self.writer.lock(cx).await.map_err(|e| match e {
-                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
-                    },
-                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
-                        phase: "tantivy.batch_index".into(),
-                        reason: "writer lock cancelled".into(),
-                    },
-                    _ => {
-                        SearchError::SubsystemError {
-                            subsystem: "tantivy",
-                            source: Box::new(std::io::Error::other("writer mutex lock failed")),
-                        }
-                    }
-                })?;
+                let writer = self
+                    .writer
+                    .lock(cx)
+                    .await
+                    .map_err(|e| Self::map_writer_lock_error("tantivy.batch_index", e))?;
 
                 for doc in docs {
                     let tantivy_doc = self.to_tantivy_doc(doc);
@@ -893,22 +874,11 @@ impl LexicalSearch for TantivyIndex {
     fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             {
-                let mut writer = self.writer.lock(cx).await.map_err(|e| match e {
-                    asupersync::sync::LockError::Poisoned => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other("writer mutex poisoned")),
-                    },
-                    asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
-                        phase: "tantivy.commit".into(),
-                        reason: "writer lock cancelled".into(),
-                    },
-                    _ => {
-                        SearchError::SubsystemError {
-                            subsystem: "tantivy",
-                            source: Box::new(std::io::Error::other("writer mutex lock failed")),
-                        }
-                    }
-                })?;
+                let mut writer = self
+                    .writer
+                    .lock(cx)
+                    .await
+                    .map_err(|e| Self::map_writer_lock_error("tantivy.commit", e))?;
 
                 writer.commit().map_err(|e| SearchError::SubsystemError {
                     subsystem: "tantivy",
@@ -1014,6 +984,24 @@ mod tests {
     }
 
     // ─── Indexing tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn map_writer_lock_error_polled_after_completion_maps_to_subsystem_error() {
+        let err = TantivyIndex::map_writer_lock_error(
+            "tantivy.index",
+            asupersync::sync::LockError::PolledAfterCompletion,
+        );
+        match err {
+            SearchError::SubsystemError { source, .. } => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("writer mutex future reused after completion during tantivy.index")
+                );
+            }
+            other => panic!("expected subsystem error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn index_single_document() {
