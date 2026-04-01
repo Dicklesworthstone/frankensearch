@@ -727,7 +727,11 @@ mod tests {
         let err = map_lock_error("flashrank", LockError::PolledAfterCompletion);
         match err {
             SearchError::RerankFailed { source, .. } => {
-                assert!(source.to_string().contains("future reused after completion"));
+                assert!(
+                    source
+                        .to_string()
+                        .contains("future reused after completion")
+                );
             }
             other => panic!("expected rerank failure, got {other:?}"),
         }

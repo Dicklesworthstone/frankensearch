@@ -471,13 +471,13 @@ fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "fastembed mutex poisoned".into(),
         },
-        LockError::PolledAfterCompletion => SearchError::EmbeddingFailed {
-            model: model.to_owned(),
-            source: std::io::Error::other(format!(
-                "fastembed mutex future reused after completion during {phase}"
-            ))
-            .into(),
-        },
+        LockError::PolledAfterCompletion => {
+            let detail = format!("fastembed mutex future reused after completion during {phase}");
+            SearchError::EmbeddingFailed {
+                model: model.to_owned(),
+                source: std::io::Error::other(detail).into(),
+            }
+        }
     }
 }
 

@@ -995,9 +995,9 @@ mod tests {
         match err {
             SearchError::SubsystemError { source, .. } => {
                 assert!(
-                    source
-                        .to_string()
-                        .contains("writer mutex future reused after completion during tantivy.index")
+                    source.to_string().contains(
+                        "writer mutex future reused after completion during tantivy.index"
+                    )
                 );
             }
             other => panic!("expected subsystem error, got {other:?}"),
