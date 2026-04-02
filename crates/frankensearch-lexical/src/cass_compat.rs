@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 /// Schema version namespace used for cass-compatible Tantivy indexes.
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-tokens";
+pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-tokens-conversation-id";
 
 // ─── HyphenDecompose token filter ────────────────────────────────────────────
 //
@@ -227,6 +227,7 @@ pub struct CassFields {
     pub source_id: Field,
     pub origin_kind: Field,
     pub origin_host: Field,
+    pub conversation_id: Option<Field>,
 }
 
 /// Merge status for cass-compatible Tantivy segment optimization.
@@ -261,6 +262,7 @@ pub struct CassDocument {
     pub source_id: String,
     pub origin_kind: String,
     pub origin_host: Option<String>,
+    pub conversation_id: Option<i64>,
 }
 
 /// Tantivy index compatible with cass lexical schema and lifecycle.
@@ -488,6 +490,11 @@ impl CassTantivyIndex {
             {
                 d.add_text(self.fields.origin_host, host);
             }
+            if let Some(field) = self.fields.conversation_id
+                && let Some(conversation_id) = cass_doc.conversation_id
+            {
+                d.add_i64(field, conversation_id);
+            }
             if let Some(workspace) = &cass_doc.workspace {
                 d.add_text(self.fields.workspace, workspace);
             }
@@ -547,6 +554,7 @@ pub fn cass_build_schema() -> Schema {
     schema_builder.add_text_field("source_id", STRING | STORED);
     schema_builder.add_text_field("origin_kind", STRING | STORED);
     schema_builder.add_text_field("origin_host", STRING | STORED);
+    schema_builder.add_i64_field("conversation_id", STORED);
     schema_builder.build()
 }
 
@@ -581,6 +589,7 @@ pub fn cass_fields_from_schema(schema: &Schema) -> SearchResult<CassFields> {
         source_id: get("source_id")?,
         origin_kind: get("origin_kind")?,
         origin_host: get("origin_host")?,
+        conversation_id: schema.get_field("conversation_id").ok(),
     })
 }
 
