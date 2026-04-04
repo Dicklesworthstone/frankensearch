@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 /// Schema version namespace used for cass-compatible Tantivy indexes.
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-tokens-conversation-id";
+pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-cjk-bigrams";
 
 // ─── HyphenDecompose token filter ────────────────────────────────────────────
 //
@@ -116,6 +116,137 @@ impl<T: TokenStream> TokenStream for HyphenDecomposeStream<'_, T> {
         self.decompose();
         // If decompose produced tokens, the first will come from pending.
         // Otherwise the plain upstream token is returned via `token()`.
+        true
+    }
+
+    fn token(&self) -> &Token {
+        self.pending.last().unwrap_or_else(|| self.tail.token())
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.pending
+            .last_mut()
+            .unwrap_or_else(|| self.tail.token_mut())
+    }
+}
+
+// ─── CJK Bigram token filter ────────────────────────────────────────────────
+//
+// CJK scripts (Chinese, Japanese kanji, Korean hangul) are written without
+// whitespace between words.  A single CJK token such as "搜索引擎" must be
+// decomposed into overlapping character bigrams ("搜索", "索引", "引擎") so
+// that sub-string queries can match.  Non-CJK tokens pass through unchanged.
+
+/// Returns `true` when `c` falls in a CJK-relevant Unicode range.
+#[inline]
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+        | '\u{3100}'..='\u{312F}' // Bopomofo
+        | '\u{3300}'..='\u{33FF}' // CJK Compatibility
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{20000}'..='\u{2A6DF}' // CJK Extension B
+    )
+}
+
+/// A [`TokenFilter`] that decomposes tokens consisting entirely of CJK
+/// characters into overlapping character bigrams.
+///
+/// Given the token `搜索引擎`, the stream will yield:
+///   `搜索`, `索引`, `引擎`
+///
+/// A single CJK character emits itself as a unigram.
+/// Tokens that contain no CJK characters pass through unchanged.
+#[derive(Clone)]
+pub struct CjkBigramDecompose;
+
+impl TokenFilter for CjkBigramDecompose {
+    type Tokenizer<T: Tokenizer> = CjkBigramDecomposeFilter<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> CjkBigramDecomposeFilter<T> {
+        CjkBigramDecomposeFilter {
+            inner: tokenizer,
+            pending: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CjkBigramDecomposeFilter<T> {
+    inner: T,
+    pending: Vec<Token>,
+}
+
+impl<T: Tokenizer> Tokenizer for CjkBigramDecomposeFilter<T> {
+    type TokenStream<'a> = CjkBigramDecomposeStream<'a, T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        self.pending.clear();
+        CjkBigramDecomposeStream {
+            tail: self.inner.token_stream(text),
+            pending: &mut self.pending,
+        }
+    }
+}
+
+pub struct CjkBigramDecomposeStream<'a, T> {
+    tail: T,
+    pending: &'a mut Vec<Token>,
+}
+
+impl<T: TokenStream> CjkBigramDecomposeStream<'_, T> {
+    fn decompose_cjk(&mut self) {
+        let token = self.tail.token();
+        let chars: Vec<char> = token.text.chars().collect();
+
+        // Only decompose tokens that are entirely CJK.
+        if chars.is_empty() || !chars.iter().all(|c| is_cjk(*c)) {
+            return;
+        }
+
+        if chars.len() == 1 {
+            // Single CJK character: emit as unigram (already the token text).
+            return;
+        }
+
+        // Build bigrams in reverse so `.pop()` yields them left-to-right.
+        // We replace the original token entirely with bigrams.
+        let mut bigrams: Vec<Token> = Vec::with_capacity(chars.len());
+        for i in (0..chars.len() - 1).rev() {
+            let mut bigram = String::with_capacity(8);
+            bigram.push(chars[i]);
+            bigram.push(chars[i + 1]);
+            bigrams.push(Token {
+                text: bigram,
+                position: token.position,
+                offset_from: token.offset_from,
+                offset_to: token.offset_to,
+                position_length: token.position_length,
+            });
+        }
+
+        // Clear the original token text and replace with bigrams via pending.
+        // The first bigram is popped first (it's at the end of the vec).
+        self.pending.extend(bigrams);
+    }
+}
+
+impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
+    fn advance(&mut self) -> bool {
+        self.pending.pop();
+        if !self.pending.is_empty() {
+            return true;
+        }
+
+        if !self.tail.advance() {
+            return false;
+        }
+
+        self.decompose_cjk();
         true
     }
 
@@ -635,22 +766,32 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 /// Register the tokenizer used by cass-compatible lexical fields.
 ///
 /// Pipeline:
-///   1. `RegexTokenizer` — matches `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*`, preserving hyphenated
-///      identifiers like `bd-q3fy` or `POL-358` as single tokens.
+///   1. `RegexTokenizer` — matches ASCII alphanumeric runs (with hyphens)
+///      **and** CJK character runs as separate tokens.
 ///   2. `HyphenDecompose` — for each hyphenated token, emits the compound
 ///      form *and* the individual sub-parts (all at the same position) so
 ///      both exact ID searches and partial-word searches match.
-///   3. `LowerCaser` — normalizes to lowercase.
-///   4. `RemoveLongFilter` — drops tokens longer than 256 bytes.
+///   3. `CjkBigramDecompose` — decomposes CJK-only tokens into overlapping
+///      character bigrams so that sub-string queries work for Chinese,
+///      Japanese, and Korean text.
+///   4. `LowerCaser` — normalizes to lowercase.
+///   5. `RemoveLongFilter` — drops tokens longer than 256 bytes.
 pub fn cass_ensure_tokenizer(index: &mut Index) {
-    // [a-zA-Z0-9]+ matches alphanumeric runs; (?:-[a-zA-Z0-9]+)* extends
+    // [a-zA-Z0-9]+ matches ASCII alphanumeric runs; (?:-[a-zA-Z0-9]+)* extends
     // across hyphens.  We use an explicit character class instead of \w to
     // exclude underscores — matching the behaviour of the old SimpleTokenizer
     // and cass_sanitize_query, which both treat `_` as a word boundary.
-    let regex_tok = RegexTokenizer::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*")
-        .expect("hyphen-preserving regex tokenizer pattern must be valid");
+    //
+    // The CJK alternation matches runs of CJK Unified Ideographs, Hiragana,
+    // Katakana, Hangul Syllables, and other CJK ranges so they are emitted as
+    // tokens that the CjkBigramDecompose filter can then split into bigrams.
+    let regex_tok = RegexTokenizer::new(
+        r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF]+",
+    )
+    .expect("hyphen-preserving + CJK regex tokenizer pattern must be valid");
     let analyzer = TextAnalyzer::builder(regex_tok)
         .filter(HyphenDecompose)
+        .filter(CjkBigramDecompose)
         .filter(LowerCaser)
         .filter(RemoveLongFilter::limit(256))
         .build();
@@ -1040,6 +1181,67 @@ fn cass_apply_query_token(
     *just_saw_or = false;
 }
 
+/// Returns `true` when the string contains at least one CJK character.
+#[inline]
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(is_cjk)
+}
+
+/// Decompose a CJK string into character bigrams (matching `CjkBigramDecompose`).
+/// For a single CJK character, returns the character itself as a unigram.
+fn cjk_bigrams(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().filter(|c| is_cjk(*c)).collect();
+    if chars.len() <= 1 {
+        return chars.iter().map(|c| c.to_string()).collect();
+    }
+    (0..chars.len() - 1)
+        .map(|i| {
+            let mut b = String::with_capacity(8);
+            b.push(chars[i]);
+            b.push(chars[i + 1]);
+            b
+        })
+        .collect()
+}
+
+/// Build a query that requires ALL bigrams to match in at least one field.
+/// This mirrors how the tokenizer indexes CJK text.
+fn cass_build_cjk_term_query(
+    bigrams: &[String],
+    fields: &CassFields,
+) -> Option<Box<dyn Query>> {
+    if bigrams.is_empty() {
+        return None;
+    }
+
+    // For each bigram, require it to appear in at least one searchable field.
+    let mut bigram_musts: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    for bigram in bigrams {
+        let mut field_shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for field in [
+            fields.title,
+            fields.content,
+            fields.title_prefix,
+            fields.content_prefix,
+        ] {
+            field_shoulds.push((
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, bigram),
+                    IndexRecordOption::WithFreqsAndPositions,
+                )),
+            ));
+        }
+        bigram_musts.push((Occur::Must, Box::new(BooleanQuery::new(field_shoulds))));
+    }
+
+    match bigram_musts.len() {
+        0 => None,
+        1 => bigram_musts.pop().map(|(_, q)| q),
+        _ => Some(Box::new(BooleanQuery::new(bigram_musts))),
+    }
+}
+
 /// Build query clauses for a single term based on its wildcard pattern.
 fn cass_build_term_query_clauses(
     pattern: &CassWildcardPattern,
@@ -1050,6 +1252,14 @@ fn cass_build_term_query_clauses(
     match pattern {
         CassWildcardPattern::Exact(term) | CassWildcardPattern::Prefix(term) => {
             if term.is_empty() {
+                return shoulds;
+            }
+            // CJK terms must be decomposed into bigrams to match the indexed tokens.
+            if contains_cjk(term) {
+                let bigrams = cjk_bigrams(term);
+                if let Some(q) = cass_build_cjk_term_query(&bigrams, fields) {
+                    shoulds.push((Occur::Should, q));
+                }
                 return shoulds;
             }
             for field in [
@@ -1111,6 +1321,12 @@ fn cass_build_phrase_query(terms: &[String], fields: &CassFields) -> Option<Box<
         return None;
     }
     if terms.len() == 1 {
+        return cass_build_compound_term_query(terms, fields);
+    }
+
+    // If any term contains CJK, fall back to compound term query (AND of bigrams)
+    // because PhraseQuery expects exact indexed tokens and CJK is bigram-indexed.
+    if terms.iter().any(|t| contains_cjk(t)) {
         return cass_build_compound_term_query(terms, fields);
     }
 
@@ -1359,6 +1575,223 @@ mod cass_query_tests {
         assert!(
             dbg.contains("BooleanQuery"),
             "expected boolean query: {dbg}"
+        );
+    }
+
+    #[test]
+    fn is_cjk_detects_chinese_characters() {
+        assert!(is_cjk('\u{4E00}')); // CJK Unified start
+        assert!(is_cjk('\u{641C}')); // 搜
+        assert!(is_cjk('\u{7D22}')); // 索
+        assert!(!is_cjk('a'));
+        assert!(!is_cjk('1'));
+    }
+
+    #[test]
+    fn is_cjk_detects_japanese_hiragana_katakana() {
+        assert!(is_cjk('\u{3042}')); // あ (hiragana)
+        assert!(is_cjk('\u{30A2}')); // ア (katakana)
+    }
+
+    #[test]
+    fn is_cjk_detects_korean_hangul() {
+        assert!(is_cjk('\u{AC00}')); // 가 (hangul start)
+        assert!(is_cjk('\u{D558}')); // 하
+    }
+
+    #[test]
+    fn cjk_bigram_decompose_produces_bigrams() {
+        // Build a minimal tokenizer pipeline with just CJK bigrams.
+        let regex_tok = RegexTokenizer::new(
+            r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF]+"
+        ).unwrap();
+        let mut analyzer = TextAnalyzer::builder(regex_tok)
+            .filter(CjkBigramDecompose)
+            .build();
+
+        // Chinese: 搜索引擎 -> bigrams: 搜索, 索引, 引擎
+        let mut stream = analyzer.token_stream("搜索引擎");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens, vec!["搜索", "索引", "引擎"]);
+    }
+
+    #[test]
+    fn cjk_bigram_single_char_emits_unigram() {
+        let regex_tok = RegexTokenizer::new(
+            r"[\u4E00-\u9FFF]+"
+        ).unwrap();
+        let mut analyzer = TextAnalyzer::builder(regex_tok)
+            .filter(CjkBigramDecompose)
+            .build();
+
+        let mut stream = analyzer.token_stream("搜");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens, vec!["搜"]);
+    }
+
+    #[test]
+    fn cjk_bigram_passes_through_ascii() {
+        // ASCII tokens should pass through unchanged.
+        let regex_tok = RegexTokenizer::new(
+            r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF]+"
+        ).unwrap();
+        let mut analyzer = TextAnalyzer::builder(regex_tok)
+            .filter(CjkBigramDecompose)
+            .build();
+
+        let mut stream = analyzer.token_stream("hello");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens, vec!["hello"]);
+    }
+
+    #[test]
+    fn cjk_mixed_text_tokenizes_both() {
+        // Mixed CJK and ASCII text should produce tokens for both.
+        let regex_tok = RegexTokenizer::new(
+            r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]+"
+        ).unwrap();
+        let mut analyzer = TextAnalyzer::builder(regex_tok)
+            .filter(CjkBigramDecompose)
+            .filter(LowerCaser)
+            .build();
+
+        // "Hello搜索World" -> hello, 搜索, world
+        let mut stream = analyzer.token_stream("Hello搜索World");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens, vec!["hello", "搜索", "world"]);
+    }
+
+    #[test]
+    fn cjk_sanitize_query_preserves_chinese() {
+        let out = cass_sanitize_query("搜索引擎 test");
+        assert!(out.contains("搜索引擎"));
+        assert!(out.contains("test"));
+    }
+
+    #[test]
+    fn cjk_index_and_search_roundtrip() {
+        // End-to-end: index a Chinese document, search for a substring.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+
+        let doc = CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "/tmp/test".to_string(),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000),
+            title: Some("搜索引擎测试".to_string()),
+            content: "这是一个搜索引擎的测试".to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[doc]).expect("add");
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+
+        let fields = idx.fields();
+        let query = cass_build_tantivy_query("搜索", &CassQueryFilters::default(), &fields);
+
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .expect("search");
+        assert!(
+            !results.is_empty(),
+            "CJK search for '搜索' should find the indexed Chinese document"
+        );
+    }
+
+    #[test]
+    fn japanese_index_and_search_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+
+        let doc = CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "/tmp/test".to_string(),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000),
+            title: Some("テスト".to_string()),
+            content: "これはテストです".to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[doc]).expect("add");
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+
+        let fields = idx.fields();
+        let query = cass_build_tantivy_query("テスト", &CassQueryFilters::default(), &fields);
+
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .expect("search");
+        assert!(
+            !results.is_empty(),
+            "CJK search for 'テスト' should find the indexed Japanese document"
+        );
+    }
+
+    #[test]
+    fn korean_index_and_search_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+
+        let doc = CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "/tmp/test".to_string(),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000),
+            title: Some("검색엔진".to_string()),
+            content: "한국어 검색엔진 테스트".to_string(),
+            conversation_id: None,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        idx.add_cass_documents(&[doc]).expect("add");
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+
+        let fields = idx.fields();
+        let query = cass_build_tantivy_query("검색", &CassQueryFilters::default(), &fields);
+
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .expect("search");
+        assert!(
+            !results.is_empty(),
+            "CJK search for '검색' should find the indexed Korean document"
         );
     }
 }
