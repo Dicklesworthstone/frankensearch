@@ -856,7 +856,13 @@ impl TwoTierSearcher {
         let (embed_timed, lexical_timed) = rayon::join(
             || {
                 let start = Instant::now();
-                let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query));
+                let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query))
+                    .unwrap_or_else(|| {
+                        Err(SearchError::EmbeddingFailed {
+                            model: self.fast_embedder.id().to_owned(),
+                            source: "embedder returned Pending; only sync-in-async embedders are supported in the rayon path".into(),
+                        })
+                    });
                 (result, start.elapsed())
             },
             || {
@@ -864,7 +870,13 @@ impl TwoTierSearcher {
                     || (None, Duration::ZERO),
                     |lex| {
                         let start = Instant::now();
-                        let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget));
+                        let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget))
+                            .unwrap_or_else(|| {
+                                Err(SearchError::SubsystemError {
+                                    subsystem: "lexical",
+                                    source: "lexical search returned Pending; only sync-in-async implementations are supported in the rayon path".into(),
+                                })
+                            });
                         (Some(result), start.elapsed())
                     },
                 )
@@ -2438,22 +2450,15 @@ fn contains_term_with_word_boundaries(text: &str, term: &str) -> bool {
 /// on the first poll. This helper exploits that property to call them from
 /// synchronous contexts (e.g., `rayon::join` threads).
 ///
-/// # Panics
-///
-/// Panics if the future is not immediately ready (i.e., actually yields `Pending`).
+/// Returns `None` if the future is not immediately ready (i.e., yields `Pending`).
 fn poll_immediate<T>(
     mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
-) -> T {
+) -> Option<T> {
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(val) => val,
-        std::task::Poll::Pending => {
-            panic!(
-                "poll_immediate: future yielded Pending — only use with sync-in-async \
-                 implementations (hash/model2vec embedders, Tantivy lexical)"
-            );
-        }
+        std::task::Poll::Ready(val) => Some(val),
+        std::task::Poll::Pending => None,
     }
 }
 
