@@ -29,6 +29,7 @@ hnsw_rs = { workspace = true, optional = true }
 asupersync = { workspace = true }
 serde_json = { workspace = true }
 proptest = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

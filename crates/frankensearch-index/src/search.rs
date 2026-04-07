@@ -763,7 +763,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        // Use tempfile::tempdir() parent for CI compatibility (macOS runners
+        // can hit PermissionDenied on /tmp under heavy concurrent test load).
+        let base = tempfile::tempdir()
+            .map(|d| d.into_path())
+            .unwrap_or_else(|_| std::env::temp_dir());
+        base.join(format!(
             "frankensearch-index-search-{name}-{}-{now}.fsvi",
             std::process::id()
         ))
