@@ -435,10 +435,8 @@ jobs:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
-            build_tool: cargo
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            build_tool: cargo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -491,9 +489,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          target="${{ matrix.target }}"
-          extra_features=""
-          cargo build -p frankensearch-fsfs --release --target "${target}" ${extra_features}
+          cargo build -p frankensearch-fsfs --release --target "${{ matrix.target }}"
 
       - name: Package archive + checksum
         shell: bash
