@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.2.3"
+version = "1.2.4"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
 rust-version.workspace = true

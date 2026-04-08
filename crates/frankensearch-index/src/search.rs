@@ -766,7 +766,11 @@ mod tests {
         // Use tempfile::tempdir() parent for CI compatibility (macOS runners
         // can hit PermissionDenied on /tmp under heavy concurrent test load).
         let base = tempfile::tempdir()
-            .map(|d| { let p = d.path().to_owned(); let _ = d.keep(); p })
+            .map(|d| {
+                let p = d.path().to_owned();
+                let _ = d.keep();
+                p
+            })
             .unwrap_or_else(|_| std::env::temp_dir());
         base.join(format!(
             "frankensearch-index-search-{name}-{}-{now}.fsvi",
