@@ -212,7 +212,7 @@ fn two_tier_index_fast_and_quality_alignment() {
         .quality_scores_for_hits(&query_quality, &fast_hits)
         .expect("quality scores");
     // shared-1 should have highest quality score (its quality embedding is close to query)
-    assert!(quality_scores[0] > quality_scores[1]);
+    assert!(quality_scores[0].unwrap() > quality_scores[1].unwrap());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

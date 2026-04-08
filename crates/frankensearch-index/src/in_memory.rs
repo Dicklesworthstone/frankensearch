@@ -451,11 +451,27 @@ impl InMemoryTwoTierIndex {
         &self,
         query_vec: &[f32],
         hits: &[VectorHit],
-    ) -> SearchResult<Vec<f32>> {
+    ) -> SearchResult<Vec<Option<f32>>> {
         let Some(quality) = &self.quality_index else {
-            return Ok(vec![0.0; hits.len()]);
+            return Ok(vec![None; hits.len()]);
         };
-        quality.scores_for_hits(query_vec, hits)
+        if query_vec.len() != quality.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: quality.dimension,
+                found: query_vec.len(),
+            });
+        }
+        let mut scores = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let score = quality
+                .doc_ids
+                .iter()
+                .position(|id| id == &hit.doc_id)
+                .map(|idx| dot_product_f16_f32(quality.vector_slice(idx), query_vec))
+                .transpose()?;
+            scores.push(score);
+        }
+        Ok(scores)
     }
 
     /// Whether a quality index is loaded.
@@ -863,14 +879,17 @@ mod tests {
             .quality_scores_for_hits(&quality_query, &hits)
             .unwrap();
         assert_eq!(scores.len(), 5);
-        // All scores should be finite
-        for &s in &scores {
-            assert!(s.is_finite(), "quality score should be finite");
+        // All scores should be Some and finite
+        for s in &scores {
+            assert!(
+                s.is_some_and(|v| v.is_finite()),
+                "quality score should be Some and finite"
+            );
         }
     }
 
     #[test]
-    fn two_tier_no_quality_returns_zeros() {
+    fn two_tier_no_quality_returns_nones() {
         let dim = 4;
         let fast = InMemoryVectorIndex::from_vectors(
             vec!["a".into()],
@@ -886,7 +905,7 @@ mod tests {
         let scores = two_tier
             .quality_scores_for_hits(&make_normalized_vec(dim, 1.0), &hits)
             .unwrap();
-        assert_eq!(scores, vec![0.0]);
+        assert_eq!(scores, vec![None]);
     }
 
     #[test]

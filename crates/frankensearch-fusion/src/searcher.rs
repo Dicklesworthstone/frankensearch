@@ -836,7 +836,7 @@ impl TwoTierSearcher {
     ) -> SearchResult<Vec<ScoredResult>> {
         let candidate_target = self.conformal_candidate_target(k);
         let base_candidates =
-            candidate_count(candidate_target, 0, self.config.candidate_multiplier);
+            candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
 
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
         let semantic_budget =
@@ -1203,14 +1203,18 @@ impl TwoTierSearcher {
             .quality_scores_for_hits(&quality_vec, &fast_hits)?;
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Build quality VectorHits for blending.
+        // Build quality VectorHits for blending. Only include docs that have
+        // quality-tier vectors — docs with None are left out so the blend
+        // function uses their fast-only score without penalty.
         let mut quality_hits = Vec::with_capacity(fast_hits.len());
-        for (hit, &score) in fast_hits.iter().zip(quality_scores.iter()) {
-            quality_hits.push(VectorHit {
-                index: hit.index,
-                score,
-                doc_id: hit.doc_id.clone(),
-            });
+        for (hit, score) in fast_hits.iter().zip(quality_scores.iter()) {
+            if let Some(s) = score {
+                quality_hits.push(VectorHit {
+                    index: hit.index,
+                    score: *s,
+                    doc_id: hit.doc_id.clone(),
+                });
+            }
         }
         self.apply_score_calibration_to_hits(&mut quality_hits);
 
@@ -1573,6 +1577,20 @@ impl TwoTierSearcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .should_skip_quality()
+    }
+
+    /// Reset the phase gate, clearing accumulated evidence and any decision.
+    ///
+    /// Call this after index rebuilds or significant corpus changes so the gate
+    /// re-evaluates whether quality refinement is beneficial for the new data.
+    /// No-op if the searcher was not configured with a phase gate.
+    pub fn reset_phase_gate(&self) {
+        if let Some(phase_gate) = self.phase_gate.as_ref() {
+            let _ = phase_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reset();
+        }
     }
 
     fn maybe_record_phase_gate_observation(
@@ -2871,6 +2889,33 @@ mod tests {
             builder
                 .add_fast_record(format!("doc-{i}"), &vec)
                 .expect("add record");
+        }
+        Arc::new(builder.finish().expect("finish index"))
+    }
+
+    /// Build a test index with both fast and quality vectors.
+    fn build_test_index_with_quality(dimension: usize) -> Arc<TwoTierIndex> {
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-searcher-test-qual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut builder =
+            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+        builder.set_fast_embedder_id("stub-fast");
+        builder.set_quality_embedder_id("stub-quality");
+        for i in 0..10 {
+            let mut vec = vec![0.0; dimension];
+            vec[i % dimension] = 1.0;
+            builder
+                .add_fast_record(format!("doc-{i}"), &vec)
+                .expect("add fast record");
+            builder
+                .add_quality_record(format!("doc-{i}"), &vec)
+                .expect("add quality record");
         }
         Arc::new(builder.finish().expect("finish index"))
     }
@@ -5380,7 +5425,7 @@ mod tests {
     #[test]
     fn search_collect_with_text_returns_refined_when_quality_available() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())

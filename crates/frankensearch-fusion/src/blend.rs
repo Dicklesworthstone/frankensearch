@@ -9,11 +9,10 @@
 //!
 //! where `alpha` is `blend_factor` (default behavior target: `0.7`).
 //!
-//! Missing-source behavior is intentional:
-//! - document only in fast set: `quality_score = 0.0`
-//! - document only in quality set: `fast_score = 0.0`
-//!
-//! This naturally penalizes single-source hits when both tiers are available.
+//! Missing-source behavior:
+//! - document in both sets: blended with `alpha * quality + (1-alpha) * fast`
+//! - document only in fast set: uses fast score directly (no quality penalty)
+//! - document only in quality set: uses quality score directly (no fast penalty)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -163,9 +162,12 @@ pub fn blend_two_tier(
     let mut blended: Vec<VectorHit> = merged
         .into_iter()
         .map(|(doc_id, pair)| {
-            let fast = pair.fast.unwrap_or(0.0);
-            let quality = pair.quality.unwrap_or(0.0);
-            let score = alpha.mul_add(quality, (1.0 - alpha) * fast);
+            let score = match (pair.fast, pair.quality) {
+                (Some(f), Some(q)) => alpha.mul_add(q, (1.0 - alpha) * f),
+                (Some(f), None) => f,
+                (None, Some(q)) => q,
+                (None, None) => 0.0,
+            };
             VectorHit {
                 index: pair.index,
                 score: sanitize_score(score),
@@ -436,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn single_source_scores_are_penalized() {
+    fn single_source_scores_are_not_penalized() {
         let fast = vec![hit("fast-only", 10.0, 0)];
         let quality = vec![hit("quality-only", 10.0, 1)];
         let blended = blend_two_tier(&fast, &quality, 0.7);
@@ -444,9 +446,10 @@ mod tests {
         let fast_only = score_for("fast-only", &blended);
         let quality_only = score_for("quality-only", &blended);
 
+        // Single-source docs use their normalized score directly without penalty.
         // Degenerate single-entry normalization clamps source scores to 1.0.
-        assert!((fast_only - 0.3).abs() <= EPSILON);
-        assert!((quality_only - 0.7).abs() <= EPSILON);
+        assert!((fast_only - 1.0).abs() <= EPSILON);
+        assert!((quality_only - 1.0).abs() <= EPSILON);
     }
 
     #[test]

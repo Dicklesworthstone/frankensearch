@@ -219,10 +219,12 @@ impl SyncTwoTierSearcher {
         let quality_hits = fast_hits
             .iter()
             .zip(quality_scores.iter())
-            .map(|(fast, score)| VectorHit {
-                index: fast.index,
-                doc_id: fast.doc_id.clone(),
-                score: *score,
+            .filter_map(|(fast, score)| {
+                score.map(|s| VectorHit {
+                    index: fast.index,
+                    doc_id: fast.doc_id.clone(),
+                    score: s,
+                })
             })
             .collect::<Vec<_>>();
         let blended = blend_two_tier(

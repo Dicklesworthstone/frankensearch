@@ -138,20 +138,28 @@ impl TwoTierConfig {
     /// Load overrides from environment variables.
     ///
     /// Only overrides fields for which environment variables are set.
-    /// Invalid values are silently ignored (defaults are kept).
+    /// Invalid or out-of-range values are rejected with a warning log.
     #[must_use]
     pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(val) = std::env::var("FRANKENSEARCH_QUALITY_WEIGHT")
-            && let Ok(w) = val.parse::<f64>()
-            && (0.0..=1.0).contains(&w)
-        {
-            self.quality_weight = w;
+        if let Ok(val) = std::env::var("FRANKENSEARCH_QUALITY_WEIGHT") {
+            match val.parse::<f64>() {
+                Ok(w) if (0.0..=1.0).contains(&w) => self.quality_weight = w,
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_QUALITY_WEIGHT",
+                    value = %val,
+                    "invalid value (expected f64 in 0.0..=1.0), keeping default"
+                ),
+            }
         }
-        if let Ok(val) = std::env::var("FRANKENSEARCH_RRF_K")
-            && let Ok(k) = val.parse::<f64>()
-            && k > 0.0
-        {
-            self.rrf_k = k;
+        if let Ok(val) = std::env::var("FRANKENSEARCH_RRF_K") {
+            match val.parse::<f64>() {
+                Ok(k) if k > 0.0 => self.rrf_k = k,
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_RRF_K",
+                    value = %val,
+                    "invalid value (expected f64 > 0.0), keeping default"
+                ),
+            }
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_FAST_ONLY") {
             self.fast_only = val == "true" || val == "1";
@@ -159,21 +167,37 @@ impl TwoTierConfig {
         if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_ENABLED") {
             self.graph_ranking_enabled = val == "true" || val == "1";
         }
-        if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_WEIGHT")
-            && let Ok(weight) = val.parse::<f64>()
-            && (0.0..=1.0).contains(&weight)
-        {
-            self.graph_ranking_weight = weight;
+        if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_WEIGHT") {
+            match val.parse::<f64>() {
+                Ok(weight) if (0.0..=1.0).contains(&weight) => {
+                    self.graph_ranking_weight = weight;
+                }
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_GRAPH_RANKING_WEIGHT",
+                    value = %val,
+                    "invalid value (expected f64 in 0.0..=1.0), keeping default"
+                ),
+            }
         }
-        if let Ok(val) = std::env::var("FRANKENSEARCH_QUALITY_TIMEOUT")
-            && let Ok(ms) = val.parse::<u64>()
-        {
-            self.quality_timeout_ms = ms;
+        if let Ok(val) = std::env::var("FRANKENSEARCH_QUALITY_TIMEOUT") {
+            match val.parse::<u64>() {
+                Ok(ms) => self.quality_timeout_ms = ms,
+                Err(_) => tracing::warn!(
+                    var = "FRANKENSEARCH_QUALITY_TIMEOUT",
+                    value = %val,
+                    "invalid value (expected u64), keeping default"
+                ),
+            }
         }
-        if let Ok(val) = std::env::var("FRANKENSEARCH_HNSW_THRESHOLD")
-            && let Ok(threshold) = val.parse::<usize>()
-        {
-            self.hnsw_threshold = threshold;
+        if let Ok(val) = std::env::var("FRANKENSEARCH_HNSW_THRESHOLD") {
+            match val.parse::<usize>() {
+                Ok(threshold) => self.hnsw_threshold = threshold,
+                Err(_) => tracing::warn!(
+                    var = "FRANKENSEARCH_HNSW_THRESHOLD",
+                    value = %val,
+                    "invalid value (expected usize), keeping default"
+                ),
+            }
         }
         self
     }

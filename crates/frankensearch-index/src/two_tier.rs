@@ -350,8 +350,9 @@ impl TwoTierIndex {
 
     /// Compute quality-tier scores for fast-index document positions.
     ///
-    /// Missing quality entries produce `0.0`, preserving index alignment for
-    /// downstream blending.
+    /// Missing quality entries produce `None`, allowing downstream blending
+    /// to use fast-only scores without penalizing documents that lack quality
+    /// vectors.
     ///
     /// # Errors
     ///
@@ -362,9 +363,9 @@ impl TwoTierIndex {
         &self,
         query_vec: &[f32],
         hits: &[VectorHit],
-    ) -> SearchResult<Vec<f32>> {
+    ) -> SearchResult<Vec<Option<f32>>> {
         let Some(quality_index) = &self.quality_index else {
-            return Ok(vec![0.0; hits.len()]);
+            return Ok(vec![None; hits.len()]);
         };
 
         if query_vec.len() != quality_index.dimension() {
@@ -408,7 +409,7 @@ impl TwoTierIndex {
                 }
             }
 
-            scores.push(found_score.unwrap_or(0.0));
+            scores.push(found_score);
         }
         Ok(scores)
     }
@@ -1024,13 +1025,16 @@ mod tests {
             .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
             .expect("quality scores");
         assert_eq!(scores.len(), 3);
-        assert!((scores[0] - 1.0).abs() < 1e-6);
-        assert!(scores[1].abs() < 1e-6);
-        assert!(scores[2].abs() < 1e-6);
+        // doc-a has quality vector [1,0,0,0], query=[1,0,0,0] → dot=1.0
+        assert!((scores[0].unwrap() - 1.0).abs() < 1e-6);
+        // doc-b has NO quality vector → None
+        assert!(scores[1].is_none());
+        // doc-c has quality vector [0,1,0,0], query=[1,0,0,0] → dot=0.0
+        assert!(scores[2].unwrap().abs() < 1e-6);
     }
 
     #[test]
-    fn quality_scores_are_zero_without_quality_index() {
+    fn quality_scores_are_none_without_quality_index() {
         let dir = temp_index_dir("no-quality");
         fs::create_dir_all(&dir).expect("create temp dir");
         let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
@@ -1061,7 +1065,7 @@ mod tests {
         let scores = index
             .quality_scores_for_hits(&[1.0, 0.0], &hits)
             .expect("scores");
-        assert_eq!(scores, vec![0.0, 0.0, 0.0]);
+        assert_eq!(scores, vec![None, None, None]);
     }
 
     #[test]
@@ -1769,9 +1773,9 @@ mod tests {
             .expect("quality scores");
         assert_eq!(scores.len(), 2);
         // doc-a quality = [0,0,1] dot [0,1,0] = 0.0
-        assert!(scores[0].abs() < 1e-6);
+        assert!(scores[0].unwrap().abs() < 1e-6);
         // doc-b quality = [0,1,0] dot [0,1,0] = 1.0
-        assert!((scores[1] - 1.0).abs() < 1e-6);
+        assert!((scores[1].unwrap() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1907,7 +1911,7 @@ mod tests {
         let scores = index
             .quality_scores_for_hits(&[1.0, 2.0, 3.0, 4.0, 5.0], &hits)
             .expect("any dim accepted");
-        assert_eq!(scores, vec![0.0]);
+        assert_eq!(scores, vec![None]);
     }
 
     #[test]

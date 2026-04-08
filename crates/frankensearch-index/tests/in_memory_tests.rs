@@ -262,13 +262,17 @@ fn in_memory_two_tier_supports_quality_and_no_quality_modes() {
         .quality_scores_for_hits(&normalize(vec![1.0, 0.0]), &hits)
         .expect("quality scores");
     assert_eq!(quality_scores.len(), hits.len());
-    assert!(quality_scores.iter().all(|score| score.is_finite()));
+    assert!(
+        quality_scores
+            .iter()
+            .all(|score| score.is_some_and(|s| s.is_finite()))
+    );
 
     let without_quality = InMemoryTwoTierIndex::new(fast, None);
-    let zero_scores = without_quality
+    let none_scores = without_quality
         .quality_scores_for_hits(&normalize(vec![1.0, 0.0]), &hits)
         .expect("quality fallback scores");
-    assert_eq!(zero_scores, vec![0.0; hits.len()]);
+    assert_eq!(none_scores, vec![None; hits.len()]);
 }
 
 #[test]
