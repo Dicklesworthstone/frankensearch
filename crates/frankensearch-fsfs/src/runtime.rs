@@ -2361,15 +2361,21 @@ fn archive_entry_path_is_safe(entry: &str) -> bool {
         .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
 }
 
-fn validate_tar_archive_paths(archive_path: &Path) -> SearchResult<()> {
-    let listing = std::process::Command::new("tar")
-        .args(["-tJf"])
-        .arg(archive_path)
-        .output()
-        .map_err(|e| SearchError::SubsystemError {
-            subsystem: "fsfs.update.tar_list",
-            source: Box::new(e),
-        })?;
+fn validate_archive_paths(archive_path: &Path, is_zip: bool) -> SearchResult<()> {
+    let mut cmd = std::process::Command::new("tar");
+    if is_zip {
+        cmd.args(["-tf"]);
+    } else {
+        cmd.args(["-tJf"]);
+    }
+    let listing =
+        cmd.arg("--")
+            .arg(archive_path)
+            .output()
+            .map_err(|e| SearchError::SubsystemError {
+                subsystem: "fsfs.update.tar_list",
+                source: Box::new(e),
+            })?;
 
     if !listing.status.success() {
         return Err(SearchError::InvalidConfig {
@@ -3630,8 +3636,8 @@ impl FsfsRuntime {
             source: Box::new(e),
         })?;
 
+        validate_archive_paths(&archive_path, is_zip)?;
         if !is_zip {
-            validate_tar_archive_paths(&archive_path)?;
             let tar_status = std::process::Command::new("tar")
                 .args(["-xJf"])
                 .arg(&archive_path)
@@ -8394,13 +8400,12 @@ impl FsfsRuntime {
         ))?;
 
         // Semantic upgrade pass: if running with hash fallback, try real embedder
-        if embedder_is_hash_fallback && !deferred_semantic_file_keys.is_empty() {
+        if embedder_is_hash_fallback {
             if let Ok(real_embedder) = self.resolve_fast_embedder() {
                 if real_embedder.embed(cx, "probe").await.is_ok() {
                     info!(
                         embedder = real_embedder.id(),
-                        deferred_files = deferred_semantic_file_keys.len(),
-                        "semantic upgrade: real embedder now available, upgrading deferred files"
+                        "semantic upgrade: real embedder now available, rebuilding semantic index"
                     );
                     on_progress(&make_snapshot(
                         IndexingProgressStage::SemanticUpgrade,
@@ -8425,30 +8430,310 @@ impl FsfsRuntime {
                         &recent_warnings,
                     ))?;
 
-                    // Recreate vector writer with real embedder
+                    // Finish the hash-based writer before rebuilding.
                     if let Some(writer) = vector_writer.take() {
                         writer.finish()?;
                     }
-                    let real_vector_writer = VectorIndex::create(
-                        &vector_path,
+
+                    let upgrade_suffix = pressure_timestamp_ms();
+                    let upgrade_path =
+                        vector_path.with_extension(format!("fsvi.upgrade.{upgrade_suffix}"));
+                    let mut upgrade_writer = VectorIndex::create(
+                        &upgrade_path,
                         real_embedder.id(),
                         real_embedder.dimension(),
                     )?;
 
-                    for key in &deferred_semantic_file_keys {
-                        if let Some(entry) = checkpoint.files.get_mut(key) {
-                            entry.semantic_indexed = true;
+                    let mut upgrade_failed = false;
+                    let mut upgrade_batch: Vec<(String, IndexableDocument)> =
+                        Vec::with_capacity(BATCH_SIZE);
+
+                    for entry in manifests
+                        .iter()
+                        .filter(|entry| entry.ingestion_class == "full_semantic_lexical")
+                    {
+                        if upgrade_failed {
+                            break;
+                        }
+
+                        let source_path = target_root.join(&entry.file_key);
+                        let metadata = match fs::metadata(&source_path) {
+                            Ok(metadata) => metadata,
+                            Err(error) if is_ignorable_index_walk_error(&error) => {
+                                warn!(
+                                    path = %source_path.display(),
+                                    error = %error,
+                                    "semantic upgrade skipped file with unreadable metadata"
+                                );
+                                upgrade_failed = true;
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    format!(
+                                        "Semantic upgrade aborted: unreadable metadata for {}",
+                                        source_path.display()
+                                    ),
+                                );
+                                break;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+
+                        let modified_ms = metadata
+                            .modified()
+                            .ok()
+                            .map(system_time_to_ms)
+                            .unwrap_or_default();
+                        let indexed_revision_ms = u64::try_from(entry.revision).unwrap_or_default();
+                        if modified_ms > indexed_revision_ms {
+                            upgrade_failed = true;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Semantic upgrade aborted: {} changed during indexing",
+                                    source_path.display()
+                                ),
+                            );
+                            warn!(
+                                path = %source_path.display(),
+                                modified_ms,
+                                indexed_revision_ms,
+                                "semantic upgrade aborted due to file change"
+                            );
+                            break;
+                        }
+
+                        let bytes = match fs::read(&source_path) {
+                            Ok(bytes) => bytes,
+                            Err(error) if is_ignorable_index_walk_error(&error) => {
+                                warn!(
+                                    path = %source_path.display(),
+                                    error = %error,
+                                    "semantic upgrade skipped file with read error"
+                                );
+                                upgrade_failed = true;
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    format!(
+                                        "Semantic upgrade aborted: read error for {}",
+                                        source_path.display()
+                                    ),
+                                );
+                                break;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+
+                        let canonical = if is_pdf_file(&source_path) {
+                            match try_extract_pdf_text(&bytes, &source_path) {
+                                Some(pdf_text) => canonicalizer.canonicalize(&pdf_text),
+                                None => {
+                                    upgrade_failed = true;
+                                    push_warning(
+                                        &mut recent_warnings,
+                                        IndexingWarningSeverity::Error,
+                                        format!(
+                                            "Semantic upgrade aborted: unable to extract PDF {}",
+                                            source_path.display()
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        } else if is_probably_binary(&bytes) {
+                            upgrade_failed = true;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Semantic upgrade aborted: binary file {}",
+                                    source_path.display()
+                                ),
+                            );
+                            break;
+                        } else {
+                            let raw_text = String::from_utf8_lossy(&bytes);
+                            canonicalizer.canonicalize(&raw_text)
+                        };
+
+                        if canonical.trim().is_empty() {
+                            upgrade_failed = true;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Semantic upgrade aborted: empty canonical text for {}",
+                                    source_path.display()
+                                ),
+                            );
+                            break;
+                        }
+
+                        let file_name = source_path
+                            .file_name()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let doc = IndexableDocument::new(entry.file_key.clone(), canonical)
+                            .with_title(file_name)
+                            .with_metadata("source_path", source_path.display().to_string())
+                            .with_metadata("ingestion_class", entry.ingestion_class.clone())
+                            .with_metadata("source_modified_ms", indexed_revision_ms.to_string());
+                        upgrade_batch.push((entry.file_key.clone(), doc));
+
+                        if upgrade_batch.len() >= BATCH_SIZE {
+                            let texts: Vec<&str> = upgrade_batch
+                                .iter()
+                                .map(|(_, doc)| doc.content.as_str())
+                                .collect();
+                            let embed_start = Instant::now();
+                            let embeddings_result = real_embedder.embed_batch(cx, &texts).await;
+                            embedding_elapsed_ms = embedding_elapsed_ms
+                                .saturating_add(embed_start.elapsed().as_millis());
+
+                            match embeddings_result {
+                                Ok(embeddings) => {
+                                    if embeddings.len() != upgrade_batch.len() {
+                                        upgrade_failed = true;
+                                        push_warning(
+                                            &mut recent_warnings,
+                                            IndexingWarningSeverity::Error,
+                                            format!(
+                                                "Semantic upgrade aborted: embed_batch returned {} vectors for {} documents",
+                                                embeddings.len(),
+                                                upgrade_batch.len(),
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                    let vector_start = Instant::now();
+                                    for ((_, doc), embedding) in
+                                        upgrade_batch.iter().zip(embeddings)
+                                    {
+                                        upgrade_writer.write_record(&doc.id, &embedding)?;
+                                    }
+                                    vector_elapsed_ms = vector_elapsed_ms
+                                        .saturating_add(vector_start.elapsed().as_millis());
+                                }
+                                Err(error) => {
+                                    upgrade_failed = true;
+                                    warn!(
+                                        error = %error,
+                                        "semantic upgrade embedding batch failed"
+                                    );
+                                    push_warning(
+                                        &mut recent_warnings,
+                                        IndexingWarningSeverity::Error,
+                                        format!(
+                                            "Semantic upgrade aborted: embedding batch failed: {error}"
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                            upgrade_batch.clear();
                         }
                     }
 
-                    real_vector_writer.finish()?;
-                    embedder_is_hash_fallback = false;
-                    embedder_degraded = false;
-                    push_warning(
-                        &mut recent_warnings,
-                        IndexingWarningSeverity::Info,
-                        "Semantic embedder recovered; upgrade complete".to_owned(),
-                    );
+                    if !upgrade_failed && !upgrade_batch.is_empty() {
+                        let texts: Vec<&str> = upgrade_batch
+                            .iter()
+                            .map(|(_, doc)| doc.content.as_str())
+                            .collect();
+                        let embed_start = Instant::now();
+                        let embeddings_result = real_embedder.embed_batch(cx, &texts).await;
+                        embedding_elapsed_ms =
+                            embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
+
+                        match embeddings_result {
+                            Ok(embeddings) => {
+                                if embeddings.len() != upgrade_batch.len() {
+                                    upgrade_failed = true;
+                                    push_warning(
+                                        &mut recent_warnings,
+                                        IndexingWarningSeverity::Error,
+                                        format!(
+                                            "Semantic upgrade aborted: embed_batch returned {} vectors for {} documents",
+                                            embeddings.len(),
+                                            upgrade_batch.len(),
+                                        ),
+                                    );
+                                } else {
+                                    let vector_start = Instant::now();
+                                    for ((_, doc), embedding) in
+                                        upgrade_batch.iter().zip(embeddings)
+                                    {
+                                        upgrade_writer.write_record(&doc.id, &embedding)?;
+                                    }
+                                    vector_elapsed_ms = vector_elapsed_ms
+                                        .saturating_add(vector_start.elapsed().as_millis());
+                                }
+                            }
+                            Err(error) => {
+                                upgrade_failed = true;
+                                warn!(
+                                    error = %error,
+                                    "semantic upgrade embedding batch failed"
+                                );
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    format!(
+                                        "Semantic upgrade aborted: embedding batch failed: {error}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    if upgrade_failed {
+                        push_warning(
+                            &mut recent_warnings,
+                            IndexingWarningSeverity::Warn,
+                            format!(
+                                "Semantic upgrade aborted; keeping hash index (upgrade file at {})",
+                                upgrade_path.display()
+                            ),
+                        );
+                    } else {
+                        upgrade_writer.finish()?;
+                        if let Err(error) = fs::rename(&upgrade_path, &vector_path) {
+                            warn!(
+                                upgrade = %upgrade_path.display(),
+                                target = %vector_path.display(),
+                                error = %error,
+                                "semantic upgrade rename failed; attempting copy"
+                            );
+                            fs::copy(&upgrade_path, &vector_path).map_err(|e| {
+                                SearchError::SubsystemError {
+                                    subsystem: "fsfs.semantic_upgrade.swap",
+                                    source: Box::new(e),
+                                }
+                            })?;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Warn,
+                                format!(
+                                    "Semantic upgrade copied new index into place; leftover file at {}",
+                                    upgrade_path.display()
+                                ),
+                            );
+                        }
+
+                        deferred_semantic_file_keys.clear();
+                        semantic_deferred_files = 0;
+                        embedder_is_hash_fallback = false;
+                        embedder_degraded = false;
+                        checkpoint.embedder_id = real_embedder.id().to_string();
+                        checkpoint.embedder_is_hash_fallback = false;
+                        push_warning(
+                            &mut recent_warnings,
+                            IndexingWarningSeverity::Info,
+                            "Semantic embedder recovered; upgrade complete".to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -8488,8 +8773,9 @@ impl FsfsRuntime {
         };
         self.write_index_sentinel(&index_root, &sentinel)?;
 
-        // Remove checkpoint on successful completion (unless degraded)
-        if embedder_is_hash_fallback {
+        // Remove checkpoint on successful completion (unless degraded or deferred).
+        let should_persist_checkpoint = embedder_is_hash_fallback || semantic_deferred_files > 0;
+        if should_persist_checkpoint {
             checkpoint.updated_at_ms = pressure_timestamp_ms();
             write_indexing_checkpoint(&index_root, &checkpoint);
         } else {
