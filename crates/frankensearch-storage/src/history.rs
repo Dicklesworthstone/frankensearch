@@ -118,6 +118,20 @@ pub fn record_search(
     Ok(())
 }
 
+fn escape_like_pattern(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Retrieve search history in most-recent-first order.
 pub fn list_search_history(conn: &Connection, limit: i64) -> SearchResult<Vec<SearchHistoryEntry>> {
     let params = [SqliteValue::Integer(limit)];
@@ -143,7 +157,7 @@ pub fn search_history_prefix(
     prefix: &str,
     limit: i64,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
-    let pattern = format!("{prefix}%");
+    let pattern = format!("{}%", escape_like_pattern(prefix));
     let params = [
         SqliteValue::Text(pattern.into()),
         SqliteValue::Integer(limit),
@@ -152,7 +166,7 @@ pub fn search_history_prefix(
         .query_with_params(
             "SELECT id, query, query_class, result_count, phase1_latency_ms, \
              phase2_latency_ms, top_results_json, searched_at \
-             FROM search_history WHERE query LIKE ?1 \
+             FROM search_history WHERE query LIKE ?1 ESCAPE '\\' \
              ORDER BY searched_at DESC LIMIT ?2;",
             &params,
         )
@@ -669,6 +683,23 @@ mod tests {
 
         let no_results = search_history_prefix(&conn, "golang", 10).expect("prefix search");
         assert!(no_results.is_empty());
+    }
+
+    #[test]
+    fn history_prefix_search_escapes_wildcards() {
+        let conn = test_conn();
+        for q in ["100% coverage", "100 percent", "abc_def", "abcXdef"] {
+            record_search(&conn, q, None, None, None, None, None, 1_700_000_000, 0)
+                .expect("record");
+        }
+
+        let percent_results = search_history_prefix(&conn, "100%", 10).expect("prefix search");
+        assert_eq!(percent_results.len(), 1);
+        assert_eq!(percent_results[0].query, "100% coverage");
+
+        let underscore_results = search_history_prefix(&conn, "abc_", 10).expect("prefix search");
+        assert_eq!(underscore_results.len(), 1);
+        assert_eq!(underscore_results[0].query, "abc_def");
     }
 
     // ─── Bookmark Tests ────────────────────────────────────────────────
