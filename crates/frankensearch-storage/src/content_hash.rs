@@ -26,7 +26,7 @@ impl ContentHasher {
         let digest = Self::hash(canonical_text);
         let mut out = String::with_capacity(digest.len() * 2);
         for byte in digest {
-            write!(&mut out, "{byte:02x}").expect("write to String is infallible");
+            let _ = write!(&mut out, "{byte:02x}");
         }
         out
     }

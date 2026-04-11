@@ -552,8 +552,18 @@ pub fn list_document_ids(conn: &Connection, limit: usize) -> SearchResult<Vec<St
         return Ok(Vec::new());
     }
 
-    let sql = format!("SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT {limit};");
-    let rows = conn.query(&sql).map_err(storage_error)?;
+    let limit_i64 = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+        field: "documents.limit".to_owned(),
+        value: limit.to_string(),
+        reason: "limit does not fit in sqlite integer".to_owned(),
+    })?;
+    let params = [SqliteValue::Integer(limit_i64)];
+    let rows = conn
+        .query_with_params(
+            "SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;",
+            &params,
+        )
+        .map_err(storage_error)?;
     let mut ids = Vec::with_capacity(rows.len());
 
     for row in &rows {
@@ -1191,12 +1201,12 @@ mod tests {
             );
             storage
                 .upsert_document(&doc)
-                .unwrap_or_else(|e| panic!("upsert for {id:?} should succeed: {e}"));
+                .expect("upsert should succeed");
 
             let fetched = storage
                 .get_document(id)
-                .unwrap_or_else(|e| panic!("get for {id:?} should succeed: {e}"))
-                .unwrap_or_else(|| panic!("document {id:?} should exist"));
+                .expect("get should succeed")
+                .expect("document should exist");
             assert_eq!(fetched.doc_id, *id);
         }
 
