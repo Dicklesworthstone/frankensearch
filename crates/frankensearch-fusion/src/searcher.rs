@@ -477,7 +477,7 @@ impl TwoTierSearcher {
             .await;
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
-        let initial_results = match initial {
+        let initial_hits = match initial {
             Ok(results) => results,
             Err(err) => {
                 self.export_error(&err);
@@ -495,7 +495,6 @@ impl TwoTierSearcher {
             }
         };
 
-        let initial_hits = initial_results.clone();
         let initial_latency = phase1_start.elapsed();
         let display_hits: Vec<_> = initial_hits.iter().take(k).cloned().collect();
 
