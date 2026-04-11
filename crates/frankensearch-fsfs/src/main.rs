@@ -544,7 +544,9 @@ fn run_config_set_command(
     } else {
         String::new()
     };
-    let mut doc: toml::Value =
+    let mut doc: toml::Value = if existing_text.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
         existing_text
             .parse()
             .map_err(|source: toml::de::Error| SearchError::SubsystemError {
@@ -553,7 +555,8 @@ fn run_config_set_command(
                     "failed to parse existing config at {}: {source}",
                     path.display()
                 ))),
-            })?;
+            })?
+    };
 
     // Navigate the dotted key path and set the value.
     let segments: Vec<&str> = key.split('.').collect();
@@ -954,10 +957,14 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_cli_env_overrides, expand_cli_config_path, parse_bool_token};
+    use super::{
+        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, run_config_set_command,
+    };
     use frankensearch_fsfs::CliInput;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+    use toml::Value;
 
     #[test]
     fn expand_cli_config_path_expands_tilde_prefix() {
@@ -1004,5 +1011,59 @@ mod tests {
         apply_cli_env_overrides(&mut input, &env).expect("apply env");
         assert!(input.no_color);
         assert!(input.verbose);
+    }
+
+    #[test]
+    fn config_set_creates_new_file_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        run_config_set_command(&cli, Some(path.as_path()), None, None, "search.rrf_k", "75")
+            .expect("config set");
+
+        let contents = std::fs::read_to_string(&path).expect("read config");
+        let parsed: Value = toml::from_str(&contents).expect("parse toml");
+        assert_eq!(
+            parsed
+                .get("search")
+                .and_then(|v| v.get("rrf_k"))
+                .and_then(Value::as_integer),
+            Some(75)
+        );
+    }
+
+    #[test]
+    fn config_set_accepts_whitespace_only_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fsfs.toml");
+        std::fs::write(&path, "  \n\t").expect("write whitespace file");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        run_config_set_command(
+            &cli,
+            Some(path.as_path()),
+            None,
+            None,
+            "search.fast_only",
+            "true",
+        )
+        .expect("config set");
+
+        let contents = std::fs::read_to_string(&path).expect("read config");
+        let parsed: Value = toml::from_str(&contents).expect("parse toml");
+        assert_eq!(
+            parsed
+                .get("search")
+                .and_then(|v| v.get("fast_only"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }
