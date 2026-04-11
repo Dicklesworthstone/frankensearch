@@ -132,9 +132,25 @@ fn escape_like_pattern(input: &str) -> String {
     escaped
 }
 
+fn limit_to_i64(limit: usize, field: &'static str) -> SearchResult<i64> {
+    i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+        field: field.to_owned(),
+        value: limit.to_string(),
+        reason: "limit does not fit in sqlite integer".to_owned(),
+    })
+}
+
 /// Retrieve search history in most-recent-first order.
-pub fn list_search_history(conn: &Connection, limit: i64) -> SearchResult<Vec<SearchHistoryEntry>> {
-    let params = [SqliteValue::Integer(limit)];
+pub fn list_search_history(
+    conn: &Connection,
+    limit: usize,
+) -> SearchResult<Vec<SearchHistoryEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = limit_to_i64(limit, "history.limit")?;
+    let params = [SqliteValue::Integer(limit_i64)];
     let rows = conn
         .query_with_params(
             "SELECT id, query, query_class, result_count, phase1_latency_ms, \
@@ -155,12 +171,17 @@ pub fn list_search_history(conn: &Connection, limit: i64) -> SearchResult<Vec<Se
 pub fn search_history_prefix(
     conn: &Connection,
     prefix: &str,
-    limit: i64,
+    limit: usize,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let pattern = format!("{}%", escape_like_pattern(prefix));
+    let limit_i64 = limit_to_i64(limit, "history.prefix_limit")?;
     let params = [
         SqliteValue::Text(pattern.into()),
-        SqliteValue::Integer(limit),
+        SqliteValue::Integer(limit_i64),
     ];
     let rows = conn
         .query_with_params(
@@ -191,13 +212,14 @@ pub fn count_search_history(conn: &Connection) -> SearchResult<i64> {
 }
 
 /// Truncate search history to keep only the most recent `max_entries`.
-pub fn truncate_search_history(conn: &Connection, max_entries: i64) -> SearchResult<i64> {
+pub fn truncate_search_history(conn: &Connection, max_entries: usize) -> SearchResult<i64> {
     let count = count_search_history(conn)?;
-    if count <= max_entries {
+    let max_entries_i64 = limit_to_i64(max_entries, "history.max_entries")?;
+    if count <= max_entries_i64 {
         return Ok(0);
     }
 
-    let to_delete = count - max_entries;
+    let to_delete = count - max_entries_i64;
     let params = [SqliteValue::Integer(to_delete)];
     conn.execute_with_params(
         "DELETE FROM search_history WHERE id IN (\
@@ -366,8 +388,13 @@ pub fn remove_bookmark_by_doc(conn: &Connection, doc_id: &str) -> SearchResult<(
 }
 
 /// List all bookmarks in most-recent-first order.
-pub fn list_bookmarks(conn: &Connection, limit: i64) -> SearchResult<Vec<Bookmark>> {
-    let params = [SqliteValue::Integer(limit)];
+pub fn list_bookmarks(conn: &Connection, limit: usize) -> SearchResult<Vec<Bookmark>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = limit_to_i64(limit, "bookmarks.limit")?;
+    let params = [SqliteValue::Integer(limit_i64)];
     let rows = conn
         .query_with_params(
             "SELECT id, doc_id, query, note, created_at \
