@@ -11220,6 +11220,12 @@ fn nearest_existing_path(path: &Path) -> PathBuf {
 
 #[must_use]
 fn is_uninstall_protected_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return true;
+    }
     if path.as_os_str().is_empty() || path.parent().is_none() || path == Path::new("/") {
         return true;
     }
@@ -17917,6 +17923,12 @@ mod tests {
                 .is_some_and(|detail| detail.contains("not recognized as fsfs-managed"))
         );
         assert!(index_root.exists(), "unsafe directory should be preserved");
+    }
+
+    #[test]
+    fn uninstall_protected_path_rejects_parent_traversal() {
+        let normalized = super::normalize_probe_path(Path::new("../"));
+        assert!(super::is_uninstall_protected_path(&normalized));
     }
 
     #[test]
