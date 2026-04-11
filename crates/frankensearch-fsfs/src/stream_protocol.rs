@@ -345,9 +345,6 @@ const fn retry_directive_for_error(
 ///
 /// Returns `SearchError::SubsystemError` if serialization fails.
 ///
-/// # Panics
-///
-/// Panics if `serde_json` produces non-UTF-8 output (cannot happen in practice).
 pub fn encode_stream_frame_ndjson<T>(frame: &StreamFrame<T>) -> SearchResult<String>
 where
     T: Serialize,
@@ -361,8 +358,12 @@ where
         ))),
     })?;
     buf.push(b'\n');
-    // serde_json always produces valid UTF-8; unwrap is safe here.
-    Ok(String::from_utf8(buf).expect("serde_json output is valid UTF-8"))
+    String::from_utf8(buf).map_err(|source| SearchError::SubsystemError {
+        subsystem: SUBSYSTEM,
+        source: Box::new(io::Error::other(format!(
+            "failed to encode NDJSON as UTF-8: {source}"
+        ))),
+    })
 }
 
 /// Decode one NDJSON frame line.
@@ -593,16 +594,16 @@ fn validate_terminal_event(
 
 fn prepare_toon_value_for_lossless_strings(value: &mut serde_json::Value) -> SearchResult<()> {
     match value {
-        serde_json::Value::String(token) => {
-            if should_wrap_toon_string_token(token) {
+        serde_json::Value::String(value) => {
+            if should_wrap_toon_string_value(value) {
                 let wrapped =
-                    serde_json::to_string(token).map_err(|source| SearchError::SubsystemError {
+                    serde_json::to_string(value).map_err(|source| SearchError::SubsystemError {
                         subsystem: SUBSYSTEM,
                         source: Box::new(io::Error::other(format!(
                             "failed to prepare TOON stream string token: {source}"
                         ))),
                     })?;
-                *token = wrapped;
+                *value = wrapped;
             }
         }
         serde_json::Value::Array(values) => {
@@ -620,27 +621,27 @@ fn prepare_toon_value_for_lossless_strings(value: &mut serde_json::Value) -> Sea
     Ok(())
 }
 
-fn should_wrap_toon_string_token(token: &str) -> bool {
-    !toon_encoder_would_quote_string(token, TOON_DEFAULT_DELIMITER)
-        && !toon_unquoted_token_roundtrips_as_same_string(token)
+fn should_wrap_toon_string_value(value: &str) -> bool {
+    !toon_encoder_would_quote_string(value, TOON_DEFAULT_DELIMITER)
+        && !toon_unquoted_value_roundtrips_as_same_string(value)
 }
 
-fn toon_encoder_would_quote_string(token: &str, delimiter: char) -> bool {
-    token.contains(delimiter)
-        || token.contains(' ')
-        || token.contains('\n')
-        || token.contains('\t')
-        || token == "true"
-        || token == "false"
-        || token == "null"
-        || token.parse::<f64>().is_ok()
+fn toon_encoder_would_quote_string(value: &str, delimiter: char) -> bool {
+    value.contains(delimiter)
+        || value.contains(' ')
+        || value.contains('\n')
+        || value.contains('\t')
+        || value == "true"
+        || value == "false"
+        || value == "null"
+        || value.parse::<f64>().is_ok()
 }
 
-fn toon_unquoted_token_roundtrips_as_same_string(token: &str) -> bool {
-    let probe = format!("v: {token}");
+fn toon_unquoted_value_roundtrips_as_same_string(value: &str) -> bool {
+    let probe = format!("v: {value}");
     match toon_rust::decode(&probe, None) {
         Ok(serde_json::Value::Object(map)) => {
-            map.get("v") == Some(&serde_json::Value::String(token.to_owned()))
+            map.get("v") == Some(&serde_json::Value::String(value.to_owned()))
         }
         _ => false,
     }
