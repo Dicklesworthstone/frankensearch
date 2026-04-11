@@ -209,20 +209,26 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let sql = format!(
-            "SELECT d.doc_id, d.updated_at \
+        let limit_i64 = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+            field: "embedding_status.limit".to_owned(),
+            value: limit.to_string(),
+            reason: "limit does not fit in sqlite integer".to_owned(),
+        })?;
+        let sql = "SELECT d.doc_id, d.updated_at \
              FROM documents d \
              LEFT JOIN embedding_status e \
                ON d.doc_id = e.doc_id AND e.embedder_id = ?1 \
              WHERE e.status IS NULL OR e.status = 'pending' \
              ORDER BY d.updated_at DESC \
-             LIMIT {limit};"
-        );
+             LIMIT ?2;";
 
-        let params = [SqliteValue::Text(embedder_id.to_owned().into())];
+        let params = [
+            SqliteValue::Text(embedder_id.to_owned().into()),
+            SqliteValue::Integer(limit_i64),
+        ];
         let rows = self
             .connection()
-            .query_with_params(&sql, &params)
+            .query_with_params(sql, &params)
             .map_err(storage_error)?;
         let mut doc_ids = Vec::with_capacity(rows.len());
         for row in &rows {
