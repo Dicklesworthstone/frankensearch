@@ -118,6 +118,28 @@ impl Default for TwoTierConfig {
 }
 
 impl TwoTierConfig {
+    fn parse_env_bool(value: &str) -> Option<bool> {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        if normalized.eq_ignore_ascii_case("true")
+            || normalized.eq_ignore_ascii_case("1")
+            || normalized.eq_ignore_ascii_case("yes")
+            || normalized.eq_ignore_ascii_case("on")
+        {
+            return Some(true);
+        }
+        if normalized.eq_ignore_ascii_case("false")
+            || normalized.eq_ignore_ascii_case("0")
+            || normalized.eq_ignore_ascii_case("no")
+            || normalized.eq_ignore_ascii_case("off")
+        {
+            return Some(false);
+        }
+        None
+    }
+
     fn from_optimized_file(path: &std::path::Path) -> Self {
         std::fs::read_to_string(path).map_or_else(
             |_| Self::default(),
@@ -162,10 +184,24 @@ impl TwoTierConfig {
             }
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_FAST_ONLY") {
-            self.fast_only = val == "true" || val == "1";
+            match Self::parse_env_bool(&val) {
+                Some(flag) => self.fast_only = flag,
+                None => tracing::warn!(
+                    var = "FRANKENSEARCH_FAST_ONLY",
+                    value = %val,
+                    "invalid value (expected boolean), keeping default"
+                ),
+            }
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_ENABLED") {
-            self.graph_ranking_enabled = val == "true" || val == "1";
+            match Self::parse_env_bool(&val) {
+                Some(flag) => self.graph_ranking_enabled = flag,
+                None => tracing::warn!(
+                    var = "FRANKENSEARCH_GRAPH_RANKING_ENABLED",
+                    value = %val,
+                    "invalid value (expected boolean), keeping default"
+                ),
+            }
         }
         if let Ok(val) = std::env::var("FRANKENSEARCH_GRAPH_RANKING_WEIGHT") {
             match val.parse::<f64>() {
@@ -341,6 +377,27 @@ mod tests {
         assert!(decoded.metrics_exporter.is_none());
         assert_eq!(decoded.candidate_multiplier, 3);
         assert_eq!(decoded.hnsw_threshold, 50_000);
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_truthy_values() {
+        for value in ["true", "TRUE", "1", "yes", "on", " On "] {
+            assert_eq!(TwoTierConfig::parse_env_bool(value), Some(true));
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_falsey_values() {
+        for value in ["false", "FALSE", "0", "no", "off", " Off "] {
+            assert_eq!(TwoTierConfig::parse_env_bool(value), Some(false));
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_unknown_values() {
+        for value in ["", "maybe", "enable", "disable"] {
+            assert_eq!(TwoTierConfig::parse_env_bool(value), None);
+        }
     }
 
     #[test]

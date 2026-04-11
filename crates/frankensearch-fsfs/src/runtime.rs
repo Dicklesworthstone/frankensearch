@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -2659,9 +2661,40 @@ pub struct RollbackManifest {
     pub entries: Vec<BackupEntry>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static BACKUP_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn backup_dir_override() -> Option<PathBuf> {
+    BACKUP_DIR_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn backup_dir_override() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(test)]
+fn with_backup_dir_override<F, T>(dir: PathBuf, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    BACKUP_DIR_OVERRIDE.with(|cell| {
+        let previous = cell.replace(Some(dir));
+        let result = f();
+        cell.replace(previous);
+        result
+    })
+}
+
 /// Resolve the backup directory path.
 #[must_use]
 pub fn backup_dir() -> Option<PathBuf> {
+    if let Some(dir) = backup_dir_override() {
+        return Some(dir);
+    }
     dirs::data_dir().map(|d| d.join("frankensearch").join("backups"))
 }
 
@@ -7442,33 +7475,33 @@ impl FsfsRuntime {
             return Ok(manifests);
         };
 
-        let requested_token = normalize_model_token(requested);
+        let requested_key = normalize_model_key(requested);
         let mut exact = Vec::new();
         let mut fuzzy = Vec::new();
         for manifest in manifests {
             let install_dir = Self::manifest_install_dir_name(&manifest);
-            let id_token = normalize_model_token(&manifest.id);
-            let install_token = normalize_model_token(&install_dir);
-            let display_token = manifest
+            let id_key = normalize_model_key(&manifest.id);
+            let install_key = normalize_model_key(&install_dir);
+            let display_key = manifest
                 .display_name
                 .as_ref()
-                .map(|value| normalize_model_token(value));
-            let repo_token = normalize_model_token(&manifest.repo);
+                .map(|value| normalize_model_key(value));
+            let repo_key = normalize_model_key(&manifest.repo);
 
-            let exact_match = requested_token == id_token
-                || requested_token == install_token
-                || display_token.as_deref() == Some(requested_token.as_str());
+            let exact_match = requested_key == id_key
+                || requested_key == install_key
+                || display_key.as_deref() == Some(requested_key.as_str());
             if exact_match {
                 exact.push(manifest);
                 continue;
             }
 
-            let fuzzy_match = id_token.contains(&requested_token)
-                || install_token.contains(&requested_token)
-                || display_token
+            let fuzzy_match = id_key.contains(&requested_key)
+                || install_key.contains(&requested_key)
+                || display_key
                     .as_ref()
-                    .is_some_and(|value| value.contains(&requested_token))
-                || repo_token.contains(&requested_token);
+                    .is_some_and(|value| value.contains(&requested_key))
+                || repo_key.contains(&requested_key);
             if fuzzy_match {
                 fuzzy.push(manifest);
             }
@@ -7777,7 +7810,7 @@ impl FsfsRuntime {
                 let Some(name) = name.to_str() else {
                     continue;
                 };
-                if normalize_model_token(name).contains(&normalize_model_token(model_name)) {
+                if normalize_model_key(name).contains(&normalize_model_key(model_name)) {
                     candidates.push(entry.path());
                 }
             }
@@ -11304,7 +11337,7 @@ fn resolve_manifest_file_path(
     index_root.join(file_key)
 }
 
-fn normalize_model_token(value: &str) -> String {
+fn normalize_model_key(value: &str) -> String {
     value
         .chars()
         .filter(char::is_ascii_alphanumeric)
@@ -14926,7 +14959,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{IndexableDocument, LexicalSearch};
@@ -14972,6 +15005,26 @@ mod tests {
         decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fsfs_test_{label}_{nanos}"))
+    }
+
+    fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
+    where
+        F: FnOnce(PathBuf) -> T,
+    {
+        let base_dir = unique_test_dir(label);
+        let _ = fs::create_dir_all(&base_dir);
+        let backup_dir = base_dir.join("backups");
+        let result = super::with_backup_dir_override(backup_dir, || f(base_dir.clone()));
+        let _ = fs::remove_dir_all(&base_dir);
+        result
+    }
 
     fn test_dashboard_status_payload() -> FsfsStatusPayload {
         FsfsStatusPayload {
@@ -15311,12 +15364,14 @@ mod tests {
         let error = FsfsRuntime::read_search_serve_socket_request(&mut reader)
             .expect_err("oversized request should fail");
         writer_task.join().expect("writer thread");
-        match error {
-            frankensearch_core::SearchError::InvalidConfig { field, .. } => {
-                assert_eq!(field, "cli.serve.request");
-            }
-            other => panic!("expected InvalidConfig for oversized request, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                &error,
+                frankensearch_core::SearchError::InvalidConfig { field, .. }
+                if field == "cli.serve.request"
+            ),
+            "expected InvalidConfig for oversized request, got {error:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -18562,19 +18617,21 @@ mod tests {
 
     #[test]
     fn list_backups_returns_vec() {
-        // Just verify it doesn't panic.
-        let backups = super::list_backups();
-        assert!(backups.len() <= 100); // sanity check
+        with_test_backup_dir("list_backups_returns_vec", |_| {
+            // Just verify it doesn't panic.
+            let backups = super::list_backups();
+            assert!(backups.len() <= 100); // sanity check
+        });
     }
 
     #[test]
     fn restore_backup_fails_with_no_backups() {
-        // With a fresh manifest, restore should fail.
-        // This may succeed if a previous test wrote backups, so we just
-        // verify the function doesn't panic.
-        let result = super::restore_backup(Some("v99.99.99"));
-        // Should fail because that version doesn't exist.
-        assert!(result.is_err());
+        with_test_backup_dir("restore_backup_fails_with_no_backups", |_| {
+            // With a fresh manifest, restore should fail.
+            let result = super::restore_backup(Some("v99.99.99"));
+            // Should fail because that version doesn't exist.
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -18584,21 +18641,22 @@ mod tests {
 
     #[test]
     fn write_and_read_rollback_manifest_roundtrip() {
-        let manifest = super::RollbackManifest {
-            entries: vec![super::BackupEntry {
-                version: "0.99.0".into(),
-                backed_up_at_epoch: super::epoch_now(),
-                original_path: "/test/fsfs".into(),
-                binary_filename: "fsfs-0.99.0".into(),
-                sha256: "test_hash".into(),
-            }],
-        };
-        super::write_rollback_manifest(&manifest).unwrap();
-        let loaded = super::read_rollback_manifest();
-        assert!(!loaded.entries.is_empty());
-        // Find our test entry (other tests may have added entries too).
-        let found = loaded.entries.iter().any(|e| e.version == "0.99.0");
-        assert!(found);
+        with_test_backup_dir("write_and_read_rollback_manifest_roundtrip", |_| {
+            let manifest = super::RollbackManifest {
+                entries: vec![super::BackupEntry {
+                    version: "0.99.0".into(),
+                    backed_up_at_epoch: super::epoch_now(),
+                    original_path: "/test/fsfs".into(),
+                    binary_filename: "fsfs-0.99.0".into(),
+                    sha256: "test_hash".into(),
+                }],
+            };
+            super::write_rollback_manifest(&manifest).unwrap();
+            let loaded = super::read_rollback_manifest();
+            assert!(!loaded.entries.is_empty());
+            let found = loaded.entries.iter().any(|e| e.version == "0.99.0");
+            assert!(found);
+        });
     }
 
     // ─── Additional Auto-Update Edge Case Tests (bd-2w7x.46) ──────────
@@ -18716,45 +18774,43 @@ mod tests {
 
     #[test]
     fn create_backup_produces_valid_entry() {
-        // Create a fake binary to back up.
-        let dir = std::env::temp_dir().join("fsfs_test_create_backup");
-        let _ = fs::create_dir_all(&dir);
-        let fake_binary = dir.join("fsfs");
-        fs::write(&fake_binary, b"#!/bin/sh\necho fsfs test").unwrap();
+        with_test_backup_dir("create_backup_produces_valid_entry", |dir| {
+            // Create a fake binary to back up.
+            let fake_binary = dir.join("fsfs");
+            fs::write(&fake_binary, b"#!/bin/sh\necho fsfs test").unwrap();
 
-        let entry = super::create_backup(&fake_binary).unwrap();
-        assert_eq!(entry.version, env!("CARGO_PKG_VERSION"));
-        assert!(!entry.binary_filename.is_empty());
-        assert!(!entry.sha256.is_empty());
+            let entry = super::create_backup(&fake_binary).unwrap();
+            assert_eq!(entry.version, env!("CARGO_PKG_VERSION"));
+            assert!(!entry.binary_filename.is_empty());
+            assert!(!entry.sha256.is_empty());
 
-        // Verify the backup file exists in the backup directory.
-        if let Some(bdir) = super::backup_dir() {
-            assert!(bdir.join(&entry.binary_filename).exists());
-        }
-        let _ = fs::remove_dir_all(&dir);
+            // Verify the backup file exists in the backup directory.
+            if let Some(bdir) = super::backup_dir() {
+                assert!(bdir.join(&entry.binary_filename).exists());
+            }
+        });
     }
 
     #[test]
     fn create_backup_deduplicates_same_version() {
-        let dir = std::env::temp_dir().join("fsfs_test_backup_dedup");
-        let _ = fs::create_dir_all(&dir);
-        let fake_binary = dir.join("fsfs");
-        fs::write(&fake_binary, b"#!/bin/sh\necho test1").unwrap();
+        with_test_backup_dir("create_backup_deduplicates_same_version", |dir| {
+            let fake_binary = dir.join("fsfs");
+            fs::write(&fake_binary, b"#!/bin/sh\necho test1").unwrap();
 
-        // Create first backup.
-        let _ = super::create_backup(&fake_binary);
-        // Create second backup of same version.
-        let _ = super::create_backup(&fake_binary);
+            // Create first backup.
+            let _ = super::create_backup(&fake_binary);
+            // Create second backup of same version.
+            let _ = super::create_backup(&fake_binary);
 
-        // Manifest should have only one entry for the current version.
-        let manifest = super::read_rollback_manifest();
-        let count = manifest
-            .entries
-            .iter()
-            .filter(|e| e.version == env!("CARGO_PKG_VERSION"))
-            .count();
-        assert_eq!(count, 1, "should deduplicate same-version backups");
-        let _ = fs::remove_dir_all(&dir);
+            // Manifest should have only one entry for the current version.
+            let manifest = super::read_rollback_manifest();
+            let count = manifest
+                .entries
+                .iter()
+                .filter(|e| e.version == env!("CARGO_PKG_VERSION"))
+                .count();
+            assert_eq!(count, 1, "should deduplicate same-version backups");
+        });
     }
 
     #[test]
@@ -19516,23 +19572,18 @@ mod tests {
         // Mirrors the verification logic at line 3712-3735.
         let verify = std::process::Command::new(&binary).arg("version").output();
 
-        match verify {
-            Ok(out) if out.status.success() => {
-                panic!("broken binary should NOT pass verification");
-            }
-            Ok(out) => {
-                // This is the expected path - verification failed.
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(
-                    stderr.contains("FATAL: corrupted binary"),
-                    "self-test error output should be captured, got: {stderr}"
-                );
-                // In the real code, this triggers rollback (line 3723-3734).
-            }
-            Err(e) => {
-                panic!("should be able to execute the binary: {e}");
-            }
-        }
+        let out = verify.expect("should be able to execute the binary");
+        assert!(
+            !out.status.success(),
+            "broken binary should NOT pass verification"
+        );
+        // This is the expected path - verification failed.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("FATAL: corrupted binary"),
+            "self-test error output should be captured, got: {stderr}"
+        );
+        // In the real code, this triggers rollback (line 3723-3734).
 
         let _ = fs::remove_dir_all(&dir);
     }
