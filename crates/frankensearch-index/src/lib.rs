@@ -802,41 +802,74 @@ impl VectorIndex {
             });
         }
 
-        // Collect all sources.
-        let mut sources = Vec::with_capacity(main_before + wal_count);
-        for i in 0..main_before {
-            if !self.is_deleted(i) {
-                sources.push(MergeSource::Main(i));
+        let deduped_sources = (|| -> SearchResult<Vec<MergeSource>> {
+            #[derive(Clone, Copy)]
+            struct SortKey<'a> {
+                doc_id_hash: u64,
+                doc_id: &'a str,
             }
-        }
-        for (idx, _) in self.wal_entries.iter().enumerate() {
-            sources.push(MergeSource::Wal(idx));
-        }
 
-        // Sort to ensure binary search property.
-        // We can't use sort_by_key easily because we need `self` for Main lookups.
-        sources.sort_by(|a, b| {
-            let (hash_a, id_a) = self.resolve_sort_key(a);
-            let (hash_b, id_b) = self.resolve_sort_key(b);
-            hash_a.cmp(&hash_b).then(id_a.cmp(id_b))
-        });
+            #[derive(Clone, Copy)]
+            struct KeyedSource<'a> {
+                key: SortKey<'a>,
+                source: MergeSource,
+            }
 
-        // Deduplicate sources by doc_id, keeping the latest (WAL over Main).
-        // Since `sources` is sorted, duplicates are adjacent and the stable sort
-        // ensures that newer sources (WAL) appear after older sources (Main).
-        let mut deduped_sources = Vec::with_capacity(sources.len());
-        for source in sources {
-            if let Some(last) = deduped_sources.last() {
-                let (last_hash, last_id) = self.resolve_sort_key(last);
-                let (hash, id) = self.resolve_sort_key(&source);
-                if hash == last_hash && id == last_id {
-                    // Overwrite the older entry with the newer one
-                    *deduped_sources.last_mut().unwrap() = source;
-                    continue;
+            // Collect all sources with their sort keys.
+            let mut keyed_sources = Vec::with_capacity(main_before + wal_count);
+            for i in 0..main_before {
+                if !self.is_deleted(i) {
+                    let entry = self.record_at(i)?;
+                    let doc_id = self.doc_id_at(i)?;
+                    keyed_sources.push(KeyedSource {
+                        key: SortKey {
+                            doc_id_hash: entry.doc_id_hash,
+                            doc_id,
+                        },
+                        source: MergeSource::Main(i),
+                    });
                 }
             }
-            deduped_sources.push(source);
-        }
+            for (idx, entry) in self.wal_entries.iter().enumerate() {
+                keyed_sources.push(KeyedSource {
+                    key: SortKey {
+                        doc_id_hash: entry.doc_id_hash,
+                        doc_id: &entry.doc_id,
+                    },
+                    source: MergeSource::Wal(idx),
+                });
+            }
+
+            // Sort to ensure binary search property.
+            keyed_sources.sort_by(|a, b| {
+                a.key
+                    .doc_id_hash
+                    .cmp(&b.key.doc_id_hash)
+                    .then(a.key.doc_id.cmp(b.key.doc_id))
+            });
+
+            // Deduplicate sources by doc_id, keeping the latest (WAL over Main).
+            // Since `keyed_sources` is sorted, duplicates are adjacent and the stable sort
+            // ensures that newer sources (WAL) appear after older sources (Main).
+            let mut deduped: Vec<KeyedSource<'_>> = Vec::with_capacity(keyed_sources.len());
+            for item in keyed_sources {
+                if let Some(last) = deduped.last_mut() {
+                    if item.key.doc_id_hash == last.key.doc_id_hash
+                        && item.key.doc_id == last.key.doc_id
+                    {
+                        // Overwrite the older entry with the newer one
+                        *last = item;
+                        continue;
+                    }
+                }
+                deduped.push(item);
+            }
+
+            Ok(deduped
+                .into_iter()
+                .map(|item| item.source)
+                .collect::<Vec<_>>())
+        })()?;
 
         // Perform the rewrite.
         self.rewrite_index(
@@ -876,22 +909,16 @@ impl VectorIndex {
         Ok(stats)
     }
 
-    fn resolve_sort_key<'a>(&'a self, source: &MergeSource) -> (u64, &'a str) {
+    fn resolve_sort_key<'a>(&'a self, source: &MergeSource) -> SearchResult<(u64, &'a str)> {
         match source {
             MergeSource::Main(idx) => {
-                // These unwraps are safe because we only create Main(idx) for valid indices
-                // and the index is immutable during compaction.
-                let entry = self
-                    .record_at(*idx)
-                    .expect("index corrupted during compaction");
-                let id = self
-                    .doc_id_at(*idx)
-                    .expect("index corrupted during compaction");
-                (entry.doc_id_hash, id)
+                let entry = self.record_at(*idx)?;
+                let id = self.doc_id_at(*idx)?;
+                Ok((entry.doc_id_hash, id))
             }
             MergeSource::Wal(idx) => {
                 let entry = &self.wal_entries[*idx];
-                (entry.doc_id_hash, &entry.doc_id)
+                Ok((entry.doc_id_hash, &entry.doc_id))
             }
         }
     }
@@ -921,7 +948,7 @@ impl VectorIndex {
         let mut string_table_len = 0u64;
 
         for source in sources {
-            let (doc_id_hash, doc_id) = self.resolve_sort_key(source);
+            let (doc_id_hash, doc_id) = self.resolve_sort_key(source)?;
             let doc_id_len = doc_id.len();
 
             // Validation
@@ -1017,7 +1044,7 @@ impl VectorIndex {
 
                 // Pass 3: Write String Table
                 for source in sources {
-                    let (_, doc_id) = self.resolve_sort_key(source);
+                    let (_, doc_id) = self.resolve_sort_key(source)?;
                     writer.write_all(doc_id.as_bytes())?;
                 }
 
