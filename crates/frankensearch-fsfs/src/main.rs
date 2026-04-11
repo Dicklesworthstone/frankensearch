@@ -604,7 +604,12 @@ fn run_config_set_command(
         }
         cursor = cursor
             .as_table_mut()
-            .expect("just ensured table")
+            .ok_or_else(|| SearchError::SubsystemError {
+                subsystem: CONFIG_SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "config.set path segment '{segment}' did not resolve to a table"
+                ))),
+            })?
             .entry(segment)
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
     }
@@ -633,7 +638,12 @@ fn run_config_set_command(
     }
     cursor
         .as_table_mut()
-        .expect("just ensured table")
+        .ok_or_else(|| SearchError::SubsystemError {
+            subsystem: CONFIG_SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "config.set path '{key}' did not resolve to a table"
+            ))),
+        })?
         .insert(leaf_key.to_owned(), parsed_value);
 
     // Write back.
