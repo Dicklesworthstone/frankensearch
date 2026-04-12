@@ -689,6 +689,11 @@ impl VectorIndex {
             })?;
         }
 
+        // Soft-delete any existing entries (main or WAL) for these documents
+        // so that the newly appended WAL entries replace them entirely.
+        let doc_ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+        self.soft_delete_batch(&doc_ids)?;
+
         let mut wal_entries: Vec<wal::WalEntry> = Vec::with_capacity(entries.len());
         let mut seen = std::collections::HashSet::new();
         for (doc_id, embedding) in entries.iter().rev() {
