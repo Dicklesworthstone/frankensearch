@@ -182,7 +182,6 @@ fn strip_markdown_line(line: &str) -> String {
     result = result.replace("**", "");
     result = result.replace("__", "");
     result = result.replace('*', "");
-    result = result.replace('_', " "); // Underscore often used in identifiers
 
     // Remove inline code backticks
     result = result.replace('`', "");

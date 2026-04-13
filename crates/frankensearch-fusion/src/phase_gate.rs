@@ -67,6 +67,10 @@ pub struct PhaseGateConfig {
     /// reached and the searcher always refines.
     /// Default: true.
     pub enabled: bool,
+    /// Time-based expiry in milliseconds. If set, the accumulated evidence and
+    /// any permanent decision will be reset if no updates occur within this window,
+    /// allowing recovery from transient quality-tier lockouts.
+    pub expiry_ms: Option<u64>,
 }
 
 impl Default for PhaseGateConfig {
@@ -76,6 +80,7 @@ impl Default for PhaseGateConfig {
             timeout_queries: 500,
             min_delta: 0.01,
             enabled: true,
+            expiry_ms: Some(1000 * 60 * 60), // 1 hour default expiry
         }
     }
 }
@@ -105,12 +110,15 @@ pub struct PhaseGate {
     quality_wins: u64,
     /// Running count of observations where fast was better (or tied).
     fast_wins: u64,
+    /// Timestamp of the last observation, used for expiry.
+    #[serde(skip)]
+    last_updated: Option<std::time::Instant>,
 }
 
 impl PhaseGate {
     /// Create a new phase gate with the given configuration.
     #[must_use]
-    pub const fn new(config: PhaseGateConfig) -> Self {
+    pub fn new(config: PhaseGateConfig) -> Self {
         Self {
             config,
             e_value: 1.0,
@@ -118,6 +126,7 @@ impl PhaseGate {
             observations: 0,
             quality_wins: 0,
             fast_wins: 0,
+            last_updated: None,
         }
     }
 
@@ -129,17 +138,30 @@ impl PhaseGate {
 
     /// The current decision, if any.
     ///
-    /// Returns `None` when evidence is insufficient. The caller should
-    /// default to always refining when `None`.
+    /// Returns `None` when evidence is insufficient or if the gate has expired.
+    /// The caller should default to always refining when `None`.
     #[must_use]
-    pub const fn decision(&self) -> Option<PhaseDecision> {
-        self.decision
+    pub fn decision(&self) -> Option<PhaseDecision> {
+        if self.is_expired() {
+            None
+        } else {
+            self.decision
+        }
     }
 
     /// Whether the gate recommends skipping the quality tier.
     #[must_use]
     pub fn should_skip_quality(&self) -> bool {
-        self.decision == Some(PhaseDecision::SkipQuality)
+        self.decision() == Some(PhaseDecision::SkipQuality)
+    }
+
+    /// Returns `true` if the gate has expired due to lack of updates.
+    fn is_expired(&self) -> bool {
+        if let (Some(expiry), Some(last)) = (self.config.expiry_ms, self.last_updated) {
+            last.elapsed().as_millis() as u64 > expiry
+        } else {
+            false
+        }
     }
 
     /// Update the gate with a new observation.
@@ -147,8 +169,14 @@ impl PhaseGate {
     /// Returns evidence records for any state transitions (decision reached
     /// or timeout-forced reset).
     pub fn update(&mut self, obs: &PhaseObservation) -> Vec<EvidenceRecord> {
+        let mut evidence = Vec::new();
+        if self.is_expired() {
+            evidence.extend(self.reset());
+        }
+        self.last_updated = Some(std::time::Instant::now());
+
         if !self.config.enabled || self.decision.is_some() {
-            return Vec::new();
+            return evidence;
         }
 
         self.observations += 1;

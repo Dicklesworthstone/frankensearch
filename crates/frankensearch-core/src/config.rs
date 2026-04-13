@@ -385,6 +385,8 @@ pub struct TwoTierMetrics {
     pub lexical_candidates: usize,
     /// Number of candidates retrieved from semantic search.
     pub semantic_candidates: usize,
+    /// Number of candidates lacking a quality-tier embedding.
+    pub incomplete_embeddings: usize,
     /// Embedder used for fast tier.
     pub fast_embedder_id: Option<String>,
     /// Embedder used for quality tier.

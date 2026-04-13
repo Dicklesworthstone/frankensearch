@@ -339,6 +339,16 @@ impl TwoTierIndex {
             }
             return Ok(hits);
         }
+        let mrl_config = crate::mrl::MrlConfig {
+            search_dims: self.config.mrl_search_dims,
+            rescore_dims: 0,
+            rescore_top_k: self.config.mrl_rescore_top_k,
+        };
+
+        if mrl_config.search_dims > 0 && mrl_config.search_dims < self.fast_index.dimension() {
+            return self.fast_index.mrl_search(query_vec, k, &mrl_config, None);
+        }
+
         params.map_or_else(
             || self.fast_index.search_top_k(query_vec, k, None),
             |params| {

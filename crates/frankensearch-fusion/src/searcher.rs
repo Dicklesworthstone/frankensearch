@@ -856,40 +856,59 @@ impl TwoTierSearcher {
             k: self.effective_rrf_k(query_class),
         };
 
-        // Run embedding and lexical search in parallel via rayon::join.
-        // Both trait methods are sync-in-async (complete on first poll), so
-        // rayon gives true thread-level parallelism without an async runtime.
-        // rayon::join is scoped — closures borrow from the parent directly,
-        // no Arc clone or String allocation needed.
-        let (embed_timed, lexical_timed) = rayon::join(
-            || {
-                let start = Instant::now();
-                let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query))
-                    .unwrap_or_else(|| {
-                        Err(SearchError::EmbeddingFailed {
-                            model: self.fast_embedder.id().to_owned(),
-                            source: "embedder returned Pending; only sync-in-async embedders are supported in the rayon path".into(),
-                        })
-                    });
-                (result, start.elapsed())
-            },
-            || {
-                self.lexical.as_ref().map_or_else(
-                    || (None, Duration::ZERO),
-                    |lex| {
-                        let start = Instant::now();
-                        let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget))
-                            .unwrap_or_else(|| {
-                                Err(SearchError::SubsystemError {
-                                    subsystem: "lexical",
-                                    source: "lexical search returned Pending; only sync-in-async implementations are supported in the rayon path".into(),
-                                })
-                            });
-                        (Some(result), start.elapsed())
-                    },
-                )
-            },
-        );
+        // If the embedder is an API embedder (genuinely async), we sequentially await
+        // the futures to avoid blocking the executor inside `rayon::join` and to prevent
+        // `poll_immediate` from aborting the Pending futures.
+        let is_async_embedder = self.fast_embedder.category() == frankensearch_core::traits::ModelCategory::ApiEmbedder;
+
+        let (embed_timed, lexical_timed) = if is_async_embedder {
+            let start_embed = Instant::now();
+            let embed_res = self.fast_embedder.embed(cx, semantic_query).await;
+            let embed_elapsed = start_embed.elapsed();
+
+            let lex_res = if let Some(lex) = self.lexical.as_ref() {
+                let start_lex = Instant::now();
+                let res = lex.search(cx, semantic_query, lexical_budget).await;
+                (Some(res), start_lex.elapsed())
+            } else {
+                (None, Duration::ZERO)
+            };
+
+            ((embed_res, embed_elapsed), lex_res)
+        } else {
+            // Run embedding and lexical search in parallel via rayon::join.
+            // Both trait methods are sync-in-async (complete on first poll), so
+            // rayon gives true thread-level parallelism without an async runtime.
+            rayon::join(
+                || {
+                    let start = Instant::now();
+                    let result = poll_immediate(self.fast_embedder.embed(cx, semantic_query))
+                        .unwrap_or_else(|| {
+                            Err(SearchError::EmbeddingFailed {
+                                model: self.fast_embedder.id().to_owned(),
+                                source: "embedder returned Pending; only sync-in-async embedders are supported in the rayon path".into(),
+                            })
+                        });
+                    (result, start.elapsed())
+                },
+                || {
+                    self.lexical.as_ref().map_or_else(
+                        || (None, Duration::ZERO),
+                        |lex| {
+                            let start = Instant::now();
+                            let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget))
+                                .unwrap_or_else(|| {
+                                    Err(SearchError::SubsystemError {
+                                        subsystem: "lexical",
+                                        source: "lexical search returned Pending; only sync-in-async implementations are supported in the rayon path".into(),
+                                    })
+                                });
+                            (Some(result), start.elapsed())
+                        },
+                    )
+                },
+            )
+        };
 
         let (fast_embed_result, fast_embed_elapsed) = embed_timed;
         metrics.fast_embed_ms = fast_embed_elapsed.as_secs_f64() * 1000.0;
@@ -1223,6 +1242,7 @@ impl TwoTierSearcher {
                 });
             }
         }
+        metrics.incomplete_embeddings = fast_hits.len() - quality_hits.len();
         metrics.phase2_vectors_searched = quality_hits.len();
         self.apply_score_calibration_to_hits(&mut quality_hits);
 
