@@ -1,0 +1,36 @@
+{
+  "confidence_signals": {
+    "emit_required_fields": [
+      "classification_confidence",
+      "encoding_confidence",
+      "reason_code",
+      "utility_penalty",
+      "skip_candidate",
+      "requires_manual_review"
+    ],
+    "min_confidence_for_lossy_decode": 0.9,
+    "min_confidence_for_text": 0.8
+  },
+  "corrupt_partial_policy": {
+    "checksum_mismatch_action": "quarantine",
+    "max_recovery_prefix_bytes": 16384,
+    "truncated_action": "index_partial_with_flag"
+  },
+  "encoding_policy": {
+    "normalization": "utf8_nfc",
+    "primary_detectors": [
+      "bom",
+      "utf8_validation",
+      "icu_heuristic"
+    ],
+    "unknown_encoding_action": "quarantine"
+  },
+  "kind": "fsfs_file_classification_contract_definition",
+  "sniff_heuristics": {
+    "binary_byte_threshold_pct": 30,
+    "high_bit_ratio_threshold_pct": 60,
+    "max_probe_bytes": 8192,
+    "null_byte_hard_binary": true
+  },
+  "v": 1
+}

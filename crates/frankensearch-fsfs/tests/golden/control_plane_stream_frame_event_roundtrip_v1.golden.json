@@ -1,0 +1,21 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "event",
+  "cursor": "search:01JAH9A6A1K2M3N4P5Q6R7S8T9",
+  "producer_ts": "2026-02-14T00:50:02Z",
+  "dispatch_ts": "2026-02-14T00:50:02Z",
+  "lag_ms": 12,
+  "payload": {
+    "event_id": "01JAH9A6A1K2M3N4P5Q6R7S8T9",
+    "topic": "search",
+    "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+    "project_key": "/data/projects/frankensearch",
+    "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+    "body": {
+      "phase": "initial",
+      "latency_us": 8210,
+      "result_count": 10
+    }
+  }
+}

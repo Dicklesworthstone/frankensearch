@@ -1,0 +1,49 @@
+{
+  "kind": "fsfs_snippet_highlight_provenance_contract_definition",
+  "v": 1,
+  "snippet_policy": {
+    "max_snippets_per_result": 3,
+    "context_lines_before": 3,
+    "context_lines_after": 3,
+    "max_chars_per_snippet": 500,
+    "truncation_strategy": "grapheme_boundary_ellipsis",
+    "binary_fallback": "metadata_only"
+  },
+  "highlight_policy": {
+    "offset_unit": "utf8_byte",
+    "enforce_grapheme_boundaries": true,
+    "merge_overlapping_ranges": true,
+    "max_highlights_per_snippet": 24
+  },
+  "provenance_policy": {
+    "required_fields": [
+      "path",
+      "segment_id",
+      "line_range",
+      "byte_range",
+      "index_revision",
+      "content_hash",
+      "score_contributors",
+      "reason_code"
+    ]
+  },
+  "diagnostics_policy": {
+    "required_fields": [
+      "event",
+      "trace_id",
+      "reason_code",
+      "render_mode",
+      "snippet_status",
+      "unicode_safe",
+      "offsets_verified"
+    ],
+    "reason_code_prefixes": [
+      "snippet.",
+      "highlight.",
+      "provenance."
+    ]
+  },
+  "performance_targets": {
+    "max_extraction_ms_per_result": 1.0
+  }
+}

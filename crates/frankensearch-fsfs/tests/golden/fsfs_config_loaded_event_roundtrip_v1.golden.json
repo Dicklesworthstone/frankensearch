@@ -1,0 +1,86 @@
+{
+  "kind": "fsfs_config_loaded_event",
+  "v": 1,
+  "event": "config_loaded",
+  "event_ts": "2026-02-14T03:30:10Z",
+  "source_precedence_applied": ["cli", "env", "file", "defaults"],
+  "resolved_values": {
+    "discovery": {
+      "roots": ["/home/test"],
+      "exclude_patterns": [".git", "node_modules", "target"],
+      "text_selection_mode": "blocklist",
+      "binary_blocklist_extensions": [".exe", ".dll", ".so", ".o", ".class", ".jar", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wasm", ".pyc", ".pdb"],
+      "max_file_size_mb": 10,
+      "follow_symlinks": false
+    },
+    "indexing": {
+      "fast_model": "potion-multilingual-128M",
+      "quality_model": "all-MiniLM-L6-v2",
+      "model_dir": "/home/test/.cache/frankensearch/models",
+      "embedding_batch_size": 64,
+      "reindex_on_change": true,
+      "watch_mode": false
+    },
+    "search": {
+      "default_limit": 20,
+      "quality_weight": 0.7,
+      "rrf_k": 60,
+      "quality_timeout_ms": 500,
+      "fast_only": true,
+      "explain": false
+    },
+    "pressure": {
+      "profile": "performance",
+      "cpu_ceiling_pct": 80,
+      "memory_ceiling_mb": 2048
+    },
+    "tui": {
+      "theme": "dark",
+      "frame_budget_ms": 16,
+      "show_explanations": true,
+      "density": "normal"
+    },
+    "storage": {
+      "db_path": "/home/test/.local/share/fsfs/fsfs.db",
+      "evidence_retention_days": 7,
+      "summary_retention_days": 90
+    },
+    "privacy": {
+      "redact_file_contents_in_logs": true,
+      "redact_paths_in_telemetry": true
+    }
+  },
+  "cli_flags_used": ["--fast-only"],
+  "env_keys_used": ["FSFS_SEARCH_FAST_ONLY", "FSFS_TUI_THEME"],
+  "config_file_used": "/home/test/.config/fsfs/config.toml",
+  "warnings": [
+    {
+      "severity": "warn",
+      "reason_code": "config.search.fast_only_with_quality_model",
+      "field": "search.fast_only",
+      "source": "runtime",
+      "message": "fast_only=true while quality_model is configured"
+    },
+    {
+      "severity": "warn",
+      "reason_code": "config.unknown_key.warning",
+      "field": "search.shadow_mode",
+      "source": "file",
+      "message": "Unknown key search.shadow_mode ignored"
+    }
+  ],
+  "reason_codes": [
+    "config.search.fast_only_with_quality_model",
+    "config.unknown_key.warning"
+  ],
+  "redaction_applied": {
+    "redact_file_contents_in_logs": true,
+    "redact_paths_in_telemetry": true
+  },
+  "emit_fields": [
+    "source_precedence_applied",
+    "resolved_values",
+    "warnings",
+    "reason_codes"
+  ]
+}

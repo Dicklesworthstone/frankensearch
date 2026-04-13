@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "schema": "e2e-event-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:00.500Z",
+  "body": {
+    "type": "lane_start",
+    "correlation": {
+      "event_id": "01HQXG5M7PXYZ98765432109CD",
+      "root_request_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+      "parent_event_id": null
+    },
+    "severity": "info",
+    "lane_id": "explain_mmr"
+  }
+}

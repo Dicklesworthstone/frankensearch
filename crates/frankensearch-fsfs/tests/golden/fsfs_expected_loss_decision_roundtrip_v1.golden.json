@@ -1,0 +1,37 @@
+{
+  "kind": "fsfs_expected_loss_decision_event",
+  "v": 1,
+  "decision_id": "dec-degrade-cpu-0001",
+  "seed": 7,
+  "config_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "family": "degrade",
+  "state_id": "cpu_pressure",
+  "chosen_action": "degrade_hold",
+  "evaluated_actions": [
+    {
+      "action": "degrade_enter",
+      "expected_loss": 0.17,
+      "false_include_cost": 0.08,
+      "false_exclude_cost": 0.42,
+      "latency_cost": 0.09,
+      "quality_cost": 0.11,
+      "compute_cost": 0.04,
+      "risk_level": "high",
+      "reason_code": "FSFS_PRESSURE_DEGRADE_ENTER"
+    },
+    {
+      "action": "degrade_hold",
+      "expected_loss": 0.15,
+      "false_include_cost": 0.08,
+      "false_exclude_cost": 0.35,
+      "latency_cost": 0.07,
+      "quality_cost": 0.12,
+      "compute_cost": 0.05,
+      "risk_level": "medium",
+      "reason_code": "FSFS_PRESSURE_DEGRADE_HOLD"
+    }
+  ],
+  "selected_reason_code": "FSFS_DECISION_MIN_EXPECTED_LOSS",
+  "fallback_invoked": true,
+  "fallback_reason_code": "FSFS_FALLBACK_CPU_P95_TRIP"
+}

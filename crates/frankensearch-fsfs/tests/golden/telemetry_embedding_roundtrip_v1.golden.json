@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:45:02Z",
+  "event": {
+    "type": "embedding",
+    "instance": {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "pid": 4242
+    },
+    "correlation": {
+      "event_id": "01JAH9A30K2M3N4P5Q6R7S8T9V",
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": "01JAH9A2X1K2M3N4P5Q6R7S8T9"
+    },
+    "job": {
+      "job_id": "01JAH9A31K2M3N4P5Q6R7S8T9W",
+      "queue_depth": 12,
+      "doc_count": 32,
+      "stage": "background"
+    },
+    "embedder": {
+      "id": "potion-multilingual-128M",
+      "tier": "fast",
+      "dimension": 256
+    },
+    "status": "completed",
+    "duration_ms": 14
+  }
+}

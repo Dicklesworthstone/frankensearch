@@ -1,0 +1,10 @@
+{
+  "kind": "asupersync_cx_labruntime_result",
+  "v": 1,
+  "seed": 20250214,
+  "scenario": "two_tier_timeout_path",
+  "deterministic_match": true,
+  "quiescence_ok": true,
+  "obligation_leak_ok": true,
+  "timeout_outcome": "cancelled"
+}

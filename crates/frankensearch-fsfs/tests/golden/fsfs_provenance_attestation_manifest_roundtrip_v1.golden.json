@@ -1,0 +1,32 @@
+{
+  "kind": "fsfs_provenance_attestation",
+  "schema_version": 1,
+  "attestation_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "build": {
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "build_profile": "release",
+    "rustc_version": "1.85.0-nightly",
+    "target_triple": "x86_64-unknown-linux-gnu"
+  },
+  "runtime": {
+    "binary_hash_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config_hash_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "index_manifest_hash_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "artifact_hashes": [
+    {
+      "path": "manifest.json",
+      "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "path": "index-checksums.json",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  ],
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "build-key-1",
+    "signature_b64": "c2lnbmF0dXJl"
+  }
+}

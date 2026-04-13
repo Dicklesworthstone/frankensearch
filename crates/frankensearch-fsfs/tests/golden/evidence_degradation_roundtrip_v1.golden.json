@@ -1,0 +1,34 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:55:03Z",
+  "event": {
+    "event_id": "01JAH9B0DK2M3N4P5Q6R7S8T91",
+    "type": "degradation",
+    "project_key": "/data/projects/frankensearch",
+    "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+    "trace": {
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": "01JAH9B0AK2M3N4P5Q6R7S8T90"
+    },
+    "reason": {
+      "code": "control.backpressure.dropping",
+      "human": "Emitter entered dropping mode due to queue pressure.",
+      "severity": "error"
+    },
+    "replay": {
+      "mode": "live"
+    },
+    "redaction": {
+      "policy_version": "v1",
+      "contains_sensitive_source": false,
+      "transforms_applied": [
+        "drop"
+      ]
+    },
+    "payload": {
+      "resource_profile": "degraded",
+      "lag_ms": 280,
+      "dropped_count": 142
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:55:07Z",
+  "event": {
+    "event_id": "01JAH9B0GK2M3N4P5Q6R7S8T92",
+    "type": "alert",
+    "project_key": "/data/projects/frankensearch",
+    "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+    "trace": {
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "reason": {
+      "code": "slo.latency.p95_exceeded",
+      "human": "P95 latency exceeded configured SLO for 3 consecutive windows.",
+      "severity": "warn"
+    },
+    "replay": {
+      "mode": "live"
+    },
+    "redaction": {
+      "policy_version": "v1",
+      "contains_sensitive_source": true,
+      "transforms_applied": [
+        "hash_sha256",
+        "truncate_preview",
+        "path_tokenize"
+      ]
+    },
+    "payload": {
+      "query_hash": "79931e1f2c813f4cc7dff6c2ccf3f6c0d5f98b261f4adf4de5bf86de3977ea2f",
+      "query_preview": "how does the progressive search iterator work",
+      "lag_ms": 75
+    }
+  }
+}

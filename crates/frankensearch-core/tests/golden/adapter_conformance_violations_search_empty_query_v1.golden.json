@@ -1,0 +1,7 @@
+[
+  {
+    "code": "adapter.event.search.empty_query",
+    "field": "search.query.text",
+    "message": "query text must be non-empty"
+  }
+]

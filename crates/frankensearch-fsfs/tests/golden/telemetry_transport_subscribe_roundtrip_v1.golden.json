@@ -1,0 +1,14 @@
+{
+  "kind": "telemetry_transport_subscribe",
+  "v": 1,
+  "connection_id": "01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+  "instance_id": "01K2Q6G2BHY4KQY2D8K8X5ZP1A",
+  "topic_filter": [
+    "search",
+    "embedding",
+    "resource"
+  ],
+  "resume_cursor": "cursor:01K2Q65Z7H8N9P3R4S5T6V7W8X",
+  "heartbeat_ms": 1000,
+  "max_inflight": 256
+}

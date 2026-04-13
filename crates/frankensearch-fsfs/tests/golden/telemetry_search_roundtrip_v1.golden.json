@@ -1,0 +1,32 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:45:00Z",
+  "event": {
+    "type": "search",
+    "instance": {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "pid": 4242
+    },
+    "correlation": {
+      "event_id": "01JAH9A2X1K2M3N4P5Q6R7S8T9",
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "query": {
+      "text": "distributed consensus algorithm",
+      "class": "natural_language",
+      "phase": "initial"
+    },
+    "results": {
+      "result_count": 10,
+      "lexical_count": 18,
+      "semantic_count": 30
+    },
+    "metrics": {
+      "latency_us": 8421,
+      "memory_bytes": 1835008
+    }
+  }
+}

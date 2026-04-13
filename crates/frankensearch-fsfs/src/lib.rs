@@ -7,22 +7,37 @@
 
 pub mod adapters;
 pub mod agent_ergonomics;
+pub mod alien_recommendations;
+pub mod asupersync_cx;
+pub mod bead_self_doc;
 pub mod catalog;
 pub mod cli_e2e;
 pub mod concurrency;
 pub mod config;
+pub mod control_plane;
+pub mod control_plane_error;
+pub mod crate_registry;
+pub mod determinism;
 pub mod evidence;
+pub mod expected_loss;
 pub mod explainability_screen;
 pub mod explanation_payload;
+pub mod file_classification;
+pub mod high_cost_artifact;
+pub mod incremental_change;
+pub mod interaction_matrix;
 pub mod interaction_primitives;
 pub mod lexical_pipeline;
 pub mod lifecycle;
 pub mod mount_info;
 pub mod orchestration;
 pub mod output_schema;
+pub mod packaging;
 pub mod pressure;
 pub mod pressure_sensing;
+pub mod privacy;
 pub mod profiling;
+pub mod provenance;
 pub mod query_execution;
 pub mod query_expansion;
 pub mod query_latency_optimization;
@@ -30,9 +45,14 @@ pub mod query_planning;
 pub mod ranking_priors;
 pub mod redaction;
 pub mod repro;
+pub mod root_discovery;
 pub mod runtime;
 pub mod shutdown;
+pub mod slo_anomaly;
+pub mod snippet_provenance;
 pub mod stream_protocol;
+pub mod telemetry;
+pub mod telemetry_transport;
 pub mod tracing_setup;
 pub mod watcher;
 
@@ -189,10 +209,14 @@ pub use redaction::{
     deterministic_mask, deterministic_truncate, is_hard_deny_path,
 };
 pub use repro::{
-    ArtifactEntry, CaptureReason, EnvEntry, EnvSnapshot, FrameSeqRange, IndexChecksum,
-    IndexChecksums, ModelManifest, ModelSnapshot, PACK_FILES, REPRO_SCHEMA_VERSION, ReplayMeta,
-    ReplayMode, ReproInstance, ReproManifest, RetentionPolicy, RetentionTier, files_for_tier,
-    should_capture_env, should_redact_env,
+    ArtifactEntry, AttestationSignature, BuildProvenance, CaptureReason, EnvEntry, EnvSnapshot,
+    FrameSeqRange, IndexChecksum, IndexChecksums, ModelManifest, ModelSnapshot, PACK_FILES,
+    PROVENANCE_ATTESTATION_FILENAME, ProvenanceAttestation, ProvenanceStartupCheck,
+    REPRO_SCHEMA_VERSION, ReplayMeta, ReplayMode, ReproInstance, ReproManifest, RetentionPolicy,
+    RetentionTier, RuntimeProvenance, StartupVerificationAction, StartupVerificationAlert,
+    StartupVerificationOutcome, StartupVerificationPolicy, StartupVerificationReport,
+    StartupVerificationStatus, VerificationSeverity, files_for_tier, should_capture_env,
+    should_redact_env,
 };
 pub use runtime::{
     FsfsRuntime, InterfaceMode, VersionCheckCache, is_cache_valid, maybe_print_update_notice,

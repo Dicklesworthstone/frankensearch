@@ -1,0 +1,17 @@
+{
+  "connection_id": "01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+  "dispatch_ts": "2026-02-14T01:20:02.020Z",
+  "dropped_since_last": 20,
+  "frame_type": "error",
+  "kind": "telemetry_transport_stream_frame",
+  "lag_ms": 20,
+  "payload": {
+    "error_code": "stream_disconnected",
+    "reason_code": "peer_closed_socket",
+    "retry_after_ms": 250
+  },
+  "producer_ts": "2026-02-14T01:20:02Z",
+  "sequence": 44,
+  "transport": "jsonl_fallback",
+  "v": 1
+}

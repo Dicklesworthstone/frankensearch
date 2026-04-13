@@ -1,0 +1,28 @@
+{
+  "kind": "fsfs_root_discovery_decision",
+  "v": 1,
+  "path": "/home/ubuntu/projects/frankensearch/src/lib.rs",
+  "override_mode": "strict",
+  "rules_evaluated": [
+    {
+      "source": "hard_deny",
+      "matched": false,
+      "effect": "noop"
+    },
+    {
+      "source": "gitignore",
+      "matched": false,
+      "effect": "noop"
+    },
+    {
+      "source": "default_root",
+      "matched": true,
+      "effect": "include"
+    }
+  ],
+  "final_decision": "include",
+  "reason_code": "FSFS_DEFAULT_ROOT_INCLUDE",
+  "symlink_detected": false,
+  "mount_crossing": false,
+  "loop_detected": false
+}

@@ -455,6 +455,54 @@ impl FileProtector {
         })
     }
 
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
+    pub(crate) fn is_repairable(
+        &self,
+        path: &Path,
+        sidecar_path: &Path,
+    ) -> SearchResult<bool> {
+        let source_file = match fs::File::open(path) {
+            Ok(file) => Some(file),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(SearchError::Io(err)),
+        };
+
+        let trailer_bytes = fs::read(sidecar_path)?;
+        let (header, trailer_symbols) = deserialize_repair_trailer(&trailer_bytes)?;
+
+        if header.source_len == 0 {
+            return Ok(true);
+        }
+
+        let repair_symbols: Vec<(u32, Vec<u8>)> = trailer_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+
+        let mut symbols = if let Some(ref file) = source_file {
+            let len = file.metadata()?.len();
+            if len > 0 {
+                if len == header.source_len {
+                    // Bit-rot case: avoid feeding corrupted symbols, rely on repair symbols.
+                    Vec::new()
+                } else {
+                    let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
+                    source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        symbols.extend(repair_symbols);
+
+        let decoded =
+            self.codec
+                .decode_for_symbol_size(&symbols, header.k_source, header.symbol_size)?;
+        Ok(matches!(decoded, DecodedPayload::Success { .. }))
+    }
+
     #[allow(clippy::too_many_lines)]
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {

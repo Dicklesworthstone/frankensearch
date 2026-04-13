@@ -1,0 +1,58 @@
+{
+  "kind": "snapshot_response",
+  "v": 1,
+  "snapshot_id": "01JAH9A5MK2M3N4P5Q6R7S8T90",
+  "generated_ts": "2026-02-14T00:50:00Z",
+  "fleet_summary": {
+    "detected_instances": 2,
+    "healthy_instances": 1,
+    "degraded_instances": 1,
+    "stale_instances": 0
+  },
+  "instances": [
+    {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "attribution_confidence": 0.99,
+      "health": {
+        "lifecycle_state": "healthy",
+        "slo_status": "green",
+        "error_budget_consumed_pct": 14.2
+      },
+      "latest_metrics": {
+        "search": {
+          "p50_ms": 6.2,
+          "p95_ms": 41.8,
+          "qps": 12.5
+        },
+        "embedding": {
+          "queue_depth": 8,
+          "throughput_eps": 204.1,
+          "fail_rate_pct": 0.4
+        },
+        "index": {
+          "docs": 12034,
+          "index_bytes": 19833421,
+          "stale_ratio_pct": 0.8
+        },
+        "resource": {
+          "cpu_pct": 38.5,
+          "rss_bytes": 73400320,
+          "io_read_bps": 32342.0,
+          "io_write_bps": 12340.0
+        }
+      },
+      "anomaly_summary": {
+        "active_count": 0,
+        "max_severity": "none",
+        "last_anomaly_ts": null
+      },
+      "lag": {
+        "ingest_lag_ms_p50": 14.0,
+        "ingest_lag_ms_p95": 38.0,
+        "stream_queue_depth": 3
+      }
+    }
+  ]
+}

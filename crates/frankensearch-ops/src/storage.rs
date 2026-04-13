@@ -294,6 +294,7 @@ impl Default for OpsStorageConfig {
 pub enum SearchEventPhase {
     Initial,
     Refined,
+    Reranked,
     Failed,
 }
 
@@ -303,6 +304,7 @@ impl SearchEventPhase {
         match self {
             Self::Initial => "initial",
             Self::Refined => "refined",
+            Self::Reranked => "reranked",
             Self::Failed => "failed",
         }
     }
@@ -402,6 +404,7 @@ const fn search_event_phase_from_telemetry(phase: TelemetrySearchEventPhase) -> 
     match phase {
         TelemetrySearchEventPhase::Initial => SearchEventPhase::Initial,
         TelemetrySearchEventPhase::Refined => SearchEventPhase::Refined,
+        TelemetrySearchEventPhase::Reranked => SearchEventPhase::Reranked,
         TelemetrySearchEventPhase::RefinementFailed => SearchEventPhase::Failed,
     }
 }

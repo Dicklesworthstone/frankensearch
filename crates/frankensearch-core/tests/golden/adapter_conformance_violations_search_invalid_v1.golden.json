@@ -1,0 +1,62 @@
+[
+  {
+    "code": "adapter.envelope.missing_timestamp",
+    "field": "envelope.ts",
+    "message": "timestamp must be non-empty"
+  },
+  {
+    "code": "adapter.envelope.schema_version_mismatch",
+    "field": "envelope.v",
+    "message": "expected schema v1, got v99"
+  },
+  {
+    "code": "adapter.event.correlation.invalid_event_id",
+    "field": "search.correlation.event_id",
+    "message": "event_id must be a 26-char ULID"
+  },
+  {
+    "code": "adapter.event.correlation.invalid_parent_event_id",
+    "field": "search.correlation.parent_event_id",
+    "message": "parent_event_id must be a 26-char ULID when provided"
+  },
+  {
+    "code": "adapter.event.correlation.invalid_root_request_id",
+    "field": "search.correlation.root_request_id",
+    "message": "root_request_id must be a 26-char ULID"
+  },
+  {
+    "code": "adapter.event.instance.invalid_instance_id",
+    "field": "search.instance.instance_id",
+    "message": "instance_id must be a 26-char ULID"
+  },
+  {
+    "code": "adapter.event.instance.missing_host_name",
+    "field": "search.instance.host_name",
+    "message": "host_name must be non-empty"
+  },
+  {
+    "code": "adapter.event.instance.missing_project_key",
+    "field": "search.instance.project_key",
+    "message": "project_key must be non-empty"
+  },
+  {
+    "code": "adapter.event.search.missing_source_counts",
+    "field": "search.results",
+    "message": "result_count > 0 requires lexical_count or semantic_count to be non-zero"
+  },
+  {
+    "code": "adapter.event.search.query_too_long",
+    "field": "search.query.text",
+    "message": "query length 617 exceeds 500"
+  },
+  {
+    "code": "adapter.event.search.zero_latency",
+    "field": "search.metrics.latency_us",
+    "message": "latency_us should be > 0 for completed search telemetry"
+  },
+  {
+    "code": "adapter.redaction.forbidden_pattern",
+    "field": "envelope",
+    "message": "payload contains forbidden pattern 'BEGIN PRIVATE KEY'"
+  }
+]

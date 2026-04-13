@@ -1,0 +1,17 @@
+{
+  "schema": "interaction-failure-summary-v1",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "bead": "bd-3un.52.6",
+  "workflow": "interaction-matrix-gate",
+  "run_url": "https://github.com/run/1",
+  "replay_command": "cargo test",
+  "required_artifacts": [
+    "log.txt"
+  ],
+  "escalation_playbook": "https://docs/playbook",
+  "escalation_metadata": {
+    "thread_id": "bd-3un.52.6",
+    "ownership_artifact": "interaction_lane_ownership.json",
+    "summary_contract": "lane_id"
+  }
+}

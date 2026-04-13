@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:45:10Z",
+  "event": {
+    "type": "lifecycle",
+    "instance": {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "pid": 4242
+    },
+    "correlation": {
+      "event_id": "01JAH9A39K2M3N4P5Q6R7S8T9Z",
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "state": "degraded",
+    "severity": "warn",
+    "reason": "quality_embedder_timeout_rate_exceeded",
+    "uptime_ms": 7200450
+  }
+}

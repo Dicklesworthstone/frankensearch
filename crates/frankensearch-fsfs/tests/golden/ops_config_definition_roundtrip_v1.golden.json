@@ -1,0 +1,37 @@
+{
+  "kind": "ops_config_definition",
+  "v": 1,
+  "source_precedence": [
+    "env",
+    "file",
+    "defaults"
+  ],
+  "file_path_policy": {
+    "primary": "${XDG_CONFIG_HOME}/frankensearch/ops.toml",
+    "fallback": "~/.config/frankensearch/ops.toml"
+  },
+  "defaults": {
+    "telemetry_collection_interval_ms": 1000,
+    "ingestion_batch_size": 100,
+    "retention_raw_days": 7,
+    "retention_summary_days": 90,
+    "slo_search_p99_ms": 500,
+    "slo_embedding_throughput_min_docs_per_s": 10.0,
+    "discovery_scan_interval_ms": 30000,
+    "ui_refresh_interval_ms": 250,
+    "backpressure_queue_depth_limit": 10000
+  },
+  "reloadable_fields": [
+    "slo_search_p99_ms",
+    "slo_embedding_throughput_min_docs_per_s",
+    "discovery_scan_interval_ms",
+    "ui_refresh_interval_ms",
+    "backpressure_queue_depth_limit"
+  ],
+  "restart_required_fields": [
+    "telemetry_collection_interval_ms",
+    "ingestion_batch_size",
+    "retention_raw_days",
+    "retention_summary_days"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "final_score": 0.812,
+  "components": [
+    {
+      "source": {
+        "SemanticQuality": {
+          "embedder": "all-MiniLM-L6-v2",
+          "cosine_sim": 0.92
+        }
+      },
+      "raw_score": 0.92,
+      "normalized_score": 0.87,
+      "rrf_contribution": 0.014,
+      "weight": 0.7
+    }
+  ],
+  "phase": "Refined",
+  "rank_movement": {
+    "initial_rank": 5,
+    "refined_rank": 2,
+    "delta": -3,
+    "reason": "quality model promoted result"
+  }
+}

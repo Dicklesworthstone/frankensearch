@@ -1,0 +1,231 @@
+{
+  "change_management": {
+    "diagnostic_output": [
+      "JSON finding lines with rule_id, severity, bead_id, and fix_hint",
+      "Summary counts for mapped, unresolved, missing, duplicate, and overlap findings"
+    ],
+    "lint_commands": [
+      "scripts/check_crate_placement_registry.sh --mode unit",
+      "scripts/check_crate_placement_registry.sh --mode integration --scope active",
+      "scripts/check_crate_placement_registry.sh --mode integration --scope changed"
+    ],
+    "owner": "bd-33iv",
+    "update_workflow": [
+      "Update docs/crate-placement-registry.json when creating/editing active implementation beads.",
+      "If a bead cannot be mapped to a single lane, mark placement_status as conflict/unknown and include owner + deadline + blocking impact.",
+      "Run scripts/check_crate_placement_registry.sh --mode all before commit.",
+      "Post diagnostics output in the bead thread and resolve any FAIL findings before merge."
+    ]
+  },
+  "generated_from": ".beads/issues.jsonl",
+  "last_updated": "2026-02-14",
+  "owners": {
+    "beads-quality-stream": "bd-3qwe",
+    "composition-lane": "bd-ehuk",
+    "core-stream": "bd-3un",
+    "fsfs-stream": "bd-2hz",
+    "ops-stream": "bd-2yu",
+    "storage-stream": "bd-3w1"
+  },
+  "rules": [
+    {
+      "id_pattern": "^bd-2hz(?:\\.|$)",
+      "integration_boundaries": [
+        "crates/frankensearch-core/src/**",
+        "crates/frankensearch-fusion/src/**"
+      ],
+      "owner": "fsfs-stream",
+      "placement_status": "resolved",
+      "rationale": "All fsfs workstream beads land in the fsfs crate first, with optional TUI/supporting policy artifacts.",
+      "rule_id": "R-2HZ",
+      "target_paths": [
+        "crates/frankensearch-fsfs/src/**",
+        "crates/frankensearch-tui/src/**",
+        "docs/fsfs-*.md",
+        "schemas/fsfs-*.schema.json",
+        "scripts/**fsfs*.sh"
+      ]
+    },
+    {
+      "id_pattern": "^bd-2yu(?:\\.|$)",
+      "integration_boundaries": [
+        "crates/frankensearch-storage/src/**",
+        "crates/frankensearch-core/src/**"
+      ],
+      "owner": "ops-stream",
+      "placement_status": "resolved",
+      "rationale": "Ops control-plane work maps to ops + TUI crates plus telemetry/control-plane contracts.",
+      "rule_id": "R-2YU",
+      "target_paths": [
+        "crates/frankensearch-ops/src/**",
+        "crates/frankensearch-tui/src/**",
+        "docs/ops-*.md",
+        "docs/observability-contract.md",
+        "schemas/ops-*.schema.json",
+        "schemas/control-plane-*.schema.json"
+      ]
+    },
+    {
+      "id_pattern": "^bd-3w1(?:\\.|$)",
+      "integration_boundaries": [
+        "crates/frankensearch-index/src/**",
+        "crates/frankensearch-fusion/src/**"
+      ],
+      "owner": "storage-stream",
+      "placement_status": "resolved",
+      "rationale": "FrankenSQLite + durability beads are implemented in storage/durability crates with architecture docs as the contract surface.",
+      "rule_id": "R-3W1",
+      "target_paths": [
+        "crates/frankensearch-storage/src/**",
+        "crates/frankensearch-durability/src/**",
+        "docs/architecture/native-mode-distributed-search.md"
+      ]
+    },
+    {
+      "id_pattern": "^bd-3un(?:\\.|$)",
+      "integration_boundaries": [
+        "crates/frankensearch-storage/src/**",
+        "crates/frankensearch-durability/src/**"
+      ],
+      "owner": "core-stream",
+      "placement_status": "resolved",
+      "rationale": "Main crate-extraction beads map to canonical frankensearch component crates and facade exports.",
+      "rule_id": "R-3UN",
+      "target_paths": [
+        "crates/frankensearch-core/src/**",
+        "crates/frankensearch-embed/src/**",
+        "crates/frankensearch-index/src/**",
+        "crates/frankensearch-lexical/src/**",
+        "crates/frankensearch-fusion/src/**",
+        "crates/frankensearch-rerank/src/**",
+        "frankensearch/src/**"
+      ]
+    },
+    {
+      "id_pattern": "^bd-3qwe(?:\\.|$)",
+      "owner": "beads-quality-stream",
+      "placement_status": "resolved",
+      "rationale": "Bead self-documentation normalization is enforced by policy docs and lint scripts, with source-of-truth in issues.jsonl.",
+      "rule_id": "R-3QWE",
+      "target_paths": [
+        ".beads/issues.jsonl",
+        "docs/*policy*.md",
+        "scripts/check_bead_*.sh",
+        "scripts/check_dependency_semantics.sh"
+      ]
+    },
+    {
+      "id_pattern": "^bd-1pkl$",
+      "owner": "composition-lane",
+      "placement_status": "resolved",
+      "rationale": "Policy-gate bead for composition matrix couples bead policy text with fusion interaction contracts.",
+      "rule_id": "R-1PKL",
+      "target_paths": [
+        ".beads/issues.jsonl",
+        "docs/interaction-*.md",
+        "crates/frankensearch-fusion/src/interaction_*.rs"
+      ]
+    },
+    {
+      "id_pattern": "^bd-ls2f$",
+      "owner": "reproducibility-lane",
+      "placement_status": "resolved",
+      "rationale": "Reproducibility contract bead is anchored in docs/schemas with CI-facing validation scripts.",
+      "rule_id": "R-LS2F",
+      "target_paths": [
+        "docs/repro*.md",
+        "schemas/e2e-artifact-v1.schema.json",
+        "schemas/fixtures/e2e-*.json",
+        "scripts/check_feature_matrix.sh"
+      ]
+    },
+    {
+      "id_pattern": "^bd-2hk9$",
+      "owner": "optimization-lane",
+      "placement_status": "resolved",
+      "rationale": "Optimizer bead owns tuning tool artifacts plus config-loading hooks.",
+      "rule_id": "R-2HK9",
+      "target_paths": [
+        "tools/optimize_params/src/**",
+        "data/optimized_params.toml",
+        "data/optimization_log.jsonl",
+        "data/optimization_report.md",
+        "crates/frankensearch-core/src/config.rs"
+      ]
+    },
+    {
+      "id_pattern": "^bd-2rq$",
+      "owner": "federation-lane",
+      "placement_status": "resolved",
+      "rationale": "Federated-search functionality is implemented in fusion orchestrator code and fusion test surface.",
+      "rule_id": "R-2RQ",
+      "target_paths": [
+        "crates/frankensearch-fusion/src/federated.rs",
+        "crates/frankensearch-fusion/src/searcher.rs",
+        "crates/frankensearch-fusion/src/lib.rs",
+        "crates/frankensearch-fusion/tests/**"
+      ]
+    },
+    {
+      "id_pattern": "^bd-33iv$",
+      "owner": "BoldMarsh",
+      "placement_status": "resolved",
+      "rationale": "This bead defines and validates the placement registry contract itself.",
+      "rule_id": "R-33IV",
+      "target_paths": [
+        "docs/crate-placement-registry.json",
+        "docs/crate-placement-registry.md",
+        "schemas/crate-placement-registry-v1.schema.json",
+        "schemas/fixtures/crate-placement-registry-v1.json",
+        "scripts/check_crate_placement_registry.sh"
+      ]
+    },
+    {
+      "blocking_impact": "medium",
+      "id_pattern": "^bd-1gfx$",
+      "notes": "Resolve by splitting future hardening beads into crate-scoped child tasks.",
+      "owner": "hardening-lane",
+      "placement_status": "conflict",
+      "rationale": "Cross-agent hardening pass is intentionally cross-cutting and cannot be constrained to one crate path.",
+      "resolution_deadline": "2026-02-21",
+      "resolution_owner": "DustyElk",
+      "rule_id": "R-1GFX",
+      "target_paths": [
+        "crates/**",
+        "tests/**",
+        "benches/**"
+      ]
+    },
+    {
+      "id_pattern": "^bd-3vw3$",
+      "owner": "composition-program",
+      "placement_status": "resolved",
+      "rationale": "Sprint composition program bead is planning/policy oriented and stays in bead + docs surfaces.",
+      "rule_id": "R-3VW3",
+      "target_paths": [
+        ".beads/issues.jsonl",
+        "docs/observability-contract.md",
+        "docs/baseline-budget-policy.md",
+        "docs/test-matrix-policy.md"
+      ]
+    },
+    {
+      "blocking_impact": "high",
+      "id_pattern": "^bd-ehuk$",
+      "notes": "Close after interaction matrix completion and CI gate wiring are merged.",
+      "owner": "composition-lane",
+      "placement_status": "conflict",
+      "rationale": "Release-gate composition sign-off spans fusion contracts, test matrix, and policy docs.",
+      "resolution_deadline": "2026-02-20",
+      "resolution_owner": "composition-lane",
+      "rule_id": "R-EHUK",
+      "target_paths": [
+        "crates/frankensearch-fusion/src/interaction_lanes.rs",
+        "crates/frankensearch-fusion/src/interaction_oracles.rs",
+        "tests/**",
+        "docs/observability-contract.md"
+      ]
+    }
+  ],
+  "version": "1.0.0"
+}

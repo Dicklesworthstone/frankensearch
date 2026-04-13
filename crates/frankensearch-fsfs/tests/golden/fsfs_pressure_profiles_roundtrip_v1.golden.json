@@ -1,0 +1,78 @@
+{
+  "kind": "fsfs_pressure_profiles_contract_definition",
+  "v": 1,
+  "profiles": {
+    "strict": {
+      "scheduler_mode": "fair_share",
+      "max_embed_concurrency": 2,
+      "max_index_concurrency": 2,
+      "quality_enabled": false,
+      "allow_background_indexing": false,
+      "pressure_enter_threshold": 0.35,
+      "pressure_exit_threshold": 0.20,
+      "override_policy": {
+        "overridable_fields": [
+          "scheduler_mode",
+          "max_index_concurrency"
+        ],
+        "locked_fields": [
+          "quality_enabled",
+          "allow_background_indexing",
+          "max_embed_concurrency"
+        ]
+      }
+    },
+    "performance": {
+      "scheduler_mode": "latency_sensitive",
+      "max_embed_concurrency": 6,
+      "max_index_concurrency": 8,
+      "quality_enabled": true,
+      "allow_background_indexing": true,
+      "pressure_enter_threshold": 0.65,
+      "pressure_exit_threshold": 0.45,
+      "override_policy": {
+        "overridable_fields": [
+          "scheduler_mode",
+          "max_embed_concurrency",
+          "max_index_concurrency",
+          "allow_background_indexing"
+        ],
+        "locked_fields": [
+          "quality_enabled"
+        ]
+      }
+    },
+    "degraded": {
+      "scheduler_mode": "fair_share",
+      "max_embed_concurrency": 1,
+      "max_index_concurrency": 1,
+      "quality_enabled": false,
+      "allow_background_indexing": false,
+      "pressure_enter_threshold": 0.15,
+      "pressure_exit_threshold": 0.10,
+      "override_policy": {
+        "overridable_fields": [],
+        "locked_fields": [
+          "scheduler_mode",
+          "max_embed_concurrency",
+          "max_index_concurrency",
+          "quality_enabled",
+          "allow_background_indexing"
+        ]
+      }
+    }
+  },
+  "precedence_order": [
+    "hard_safety_guards",
+    "cli_override",
+    "env_override",
+    "config_override",
+    "profile_default"
+  ],
+  "migration_policy": {
+    "profile_version": 1,
+    "requires_revision_bump_on_semantic_change": true,
+    "drift_protection": "explicit_migration_required",
+    "deprecated_fields": []
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "schema": "e2e-event-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:01Z",
+  "body": {
+    "type": "oracle_check",
+    "correlation": {
+      "event_id": "01HQXG5M7QABCDEF12345678AB",
+      "root_request_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+      "parent_event_id": "01HQXG5M7PXYZ98765432109CD"
+    },
+    "severity": "info",
+    "lane_id": "baseline",
+    "oracle_id": "ORACLE_NO_DUPLICATES",
+    "outcome": "pass",
+    "context": "0 duplicates found in 10 results",
+    "metrics": {
+      "result_count": 10,
+      "unique_count": 10
+    }
+  }
+}

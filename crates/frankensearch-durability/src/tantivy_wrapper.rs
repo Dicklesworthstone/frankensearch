@@ -298,6 +298,9 @@ impl DurableTantivyIndex {
                     source: Box::new(e),
                 })?;
 
+        // Phase 1: Detection (oldest first, per Tantivy's segment meta order)
+        let mut repair_queue = Vec::new();
+
         for meta in &segment_metas {
             let files = meta.list_files();
             for relative_path in &files {
@@ -309,50 +312,43 @@ impl DurableTantivyIndex {
                     continue;
                 }
                 let abs_path = self.data_dir.join(relative_path);
-                if !abs_path.exists() {
+                let sidecar = FileProtector::sidecar_path(&abs_path);
+
+                if !sidecar.exists() {
+                    if abs_path.exists() {
+                        files_checked += 1;
+                        files_unprotected += 1;
+                        debug!(
+                            segment_id = %meta.id().short_uuid_string(),
+                            file = %relative_path.display(),
+                            "no sidecar, skipping verification"
+                        );
+                    }
                     continue;
                 }
 
                 files_checked += 1;
                 let check_start = Instant::now();
-                match self.protector.verify_and_repair_file(&abs_path) {
-                    Ok(health) => match health.status {
-                        FileHealth::Intact => {
-                            files_intact += 1;
-                        }
-                        FileHealth::Repaired {
-                            bytes_written,
-                            repair_time: file_repair_time,
-                        } => {
-                            files_repaired += 1;
-                            repair_time += file_repair_time;
-                            info!(
-                                segment_id = %meta.id().short_uuid_string(),
-                                file = %relative_path.display(),
-                                bytes_written,
-                                repair_time_ms = file_repair_time.as_millis(),
-                                "segment component repaired"
-                            );
-                        }
-                        FileHealth::Unrecoverable { reason } => {
-                            files_unrecoverable += 1;
-                            repair_time += check_start.elapsed();
-                            warn!(
-                                segment_id = %meta.id().short_uuid_string(),
-                                file = %relative_path.display(),
-                                reason,
-                                "segment component unrecoverable"
-                            );
-                        }
-                        FileHealth::Unprotected => {
-                            files_unprotected += 1;
-                            debug!(
-                                segment_id = %meta.id().short_uuid_string(),
-                                file = %relative_path.display(),
-                                "no sidecar, skipping verification"
-                            );
-                        }
-                    },
+                match self.protector.verify_file(&abs_path, &sidecar) {
+                    Ok(verify) if verify.healthy => {
+                        files_intact += 1;
+                    }
+                    Ok(verify) => {
+                        debug!(
+                            path = %abs_path.display(),
+                            expected_crc32 = verify.expected_crc32,
+                            actual_crc32 = verify.actual_crc32,
+                            "corruption detected"
+                        );
+                        repair_queue.push((meta.clone(), relative_path.clone(), abs_path));
+                    }
+                    Err(SearchError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(
+                            path = %abs_path.display(),
+                            "source file missing, will attempt repair from sidecar"
+                        );
+                        repair_queue.push((meta.clone(), relative_path.clone(), abs_path));
+                    }
                     Err(e) => {
                         files_unrecoverable += 1;
                         repair_time += check_start.elapsed();
@@ -360,9 +356,59 @@ impl DurableTantivyIndex {
                             segment_id = %meta.id().short_uuid_string(),
                             file = %relative_path.display(),
                             error = %e,
-                            "verify-and-repair failed"
+                            "verify failed (unrecoverable)"
                         );
                     }
+                }
+            }
+        }
+
+        // Phase 2: Repair (newest first, by iterating reverse over the detection queue)
+        for (meta, relative_path, abs_path) in repair_queue.into_iter().rev() {
+            let check_start = Instant::now();
+            match self.protector.verify_and_repair_file(&abs_path) {
+                Ok(health) => match health.status {
+                    FileHealth::Repaired {
+                        bytes_written,
+                        repair_time: file_repair_time,
+                    } => {
+                        files_repaired += 1;
+                        repair_time += file_repair_time;
+                        info!(
+                            segment_id = %meta.id().short_uuid_string(),
+                            file = %relative_path.display(),
+                            bytes_written,
+                            repair_time_ms = file_repair_time.as_millis(),
+                            "segment component repaired"
+                        );
+                    }
+                    FileHealth::Unrecoverable { reason } => {
+                        files_unrecoverable += 1;
+                        repair_time += check_start.elapsed();
+                        warn!(
+                            segment_id = %meta.id().short_uuid_string(),
+                            file = %relative_path.display(),
+                            reason,
+                            "segment component unrecoverable"
+                        );
+                    }
+                    FileHealth::Intact => {
+                        // Should not occur since it was detected as corrupt, but safe to handle
+                        files_intact += 1;
+                    }
+                    FileHealth::Unprotected => {
+                        files_unprotected += 1;
+                    }
+                },
+                Err(e) => {
+                    files_unrecoverable += 1;
+                    repair_time += check_start.elapsed();
+                    warn!(
+                        segment_id = %meta.id().short_uuid_string(),
+                        file = %relative_path.display(),
+                        error = %e,
+                        "verify-and-repair failed"
+                    );
                 }
             }
         }

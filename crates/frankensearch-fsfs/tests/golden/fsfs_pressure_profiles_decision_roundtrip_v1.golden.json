@@ -1,0 +1,62 @@
+{
+  "kind": "fsfs_pressure_profile_resolution",
+  "v": 1,
+  "trace_id": "trace-prof-001",
+  "selected_profile": "performance",
+  "overrides": [
+    {
+      "field": "max_index_concurrency",
+      "source": "cli",
+      "requested_value": 10,
+      "applied": true,
+      "reason_code": "override.applied.cli_field"
+    },
+    {
+      "field": "quality_enabled",
+      "source": "env",
+      "requested_value": false,
+      "applied": false,
+      "reason_code": "override.rejected.locked_field"
+    }
+  ],
+  "effective": {
+    "scheduler_mode": "latency_sensitive",
+    "max_embed_concurrency": 6,
+    "max_index_concurrency": 10,
+    "quality_enabled": true,
+    "allow_background_indexing": true,
+    "pressure_enter_threshold": 0.65,
+    "pressure_exit_threshold": 0.45,
+    "override_policy": {
+      "overridable_fields": [
+        "scheduler_mode",
+        "max_embed_concurrency",
+        "max_index_concurrency",
+        "allow_background_indexing"
+      ],
+      "locked_fields": [
+        "quality_enabled"
+      ]
+    }
+  },
+  "safety_clamps": [
+    {
+      "field": "max_index_concurrency",
+      "clamped_to": 10,
+      "reason_code": "safety.clamp.max_index_concurrency"
+    }
+  ],
+  "conflict_detected": false,
+  "diagnostics": {
+    "event": "profile_resolution_completed",
+    "reason_code": "profile.resolution.ok",
+    "precedence_chain": [
+      "hard_safety_guards",
+      "cli_override",
+      "env_override",
+      "config_override",
+      "profile_default"
+    ],
+    "effective_profile_version": 1
+  }
+}

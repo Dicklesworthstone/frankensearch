@@ -1,0 +1,8 @@
+{
+  "kind": "asupersync_cx_api_signature_case",
+  "v": 1,
+  "function_name": "canonicalize_query",
+  "function_kind": "sync_public",
+  "cx_position": "absent",
+  "valid": true
+}

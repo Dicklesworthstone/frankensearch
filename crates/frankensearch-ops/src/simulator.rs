@@ -403,7 +403,7 @@ impl TelemetrySimulator {
                         &mut rng,
                     );
                     let query_class = QueryClass::classify(&query);
-                    let phase = synthesize_phase(
+                    let phases = synthesize_phases(
                         spec.workload,
                         query_class,
                         restart_tick,
@@ -420,48 +420,50 @@ impl TelemetrySimulator {
                         &mut rng,
                     );
 
-                    let phase_label = phase_label(&phase).to_owned();
-                    let failure_kind = failure_kind_for_phase(&phase).map(str::to_owned);
-                    let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);
+                    for phase in phases {
+                        let phase_label = phase_label(&phase).to_owned();
+                        let failure_kind = failure_kind_for_phase(&phase).map(str::to_owned);
+                        let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);
 
-                    let correlation_idx = event_index / 2;
-                    let event_id = format!(
-                        "evt:{}:{}:{tick_index}:{event_index}:{phase_label}",
-                        spec.project_key, spec.instance_index
-                    );
-                    let correlation_id =
-                        format!("corr:{}:{tick_index}:{correlation_idx}", spec.instance_id);
+                        let correlation_idx = event_index / 2;
+                        let event_id = format!(
+                            "evt:{}:{}:{tick_index}:{event_index}:{phase_label}",
+                            spec.project_key, spec.instance_index
+                        );
+                        let correlation_id =
+                            format!("corr:{}:{tick_index}:{correlation_idx}", spec.instance_id);
 
-                    search_events.push(SimulatedSearchEvent {
-                        record: SearchEventRecord {
-                            event_id,
-                            project_key: spec.project_key.clone(),
-                            instance_id: spec.instance_id.clone(),
-                            correlation_id,
-                            query_hash: Some(format!(
-                                "{:016x}",
-                                stable_u64_hash(
-                                    format!("{query}:{tick_index}:{event_index}").as_str()
-                                )
-                            )),
-                            query_class: Some(query_class.to_string()),
-                            phase: record_phase,
-                            latency_us,
-                            result_count,
-                            memory_bytes: Some(memory_bytes_for_event(
-                                spec.workload,
-                                query_class,
-                                &mut rng,
-                            )),
-                            ts_ms: u64_to_i64(now_ms)?,
-                        },
-                        query,
-                        query_class,
-                        phase_label,
-                        skip_reason,
-                        failure_kind,
-                    });
-                    emitted_events = emitted_events.saturating_add(1);
+                        search_events.push(SimulatedSearchEvent {
+                            record: SearchEventRecord {
+                                event_id,
+                                project_key: spec.project_key.clone(),
+                                instance_id: spec.instance_id.clone(),
+                                correlation_id,
+                                query_hash: Some(format!(
+                                    "{:016x}",
+                                    stable_u64_hash(
+                                        format!("{query}:{tick_index}:{event_index}").as_str()
+                                    )
+                                )),
+                                query_class: Some(query_class.to_string()),
+                                phase: record_phase,
+                                latency_us,
+                                result_count,
+                                memory_bytes: Some(memory_bytes_for_event(
+                                    spec.workload,
+                                    query_class,
+                                    &mut rng,
+                                )),
+                                ts_ms: u64_to_i64(now_ms)?,
+                            },
+                            query: query.clone(),
+                            query_class,
+                            phase_label,
+                            skip_reason: skip_reason.clone(),
+                            failure_kind,
+                        });
+                        emitted_events = emitted_events.saturating_add(1);
+                    }
                 }
 
                 resource_samples.push(ResourceSampleRecord {
@@ -681,7 +683,7 @@ fn event_count_for_tick(
         .max(1)
 }
 
-fn synthesize_phase(
+fn synthesize_phases(
     workload: WorkloadProfile,
     query_class: QueryClass,
     restart_tick: bool,
@@ -689,7 +691,7 @@ fn synthesize_phase(
     event_index: u64,
     instance_id: &str,
     rng: &mut DeterministicRng,
-) -> SearchPhase {
+) -> Vec<SearchPhase> {
     let roll = rng.next_bounded(100);
     let fail_cutoff = match workload {
         WorkloadProfile::Steady => 8_u64,
@@ -720,7 +722,7 @@ fn synthesize_phase(
 
     if roll < fail_cutoff {
         let timeout_ms = 120_u64.saturating_add(rng.next_bounded(120));
-        return SearchPhase::RefinementFailed {
+        return vec![SearchPhase::RefinementFailed {
             initial_results: build_results(
                 instance_id,
                 tick_index,
@@ -733,29 +735,34 @@ fn synthesize_phase(
                 budget_ms: 100,
             },
             latency: Duration::from_micros(latency_base_us.saturating_mul(30)),
-        };
+        }];
     }
+
+    let mut phases = Vec::new();
+
+    let initial = SearchPhase::Initial {
+        results: build_results(
+            instance_id,
+            tick_index,
+            event_index,
+            result_count,
+            ScoreSource::SemanticFast,
+        ),
+        latency: Duration::from_micros(latency_base_us.saturating_add(rng.next_bounded(1_000))),
+        metrics: PhaseMetrics {
+            embedder_id: "potion-128m".to_owned(),
+            vectors_searched: 1_024,
+            lexical_candidates: 32,
+            fused_count: result_count,
+        },
+    };
+    phases.push(initial);
 
     if query_class == QueryClass::Empty || roll < initial_cutoff {
-        return SearchPhase::Initial {
-            results: build_results(
-                instance_id,
-                tick_index,
-                event_index,
-                result_count,
-                ScoreSource::SemanticFast,
-            ),
-            latency: Duration::from_micros(latency_base_us.saturating_add(rng.next_bounded(1_000))),
-            metrics: PhaseMetrics {
-                embedder_id: "potion-128m".to_owned(),
-                vectors_searched: 1_024,
-                lexical_candidates: 32,
-                fused_count: result_count,
-            },
-        };
+        return phases;
     }
 
-    SearchPhase::Refined {
+    let refined = SearchPhase::Refined {
         results: build_results(
             instance_id,
             tick_index,
@@ -779,7 +786,35 @@ fn synthesize_phase(
             demoted: 1,
             stable: result_count.saturating_sub(1),
         },
+    };
+    phases.push(refined);
+
+    // Phase 3: Reranking (optional simulation)
+    if roll > 80 {
+        let reranked = SearchPhase::Reranked {
+            results: build_results(
+                instance_id,
+                tick_index,
+                event_index,
+                result_count.saturating_add(2),
+                ScoreSource::Reranked,
+            ),
+            latency: Duration::from_micros(
+                latency_base_us
+                    .saturating_mul(40)
+                    .saturating_add(rng.next_bounded(50_000)),
+            ),
+            metrics: PhaseMetrics {
+                embedder_id: "flashrank-nano".to_owned(),
+                vectors_searched: 4_096,
+                lexical_candidates: 96,
+                fused_count: result_count.saturating_add(2),
+            },
+        };
+        phases.push(reranked);
     }
+
+    phases
 }
 
 fn build_results(
@@ -822,6 +857,7 @@ const fn phase_label(phase: &SearchPhase) -> &'static str {
     match phase {
         SearchPhase::Initial { .. } => "initial",
         SearchPhase::Refined { .. } => "refined",
+        SearchPhase::Reranked { .. } => "reranked",
         SearchPhase::RefinementFailed { .. } => "failed",
     }
 }
@@ -829,7 +865,9 @@ const fn phase_label(phase: &SearchPhase) -> &'static str {
 const fn failure_kind_for_phase(phase: &SearchPhase) -> Option<&'static str> {
     match phase {
         SearchPhase::RefinementFailed { error, .. } => Some(search_error_kind(error)),
-        SearchPhase::Initial { .. } | SearchPhase::Refined { .. } => None,
+        SearchPhase::Initial { .. }
+        | SearchPhase::Refined { .. }
+        | SearchPhase::Reranked { .. } => None,
     }
 }
 
@@ -871,6 +909,13 @@ fn phase_to_record_fields(phase: &SearchPhase) -> (SearchEventPhase, u64, Option
             latency, results, ..
         } => (
             SearchEventPhase::Refined,
+            duration_to_us(*latency),
+            Some(usize_to_u64(results.len())),
+        ),
+        SearchPhase::Reranked {
+            latency, results, ..
+        } => (
+            SearchEventPhase::Reranked,
             duration_to_us(*latency),
             Some(usize_to_u64(results.len())),
         ),
@@ -1230,6 +1275,10 @@ mod tests {
         assert!(
             phase_counts.get("refined").copied().unwrap_or_default() > 0,
             "mixed workloads should include refined events"
+        );
+        assert!(
+            phase_counts.get("reranked").copied().unwrap_or_default() > 0,
+            "mixed workloads should include reranked events"
         );
     }
 

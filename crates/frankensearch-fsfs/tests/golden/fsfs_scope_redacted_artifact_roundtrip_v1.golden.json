@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_scope_redacted_artifact",
+  "v": 1,
+  "artifact_type": "explain",
+  "path": "/home/ubuntu/project/secrets.env",
+  "reason_code": "redacted_sensitive_token",
+  "redaction_applied": true,
+  "raw_content_present": false,
+  "redaction_profile": "privacy-v1-default"
+}

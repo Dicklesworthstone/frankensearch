@@ -158,8 +158,25 @@ impl FsviProtector {
             return Ok(FsviVerifyResult::NoSidecar);
         }
 
+        // If the source file is missing but a sidecar exists, treat as corrupted so
+        // callers can attempt repair.
+        let file = match fs::File::open(fsvi_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Validate the sidecar payload before declaring repairable.
+                let trailer_bytes = fs::read(&sidecar_path).map_err(SearchError::Io)?;
+                let _ = deserialize_repair_trailer(&trailer_bytes)?;
+                let repairable = self.protector.is_repairable(fsvi_path, &sidecar_path)?;
+                warn!(
+                    path = %fsvi_path.display(),
+                    "FSVI source missing; sidecar present (treating as corrupted)"
+                );
+                return Ok(FsviVerifyResult::Corrupted { repairable });
+            }
+            Err(err) => return Err(SearchError::Io(err)),
+        };
+
         // Fast path: xxh3 hash check
-        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
         let len = file.metadata().map_err(SearchError::Io)?.len();
         let actual_hash = if len == 0 {
             xxh3_64(&[])
@@ -190,6 +207,7 @@ impl FsviProtector {
         }
 
         // Corruption detected — check if repairable
+        let repairable = self.protector.is_repairable(fsvi_path, &sidecar_path)?;
         warn!(
             path = %fsvi_path.display(),
             expected_crc = verify.expected_crc32,
@@ -199,7 +217,7 @@ impl FsviProtector {
             "FSVI corruption detected"
         );
 
-        Ok(FsviVerifyResult::Corrupted { repairable: true })
+        Ok(FsviVerifyResult::Corrupted { repairable })
     }
 
     /// Attempt to repair a corrupted FSVI file using the `.fec` sidecar.
@@ -219,25 +237,33 @@ impl FsviProtector {
             });
         }
 
-        // Compute hash before repair
-        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
-        let len = file.metadata().map_err(SearchError::Io)?.len();
-        let hash_before = if len == 0 {
-            xxh3_64(&[])
-        } else {
-            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
-            xxh3_64(&mmap)
+        // Compute hash before repair (if file exists).
+        let (hash_before, len, had_source) = match fs::File::open(fsvi_path) {
+            Ok(file) => {
+                let len = file.metadata().map_err(SearchError::Io)?.len();
+                let hash_before = if len == 0 {
+                    xxh3_64(&[])
+                } else {
+                    let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+                    xxh3_64(&mmap)
+                };
+                (hash_before, len, true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, false),
+            Err(err) => return Err(SearchError::Io(err)),
         };
-        // Close file before backup (rename)
-        drop(file);
 
-        // Create backup of corrupted file
-        let backup_path = PathBuf::from(format!("{}.corrupted", fsvi_path.display()));
-        fs::copy(fsvi_path, &backup_path).map_err(SearchError::Io)?;
-        debug!(
-            backup = %backup_path.display(),
-            "backed up corrupted FSVI file before repair"
-        );
+        let backup_path = if had_source {
+            let backup_path = PathBuf::from(format!("{}.corrupted", fsvi_path.display()));
+            fs::copy(fsvi_path, &backup_path).map_err(SearchError::Io)?;
+            debug!(
+                backup = %backup_path.display(),
+                "backed up corrupted FSVI file before repair"
+            );
+            Some(backup_path)
+        } else {
+            None
+        };
 
         // Attempt repair
         let outcome = self.protector.repair_file(fsvi_path, &sidecar_path)?;
@@ -247,7 +273,9 @@ impl FsviProtector {
         match outcome {
             FileRepairOutcome::NotNeeded => {
                 // Clean up unnecessary backup
-                let _ = fs::remove_file(&backup_path);
+                if let Some(path) = &backup_path {
+                    let _ = fs::remove_file(path);
+                }
                 Ok(FsviRepairResult {
                     bytes_written: usize::try_from(len).unwrap_or(usize::MAX),
                     symbols_used: 0,
@@ -302,7 +330,9 @@ impl FsviProtector {
                 );
 
                 // Restore the backup
-                fs::copy(&backup_path, fsvi_path).map_err(SearchError::Io)?;
+                if let Some(path) = &backup_path {
+                    fs::copy(path, fsvi_path).map_err(SearchError::Io)?;
+                }
 
                 Err(SearchError::IndexCorrupted {
                     path: fsvi_path.to_path_buf(),
@@ -426,6 +456,63 @@ mod tests {
         }
     }
 
+    /// Mock codec that emits no repair symbols (forces unrepairable corruption).
+    #[derive(Debug)]
+    struct NoRepairCodec;
+
+    impl SymbolCodec for NoRepairCodec {
+        fn encode(
+            &self,
+            _cx: &Cx,
+            source_data: &[u8],
+            symbol_size: u32,
+            _repair_overhead: f64,
+        ) -> fsqlite_error::Result<CodecEncodeResult> {
+            let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
+            let mut source_symbols = Vec::new();
+
+            let mut esi: u32 = 0;
+            for chunk in source_data.chunks(symbol_size_usize) {
+                let mut data = chunk.to_vec();
+                if data.len() < symbol_size_usize {
+                    data.resize(symbol_size_usize, 0);
+                }
+                source_symbols.push((esi, data));
+                esi = esi.saturating_add(1);
+            }
+
+            Ok(CodecEncodeResult {
+                source_symbols,
+                repair_symbols: Vec::new(),
+                k_source: esi,
+            })
+        }
+
+        fn decode(
+            &self,
+            _cx: &Cx,
+            symbols: &[(u32, Vec<u8>)],
+            k_source: u32,
+            _symbol_size: u32,
+        ) -> fsqlite_error::Result<CodecDecodeResult> {
+            if symbols.len() < k_source as usize {
+                return Ok(CodecDecodeResult::Failure {
+                    reason:
+                        fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                    symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                    k_required: k_source,
+                });
+            }
+
+            Ok(CodecDecodeResult::Success {
+                data: Vec::new(),
+                symbols_used: k_source,
+                peeled_count: 0,
+                inactivated_count: 0,
+            })
+        }
+    }
+
     fn temp_path(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -445,6 +532,15 @@ mod tests {
             ..DurabilityConfig::default()
         };
         FsviProtector::new(Arc::new(MockCodec), config).expect("create protector")
+    }
+
+    fn make_unrepairable_protector() -> FsviProtector {
+        let config = DurabilityConfig {
+            symbol_size: 256,
+            repair_overhead: 1.0,
+            ..DurabilityConfig::default()
+        };
+        FsviProtector::new(Arc::new(NoRepairCodec), config).expect("create protector")
     }
 
     #[test]
@@ -490,6 +586,62 @@ mod tests {
         assert_eq!(verify, FsviVerifyResult::NoSidecar);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_missing_source_with_sidecar_is_repairable() {
+        let protector = make_protector();
+        let path = temp_path("missing-source");
+
+        let payload = vec![88_u8; 512];
+        std::fs::write(&path, &payload).expect("write payload");
+        let protection = protector.protect_atomic(&path).expect("protect");
+
+        std::fs::remove_file(&path).expect("remove source");
+
+        let verify = protector.verify(&path).expect("verify missing source");
+        assert!(
+            matches!(verify, FsviVerifyResult::Corrupted { repairable: true }),
+            "expected Corrupted+repairable, got {verify:?}"
+        );
+
+        let repair = protector.repair(&path).expect("repair missing source");
+        assert!(repair.bytes_written > 0);
+        let restored = std::fs::read(&path).expect("read restored");
+        assert_eq!(restored, payload);
+
+        let verify_after = protector.verify(&path).expect("verify restored");
+        assert_eq!(verify_after, FsviVerifyResult::Intact);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&protection.sidecar_path);
+        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn verify_flags_unrepairable_when_symbols_insufficient() {
+        let protector = make_unrepairable_protector();
+        let path = temp_path("unrepairable");
+
+        let payload = vec![7_u8; 512];
+        std::fs::write(&path, &payload).expect("write payload");
+
+        let result = protector.protect_atomic(&path).expect("protect");
+        assert!(result.sidecar_path.exists());
+
+        let mut corrupted = payload;
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&path, &corrupted).expect("write corrupted");
+
+        let verify = protector.verify(&path).expect("verify");
+        assert!(
+            matches!(verify, FsviVerifyResult::Corrupted { repairable: false }),
+            "expected unrepairable corruption, got {verify:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&result.sidecar_path);
     }
 
     #[test]

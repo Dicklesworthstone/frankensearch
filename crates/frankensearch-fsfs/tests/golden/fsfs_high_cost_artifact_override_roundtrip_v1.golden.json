@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_high_cost_override_event",
+  "v": 1,
+  "path": "/workspace/vendor/special_lib/README.md",
+  "requested_action": "index_full",
+  "approved": true,
+  "expires_at": "2026-02-15T00:00:00Z",
+  "reason": "Need full text search over this vendor subtree for incident debugging",
+  "reason_code": "FSFS_OVERRIDE_FORCE_INCLUDE_APPROVED"
+}

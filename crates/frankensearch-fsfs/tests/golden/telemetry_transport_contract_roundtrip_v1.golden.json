@@ -1,0 +1,42 @@
+{
+  "backpressure": {
+    "block_instance_search": false,
+    "drop_counter_required": true,
+    "max_inflight_min": 128,
+    "strategy": "drop_not_block"
+  },
+  "fallback_transport": {
+    "path_template": "{data_dir}/telemetry/{instance_id}.jsonl",
+    "type": "jsonl_file"
+  },
+  "kind": "telemetry_transport_contract_definition",
+  "lifecycle": {
+    "disconnect_behavior": "graceful_or_retry",
+    "handshake_required": true,
+    "heartbeat_required": true,
+    "resume_required": true
+  },
+  "multi_consumer": {
+    "max_consumers": 8,
+    "mode": "fan_out"
+  },
+  "primary_transport": {
+    "auth_mode": "uid_match",
+    "framing": "length_prefixed",
+    "socket_path_template": "${XDG_RUNTIME_DIR}/frankensearch/{instance_id}.sock",
+    "supported_codecs": [
+      "msgpack",
+      "cbor"
+    ],
+    "type": "unix_domain_socket"
+  },
+  "security": {
+    "local_only": true,
+    "network_transport_allowed": false
+  },
+  "slo_targets": {
+    "p95_delivery_lag_ms_target": 100,
+    "throughput_eps_target": 10000
+  },
+  "v": 1
+}

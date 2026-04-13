@@ -291,12 +291,13 @@ impl RankChanges {
     }
 }
 
-/// Progressive search phases for two-tier display.
+/// Progressive search phases for three-tier display.
 ///
 /// The iterator contract:
 /// 1. Always yields `Initial` first (~15ms).
 /// 2. Then yields either `Refined` or `RefinementFailed` (never both).
-/// 3. Iterator is fused after yielding 2 phases (`next()` returns `None`).
+/// 3. Optionally yields `Reranked` if a cross-encoder is configured.
+/// 4. Iterator is fused after yielding final phase (`next()` returns `None`).
 ///
 /// Consumers can stop after `Initial` if latency-sensitive.
 ///
@@ -307,6 +308,7 @@ impl RankChanges {
 ///     match phase {
 ///         SearchPhase::Initial { results, .. } => display_immediately(&results),
 ///         SearchPhase::Refined { results, .. } => update_display(&results),
+///         SearchPhase::Reranked { results, .. } => update_display_with_final_scores(&results),
 ///         SearchPhase::RefinementFailed { initial_results, error, .. } => {
 ///             // Keep showing initial results, log the error
 ///             log_warning(&error);
@@ -334,7 +336,6 @@ pub enum SearchPhase {
     ///
     /// Contains blended scores (0.7 quality + 0.3 fast by default).
     /// Results may have different ordering than `Initial`.
-    /// `rerank_score` is `Some(_)` if the reranker was applied.
     Refined {
         /// Quality-refined search results.
         results: Vec<ScoredResult>,
@@ -344,6 +345,19 @@ pub enum SearchPhase {
         metrics: PhaseMetrics,
         /// How rankings changed compared to Initial.
         rank_changes: RankChanges,
+    },
+
+    /// Final reranked results from cross-encoder inference.
+    ///
+    /// Contains scores produced by a cross-encoder model processing
+    /// (query, doc) pairs directly. Most accurate but slowest phase.
+    Reranked {
+        /// Reranked search results.
+        results: Vec<ScoredResult>,
+        /// Time elapsed for this phase (including earlier refinement).
+        latency: Duration,
+        /// Diagnostic metrics for this phase.
+        metrics: PhaseMetrics,
     },
 
     /// Quality refinement failed; initial results remain valid.
@@ -1018,6 +1032,42 @@ mod tests {
             assert_eq!(rank_changes.total(), 20);
         } else {
             panic!("expected Refined variant");
+        }
+    }
+
+    #[test]
+    fn search_phase_reranked_construction() {
+        let phase = SearchPhase::Reranked {
+            results: vec![ScoredResult {
+                doc_id: "r1".into(),
+                score: 0.95,
+                source: ScoreSource::Reranked,
+                index: None,
+                fast_score: Some(0.7),
+                quality_score: Some(0.9),
+                lexical_score: None,
+                rerank_score: Some(0.95),
+                explanation: None,
+                metadata: None,
+            }],
+            latency: Duration::from_millis(450),
+            metrics: PhaseMetrics {
+                embedder_id: "flashrank".into(),
+                vectors_searched: 2000,
+                lexical_candidates: 100,
+                fused_count: 20,
+            },
+        };
+        if let SearchPhase::Reranked {
+            results,
+            latency,
+            ..
+        } = phase
+        {
+            assert_eq!(results.len(), 1);
+            assert_eq!(latency, Duration::from_millis(450));
+        } else {
+            panic!("expected Reranked variant");
         }
     }
 

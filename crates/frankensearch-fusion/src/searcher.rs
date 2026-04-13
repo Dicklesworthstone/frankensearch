@@ -670,7 +670,7 @@ impl TwoTierSearcher {
                         }
                         self.export_search_metrics(query_class, &metrics, refined_count, true);
                         on_phase(SearchPhase::Refined {
-                            results: refined_results,
+                            results: refined_results.clone(),
                             latency: phase2_latency,
                             metrics: PhaseMetrics {
                                 embedder_id: self
@@ -684,6 +684,58 @@ impl TwoTierSearcher {
                             },
                             rank_changes: metrics.rank_changes.clone(),
                         });
+
+                        // Phase 3: Reranking (optional, only if feature enabled and reranker present)
+                        #[cfg(feature = "rerank")]
+                        if self.reranker.is_some() {
+                            let phase3_start = Instant::now();
+                            match self.run_phase3(
+                                cx,
+                                semantic_query,
+                                k,
+                                refined_results,
+                                &text_fn,
+                                &mut metrics,
+                            ).await {
+                                Ok(reranked_results) => {
+                                    let phase3_latency = phase3_start.elapsed();
+                                    let reranked_count = reranked_results.len();
+                                    
+                                    if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                                        let reranked_event_id = self.emit_search_telemetry(
+                                            semantic_query,
+                                            query_class,
+                                            SearchEventPhase::Reranked,
+                                            reranked_count,
+                                            metrics.lexical_candidates,
+                                            metrics.semantic_candidates,
+                                            phase3_latency,
+                                            root_request_id,
+                                            telemetry_initial_event_id.clone(),
+                                        );
+                                        if let Some(event_id) = &reranked_event_id {
+                                            telemetry_last_event_id = Some(event_id.clone());
+                                        }
+                                    }
+
+                                    on_phase(SearchPhase::Reranked {
+                                        results: reranked_results,
+                                        latency: phase3_latency + phase2_latency,
+                                        metrics: PhaseMetrics {
+                                            embedder_id: self.reranker.as_ref().map_or("none", |r| r.id()).to_owned(),
+                                            vectors_searched: metrics.phase2_vectors_searched,
+                                            lexical_candidates: metrics.lexical_candidates,
+                                            fused_count: reranked_count,
+                                        },
+                                    });
+                                }
+                                Err(err) => {
+                                    self.export_error(&err);
+                                    tracing::warn!(error = %err, "reranking phase failed");
+                                    // Don't emit RefinementFailed here because Refined already succeeded.
+                                }
+                            }
+                        }
                     }
                     Err(SearchError::Cancelled { phase, reason }) => {
                         if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
@@ -1436,34 +1488,36 @@ impl TwoTierSearcher {
             })
             .collect();
 
-        // Optional cross-encoder reranking.
+        Ok(results)
+    }
+
+    /// Run Phase 3: cross-encoder reranking and MMR diversity.
+    #[cfg(feature = "rerank")]
+    async fn run_phase3(
+        &self,
+        cx: &Cx,
+        query: &str,
+        k: usize,
+        mut results: Vec<ScoredResult>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        metrics: &mut TwoTierMetrics,
+    ) -> SearchResult<Vec<ScoredResult>> {
         if let Some(ref reranker) = self.reranker {
-            #[cfg(feature = "rerank")]
-            {
-                let rerank_start = Instant::now();
-                let rerank_budget = k.min(results.len());
-                if rerank_budget > 0
-                    && let Err(err) = frankensearch_rerank::pipeline::rerank_step(
-                        cx,
-                        reranker.as_ref(),
-                        query,
-                        &mut results,
-                        text_fn,
-                        rerank_budget,
-                        5,
-                    )
-                    .await
-                {
-                    self.export_error(&err);
-                    return Err(err);
-                }
-                metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
+            let rerank_start = Instant::now();
+            let rerank_budget = k.min(results.len());
+            if rerank_budget > 0 {
+                frankensearch_rerank::pipeline::rerank_step(
+                    cx,
+                    reranker.as_ref(),
+                    query,
+                    &mut results,
+                    text_fn,
+                    rerank_budget,
+                    5,
+                )
+                .await?;
             }
-            #[cfg(not(feature = "rerank"))]
-            {
-                let _ = (reranker, text_fn);
-                tracing::debug!("reranker configured but `rerank` feature not enabled");
-            }
+            metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         if self.mmr_config.enabled && results.len() > 1 {
@@ -1474,9 +1528,7 @@ impl TwoTierSearcher {
                 let mut complete_pool = true;
 
                 for result in results.iter().take(pool) {
-                    if let Some(embedding) =
-                        self.index.semantic_vector_for_doc_id(&result.doc_id)?
-                    {
+                    if let Some(embedding) = self.index.semantic_vector_for_doc_id(&result.doc_id)? {
                         embeddings.push(embedding);
                         scores.push(f64::from(result.score));
                     } else {

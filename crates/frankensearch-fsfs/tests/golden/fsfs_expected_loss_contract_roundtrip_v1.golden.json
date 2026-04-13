@@ -1,0 +1,49 @@
+{
+  "kind": "fsfs_expected_loss_contract_definition",
+  "v": 1,
+  "action_families": {
+    "ingest": [
+      "index_now",
+      "index_later",
+      "skip"
+    ],
+    "embed": [
+      "embed_now",
+      "embed_defer",
+      "embed_disable"
+    ],
+    "degrade": [
+      "degrade_enter",
+      "degrade_hold",
+      "degrade_exit"
+    ]
+  },
+  "cost_asymmetry_definitions": {
+    "false_include_vs_false_exclude": "False exclude has higher recall penalty than false include for critical sources.",
+    "latency_vs_quality": "Latency spikes are capped before quality penalties under pressure.",
+    "compute_vs_recall": "Compute budget can be sacrificed only when recall floor is preserved."
+  },
+  "required_decision_fields": [
+    "family",
+    "state_id",
+    "action",
+    "expected_loss",
+    "false_include_cost",
+    "false_exclude_cost",
+    "latency_cost",
+    "quality_cost",
+    "compute_cost",
+    "risk_level",
+    "reason_code"
+  ],
+  "fallback_policy": {
+    "required_for_high_risk": true,
+    "required_fields": [
+      "condition",
+      "fallback_action",
+      "reason_code",
+      "trip_threshold",
+      "applies_to_actions"
+    ]
+  }
+}

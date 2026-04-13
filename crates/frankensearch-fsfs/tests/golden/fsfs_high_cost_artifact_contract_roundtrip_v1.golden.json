@@ -1,0 +1,52 @@
+{
+  "kind": "fsfs_high_cost_artifact_contract_definition",
+  "v": 1,
+  "giant_log_detector": {
+    "max_size_mb": 25,
+    "churn_window_minutes": 60,
+    "redundancy_ratio_threshold": 0.8
+  },
+  "vendor_generated_detector": {
+    "vendor_path_patterns": [
+      "vendor/",
+      "node_modules/",
+      "third_party/"
+    ],
+    "generated_markers": [
+      "@generated",
+      "DO NOT EDIT"
+    ],
+    "library_tree_depth_threshold": 4
+  },
+  "archive_transient_detector": {
+    "archive_extensions": [
+      ".zip",
+      ".tar",
+      ".gz",
+      ".7z"
+    ],
+    "transient_directories": [
+      "target/",
+      "dist/",
+      ".cache/"
+    ],
+    "build_artifact_patterns": [
+      "*.pyc",
+      "*.o",
+      "*.class",
+      "*.min.js"
+    ]
+  },
+  "override_policy": {
+    "allow_user_force_include": true,
+    "requires_reason": true,
+    "max_override_ttl_seconds": 86400
+  },
+  "default_actions": {
+    "giant_log": "index_metadata_only",
+    "vendor_tree": "skip",
+    "generated_file": "index_metadata_only",
+    "archive_container": "skip",
+    "transient_build_artifact": "skip"
+  }
+}

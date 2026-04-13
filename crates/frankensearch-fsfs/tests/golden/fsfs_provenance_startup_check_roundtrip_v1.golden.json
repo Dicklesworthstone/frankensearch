@@ -1,0 +1,24 @@
+{
+  "kind": "fsfs_provenance_startup_check",
+  "schema_version": 1,
+  "trace_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+  "attestation_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+  "status": "degraded",
+  "action": "enter_safe_mode",
+  "checks": {
+    "attestation_present": true,
+    "attestation_parsed": true,
+    "signature_present": true,
+    "signature_valid": true,
+    "binary_hash_match": false,
+    "config_hash_match": true,
+    "index_manifest_hash_match": true
+  },
+  "alerts": [
+    {
+      "reason_code": "provenance.startup.hash_mismatch",
+      "severity": "error",
+      "message": "runtime provenance hash mismatch"
+    }
+  ]
+}

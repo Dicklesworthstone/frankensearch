@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "schema": "e2e-oracle-report-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:02Z",
+  "body": {
+    "lanes": [
+      {
+        "lane_id": "baseline",
+        "seed": 3405643776,
+        "query_count": 5,
+        "verdicts": [
+          { "oracle_id": "ORACLE_NO_DUPLICATES", "outcome": "pass", "context": "" },
+          { "oracle_id": "ORACLE_MONOTONIC_SCORES", "outcome": "pass", "context": "" },
+          { "oracle_id": "ORACLE_PHASE1_ALWAYS_YIELDS", "outcome": "pass", "context": "" },
+          { "oracle_id": "ORACLE_EXPLAIN_PRESENT", "outcome": "skip", "context": "explain disabled for baseline lane" }
+        ],
+        "pass_count": 3,
+        "fail_count": 0,
+        "skip_count": 1,
+        "all_passed": true
+      }
+    ],
+    "totals": {
+      "lanes_run": 1,
+      "lanes_passed": 1,
+      "oracles_pass": 3,
+      "oracles_fail": 0,
+      "oracles_skip": 1,
+      "all_passed": true
+    }
+  }
+}

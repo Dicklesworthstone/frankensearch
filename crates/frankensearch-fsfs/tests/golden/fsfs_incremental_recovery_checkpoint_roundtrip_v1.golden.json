@@ -1,0 +1,11 @@
+{
+  "kind": "fsfs_incremental_recovery_checkpoint",
+  "v": 1,
+  "checkpoint_id": "fsfs-ckpt-2026-02-14T03:00:00Z",
+  "last_applied_seq": 4812,
+  "pending_changes": 2,
+  "journal_clean": false,
+  "stale_entries": 4,
+  "action_on_restart": "replay_pending",
+  "reason_code": "FSFS_RESTART_REPLAY_PENDING"
+}

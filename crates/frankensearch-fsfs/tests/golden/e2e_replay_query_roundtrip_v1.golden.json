@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "schema": "e2e-replay-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:00Z",
+  "body": {
+    "type": "query",
+    "offset_ms": 0,
+    "seq": 0,
+    "payload": {
+      "query_text": "search term",
+      "k": 10
+    }
+  }
+}

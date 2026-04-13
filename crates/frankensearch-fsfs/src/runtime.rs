@@ -7526,6 +7526,7 @@ impl FsfsRuntime {
             "potion-multilingual-128m" => "potion-multilingual-128M".to_owned(),
             "all-minilm-l6-v2" => "all-MiniLM-L6-v2".to_owned(),
             "ms-marco-minilm-l-6-v2" => "ms-marco-MiniLM-L-6-v2".to_owned(),
+            "flashrank-nano" => "flashrank".to_owned(),
             _ => manifest.id.clone(),
         }
     }
@@ -17850,7 +17851,7 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            assert_eq!(payload.models.len(), 6);
+            assert_eq!(payload.models.len(), 7);
             assert!(payload.models.iter().all(|entry| entry.state == "missing"));
         });
     }

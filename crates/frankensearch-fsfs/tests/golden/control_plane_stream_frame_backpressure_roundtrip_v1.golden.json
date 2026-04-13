@@ -1,0 +1,18 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "control",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:04Z",
+  "lag_ms": 0,
+  "payload": {
+    "control_type": "backpressure",
+    "backpressure_state": "dropping",
+    "dropped_count_window": 142,
+    "sampling_ratio": 0.35,
+    "retry_after_ms": null,
+    "resume_cursor_hint": null,
+    "reason_code": "queue_depth_exceeded"
+  }
+}

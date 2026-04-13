@@ -1,0 +1,30 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:45:05Z",
+  "event": {
+    "type": "index",
+    "instance": {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "pid": 4242
+    },
+    "correlation": {
+      "event_id": "01JAH9A34K2M3N4P5Q6R7S8T9X",
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "operation": "rebuild",
+    "inventory": {
+      "words": 245781,
+      "tokens": 331992,
+      "lines": 58740,
+      "bytes": 19833421,
+      "docs": 12034
+    },
+    "dimension": 384,
+    "quantization": "f16",
+    "status": "completed",
+    "duration_ms": 18423
+  }
+}

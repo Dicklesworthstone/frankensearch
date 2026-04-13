@@ -1,0 +1,14 @@
+{
+  "kind": "telemetry_transport_endpoint",
+  "v": 1,
+  "instance_id": "01K2Q6G2BHY4KQY2D8K8X5ZP1A",
+  "project_key": "frankensearch-main",
+  "socket_path": "/run/user/1000/frankensearch/01K2Q6G2BHY4KQY2D8K8X5ZP1A.sock",
+  "fallback_jsonl_path": "/home/ubuntu/.local/share/frankensearch/telemetry/01K2Q6G2BHY4KQY2D8K8X5ZP1A.jsonl",
+  "framing": "length_prefixed",
+  "codec": "msgpack",
+  "auth_mode": "uid_match",
+  "heartbeat_ms": 1000,
+  "max_inflight": 512,
+  "drop_policy": "drop_not_block"
+}

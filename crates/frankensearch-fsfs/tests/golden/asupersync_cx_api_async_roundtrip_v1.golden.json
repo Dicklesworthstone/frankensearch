@@ -1,0 +1,8 @@
+{
+  "kind": "asupersync_cx_api_signature_case",
+  "v": 1,
+  "function_name": "search",
+  "function_kind": "async_public",
+  "cx_position": "first",
+  "valid": true
+}

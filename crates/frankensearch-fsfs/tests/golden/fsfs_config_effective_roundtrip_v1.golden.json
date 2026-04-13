@@ -1,0 +1,81 @@
+{
+  "kind": "fsfs_config_effective",
+  "v": 1,
+  "resolved_at_ts": "2026-02-14T03:30:00Z",
+  "source_precedence_applied": ["cli", "env", "file", "defaults"],
+  "sources": {
+    "cli_flags_used": ["--roots", "--limit"],
+    "env_keys_used": ["FSFS_SEARCH_DEFAULT_LIMIT", "FSFS_TUI_THEME"],
+    "config_file_used": "/home/test/.config/fsfs/config.toml"
+  },
+  "values": {
+    "discovery": {
+      "roots": ["/home/test", "/opt/projects"],
+      "exclude_patterns": [".git", "node_modules", "target"],
+      "text_selection_mode": "blocklist",
+      "binary_blocklist_extensions": [".exe", ".dll", ".so", ".o", ".class", ".jar", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wasm", ".pyc", ".pdb"],
+      "max_file_size_mb": 20,
+      "follow_symlinks": false
+    },
+    "indexing": {
+      "fast_model": "potion-multilingual-128M",
+      "quality_model": "all-MiniLM-L6-v2",
+      "model_dir": "/home/test/.cache/frankensearch/models",
+      "embedding_batch_size": 128,
+      "reindex_on_change": true,
+      "watch_mode": false
+    },
+    "search": {
+      "default_limit": 30,
+      "quality_weight": 0.65,
+      "rrf_k": 60,
+      "quality_timeout_ms": 450,
+      "fast_only": false,
+      "explain": true
+    },
+    "pressure": {
+      "profile": "performance",
+      "cpu_ceiling_pct": 85,
+      "memory_ceiling_mb": 3072
+    },
+    "tui": {
+      "theme": "dark",
+      "frame_budget_ms": 16,
+      "show_explanations": true,
+      "density": "normal"
+    },
+    "storage": {
+      "db_path": "/home/test/.local/share/fsfs/fsfs.db",
+      "evidence_retention_days": 14,
+      "summary_retention_days": 120
+    },
+    "privacy": {
+      "redact_file_contents_in_logs": true,
+      "redact_paths_in_telemetry": true
+    }
+  },
+  "path_expansions": [
+    {
+      "field": "indexing.model_dir",
+      "raw": "~/.cache/frankensearch/models",
+      "expanded": "/home/test/.cache/frankensearch/models",
+      "source": "file"
+    },
+    {
+      "field": "storage.db_path",
+      "raw": "~/.local/share/fsfs/fsfs.db",
+      "expanded": "/home/test/.local/share/fsfs/fsfs.db",
+      "source": "file"
+    }
+  ],
+  "diagnostics": [
+    {
+      "severity": "warn",
+      "reason_code": "config.unknown_key.warning",
+      "field": "search.shadow_mode",
+      "source": "file",
+      "message": "Unknown key search.shadow_mode ignored"
+    }
+  ],
+  "conflict_warnings": []
+}

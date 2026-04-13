@@ -1,0 +1,76 @@
+{
+  "kind": "control_plane_error_catalog",
+  "v": 1,
+  "variants": [
+    {
+      "error_type": "DiscoveryFailed",
+      "default_severity": "Degraded",
+      "ui_surface": "full_screen_panel",
+      "status_badge": "discovery",
+      "recovery_guidance": [
+        "Check discovery roots and process permissions.",
+        "Retry discovery scan from command palette."
+      ]
+    },
+    {
+      "error_type": "StorageError",
+      "default_severity": "Fatal",
+      "ui_surface": "full_screen_panel",
+      "status_badge": "storage",
+      "recovery_guidance": [
+        "Verify DB integrity and disk health.",
+        "Switch to read-only fallback while repairing storage."
+      ]
+    },
+    {
+      "error_type": "StreamDisconnected",
+      "default_severity": "Transient",
+      "ui_surface": "toast",
+      "status_badge": "stream",
+      "recovery_guidance": [
+        "Allow automatic reconnect to run.",
+        "Inspect stream transport path if disconnects persist."
+      ]
+    },
+    {
+      "error_type": "SchemaMismatch",
+      "default_severity": "Fatal",
+      "ui_surface": "full_screen_panel",
+      "status_badge": "schema",
+      "recovery_guidance": [
+        "Pin compatible schema versions across adapters.",
+        "Apply migration for control-plane schema contracts."
+      ]
+    },
+    {
+      "error_type": "IngestionOverflow",
+      "default_severity": "Degraded",
+      "ui_surface": "status_badge",
+      "status_badge": "ingest",
+      "recovery_guidance": [
+        "Reduce ingestion rate or increase queue budget.",
+        "Confirm backpressure policy is active."
+      ]
+    },
+    {
+      "error_type": "AttributionFailed",
+      "default_severity": "Degraded",
+      "ui_surface": "status_badge",
+      "status_badge": "attribution",
+      "recovery_guidance": [
+        "Verify host handshake identity signals.",
+        "Apply fallback attribution hints for unknown instances."
+      ]
+    },
+    {
+      "error_type": "TelemetryGap",
+      "default_severity": "Transient",
+      "ui_surface": "status_badge",
+      "status_badge": "telemetry",
+      "recovery_guidance": [
+        "Inspect emitter health and lag counters.",
+        "Retry telemetry subscription with resume cursor."
+      ]
+    }
+  ]
+}

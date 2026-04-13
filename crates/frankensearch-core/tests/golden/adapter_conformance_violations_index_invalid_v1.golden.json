@@ -1,0 +1,12 @@
+[
+  {
+    "code": "adapter.event.index.zero_dimension",
+    "field": "index.dimension",
+    "message": "dimension should be > 0"
+  },
+  {
+    "code": "adapter.event.index.zero_duration",
+    "field": "index.duration_ms",
+    "message": "duration_ms should be > 0 for completed telemetry"
+  }
+]

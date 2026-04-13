@@ -1,0 +1,34 @@
+{
+  "kind": "control_plane_error_event",
+  "v": 1,
+  "ts": "2026-02-14T01:05:00Z",
+  "event_id": "01JAH9B8AK2M3N4P5Q6R7S8T97",
+  "error_type": "StreamDisconnected",
+  "severity_class": "Transient",
+  "reason_code": "control.stream_disconnected.retrying",
+  "message": "Live stream disconnected; retry loop active.",
+  "project_key": "/data/projects/frankensearch",
+  "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+  "correlation": {
+    "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+    "parent_event_id": null
+  },
+  "retry_count": 2,
+  "recoverable": true,
+  "ui_mapping": {
+    "surface": "toast",
+    "status_badge": "stream",
+    "escalation_after_count": 50
+  },
+  "recovery": {
+    "retry_policy": "exponential_backoff",
+    "operator_steps": [
+      "Wait for automatic reconnect attempts.",
+      "If disconnect burst continues, inspect transport diagnostics."
+    ],
+    "suggested_commands": [
+      "ops.reconnect_stream",
+      "ops.capture_snapshot"
+    ]
+  }
+}

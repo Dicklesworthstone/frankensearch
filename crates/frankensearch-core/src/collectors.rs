@@ -705,6 +705,7 @@ impl From<QueryClass> for TelemetryQueryClass {
 pub enum SearchEventPhase {
     Initial,
     Refined,
+    Reranked,
     RefinementFailed,
 }
 

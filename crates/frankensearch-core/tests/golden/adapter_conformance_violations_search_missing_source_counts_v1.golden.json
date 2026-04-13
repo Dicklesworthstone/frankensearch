@@ -1,0 +1,7 @@
+[
+  {
+    "code": "adapter.event.search.missing_source_counts",
+    "field": "search.results",
+    "message": "result_count > 0 requires lexical_count or semantic_count to be non-zero"
+  }
+]

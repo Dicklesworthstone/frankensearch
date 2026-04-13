@@ -362,8 +362,49 @@ pub fn redaction_query_hashed() -> EvidenceRedaction {
 #[cfg(test)]
 mod tests {
     use crate::determinism::ReplayMetadata;
+    use std::fs;
+    use std::path::PathBuf;
 
     use super::*;
+
+    fn load_fixture(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/fixtures")
+            .join(name);
+        fs::read_to_string(path).expect("read fixture json")
+    }
+
+    fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let golden_path = dir.join(format!("{name}.golden.json"));
+        let actual = serde_json::to_string_pretty(value).expect("serialize golden json");
+
+        if std::env::var("UPDATE_GOLDENS").is_ok() {
+            fs::create_dir_all(&dir).expect("create golden directory");
+            fs::write(&golden_path, actual.as_bytes()).expect("write golden file");
+            return;
+        }
+
+        let expected = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+            panic!(
+                "Golden file not found: {}\nSet UPDATE_GOLDENS=1 to create it.",
+                golden_path.display()
+            );
+        });
+
+        let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
+        let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+
+        if actual_trimmed != expected_trimmed {
+            let actual_path = golden_path.with_extension("actual.json");
+            fs::write(&actual_path, actual_trimmed.as_bytes()).expect("write actual file");
+            panic!(
+                "GOLDEN MISMATCH: {name}\nexpected: {}\nactual: {}",
+                golden_path.display(),
+                actual_path.display()
+            );
+        }
+    }
 
     fn sample_event() -> EvidenceEvent {
         EvidenceEvent {
@@ -559,5 +600,31 @@ mod tests {
         let err = EvidenceWriteError::Io(std::io::Error::other("test error"));
         let msg = err.to_string();
         assert!(msg.contains("evidence I/O error"));
+    }
+
+    // ─── Conformance Fixtures ───────────────────────────────────────────
+
+    #[test]
+    fn evidence_fixture_decision_matches_golden_snapshot() {
+        let raw = load_fixture("evidence-decision-v1.json");
+        let envelope: EvidenceEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.event.event_type, EvidenceEventType::Decision);
+        assert_golden_json("evidence_fixture_decision_v1", &envelope);
+    }
+
+    #[test]
+    fn evidence_fixture_alert_matches_golden_snapshot() {
+        let raw = load_fixture("evidence-alert-v1.json");
+        let envelope: EvidenceEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.event.event_type, EvidenceEventType::Alert);
+        assert_golden_json("evidence_fixture_alert_v1", &envelope);
+    }
+
+    #[test]
+    fn evidence_fixture_degradation_matches_golden_snapshot() {
+        let raw = load_fixture("evidence-degradation-v1.json");
+        let envelope: EvidenceEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.event.event_type, EvidenceEventType::Degradation);
+        assert_golden_json("evidence_fixture_degradation_v1", &envelope);
     }
 }

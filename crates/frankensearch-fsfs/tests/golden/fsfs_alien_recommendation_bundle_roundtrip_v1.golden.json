@@ -1,0 +1,154 @@
+{
+  "kind": "fsfs_alien_recommendation_bundle",
+  "v": 1,
+  "cards": [
+    {
+      "kind": "fsfs_alien_recommendation_card",
+      "v": 1,
+      "subsystem": "ingestion_policy",
+      "ev_score": 3.9,
+      "priority_tier": "A",
+      "adoption_wedge": "Start with code/docs roots and extend to mixed corpora after stability proof.",
+      "budgeted_mode": {
+        "latency_budget_ms": 35,
+        "memory_budget_mb": 96,
+        "retry_budget": 1,
+        "on_exhaustion": "Switch low-value sources to deferred ingest queue."
+      },
+      "fallback_trigger": {
+        "condition": "ingest_queue_p95_ms > 250 for 3 windows",
+        "fallback_action": "index_later",
+        "reason_code": "FSFS_INGEST_QUEUE_PRESSURE_TRIP"
+      },
+      "baseline_comparator": "Naive immediate indexing for every discovered artifact.",
+      "isomorphism_proof_plan": {
+        "invariants": [
+          "Deterministic include/exclude decision for identical path snapshots."
+        ],
+        "baseline_harness": "tests/e2e_ingest_replay.sh",
+        "replay_checks": [
+          "decision_trace_equivalence"
+        ]
+      },
+      "repro_artifacts": {
+        "manifest_fields": [
+          "seed",
+          "config_hash",
+          "subsystem",
+          "scenario_id"
+        ],
+        "artifact_outputs": [
+          "ingest_decisions.jsonl",
+          "ingest_summary.json"
+        ],
+        "replay_command": "cargo test -p frankensearch --test ingest_replay"
+      },
+      "rollback_plan": {
+        "rollback_command": "fsfsctl policy set ingest.naive=true",
+        "abort_conditions": [
+          "recall_drop_gt_5pct"
+        ]
+      }
+    },
+    {
+      "kind": "fsfs_alien_recommendation_card",
+      "v": 1,
+      "subsystem": "degradation_scheduler",
+      "ev_score": 3.6,
+      "priority_tier": "A",
+      "adoption_wedge": "Deploy first on hosts with predictable pressure telemetry.",
+      "budgeted_mode": {
+        "latency_budget_ms": 20,
+        "memory_budget_mb": 64,
+        "retry_budget": 0,
+        "on_exhaustion": "Enter degrade_hold with capped feature set until pressure clears."
+      },
+      "fallback_trigger": {
+        "condition": "cpu_p95_ms > 220 or rss_mb > 2048",
+        "fallback_action": "degrade_hold",
+        "reason_code": "FSFS_DEGRADE_PRESSURE_GUARD"
+      },
+      "baseline_comparator": "Reactive thresholding without explicit controller contract.",
+      "isomorphism_proof_plan": {
+        "invariants": [
+          "State transition order remains deterministic for identical telemetry streams."
+        ],
+        "baseline_harness": "tests/e2e_degrade_replay.sh",
+        "replay_checks": [
+          "state_machine_trace_equivalence"
+        ]
+      },
+      "repro_artifacts": {
+        "manifest_fields": [
+          "seed",
+          "config_hash",
+          "subsystem",
+          "policy_version",
+          "scenario_id"
+        ],
+        "artifact_outputs": [
+          "degrade_transitions.jsonl",
+          "pressure_summary.json"
+        ],
+        "replay_command": "cargo test -p frankensearch --test degrade_replay"
+      },
+      "rollback_plan": {
+        "rollback_command": "fsfsctl policy set degrade.static_threshold=true",
+        "abort_conditions": [
+          "state_oscillation_gt_3_per_hour"
+        ]
+      }
+    },
+    {
+      "kind": "fsfs_alien_recommendation_card",
+      "v": 1,
+      "subsystem": "ranking_policy",
+      "ev_score": 3.3,
+      "priority_tier": "B",
+      "adoption_wedge": "Start with read-mostly corpora and evaluate ranking deltas before broad rollout.",
+      "budgeted_mode": {
+        "latency_budget_ms": 45,
+        "memory_budget_mb": 128,
+        "retry_budget": 1,
+        "on_exhaustion": "Fall back to conservative blend and disable optional rerankers."
+      },
+      "fallback_trigger": {
+        "condition": "nDCG_drop > 0.03 over 2 evaluation windows",
+        "fallback_action": "conservative_blend",
+        "reason_code": "FSFS_RANKING_QUALITY_GUARD"
+      },
+      "baseline_comparator": "Fixed RRF/blend configuration with no adaptive ranking controls.",
+      "isomorphism_proof_plan": {
+        "invariants": [
+          "Tie-break order is stable for equal composite scores.",
+          "Fallback ranking does not violate deterministic candidate ordering."
+        ],
+        "baseline_harness": "tests/e2e_ranking_replay.sh",
+        "replay_checks": [
+          "rank_delta_bounds",
+          "tie_break_stability"
+        ]
+      },
+      "repro_artifacts": {
+        "manifest_fields": [
+          "seed",
+          "config_hash",
+          "subsystem",
+          "scenario_id"
+        ],
+        "artifact_outputs": [
+          "ranking_trace.jsonl",
+          "ranking_delta_report.json"
+        ],
+        "replay_command": "cargo test -p frankensearch --test ranking_replay"
+      },
+      "rollback_plan": {
+        "rollback_command": "fsfsctl policy set ranking.fixed=true",
+        "abort_conditions": [
+          "ndcg_drop_gt_0.05",
+          "latency_p95_regression_gt_15pct"
+        ]
+      }
+    }
+  ]
+}

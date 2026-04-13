@@ -1,0 +1,67 @@
+{
+  "kind": "fsfs_expected_loss_matrix",
+  "v": 1,
+  "family": "degrade",
+  "state_space": [
+    "normal",
+    "cpu_pressure",
+    "memory_pressure"
+  ],
+  "action_space": [
+    "degrade_enter",
+    "degrade_hold",
+    "degrade_exit"
+  ],
+  "loss_rows": [
+    {
+      "state_id": "cpu_pressure",
+      "action_losses": [
+        {
+          "action": "degrade_enter",
+          "expected_loss": 0.17,
+          "false_include_cost": 0.08,
+          "false_exclude_cost": 0.42,
+          "latency_cost": 0.09,
+          "quality_cost": 0.11,
+          "compute_cost": 0.04,
+          "risk_level": "high",
+          "reason_code": "FSFS_PRESSURE_DEGRADE_ENTER"
+        },
+        {
+          "action": "degrade_hold",
+          "expected_loss": 0.25,
+          "false_include_cost": 0.12,
+          "false_exclude_cost": 0.39,
+          "latency_cost": 0.22,
+          "quality_cost": 0.05,
+          "compute_cost": 0.07,
+          "risk_level": "medium",
+          "reason_code": "FSFS_PRESSURE_DEGRADE_HOLD"
+        },
+        {
+          "action": "degrade_exit",
+          "expected_loss": 0.63,
+          "false_include_cost": 0.31,
+          "false_exclude_cost": 0.15,
+          "latency_cost": 0.58,
+          "quality_cost": 0.01,
+          "compute_cost": 0.14,
+          "risk_level": "high",
+          "reason_code": "FSFS_PRESSURE_DEGRADE_EXIT_TOO_EARLY"
+        }
+      ]
+    }
+  ],
+  "fallback_triggers": [
+    {
+      "condition": "cpu_p95_ms > 220 for 3 windows",
+      "fallback_action": "degrade_hold",
+      "reason_code": "FSFS_FALLBACK_CPU_P95_TRIP",
+      "trip_threshold": "3_windows",
+      "applies_to_actions": [
+        "degrade_enter",
+        "degrade_exit"
+      ]
+    }
+  ]
+}

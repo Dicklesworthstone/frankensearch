@@ -1,0 +1,36 @@
+{
+  "kind": "fsfs_root_discovery_contract_definition",
+  "v": 1,
+  "default_roots": [
+    "/home/ubuntu"
+  ],
+  "override_modes": {
+    "strict": {
+      "deny_on_ambiguity": true,
+      "cross_mount_default": false,
+      "follow_symlink_default": false
+    },
+    "permissive": {
+      "allow_explicit_include_override": true,
+      "audit_reason_codes_required": true
+    }
+  },
+  "precedence_order": [
+    "hard_deny",
+    "explicit_exclude",
+    "explicit_include",
+    "fsfs_config_exclude",
+    "fsfs_config_include",
+    "gitignore",
+    "dot_ignore",
+    "system_exclude",
+    "default_root"
+  ],
+  "traversal_safety": {
+    "symlink_policy": "follow_bounded",
+    "max_symlink_depth": 4,
+    "detect_loops": true,
+    "mount_boundary_policy": "stay_on_device",
+    "max_mount_hops": 0
+  }
+}

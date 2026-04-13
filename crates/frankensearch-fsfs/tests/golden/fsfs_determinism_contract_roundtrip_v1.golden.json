@@ -1,0 +1,91 @@
+{
+  "kind": "fsfs_determinism_contract_definition",
+  "v": 1,
+  "tier_matrix": [
+    {
+      "tier": "tier1",
+      "comparison_mode": "bit_exact",
+      "required_surfaces": [
+        "ranked_output",
+        "degradation_state_transition"
+      ],
+      "guarantee": "Identical inputs and state produce bit-identical outputs."
+    },
+    {
+      "tier": "tier2",
+      "comparison_mode": "semantic_equivalence",
+      "required_surfaces": [
+        "explain_payload",
+        "evidence_ledger"
+      ],
+      "guarantee": "Semantically equivalent output with stable meaning."
+    },
+    {
+      "tier": "tier3",
+      "comparison_mode": "statistical_tolerance",
+      "required_surfaces": [
+        "embedding_similarity",
+        "performance_measurement"
+      ],
+      "guarantee": "Reproducibility within declared statistical tolerance."
+    }
+  ],
+  "nondeterminism_mitigations": [
+    {
+      "source": "float_arithmetic",
+      "mitigation": "Canonical rounding policy at score comparison boundaries.",
+      "requirement_id": "DET-FLOAT_ROUNDING"
+    },
+    {
+      "source": "thread_scheduling",
+      "mitigation": "Deterministic tie-break with doc_id lexical ordering.",
+      "requirement_id": "DET-TIEBREAK"
+    },
+    {
+      "source": "filesystem_ordering",
+      "mitigation": "Sort discovered paths before classification and indexing.",
+      "requirement_id": "DET-PATH_SORT"
+    },
+    {
+      "source": "clock_source",
+      "mitigation": "Injectable frozen or simulated clock for replay and tests.",
+      "requirement_id": "DET-CLOCK"
+    },
+    {
+      "source": "random_sampling",
+      "mitigation": "Seeded RNG with seed persisted in manifest and logs.",
+      "requirement_id": "DET-SEED"
+    }
+  ],
+  "repro_manifest_required_fields": [
+    "seed",
+    "config_hash",
+    "determinism_tier",
+    "index_version",
+    "model_versions",
+    "platform",
+    "clock_mode",
+    "tie_break_policy",
+    "float_policy",
+    "query_fingerprint",
+    "evidence_bundle"
+  ],
+  "test_contract": {
+    "unit_replay_count_min": 2,
+    "integration_replay_count_min": 2,
+    "e2e_replay_count_min": 2,
+    "required_checks": [
+      "ranking_output_stability",
+      "degradation_state_stability",
+      "serialization_normalization_stability",
+      "repeated_scenario_replay",
+      "artifact_bundle_replay"
+    ]
+  },
+  "logging_requirements": {
+    "seed_in_every_log": true,
+    "config_hash_in_every_log": true,
+    "tier_in_every_log": true,
+    "mismatch_reason_codes_required": true
+  }
+}

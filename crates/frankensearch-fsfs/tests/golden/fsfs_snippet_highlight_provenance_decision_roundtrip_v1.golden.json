@@ -1,0 +1,75 @@
+{
+  "degraded": {
+    "applied": false,
+    "fallback_action": "none",
+    "mode": "none"
+  },
+  "diagnostics": {
+    "emitted_fields": [
+      "event",
+      "trace_id",
+      "reason_code",
+      "render_mode",
+      "snippet_status",
+      "unicode_safe",
+      "offsets_verified"
+    ],
+    "event": "snippet_rendered",
+    "offsets_verified": true,
+    "reason_code": "snippet.render.success",
+    "unicode_safe": true
+  },
+  "doc_id": "doc://src/query_planning.rs",
+  "kind": "fsfs_snippet_highlight_provenance_decision",
+  "path": "/home/ubuntu/project/src/query_planning.rs",
+  "provenance": {
+    "content_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "index_revision": 42,
+    "path": "/home/ubuntu/project/src/query_planning.rs",
+    "score_contributors": [
+      {
+        "name": "lexical_bm25",
+        "raw_score": 14.2,
+        "weight": 0.45
+      },
+      {
+        "name": "semantic_cosine",
+        "raw_score": 0.82,
+        "weight": 0.55
+      }
+    ],
+    "segment_id": "seg_0001"
+  },
+  "render_mode": "json",
+  "snippet_segments": [
+    {
+      "byte_range": [
+        3821,
+        3897
+      ],
+      "highlights": [
+        {
+          "end_byte": 3841,
+          "highlight_type": "lexical",
+          "query_term": "fallback",
+          "start_byte": 3831
+        },
+        {
+          "end_byte": 3865,
+          "highlight_type": "semantic",
+          "start_byte": 3857
+        }
+      ],
+      "line_range": [
+        140,
+        143
+      ],
+      "segment_id": "seg_0001",
+      "text": "classifier routes low signal query to uncertain fallback profile",
+      "truncated": false
+    }
+  ],
+  "snippet_status": "rendered",
+  "trace_id": "trace-9f3a8f67",
+  "v": 1
+}

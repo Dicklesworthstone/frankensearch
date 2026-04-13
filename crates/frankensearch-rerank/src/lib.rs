@@ -32,11 +32,13 @@ pub use pipeline::{DEFAULT_MIN_CANDIDATES, DEFAULT_TOP_K_RERANK, rerank_step};
 pub use fastembed_reranker::FastEmbedReranker;
 
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use asupersync::Cx;
 use asupersync::sync::{LockError, Mutex};
 use ort::session::Session;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tracing::instrument;
 
@@ -55,9 +57,22 @@ const INFERENCE_BATCH_SIZE: usize = 32;
 const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
 const MODEL_ONNX_LEGACY: &str = "model.onnx";
 const TOKENIZER_JSON: &str = "tokenizer.json";
+const CONFIG_JSON: &str = "config.json";
+const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 
 /// Output tensor name candidates, tried in order.
 const OUTPUT_TENSOR_CANDIDATES: [&str; 3] = ["logits", "output", "sentence_embedding"];
+
+#[derive(Debug, Deserialize)]
+struct ModelConfig {
+    #[serde(default)]
+    pad_token_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenizerConfig {
+    model_max_length: Option<usize>,
+}
 
 /// `FlashRank` cross-encoder reranker backed by ONNX Runtime.
 ///
@@ -75,6 +90,7 @@ const OUTPUT_TENSOR_CANDIDATES: [&str; 3] = ["logits", "output", "sentence_embed
 pub struct FlashRankReranker {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
+    input_names: Vec<String>,
     max_length: usize,
     name: String,
     model_dir: PathBuf,
@@ -84,6 +100,7 @@ impl fmt::Debug for FlashRankReranker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlashRankReranker")
             .field("name", &self.name)
+            .field("input_names", &self.input_names)
             .field("max_length", &self.max_length)
             .field("model_dir", &self.model_dir)
             .finish_non_exhaustive()
@@ -133,6 +150,37 @@ impl FlashRankReranker {
             });
         }
 
+        // Load metadata
+        let config_path = model_dir.join(CONFIG_JSON);
+        let pad_token_id = if config_path.is_file() {
+            let content = fs::read_to_string(&config_path).map_err(|e| SearchError::ModelLoadFailed {
+                path: config_path.clone(),
+                source: format!("failed to read config.json: {e}").into(),
+            })?;
+            let config: ModelConfig = serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
+                path: config_path,
+                source: format!("failed to parse config.json: {e}").into(),
+            })?;
+            config.pad_token_id
+        } else {
+            0
+        };
+
+        let tokenizer_config_path = model_dir.join(TOKENIZER_CONFIG_JSON);
+        let model_max_len = if tokenizer_config_path.is_file() {
+            let content = fs::read_to_string(&tokenizer_config_path).map_err(|e| SearchError::ModelLoadFailed {
+                path: tokenizer_config_path.clone(),
+                source: format!("failed to read tokenizer_config.json: {e}").into(),
+            })?;
+            let config: TokenizerConfig = serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
+                path: tokenizer_config_path,
+                source: format!("failed to parse tokenizer_config.json: {e}").into(),
+            })?;
+            config.model_max_length.unwrap_or(max_length)
+        } else {
+            max_length
+        };
+
         // Load ONNX session with Level3 optimization
         let session = Session::builder()
             .and_then(|b| {
@@ -145,16 +193,42 @@ impl FlashRankReranker {
                 source: format!("ONNX session creation failed: {e}").into(),
             })?;
 
-        // Load tokenizer
-        let tokenizer =
+        // Detect required input names
+        let input_names: Vec<String> = session
+            .inputs()
+            .iter()
+            .map(|i| i.name().to_owned())
+            .collect();
+
+        // Load and configure tokenizer
+        let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| SearchError::ModelLoadFailed {
                 path: tokenizer_path,
                 source: format!("tokenizer load failed: {e}").into(),
             })?;
 
+        let final_max_len = model_max_len.min(max_length);
+        tokenizer = tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: final_max_len,
+                ..Default::default()
+            }))
+            .map_err(|e| SearchError::ModelLoadFailed {
+                path: model_dir.join(TOKENIZER_JSON),
+                source: format!("failed to enable truncation: {e}").into(),
+            })?
+            .with_padding(Some(tokenizers::PaddingParams {
+                pad_id: pad_token_id,
+                pad_token: "[PAD]".to_owned(),
+                ..Default::default()
+            }))
+            .into();
+
         tracing::info!(
             model = %name,
-            max_length,
+            input_names = ?input_names,
+            max_length = final_max_len,
+            pad_token_id,
             model_dir = %model_dir.display(),
             "FlashRank reranker model loaded"
         );
@@ -162,7 +236,8 @@ impl FlashRankReranker {
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
-            max_length,
+            input_names,
+            max_length: final_max_len,
             name: name.to_owned(),
             model_dir,
         })
@@ -210,9 +285,10 @@ impl FlashRankReranker {
     #[allow(clippy::cast_possible_wrap)]
     fn infer_batch(
         session: &mut Session,
+        input_names: &[String],
         pairs: &[TokenizedPair],
         model_name: &str,
-    ) -> SearchResult<Vec<(f32, f32)>> {
+    ) -> SearchResult<Vec<(f32, Option<f32>)>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -252,18 +328,28 @@ impl FlashRankReranker {
         })?;
         let shape = [batch_i64, seq_i64];
 
-        let input_ids_tensor = ort::value::Tensor::from_array((shape, flat_input_ids))
-            .map_err(|e| rerank_ort_error(model_name, "input_ids tensor", &e))?;
-        let attention_mask_tensor = ort::value::Tensor::from_array((shape, flat_attention_mask))
-            .map_err(|e| rerank_ort_error(model_name, "attention_mask tensor", &e))?;
-        let token_type_ids_tensor = ort::value::Tensor::from_array((shape, flat_token_type_ids))
-            .map_err(|e| rerank_ort_error(model_name, "token_type_ids tensor", &e))?;
+        let mut inputs: Vec<(
+            &str,
+            ort::value::Value<ort::value::TensorValueType<i64>>,
+        )> = Vec::with_capacity(3);
 
-        let inputs = ort::inputs! {
-            "input_ids" => input_ids_tensor,
-            "attention_mask" => attention_mask_tensor,
-            "token_type_ids" => token_type_ids_tensor,
-        };
+        if input_names.iter().any(|n| n == "input_ids") {
+            let tensor = ort::value::Tensor::from_array((shape, flat_input_ids))
+                .map_err(|e| rerank_ort_error(model_name, "input_ids tensor", &e))?;
+            inputs.push(("input_ids", tensor));
+        }
+
+        if input_names.iter().any(|n| n == "attention_mask") {
+            let tensor = ort::value::Tensor::from_array((shape, flat_attention_mask))
+                .map_err(|e| rerank_ort_error(model_name, "attention_mask tensor", &e))?;
+            inputs.push(("attention_mask", tensor));
+        }
+
+        if input_names.iter().any(|n| n == "token_type_ids") {
+            let tensor = ort::value::Tensor::from_array((shape, flat_token_type_ids))
+                .map_err(|e| rerank_ort_error(model_name, "token_type_ids tensor", &e))?;
+            inputs.push(("token_type_ids", tensor));
+        }
 
         let outputs = session.run(inputs).map_err(|e| SearchError::RerankFailed {
             model: model_name.to_owned(),
@@ -271,13 +357,9 @@ impl FlashRankReranker {
         })?;
 
         // Extract logits from the output tensor using name fallback chain
-        let logits = extract_logits(&outputs, model_name, batch_size)?;
+        let scores = extract_scores(&outputs, model_name, batch_size)?;
 
-        // Return (sigmoid-activated score, raw logit) pairs.
-        Ok(logits
-            .iter()
-            .map(|&logit| (sigmoid(logit), logit))
-            .collect())
+        Ok(scores)
     }
 
     /// Directory containing model assets.
@@ -315,7 +397,8 @@ impl Reranker for FlashRankReranker {
             // Run inference in batches
             let mut all_scores = Vec::with_capacity(documents.len());
             for chunk in all_pairs.chunks(INFERENCE_BATCH_SIZE) {
-                let batch_scores = Self::infer_batch(&mut session, chunk, &self.name)?;
+                let batch_scores =
+                    Self::infer_batch(&mut session, &self.input_names, chunk, &self.name)?;
                 all_scores.extend(batch_scores);
             }
 
@@ -337,7 +420,7 @@ impl Reranker for FlashRankReranker {
             // can never be silently truncated if this block is modified later.
             let mut results = Vec::with_capacity(documents.len());
             for (rank, doc) in documents.iter().enumerate() {
-                let Some(&(score, logit)) = all_scores.get(rank) else {
+                let Some(&(score, raw_logit)) = all_scores.get(rank) else {
                     return Err(SearchError::RerankFailed {
                         model: self.name.clone(),
                         source: format!(
@@ -352,7 +435,7 @@ impl Reranker for FlashRankReranker {
                     doc_id: doc.doc_id.clone(),
                     score,
                     original_rank: rank,
-                    raw_logit: Some(logit),
+                    raw_logit,
                 });
             }
 
@@ -408,11 +491,11 @@ const fn sanitize_score(score: f32) -> f32 {
 ///
 /// Uses `try_extract_raw_tensor::<f32>()` which returns `(&[i64], &[f32])`.
 #[allow(clippy::cast_sign_loss)]
-fn extract_logits(
+fn extract_scores(
     outputs: &ort::session::SessionOutputs<'_>,
     model_name: &str,
     batch_size: usize,
-) -> SearchResult<Vec<f32>> {
+) -> SearchResult<Vec<(f32, Option<f32>)>> {
     // Try named output tensors in priority order (use .get() to avoid panicking)
     for name in &OUTPUT_TENSOR_CANDIDATES {
         if let Some(value) = outputs.get(*name)
@@ -446,25 +529,42 @@ fn extract_scores_from_raw(
     (shape, data): (&[i64], &[f32]),
     batch_size: usize,
     model_name: &str,
-) -> SearchResult<Vec<f32>> {
+) -> SearchResult<Vec<(f32, Option<f32>)>> {
     // Safe i64→usize helper: negative or out-of-range dimensions never match.
     let dim_eq = |n: &i64| usize::try_from(*n).is_ok_and(|v| v == batch_size);
 
     match shape {
         // [batch, 1] — single logit per sample
-        [n, 1] if dim_eq(n) && data.len() >= batch_size => Ok(data[..batch_size].to_vec()),
-        // [batch, 2] — binary classification, take positive class (index 1)
-        [n, 2] if dim_eq(n) && data.len() == batch_size * 2 => {
-            Ok(data.chunks_exact(2).map(|pair| pair[1]).collect())
-        }
+        [n, 1] if dim_eq(n) && data.len() >= batch_size => Ok(data[..batch_size]
+            .iter()
+            .map(|&logit| (sigmoid(logit), Some(logit)))
+            .collect()),
+        // [batch, 2] — binary classification. Use logit delta for score/logit.
+        [n, 2] if dim_eq(n) && data.len() == batch_size * 2 => Ok(data
+            .chunks_exact(2)
+            .map(|pair| {
+                let (l0, l1) = (pair[0], pair[1]);
+                let delta = l1 - l0;
+                (sigmoid(delta), Some(delta))
+            })
+            .collect()),
         // [batch] — flat logits
-        [n] if dim_eq(n) => Ok(data.to_vec()),
+        [n] if dim_eq(n) => Ok(data
+            .iter()
+            .map(|&logit| (sigmoid(logit), Some(logit)))
+            .collect()),
         // [1, batch] — transposed single-row output
-        [1, n] if dim_eq(n) => Ok(data.to_vec()),
+        [1, n] if dim_eq(n) => Ok(data
+            .iter()
+            .map(|&logit| (sigmoid(logit), Some(logit)))
+            .collect()),
         _ => {
             // Best-effort: take first `batch_size` elements if enough data
             if data.len() >= batch_size {
-                Ok(data[..batch_size].to_vec())
+                Ok(data[..batch_size]
+                    .iter()
+                    .map(|&logit| (sigmoid(logit), Some(logit)))
+                    .collect())
             } else {
                 Err(SearchError::RerankFailed {
                     model: model_name.to_owned(),
@@ -492,6 +592,69 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: std::io::Error::other("reranker mutex future reused after completion").into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod score_tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        let delta = (actual - expected).abs();
+        assert!(
+            delta <= 1e-4,
+            "expected {expected}, got {actual} (delta {delta})"
+        );
+    }
+
+    #[test]
+    fn extract_scores_batch_one_column_preserves_logits() {
+        let shape = [2_i64, 1];
+        let data = [0.0_f32, 1.0];
+        let scores = extract_scores_from_raw((&shape, &data), 2, "test").unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_close(scores[0].0, sigmoid(0.0));
+        assert_close(scores[1].0, sigmoid(1.0));
+        assert_eq!(scores[0].1, Some(0.0));
+        assert_eq!(scores[1].1, Some(1.0));
+    }
+
+    #[test]
+    fn extract_scores_batch_two_column_uses_logit_delta() {
+        let shape = [2_i64, 2];
+        let data = [1.0_f32, 2.0, 0.5, -0.5];
+        let scores = extract_scores_from_raw((&shape, &data), 2, "test").unwrap();
+        assert_eq!(scores.len(), 2);
+        let delta0 = 2.0 - 1.0;
+        let delta1 = -0.5 - 0.5;
+        assert_close(scores[0].0, sigmoid(delta0));
+        assert_close(scores[1].0, sigmoid(delta1));
+        assert_eq!(scores[0].1, Some(delta0));
+        assert_eq!(scores[1].1, Some(delta1));
+    }
+
+    #[test]
+    fn extract_scores_flat_shape_preserves_logits() {
+        let shape = [2_i64];
+        let data = [0.25_f32, -0.75];
+        let scores = extract_scores_from_raw((&shape, &data), 2, "test").unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_close(scores[0].0, sigmoid(0.25));
+        assert_close(scores[1].0, sigmoid(-0.75));
+        assert_eq!(scores[0].1, Some(0.25));
+        assert_eq!(scores[1].1, Some(-0.75));
+    }
+
+    #[test]
+    fn extract_scores_transposed_shape_preserves_logits() {
+        let shape = [1_i64, 2];
+        let data = [0.8_f32, -0.2];
+        let scores = extract_scores_from_raw((&shape, &data), 2, "test").unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_close(scores[0].0, sigmoid(0.8));
+        assert_close(scores[1].0, sigmoid(-0.2));
+        assert_eq!(scores[0].1, Some(0.8));
+        assert_eq!(scores[1].1, Some(-0.2));
     }
 }
 

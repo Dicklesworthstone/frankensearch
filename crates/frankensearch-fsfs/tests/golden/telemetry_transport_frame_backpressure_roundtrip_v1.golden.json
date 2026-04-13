@@ -1,0 +1,16 @@
+{
+  "connection_id": "01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+  "dispatch_ts": "2026-02-14T01:20:01.012Z",
+  "dropped_since_last": 18,
+  "frame_type": "control",
+  "kind": "telemetry_transport_stream_frame",
+  "lag_ms": 12,
+  "payload": {
+    "control_type": "backpressure",
+    "reason_code": "queue_high_watermark"
+  },
+  "producer_ts": "2026-02-14T01:20:01Z",
+  "sequence": 43,
+  "transport": "unix_domain_socket",
+  "v": 1
+}

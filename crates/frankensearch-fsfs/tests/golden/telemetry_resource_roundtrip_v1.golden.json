@@ -1,0 +1,27 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:45:08Z",
+  "event": {
+    "type": "resource",
+    "instance": {
+      "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+      "project_key": "/data/projects/frankensearch",
+      "host_name": "atlas",
+      "pid": 4242
+    },
+    "correlation": {
+      "event_id": "01JAH9A37K2M3N4P5Q6R7S8T9Y",
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "sample": {
+      "cpu_pct": 42.7,
+      "rss_bytes": 73400320,
+      "io_read_bytes": 993421,
+      "io_write_bytes": 341204,
+      "interval_ms": 1000,
+      "load_avg_1m": 1.43,
+      "pressure_profile": "performance"
+    }
+  }
+}

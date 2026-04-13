@@ -1,0 +1,15 @@
+{
+  "schema": "interaction-lane-ownership-v1",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "bead": "bd-3un.52.6",
+  "lanes": [
+    {
+      "lane_id": "baseline",
+      "owner_lane": "fusion-composition-owner",
+      "bead_refs": [
+        "bd-3un.52"
+      ],
+      "escalation": "composition-owner"
+    }
+  ]
+}

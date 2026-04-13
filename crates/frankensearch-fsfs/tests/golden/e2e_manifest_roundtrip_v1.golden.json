@@ -1,0 +1,44 @@
+{
+  "v": 1,
+  "schema": "e2e-manifest-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:00Z",
+  "body": {
+    "suite": "interaction",
+    "determinism_tier": "bit_exact",
+    "seed": 42,
+    "config_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "index_version": "fsvi-v3",
+    "model_versions": [
+      {
+        "name": "potion-128M",
+        "revision": "abc123",
+        "digest": "sha256:a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef"
+      },
+      {
+        "name": "MiniLM-L6-v2",
+        "revision": "def456"
+      }
+    ],
+    "platform": {
+      "os": "linux",
+      "arch": "x86_64",
+      "rustc": "nightly-2026-02-01"
+    },
+    "clock_mode": "simulated",
+    "tie_break_policy": "doc_id_lexical",
+    "artifacts": [
+      {
+        "file": "structured_events.jsonl",
+        "checksum": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+        "line_count": 147
+      },
+      {
+        "file": "oracle-report.json",
+        "checksum": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+      }
+    ],
+    "duration_ms": 1234,
+    "exit_status": "pass"
+  }
+}

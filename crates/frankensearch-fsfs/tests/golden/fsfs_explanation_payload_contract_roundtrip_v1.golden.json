@@ -1,0 +1,52 @@
+{
+  "kind": "fsfs_explanation_payload_contract_definition",
+  "v": 1,
+  "ranking_policy": {
+    "required_fields": [
+      "doc_id",
+      "final_score",
+      "phase",
+      "reason_code",
+      "confidence_per_mille",
+      "components"
+    ],
+    "require_component_breakdown": true,
+    "phase_enum": [
+      "Initial",
+      "Refined"
+    ]
+  },
+  "policy_decision_policy": {
+    "required_fields": [
+      "domain",
+      "decision",
+      "reason_code",
+      "confidence_per_mille",
+      "summary",
+      "metadata"
+    ],
+    "domain_enum": [
+      "query_intent",
+      "retrieval_budget",
+      "query_execution",
+      "degradation",
+      "discovery"
+    ]
+  },
+  "transport_parity_policy": {
+    "json_lossless": true,
+    "toon_requires_stable_labels": true,
+    "tui_preserves_reason_codes": true
+  },
+  "diagnostics_policy": {
+    "reason_code_prefixes": [
+      "query.",
+      "degrade.",
+      "discovery."
+    ],
+    "confidence_bounds": [
+      0,
+      1000
+    ]
+  }
+}

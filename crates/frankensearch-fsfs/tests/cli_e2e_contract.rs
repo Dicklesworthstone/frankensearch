@@ -22,6 +22,48 @@ fn scenario_by_kind(kind: CliE2eScenarioKind) -> frankensearch_fsfs::CliE2eScena
         .expect("scenario should exist")
 }
 
+fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let golden_path = dir.join(format!("{name}.golden.json"));
+    let actual = serde_json::to_string_pretty(value).expect("serialize golden json");
+
+    if std::env::var("UPDATE_GOLDENS").is_ok() {
+        std::fs::create_dir_all(&dir).expect("create golden directory");
+        std::fs::write(&golden_path, actual.as_bytes()).expect("write golden file");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+        panic!(
+            "Golden file not found: {}\nSet UPDATE_GOLDENS=1 to create it.",
+            golden_path.display()
+        );
+    });
+
+    let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
+    let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+
+    if actual_trimmed != expected_trimmed {
+        let actual_path = golden_path.with_extension("actual.json");
+        std::fs::write(&actual_path, actual_trimmed.as_bytes()).expect("write actual file");
+        panic!(
+            "GOLDEN MISMATCH: {name}\nexpected: {}\nactual: {}",
+            golden_path.display(),
+            actual_path.display()
+        );
+    }
+}
+
+fn stabilize_bundle(bundle: &mut CliE2eArtifactBundle) {
+    bundle.manifest.ts = "2026-02-14T00:00:00Z".to_owned();
+    bundle.manifest.run_id = "01JABCDEF00000000000000000".to_owned();
+    for event in &mut bundle.events {
+        event.ts = "2026-02-14T00:00:00Z".to_owned();
+    }
+    // We do not freeze replay_command fully if it varies, but we can set it to a stable string
+    bundle.replay_command = format!("frankensearch --seed 42 {}", bundle.scenario.args.join(" "));
+}
+
 fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
     assert!(
         artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL),
@@ -48,7 +90,7 @@ fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
 #[test]
 fn scenario_cli_index_baseline() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Index);
-    let bundle =
+    let mut bundle =
         CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.schema_version, CLI_E2E_SCHEMA_VERSION);
@@ -57,12 +99,15 @@ fn scenario_cli_index_baseline() {
         bundle.scenario.args.first().map(String::as_str),
         Some("index")
     );
+
+    stabilize_bundle(&mut bundle);
+    assert_golden_json("cli_e2e_index_baseline_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_search_stream() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Search);
-    let bundle =
+    let mut bundle =
         CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Search);
@@ -74,22 +119,28 @@ fn scenario_cli_search_stream() {
             .as_deref()
             .is_some_and(|code| code.starts_with("e2e.cli."))
     }));
+
+    stabilize_bundle(&mut bundle);
+    assert_golden_json("cli_e2e_search_stream_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_explain_hit() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Explain);
-    let bundle =
+    let mut bundle =
         CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Explain);
     assert!(bundle.scenario.args.contains(&"toon".to_owned()));
+
+    stabilize_bundle(&mut bundle);
+    assert_golden_json("cli_e2e_explain_hit_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_degrade_path() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Degrade);
-    let bundle =
+    let mut bundle =
         CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Fail);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Degrade);
@@ -112,6 +163,9 @@ fn scenario_cli_degrade_path() {
             .replay_command
             .contains("--exact scenario_cli_degrade_path")
     );
+
+    stabilize_bundle(&mut bundle);
+    assert_golden_json("cli_e2e_degrade_path_v1", &bundle);
 }
 
 #[test]

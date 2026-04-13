@@ -1,0 +1,27 @@
+[
+  {
+    "code": "adapter.event.embedding.missing_embedder_id",
+    "field": "embedding.embedder.id",
+    "message": "embedder id must be non-empty"
+  },
+  {
+    "code": "adapter.event.embedding.missing_job_id",
+    "field": "embedding.job.job_id",
+    "message": "job_id must be non-empty"
+  },
+  {
+    "code": "adapter.event.embedding.zero_dimension",
+    "field": "embedding.embedder.dimension",
+    "message": "dimension should be > 0"
+  },
+  {
+    "code": "adapter.event.embedding.zero_doc_count",
+    "field": "embedding.job.doc_count",
+    "message": "doc_count should be > 0"
+  },
+  {
+    "code": "adapter.event.embedding.zero_duration",
+    "field": "embedding.duration_ms",
+    "message": "duration_ms should be > 0 for completed telemetry"
+  }
+]

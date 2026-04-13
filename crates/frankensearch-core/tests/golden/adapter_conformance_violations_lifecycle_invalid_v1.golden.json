@@ -1,0 +1,12 @@
+[
+  {
+    "code": "adapter.event.lifecycle.empty_reason",
+    "field": "lifecycle.reason",
+    "message": "reason must be non-empty when provided"
+  },
+  {
+    "code": "adapter.event.lifecycle.zero_uptime",
+    "field": "lifecycle.uptime_ms",
+    "message": "uptime_ms should be > 0 when provided"
+  }
+]

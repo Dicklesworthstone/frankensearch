@@ -9,6 +9,38 @@ use frankensearch_fsfs::{
     PolicyDecisionExplanation, PolicyDomain, RankingExplanation, TraceLink, validate_envelope,
 };
 
+fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let golden_path = dir.join(format!("{name}.golden.json"));
+    let actual = serde_json::to_string_pretty(value).expect("serialize golden json");
+
+    if std::env::var("UPDATE_GOLDENS").is_ok() {
+        std::fs::create_dir_all(&dir).expect("create golden directory");
+        std::fs::write(&golden_path, actual.as_bytes()).expect("write golden file");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+        panic!(
+            "Golden file not found: {}\nSet UPDATE_GOLDENS=1 to create it.",
+            golden_path.display()
+        );
+    });
+
+    let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
+    let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+
+    if actual_trimmed != expected_trimmed {
+        let actual_path = golden_path.with_extension("actual.json");
+        std::fs::write(&actual_path, actual_trimmed.as_bytes()).expect("write actual file");
+        panic!(
+            "GOLDEN MISMATCH: {name}\nexpected: {}\nactual: {}",
+            golden_path.display(),
+            actual_path.display()
+        );
+    }
+}
+
 fn sample_ranking() -> RankingExplanation {
     let explanation = HitExplanation {
         final_score: 0.812,
@@ -65,6 +97,8 @@ fn explanation_payload_validates_inside_output_envelope() {
         "envelope must satisfy strict output contract"
     );
 
+    assert_golden_json("explanation_payload_envelope_v1", &envelope);
+
     let encoded = serde_json::to_string(&envelope).expect("serialize output envelope");
     let decoded: serde_json::Value =
         serde_json::from_str(&encoded).expect("deserialize output envelope");
@@ -103,6 +137,8 @@ fn explanation_payload_toon_and_tui_use_stable_labels() {
             summary: "normal execution plan".to_owned(),
             metadata: std::collections::BTreeMap::new(),
         });
+
+    assert_golden_json("explanation_payload_tui_and_toon_v1", &payload);
 
     let toon = payload.to_toon();
     assert!(toon.contains("phase=refined"));

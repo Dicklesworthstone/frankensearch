@@ -1,0 +1,94 @@
+{
+  "kind": "fsfs_config_contract_definition",
+  "v": 1,
+  "source_precedence": ["cli", "env", "file", "defaults"],
+  "config_file_policy": {
+    "primary": "${XDG_CONFIG_HOME}/fsfs/config.toml",
+    "fallback": "~/.config/fsfs/config.toml",
+    "expand_tilde": true
+  },
+  "defaults": {
+    "discovery": {
+      "roots": ["$HOME"],
+      "exclude_patterns": [".git", "node_modules", "target", "__pycache__"],
+      "text_selection_mode": "blocklist",
+      "binary_blocklist_extensions": [".exe", ".dll", ".so", ".o", ".class", ".jar", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wasm", ".pyc", ".pdb"],
+      "max_file_size_mb": 10,
+      "follow_symlinks": false
+    },
+    "indexing": {
+      "fast_model": "potion-multilingual-128M",
+      "quality_model": "all-MiniLM-L6-v2",
+      "model_dir": "~/.cache/frankensearch/models",
+      "embedding_batch_size": 64,
+      "reindex_on_change": true,
+      "watch_mode": false
+    },
+    "search": {
+      "default_limit": 20,
+      "quality_weight": 0.7,
+      "rrf_k": 60,
+      "quality_timeout_ms": 500,
+      "fast_only": false,
+      "explain": false
+    },
+    "pressure": {
+      "profile": "performance",
+      "cpu_ceiling_pct": 80,
+      "memory_ceiling_mb": 2048
+    },
+    "tui": {
+      "theme": "dark",
+      "frame_budget_ms": 16,
+      "show_explanations": true,
+      "density": "normal"
+    },
+    "storage": {
+      "db_path": "~/.local/share/fsfs/fsfs.db",
+      "evidence_retention_days": 7,
+      "summary_retention_days": 90
+    },
+    "privacy": {
+      "redact_file_contents_in_logs": true,
+      "redact_paths_in_telemetry": true
+    }
+  },
+  "env_var_map": {
+    "discovery_roots": "FSFS_DISCOVERY_ROOTS",
+    "discovery_exclude_patterns": "FSFS_DISCOVERY_EXCLUDE_PATTERNS",
+    "search_default_limit": "FSFS_SEARCH_DEFAULT_LIMIT",
+    "search_fast_only": "FSFS_SEARCH_FAST_ONLY",
+    "search_explain": "FSFS_SEARCH_EXPLAIN",
+    "pressure_profile": "FSFS_PRESSURE_PROFILE",
+    "tui_theme": "FSFS_TUI_THEME",
+    "privacy_redact_paths_in_telemetry": "FSFS_PRIVACY_REDACT_PATHS_IN_TELEMETRY"
+  },
+  "cli_flag_map": {
+    "roots": "--roots",
+    "exclude": "--exclude",
+    "limit": "--limit",
+    "fast_only": "--fast-only",
+    "explain": "--explain",
+    "profile": "--profile",
+    "theme": "--theme"
+  },
+  "validation": {
+    "unknown_key_policy": "warn",
+    "path_expansion": "tilde_to_home",
+    "conflict_rules": ["config.search.fast_only_with_quality_model"],
+    "invariants": [
+      "config.storage.summary_retention_days_gte_evidence_retention_days",
+      "config.paths.expand_tilde_before_validation"
+    ]
+  },
+  "logging": {
+    "event_name": "config_loaded",
+    "required_fields": [
+      "source_precedence_applied",
+      "resolved_values",
+      "warnings",
+      "reason_codes"
+    ],
+    "reason_code_prefix": "config."
+  }
+}

@@ -304,7 +304,10 @@ impl TwoTierConfig {
                 reason: "must be >= 10".to_owned(),
             });
         }
-        if self.graph_ranking_enabled && (!self.graph_ranking_weight.is_finite() || !(0.0..=1.0).contains(&self.graph_ranking_weight)) {
+        if self.graph_ranking_enabled
+            && (!self.graph_ranking_weight.is_finite()
+                || !(0.0..=1.0).contains(&self.graph_ranking_weight))
+        {
             return Err(crate::error::SearchError::InvalidConfig {
                 field: "graph_ranking_weight".to_owned(),
                 value: self.graph_ranking_weight.to_string(),

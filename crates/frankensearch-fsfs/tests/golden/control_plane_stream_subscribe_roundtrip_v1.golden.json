@@ -1,0 +1,19 @@
+{
+  "kind": "stream_subscribe",
+  "v": 1,
+  "client_id": "01JAH9A61K2M3N4P5Q6R7S8T91",
+  "topics": [
+    "search",
+    "embedding",
+    "index",
+    "resource",
+    "anomaly",
+    "lifecycle"
+  ],
+  "project_filter": [
+    "/data/projects/frankensearch"
+  ],
+  "resume_cursor": null,
+  "max_inflight": 128,
+  "heartbeat_ms": 1000
+}

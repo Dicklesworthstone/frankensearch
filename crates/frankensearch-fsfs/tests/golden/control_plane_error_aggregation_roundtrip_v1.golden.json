@@ -1,0 +1,14 @@
+{
+  "kind": "control_plane_error_aggregation",
+  "v": 1,
+  "window": "1m",
+  "error_type": "StreamDisconnected",
+  "project_key": "/data/projects/frankensearch",
+  "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+  "reason_code": "control.stream_disconnected.retrying",
+  "occurrences": 57,
+  "first_seen_ts": "2026-02-14T01:04:00Z",
+  "last_seen_ts": "2026-02-14T01:05:00Z",
+  "escalated": true,
+  "aggregation_reason_code": "control.stream_disconnected.burst"
+}

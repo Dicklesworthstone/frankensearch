@@ -34,12 +34,13 @@ fn fast_circuit_breaker() -> CircuitBreaker {
     })
 }
 
-const fn fast_phase_gate() -> PhaseGate {
+fn fast_phase_gate() -> PhaseGate {
     PhaseGate::new(PhaseGateConfig {
         alpha: 0.05,
         timeout_queries: 20,
         min_delta: 0.01,
         enabled: true,
+        expiry_ms: None,
     })
 }
 

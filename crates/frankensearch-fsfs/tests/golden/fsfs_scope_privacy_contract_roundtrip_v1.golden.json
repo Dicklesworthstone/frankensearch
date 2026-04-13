@@ -1,0 +1,56 @@
+{
+  "kind": "fsfs_scope_privacy_contract_definition",
+  "v": 1,
+  "scope_defaults": {
+    "default_roots": [
+      "/home/ubuntu"
+    ],
+    "requires_explicit_opt_in_outside_defaults": true,
+    "opt_out_globs_supported": true,
+    "precedence": [
+      "hard_deny",
+      "opt_out",
+      "opt_in",
+      "default"
+    ]
+  },
+  "sensitive_classes": [
+    "credentials",
+    "tokens",
+    "private_keys",
+    "ssh_material",
+    "browser_secrets",
+    "personal_data"
+  ],
+  "path_policies": {
+    "deny_always_globs": [
+      "/home/*/.ssh/**",
+      "/home/*/.gnupg/**",
+      "/home/*/.aws/credentials"
+    ],
+    "allow_with_opt_in_globs": [
+      "/mnt/external/**",
+      "/Volumes/**"
+    ]
+  },
+  "redaction": {
+    "logs_default_action": "mask",
+    "explain_default_action": "hash",
+    "replay_default_action": "drop",
+    "deterministic_profile_id": "privacy-v1-default"
+  },
+  "threat_model": {
+    "local_multi_user_assumed": true,
+    "same_host_read_risk": true,
+    "mitigations": [
+      "strict_file_permissions",
+      "pre_emit_redaction",
+      "reason_coded_decisions"
+    ]
+  },
+  "telemetry_emission_rules": {
+    "raw_content_allowed": false,
+    "reason_code_required": true,
+    "redaction_version": "v1"
+  }
+}

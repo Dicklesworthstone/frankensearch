@@ -261,6 +261,41 @@ impl ModelManifest {
         }
     }
 
+    /// Built-in manifest for flashrank-nano (cross-encoder reranker).
+    #[must_use]
+    pub fn flashrank_nano() -> Self {
+        const REVISION: &str = PLACEHOLDER_PINNED_REVISION;
+        const REPO: &str = "prithivida/flashrank-nano";
+        Self {
+            id: "flashrank-nano".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("FlashRank Nano (Reranker)".to_owned()),
+            description: Some(
+                "FlashRank compact ONNX cross-encoder reranker model".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".to_owned(),
+                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                    size: 0,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                    size: 0,
+                    url: None,
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: None,
+            tier: Some(ModelTier::Reranker),
+            download_size_bytes: 0,
+        }
+    }
+
     /// Built-in manifest for MS MARCO `MiniLM` reranker (cross-encoder).
     #[must_use]
     pub fn ms_marco_reranker() -> Self {
@@ -575,6 +610,7 @@ impl ModelManifest {
                 Self::snowflake_arctic_s(),
                 Self::nomic_embed(),
                 Self::jina_reranker_turbo(),
+                Self::flashrank_nano(),
             ],
         }
     }
@@ -2608,7 +2644,7 @@ mod tests {
     fn builtin_catalog_contains_all_models() {
         let catalog = ModelManifest::builtin_catalog();
         assert_eq!(catalog.schema_version, MANIFEST_SCHEMA_VERSION);
-        assert_eq!(catalog.models.len(), 6);
+        assert_eq!(catalog.models.len(), 7);
 
         let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"potion-multilingual-128m"));
@@ -2617,6 +2653,7 @@ mod tests {
         assert!(ids.contains(&"snowflake-arctic-embed-s"));
         assert!(ids.contains(&"nomic-embed-text-v1.5"));
         assert!(ids.contains(&"jina-reranker-v1-turbo-en"));
+        assert!(ids.contains(&"flashrank-nano"));
 
         catalog.validate().unwrap();
     }
@@ -2639,6 +2676,7 @@ mod tests {
             ModelManifest::snowflake_arctic_s(),
             ModelManifest::nomic_embed(),
             ModelManifest::jina_reranker_turbo(),
+            ModelManifest::flashrank_nano(),
         ];
 
         for manifest in manifests {

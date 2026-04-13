@@ -1,0 +1,34 @@
+{
+  "kind": "fsfs_incremental_change_detection_contract_definition",
+  "v": 1,
+  "fastpath_policy": {
+    "mtime_granularity_ns": 1000000000,
+    "require_size_change": false,
+    "hash_on_mtime_only": true,
+    "max_fastpath_skips": 3
+  },
+  "hash_policy": {
+    "algorithm": "sha256",
+    "sample_prefix_bytes": 4096,
+    "full_hash_threshold_bytes": 65536
+  },
+  "rename_move_policy": {
+    "identity_keys": [
+      "device",
+      "inode",
+      "content_hash"
+    ],
+    "same_device_rename_preserves_identity": true,
+    "cross_device_move": "hash_confirm"
+  },
+  "recovery_policy": {
+    "journal_required": true,
+    "replay_order": "sequence_asc",
+    "pending_ttl_seconds": 3600
+  },
+  "reconciliation_policy": {
+    "full_scan_interval_seconds": 21600,
+    "stale_after_seconds": 86400,
+    "orphan_entry_action": "mark_stale"
+  }
+}

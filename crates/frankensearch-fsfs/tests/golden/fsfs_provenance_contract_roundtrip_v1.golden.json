@@ -1,0 +1,31 @@
+{
+  "kind": "fsfs_provenance_contract",
+  "schema_version": 1,
+  "required_attestation_fields": [
+    "attestation_id",
+    "generated_at",
+    "build.source_commit",
+    "build.build_profile",
+    "build.rustc_version",
+    "build.target_triple",
+    "runtime.binary_hash_sha256",
+    "runtime.config_hash_sha256",
+    "runtime.index_manifest_hash_sha256",
+    "artifact_hashes[].path",
+    "artifact_hashes[].sha256"
+  ],
+  "startup_policy": {
+    "require_attestation": true,
+    "require_signature": false,
+    "on_attestation_missing": "enter_safe_mode",
+    "on_signature_missing": "enter_safe_mode",
+    "on_signature_invalid": "abort_startup",
+    "on_hash_mismatch": "abort_startup"
+  },
+  "reason_codes": [
+    "provenance.startup.attestation_missing",
+    "provenance.startup.signature_missing",
+    "provenance.startup.signature_invalid",
+    "provenance.startup.hash_mismatch"
+  ]
+}

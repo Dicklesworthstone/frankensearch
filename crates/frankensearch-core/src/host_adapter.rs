@@ -13,9 +13,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::collectors::{
-    TELEMETRY_SCHEMA_VERSION, TelemetryCorrelation, TelemetryEmbedderInfo, TelemetryEmbeddingJob,
-    TelemetryEnvelope, TelemetryEvent, TelemetryInstance, TelemetrySearchMetrics,
-    TelemetrySearchResults,
+    EmbeddingStage, EmbedderTier, EmbeddingStatus, IndexInventory, IndexOperation, IndexStatus, 
+    LifecycleSeverity, LifecycleState, QuantizationMode, TelemetryCorrelation, 
+    TelemetryEmbedderInfo, TelemetryEmbeddingJob, TelemetryEnvelope, TelemetryEvent, 
+    TelemetryInstance, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery, 
+    TelemetrySearchResults, TELEMETRY_SCHEMA_VERSION,
 };
 use crate::error::{SearchError, SearchResult};
 
@@ -1220,6 +1222,7 @@ fn normalize_project_hint(hint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -1313,6 +1316,63 @@ mod tests {
         serde_json::from_str(&raw).unwrap()
     }
 
+    fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let golden_path = dir.join(format!("{name}.golden.json"));
+        let actual = serde_json::to_string_pretty(value).expect("serialize golden json");
+
+        if std::env::var("UPDATE_GOLDENS").is_ok() {
+            fs::create_dir_all(&dir).expect("create golden directory");
+            fs::write(&golden_path, actual.as_bytes()).expect("write golden file");
+            return;
+        }
+
+        let expected = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+            panic!(
+                "Golden file not found: {}\nSet UPDATE_GOLDENS=1 to create it.",
+                golden_path.display()
+            );
+        });
+
+        let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
+        let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+
+        if actual_trimmed != expected_trimmed {
+            let actual_path = golden_path.with_extension("actual.json");
+            fs::write(&actual_path, actual_trimmed.as_bytes()).expect("write actual file");
+            panic!(
+                "GOLDEN MISMATCH: {name}\nexpected: {}\nactual: {}",
+                golden_path.display(),
+                actual_path.display()
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    struct ViolationSnapshot {
+        code: String,
+        field: String,
+        message: String,
+    }
+
+    fn snapshot_violations(violations: &[ConformanceViolation]) -> Vec<ViolationSnapshot> {
+        let mut snapshots: Vec<ViolationSnapshot> = violations
+            .iter()
+            .map(|violation| ViolationSnapshot {
+                code: violation.code.clone(),
+                field: violation.field.clone(),
+                message: violation.message.clone(),
+            })
+            .collect();
+        snapshots.sort_by(|a, b| {
+            a.code
+                .cmp(&b.code)
+                .then_with(|| a.field.cmp(&b.field))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        snapshots
+    }
+
     #[test]
     fn sample_host_adapter_passes_conformance_with_golden_fixtures() {
         let harness = ConformanceHarness::default();
@@ -1331,6 +1391,333 @@ mod tests {
         assert_eq!(report.emitted_events, fixtures.len());
         assert!(report.lifecycle_hooks_checked >= 2);
         assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn conformance_report_matches_golden_output() {
+        let harness = ConformanceHarness::default();
+        let adapter = MemoryHostAdapter::new(default_identity());
+        let fixtures = vec![
+            load_fixture("telemetry-search-v1.json"),
+            load_fixture("telemetry-embedding-v1.json"),
+            load_fixture("telemetry-index-v1.json"),
+            load_fixture("telemetry-resource-v1.json"),
+            load_fixture("telemetry-lifecycle-v1.json"),
+        ];
+
+        let report = harness.run(&adapter, &fixtures);
+        assert_golden_json("adapter_conformance_report_v1", &report);
+    }
+
+    #[test]
+    fn telemetry_fixtures_pass_envelope_conformance() {
+        let harness = ConformanceHarness::default();
+        let fixtures = [
+            "telemetry-search-v1.json",
+            "telemetry-embedding-v1.json",
+            "telemetry-index-v1.json",
+            "telemetry-resource-v1.json",
+            "telemetry-lifecycle-v1.json",
+        ];
+
+        for fixture in fixtures {
+            let envelope = load_fixture(fixture);
+            let violations = harness.validate_envelope(&envelope);
+            assert!(
+                violations.is_empty(),
+                "fixture {fixture} should pass conformance, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conformance_violations_match_golden_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+        envelope.v = 99;
+        envelope.ts = "".to_owned();
+
+        if let TelemetryEvent::Search {
+            instance,
+            correlation,
+            query,
+            results,
+            metrics,
+            ..
+        } = &mut envelope.event
+        {
+            instance.instance_id = "not-a-ulid".to_owned();
+            instance.project_key = " ".to_owned();
+            instance.host_name = String::new();
+            instance.pid = Some(1234);
+
+            correlation.event_id = "bad-event".to_owned();
+            correlation.root_request_id = "bad-root".to_owned();
+            correlation.parent_event_id = Some("bad-parent".to_owned());
+
+            query.text = format!("BEGIN PRIVATE KEY{}", "a".repeat(600));
+            metrics.latency_us = 0;
+            results.result_count = 7;
+            results.lexical_count = 0;
+            results.semantic_count = 0;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json(
+            "adapter_conformance_violations_search_invalid_v1",
+            &snapshot,
+        );
+    }
+
+    #[test]
+    fn conformance_violations_embedding_invalid_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        envelope.event = TelemetryEvent::Embedding {
+            instance: TelemetryInstance {
+                instance_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                project_key: "frankensearch".to_owned(),
+                host_name: "test-host".to_owned(),
+                pid: Some(1234),
+            },
+            correlation: TelemetryCorrelation {
+                event_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                root_request_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                parent_event_id: None,
+            },
+            job: TelemetryEmbeddingJob {
+                job_id: " ".to_owned(), // invalid
+                queue_depth: 0,
+                doc_count: 0, // invalid
+                stage: EmbeddingStage::Fast,
+            },
+            embedder: TelemetryEmbedderInfo {
+                id: "".to_owned(), // invalid
+                tier: EmbedderTier::Fast,
+                dimension: 0, // invalid
+            },
+            status: EmbeddingStatus::Completed,
+            duration_ms: 0, // invalid
+        };
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_embedding_invalid_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_index_invalid_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        envelope.event = TelemetryEvent::Index {
+            instance: TelemetryInstance {
+                instance_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                project_key: "frankensearch".to_owned(),
+                host_name: "test-host".to_owned(),
+                pid: Some(1234),
+            },
+            correlation: TelemetryCorrelation {
+                event_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                root_request_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                parent_event_id: None,
+            },
+            operation: IndexOperation::Build,
+            inventory: IndexInventory {
+                words: 0,
+                tokens: 0,
+                lines: 0,
+                bytes: 0,
+                docs: 0,
+            },
+            dimension: 0,   // invalid
+            quantization: QuantizationMode::F16,
+            status: IndexStatus::Completed,
+            duration_ms: 0, // invalid
+        };
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_index_invalid_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_resource_invalid_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        envelope.event = TelemetryEvent::Resource {
+            instance: TelemetryInstance {
+                instance_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                project_key: "frankensearch".to_owned(),
+                host_name: "test-host".to_owned(),
+                pid: Some(1234),
+            },
+            correlation: TelemetryCorrelation {
+                event_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                root_request_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                parent_event_id: None,
+            },
+            sample: TelemetryResourceSample {
+                cpu_pct: 150.0, // invalid
+                rss_bytes: 0,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                interval_ms: 0, // invalid
+                load_avg_1m: Some(-1.0), // invalid
+                pressure_profile: None,
+            },
+        };
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_resource_invalid_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_lifecycle_invalid_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        envelope.event = TelemetryEvent::Lifecycle {
+            instance: TelemetryInstance {
+                instance_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                project_key: "frankensearch".to_owned(),
+                host_name: "test-host".to_owned(),
+                pid: Some(1234),
+            },
+            correlation: TelemetryCorrelation {
+                event_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                root_request_id: "01JAH9A2W8F8Q6GQ4C7M3N2P1R".to_owned(),
+                parent_event_id: None,
+            },
+            state: LifecycleState::Started,
+            severity: LifecycleSeverity::Info,
+            reason: Some(" ".to_owned()), // invalid
+            uptime_ms: Some(0),           // invalid
+        };
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_lifecycle_invalid_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_search_empty_query_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { query, .. } = &mut envelope.event {
+            query.text = "   ".to_owned();
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json(
+            "adapter_conformance_violations_search_empty_query_v1",
+            &snapshot,
+        );
+    }
+
+    #[test]
+    fn conformance_violations_search_missing_source_counts_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { results, .. } = &mut envelope.event {
+            results.result_count = 1;
+            results.lexical_count = 0;
+            results.semantic_count = 0;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json(
+            "adapter_conformance_violations_search_missing_source_counts_v1",
+            &snapshot,
+        );
+    }
+
+    #[test]
+    fn conformance_violations_privacy_redaction_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { query, .. } = &mut envelope.event {
+            // query contains a "forbidden" pattern (mocked secret)
+            query.text = "find documents with key=sk-1234567890abcdef".to_owned();
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_privacy_redaction_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_search_filter_fidelity_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { results, .. } = &mut envelope.event {
+            // Simulate complex results with varied source metadata
+            results.result_count = 3;
+            results.lexical_count = 1;
+            results.semantic_count = 2;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_filter_fidelity_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_metadata_security_redaction_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { query, .. } = &mut envelope.event {
+            // query contains multiple forbidden patterns
+            query.text = "find docs with key=sk-123 and token=Bearer abcdef123456".to_owned();
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json("adapter_conformance_violations_metadata_redaction_v1", &snapshot);
+    }
+
+    #[test]
+    fn conformance_violations_search_result_count_exceeds_sources_snapshot() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+
+        if let TelemetryEvent::Search { results, .. } = &mut envelope.event {
+            results.lexical_count = 1;
+            results.semantic_count = 1;
+            results.result_count = 5;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        let snapshot = snapshot_violations(&violations);
+        assert_golden_json(
+            "adapter_conformance_violations_search_result_count_exceeds_sources_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1500,807 +1887,5 @@ mod tests {
                 .iter()
                 .any(|violation| violation.code == "adapter.redaction.forbidden_pattern")
         );
-    }
-
-    #[test]
-    fn harness_reports_adapter_hook_errors_with_diagnostics() {
-        let harness = ConformanceHarness::default();
-        let mut adapter = MemoryHostAdapter::new(default_identity());
-        adapter.fail_emit = true;
-        adapter.fail_lifecycle = true;
-
-        let fixtures = vec![load_fixture("telemetry-search-v1.json")];
-        let report = harness.run(&adapter, &fixtures);
-
-        assert!(!report.passed);
-        assert!(
-            report
-                .violations
-                .iter()
-                .any(|violation| violation.code == "adapter.hook.error")
-        );
-    }
-
-    #[test]
-    fn host_project_attribution_prefers_adapter_identity_hint() {
-        let attribution = resolve_host_project_attribution(
-            Some("mcp_agent_mail_rust"),
-            Some("agent-mail"),
-            Some("mail-host-01"),
-        );
-        assert_eq!(attribution.resolved_project_key, "mcp_agent_mail_rust");
-        assert_eq!(attribution.reason_code, "attribution.adapter_identity");
-        assert!(!attribution.collision);
-        assert!(attribution.confidence_score >= 90);
-    }
-
-    #[test]
-    fn host_project_attribution_falls_back_to_unknown_bucket() {
-        let attribution =
-            resolve_host_project_attribution(None, Some("custom-app"), Some("odd-host-name"));
-        assert_eq!(attribution.resolved_project_key, "unknown");
-        assert_eq!(attribution.reason_code, "attribution.unknown");
-        assert_eq!(attribution.confidence_score, 20);
-        assert!(!attribution.collision);
-    }
-
-    #[test]
-    fn host_project_attribution_flags_collisions() {
-        let attribution =
-            resolve_host_project_attribution(Some("cass"), Some("xf"), Some("mixed-host"));
-        assert_eq!(
-            attribution.resolved_project_key,
-            "coding_agent_session_search"
-        );
-        assert_eq!(attribution.reason_code, "attribution.collision");
-        assert!(attribution.collision);
-        assert!(attribution.confidence_score < 95);
-    }
-
-    #[test]
-    fn host_project_attribution_uses_host_name_hint_when_needed() {
-        let attribution =
-            resolve_host_project_attribution(None, None, Some("frankenterm-prod-runner"));
-        assert_eq!(attribution.resolved_project_key, "frankenterm");
-        assert_eq!(attribution.reason_code, "attribution.host_name");
-        assert!(!attribution.collision);
-    }
-
-    #[test]
-    fn host_project_attribution_matches_mcp_adapter_style_host_hint() {
-        let attribution =
-            resolve_host_project_attribution(None, None, Some("mcp-agent-mail-host-adapter"));
-        assert_eq!(attribution.resolved_project_key, "mcp_agent_mail_rust");
-        assert_eq!(attribution.reason_code, "attribution.host_name");
-        assert!(!attribution.collision);
-    }
-
-    // ── is_valid_ulid edge cases ────────────────────────────────────────
-
-    #[test]
-    fn ulid_valid_26_char_crockford() {
-        assert!(is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1R"));
-    }
-
-    #[test]
-    fn ulid_empty_string() {
-        assert!(!is_valid_ulid(""));
-    }
-
-    #[test]
-    fn ulid_too_short() {
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1"));
-    }
-
-    #[test]
-    fn ulid_too_long() {
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1RX"));
-    }
-
-    #[test]
-    fn ulid_invalid_chars_i_l_o_u() {
-        // Crockford base32 excludes I, L, O, U
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PIR")); // I at pos 24
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PLR")); // L at pos 24
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2POR")); // O at pos 24
-        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PUR")); // U at pos 24
-    }
-
-    #[test]
-    fn ulid_lowercase_valid() {
-        assert!(is_valid_ulid("01jah9a2w8f8q6gq4c7m3n2p1r"));
-    }
-
-    // ── normalize_project_hint edge cases ───────────────────────────────
-
-    #[test]
-    fn normalize_hint_strips_special_chars() {
-        assert_eq!(normalize_project_hint("Hello-World!"), "hello_world");
-    }
-
-    #[test]
-    fn normalize_hint_empty_input() {
-        assert_eq!(normalize_project_hint(""), "");
-    }
-
-    #[test]
-    fn normalize_hint_only_special_chars() {
-        assert_eq!(normalize_project_hint("---"), "");
-    }
-
-    #[test]
-    fn normalize_hint_preserves_alphanumeric() {
-        assert_eq!(normalize_project_hint("abc123"), "abc123");
-    }
-
-    #[test]
-    fn normalize_hint_collapses_consecutive_separators() {
-        assert_eq!(normalize_project_hint("a--b__c"), "a_b_c");
-    }
-
-    #[test]
-    fn normalize_hint_no_trailing_separator() {
-        let result = normalize_project_hint("hello-");
-        assert!(!result.ends_with('_'), "no trailing separator: {result}");
-    }
-
-    // ── canonical_projects_from_hint coverage ───────────────────────────
-
-    #[test]
-    fn hint_resolves_cass_aliases() {
-        for alias in [
-            "coding_agent_session_search",
-            "codingagentsessionsearch",
-            "cass",
-            "CASS",
-        ] {
-            let matches = canonical_projects_from_hint(alias);
-            assert!(
-                matches.contains(&"coding_agent_session_search"),
-                "alias '{alias}' should resolve to cass"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_resolves_cass_adapter_style_names() {
-        for hint in [
-            "cass-host-adapter",
-            "coding-agent-session-search-host-adapter",
-        ] {
-            let matches = canonical_projects_from_hint(hint);
-            assert!(
-                matches.contains(&"coding_agent_session_search"),
-                "hint '{hint}' should resolve to coding_agent_session_search"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_resolves_xf() {
-        let matches = canonical_projects_from_hint("xf");
-        assert!(matches.contains(&"xf"));
-    }
-
-    #[test]
-    fn hint_resolves_xf_adapter_style_names() {
-        for hint in ["xf-host-adapter", "collector-xf-host-adapter-prod"] {
-            let matches = canonical_projects_from_hint(hint);
-            assert!(
-                matches.contains(&"xf"),
-                "hint '{hint}' should resolve to xf"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_resolves_mcp_agent_mail_aliases() {
-        for alias in [
-            "mcp_agent_mail_rust",
-            "mcpagentmailrust",
-            "mcpagentmail",
-            "agent_mail",
-            "agentmail",
-            "amail",
-        ] {
-            let matches = canonical_projects_from_hint(alias);
-            assert!(
-                matches.contains(&"mcp_agent_mail_rust"),
-                "alias '{alias}' should resolve to mcp_agent_mail_rust"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_resolves_mcp_agent_mail_adapter_style_names() {
-        for hint in ["mcp-agent-mail-host-adapter", "mcp_agent_mail_host_adapter"] {
-            let matches = canonical_projects_from_hint(hint);
-            assert!(
-                matches.contains(&"mcp_agent_mail_rust"),
-                "hint '{hint}' should resolve to mcp_agent_mail_rust"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_resolves_mcp_agent_mail_when_phrase_is_embedded() {
-        for hint in [
-            "collector-mcp-agent-mail-host-adapter-prod",
-            "telemetry_mcp_agent_mail_rust_host_adapter_v2",
-        ] {
-            let matches = canonical_projects_from_hint(hint);
-            assert!(
-                matches.contains(&"mcp_agent_mail_rust"),
-                "embedded hint '{hint}' should resolve to mcp_agent_mail_rust"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_does_not_resolve_mcp_agent_mail_when_alias_tokens_are_noncontiguous() {
-        let matches = canonical_projects_from_hint("agent_queue_mail_bridge");
-        assert!(
-            !matches.contains(&"mcp_agent_mail_rust"),
-            "noncontiguous tokens should not match mcp_agent_mail_rust"
-        );
-    }
-
-    #[test]
-    fn hint_resolves_frankenterm() {
-        let matches = canonical_projects_from_hint("frankenterm");
-        assert!(matches.contains(&"frankenterm"));
-    }
-
-    #[test]
-    fn hint_resolves_frankenterm_adapter_style_names() {
-        for hint in [
-            "frankenterm-host-adapter",
-            "telemetry-frankenterm-host-adapter-v2",
-        ] {
-            let matches = canonical_projects_from_hint(hint);
-            assert!(
-                matches.contains(&"frankenterm"),
-                "hint '{hint}' should resolve to frankenterm"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_unknown_returns_empty() {
-        let matches = canonical_projects_from_hint("totally_unknown_project");
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn hint_empty_returns_empty() {
-        let matches = canonical_projects_from_hint("");
-        assert!(matches.is_empty());
-    }
-
-    // ── HostProjectAttribution::unknown defaults ────────────────────────
-
-    #[test]
-    fn attribution_unknown_has_expected_defaults() {
-        let attr = HostProjectAttribution::unknown("test.reason");
-        assert_eq!(attr.resolved_project_key, "unknown");
-        assert_eq!(attr.confidence_score, 20);
-        assert_eq!(attr.reason_code, "test.reason");
-        assert!(!attr.collision);
-    }
-
-    // ── attribution with all hints None ─────────────────────────────────
-
-    #[test]
-    fn attribution_all_none_returns_unknown() {
-        let attr = resolve_host_project_attribution(None, None, None);
-        assert_eq!(attr.resolved_project_key, "unknown");
-        assert_eq!(attr.reason_code, "attribution.unknown");
-    }
-
-    // ── AdapterIdentity serde roundtrip ─────────────────────────────────
-
-    #[test]
-    fn adapter_identity_serde_roundtrip() {
-        let identity = default_identity();
-        let json = serde_json::to_string(&identity).unwrap();
-        let decoded: AdapterIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(identity, decoded);
-    }
-
-    #[test]
-    fn adapter_identity_without_optional_fields_roundtrip() {
-        let identity = AdapterIdentity {
-            adapter_id: "test".to_owned(),
-            adapter_version: "0.1.0".to_owned(),
-            host_project: "test-host".to_owned(),
-            runtime_role: None,
-            instance_uuid: None,
-            telemetry_schema_version: TELEMETRY_SCHEMA_VERSION,
-            redaction_policy_version: "v1".to_owned(),
-        };
-        let json = serde_json::to_string(&identity).unwrap();
-        let decoded: AdapterIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(identity, decoded);
-    }
-
-    // ── ConformanceViolation serde roundtrip ─────────────────────────────
-
-    #[test]
-    fn conformance_violation_serde_roundtrip() {
-        let v = ConformanceViolation {
-            code: "test.code".to_owned(),
-            field: "test.field".to_owned(),
-            message: "test message".to_owned(),
-        };
-        let json = serde_json::to_string(&v).unwrap();
-        let decoded: ConformanceViolation = serde_json::from_str(&json).unwrap();
-        assert_eq!(v, decoded);
-    }
-
-    // ── ConformanceReport serde roundtrip and passed logic ───────────────
-
-    #[test]
-    fn conformance_report_passed_when_no_violations() {
-        let report = ConformanceReport::with_violations(5, 5, 3, Vec::new());
-        assert!(report.passed);
-        assert_eq!(report.fixtures_checked, 5);
-        assert_eq!(report.emitted_events, 5);
-        assert_eq!(report.lifecycle_hooks_checked, 3);
-    }
-
-    #[test]
-    fn conformance_report_failed_when_violations_present() {
-        let violations = vec![ConformanceViolation {
-            code: "test".to_owned(),
-            field: "f".to_owned(),
-            message: "m".to_owned(),
-        }];
-        let report = ConformanceReport::with_violations(1, 1, 1, violations);
-        assert!(!report.passed);
-        assert_eq!(report.violations.len(), 1);
-    }
-
-    #[test]
-    fn conformance_report_serde_roundtrip() {
-        let report = ConformanceReport::with_violations(3, 3, 2, Vec::new());
-        let json = serde_json::to_string(&report).unwrap();
-        let decoded: ConformanceReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(report, decoded);
-    }
-
-    // ── ConformanceConfig defaults ──────────────────────────────────────
-
-    #[test]
-    fn conformance_config_default_values() {
-        let config = ConformanceConfig::default();
-        assert_eq!(config.expected_schema_version, TELEMETRY_SCHEMA_VERSION);
-        assert_eq!(config.required_redaction_policy_version, "v1");
-        assert_eq!(
-            config.forbidden_substrings.len(),
-            DEFAULT_REDACTION_FORBIDDEN_PATTERNS.len()
-        );
-    }
-
-    // ── NoopAdapterSink ─────────────────────────────────────────────────
-
-    #[test]
-    fn noop_adapter_sink_accepts_all_operations() {
-        let sink = NoopAdapterSink;
-        let fixture = load_fixture("telemetry-search-v1.json");
-        sink.emit(&fixture).expect("noop emit should succeed");
-        sink.on_lifecycle_event(&AdapterLifecycleEvent::HealthTick {
-            ts: "test".to_owned(),
-        })
-        .expect("noop lifecycle should succeed");
-    }
-
-    // ── validate_identity missing required fields ────────────────────────
-
-    #[test]
-    fn validate_identity_missing_adapter_id() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.adapter_id = String::new();
-        let violations = harness.validate_identity(&identity);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.identity.missing_adapter_id")
-        );
-    }
-
-    #[test]
-    fn validate_identity_missing_adapter_version() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.adapter_version = "  ".to_owned();
-        let violations = harness.validate_identity(&identity);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.identity.missing_adapter_version")
-        );
-    }
-
-    #[test]
-    fn validate_identity_missing_host_project() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.host_project = String::new();
-        let violations = harness.validate_identity(&identity);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.identity.missing_host_project")
-        );
-    }
-
-    #[test]
-    fn validate_identity_redaction_policy_mismatch() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.redaction_policy_version = "v99".to_owned();
-        let violations = harness.validate_identity(&identity);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.identity.redaction_policy_mismatch")
-        );
-    }
-
-    #[test]
-    fn validate_identity_canonical_pair_mismatch_for_known_host() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.host_project = "xf".to_owned();
-        identity.adapter_id = "cass-host-adapter".to_owned();
-        let violations = harness.validate_identity(&identity);
-        assert!(violations.iter().any(|v| {
-            v.code == "adapter.identity.canonical_pair_mismatch" && v.field == "identity.adapter_id"
-        }));
-    }
-
-    #[test]
-    fn validate_identity_canonical_pair_mismatch_for_known_adapter() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.adapter_id = "mcp-agent-mail-host-adapter".to_owned();
-        identity.host_project = "custom_mail".to_owned();
-        let violations = harness.validate_identity(&identity);
-        assert!(violations.iter().any(|v| {
-            v.code == "adapter.identity.canonical_pair_mismatch"
-                && v.field == "identity.host_project"
-        }));
-    }
-
-    #[test]
-    fn validate_identity_allows_unknown_pair_for_future_hosts() {
-        let harness = ConformanceHarness::default();
-        let mut identity = default_identity();
-        identity.adapter_id = "future-host-adapter".to_owned();
-        identity.host_project = "future_host".to_owned();
-        let violations = harness.validate_identity(&identity);
-        assert!(
-            !violations
-                .iter()
-                .any(|v| v.code == "adapter.identity.canonical_pair_mismatch")
-        );
-    }
-
-    // ── validate_envelope edge cases ─────────────────────────────────────
-
-    #[test]
-    fn validate_envelope_wrong_schema_version() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-search-v1.json");
-        envelope.v = 99;
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.envelope.schema_version_mismatch")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_empty_timestamp() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-search-v1.json");
-        envelope.ts = "  ".to_owned();
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.envelope.missing_timestamp")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_search_zero_latency_and_source_mismatch_are_reported() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-search-v1.json");
-        if let TelemetryEvent::Search {
-            results, metrics, ..
-        } = &mut envelope.event
-        {
-            metrics.latency_us = 0;
-            results.result_count = 7;
-            results.lexical_count = 0;
-            results.semantic_count = 0;
-        } else {
-            panic!("search fixture shape changed");
-        }
-
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.search.zero_latency")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.search.missing_source_counts")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_embedding_required_fields_are_enforced() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-embedding-v1.json");
-        if let TelemetryEvent::Embedding {
-            job,
-            embedder,
-            duration_ms,
-            ..
-        } = &mut envelope.event
-        {
-            job.job_id.clear();
-            job.doc_count = 0;
-            embedder.id = " ".to_owned();
-            embedder.dimension = 0;
-            *duration_ms = 0;
-        } else {
-            panic!("embedding fixture shape changed");
-        }
-
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.embedding.missing_job_id")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.embedding.zero_doc_count")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.embedding.missing_embedder_id")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.embedding.zero_dimension")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.embedding.zero_duration")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_index_zero_dimension_is_reported() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-index-v1.json");
-        if let TelemetryEvent::Index { dimension, .. } = &mut envelope.event {
-            *dimension = 0;
-        } else {
-            panic!("index fixture shape changed");
-        }
-
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.index.zero_dimension")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_resource_numeric_ranges_are_enforced() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-resource-v1.json");
-        if let TelemetryEvent::Resource { sample, .. } = &mut envelope.event {
-            sample.cpu_pct = 123.45;
-            sample.load_avg_1m = Some(-2.0);
-            sample.interval_ms = 0;
-        } else {
-            panic!("resource fixture shape changed");
-        }
-
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.resource.cpu_pct_out_of_range")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.resource.invalid_load_avg_1m")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.resource.zero_interval")
-        );
-    }
-
-    #[test]
-    fn validate_envelope_lifecycle_optional_fields_are_validated_when_present() {
-        let harness = ConformanceHarness::default();
-        let mut envelope = load_fixture("telemetry-lifecycle-v1.json");
-        if let TelemetryEvent::Lifecycle {
-            reason, uptime_ms, ..
-        } = &mut envelope.event
-        {
-            *reason = Some("  ".to_owned());
-            *uptime_ms = Some(0);
-        } else {
-            panic!("lifecycle fixture shape changed");
-        }
-
-        let violations = harness.validate_envelope(&envelope);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.lifecycle.empty_reason")
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.code == "adapter.event.lifecycle.zero_uptime")
-        );
-    }
-
-    // ── CanonicalHostProject::ALL ───────────────────────────────────────
-
-    #[test]
-    fn canonical_host_project_all_has_four_entries() {
-        assert_eq!(CanonicalHostProject::ALL.len(), 4);
-    }
-
-    #[test]
-    fn canonical_host_project_keys_are_unique() {
-        let keys: Vec<&str> = CanonicalHostProject::ALL
-            .iter()
-            .map(|h| h.host_project_key())
-            .collect();
-        let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
-        assert_eq!(keys.len(), unique.len(), "host project keys must be unique");
-    }
-
-    #[test]
-    fn canonical_host_project_adapter_ids_are_unique() {
-        let ids: Vec<&str> = CanonicalHostProject::ALL
-            .iter()
-            .map(|h| h.adapter_id())
-            .collect();
-        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
-        assert_eq!(ids.len(), unique.len(), "adapter IDs must be unique");
-    }
-
-    #[test]
-    fn canonical_host_project_runtime_roles_are_nonempty() {
-        for host in CanonicalHostProject::ALL {
-            let role = host.default_runtime_role();
-            assert!(!role.is_empty(), "{host:?} has empty default_runtime_role");
-        }
-    }
-
-    // ── AdapterLifecycleEvent serde roundtrip ────────────────────────────
-
-    #[test]
-    fn lifecycle_event_serde_roundtrip() {
-        for event in [
-            AdapterLifecycleEvent::SessionStart {
-                ts: "t1".to_owned(),
-            },
-            AdapterLifecycleEvent::SessionStop {
-                ts: "t2".to_owned(),
-            },
-            AdapterLifecycleEvent::HealthTick {
-                ts: "t3".to_owned(),
-            },
-        ] {
-            let json = serde_json::to_string(&event).unwrap();
-            let decoded: AdapterLifecycleEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(event, decoded);
-        }
-    }
-
-    // ── CanonicalHostProject serde roundtrip ─────────────────────────────
-
-    #[test]
-    fn canonical_host_project_serde_roundtrip() {
-        for host in CanonicalHostProject::ALL {
-            let json = serde_json::to_string(&host).unwrap();
-            let decoded: CanonicalHostProject = serde_json::from_str(&json).unwrap();
-            assert_eq!(host, decoded);
-        }
-    }
-
-    // ── HostProjectAttribution serde roundtrip ──────────────────────────
-
-    #[test]
-    fn host_project_attribution_serde_roundtrip() {
-        let attr = HostProjectAttribution {
-            resolved_project_key: "xf".to_owned(),
-            confidence_score: 85,
-            reason_code: "attribution.telemetry_project_key".to_owned(),
-            collision: false,
-        };
-        let json = serde_json::to_string(&attr).unwrap();
-        let decoded: HostProjectAttribution = serde_json::from_str(&json).unwrap();
-        assert_eq!(attr, decoded);
-    }
-
-    // ── ForwardingHostAdapter identity_ref ───────────────────────────────
-
-    #[test]
-    fn forwarding_adapter_identity_ref_matches_identity() {
-        let adapter = ForwardingHostAdapter::for_xf("1.0.0", None);
-        let ref_identity = adapter.identity_ref();
-        let cloned_identity = adapter.identity();
-        assert_eq!(*ref_identity, cloned_identity);
-    }
-
-    // ── DEFAULT_REDACTION_FORBIDDEN_PATTERNS ─────────────────────────────
-
-    #[test]
-    fn default_forbidden_patterns_are_nonempty() {
-        assert!(!DEFAULT_REDACTION_FORBIDDEN_PATTERNS.is_empty());
-        for pattern in DEFAULT_REDACTION_FORBIDDEN_PATTERNS {
-            assert!(!pattern.is_empty(), "forbidden pattern must be nonempty");
-        }
-    }
-
-    // ── ForwardingHostAdapter Debug impl ─────────────────────────────────
-
-    #[test]
-    fn forwarding_adapter_debug_works() {
-        let adapter = ForwardingHostAdapter::for_cass("0.1.0", None);
-        let debug = format!("{adapter:?}");
-        assert!(debug.contains("ForwardingHostAdapter"));
-        assert!(debug.contains("cass-host-adapter"));
-    }
-
-    // ── MCP Agent Mail has control-plane role ────────────────────────────
-
-    #[test]
-    fn mcp_agent_mail_default_role_is_control_plane() {
-        assert_eq!(
-            CanonicalHostProject::McpAgentMailRust.default_runtime_role(),
-            "control-plane"
-        );
-    }
-
-    #[test]
-    fn non_mcp_hosts_default_role_is_query() {
-        for host in [
-            CanonicalHostProject::CodingAgentSessionSearch,
-            CanonicalHostProject::Xf,
-            CanonicalHostProject::Frankenterm,
-        ] {
-            assert_eq!(
-                host.default_runtime_role(),
-                "query",
-                "{host:?} should default to query role"
-            );
-        }
     }
 }

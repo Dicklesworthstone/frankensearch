@@ -1,0 +1,89 @@
+{
+  "kind": "fsfs_explanation_payload_decision",
+  "v": 1,
+  "schema_version": "fsfs.explanation.payload.v1",
+  "query": "rust async channels",
+  "trace": {
+    "trace_id": "01HZY4R7M0P7W7Y9B31QVT0MAA",
+    "event_id": "01HZY4R7M0S8M3H9V6JQDT6N7B",
+    "parent_event_id": "01HZY4R7M0M5Q2R6QY7JFBX9AC",
+    "policy_id": "query:budget_balanced"
+  },
+  "ranking": {
+    "doc_id": "doc://src/fusion.rs",
+    "final_score": 0.8123,
+    "phase": "Refined",
+    "reason_code": "query.explain.attached",
+    "confidence_per_mille": 940,
+    "rank_movement": {
+      "initial_rank": 4,
+      "refined_rank": 1,
+      "delta": -3,
+      "reason": "quality semantic uplift"
+    },
+    "fusion": {
+      "fused_score": 0.8123,
+      "lexical_rank": 3,
+      "semantic_rank": 1,
+      "lexical_score": 0.51,
+      "semantic_score": 0.93,
+      "in_both_sources": true
+    },
+    "components": [
+      {
+        "source": "lexical_bm25",
+        "summary": "BM25(terms=[rust, async], tf=2.00, idf=4.10)",
+        "raw_score": 12.2,
+        "normalized_score": 0.77,
+        "rrf_contribution": 0.014,
+        "weight": 0.3,
+        "confidence_per_mille": 860
+      },
+      {
+        "source": "semantic_quality",
+        "summary": "QualitySemantic(all-MiniLM-L6-v2, cos=0.9310)",
+        "raw_score": 0.931,
+        "normalized_score": 0.91,
+        "rrf_contribution": 0.016,
+        "weight": 0.7,
+        "confidence_per_mille": 930
+      }
+    ]
+  },
+  "policy_decisions": [
+    {
+      "domain": "query_intent",
+      "decision": "NaturalLanguage",
+      "reason_code": "query.intent.natural_language",
+      "confidence_per_mille": 920,
+      "summary": "query intent classified as NaturalLanguage",
+      "metadata": {
+        "normalized_query": "rust async channels",
+        "fallback": "None"
+      }
+    },
+    {
+      "domain": "retrieval_budget",
+      "decision": "Balanced",
+      "reason_code": "query.budget.balanced",
+      "confidence_per_mille": 850,
+      "summary": "budget limit 20 with lexical fanout 100 and semantic fanout 80",
+      "metadata": {
+        "limit": "20",
+        "lexical_fanout": "100",
+        "semantic_fanout": "80"
+      }
+    },
+    {
+      "domain": "degradation",
+      "decision": "Normal",
+      "reason_code": "degrade.state.stable",
+      "confidence_per_mille": 700,
+      "summary": "degradation transition Normal -> Normal (changed=false)",
+      "metadata": {
+        "changed": "false",
+        "banner": "Normal mode: hybrid retrieval and indexing are fully enabled."
+      }
+    }
+  ]
+}

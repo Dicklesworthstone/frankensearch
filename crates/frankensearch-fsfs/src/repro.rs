@@ -477,6 +477,28 @@ impl StartupVerificationOutcome {
     }
 }
 
+/// Structured startup verification artifact emitted for provenance checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceStartupCheck {
+    /// Optional schema discriminator for external contracts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Schema version (currently 1).
+    pub schema_version: u8,
+    /// Trace ID correlating this check to a session.
+    pub trace_id: String,
+    /// Attestation identifier if available.
+    pub attestation_id: String,
+    /// Terminal verification status.
+    pub status: StartupVerificationStatus,
+    /// Selected fallback action.
+    pub action: StartupVerificationAction,
+    /// Raw verification checks.
+    pub checks: StartupVerificationReport,
+    /// Alert entries emitted for operators.
+    pub alerts: Vec<StartupVerificationAlert>,
+}
+
 pub const REASON_ATTESTATION_MISSING: &str = "provenance.startup.attestation_missing";
 pub const REASON_SIGNATURE_MISSING: &str = "provenance.startup.signature_missing";
 pub const REASON_SIGNATURE_INVALID: &str = "provenance.startup.signature_invalid";

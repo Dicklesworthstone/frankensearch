@@ -1,0 +1,25 @@
+{
+  "kind": "fsfs_file_classification_decision",
+  "v": 1,
+  "path": "/workspace/src/lib.rs",
+  "size_bytes": 4201,
+  "probe_bytes": 4096,
+  "sniff_features": {
+    "null_bytes": 0,
+    "non_printable_ratio": 0.01,
+    "high_bit_ratio": 0.0,
+    "bom": "none"
+  },
+  "detected_type": "text",
+  "detected_encoding": "utf-8",
+  "normalization_applied": "utf8_nfc",
+  "ingest_action": "index",
+  "classification_confidence": 0.99,
+  "encoding_confidence": 0.98,
+  "reason_code": "FSFS_TEXT_UTF8_HIGH_CONFIDENCE",
+  "downstream_signals": {
+    "utility_penalty": 0.02,
+    "skip_candidate": false,
+    "requires_manual_review": false
+  }
+}

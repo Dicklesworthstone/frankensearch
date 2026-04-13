@@ -1,0 +1,22 @@
+{
+  "kind": "fsfs_incremental_change_decision",
+  "v": 1,
+  "path": "/workspace/src/search.rs",
+  "event_type": "modify",
+  "detection_mode": "hash_confirm",
+  "previous_state": {
+    "file_id": "dev1:ino4242",
+    "size_bytes": 8123,
+    "mtime_ns": 1739500000000000000,
+    "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "current_state": {
+    "file_id": "dev1:ino4242",
+    "size_bytes": 8123,
+    "mtime_ns": 1739510000000000000,
+    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "queue_action": "enqueue_embed",
+  "reason_code": "FSFS_HASH_CONFIRMED_CONTENT_CHANGE",
+  "confidence": 0.97
+}

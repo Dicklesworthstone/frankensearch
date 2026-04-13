@@ -1,0 +1,17 @@
+[
+  {
+    "code": "adapter.event.resource.cpu_pct_out_of_range",
+    "field": "resource.sample.cpu_pct",
+    "message": "cpu_pct 123.45 must be in [0, 100]"
+  },
+  {
+    "code": "adapter.event.resource.invalid_load_avg_1m",
+    "field": "resource.sample.load_avg_1m",
+    "message": "load_avg_1m -2 must be finite and >= 0"
+  },
+  {
+    "code": "adapter.event.resource.zero_interval",
+    "field": "resource.sample.interval_ms",
+    "message": "interval_ms must be greater than zero"
+  }
+]

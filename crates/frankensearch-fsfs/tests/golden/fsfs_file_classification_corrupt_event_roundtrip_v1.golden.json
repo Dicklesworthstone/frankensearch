@@ -1,0 +1,9 @@
+{
+  "kind": "fsfs_file_classification_corrupt_event",
+  "v": 1,
+  "path": "/workspace/tmp/partial.log",
+  "error_class": "truncated",
+  "bytes_recovered": 4096,
+  "ingest_action": "index_partial_with_flag",
+  "reason_code": "FSFS_PARTIAL_TRUNCATED_PREFIX_ONLY"
+}

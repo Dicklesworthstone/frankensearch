@@ -1,0 +1,14 @@
+{
+  "schema": "composition-matrix-gate-summary-v1",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "bead": "bd-1pkl",
+  "matrix_anchor": "bd-3un.52",
+  "required_fields": [
+    "MATRIX_LINK"
+  ],
+  "fallback_contract": "ON_EXHAUSTION",
+  "required_interaction_tests": [
+    "interaction_unit"
+  ],
+  "ownership_artifact": "interaction_lane_ownership.json"
+}

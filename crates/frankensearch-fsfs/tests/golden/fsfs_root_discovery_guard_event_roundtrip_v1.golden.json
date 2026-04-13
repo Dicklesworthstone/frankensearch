@@ -1,0 +1,8 @@
+{
+  "kind": "fsfs_root_traversal_guard_event",
+  "v": 1,
+  "path": "/home/ubuntu/loop-symlink",
+  "guard_type": "symlink_loop",
+  "action_taken": "stopped_traversal",
+  "reason_code": "FSFS_SYMLINK_LOOP_DETECTED"
+}

@@ -1,0 +1,18 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "control",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:06Z",
+  "lag_ms": 0,
+  "payload": {
+    "control_type": "reconnect_advisory",
+    "backpressure_state": null,
+    "dropped_count_window": null,
+    "sampling_ratio": null,
+    "retry_after_ms": 1500,
+    "resume_cursor_hint": "search:01JAH9A6A1K2M3N4P5Q6R7S8T9",
+    "reason_code": "transport_reset"
+  }
+}

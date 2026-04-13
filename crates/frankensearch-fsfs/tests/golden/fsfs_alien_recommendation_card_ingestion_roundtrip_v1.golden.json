@@ -1,0 +1,52 @@
+{
+  "kind": "fsfs_alien_recommendation_card",
+  "v": 1,
+  "subsystem": "ingestion_policy",
+  "ev_score": 3.9,
+  "priority_tier": "A",
+  "adoption_wedge": "Start on home-source code/docs roots before broad corpus expansion.",
+  "budgeted_mode": {
+    "latency_budget_ms": 35,
+    "memory_budget_mb": 96,
+    "retry_budget": 1,
+    "on_exhaustion": "Switch from index_now to index_later for low-utility classes."
+  },
+  "fallback_trigger": {
+    "condition": "ingest_queue_p95_ms > 250 for 3 windows",
+    "fallback_action": "index_later",
+    "reason_code": "FSFS_INGEST_QUEUE_PRESSURE_TRIP"
+  },
+  "baseline_comparator": "Naive immediate indexing without utility-weighted gating.",
+  "isomorphism_proof_plan": {
+    "invariants": [
+      "No duplicate doc-id insertions for a stable snapshot.",
+      "Exclusion decisions remain stable under deterministic path ordering."
+    ],
+    "baseline_harness": "tests/e2e_ingest_replay.sh",
+    "replay_checks": [
+      "compare_decision_trace",
+      "compare_index_manifest"
+    ]
+  },
+  "repro_artifacts": {
+    "manifest_fields": [
+      "seed",
+      "config_hash",
+      "subsystem",
+      "policy_version",
+      "scenario_id"
+    ],
+    "artifact_outputs": [
+      "decision_trace.jsonl",
+      "index_manifest.json"
+    ],
+    "replay_command": "cargo test -p frankensearch --test ingest_replay -- --nocapture"
+  },
+  "rollback_plan": {
+    "rollback_command": "fsfsctl policy set ingest.baseline_naive=true",
+    "abort_conditions": [
+      "recall_drop_gt_5pct",
+      "queue_latency_p95_gt_400ms"
+    ]
+  }
+}

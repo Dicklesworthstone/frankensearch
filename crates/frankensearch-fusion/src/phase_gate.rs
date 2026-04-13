@@ -425,6 +425,7 @@ mod tests {
             timeout_queries: 100,
             min_delta: 0.01,
             enabled: true,
+            expiry_ms: None,
         }
     }
 
@@ -883,6 +884,7 @@ mod tests {
             timeout_queries: 200,
             min_delta: 0.05,
             enabled: true,
+            expiry_ms: None,
         };
         let gate = PhaseGate::new(config.clone());
         assert_eq!(*gate.config(), config);
