@@ -260,7 +260,8 @@ fn test_fsfs_config_roundtrip_conformance() {
 fn test_fsfs_config_effective_conformance() {
     let path = fixture_dir().join("fsfs-config-effective-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse config effective");
+    let parsed: frankensearch_fsfs::ConfigEffectiveSnapshot =
+        serde_json::from_str(&raw).expect("parse config effective");
     assert_golden_json("fsfs_config_effective_roundtrip_v1", &parsed);
 }
 
@@ -268,7 +269,8 @@ fn test_fsfs_config_effective_conformance() {
 fn test_fsfs_config_load_event_conformance() {
     let path = fixture_dir().join("fsfs-config-load-event-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse config load event");
+    let parsed: frankensearch_fsfs::ConfigLoadedEvent =
+        serde_json::from_str(&raw).expect("parse config load event");
     assert_golden_json("fsfs_config_loaded_event_roundtrip_v1", &parsed);
 }
 
@@ -514,21 +516,20 @@ fn test_incremental_recovery_checkpoint_conformance() {
 }
 
 #[test]
-fn test_pressure_profiles_roundtrip_conformance() {
+fn test_pressure_profiles_contract_conformance() {
     let path = fixture_dir().join("fsfs-pressure-profiles-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse pressure-profiles fixture");
+    let parsed: frankensearch_fsfs::pressure_profile_contract::PressureProfilesContractDefinition =
+        serde_json::from_str(&raw).expect("parse pressure-profiles contract");
     assert_golden_json("fsfs_pressure_profiles_roundtrip_v1", &parsed);
 }
 
 #[test]
-fn test_pressure_profiles_decision_conformance() {
+fn test_pressure_profiles_resolution_conformance() {
     let path = fixture_dir().join("fsfs-pressure-profiles-decision-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse pressure profiles decision fixture");
+    let parsed: frankensearch_fsfs::pressure_profile_contract::PressureProfileResolution =
+        serde_json::from_str(&raw).expect("parse pressure profiles resolution");
     assert_golden_json("fsfs_pressure_profiles_decision_roundtrip_v1", &parsed);
 }
 

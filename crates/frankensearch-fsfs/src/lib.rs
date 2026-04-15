@@ -100,8 +100,9 @@ pub use concurrency::{
     read_sentinel, remove_sentinel, try_acquire_sentinel, write_sentinel,
 };
 pub use config::{
-    CliOverrides, ConfigLoadResult, ConfigLoadedEvent, ConfigSource, ConfigWarning, Density,
-    DiscoveryConfig, FsfsConfig, IndexingConfig, MountPolicyEntry, PRESSURE_PROFILE_VERSION,
+    CliOverrides, ConfigDiagnosticSeverity, ConfigEffectiveSnapshot, ConfigLoadResult,
+    ConfigLoadedEvent, ConfigSource, ConfigSourcesUsed, ConfigWarning, Density, DiscoveryConfig,
+    FsfsConfig, IndexingConfig, MountPolicyEntry, PRESSURE_PROFILE_VERSION,
     PROFILE_PRECEDENCE_CHAIN, PathExpansion, PressureConfig, PressureProfile,
     PressureProfileEffectiveSettings, PressureProfileField, PressureProfileOverrideDecision,
     PressureProfileOverridePolicy, PressureProfileResolution, PressureProfileResolutionDiagnostics,
@@ -164,15 +165,19 @@ pub use pressure::{
     PressureSnapshot, PressureState, PressureTransition, ProcIoCounters,
 };
 pub use pressure_profile_contract::{
-    DriftProtection, MigrationPolicy, OverrideDecision, OverridePolicy, OverrideSource,
-    PressureProfileResolution, PressureProfilesContractDefinition, ProfileConfig, ProfileField,
-    ProfileId, ProfileSet, ResolutionDiagnostics, SafetyClamp, SchedulerMode,
-    DEFAULT_PRECEDENCE_ORDER, KIND_CONTRACT_DEFINITION as PRESSURE_PROFILE_KIND_CONTRACT,
-    KIND_PROFILE_RESOLUTION as PRESSURE_PROFILE_KIND_RESOLUTION, PRECEDENCE_CLI_OVERRIDE,
-    PRECEDENCE_CONFIG_OVERRIDE, PRECEDENCE_ENV_OVERRIDE, PRECEDENCE_HARD_SAFETY_GUARDS,
-    PRECEDENCE_PROFILE_DEFAULT, REASON_OVERRIDE_APPLIED_CLI, REASON_OVERRIDE_APPLIED_CONFIG,
+    ContractSchedulerMode, DEFAULT_PRECEDENCE_ORDER, DriftProtection,
+    KIND_CONTRACT_DEFINITION as PRESSURE_PROFILE_KIND_CONTRACT,
+    KIND_PROFILE_RESOLUTION as PRESSURE_PROFILE_KIND_RESOLUTION, MigrationPolicy,
+    OverrideDecision as ContractOverrideDecision, OverridePolicy as ContractOverridePolicy,
+    OverrideSource as ContractOverrideSource, PRECEDENCE_CLI_OVERRIDE, PRECEDENCE_CONFIG_OVERRIDE,
+    PRECEDENCE_ENV_OVERRIDE, PRECEDENCE_HARD_SAFETY_GUARDS, PRECEDENCE_PROFILE_DEFAULT,
+    PressureProfileResolution as ContractPressureProfileResolution,
+    PressureProfilesContractDefinition, ProfileConfig as ContractProfileConfig,
+    ProfileField as ContractProfileField, ProfileId as ContractProfileId,
+    ProfileSet as ContractProfileSet, REASON_OVERRIDE_APPLIED_CLI, REASON_OVERRIDE_APPLIED_CONFIG,
     REASON_OVERRIDE_APPLIED_ENV, REASON_OVERRIDE_REJECTED_INVALID, REASON_OVERRIDE_REJECTED_LOCKED,
     REASON_PROFILE_RESOLUTION_CONFLICT, REASON_PROFILE_RESOLUTION_OK, REASON_SAFETY_CLAMP_PREFIX,
+    ResolutionDiagnostics as ContractResolutionDiagnostics, SafetyClamp as ContractSafetyClamp,
 };
 pub use pressure_sensing::{
     ControlState, HostSampler, PressureSample, PressureSensor,

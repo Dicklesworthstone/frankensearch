@@ -4,6 +4,7 @@ use std::fs;
 use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,14 @@ const PRECEDENCE: [ConfigSource; 4] = [
     ConfigSource::File,
     ConfigSource::Defaults,
 ];
+const CONFIG_LOADED_EMIT_FIELDS: [&str; 4] = [
+    "source_precedence_applied",
+    "resolved_values",
+    "warnings",
+    "reason_codes",
+];
+const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_FAST_ONLY_WARNING_CODE: &str = "config.search.fast_only_with_quality_model";
 
 /// Versioned profile contract revision for pressure-profile policy resolution.
 pub const PRESSURE_PROFILE_VERSION: u16 = 1;
@@ -1051,8 +1060,17 @@ pub enum ConfigSource {
     Runtime,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigWarning {
+    pub severity: ConfigDiagnosticSeverity,
     pub reason_code: String,
     pub field: String,
     pub source: ConfigSource,
@@ -1079,61 +1097,230 @@ pub struct ConfigLoadResult {
     pub path_expansions: Vec<PathExpansion>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigSourcesUsed {
+    pub cli_flags_used: Vec<String>,
+    pub env_keys_used: Vec<String>,
+    pub config_file_used: Option<PathBuf>,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigContractValues {
+    pub discovery: ContractDiscoveryConfig,
+    pub indexing: ContractIndexingConfig,
+    pub search: ContractSearchConfig,
+    pub pressure: ContractPressureConfig,
+    pub tui: ContractTuiConfig,
+    pub storage: ContractStorageConfig,
+    pub privacy: PrivacyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractDiscoveryConfig {
+    pub roots: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub text_selection_mode: TextSelectionMode,
+    pub binary_blocklist_extensions: Vec<String>,
+    pub max_file_size_mb: usize,
+    pub follow_symlinks: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractIndexingConfig {
+    pub fast_model: String,
+    pub quality_model: String,
+    pub model_dir: String,
+    pub embedding_batch_size: usize,
+    pub reindex_on_change: bool,
+    pub watch_mode: bool,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContractSearchConfig {
+    pub default_limit: usize,
+    pub quality_weight: f64,
+    pub rrf_k: f64,
+    pub quality_timeout_ms: u64,
+    pub fast_only: bool,
+    pub explain: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractPressureConfig {
+    pub profile: PressureProfile,
+    pub cpu_ceiling_pct: u8,
+    pub memory_ceiling_mb: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractTuiConfig {
+    pub theme: TuiTheme,
+    pub frame_budget_ms: u16,
+    pub show_explanations: bool,
+    pub density: Density,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractStorageConfig {
+    pub db_path: String,
+    pub evidence_retention_days: u16,
+    pub summary_retention_days: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigEffectiveSnapshot {
+    pub kind: String,
+    pub v: u32,
+    pub resolved_at_ts: String,
+    pub source_precedence_applied: [ConfigSource; 4],
+    pub sources: ConfigSourcesUsed,
+    pub values: ConfigContractValues,
+    pub path_expansions: Vec<PathExpansion>,
+    pub diagnostics: Vec<ConfigWarning>,
+    pub conflict_warnings: Vec<String>,
+}
+
+impl From<&FsfsConfig> for ConfigContractValues {
+    fn from(config: &FsfsConfig) -> Self {
+        Self {
+            discovery: ContractDiscoveryConfig {
+                roots: config.discovery.roots.clone(),
+                exclude_patterns: config.discovery.exclude_patterns.clone(),
+                text_selection_mode: config.discovery.text_selection_mode,
+                binary_blocklist_extensions: config.discovery.binary_blocklist_extensions.clone(),
+                max_file_size_mb: config.discovery.max_file_size_mb,
+                follow_symlinks: config.discovery.follow_symlinks,
+            },
+            indexing: ContractIndexingConfig {
+                fast_model: config.indexing.fast_model.clone(),
+                quality_model: config.indexing.quality_model.clone(),
+                model_dir: config.indexing.model_dir.clone(),
+                embedding_batch_size: config.indexing.embedding_batch_size,
+                reindex_on_change: config.indexing.reindex_on_change,
+                watch_mode: config.indexing.watch_mode,
+            },
+            search: ContractSearchConfig {
+                default_limit: config.search.default_limit,
+                quality_weight: config.search.quality_weight,
+                rrf_k: config.search.rrf_k,
+                quality_timeout_ms: config.search.quality_timeout_ms,
+                fast_only: config.search.fast_only,
+                explain: config.search.explain,
+            },
+            pressure: ContractPressureConfig {
+                profile: config.pressure.profile,
+                cpu_ceiling_pct: config.pressure.cpu_ceiling_pct,
+                memory_ceiling_mb: config.pressure.memory_ceiling_mb,
+            },
+            tui: ContractTuiConfig {
+                theme: config.tui.theme,
+                frame_budget_ms: config.tui.frame_budget_ms,
+                show_explanations: config.tui.show_explanations,
+                density: config.tui.density,
+            },
+            storage: ContractStorageConfig {
+                db_path: config.storage.db_path.clone(),
+                evidence_retention_days: config.storage.evidence_retention_days,
+                summary_retention_days: config.storage.summary_retention_days,
+            },
+            privacy: config.privacy.clone(),
+        }
+    }
+}
+
 impl ConfigLoadResult {
     #[must_use]
     pub fn to_loaded_event(&self) -> ConfigLoadedEvent {
-        let mut reason_codes: Vec<String> = self
-            .warnings
-            .iter()
-            .map(|warning| warning.reason_code.clone())
-            .collect();
-        reason_codes.push(
-            self.pressure_profile_resolution
-                .diagnostics
-                .reason_code
-                .clone(),
-        );
-        reason_codes.extend(
-            self.pressure_profile_resolution
-                .overrides
-                .iter()
-                .filter(|decision| !decision.applied)
-                .map(|decision| decision.reason_code.clone()),
-        );
-        reason_codes.extend(
-            self.pressure_profile_resolution
-                .safety_clamps
-                .iter()
-                .map(|clamp| clamp.reason_code.clone()),
-        );
-        reason_codes.sort_unstable();
-        reason_codes.dedup();
+        self.to_loaded_event_at(config_timestamp_now())
+    }
+
+    #[must_use]
+    pub fn to_loaded_event_at(&self, event_ts: impl Into<String>) -> ConfigLoadedEvent {
+        let warnings = self.contract_warnings();
 
         ConfigLoadedEvent {
+            kind: "fsfs_config_loaded_event".into(),
+            v: CONFIG_SCHEMA_VERSION,
             event: "config_loaded".into(),
-            source_precedence_applied: PRECEDENCE,
-            config_file_used: self.config_file_used.clone(),
+            event_ts: event_ts.into(),
+            source_precedence_applied: self.source_precedence,
+            resolved_values: ConfigContractValues::from(&self.config),
             cli_flags_used: self.cli_flags_used.clone(),
             env_keys_used: self.env_keys_used.clone(),
-            pressure_profile_resolution: self.pressure_profile_resolution.clone(),
-            resolved_values: self.config.clone(),
-            warnings: self.warnings.clone(),
-            reason_codes,
+            config_file_used: self.config_file_used.clone(),
+            warnings: warnings.clone(),
+            reason_codes: reason_codes_from_warnings(&warnings),
+            redaction_applied: self.config.privacy.clone(),
+            emit_fields: CONFIG_LOADED_EMIT_FIELDS.map(str::to_owned).to_vec(),
         }
+    }
+
+    #[must_use]
+    pub fn to_effective_snapshot(&self) -> ConfigEffectiveSnapshot {
+        self.to_effective_snapshot_at(config_timestamp_now())
+    }
+
+    #[must_use]
+    pub fn to_effective_snapshot_at(
+        &self,
+        resolved_at_ts: impl Into<String>,
+    ) -> ConfigEffectiveSnapshot {
+        let diagnostics = self.contract_warnings();
+
+        ConfigEffectiveSnapshot {
+            kind: "fsfs_config_effective".into(),
+            v: CONFIG_SCHEMA_VERSION,
+            resolved_at_ts: resolved_at_ts.into(),
+            source_precedence_applied: self.source_precedence,
+            sources: ConfigSourcesUsed {
+                cli_flags_used: self.cli_flags_used.clone(),
+                env_keys_used: self.env_keys_used.clone(),
+                config_file_used: self.config_file_used.clone(),
+            },
+            values: ConfigContractValues::from(&self.config),
+            path_expansions: self.path_expansions.clone(),
+            diagnostics: diagnostics.clone(),
+            conflict_warnings: conflict_warnings_from_diagnostics(&diagnostics),
+        }
+    }
+
+    fn contract_warnings(&self) -> Vec<ConfigWarning> {
+        let mut warnings: Vec<ConfigWarning> = self
+            .warnings
+            .iter()
+            .filter(|warning| {
+                warning.reason_code.starts_with("config.")
+                    && warning.reason_code != CONFIG_FAST_ONLY_WARNING_CODE
+            })
+            .cloned()
+            .collect();
+
+        if self.config.search.fast_only && !self.config.indexing.quality_model.trim().is_empty() {
+            warnings.push(fast_only_quality_model_warning());
+        }
+
+        normalize_contract_warnings(&mut warnings);
+        warnings
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigLoadedEvent {
+    pub kind: String,
+    pub v: u32,
     pub event: String,
+    pub event_ts: String,
     pub source_precedence_applied: [ConfigSource; 4],
-    pub config_file_used: Option<PathBuf>,
+    pub resolved_values: ConfigContractValues,
     pub cli_flags_used: Vec<String>,
     pub env_keys_used: Vec<String>,
-    pub pressure_profile_resolution: PressureProfileResolution,
-    pub resolved_values: FsfsConfig,
+    pub config_file_used: Option<PathBuf>,
     pub warnings: Vec<ConfigWarning>,
     pub reason_codes: Vec<String>,
+    pub redaction_applied: PrivacyConfig,
+    pub emit_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1481,16 +1668,19 @@ where
 
 pub fn emit_config_loaded(event: &ConfigLoadedEvent) {
     info!(
+        kind = %event.kind,
+        v = event.v,
         event = %event.event,
-        precedence = ?event.source_precedence_applied,
+        event_ts = %event.event_ts,
+        source_precedence_applied = ?event.source_precedence_applied,
+        resolved_values = ?event.resolved_values,
         config_file_used = ?event.config_file_used,
         cli_flags_used = ?event.cli_flags_used,
         env_keys_used = ?event.env_keys_used,
-        pressure_profile = ?event.pressure_profile_resolution.selected_profile,
-        profile_conflict = event.pressure_profile_resolution.conflict_detected,
-        profile_reason_code = %event.pressure_profile_resolution.diagnostics.reason_code,
-        profile_version = event.pressure_profile_resolution.diagnostics.effective_profile_version,
+        warnings = ?event.warnings,
         reason_codes = ?event.reason_codes,
+        redaction_applied = ?event.redaction_applied,
+        emit_fields = ?event.emit_fields,
         "fsfs configuration loaded"
     );
 }
@@ -1677,6 +1867,7 @@ fn apply_profile_bool_override(
         if requested != *effective_value {
             *conflict_detected = true;
             warnings.push(ConfigWarning {
+                severity: ConfigDiagnosticSeverity::Warn,
                 reason_code: "override.rejected.locked_field".into(),
                 field: profile_field_path(field).into(),
                 source: config_source_for_override(source),
@@ -2233,6 +2424,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
     for (section, section_value) in root {
         if !known_top_level.contains(section.as_str()) {
             warnings.push(ConfigWarning {
+                severity: ConfigDiagnosticSeverity::Warn,
                 reason_code: "config.unknown_key.warning".into(),
                 field: format!("config.{section}"),
                 source: ConfigSource::File,
@@ -2315,6 +2507,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
         for key in section_table.keys() {
             if !known_section_keys.contains(key.as_str()) {
                 warnings.push(ConfigWarning {
+                    severity: ConfigDiagnosticSeverity::Warn,
                     reason_code: "config.unknown_key.warning".into(),
                     field: format!("{section}.{key}"),
                     source: ConfigSource::File,
@@ -2532,15 +2725,103 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
     }
 
     if config.search.fast_only && !config.indexing.quality_model.trim().is_empty() {
-        warnings.push(ConfigWarning {
-            reason_code: "config.search.fast_only_with_quality_model".into(),
-            field: "search.fast_only".into(),
-            source: ConfigSource::Runtime,
-            message: "fast_only=true while quality_model is configured".into(),
-        });
+        warnings.push(fast_only_quality_model_warning());
     }
 
     Ok(())
+}
+
+fn fast_only_quality_model_warning() -> ConfigWarning {
+    ConfigWarning {
+        severity: ConfigDiagnosticSeverity::Warn,
+        reason_code: CONFIG_FAST_ONLY_WARNING_CODE.into(),
+        field: "search.fast_only".into(),
+        source: ConfigSource::Runtime,
+        message: "fast_only=true while quality_model is configured".into(),
+    }
+}
+
+fn reason_codes_from_warnings(warnings: &[ConfigWarning]) -> Vec<String> {
+    let mut reason_codes: Vec<String> = warnings
+        .iter()
+        .map(|warning| warning.reason_code.clone())
+        .collect();
+    reason_codes.sort_unstable();
+    reason_codes.dedup();
+    reason_codes
+}
+
+fn conflict_warnings_from_diagnostics(diagnostics: &[ConfigWarning]) -> Vec<String> {
+    let mut warnings: Vec<String> = diagnostics
+        .iter()
+        .filter(|warning| warning.reason_code == CONFIG_FAST_ONLY_WARNING_CODE)
+        .map(|warning| warning.reason_code.clone())
+        .collect();
+    warnings.sort_unstable();
+    warnings.dedup();
+    warnings
+}
+
+fn normalize_contract_warnings(warnings: &mut Vec<ConfigWarning>) {
+    warnings.sort_by(|left, right| {
+        left.reason_code
+            .cmp(&right.reason_code)
+            .then_with(|| left.field.cmp(&right.field))
+            .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| source_sort_key(left.source).cmp(&source_sort_key(right.source)))
+            .then_with(|| severity_sort_key(left.severity).cmp(&severity_sort_key(right.severity)))
+    });
+    warnings.dedup();
+}
+
+const fn severity_sort_key(severity: ConfigDiagnosticSeverity) -> u8 {
+    match severity {
+        ConfigDiagnosticSeverity::Info => 0,
+        ConfigDiagnosticSeverity::Warn => 1,
+        ConfigDiagnosticSeverity::Error => 2,
+    }
+}
+
+const fn source_sort_key(source: ConfigSource) -> u8 {
+    match source {
+        ConfigSource::Cli => 0,
+        ConfigSource::Env => 1,
+        ConfigSource::File => 2,
+        ConfigSource::Defaults => 3,
+        ConfigSource::Runtime => 4,
+    }
+}
+
+fn config_timestamp_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_epoch_secs_utc(secs)
+}
+
+fn format_epoch_secs_utc(secs: u64) -> String {
+    let days_since_epoch = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let hours = time_of_day / 3_600;
+    let minutes = (time_of_day % 3_600) / 60;
+    let seconds = time_of_day % 60;
+    let (year, month, day) = epoch_days_to_ymd(days_since_epoch);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 fn parse_csv(value: &str, field: &str) -> SearchResult<Vec<String>> {
@@ -4698,22 +4979,96 @@ mod tests {
 
     #[test]
     fn to_loaded_event_collects_reason_codes() {
+        let file = "\
+[pressure]\nprofile = \"strict\"\n\
+[search]\nfast_only = true\nshadow_mode = true\n";
         let result = load_from_str(
-            None,
+            Some(file),
             None,
             &HashMap::new(),
             &CliOverrides::default(),
             home(),
         )
-        .expect("load defaults");
-        let event = result.to_loaded_event();
+        .expect("load config");
+        let event = result.to_loaded_event_at("2026-02-14T03:30:10Z");
+
+        assert_eq!(event.kind, "fsfs_config_loaded_event");
+        assert_eq!(event.v, super::CONFIG_SCHEMA_VERSION);
         assert_eq!(event.event, "config_loaded");
+        assert_eq!(event.event_ts, "2026-02-14T03:30:10Z");
         assert!(!event.reason_codes.is_empty());
-        // reason_codes should be sorted and deduped
+        assert_eq!(
+            event.emit_fields,
+            super::CONFIG_LOADED_EMIT_FIELDS.map(str::to_owned).to_vec()
+        );
+        assert_eq!(event.redaction_applied, super::PrivacyConfig::default());
+        assert!(
+            event
+                .warnings
+                .iter()
+                .all(|warning| warning.reason_code.starts_with("config."))
+        );
+        assert!(
+            event
+                .warnings
+                .iter()
+                .all(|warning| { warning.severity == super::ConfigDiagnosticSeverity::Warn })
+        );
+        assert!(event.warnings.iter().any(|warning| {
+            warning.reason_code == "config.unknown_key.warning"
+                && warning.field == "search.shadow_mode"
+        }));
+        assert!(event.warnings.iter().any(|warning| {
+            warning.reason_code == super::CONFIG_FAST_ONLY_WARNING_CODE
+                && warning.field == "search.fast_only"
+        }));
         let mut sorted = event.reason_codes.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(event.reason_codes, sorted);
+    }
+
+    #[test]
+    fn contract_payloads_filter_non_config_reason_codes() {
+        let file = "\
+[pressure]\nprofile = \"performance\"\n\
+[search]\nfast_only = true\n\
+[fantasy]\nfoo = 42\n";
+
+        let result = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load config");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.reason_code == "override.rejected.locked_field")
+        );
+
+        let effective = result.to_effective_snapshot_at("2026-02-14T03:30:00Z");
+        assert_eq!(effective.kind, "fsfs_config_effective");
+        assert_eq!(effective.v, super::CONFIG_SCHEMA_VERSION);
+        assert_eq!(effective.resolved_at_ts, "2026-02-14T03:30:00Z");
+        assert!(!effective.values.search.fast_only);
+        assert!(
+            effective
+                .diagnostics
+                .iter()
+                .all(|warning| warning.reason_code.starts_with("config."))
+        );
+        assert!(
+            !effective
+                .diagnostics
+                .iter()
+                .any(|warning| warning.reason_code == "override.rejected.locked_field")
+        );
+        assert!(effective.conflict_warnings.is_empty());
     }
 
     // ── Unknown section warning ──
