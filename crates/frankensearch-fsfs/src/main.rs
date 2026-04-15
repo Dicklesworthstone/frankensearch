@@ -9,12 +9,12 @@ use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
-    FsfsRuntime, InterfaceMode, OutputEnvelope, OutputFormat, PathExpansion, ShutdownCoordinator,
-    ShutdownReason, Verbosity, default_project_config_file_path, default_user_config_file_path,
-    detect_auto_mode, emit_config_loaded, emit_envelope, exit_code, init_subscriber,
-    is_cache_valid, load_from_layered_sources, load_from_sources, load_from_str,
-    maybe_print_update_notice, meta_for_format, parse_cli_args, read_version_cache,
-    resolve_output_format, spawn_version_cache_refresh,
+    FsfsRuntime, InterfaceMode, OutputEnvelope, OutputFormat, ShutdownCoordinator, ShutdownReason,
+    Verbosity, default_project_config_file_path, default_user_config_file_path, detect_auto_mode,
+    emit_config_loaded, emit_envelope, exit_code, init_subscriber, is_cache_valid,
+    load_from_layered_sources, load_from_sources, load_from_str, maybe_print_update_notice,
+    meta_for_format, parse_cli_args, read_version_cache, resolve_output_format,
+    spawn_version_cache_refresh,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -28,17 +28,6 @@ struct ConfigFileSummary {
     project: Option<String>,
     user: Option<String>,
     active: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ConfigShowPayload {
-    effective: FsfsConfig,
-    effective_toml: String,
-    value_sources: BTreeMap<String, String>,
-    source_precedence: Vec<String>,
-    files: ConfigFileSummary,
-    warnings: Vec<ConfigWarning>,
-    path_expansions: Vec<PathExpansion>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -402,25 +391,25 @@ fn run_config_show_command(
     project_config_path: Option<&Path>,
     user_config_path: Option<&Path>,
 ) -> SearchResult<()> {
-    let stage_snapshots = build_stage_snapshots(
-        env_map,
-        &cli_input.overrides,
-        home_dir,
-        explicit_config_path,
-        project_config_path,
-        user_config_path,
-    )?;
-    let final_values = flatten_config_values(&loaded.config)?;
-    let value_sources = final_values
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                source_for_key(key, value, &stage_snapshots).to_owned(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     if cli_input.format == OutputFormat::Table {
+        let stage_snapshots = build_stage_snapshots(
+            env_map,
+            &cli_input.overrides,
+            home_dir,
+            explicit_config_path,
+            project_config_path,
+            user_config_path,
+        )?;
+        let final_values = flatten_config_values(&loaded.config)?;
+        let value_sources = final_values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    source_for_key(key, value, &stage_snapshots).to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         for (key, value) in &final_values {
             let source = value_sources.get(key).map_or("defaults", String::as_str);
             println!("{key} = {} ({source})", format_value_for_table(value));
@@ -437,27 +426,7 @@ fn run_config_show_command(
         }
         return Ok(());
     }
-    let payload = ConfigShowPayload {
-        effective: loaded.config.clone(),
-        effective_toml: toml::to_string_pretty(&loaded.config).map_err(|source| {
-            SearchError::SubsystemError {
-                subsystem: CONFIG_SUBSYSTEM,
-                source: Box::new(io::Error::other(format!(
-                    "failed to encode effective config as TOML: {source}"
-                ))),
-            }
-        })?,
-        value_sources,
-        source_precedence: configured_precedence(explicit_config_path.is_some()),
-        files: config_file_summary(
-            loaded,
-            explicit_config_path,
-            project_config_path,
-            user_config_path,
-        ),
-        warnings: loaded.warnings.clone(),
-        path_expansions: loaded.path_expansions.clone(),
-    };
+    let payload = loaded.to_effective_snapshot_at(iso_timestamp_now());
     emit_success_payload("config", &payload, cli_input.format)
 }
 
