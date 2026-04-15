@@ -200,6 +200,7 @@ fn main() {
                     phases.push(match p {
                         SearchPhase::Initial { .. } => "Initial",
                         SearchPhase::Refined { .. } => "Refined",
+                        SearchPhase::Reranked { .. } => "Reranked",
                         SearchPhase::RefinementFailed { .. } => "Failed",
                     });
                 },

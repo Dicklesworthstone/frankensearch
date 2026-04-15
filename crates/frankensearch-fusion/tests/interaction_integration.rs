@@ -233,7 +233,7 @@ impl PhaseCollector {
                 self.initial_results = results;
                 self.initial_received = true;
             }
-            SearchPhase::Refined { results, .. } => {
+            SearchPhase::Refined { results, .. } | SearchPhase::Reranked { results, .. } => {
                 self.refined_results = Some(results);
             }
             SearchPhase::RefinementFailed { .. } => {

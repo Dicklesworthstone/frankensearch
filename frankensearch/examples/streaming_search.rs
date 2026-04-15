@@ -120,6 +120,25 @@ fn main() {
                             );
                         }
                     }
+                    SearchPhase::Reranked {
+                        results,
+                        latency,
+                        ..
+                    } => {
+                        println!(
+                            "event=phase name=reranked hits={} latency_ms={:.2}",
+                            results.len(),
+                            latency.as_secs_f64() * 1000.0
+                        );
+                        for (rank, hit) in results.iter().take(3).enumerate() {
+                            println!(
+                                "event=hit phase=reranked rank={} doc_id={} score={:.4}",
+                                rank + 1,
+                                hit.doc_id,
+                                hit.score
+                            );
+                        }
+                    }
                     SearchPhase::RefinementFailed {
                         initial_results,
                         error,

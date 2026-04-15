@@ -110,7 +110,7 @@ impl Default for CliE2eRunConfig {
 }
 
 /// Structured artifact bundle emitted for one scenario run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliE2eArtifactBundle {
     /// Contract schema version for this bundle.
     pub schema_version: String,

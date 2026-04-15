@@ -128,7 +128,11 @@ fn main() {
                                 println!("    {} (score: {:.4})", r.doc_id, r.score);
                             }
                         }
-                        SearchPhase::Refined { results, rank_changes, .. } => {
+                        SearchPhase::Refined {
+                            results,
+                            rank_changes,
+                            ..
+                        } => {
                             println!(
                                 "  [Phase 2 - Refined] {} results (promoted={}, demoted={}, stable={})",
                                 results.len(),
@@ -136,6 +140,12 @@ fn main() {
                                 rank_changes.demoted,
                                 rank_changes.stable,
                             );
+                            for r in results.iter().take(3) {
+                                println!("    {} (score: {:.4})", r.doc_id, r.score);
+                            }
+                        }
+                        SearchPhase::Reranked { results, .. } => {
+                            println!("  [Phase 3 - Reranked] {} results", results.len());
                             for r in results.iter().take(3) {
                                 println!("    {} (score: {:.4})", r.doc_id, r.score);
                             }

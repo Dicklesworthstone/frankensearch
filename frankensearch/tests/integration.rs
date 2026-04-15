@@ -328,6 +328,7 @@ fn two_tier_search_yields_initial_then_refined() {
                 |phase| match &phase {
                     SearchPhase::Initial { .. } => phase_names.push("Initial"),
                     SearchPhase::Refined { .. } => phase_names.push("Refined"),
+                    SearchPhase::Reranked { .. } => phase_names.push("Reranked"),
                     SearchPhase::RefinementFailed { .. } => phase_names.push("RefinementFailed"),
                 },
             )
