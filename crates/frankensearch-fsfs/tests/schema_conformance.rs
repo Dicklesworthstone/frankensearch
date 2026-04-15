@@ -185,9 +185,8 @@ where
     let path = invalid_fixture_dir().join(name);
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("read invalid fixture {}", path.display()));
-    let error = match serde_json::from_str::<T>(&raw) {
-        Ok(_) => panic!("fixture should fail rust validation: {name}"),
-        Err(error) => error,
+    let Err(error) = serde_json::from_str::<T>(&raw) else {
+        panic!("fixture should fail rust validation: {name}");
     };
     assert!(
         !error.to_string().is_empty(),
