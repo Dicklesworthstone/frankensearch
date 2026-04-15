@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jsonschema::{Draft, JSONSchema};
+use serde::de::DeserializeOwned;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -177,6 +178,23 @@ fn assert_schema_validation(
     }
 }
 
+fn assert_invalid_rust_fixture<T>(name: &str)
+where
+    T: DeserializeOwned,
+{
+    let path = invalid_fixture_dir().join(name);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("read invalid fixture {}", path.display()));
+    let error = match serde_json::from_str::<T>(&raw) {
+        Ok(_) => panic!("fixture should fail rust validation: {name}"),
+        Err(error) => error,
+    };
+    assert!(
+        !error.to_string().is_empty(),
+        "fixture {name} produced an empty rust error"
+    );
+}
+
 fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let golden_path = dir.join(format!("{name}.golden.json"));
@@ -302,6 +320,20 @@ fn test_file_classification_corrupt_event_conformance() {
         "fsfs_file_classification_corrupt_event_roundtrip_v1",
         &parsed,
     );
+}
+
+#[test]
+fn test_file_classification_invalid_fixtures_are_rejected_by_rust() {
+    for fixture in [
+        "fsfs-file-classification-invalid-corrupt-index-v1.json",
+        "fsfs-file-classification-invalid-encoding-label-v1.json",
+        "fsfs-file-classification-invalid-missing-confidence-v1.json",
+        "fsfs-file-classification-invalid-partial-index-v1.json",
+    ] {
+        assert_invalid_rust_fixture::<
+            frankensearch_fsfs::file_classification::FileClassificationDecision,
+        >(fixture);
+    }
 }
 
 #[test]
@@ -513,6 +545,26 @@ fn test_incremental_recovery_checkpoint_conformance() {
     let parsed: frankensearch_fsfs::incremental_change::IncrementalRecoveryCheckpoint =
         serde_json::from_str(&raw).expect("parse incremental change recovery");
     assert_golden_json("fsfs_incremental_recovery_checkpoint_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_incremental_change_invalid_fixtures_are_rejected_by_rust() {
+    assert_invalid_rust_fixture::<
+        frankensearch_fsfs::incremental_change::IncrementalChangeDetectionContractDefinition,
+    >("fsfs-incremental-change-detection-invalid-missing-hash-policy-v1.json");
+
+    for fixture in [
+        "fsfs-incremental-change-detection-invalid-delete-enqueue-embed-v1.json",
+        "fsfs-incremental-change-detection-invalid-rename-missing-paths-v1.json",
+    ] {
+        assert_invalid_rust_fixture::<
+            frankensearch_fsfs::incremental_change::IncrementalChangeDecision,
+        >(fixture);
+    }
+
+    assert_invalid_rust_fixture::<
+        frankensearch_fsfs::incremental_change::IncrementalRecoveryCheckpoint,
+    >("fsfs-incremental-change-detection-invalid-clean-journal-with-pending-v1.json");
 }
 
 #[test]
