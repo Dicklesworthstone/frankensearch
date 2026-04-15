@@ -222,7 +222,7 @@ pub struct DeterminismCheckResult {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::*;
+    use super::{DeterminismCheckResult, DeterminismContractDefinition};
 
     fn valid_contract_definition() -> Value {
         json!({

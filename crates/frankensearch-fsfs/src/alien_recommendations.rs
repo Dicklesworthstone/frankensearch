@@ -130,7 +130,7 @@ pub struct RecommendationBundle {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::*;
+    use super::{RecommendationBundle, RecommendationCard};
 
     fn valid_card() -> Value {
         json!({
