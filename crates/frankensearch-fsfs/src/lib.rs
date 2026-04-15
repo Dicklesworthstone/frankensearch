@@ -116,6 +116,16 @@ pub use evidence::{
     ScopeDecisionKind, TraceLink, ValidationResult, ValidationViolation, is_valid_fsfs_reason_code,
     validate_event,
 };
+pub use file_classification::{
+    ChecksumMismatchAction, ConfidenceSignals, CorruptPartialPolicy, DetectedType,
+    DownstreamSignals, EncodingDetector, EncodingPolicy,
+    ErrorClass as FileClassificationErrorClass, FILE_CLASSIFICATION_CONTRACT_KIND,
+    FILE_CLASSIFICATION_CORRUPT_EVENT_KIND, FILE_CLASSIFICATION_DECISION_KIND,
+    FILE_CLASSIFICATION_SCHEMA_VERSION, FileClassificationContractDefinition,
+    FileClassificationCorruptEvent, FileClassificationDecision, FileClassificationInput,
+    IngestAction, IntegrityState, NormalizationPolicy, SniffFeatures, SniffHeuristics,
+    TruncatedAction, UnknownEncodingAction,
+};
 pub use explainability_screen::{
     ComponentRow, ConfidenceBadge, EXPLAINABILITY_SCREEN_SCHEMA_VERSION, ExplainabilityLevel,
     ExplainabilityScreenState, FusionRow, PolicyDecisionCard, RankMovementRow, RankingDecisionCard,
