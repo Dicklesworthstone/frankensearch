@@ -26,6 +26,7 @@ use frankensearch_fsfs::{
     encode_stream_frame_ndjson,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 const RAW_TOKEN: &str = "sk_live_SUPER_SECRET_12345";
 const RAW_EMAIL: &str = "jane.doe@example.com";
@@ -59,8 +60,8 @@ fn privacy_repro_lock_payload(exit_status: ExitStatus, finding_count: usize) -> 
 }
 
 #[inline]
-fn usize_to_f64(value: usize) -> f64 {
-    f64::from(u32::try_from(value).expect("privacy fixture counters must fit in u32"))
+fn usize_to_number(value: usize) -> Number {
+    Number::from(u64::try_from(value).expect("privacy fixture counters must fit in u64"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,7 +189,7 @@ fn build_privacy_unified_bundle(
     let mut metrics = BTreeMap::new();
     metrics.insert(
         "finding_count".to_owned(),
-        usize_to_f64(lane_meta.finding_count),
+        usize_to_number(lane_meta.finding_count),
     );
 
     let event_bodies = [

@@ -1,0 +1,13 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "heartbeat",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:16Z",
+  "lag_ms": 0,
+  "payload": {
+    "queue_depth": 8,
+    "max_inflight": 128
+  }
+}

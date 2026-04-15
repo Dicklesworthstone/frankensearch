@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WaveAssignment {
@@ -26,9 +27,9 @@ pub struct DebtItem {
     pub has_exception: bool,
     pub suggested_owner: String,
     pub owner_suggestion_basis: String,
-    pub pagerank: f64,
-    pub betweenness: f64,
-    pub critical_path: f64,
+    pub pagerank: Number,
+    pub betweenness: Number,
+    pub critical_path: u32,
     pub risk_score: u32,
     pub recommended_wave: WaveAssignment,
 }

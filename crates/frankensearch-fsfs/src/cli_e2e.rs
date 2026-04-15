@@ -17,6 +17,7 @@ use frankensearch_core::{
     validate_event_envelope, validate_manifest_envelope,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 /// Schema discriminator for fsfs CLI E2E contracts.
 pub const CLI_E2E_SCHEMA_VERSION: &str = "fsfs.cli.e2e.v1";
@@ -473,7 +474,7 @@ fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
 fn scenario_event_bodies(scenario: &CliE2eScenario, exit_status: ExitStatus) -> Vec<EventBody> {
     let mut metrics = BTreeMap::new();
     let argv_len = u32::try_from(scenario.args.len()).unwrap_or(u32::MAX);
-    metrics.insert("argv_len".to_owned(), f64::from(argv_len));
+    metrics.insert("argv_len".to_owned(), Number::from(u64::from(argv_len)));
 
     let assertion_outcome = if matches!(exit_status, ExitStatus::Pass) {
         E2eOutcome::Pass

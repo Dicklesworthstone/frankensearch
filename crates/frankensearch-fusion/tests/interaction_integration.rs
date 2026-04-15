@@ -46,6 +46,7 @@ use frankensearch_fusion::interaction_oracles::{
     lane_oracle_templates, oracle_template_for_lane, oracles_for_lane,
 };
 use frankensearch_fusion::searcher::TwoTierSearcher;
+use serde_json::Number;
 
 // ─── Test Infrastructure (shared with interaction_unit.rs) ─────────────────
 
@@ -529,7 +530,7 @@ fn push_event(
     outcome: Option<E2eOutcome>,
     reason_code: Option<String>,
     context: Option<String>,
-    metrics: Option<BTreeMap<String, f64>>,
+    metrics: Option<BTreeMap<String, Number>>,
 ) {
     let event_id = format!("interaction-e2e-evt-{seq:04}");
     let body = EventBody {
@@ -673,18 +674,22 @@ async fn build_interaction_e2e_artifacts(
         let mut lane_metrics = BTreeMap::new();
         lane_metrics.insert(
             "query_count".to_owned(),
-            f64::from(u32::try_from(queries.len()).expect("query count fits in u32")),
+            Number::from(u64::from(
+                u32::try_from(queries.len()).expect("query count fits in u32"),
+            )),
         );
         lane_metrics.insert(
             "template_oracles".to_owned(),
-            f64::from(u32::try_from(template.oracle_ids.len()).expect("oracle count fits in u32")),
+            Number::from(u64::from(
+                u32::try_from(template.oracle_ids.len()).expect("oracle count fits in u32"),
+            )),
         );
         lane_metrics.insert(
             "seed".to_owned(),
-            f64::from(
+            Number::from(u64::from(
                 u32::try_from(lane.seed & u64::from(u32::MAX))
                     .expect("masked lane seed fits in u32"),
-            ),
+            )),
         );
 
         push_event(

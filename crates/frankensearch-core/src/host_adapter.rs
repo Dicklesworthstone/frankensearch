@@ -13,11 +13,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::collectors::{
-    EmbeddingStage, EmbedderTier, EmbeddingStatus, IndexInventory, IndexOperation, IndexStatus, 
-    LifecycleSeverity, LifecycleState, QuantizationMode, TelemetryCorrelation, 
-    TelemetryEmbedderInfo, TelemetryEmbeddingJob, TelemetryEnvelope, TelemetryEvent, 
-    TelemetryInstance, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery, 
-    TelemetrySearchResults, TELEMETRY_SCHEMA_VERSION,
+    TelemetryCorrelation, TelemetryEmbedderInfo, TelemetryEmbeddingJob, TelemetryEnvelope,
+    TelemetryEvent, TelemetryInstance, TelemetrySearchMetrics, TelemetrySearchResults,
+    TELEMETRY_SCHEMA_VERSION,
 };
 use crate::error::{SearchError, SearchResult};
 
@@ -1224,6 +1222,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    use crate::collectors::{
+        EmbedderTier, EmbeddingStage, EmbeddingStatus, IndexInventory, IndexOperation, IndexStatus,
+        LifecycleSeverity, LifecycleState, QuantizationMode, TelemetryResourceSample,
+    };
 
     use super::*;
 

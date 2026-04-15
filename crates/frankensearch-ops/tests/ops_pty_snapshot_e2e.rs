@@ -21,6 +21,7 @@ use frankensearch_tui::{InputEvent, ReplayPlayer, ReplayRecorder};
 use ftui_render::frame::Frame;
 use ftui_render::grapheme_pool::GraphemePool;
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 const OPS_RUN_ID: &str = "01HQXG5M7P3KZFV9N2RSTW6YAB";
 const OPS_TS: &str = "2026-02-15T01:20:00Z";
@@ -187,7 +188,7 @@ struct EventSpec<'a> {
     outcome: Option<E2eOutcome>,
     reason_code: Option<&'a str>,
     context: Option<String>,
-    metrics: Option<BTreeMap<String, f64>>,
+    metrics: Option<BTreeMap<String, Number>>,
     oracle_id: Option<&'a str>,
 }
 
@@ -328,7 +329,9 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
     let mut discovery_metrics = BTreeMap::new();
     discovery_metrics.insert(
         "instance_count".to_owned(),
-        f64::from(u32::try_from(app.state.fleet().instance_count()).unwrap_or(u32::MAX)),
+        Number::from(u64::from(
+            u32::try_from(app.state.fleet().instance_count()).unwrap_or(u32::MAX),
+        )),
     );
     events.push(make_event(
         event_seq,
@@ -827,8 +830,14 @@ fn ops_failure_bundle_includes_transcript_snapshot_diff_and_replay_entrypoint() 
 fn ops_event_factory_produces_valid_envelope_with_all_fields() {
     let metrics = {
         let mut m = BTreeMap::new();
-        m.insert("latency_ms".to_owned(), 42.5);
-        m.insert("count".to_owned(), 7.0);
+        m.insert(
+            "latency_ms".to_owned(),
+            Number::from_f64(42.5).expect("latency must be finite"),
+        );
+        m.insert(
+            "count".to_owned(),
+            Number::from_f64(7.0).expect("count must be finite"),
+        );
         m
     };
     let event = make_event(
@@ -865,7 +874,7 @@ fn ops_event_factory_produces_valid_envelope_with_all_fields() {
             .metrics
             .as_ref()
             .and_then(|m| m.get("latency_ms")),
-        Some(&42.5)
+        Some(&Number::from_f64(42.5).expect("latency must be finite"))
     );
     validate_event_envelope(&event).expect("fully-specified event should validate");
 }

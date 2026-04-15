@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -37,7 +38,7 @@ pub struct WindowBudget {
 pub struct SloMetricDefinition {
     pub metric_id: MetricId,
     pub unit: String,
-    pub objective_threshold: f64,
+    pub objective_threshold: Number,
     pub objective_bad_ratio: f64,
     pub reason_code_prefix: String,
 }

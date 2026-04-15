@@ -1,0 +1,18 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "control",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:08Z",
+  "lag_ms": 0,
+  "payload": {
+    "control_type": "sampling",
+    "backpressure_state": null,
+    "dropped_count_window": null,
+    "sampling_ratio": 0.15,
+    "retry_after_ms": null,
+    "resume_cursor_hint": null,
+    "reason_code": "adaptive_sampling"
+  }
+}

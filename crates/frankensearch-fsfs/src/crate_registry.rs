@@ -26,10 +26,15 @@ pub struct PlacementRule {
     pub target_paths: Vec<String>,
     pub owner: String,
     pub rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_boundaries: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_deadline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blocking_impact: Option<BlockingImpact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 

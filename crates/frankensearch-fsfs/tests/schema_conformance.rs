@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use jsonschema::{Draft, JSONSchema};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -8,6 +11,169 @@ fn fixture_dir() -> PathBuf {
         .parent()
         .unwrap()
         .join("schemas/fixtures")
+}
+
+fn invalid_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("schemas/fixtures-invalid")
+}
+
+fn schema_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("schemas")
+}
+
+fn schema_for_fixture(name: &str) -> &'static str {
+    if name.starts_with("control-plane-error-") {
+        return "control-plane-error-v1.schema.json";
+    }
+    if name.starts_with("control-plane-") {
+        return "control-plane-interface-v1.schema.json";
+    }
+    if name.starts_with("telemetry-transport-") {
+        return "telemetry-transport-v1.schema.json";
+    }
+    if name.starts_with("telemetry-") {
+        return "telemetry-event-v1.schema.json";
+    }
+    if name.starts_with("ops-config-") {
+        return "ops-config-v1.schema.json";
+    }
+    if name.starts_with("ops-telemetry-storage-") {
+        return "ops-telemetry-storage-v1.schema.json";
+    }
+    if name.starts_with("e2e-") {
+        return "e2e-artifact-v1.schema.json";
+    }
+    if name.starts_with("evidence-") {
+        return "evidence-jsonl-v1.schema.json";
+    }
+    if name.starts_with("asupersync-cx-") {
+        return "asupersync-cx-contract-v1.schema.json";
+    }
+    if name.starts_with("crate-placement-registry-") {
+        return "crate-placement-registry-v1.schema.json";
+    }
+    if name.starts_with("slo-anomaly-") {
+        return "slo-anomaly-v1.schema.json";
+    }
+    if name.starts_with("fsfs-alien-recommendation-") {
+        return "fsfs-alien-recommendations-v1.schema.json";
+    }
+    if name.starts_with("fsfs-config-") {
+        return "fsfs-config-v1.schema.json";
+    }
+    if name.starts_with("fsfs-determinism-") {
+        return "fsfs-determinism-v1.schema.json";
+    }
+    if name.starts_with("fsfs-expected-loss-") {
+        return "fsfs-expected-loss-v1.schema.json";
+    }
+    if name.starts_with("fsfs-explanation-payload-") {
+        return "fsfs-explanation-payload-v1.schema.json";
+    }
+    if name.starts_with("fsfs-file-classification-") {
+        return "fsfs-file-classification-v1.schema.json";
+    }
+    if name.starts_with("fsfs-high-cost-artifact-detectors-") {
+        return "fsfs-high-cost-artifact-detectors-v1.schema.json";
+    }
+    if name.starts_with("fsfs-incremental-change-detection-") {
+        return "fsfs-incremental-change-detection-v1.schema.json";
+    }
+    if name.starts_with("fsfs-packaging-release-install-") {
+        return "fsfs-packaging-release-install-v1.schema.json";
+    }
+    if name.starts_with("fsfs-pressure-profiles-") {
+        return "fsfs-pressure-profiles-v1.schema.json";
+    }
+    if name.starts_with("fsfs-provenance-attestation-") {
+        return "fsfs-provenance-attestation-v1.schema.json";
+    }
+    if name.starts_with("fsfs-root-discovery-") {
+        return "fsfs-root-discovery-v1.schema.json";
+    }
+    if name.starts_with("fsfs-scope-privacy-") {
+        return "fsfs-scope-privacy-v1.schema.json";
+    }
+    if name.starts_with("fsfs-snippet-highlight-provenance-") {
+        return "fsfs-snippet-highlight-provenance-v1.schema.json";
+    }
+    panic!("No schema mapping for fixture {name}");
+}
+
+fn is_semantic_invalid_fixture(name: &str) -> bool {
+    matches!(
+        name,
+        "crate-placement-registry-invalid-duplicate-v1.json"
+    )
+}
+
+fn load_schema<'a>(
+    cache: &'a mut BTreeMap<String, JSONSchema>,
+    schemas: &Path,
+    schema_file: &str,
+) -> &'a JSONSchema {
+    cache.entry(schema_file.to_owned()).or_insert_with(|| {
+        let schema_path = schemas.join(schema_file);
+        let raw = fs::read_to_string(&schema_path).unwrap_or_else(|_| {
+            panic!("schema file missing: {}", schema_path.display())
+        });
+        let schema_json: serde_json::Value =
+            serde_json::from_str(&raw).expect("schema should parse as json");
+        JSONSchema::options()
+            .with_draft(Draft::Draft202012)
+            .compile(&schema_json)
+            .unwrap_or_else(|error| {
+                panic!("failed to compile schema {}: {error}", schema_path.display())
+            })
+    })
+}
+
+fn assert_schema_validation(
+    cache: &mut BTreeMap<String, JSONSchema>,
+    schema_root: &Path,
+    fixture_path: &Path,
+    should_pass: bool,
+) {
+    let file_name = fixture_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("fixture filename");
+    let schema_file = schema_for_fixture(file_name);
+    let schema = load_schema(cache, schema_root, schema_file);
+    let raw = fs::read_to_string(fixture_path)
+        .unwrap_or_else(|_| panic!("read fixture {}", fixture_path.display()));
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            panic!("fixture {} is invalid json: {error}", fixture_path.display())
+        });
+    let validation = schema.validate(&value);
+    if should_pass {
+        if let Err(errors) = validation {
+            let messages: Vec<String> = errors.map(|err| err.to_string()).collect();
+            panic!(
+                "fixture {} failed schema {}: {}",
+                fixture_path.display(),
+                schema_file,
+                messages.join("; ")
+            );
+        }
+    } else if validation.is_ok() {
+        panic!(
+            "fixture {} unexpectedly passed schema {}",
+            fixture_path.display(),
+            schema_file
+        );
+    }
 }
 
 fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
@@ -51,11 +217,60 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
 }
 
 #[test]
+fn test_schema_fixtures_validate_against_jsonschema() {
+    let mut cache: BTreeMap<String, JSONSchema> = BTreeMap::new();
+    let schemas = schema_dir();
+
+    for entry in fs::read_dir(fixture_dir()).expect("read fixtures dir") {
+        let entry = entry.expect("fixture dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        assert_schema_validation(&mut cache, &schemas, &path, true);
+    }
+
+    for entry in fs::read_dir(invalid_fixture_dir()).expect("read invalid fixtures dir") {
+        let entry = entry.expect("invalid fixture dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("invalid fixture filename");
+        if is_semantic_invalid_fixture(file_name) {
+            continue;
+        }
+        assert_schema_validation(&mut cache, &schemas, &path, false);
+    }
+}
+
+#[test]
 fn test_fsfs_config_roundtrip_conformance() {
     let path = fixture_dir().join("fsfs-config-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
     let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse config contract");
     assert_golden_json("fsfs_config_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_fsfs_config_effective_conformance() {
+    let path = fixture_dir().join("fsfs-config-effective-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse config effective");
+    assert_golden_json("fsfs_config_effective_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_fsfs_config_load_event_conformance() {
+    let path = fixture_dir().join("fsfs-config-load-event-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse config load event");
+    assert_golden_json("fsfs_config_loaded_event_roundtrip_v1", &parsed);
 }
 
 #[test]
@@ -276,6 +491,15 @@ fn test_pressure_profiles_roundtrip_conformance() {
 }
 
 #[test]
+fn test_pressure_profiles_decision_conformance() {
+    let path = fixture_dir().join("fsfs-pressure-profiles-decision-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse pressure profiles decision fixture");
+    assert_golden_json("fsfs_pressure_profiles_decision_roundtrip_v1", &parsed);
+}
+
+#[test]
 fn test_alien_recommendation_bundle_conformance() {
     let path = fixture_dir().join("fsfs-alien-recommendation-bundle-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
@@ -436,6 +660,45 @@ fn test_control_plane_stream_frame_control_reconnect_conformance() {
 }
 
 #[test]
+fn test_control_plane_stream_frame_control_sampling_conformance() {
+    let path = fixture_dir().join("control-plane-stream-control-sampling-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::control_plane::StreamFrame =
+        serde_json::from_str(&raw).expect("parse control plane stream frame sampling");
+    assert_golden_json("control_plane_stream_frame_sampling_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_control_plane_stream_frame_control_topology_change_conformance() {
+    let path = fixture_dir().join("control-plane-stream-control-topology-change-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::control_plane::StreamFrame =
+        serde_json::from_str(&raw).expect("parse control plane stream frame topology change");
+    assert_golden_json(
+        "control_plane_stream_frame_topology_change_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_control_plane_stream_frame_heartbeat_conformance() {
+    let path = fixture_dir().join("control-plane-stream-heartbeat-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::control_plane::StreamFrame =
+        serde_json::from_str(&raw).expect("parse control plane stream frame heartbeat");
+    assert_golden_json("control_plane_stream_frame_heartbeat_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_control_plane_stream_frame_error_conformance() {
+    let path = fixture_dir().join("control-plane-stream-error-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::control_plane::StreamFrame =
+        serde_json::from_str(&raw).expect("parse control plane stream frame error");
+    assert_golden_json("control_plane_stream_frame_error_roundtrip_v1", &parsed);
+}
+
+#[test]
 fn test_control_plane_error_catalog_conformance() {
     let path = fixture_dir().join("control-plane-error-catalog-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
@@ -579,12 +842,30 @@ fn test_telemetry_transport_frame_control_backpressure_conformance() {
 }
 
 #[test]
+fn test_telemetry_transport_frame_control_reconnect_conformance() {
+    let path = fixture_dir().join("telemetry-transport-frame-control-reconnect-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::telemetry_transport::TransportStreamFrame =
+        serde_json::from_str(&raw).expect("parse telemetry transport frame reconnect");
+    assert_golden_json("telemetry_transport_frame_reconnect_roundtrip_v1", &parsed);
+}
+
+#[test]
 fn test_telemetry_transport_frame_error_conformance() {
     let path = fixture_dir().join("telemetry-transport-frame-error-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
     let parsed: frankensearch_fsfs::telemetry_transport::TransportStreamFrame =
         serde_json::from_str(&raw).expect("parse telemetry transport frame error");
     assert_golden_json("telemetry_transport_frame_error_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_telemetry_transport_frame_heartbeat_conformance() {
+    let path = fixture_dir().join("telemetry-transport-frame-heartbeat-v1.json");
+    let raw = fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::telemetry_transport::TransportStreamFrame =
+        serde_json::from_str(&raw).expect("parse telemetry transport frame heartbeat");
+    assert_golden_json("telemetry_transport_frame_heartbeat_roundtrip_v1", &parsed);
 }
 
 #[test]

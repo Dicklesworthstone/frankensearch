@@ -150,6 +150,7 @@ pub struct DeterminismCheckResult {
     pub run_count: u32,
     pub pass: bool,
     pub manifest_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tolerance_policy: Option<TolerancePolicy>,
     pub mismatch_diagnostics: Vec<MismatchDiagnostic>,
 }

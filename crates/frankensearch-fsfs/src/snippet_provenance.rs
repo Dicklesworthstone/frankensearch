@@ -50,6 +50,7 @@ pub struct HighlightRange {
     pub start_byte: u64,
     pub end_byte: u64,
     pub highlight_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub query_term: Option<String>,
 }
 

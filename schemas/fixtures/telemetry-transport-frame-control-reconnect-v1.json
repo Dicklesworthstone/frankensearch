@@ -1,0 +1,17 @@
+{
+  "kind": "telemetry_transport_stream_frame",
+  "v": 1,
+  "frame_type": "control",
+  "transport": "unix_domain_socket",
+  "connection_id": "01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+  "sequence": 45,
+  "producer_ts": "2026-02-14T01:20:03Z",
+  "dispatch_ts": "2026-02-14T01:20:03.030Z",
+  "lag_ms": 17.5,
+  "dropped_since_last": 21,
+  "payload": {
+    "control_type": "reconnect_advisory",
+    "reason_code": "socket_reset",
+    "retry_after_ms": 1500
+  }
+}

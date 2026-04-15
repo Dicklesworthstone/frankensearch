@@ -5,6 +5,7 @@
 //! All types are `Serialize`/`Deserialize` for JSON/JSONL emission.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -626,7 +627,7 @@ pub struct EventBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<BTreeMap<String, f64>>,
+    pub metrics: Option<BTreeMap<String, Number>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -661,7 +662,6 @@ pub enum E2eOutcome {
 pub struct Correlation {
     pub event_id: String,
     pub root_request_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_event_id: Option<String>,
 }
 

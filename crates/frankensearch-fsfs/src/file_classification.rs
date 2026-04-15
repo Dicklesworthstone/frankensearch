@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SniffHeuristics {
     pub max_probe_bytes: u32,
-    pub binary_byte_threshold_pct: f64,
-    pub high_bit_ratio_threshold_pct: f64,
+    pub binary_byte_threshold_pct: Number,
+    pub high_bit_ratio_threshold_pct: Number,
     pub null_byte_hard_binary: bool,
 }
 

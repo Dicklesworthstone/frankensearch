@@ -19,6 +19,7 @@ use frankensearch_fsfs::interaction_primitives::{
 use frankensearch_fsfs::{DegradedRetrievalMode, FsfsScreen};
 use frankensearch_tui::{InputEvent, ReplayPlayer, ReplayRecorder};
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotArtifact {
@@ -99,8 +100,8 @@ fn deluxe_tui_repro_lock_payload(
 }
 
 #[inline]
-fn usize_to_f64(value: usize) -> f64 {
-    f64::from(u32::try_from(value).expect("test counters must fit in u32"))
+fn usize_to_number(value: usize) -> Number {
+    Number::from(u64::try_from(value).expect("test counters must fit in u64"))
 }
 
 const fn mode_label(mode: DegradedRetrievalMode) -> &'static str {
@@ -287,20 +288,20 @@ fn build_deluxe_tui_unified_bundle(
     let mut metrics = BTreeMap::new();
     metrics.insert(
         "action_count".to_owned(),
-        usize_to_f64(artifact.action_trace.len()),
+        usize_to_number(artifact.action_trace.len()),
     );
     metrics.insert(
         "snapshot_count".to_owned(),
-        usize_to_f64(artifact.snapshots.len()),
+        usize_to_number(artifact.snapshots.len()),
     );
     metrics.insert(
         "viewport_height".to_owned(),
-        usize_to_f64(artifact.viewport_height),
+        usize_to_number(artifact.viewport_height),
     );
     if let Some(replay_failure) = failure {
         metrics.insert(
             "mismatch_index".to_owned(),
-            usize_to_f64(replay_failure.mismatch_index),
+            usize_to_number(replay_failure.mismatch_index),
         );
     }
 

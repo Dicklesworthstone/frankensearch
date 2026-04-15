@@ -1,0 +1,18 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "control",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:10Z",
+  "lag_ms": 0,
+  "payload": {
+    "control_type": "topology_change",
+    "backpressure_state": null,
+    "dropped_count_window": null,
+    "sampling_ratio": null,
+    "retry_after_ms": null,
+    "resume_cursor_hint": "instance:01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+    "reason_code": "instance_joined"
+  }
+}

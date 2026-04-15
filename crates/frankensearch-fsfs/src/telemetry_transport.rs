@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Number;
 use crate::control_plane::Topic;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,7 +49,7 @@ pub struct TransportSecurityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransportSloTargets {
-    pub p95_delivery_lag_ms_target: f64,
+    pub p95_delivery_lag_ms_target: Number,
     pub throughput_eps_target: u32,
 }
 
@@ -102,15 +103,25 @@ pub enum TransportType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransportPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<Topic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub control_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u32>,
 }
 
@@ -124,7 +135,7 @@ pub struct TransportStreamFrame {
     pub sequence: u64,
     pub producer_ts: String,
     pub dispatch_ts: String,
-    pub lag_ms: f64,
+    pub lag_ms: Number,
     pub dropped_since_last: u64,
     pub payload: TransportPayload,
 }

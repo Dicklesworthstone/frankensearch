@@ -1,0 +1,15 @@
+{
+  "kind": "stream_frame",
+  "v": 1,
+  "frame_type": "error",
+  "cursor": null,
+  "producer_ts": null,
+  "dispatch_ts": "2026-02-14T00:50:14Z",
+  "lag_ms": 0,
+  "payload": {
+    "code": "stream_decode_error",
+    "message": "invalid frame received",
+    "recoverable": true,
+    "retry_after_ms": 1000
+  }
+}

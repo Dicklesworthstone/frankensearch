@@ -61,6 +61,7 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 asupersync = { workspace = true }
 tempfile = "3"
 proptest = { workspace = true }
+jsonschema = { version = "0.17", features = ["draft202012"] }
 
 [lints]
 workspace = true

@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use asupersync::Cx;
 use asupersync::sync::{LockError, Mutex};
 use ort::session::Session;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::instrument;
 
@@ -208,7 +208,7 @@ impl FlashRankReranker {
             })?;
 
         let final_max_len = model_max_len.min(max_length);
-        tokenizer = tokenizer
+        tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
                 max_length: final_max_len,
                 ..Default::default()
@@ -216,13 +216,12 @@ impl FlashRankReranker {
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_dir.join(TOKENIZER_JSON),
                 source: format!("failed to enable truncation: {e}").into(),
-            })?
-            .with_padding(Some(tokenizers::PaddingParams {
-                pad_id: pad_token_id,
-                pad_token: "[PAD]".to_owned(),
-                ..Default::default()
-            }))
-            .into();
+            })?;
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            pad_id: pad_token_id,
+            pad_token: "[PAD]".to_owned(),
+            ..Default::default()
+        }));
 
         tracing::info!(
             model = %name,
