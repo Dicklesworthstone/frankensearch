@@ -266,9 +266,15 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
 const MERGE_COOLDOWN_MS: i64 = 300_000;
 /// Segment count threshold above which merge is triggered.
 const MERGE_SEGMENT_THRESHOLD: usize = 4;
-/// Cap cass rebuilds to a modest Tantivy worker pool to avoid oversubscribing
-/// the process while still letting large lexical repairs saturate modern CPUs.
-const CASS_MAX_WRITER_THREADS: usize = 4;
+/// Cap cass rebuilds to a reasonable Tantivy worker pool size. 8 is the
+/// sweet spot on modern workstations: enough to saturate a typical 4–8-core
+/// laptop and push meaningfully into high-core desktops and servers, without
+/// pushing per-run heap (threads × `CASS_WRITER_HEAP_PER_THREAD_BYTES`) into
+/// multi-GB territory or saturating disk I/O during segment flushes. The
+/// producer side (doc prep) uses rayon's default pool and already scales to
+/// all available cores, so the real ceiling for Tantivy-side parallelism is
+/// the per-machine disk/merge cost, not CPU.
+const CASS_MAX_WRITER_THREADS: usize = 8;
 /// Reserve a healthy minimum heap budget so large repairs do not churn tiny
 /// segments and constant flush/merge cycles on multi-million-message corpora.
 const CASS_MIN_WRITER_HEAP_BYTES: usize = 256 * 1024 * 1024;
@@ -1631,6 +1637,7 @@ mod cass_query_tests {
 
     #[test]
     fn cass_writer_config_scales_with_parallelism() {
+        // Single-core: 1 thread, heap clamped up to the 256 MB floor.
         assert_eq!(
             cass_writer_config_for_parallelism(1),
             CassWriterConfig {
@@ -1638,6 +1645,7 @@ mod cass_query_tests {
                 heap_size_bytes: 256 * 1024 * 1024,
             }
         );
+        // Dual-core: 2 threads × 128 MB = 256 MB hits the floor exactly.
         assert_eq!(
             cass_writer_config_for_parallelism(2),
             CassWriterConfig {
@@ -1645,11 +1653,29 @@ mod cass_query_tests {
                 heap_size_bytes: 256 * 1024 * 1024,
             }
         );
+        // Quad-core: 4 threads × 128 MB = 512 MB (above the floor).
         assert_eq!(
-            cass_writer_config_for_parallelism(8),
+            cass_writer_config_for_parallelism(4),
             CassWriterConfig {
                 num_threads: 4,
                 heap_size_bytes: 512 * 1024 * 1024,
+            }
+        );
+        // At the new `CASS_MAX_WRITER_THREADS` cap: 8 threads × 128 MB = 1 GB.
+        assert_eq!(
+            cass_writer_config_for_parallelism(8),
+            CassWriterConfig {
+                num_threads: 8,
+                heap_size_bytes: 1024 * 1024 * 1024,
+            }
+        );
+        // Above the cap (e.g. 64-core workstation): still clamped to 8 threads
+        // to avoid oversubscribing disk I/O and piling up per-thread heaps.
+        assert_eq!(
+            cass_writer_config_for_parallelism(64),
+            CassWriterConfig {
+                num_threads: 8,
+                heap_size_bytes: 1024 * 1024 * 1024,
             }
         );
     }
