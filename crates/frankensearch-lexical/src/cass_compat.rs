@@ -653,55 +653,88 @@ impl CassTantivyIndex {
 
     /// Add a batch of cass-compatible documents.
     ///
+    /// The per-doc prep work (edge-ngram generation and preview extraction) is
+    /// CPU-heavy; for non-trivial batches we run it in parallel on rayon and
+    /// then feed the pre-built `TantivyDocument`s serially into the writer
+    /// (which needs `&mut self`). On a 4-core indexing run this keeps the
+    /// tantivy writer threads fed instead of starving on a single-threaded
+    /// producer.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::SubsystemError`] if adding a document to Tantivy fails.
     pub fn add_cass_documents(&mut self, docs: &[CassDocument]) -> SearchResult<()> {
-        for cass_doc in docs {
-            let mut d = doc! {
-                self.fields.agent => cass_doc.agent.clone(),
-                self.fields.source_path => cass_doc.source_path.clone(),
-                self.fields.msg_idx => cass_doc.msg_idx,
-                self.fields.content => cass_doc.content.clone(),
-                self.fields.source_id => cass_doc.source_id.clone(),
-                self.fields.origin_kind => cass_doc.origin_kind.clone(),
-            };
+        use rayon::prelude::*;
 
-            if let Some(host) = &cass_doc.origin_host
-                && !host.is_empty()
-            {
-                d.add_text(self.fields.origin_host, host);
+        // Below this size the rayon split/join overhead isn't worth it.
+        const PARALLEL_PREP_THRESHOLD: usize = 8;
+
+        let fields = self.fields;
+        if docs.len() < PARALLEL_PREP_THRESHOLD {
+            for cass_doc in docs {
+                let d = build_cass_tantivy_document(fields, cass_doc);
+                self.writer.add_document(d).map_err(tantivy_err)?;
             }
-            if let Some(field) = self.fields.conversation_id
-                && let Some(conversation_id) = cass_doc.conversation_id
-            {
-                d.add_i64(field, conversation_id);
+        } else {
+            let prepared: Vec<tantivy::TantivyDocument> = docs
+                .par_iter()
+                .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                .collect();
+            for d in prepared {
+                self.writer.add_document(d).map_err(tantivy_err)?;
             }
-            if let Some(workspace) = &cass_doc.workspace {
-                d.add_text(self.fields.workspace, workspace);
-            }
-            if let Some(workspace_original) = &cass_doc.workspace_original {
-                d.add_text(self.fields.workspace_original, workspace_original);
-            }
-            if let Some(ts) = cass_doc.created_at {
-                d.add_i64(self.fields.created_at, ts);
-            }
-            if let Some(title) = &cass_doc.title {
-                d.add_text(self.fields.title, title);
-                d.add_text(self.fields.title_prefix, cass_generate_edge_ngrams(title));
-            }
-            d.add_text(
-                self.fields.content_prefix,
-                cass_generate_edge_ngrams(&cass_doc.content),
-            );
-            d.add_text(
-                self.fields.preview,
-                cass_build_preview(&cass_doc.content, 400),
-            );
-            self.writer.add_document(d).map_err(tantivy_err)?;
         }
         Ok(())
     }
+}
+
+/// Build a single `TantivyDocument` for a cass document. Pure function so it
+/// can run on any rayon worker.
+fn build_cass_tantivy_document(
+    fields: CassFields,
+    cass_doc: &CassDocument,
+) -> tantivy::TantivyDocument {
+    let mut d = doc! {
+        fields.agent => cass_doc.agent.clone(),
+        fields.source_path => cass_doc.source_path.clone(),
+        fields.msg_idx => cass_doc.msg_idx,
+        fields.content => cass_doc.content.clone(),
+        fields.source_id => cass_doc.source_id.clone(),
+        fields.origin_kind => cass_doc.origin_kind.clone(),
+    };
+
+    if let Some(host) = &cass_doc.origin_host
+        && !host.is_empty()
+    {
+        d.add_text(fields.origin_host, host);
+    }
+    if let Some(field) = fields.conversation_id
+        && let Some(conversation_id) = cass_doc.conversation_id
+    {
+        d.add_i64(field, conversation_id);
+    }
+    if let Some(workspace) = &cass_doc.workspace {
+        d.add_text(fields.workspace, workspace);
+    }
+    if let Some(workspace_original) = &cass_doc.workspace_original {
+        d.add_text(fields.workspace_original, workspace_original);
+    }
+    if let Some(ts) = cass_doc.created_at {
+        d.add_i64(fields.created_at, ts);
+    }
+    if let Some(title) = &cass_doc.title {
+        d.add_text(fields.title, title);
+        d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
+    }
+    d.add_text(
+        fields.content_prefix,
+        cass_generate_edge_ngrams(&cass_doc.content),
+    );
+    d.add_text(
+        fields.preview,
+        cass_build_preview(&cass_doc.content, 400),
+    );
+    d
 }
 
 /// Build cass-compatible Tantivy schema.
