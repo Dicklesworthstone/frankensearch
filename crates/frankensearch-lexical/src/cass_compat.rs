@@ -5,6 +5,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{
     AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
@@ -265,6 +266,19 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
 const MERGE_COOLDOWN_MS: i64 = 300_000;
 /// Segment count threshold above which merge is triggered.
 const MERGE_SEGMENT_THRESHOLD: usize = 4;
+/// Cap cass rebuilds to a modest Tantivy worker pool to avoid oversubscribing
+/// the process while still letting large lexical repairs saturate modern CPUs.
+const CASS_MAX_WRITER_THREADS: usize = 4;
+/// Reserve a healthy minimum heap budget so large repairs do not churn tiny
+/// segments and constant flush/merge cycles on multi-million-message corpora.
+const CASS_MIN_WRITER_HEAP_BYTES: usize = 256 * 1024 * 1024;
+/// Scale the heap budget with the worker count so each indexing thread has
+/// enough in-memory runway before Tantivy has to flush segments.
+const CASS_WRITER_HEAP_PER_THREAD_BYTES: usize = 128 * 1024 * 1024;
+/// During cass bulk rebuilds, delay background merges until there is a
+/// meaningful backlog of segments instead of burning CPU on near-continuous
+/// compaction while the canonical database is still streaming documents in.
+const CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE: usize = 32;
 
 /// Global last merge timestamp (ms since epoch).
 static LAST_MERGE_TS: AtomicI64 = AtomicI64::new(0);
@@ -396,6 +410,30 @@ pub struct CassDocument {
     pub conversation_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CassWriterConfig {
+    num_threads: usize,
+    heap_size_bytes: usize,
+}
+
+fn cass_writer_config() -> CassWriterConfig {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    cass_writer_config_for_parallelism(available_parallelism)
+}
+
+fn cass_writer_config_for_parallelism(available_parallelism: usize) -> CassWriterConfig {
+    let num_threads = available_parallelism.clamp(1, CASS_MAX_WRITER_THREADS);
+    let heap_size_bytes = num_threads
+        .saturating_mul(CASS_WRITER_HEAP_PER_THREAD_BYTES)
+        .max(CASS_MIN_WRITER_HEAP_BYTES);
+    CassWriterConfig {
+        num_threads,
+        heap_size_bytes,
+    }
+}
+
 /// Tantivy index compatible with cass lexical schema and lifecycle.
 pub struct CassTantivyIndex {
     index: Index,
@@ -462,11 +500,14 @@ impl CassTantivyIndex {
         .map_err(tantivy_err)?;
 
         let actual_schema = index.schema();
-        // cass rebuilds feed documents from a single producer thread. A single
-        // Tantivy indexing worker keeps memory use bounded and makes rebuild
-        // checkpoints materially more predictable on very large session corpora.
+        let writer_config = cass_writer_config();
+        debug!(
+            tantivy_writer_threads = writer_config.num_threads,
+            tantivy_writer_heap_mb = writer_config.heap_size_bytes / (1024 * 1024),
+            "opening cass-compatible tantivy writer"
+        );
         let writer = index
-            .writer_with_num_threads(1, 50_000_000)
+            .writer_with_num_threads(writer_config.num_threads, writer_config.heap_size_bytes)
             .map_err(tantivy_err)?;
         let fields = cass_fields_from_schema(&actual_schema)?;
         Ok(Self {
@@ -508,6 +549,16 @@ impl CassTantivyIndex {
     pub fn commit(&mut self) -> SearchResult<()> {
         self.writer.commit().map_err(tantivy_err)?;
         Ok(())
+    }
+
+    pub fn configure_bulk_load_merge_policy(&mut self) {
+        let mut merge_policy = LogMergePolicy::default();
+        merge_policy.set_min_num_segments(CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE);
+        self.writer.set_merge_policy(Box::new(merge_policy));
+        debug!(
+            min_num_segments = CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE,
+            "configured cass bulk-load merge policy"
+        );
     }
 
     #[must_use]
@@ -1543,6 +1594,31 @@ mod cass_query_tests {
         assert!(out.contains('*'));
         // Hyphens are now preserved so hyphenated identifiers stay intact.
         assert!(out.contains("hello-world"));
+    }
+
+    #[test]
+    fn cass_writer_config_scales_with_parallelism() {
+        assert_eq!(
+            cass_writer_config_for_parallelism(1),
+            CassWriterConfig {
+                num_threads: 1,
+                heap_size_bytes: 256 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            cass_writer_config_for_parallelism(2),
+            CassWriterConfig {
+                num_threads: 2,
+                heap_size_bytes: 256 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            cass_writer_config_for_parallelism(8),
+            CassWriterConfig {
+                num_threads: 4,
+                heap_size_bytes: 512 * 1024 * 1024,
+            }
+        );
     }
 
     #[test]
