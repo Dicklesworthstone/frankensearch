@@ -90,3 +90,45 @@ test_logs/
 
 # NTM session state
 .ntm/
+
+# Root-level agent-generated scripts and scratch output
+*.log
+/*.txt
+/*.py
+/*.sh
+/*.err
+/*.json
+!package.json
+/*.diff
+nohup.out
+
+# Core dumps and agent config backups
+core.*
+core
+*.mcp.json.*.bak
+cline.mcp.json
+codex.mcp.json
+cursor.mcp.json
+gemini.mcp.json
+opencode.json
+windsurf.mcp.json
+.opencode.json.*.bak
+.agent-mail-project-id
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_REPORT.md
+SESSION_*.md
+verify_*.sh
+newfile.txt
+repro_*.rs
+
+# Claude local settings
+.claude/settings.local.json
+
+# Beads ephemeral artifacts
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/recovery*/
+.beads_recovery/
