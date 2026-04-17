@@ -283,6 +283,12 @@ const CASS_WRITER_HEAP_PER_THREAD_BYTES: usize = 128 * 1024 * 1024;
 /// meaningful backlog of segments instead of burning CPU on near-continuous
 /// compaction while the canonical database is still streaming documents in.
 const CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE: usize = 256;
+/// Large cass rebuild batches should be split into multiple independent writer
+/// submissions so Tantivy's worker pool can consume them concurrently instead
+/// of idling behind a single giant `IndexWriter::run(...)` call.
+const CASS_PARALLEL_ADD_MIN_DOCS: usize = 2_048;
+const CASS_PARALLEL_ADD_TARGET_BATCH_DOCS: usize = 512;
+const CASS_PARALLEL_ADD_MAX_BATCHES: usize = 64;
 
 /// Global last merge timestamp (ms since epoch).
 static LAST_MERGE_TS: AtomicI64 = AtomicI64::new(0);
@@ -420,6 +426,13 @@ struct CassWriterConfig {
     heap_size_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CassAddPlan {
+    parallel_batches: bool,
+    batch_docs: usize,
+    batch_count: usize,
+}
+
 fn cass_writer_config() -> CassWriterConfig {
     let available_parallelism = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -440,6 +453,62 @@ fn cass_writer_config_for_parallelism(available_parallelism: usize) -> CassWrite
     CassWriterConfig {
         num_threads,
         heap_size_bytes,
+    }
+}
+
+fn cass_parallel_add_min_docs() -> usize {
+    std::env::var("CASS_TANTIVY_PARALLEL_ADD_MIN_DOCS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CASS_PARALLEL_ADD_MIN_DOCS)
+}
+
+fn cass_parallel_add_target_batch_docs() -> usize {
+    std::env::var("CASS_TANTIVY_PARALLEL_ADD_BATCH_DOCS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CASS_PARALLEL_ADD_TARGET_BATCH_DOCS)
+}
+
+fn cass_parallel_add_max_batches() -> usize {
+    std::env::var("CASS_TANTIVY_PARALLEL_ADD_MAX_BATCHES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CASS_PARALLEL_ADD_MAX_BATCHES)
+}
+
+fn cass_parallel_add_plan(
+    doc_count: usize,
+    available_parallelism: usize,
+    target_batch_docs: usize,
+    min_parallel_docs: usize,
+    max_batches: usize,
+) -> CassAddPlan {
+    if doc_count == 0 {
+        return CassAddPlan {
+            parallel_batches: false,
+            batch_docs: 1,
+            batch_count: 0,
+        };
+    }
+
+    let target_batch_docs = target_batch_docs.max(1);
+    let max_batches = max_batches.max(1);
+    let parallelism_batches = available_parallelism.max(1).saturating_mul(2).max(1);
+    let batch_count = doc_count
+        .div_ceil(target_batch_docs)
+        .min(max_batches)
+        .min(parallelism_batches)
+        .max(1);
+    let batch_docs = doc_count.div_ceil(batch_count).max(1);
+
+    CassAddPlan {
+        parallel_batches: doc_count >= min_parallel_docs && batch_count > 1,
+        batch_docs,
+        batch_count,
     }
 }
 
@@ -679,18 +748,51 @@ impl CassTantivyIndex {
         const PARALLEL_PREP_THRESHOLD: usize = 8;
 
         let fields = self.fields;
-        let prepared: Vec<tantivy::TantivyDocument> = if docs.len() < PARALLEL_PREP_THRESHOLD {
-            docs.iter()
-                .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
-                .collect()
+        let writer_parallelism = cass_writer_config().num_threads.max(1);
+        let add_plan = cass_parallel_add_plan(
+            docs.len(),
+            writer_parallelism,
+            cass_parallel_add_target_batch_docs(),
+            cass_parallel_add_min_docs(),
+            cass_parallel_add_max_batches(),
+        );
+
+        debug!(
+            docs = docs.len(),
+            batch_docs = add_plan.batch_docs,
+            batch_count = add_plan.batch_count,
+            parallel_batches = add_plan.parallel_batches,
+            writer_parallelism,
+            "submitting cass-compatible documents to tantivy writer"
+        );
+
+        if add_plan.parallel_batches {
+            let writer = &self.writer;
+            docs.par_chunks(add_plan.batch_docs)
+                .try_for_each(|chunk| -> SearchResult<()> {
+                    let prepared: Vec<tantivy::TantivyDocument> = chunk
+                        .iter()
+                        .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                        .collect();
+                    writer
+                        .run(prepared.into_iter().map(UserOperation::Add))
+                        .map_err(tantivy_err)?;
+                    Ok(())
+                })?;
         } else {
-            docs.par_iter()
-                .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
-                .collect()
-        };
-        self.writer
-            .run(prepared.into_iter().map(UserOperation::Add))
-            .map_err(tantivy_err)?;
+            let prepared: Vec<tantivy::TantivyDocument> = if docs.len() < PARALLEL_PREP_THRESHOLD {
+                docs.iter()
+                    .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                    .collect()
+            } else {
+                docs.par_iter()
+                    .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                    .collect()
+            };
+            self.writer
+                .run(prepared.into_iter().map(UserOperation::Add))
+                .map_err(tantivy_err)?;
+        }
         Ok(())
     }
 }
@@ -1681,6 +1783,34 @@ mod cass_query_tests {
             CassWriterConfig {
                 num_threads: 32,
                 heap_size_bytes: 4 * 1024 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn cass_parallel_add_plan_enables_parallel_submission_for_large_batches() {
+        assert_eq!(
+            cass_parallel_add_plan(4_096, 8, 512, 2_048, 64),
+            CassAddPlan {
+                parallel_batches: true,
+                batch_docs: 512,
+                batch_count: 8,
+            }
+        );
+        assert_eq!(
+            cass_parallel_add_plan(200_000, 32, 512, 2_048, 64),
+            CassAddPlan {
+                parallel_batches: true,
+                batch_docs: 3_125,
+                batch_count: 64,
+            }
+        );
+        assert_eq!(
+            cass_parallel_add_plan(1_024, 8, 512, 2_048, 64),
+            CassAddPlan {
+                parallel_batches: false,
+                batch_docs: 512,
+                batch_count: 2,
             }
         );
     }
