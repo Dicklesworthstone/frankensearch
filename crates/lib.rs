@@ -19,7 +19,8 @@
 pub mod cass_compat;
 
 pub use cass_compat::{
-    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassFields, CassMergeStatus,
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassDocumentRef, CassFields,
+    CassMergeStatus,
     CassQueryFilters, CassQueryToken, CassSourceFilter, CassTantivyIndex, CassWildcardPattern,
     cass_build_preview, cass_build_schema, cass_build_tantivy_query, cass_ensure_tokenizer,
     cass_fields_from_schema, cass_generate_edge_ngrams, cass_has_boolean_operators, cass_index_dir,

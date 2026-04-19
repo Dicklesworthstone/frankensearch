@@ -420,6 +420,22 @@ pub struct CassDocument {
     pub conversation_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CassDocumentRef<'a> {
+    pub agent: &'a str,
+    pub workspace: Option<&'a str>,
+    pub workspace_original: Option<&'a str>,
+    pub source_path: &'a str,
+    pub msg_idx: u64,
+    pub created_at: Option<i64>,
+    pub title: Option<&'a str>,
+    pub content: &'a str,
+    pub source_id: &'a str,
+    pub origin_kind: &'a str,
+    pub origin_host: Option<&'a str>,
+    pub conversation_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CassWriterConfig {
     num_threads: usize,
@@ -795,6 +811,63 @@ impl CassTantivyIndex {
         }
         Ok(())
     }
+
+    pub fn add_cass_document_refs(&mut self, docs: &[CassDocumentRef<'_>]) -> SearchResult<()> {
+        use rayon::prelude::*;
+
+        const PARALLEL_PREP_THRESHOLD: usize = 8;
+
+        let fields = self.fields;
+        let writer_parallelism = cass_writer_config().num_threads.max(1);
+        let add_plan = cass_parallel_add_plan(
+            docs.len(),
+            writer_parallelism,
+            cass_parallel_add_target_batch_docs(),
+            cass_parallel_add_min_docs(),
+            cass_parallel_add_max_batches(),
+        );
+
+        debug!(
+            docs = docs.len(),
+            batch_docs = add_plan.batch_docs,
+            batch_count = add_plan.batch_count,
+            parallel_batches = add_plan.parallel_batches,
+            writer_parallelism,
+            "submitting borrowed cass-compatible documents to tantivy writer"
+        );
+
+        if add_plan.parallel_batches {
+            let writer = &self.writer;
+            docs.par_chunks(add_plan.batch_docs)
+                .try_for_each(|chunk| -> SearchResult<()> {
+                    let prepared: Vec<tantivy::TantivyDocument> = chunk
+                        .iter()
+                        .copied()
+                        .map(|cass_doc| build_cass_tantivy_document_ref(fields, cass_doc))
+                        .collect();
+                    writer
+                        .run(prepared.into_iter().map(UserOperation::Add))
+                        .map_err(tantivy_err)?;
+                    Ok(())
+                })?;
+        } else {
+            let prepared: Vec<tantivy::TantivyDocument> = if docs.len() < PARALLEL_PREP_THRESHOLD {
+                docs.iter()
+                    .copied()
+                    .map(|cass_doc| build_cass_tantivy_document_ref(fields, cass_doc))
+                    .collect()
+            } else {
+                docs.par_iter()
+                    .copied()
+                    .map(|cass_doc| build_cass_tantivy_document_ref(fields, cass_doc))
+                    .collect()
+            };
+            self.writer
+                .run(prepared.into_iter().map(UserOperation::Add))
+                .map_err(tantivy_err)?;
+        }
+        Ok(())
+    }
 }
 
 /// Build a single `TantivyDocument` for a cass document. Pure function so it
@@ -840,6 +913,50 @@ fn build_cass_tantivy_document(
         cass_generate_edge_ngrams(&cass_doc.content),
     );
     d.add_text(fields.preview, cass_build_preview(&cass_doc.content, 400));
+    d
+}
+
+fn build_cass_tantivy_document_ref(
+    fields: CassFields,
+    cass_doc: CassDocumentRef<'_>,
+) -> tantivy::TantivyDocument {
+    let mut d = doc! {
+        fields.agent => cass_doc.agent,
+        fields.source_path => cass_doc.source_path,
+        fields.msg_idx => cass_doc.msg_idx,
+        fields.content => cass_doc.content,
+        fields.source_id => cass_doc.source_id,
+        fields.origin_kind => cass_doc.origin_kind,
+    };
+
+    if let Some(host) = cass_doc.origin_host
+        && !host.is_empty()
+    {
+        d.add_text(fields.origin_host, host);
+    }
+    if let Some(field) = fields.conversation_id
+        && let Some(conversation_id) = cass_doc.conversation_id
+    {
+        d.add_i64(field, conversation_id);
+    }
+    if let Some(workspace) = cass_doc.workspace {
+        d.add_text(fields.workspace, workspace);
+    }
+    if let Some(workspace_original) = cass_doc.workspace_original {
+        d.add_text(fields.workspace_original, workspace_original);
+    }
+    if let Some(ts) = cass_doc.created_at {
+        d.add_i64(fields.created_at, ts);
+    }
+    if let Some(title) = cass_doc.title {
+        d.add_text(fields.title, title);
+        d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
+    }
+    d.add_text(
+        fields.content_prefix,
+        cass_generate_edge_ngrams(cass_doc.content),
+    );
+    d.add_text(fields.preview, cass_build_preview(cass_doc.content, 400));
     d
 }
 
