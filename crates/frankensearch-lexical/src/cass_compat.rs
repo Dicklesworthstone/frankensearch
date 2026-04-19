@@ -1108,23 +1108,22 @@ pub fn cass_ensure_tokenizer(index: &mut Index) {
 /// Generate edge n-grams from text for prefix search acceleration.
 #[must_use]
 pub fn cass_generate_edge_ngrams(text: &str) -> String {
-    const MAX_NGRAM_INDICES: usize = 21;
+    const MAX_NGRAM_CHARS: usize = 20;
     let mut ngrams = String::with_capacity(text.len() * 2);
     for word in text.split(|c: char| !c.is_alphanumeric()) {
-        let indices: Vec<usize> = word
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(word.len()))
-            .take(MAX_NGRAM_INDICES)
-            .collect();
-
-        if indices.len() < 3 {
-            continue;
-        }
-        for &end_idx in &indices[2..] {
+        let mut char_count = 0usize;
+        for (start_idx, ch) in word.char_indices() {
+            char_count += 1;
+            if char_count < 2 {
+                continue;
+            }
+            if char_count > MAX_NGRAM_CHARS {
+                break;
+            }
             if !ngrams.is_empty() {
                 ngrams.push(' ');
             }
+            let end_idx = start_idx + ch.len_utf8();
             ngrams.push_str(&word[..end_idx]);
         }
     }
@@ -1929,6 +1928,21 @@ mod cass_query_tests {
                 batch_docs: 512,
                 batch_count: 2,
             }
+        );
+    }
+
+    #[test]
+    fn cass_generate_edge_ngrams_emits_expected_prefixes() {
+        assert_eq!(cass_generate_edge_ngrams("hello world"), "he hel hell hello wo wor worl world");
+        assert_eq!(cass_generate_edge_ngrams("éclair"), "éc écl écla éclai éclair");
+        assert_eq!(cass_generate_edge_ngrams("x"), "");
+    }
+
+    #[test]
+    fn cass_generate_edge_ngrams_caps_prefixes_at_twenty_chars() {
+        assert_eq!(
+            cass_generate_edge_ngrams("abcdefghijklmnopqrstuvwxy"),
+            "ab abc abcd abcde abcdef abcdefg abcdefgh abcdefghi abcdefghij abcdefghijk abcdefghijkl abcdefghijklm abcdefghijklmn abcdefghijklmno abcdefghijklmnop abcdefghijklmnopq abcdefghijklmnopqr abcdefghijklmnopqrs abcdefghijklmnopqrst"
         );
     }
 
