@@ -16,9 +16,7 @@ use tantivy::schema::{
 };
 #[cfg(test)]
 use tantivy::tokenizer::RegexTokenizer;
-use tantivy::tokenizer::{
-    LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
-};
+use tantivy::tokenizer::{TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
 
@@ -26,7 +24,7 @@ use tracing::{debug, info, warn};
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
 pub const CASS_SCHEMA_HASH: &str =
-    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored";
+    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-basic-preview-stored-content-external";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -60,6 +58,7 @@ fn is_cass_tokenizer_cjk(c: char) -> bool {
             | '\u{3100}'..='\u{312F}'
             | '\u{3300}'..='\u{33FF}'
             | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
     )
 }
 
@@ -400,6 +399,66 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
         self.pending
             .last_mut()
             .unwrap_or_else(|| self.tail.token_mut())
+    }
+}
+
+/// A cass-specific normalization filter that preserves the behavior of
+/// `LowerCaser + RemoveLongFilter::limit(256)` for the restricted token
+/// language emitted by `CassTokenizer`.
+///
+/// `CassTokenizer` only emits ASCII alphanumeric runs (optionally hyphenated)
+/// plus CJK runs, so ASCII-only in-place lowercasing is behaviorally identical
+/// to Tantivy's generic lowercaser here while avoiding its broader Unicode path.
+#[derive(Clone, Copy, Default)]
+pub struct CassNormalizeAndLimit;
+
+impl TokenFilter for CassNormalizeAndLimit {
+    type Tokenizer<T: Tokenizer> = CassNormalizeAndLimitFilter<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> CassNormalizeAndLimitFilter<T> {
+        CassNormalizeAndLimitFilter { inner: tokenizer }
+    }
+}
+
+#[derive(Clone)]
+pub struct CassNormalizeAndLimitFilter<T> {
+    inner: T,
+}
+
+impl<T: Tokenizer> Tokenizer for CassNormalizeAndLimitFilter<T> {
+    type TokenStream<'a> = CassNormalizeAndLimitStream<T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        CassNormalizeAndLimitStream {
+            tail: self.inner.token_stream(text),
+        }
+    }
+}
+
+pub struct CassNormalizeAndLimitStream<T> {
+    tail: T,
+}
+
+impl<T: TokenStream> TokenStream for CassNormalizeAndLimitStream<T> {
+    fn advance(&mut self) -> bool {
+        while self.tail.advance() {
+            let token = self.tail.token_mut();
+            if token.text.len() > 256 {
+                continue;
+            }
+            token.text.make_ascii_lowercase();
+            return true;
+        }
+
+        false
+    }
+
+    fn token(&self) -> &Token {
+        self.tail.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.tail.token_mut()
     }
 }
 
@@ -1100,18 +1159,16 @@ fn build_cass_tantivy_document_ref(
 #[must_use]
 pub fn cass_build_schema() -> Schema {
     let mut schema_builder = Schema::builder();
-    let text = TextOptions::default()
-        .set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("hyphen_normalize")
-                .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
-        )
-        .set_stored();
-
+    let indexed_text = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("hyphen_normalize")
+            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+    );
+    let stored_indexed_text = indexed_text.clone().set_stored();
     let prefix_text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer("hyphen_normalize")
-            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqs),
+            .set_index_option(tantivy::schema::IndexRecordOption::Basic),
     );
 
     schema_builder.add_text_field("agent", STRING | STORED);
@@ -1120,8 +1177,8 @@ pub fn cass_build_schema() -> Schema {
     schema_builder.add_text_field("source_path", STORED);
     schema_builder.add_u64_field("msg_idx", INDEXED | STORED);
     schema_builder.add_i64_field("created_at", INDEXED | STORED | FAST);
-    schema_builder.add_text_field("title", text.clone());
-    schema_builder.add_text_field("content", text);
+    schema_builder.add_text_field("title", stored_indexed_text);
+    schema_builder.add_text_field("content", indexed_text);
     schema_builder.add_text_field("title_prefix", prefix_text.clone());
     schema_builder.add_text_field("content_prefix", prefix_text);
     schema_builder.add_text_field("preview", STORED);
@@ -1217,14 +1274,13 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 ///   3. `CjkBigramDecompose` — decomposes CJK-only tokens into overlapping
 ///      character bigrams so that sub-string queries work for Chinese,
 ///      Japanese, and Korean text.
-///   4. `LowerCaser` — normalizes to lowercase.
-///   5. `RemoveLongFilter` — drops tokens longer than 256 bytes.
+///   4. `CassNormalizeAndLimit` — applies the same lowercase + 256-byte
+///      length-limit semantics as the old `LowerCaser + RemoveLongFilter`.
 pub fn cass_ensure_tokenizer(index: &mut Index) {
     let analyzer = TextAnalyzer::builder(CassTokenizer::default())
         .filter(HyphenDecompose)
         .filter(CjkBigramDecompose)
-        .filter(LowerCaser)
-        .filter(RemoveLongFilter::limit(256))
+        .filter(CassNormalizeAndLimit)
         .build();
     index.tokenizers().register("hyphen_normalize", analyzer);
 }
@@ -1301,15 +1357,6 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     let mut word_start = 0usize;
     let mut in_word = false;
 
-    let emit_word_prefixes = |word: &str, indices: &[usize], ngrams: &mut String| {
-        if indices.len() < 3 {
-            return;
-        }
-        for &end_idx in &indices[2..] {
-            cass_push_prefix_term(ngrams, &word[..end_idx]);
-        }
-    };
-
     for (byte_idx, ch) in content.char_indices() {
         if preview_chars < PREVIEW_MAX_CHARS {
             preview.push(ch);
@@ -1336,11 +1383,11 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
                 word_indices[word_index_count] = byte_idx - word_start;
                 word_index_count += 1;
             }
-            emit_word_prefixes(
-                &content[word_start..byte_idx],
-                &word_indices[..word_index_count],
-                &mut ngrams,
-            );
+            if word_index_count >= 3 {
+                for &end_idx in &word_indices[2..word_index_count] {
+                    cass_push_prefix_term(&mut ngrams, &content[word_start..word_start + end_idx]);
+                }
+            }
             in_word = false;
         }
     }
@@ -1350,11 +1397,11 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
             word_indices[word_index_count] = content.len() - word_start;
             word_index_count += 1;
         }
-        emit_word_prefixes(
-            &content[word_start..],
-            &word_indices[..word_index_count],
-            &mut ngrams,
-        );
+        if word_index_count >= 3 {
+            for &end_idx in &word_indices[2..word_index_count] {
+                cass_push_prefix_term(&mut ngrams, &content[word_start..word_start + end_idx]);
+            }
+        }
     }
 
     if preview_truncated {
@@ -1733,8 +1780,8 @@ fn cass_term_query_fields(fields: &CassFields) -> [(Field, IndexRecordOption); 4
     [
         (fields.title, IndexRecordOption::WithFreqsAndPositions),
         (fields.content, IndexRecordOption::WithFreqsAndPositions),
-        (fields.title_prefix, IndexRecordOption::WithFreqs),
-        (fields.content_prefix, IndexRecordOption::WithFreqs),
+        (fields.title_prefix, IndexRecordOption::Basic),
+        (fields.content_prefix, IndexRecordOption::Basic),
     ]
 }
 
@@ -2178,7 +2225,7 @@ mod cass_query_tests {
     }
 
     #[test]
-    fn cass_prefix_fields_store_freqs_without_positions() {
+    fn cass_prefix_fields_store_basic_without_freqs_or_positions() {
         let schema = cass_build_schema();
 
         for field_name in ["title_prefix", "content_prefix"] {
@@ -2186,7 +2233,7 @@ mod cass_query_tests {
             let field_entry = schema.get_field_entry(field);
             assert_eq!(
                 field_entry.field_type().get_index_record_option(),
-                Some(IndexRecordOption::WithFreqs),
+                Some(IndexRecordOption::Basic),
                 "unexpected index record option for {field_name}"
             );
         }
@@ -2203,6 +2250,24 @@ mod cass_query_tests {
             field_entry.field_type().get_index_record_option(),
             None,
             "preview should not be indexed"
+        );
+    }
+
+    #[test]
+    fn cass_content_field_is_indexed_not_stored() {
+        let schema = cass_build_schema();
+        let field = schema.get_field("content").unwrap();
+        let field_entry = schema.get_field_entry(field);
+
+        assert!(field_entry.is_indexed(), "content must stay indexed");
+        assert!(
+            !field_entry.is_stored(),
+            "content should hydrate from canonical storage instead of Tantivy stored fields"
+        );
+        assert_eq!(
+            field_entry.field_type().get_index_record_option(),
+            Some(IndexRecordOption::WithFreqsAndPositions),
+            "content should keep full positional indexing"
         );
     }
 
@@ -2309,53 +2374,6 @@ mod cass_query_tests {
         assert_eq!(tokens, vec!["搜"]);
     }
 
-    fn legacy_cjk_bigram_output(text: &str) -> Vec<String> {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.is_empty() || !chars.iter().all(|c| is_cjk(*c)) {
-            return vec![text.to_string()];
-        }
-        if chars.len() == 1 {
-            return vec![text.to_string()];
-        }
-
-        let mut out = Vec::with_capacity(chars.len() - 1);
-        for i in 0..chars.len() - 1 {
-            let mut bigram = String::with_capacity(8);
-            bigram.push(chars[i]);
-            bigram.push(chars[i + 1]);
-            out.push(bigram);
-        }
-        out
-    }
-
-    #[test]
-    fn cjk_bigram_decompose_matches_legacy_reference() {
-        let regex_tok = RegexTokenizer::new(r"[^\s]+").unwrap();
-        let mut analyzer = TextAnalyzer::builder(regex_tok)
-            .filter(CjkBigramDecompose)
-            .build();
-
-        for sample in [
-            "搜",
-            "搜索",
-            "搜索引擎",
-            "あいうえお",
-            "가나다",
-            "hello",
-            "bd-q3fy",
-            "abc搜索",
-            "搜索abc",
-            "中A文",
-        ] {
-            let mut stream = analyzer.token_stream(sample);
-            let mut actual = Vec::new();
-            while stream.advance() {
-                actual.push(stream.token().text.clone());
-            }
-            assert_eq!(actual, legacy_cjk_bigram_output(sample), "sample={sample}");
-        }
-    }
-
     #[test]
     fn cjk_bigram_passes_through_ascii() {
         // ASCII tokens should pass through unchanged.
@@ -2381,7 +2399,7 @@ mod cass_query_tests {
         ).unwrap();
         let mut analyzer = TextAnalyzer::builder(regex_tok)
             .filter(CjkBigramDecompose)
-            .filter(LowerCaser)
+            .filter(CassNormalizeAndLimit)
             .build();
 
         // "Hello搜索World" -> hello, 搜索, world
@@ -2395,7 +2413,7 @@ mod cass_query_tests {
 
     #[test]
     fn cass_tokenizer_matches_legacy_regex_boundaries() {
-        let regex_pattern = r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF]+";
+        let regex_pattern = r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF\U00020000-\U0002A6DF]+";
         let mut regex = RegexTokenizer::new(regex_pattern).unwrap();
         let mut custom = CassTokenizer::default();
 
@@ -2434,6 +2452,77 @@ mod cass_query_tests {
             }
 
             assert_eq!(custom_tokens, regex_tokens, "token mismatch for {text:?}");
+        }
+    }
+
+    #[test]
+    fn cass_tokenizer_keeps_extension_b_cjk() {
+        let mut tokenizer = CassTokenizer::default();
+        let mut stream = tokenizer.token_stream("𠀀搜索 test");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            let token = stream.token();
+            tokens.push(token.text.clone());
+        }
+
+        assert_eq!(tokens, vec!["𠀀搜索".to_string(), "test".to_string()]);
+    }
+
+    #[test]
+    fn cass_normalize_and_limit_matches_legacy_pipeline() {
+        for text in [
+            "",
+            "Hello, happy tax payer!",
+            "BD-Q3FY foo_bar BAZ-QUX",
+            "abc-123 -- def",
+            "Hello搜索World",
+            "foo搜索-barあいう123",
+            "caf\u{00E9} 𠀀 token",
+            "multi---dash and trailing- hyphen",
+            &format!("{} keep", "X".repeat(300)),
+        ] {
+            let mut legacy = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(HyphenDecompose)
+                .filter(CjkBigramDecompose)
+                .filter(tantivy::tokenizer::LowerCaser)
+                .filter(tantivy::tokenizer::RemoveLongFilter::limit(256))
+                .build();
+            let mut optimized = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(HyphenDecompose)
+                .filter(CjkBigramDecompose)
+                .filter(CassNormalizeAndLimit)
+                .build();
+
+            let mut legacy_stream = legacy.token_stream(text);
+            let mut legacy_tokens = Vec::new();
+            while legacy_stream.advance() {
+                let token = legacy_stream.token();
+                legacy_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+
+            let mut optimized_stream = optimized.token_stream(text);
+            let mut optimized_tokens = Vec::new();
+            while optimized_stream.advance() {
+                let token = optimized_stream.token();
+                optimized_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+
+            assert_eq!(
+                optimized_tokens, legacy_tokens,
+                "normalized analyzer mismatch for {text:?}"
+            );
         }
     }
 
