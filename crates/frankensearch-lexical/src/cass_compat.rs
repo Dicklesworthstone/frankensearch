@@ -742,6 +742,27 @@ impl CassTantivyIndex {
     /// Returns [`SearchError`] if filesystem I/O, schema extraction, or Tantivy
     /// index creation/opening fails.
     pub fn open_or_create(path: &Path) -> SearchResult<Self> {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        Self::open_or_create_with_writer_parallelism(path, available_parallelism)
+    }
+
+    /// Open existing index or create/rebuild as needed, using an explicit
+    /// Tantivy writer parallelism budget instead of the host-wide default.
+    ///
+    /// This is used by cass staged shard builds so multiple isolated shard
+    /// writers can run concurrently without every shard trying to claim the
+    /// machine-wide maximum writer thread count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if filesystem I/O, schema extraction, or Tantivy
+    /// index creation/opening fails.
+    pub fn open_or_create_with_writer_parallelism(
+        path: &Path,
+        available_parallelism: usize,
+    ) -> SearchResult<Self> {
         std::fs::create_dir_all(path).map_err(tantivy_err)?;
 
         let meta_path = path.join("schema_hash.json");
@@ -793,7 +814,7 @@ impl CassTantivyIndex {
         .map_err(tantivy_err)?;
 
         let actual_schema = index.schema();
-        let writer_config = cass_writer_config();
+        let writer_config = cass_writer_config_for_parallelism(available_parallelism.max(1));
         debug!(
             tantivy_writer_threads = writer_config.num_threads,
             tantivy_writer_heap_mb = writer_config.heap_size_bytes / (1024 * 1024),
@@ -985,12 +1006,13 @@ impl CassTantivyIndex {
             let writer = &self.writer;
             docs.par_chunks(add_plan.batch_docs)
                 .try_for_each(|chunk| -> SearchResult<()> {
-                    let prepared: Vec<tantivy::TantivyDocument> = chunk
-                        .iter()
-                        .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
-                        .collect();
                     writer
-                        .run(prepared.into_iter().map(UserOperation::Add))
+                        .run(
+                            chunk
+                                .iter()
+                                .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                                .map(UserOperation::Add),
+                        )
                         .map_err(tantivy_err)?;
                     Ok(())
                 })?;
@@ -1011,6 +1033,11 @@ impl CassTantivyIndex {
         Ok(())
     }
 
+    /// Add a batch of borrowed cass-compatible documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::SubsystemError`] if adding a document to Tantivy fails.
     pub fn add_cass_document_refs(&mut self, docs: &[CassDocumentRef<'_>]) -> SearchResult<()> {
         use rayon::prelude::*;
 
@@ -1039,13 +1066,14 @@ impl CassTantivyIndex {
             let writer = &self.writer;
             docs.par_chunks(add_plan.batch_docs)
                 .try_for_each(|chunk| -> SearchResult<()> {
-                    let prepared: Vec<tantivy::TantivyDocument> = chunk
-                        .iter()
-                        .copied()
-                        .map(|cass_doc| build_cass_tantivy_document_ref(fields, cass_doc))
-                        .collect();
                     writer
-                        .run(prepared.into_iter().map(UserOperation::Add))
+                        .run(
+                            chunk
+                                .iter()
+                                .copied()
+                                .map(|cass_doc| build_cass_tantivy_document_ref(fields, cass_doc))
+                                .map(UserOperation::Add),
+                        )
                         .map_err(tantivy_err)?;
                     Ok(())
                 })?;
