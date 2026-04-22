@@ -4975,6 +4975,8 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
+        use std::os::unix::process::CommandExt;
+
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -5006,6 +5008,64 @@ impl FsfsRuntime {
         if self.cli_input.no_color {
             command.arg("--no-color");
         }
+
+        // SAFETY: pre_exec runs in the forked child before execve, so the
+        // only thing the closure can safely do is async-signal-safe
+        // syscalls. `prctl(PR_SET_PDEATHSIG)` is on the official
+        // async-signal-safe list (it's just a direct syscall with no libc
+        // heap/stdio touching), so this is sound per the std docs.
+        //
+        // What this buys us: if the spawning process (the cargo-test
+        // parent, or the interactive shell invoking `fsfs search
+        // --daemon`) dies from any cause — SIGKILL, segfault, oomd,
+        // ctrl-c on the terminal — the kernel will deliver SIGTERM to
+        // this daemon. Without this hook, the daemon got reparented to
+        // PID 1 and stayed alive with its socket open, blocking the
+        // next index/search attempt at bind() time. The Apr 21 2026
+        // trj incident accumulated 41 orphaned daemons exactly this way.
+        //
+        // We send SIGTERM (not SIGKILL) so the daemon gets a chance to
+        // flush in-flight writes to its index and socket. The MCP/CLI
+        // layer that starts the daemon will eventually retry if the
+        // child is gone on reconnect, so the window where the child
+        // dies mid-shutdown is handled by the existing reconnect
+        // plumbing in `search_via_daemon`.
+        //
+        // Note: users who intentionally want a persistent daemon that
+        // outlives their shell should use `nohup fsfs search --daemon …`
+        // or `systemd-run --user --scope fsfs search --daemon …`, both
+        // of which reparent the process before pdeathsig can fire.
+        //
+        // The crate defaults to `#![deny(unsafe_code)]`, but lifecycle
+        // plumbing (kill(2), daemonization, etc.) is explicitly allowed
+        // per the lib.rs comment. pre_exec is unsafe because the closure
+        // runs in the forked child and the stdlib can't verify the
+        // async-signal-safety of whatever the caller puts in there; the
+        // two calls we make — `prctl` and `getppid` — are both on the
+        // signal-safe list (see signal-safety(7)).
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
+                    == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Race guard: if the parent already died between fork and
+                // this point, we won't receive the pdeathsig (the kernel
+                // only delivers it on *subsequent* parent death, not
+                // retroactively). Detect that case by checking getppid()
+                // and abort the child so we don't orphan immediately at
+                // startup.
+                if libc::getppid() == 1 {
+                    return Err(std::io::Error::other(
+                        "parent exited before daemon could install pdeathsig",
+                    ));
+                }
+                Ok(())
+            });
+        }
+
         command.spawn().map_err(SearchError::Io)?;
         Ok(())
     }
