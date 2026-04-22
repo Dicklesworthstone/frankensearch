@@ -5046,8 +5046,13 @@ impl FsfsRuntime {
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
-                    == -1
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) == -1
                 {
                     return Err(std::io::Error::last_os_error());
                 }
