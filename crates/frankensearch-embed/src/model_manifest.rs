@@ -2680,7 +2680,18 @@ mod tests {
         for manifest in manifests {
             assert!(!manifest.version.is_empty());
             assert!(manifest.description.is_some());
-            assert!(manifest.download_size_bytes > 0);
+            // Some built-in manifests intentionally use placeholder metadata
+            // (sha256=PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, size=0) so that file
+            // sizes are confirmed at runtime during the first download rather
+            // than baked into source code. For those, we only assert the
+            // size-sum invariant, not a non-zero total.
+            let all_placeholder = manifest
+                .files
+                .iter()
+                .all(|file| file.sha256 == PLACEHOLDER_VERIFY_AFTER_DOWNLOAD);
+            if !all_placeholder {
+                assert!(manifest.download_size_bytes > 0);
+            }
             let summed_size: u64 = manifest.files.iter().map(|file| file.size).sum();
             assert_eq!(manifest.download_size_bytes, summed_size);
         }
