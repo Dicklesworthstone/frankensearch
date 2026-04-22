@@ -1,0 +1,66 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:00:00Z",
+  "ok": true,
+  "data": {
+    "schema_version": "fsfs.explanation.payload.v1",
+    "query": "rust async search",
+    "trace": {
+      "trace_id": "01JABCDEF00000000000000000",
+      "event_id": "01JABCDEF00000000000000001",
+      "parent_event_id": null,
+      "claim_id": null,
+      "policy_id": null
+    },
+    "ranking": {
+      "doc_id": "doc-42",
+      "final_score": 0.812,
+      "phase": "Refined",
+      "reason_code": "query.explain.attached",
+      "confidence_per_mille": 950,
+      "rank_movement": {
+        "initial_rank": 5,
+        "refined_rank": 2,
+        "delta": -3,
+        "reason": "quality model promoted result"
+      },
+      "fusion": null,
+      "components": [
+        {
+          "source": "semantic_quality",
+          "summary": "QualitySemantic(all-MiniLM-L6-v2, cos=0.9200)",
+          "raw_score": 0.92,
+          "normalized_score": 0.87,
+          "rrf_contribution": 0.014,
+          "weight": 0.7,
+          "confidence_per_mille": 663
+        }
+      ]
+    },
+    "policy_decisions": [
+      {
+        "domain": "degradation",
+        "decision": "LexicalOnly",
+        "reason_code": "degrade.transition.lexical_only",
+        "confidence_per_mille": 850,
+        "summary": "degradation transition EmbedDeferred -> LexicalOnly (changed=true)",
+        "metadata": {
+          "banner": "Degraded mode",
+          "changed": "true",
+          "controls_hint": "override:auto|normal",
+          "from": "EmbedDeferred",
+          "manual_intervention": "false",
+          "override_guardrail": "metadata-only and pause remain available as emergency guardrails",
+          "override_mode": "Auto",
+          "to": "LexicalOnly",
+          "transition_context": "pressure_escalation"
+        }
+      }
+    ]
+  },
+  "meta": {
+    "command": "explain",
+    "format": "json",
+    "request_id": "01JABCDEF00000000000000002"
+  }
+}

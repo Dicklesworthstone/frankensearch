@@ -189,10 +189,12 @@ impl FlashRankReranker {
         // Load ONNX session with Level3 optimization
         let session = Session::builder()
             .and_then(|b| {
-                b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+                Ok(b.with_optimization_level(
+                    ort::session::builder::GraphOptimizationLevel::Level3,
+                )?)
             })
-            .and_then(|b| b.with_intra_threads(num_cpus()))
-            .and_then(|b| b.commit_from_file(&model_file))
+            .and_then(|b| Ok(b.with_intra_threads(num_cpus())?))
+            .and_then(|mut b| b.commit_from_file(&model_file))
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_file.clone(),
                 source: format!("ONNX session creation failed: {e}").into(),

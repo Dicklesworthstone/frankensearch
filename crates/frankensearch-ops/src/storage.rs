@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS search_events (
     correlation_id TEXT NOT NULL,
     query_hash TEXT,
     query_class TEXT,
-    phase TEXT NOT NULL CHECK (phase IN ('initial', 'refined', 'failed')),
+    phase TEXT NOT NULL CHECK (phase IN ('initial', 'refined', 'reranked', 'failed')),
     latency_us INTEGER NOT NULL,
     result_count INTEGER,
     memory_bytes INTEGER,

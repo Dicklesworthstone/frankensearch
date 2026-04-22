@@ -1,0 +1,40 @@
+{
+  "schema_version": "fsfs.explanation.payload.v1",
+  "query": "hybrid ranking",
+  "trace": null,
+  "ranking": {
+    "doc_id": "doc-42",
+    "final_score": 0.812,
+    "phase": "Refined",
+    "reason_code": "query.explain.attached",
+    "confidence_per_mille": 950,
+    "rank_movement": {
+      "initial_rank": 5,
+      "refined_rank": 2,
+      "delta": -3,
+      "reason": "quality model promoted result"
+    },
+    "fusion": null,
+    "components": [
+      {
+        "source": "semantic_quality",
+        "summary": "QualitySemantic(all-MiniLM-L6-v2, cos=0.9200)",
+        "raw_score": 0.92,
+        "normalized_score": 0.87,
+        "rrf_contribution": 0.014,
+        "weight": 0.7,
+        "confidence_per_mille": 663
+      }
+    ]
+  },
+  "policy_decisions": [
+    {
+      "domain": "query_execution",
+      "decision": "normal",
+      "reason_code": "query.execution.normal",
+      "confidence_per_mille": 910,
+      "summary": "normal execution plan",
+      "metadata": {}
+    }
+  ]
+}
