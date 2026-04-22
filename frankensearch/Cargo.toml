@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch"
-version = "0.1.0"
+version = "0.3.0"
 description = "Two-tier hybrid search for Rust: sub-millisecond initial results, quality-refined rankings in 150ms"
 edition.workspace = true
 license-file.workspace = true

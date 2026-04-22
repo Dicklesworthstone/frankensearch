@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fusion"
-version = "0.1.0"
+version = "0.2.0"
 description = "RRF fusion, score blending, and two-tier progressive search for frankensearch"
 edition.workspace = true
 license-file.workspace = true

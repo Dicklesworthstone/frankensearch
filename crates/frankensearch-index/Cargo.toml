@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-index"
-version = "0.1.2"
+version = "0.2.0"
 description = "FSVI vector index, SIMD dot product, and top-k search for frankensearch"
 edition.workspace = true
 license-file.workspace = true
