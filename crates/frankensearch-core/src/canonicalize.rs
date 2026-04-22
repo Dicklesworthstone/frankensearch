@@ -182,6 +182,7 @@ fn strip_markdown_line(line: &str) -> String {
     result = result.replace("**", "");
     result = result.replace("__", "");
     result = result.replace('*', "");
+    result = strip_italic_underscores(&result);
 
     // Remove inline code backticks
     result = result.replace('`', "");
@@ -199,6 +200,36 @@ fn strip_markdown_line(line: &str) -> String {
     result = strip_list_marker(&result);
 
     result
+}
+
+/// Strip italic underscore markers (`_word_`) while preserving underscores inside
+/// identifiers (`snake_case`). An underscore is treated as an italic marker only
+/// when it lies on a word boundary: no adjacent alphanumeric or underscore on
+/// the side facing away from the emphasized span.
+fn strip_italic_underscores(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut keep = vec![true; n];
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+    for i in 0..n {
+        if chars[i] != '_' {
+            continue;
+        }
+        let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
+        let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
+        // Opening marker: preceded by non-word (or BOL), followed by word
+        // Closing marker: preceded by word, followed by non-word (or EOL)
+        if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
+            keep[i] = false;
+        }
+    }
+
+    chars
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| if k { Some(c) } else { None })
+        .collect()
 }
 
 /// Strip markdown links: `[text](url)` → `text`.
