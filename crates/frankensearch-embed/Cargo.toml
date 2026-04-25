@@ -10,7 +10,13 @@ repository.workspace = true
 default = ["hash"]
 hash = []
 model2vec = ["dep:safetensors", "dep:tokenizers"]
-fastembed = ["dep:fastembed"]
+# fastembed v5's `hf-hub-rustls-tls` feature does NOT pass
+# default-features = false to hf-hub, so hf-hub still pulls native-tls
+# (openssl-sys) on top of rustls. We pull openssl-sys explicitly with the
+# `vendored` feature so musl/aarch64/intel-darwin cross-compile works
+# without a system OpenSSL toolchain. The dep is gated under the same
+# `fastembed` feature it follows so non-fastembed builds skip it entirely.
+fastembed = ["dep:fastembed", "dep:openssl-sys"]
 download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 api = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 bundled-default-models = ["model2vec", "fastembed"]
@@ -28,6 +34,9 @@ sha2 = { workspace = true }
 safetensors = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
+# Pulled in only when fastembed is enabled — see comment on the
+# `fastembed` feature above for why we vendor openssl.
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true }

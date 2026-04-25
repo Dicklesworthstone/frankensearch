@@ -77,7 +77,15 @@ wide = "1.1.1"
 memmap2 = "0.9"
 
 # Embedder dependencies (feature-gated per crate)
-fastembed = "5.11.0"
+# Default features pull in native-tls (openssl-sys), which breaks
+# cross-compilation to musl/aarch64-linux/intel-darwin in downstream
+# release pipelines. Force rustls TLS via explicit features.
+fastembed = { version = "5.11.0", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+    "online",
+    "image-models",
+] }
 safetensors = "0.7.0"
 tokenizers = "0.22.2"
 
@@ -85,7 +93,9 @@ tokenizers = "0.22.2"
 tantivy = "0.25.0"
 
 # ONNX Runtime for cross-encoder reranking
-ort = "2.0.0-rc.11"
+# Match fastembed's TLS choice: rustls-only so musl/aarch64 cross builds
+# don't need a system OpenSSL toolchain.
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["download-binaries", "tls-rustls"] }
 ndarray = "0.17"
 
 # HNSW approximate nearest neighbors
