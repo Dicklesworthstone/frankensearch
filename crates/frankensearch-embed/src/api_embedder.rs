@@ -121,14 +121,12 @@ impl ApiEmbedder {
     /// Create a new API embedder with the given provider and configuration.
     #[must_use]
     pub fn new(provider: Box<dyn ApiProvider>, config: ApiEmbedderConfig) -> Self {
-        let client_config = HttpClientConfig {
-            redirect_policy: RedirectPolicy::Limited(5),
-            user_agent: Some(format!(
-                "frankensearch/{} (api-embedder)",
-                env!("CARGO_PKG_VERSION")
-            )),
-            ..HttpClientConfig::default()
-        };
+        let mut client_config = HttpClientConfig::default();
+        client_config.redirect_policy = RedirectPolicy::Limited(5);
+        client_config.user_agent = Some(format!(
+            "frankensearch/{} (api-embedder)",
+            env!("CARGO_PKG_VERSION")
+        ));
         let rate_limiter = RateLimiter::new(config.requests_per_minute);
         Self {
             provider,

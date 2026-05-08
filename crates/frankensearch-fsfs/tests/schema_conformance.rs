@@ -601,6 +601,32 @@ fn test_index_freshness_audit_report_conformance() {
 }
 
 #[test]
+fn test_progressive_release_quality_gate_pack_conformance() {
+    use frankensearch_fsfs::progressive_quality_gate::{
+        GateVerdict, PROGRESSIVE_RELEASE_GATE_KIND, ReleaseGatePack, default_release_gate_input,
+    };
+
+    let report = ReleaseGatePack::from_input(default_release_gate_input("schema-release-gate"));
+
+    assert_eq!(report.kind, PROGRESSIVE_RELEASE_GATE_KIND);
+    assert_eq!(report.summary.verdict, GateVerdict::Pass);
+    assert_eq!(report.summary.lane_count, 4);
+    assert_eq!(report.summary.phase_contract_count, 12);
+    assert_eq!(report.summary.quality_envelope_count, 12);
+    assert!(report.findings.is_empty());
+    assert!(
+        report
+            .human_summary
+            .contains("Progressive Release Quality Gate")
+    );
+    assert!(report.replay_command.contains("--mode all"));
+
+    let serialized = serde_json::to_string_pretty(&report).expect("serialize release gate");
+    let parsed: ReleaseGatePack = serde_json::from_str(&serialized).expect("parse release gate");
+    assert_eq!(parsed, report);
+}
+
+#[test]
 fn test_incremental_change_invalid_fixtures_are_rejected_by_rust() {
     assert_invalid_rust_fixture::<
         frankensearch_fsfs::incremental_change::IncrementalChangeDetectionContractDefinition,

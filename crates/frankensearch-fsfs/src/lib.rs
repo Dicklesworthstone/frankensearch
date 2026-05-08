@@ -38,6 +38,7 @@ pub mod pressure_profile_contract;
 pub mod pressure_sensing;
 pub mod privacy;
 pub mod profiling;
+pub mod progressive_quality_gate;
 pub mod provenance;
 pub mod query_execution;
 pub mod query_expansion;
@@ -205,6 +206,13 @@ pub use profiling::{
     SelfCalibratingProfileArtifact, SelfCalibratingProfileArtifactKind,
     SelfCalibratingProfileInput, SelfCalibratingProfileReport, crawl_ingest_opportunity_matrix,
     crawl_ingest_optimization_track,
+};
+pub use progressive_quality_gate::{
+    ArtifactKind, FeatureLane, FeatureLaneGate, GateArtifact, GateFinding, GateStatus, GateSummary,
+    GateVerdict, LexicalFallbackGate, MetricKind, OrderingGate, PROGRESSIVE_RELEASE_GATE_KIND,
+    PROGRESSIVE_RELEASE_GATE_MATRIX_VERSION, PROGRESSIVE_RELEASE_GATE_SCHEMA_VERSION,
+    PhaseContractGate, PhaseKind, QualityEnvelopeGate, ReleaseGateInput, ReleaseGatePack,
+    default_release_gate_input,
 };
 pub use query_execution::{
     CancellationAction, CancellationDirective, CancellationPoint, DegradationOverride,
