@@ -41,7 +41,7 @@ pub enum RecommendationBundleKind {
     Current,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Subsystem {
     IngestionPolicy,
@@ -118,12 +118,76 @@ pub struct RecommendationCard {
 }
 
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RecommendationBundle {
     pub kind: RecommendationBundleKind,
     pub v: SchemaVersion1,
     pub cards: Vec<RecommendationCard>,
+}
+
+impl RecommendationBundle {
+    fn validate(&self) -> Result<(), String> {
+        if self.cards.len() < 3 {
+            return Err("recommendation bundle requires at least 3 cards".to_owned());
+        }
+
+        let mut has_ingestion_policy = false;
+        let mut has_degradation_scheduler = false;
+        let mut has_ranking_policy = false;
+
+        for card in &self.cards {
+            match card.subsystem {
+                Subsystem::IngestionPolicy => has_ingestion_policy = true,
+                Subsystem::DegradationScheduler => has_degradation_scheduler = true,
+                Subsystem::RankingPolicy => has_ranking_policy = true,
+            }
+        }
+
+        let mut missing = Vec::new();
+        if !has_ingestion_policy {
+            missing.push("ingestion_policy");
+        }
+        if !has_degradation_scheduler {
+            missing.push("degradation_scheduler");
+        }
+        if !has_ranking_policy {
+            missing.push("ranking_policy");
+        }
+
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "recommendation bundle missing required subsystem cards: {}",
+                missing.join(", ")
+            ))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RecommendationBundle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawRecommendationBundle {
+            kind: RecommendationBundleKind,
+            v: SchemaVersion1,
+            cards: Vec<RecommendationCard>,
+        }
+
+        let raw = RawRecommendationBundle::deserialize(deserializer)?;
+        let bundle = Self {
+            kind: raw.kind,
+            v: raw.v,
+            cards: raw.cards,
+        };
+        bundle.validate().map_err(de::Error::custom)?;
+        Ok(bundle)
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +268,18 @@ mod tests {
             serde_json::from_value::<RecommendationBundle>(value).expect_err("reject extra field");
 
         assert!(error.to_string().contains("unknown field `extra`"));
+    }
+
+    #[test]
+    fn recommendation_bundle_requires_all_subsystems() {
+        let value = json!({
+            "kind": "fsfs_alien_recommendation_bundle",
+            "v": 1,
+            "cards": [valid_card(), valid_card(), valid_card()]
+        });
+
+        let error = serde_json::from_value::<RecommendationBundle>(value).expect_err("reject gap");
+
+        assert!(error.to_string().contains("ranking_policy"));
     }
 }

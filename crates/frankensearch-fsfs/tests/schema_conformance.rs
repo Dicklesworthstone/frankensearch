@@ -606,6 +606,19 @@ fn test_alien_recommendation_card_ingestion_conformance() {
 }
 
 #[test]
+fn test_alien_recommendation_invalid_fixtures_are_rejected_by_rust() {
+    assert_invalid_rust_fixture::<frankensearch_fsfs::alien_recommendations::RecommendationCard>(
+        "fsfs-alien-recommendation-invalid-missing-fallback-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::alien_recommendations::RecommendationCard>(
+        "fsfs-alien-recommendation-invalid-missing-baseline-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::alien_recommendations::RecommendationBundle>(
+        "fsfs-alien-recommendation-invalid-bundle-missing-subsystem-v1.json",
+    );
+}
+
+#[test]
 fn test_determinism_contract_conformance() {
     let path = fixture_dir().join("fsfs-determinism-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
@@ -630,6 +643,19 @@ fn test_determinism_check_result_conformance() {
     let parsed: frankensearch_fsfs::determinism::DeterminismCheckResult =
         serde_json::from_str(&raw).expect("parse determinism check result");
     assert_golden_json("fsfs_determinism_check_result_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_determinism_invalid_fixtures_are_rejected_by_rust() {
+    assert_invalid_rust_fixture::<frankensearch_fsfs::determinism::ReproManifest>(
+        "fsfs-determinism-invalid-missing-seed-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::determinism::DeterminismCheckResult>(
+        "fsfs-determinism-invalid-tier1-mode-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::determinism::DeterminismCheckResult>(
+        "fsfs-determinism-invalid-failure-without-diagnostics-v1.json",
+    );
 }
 
 #[test]

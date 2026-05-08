@@ -202,7 +202,7 @@ pub struct MismatchDiagnostic {
     pub rhs: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeterminismCheckResult {
     pub kind: DeterminismCheckResultKind,
@@ -216,6 +216,76 @@ pub struct DeterminismCheckResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tolerance_policy: Option<TolerancePolicy>,
     pub mismatch_diagnostics: Vec<MismatchDiagnostic>,
+}
+
+impl DeterminismCheckResult {
+    fn validate(&self) -> Result<(), String> {
+        let expected_mode = match self.determinism_tier {
+            DeterminismTier::Tier1 => ComparisonMode::BitExact,
+            DeterminismTier::Tier2 => ComparisonMode::SemanticEquivalence,
+            DeterminismTier::Tier3 => ComparisonMode::StatisticalTolerance,
+        };
+
+        if self.comparison_mode != expected_mode {
+            return Err(format!(
+                "{:?} determinism check result requires {:?} comparison mode",
+                self.determinism_tier, expected_mode
+            ));
+        }
+
+        if matches!(self.determinism_tier, DeterminismTier::Tier3)
+            && self.tolerance_policy.is_none()
+        {
+            return Err("tier3 determinism check result requires tolerance_policy".to_owned());
+        }
+
+        if !self.pass && self.mismatch_diagnostics.is_empty() {
+            return Err(
+                "failed determinism check result requires at least one mismatch diagnostic"
+                    .to_owned(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeterminismCheckResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawDeterminismCheckResult {
+            kind: DeterminismCheckResultKind,
+            v: SchemaVersion1,
+            scenario_id: String,
+            determinism_tier: DeterminismTier,
+            comparison_mode: ComparisonMode,
+            run_count: u32,
+            pass: bool,
+            manifest_ref: String,
+            tolerance_policy: Option<TolerancePolicy>,
+            mismatch_diagnostics: Vec<MismatchDiagnostic>,
+        }
+
+        let raw = RawDeterminismCheckResult::deserialize(deserializer)?;
+        let result = Self {
+            kind: raw.kind,
+            v: raw.v,
+            scenario_id: raw.scenario_id,
+            determinism_tier: raw.determinism_tier,
+            comparison_mode: raw.comparison_mode,
+            run_count: raw.run_count,
+            pass: raw.pass,
+            manifest_ref: raw.manifest_ref,
+            tolerance_policy: raw.tolerance_policy,
+            mismatch_diagnostics: raw.mismatch_diagnostics,
+        };
+        result.validate().map_err(de::Error::custom)?;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +378,27 @@ mod tests {
             .expect_err("reject extra field");
 
         assert!(error.to_string().contains("unknown field `extra`"));
+    }
+
+    #[test]
+    fn check_result_rejects_tier_comparison_mismatch() {
+        let mut value = valid_check_result();
+        value["comparison_mode"] = json!("semantic_equivalence");
+
+        let error = serde_json::from_value::<DeterminismCheckResult>(value)
+            .expect_err("reject tier1 semantic mode");
+
+        assert!(error.to_string().contains("BitExact"));
+    }
+
+    #[test]
+    fn check_result_rejects_failed_result_without_diagnostics() {
+        let mut value = valid_check_result();
+        value["pass"] = json!(false);
+
+        let error = serde_json::from_value::<DeterminismCheckResult>(value)
+            .expect_err("reject failed result without diagnostics");
+
+        assert!(error.to_string().contains("mismatch diagnostic"));
     }
 }
