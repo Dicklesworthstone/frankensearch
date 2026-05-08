@@ -418,17 +418,20 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
   feature-matrix:
-    name: Feature check (${{ matrix.features }})
+    name: Feature smoke (${{ matrix.lane }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        features:
+        lane:
           - default
           - semantic
           - hybrid
+          - persistent
+          - durable
           - full
+          - full-fts5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -469,14 +472,20 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: feature-matrix-${{ matrix.features }}
+          shared-key: feature-matrix-${{ matrix.lane }}
           cache-targets: true
 
-      - name: cargo check --features ${{ matrix.features }}
-        run: cargo check -p frankensearch --features ${{ matrix.features }}
+      - name: Per-feature smoke lane
+        shell: bash
+        run: scripts/check_feature_matrix.sh --lane ${{ matrix.lane }} --artifact-dir ci_artifacts/feature_smoke
 
-      - name: cargo test --features ${{ matrix.features }}
-        run: cargo test -p frankensearch --features ${{ matrix.features }}
+      - name: Upload feature smoke artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-smoke-${{ matrix.lane }}
+          path: ci_artifacts/feature_smoke/*
+          retention-days: 14
 
   release-build:
     name: Release build (${{ matrix.target }})

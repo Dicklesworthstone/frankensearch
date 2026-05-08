@@ -458,3 +458,120 @@ mod tests {
         let _ = std::mem::size_of::<RepairCodecVerifyResult>();
     }
 }
+
+#[cfg(test)]
+mod feature_matrix_smoke {
+    use super::*;
+
+    fn assert_core_facade_contract() {
+        let _config = TwoTierConfig::default();
+        let _metrics = TwoTierMetrics::default();
+        assert_ne!(ScoreSource::Hybrid, ScoreSource::Lexical);
+        assert!(matches!(
+            QueryClass::classify("hybrid search ranking"),
+            QueryClass::NaturalLanguage | QueryClass::ShortKeyword
+        ));
+    }
+
+    #[cfg(feature = "hash")]
+    fn assert_hash_exports() {
+        let embedder = HashEmbedder::default_256();
+        assert_eq!(embedder.dimension(), 256);
+        assert!(!embedder.is_semantic());
+    }
+
+    #[cfg(feature = "semantic")]
+    fn assert_semantic_exports() {
+        assert_hash_exports();
+        assert!(std::mem::size_of::<Model2VecEmbedder>() > 0);
+        assert!(std::mem::size_of::<FastEmbedEmbedder>() > 0);
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn assert_hybrid_exports() {
+        assert_semantic_exports();
+        assert!(std::mem::size_of::<TantivyIndex>() > 0);
+    }
+
+    #[cfg(feature = "persistent")]
+    fn assert_persistent_exports() {
+        assert_hybrid_exports();
+        let _storage_config = StorageConfig::default();
+        let _job_queue_config = JobQueueConfig::default();
+        assert!(matches!(IngestAction::New, IngestAction::New));
+        assert!(std::mem::size_of::<StorageBackedJobRunner>() > 0);
+    }
+
+    #[cfg(feature = "durable")]
+    fn assert_durable_exports() {
+        assert_persistent_exports();
+        let _durability_config = DurabilityConfig::default();
+        assert!(std::mem::size_of::<FsviProtector>() > 0);
+    }
+
+    #[cfg(feature = "full")]
+    fn assert_full_exports() {
+        assert_durable_exports();
+        let hnsw_config = HnswConfig::default();
+        assert!(hnsw_config.m > 0);
+        let _graph_ranker = GraphRanker::new();
+        assert!(std::mem::size_of::<FlashRankReranker>() > 0);
+    }
+
+    #[cfg(feature = "fts5")]
+    fn assert_fts5_exports() {
+        let config = Fts5Config::default();
+        assert!(config.title_boost > 0.0);
+        assert!(matches!(Fts5Tokenizer::default(), Fts5Tokenizer::Unicode61));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn default_lane_behavior() {
+        assert_core_facade_contract();
+        assert_hash_exports();
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn semantic_lane_behavior() {
+        assert_core_facade_contract();
+        assert_semantic_exports();
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn hybrid_lane_behavior() {
+        assert_core_facade_contract();
+        assert_hybrid_exports();
+    }
+
+    #[cfg(feature = "persistent")]
+    #[test]
+    fn persistent_lane_behavior() {
+        assert_core_facade_contract();
+        assert_persistent_exports();
+    }
+
+    #[cfg(feature = "durable")]
+    #[test]
+    fn durable_lane_behavior() {
+        assert_core_facade_contract();
+        assert_durable_exports();
+    }
+
+    #[cfg(feature = "full")]
+    #[test]
+    fn full_lane_behavior() {
+        assert_core_facade_contract();
+        assert_full_exports();
+    }
+
+    #[cfg(feature = "full-fts5")]
+    #[test]
+    fn full_fts5_lane_behavior() {
+        assert_core_facade_contract();
+        assert_full_exports();
+        assert_fts5_exports();
+    }
+}
