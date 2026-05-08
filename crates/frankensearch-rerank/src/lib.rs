@@ -186,17 +186,29 @@ impl FlashRankReranker {
             max_length
         };
 
-        // Load ONNX session with Level3 optimization
-        let session = Session::builder()
-            .and_then(|b| {
-                b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            })
-            .and_then(|b| b.with_intra_threads(num_cpus()))
-            .and_then(|b| b.commit_from_file(&model_file))
+        // Load ONNX session with Level3 optimization.
+        let session_builder = Session::builder().map_err(|e| SearchError::ModelLoadFailed {
+            path: model_file.clone(),
+            source: format!("ONNX session creation failed: {e}").into(),
+        })?;
+        let session_builder = session_builder
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_file.clone(),
                 source: format!("ONNX session creation failed: {e}").into(),
             })?;
+        let mut session_builder = session_builder
+            .with_intra_threads(num_cpus())
+            .map_err(|e| SearchError::ModelLoadFailed {
+                path: model_file.clone(),
+                source: format!("ONNX session creation failed: {e}").into(),
+            })?;
+        let session = session_builder.commit_from_file(&model_file).map_err(|e| {
+            SearchError::ModelLoadFailed {
+                path: model_file.clone(),
+                source: format!("ONNX session creation failed: {e}").into(),
+            }
+        })?;
 
         // Detect required input names
         let input_names: Vec<String> = session
