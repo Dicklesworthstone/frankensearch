@@ -7288,6 +7288,14 @@ impl FsfsRuntime {
                 break;
             }
 
+            if cx.is_cancel_requested() {
+                info!("daemon: runtime cancellation requested");
+                return Err(SearchError::Cancelled {
+                    phase: "fsfs.daemon".to_owned(),
+                    reason: "runtime cancellation requested".to_owned(),
+                });
+            }
+
             // Poll WAL file size.
             let current_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
 
@@ -7341,11 +7349,8 @@ impl FsfsRuntime {
                 last_wal_len = current_wal_len;
             }
 
-            // Sleep for the poll interval.
-            // Use std::thread::sleep since this is a simple polling loop.
-            // The shutdown coordinator handles SIGINT.
-            let _ = cx;
-            std::thread::sleep(Duration::from_millis(poll_ms));
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(poll_ms))
+                .await;
         }
 
         Ok(())
@@ -8218,7 +8223,11 @@ impl FsfsRuntime {
                                 error = %error,
                                 "embedder probe failed; retrying"
                             );
-                            std::thread::sleep(Duration::from_millis(backoff_ms));
+                            asupersync::time::sleep(
+                                asupersync::time::wall_now(),
+                                Duration::from_millis(backoff_ms),
+                            )
+                            .await;
                         } else {
                             let reason = format!(
                                 "embedder '{}' probe failed after {} attempts: {}",
@@ -8530,7 +8539,11 @@ impl FsfsRuntime {
                                     &degradation_reason,
                                     &recent_warnings,
                                 ))?;
-                                std::thread::sleep(Duration::from_millis(backoff_ms));
+                                asupersync::time::sleep(
+                                    asupersync::time::wall_now(),
+                                    Duration::from_millis(backoff_ms),
+                                )
+                                .await;
                             } else {
                                 embedding_failures = embedding_failures.saturating_add(1);
                                 let msg = format!(
@@ -15242,6 +15255,29 @@ mod tests {
         decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+
+    #[test]
+    fn async_runtime_retries_do_not_use_blocking_thread_sleep() {
+        let source = include_str!("runtime.rs");
+        let blocking_call = ["std::thread", "::sleep"].concat();
+
+        for forbidden in [
+            format!("{blocking_call}(Duration::from_millis(poll_ms))"),
+            format!("{blocking_call}(Duration::from_millis(backoff_ms))"),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "async fsfs runtime path still contains blocking sleep: {forbidden}"
+            );
+        }
+
+        assert!(
+            source.contains(
+                "std::thread::sleep(Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS))"
+            ),
+            "the synchronous daemon connection retry remains intentionally blocking"
+        );
+    }
 
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
