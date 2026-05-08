@@ -18,6 +18,7 @@ use asupersync::fs::{
     copy as async_file_copy, read as async_file_read, read_to_string as async_file_read_to_string,
     remove_file as async_file_remove, rename as async_file_rename,
 };
+use asupersync::runtime::spawn_blocking;
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -5566,11 +5567,11 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
-        // NOTE: `expand_query` makes a blocking HTTP call via `ureq`. This is
-        // acceptable because the asupersync runtime is cooperative/single-threaded
-        // and all file/network I/O in this codebase is synchronous within async fns.
         let env_map: HashMap<String, String> = std::env::vars().collect();
-        let expansion = query_expansion::expand_query(query, &env_map);
+        let query_for_expansion = query.to_owned();
+        let expansion =
+            spawn_blocking(move || query_expansion::expand_query(&query_for_expansion, &env_map))
+                .await;
 
         info!(
             original_query = query,
@@ -15343,6 +15344,37 @@ mod tests {
                 "async fsfs mutation path should use asupersync helper: {required}"
             );
         }
+    }
+
+    #[test]
+    fn async_query_expansion_offloads_blocking_llm_http() {
+        let source = include_str!("runtime.rs");
+        let direct_call = [
+            "let expansion = ",
+            "query_expansion",
+            "::expand_query(query, &env_map);",
+        ]
+        .concat();
+        let required_offload = [
+            "spawn_blocking(move || ",
+            "query_expansion",
+            "::expand_query(&query_for_expansion, &env_map))",
+        ]
+        .concat();
+        let stale_comment = ["acceptable because ", "the asupersync runtime"].concat();
+
+        assert!(
+            !source.contains(&direct_call),
+            "execute_expanded_search must not call blocking query expansion directly"
+        );
+        assert!(
+            source.contains(&required_offload),
+            "execute_expanded_search should offload blocking query expansion with spawn_blocking"
+        );
+        assert!(
+            !source.contains(&stale_comment),
+            "blocking executor justification comment should not return"
+        );
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
