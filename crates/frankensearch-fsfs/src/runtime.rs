@@ -2089,6 +2089,9 @@ struct FsfsDownloadModelEntry {
     message: Option<String>,
 }
 
+const NON_PRODUCTION_MANIFEST_REASON: &str =
+    "manifest is not production-ready; requires pinned revision and verified checksums";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsfsDoctorPayload {
     version: String,
@@ -6790,6 +6793,17 @@ impl FsfsRuntime {
         for manifest in manifests {
             let install_dir = Self::manifest_install_dir_name(&manifest);
             let destination = model_root.join(&install_dir);
+            if let Some(entry) = Self::non_production_manifest_entry(
+                &manifest,
+                &install_dir,
+                &destination,
+                operation,
+                self.cli_input.model_name.is_some(),
+            )? {
+                results.push(entry);
+                continue;
+            }
+
             let (present, verified, verify_message) =
                 Self::inspect_manifest_installation(&manifest, &destination);
 
@@ -7627,6 +7641,58 @@ impl FsfsRuntime {
             value: requested.to_owned(),
             reason: "unknown model; run download-models --list to see available ids".to_owned(),
         })
+    }
+
+    fn non_production_manifest_entry(
+        manifest: &ModelManifest,
+        install_dir: &str,
+        destination: &Path,
+        operation: &str,
+        explicit_request: bool,
+    ) -> SearchResult<Option<FsfsDownloadModelEntry>> {
+        if manifest.is_production_ready() {
+            return Ok(None);
+        }
+
+        let message = Self::non_production_manifest_message(manifest);
+        if matches!(operation, "download") && explicit_request {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.download.model".to_owned(),
+                value: manifest.id.clone(),
+                reason: message,
+            });
+        }
+
+        let state = match operation {
+            "download" => "skipped",
+            _ => "unavailable",
+        };
+        Ok(Some(Self::download_model_entry(
+            manifest,
+            install_dir,
+            destination,
+            state,
+            None,
+            Self::path_bytes(destination)?,
+            Some(message),
+        )))
+    }
+
+    fn non_production_manifest_message(manifest: &ModelManifest) -> String {
+        let revision_state = if manifest.has_pinned_revision() {
+            "revision pinned"
+        } else {
+            "revision unpinned"
+        };
+        let checksum_state = if manifest.has_verified_checksums() {
+            "checksums verified"
+        } else {
+            "checksums missing"
+        };
+        format!(
+            "{NON_PRODUCTION_MANIFEST_REASON} ({revision_state}, {checksum_state}) for '{}'",
+            manifest.id
+        )
     }
 
     fn manifest_install_dir_name(manifest: &ModelManifest) -> String {
@@ -14623,7 +14689,7 @@ fn render_download_models_table(payload: &FsfsDownloadModelsPayload, no_color: b
     for model in &payload.models {
         let state_color = match model.state.as_str() {
             "cached" | "verified" | "downloaded" => "32",
-            "missing" => "33",
+            "missing" | "skipped" | "unavailable" => "33",
             "corrupt" | "mismatch" => "31",
             _ => "90",
         };
@@ -15134,7 +15200,7 @@ mod tests {
 
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{IndexableDocument, LexicalSearch};
-    use frankensearch_embed::HashEmbedder;
+    use frankensearch_embed::{HashEmbedder, ModelManifest};
     use frankensearch_index::VectorIndex;
     use frankensearch_lexical::TantivyIndex;
     use fsqlite::Connection;
@@ -18031,7 +18097,77 @@ mod tests {
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
             assert_eq!(payload.models.len(), 7);
-            assert!(payload.models.iter().all(|entry| entry.state == "missing"));
+            let flashrank = payload
+                .models
+                .iter()
+                .find(|entry| matches!(entry.id.as_str(), "flashrank-nano"))
+                .expect("flashrank entry");
+            assert!(matches!(flashrank.state.as_str(), "unavailable"));
+            assert_eq!(flashrank.verified, None);
+            assert!(
+                flashrank
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("production-ready"))
+            );
+            assert!(
+                payload
+                    .models
+                    .iter()
+                    .filter(|entry| !matches!(entry.id.as_str(), "flashrank-nano"))
+                    .all(|entry| matches!(entry.state.as_str(), "missing"))
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_download_models_bulk_skips_non_production_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest = ModelManifest::flashrank_nano();
+        let install_dir = FsfsRuntime::manifest_install_dir_name(&manifest);
+        let destination = temp.path().join(&install_dir);
+
+        let entry = FsfsRuntime::non_production_manifest_entry(
+            &manifest,
+            &install_dir,
+            &destination,
+            "download",
+            false,
+        )
+        .expect("non-production entry")
+        .expect("entry should be produced");
+
+        assert!(matches!(entry.id.as_str(), "flashrank-nano"));
+        assert!(matches!(entry.state.as_str(), "skipped"));
+        assert_eq!(entry.verified, None);
+        assert_eq!(entry.size_bytes, 0);
+        assert!(
+            entry
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("production-ready"))
+        );
+    }
+
+    #[test]
+    fn runtime_download_models_explicit_non_production_manifest_is_error() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut config = FsfsConfig::default();
+            config.indexing.model_dir = temp.path().join("models").display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Download,
+                model_name: Some("flashrank".to_owned()),
+                ..CliInput::default()
+            });
+
+            let err = runtime
+                .collect_download_models_payload()
+                .await
+                .expect_err("explicit non-production download should fail");
+            let message = err.to_string();
+            assert!(message.contains("production-ready"));
+            assert!(message.contains("flashrank-nano"));
         });
     }
 
