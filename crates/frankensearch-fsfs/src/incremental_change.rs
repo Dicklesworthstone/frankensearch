@@ -45,6 +45,83 @@ pub const ACTION_ON_RESTART_REPLAY_PENDING: &str = "replay_pending";
 pub const ACTION_ON_RESTART_FORCE_RECONCILE: &str = "force_reconcile";
 pub const ACTION_ON_RESTART_RESUME_TAIL: &str = "resume_tail";
 
+// ─── Evaluation Input ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalEventType {
+    Create,
+    Modify,
+    Delete,
+    Rename,
+    Move,
+    Reconcile,
+}
+
+impl IncrementalEventType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => EVENT_TYPE_CREATE,
+            Self::Modify => EVENT_TYPE_MODIFY,
+            Self::Delete => EVENT_TYPE_DELETE,
+            Self::Rename => EVENT_TYPE_RENAME,
+            Self::Move => EVENT_TYPE_MOVE,
+            Self::Reconcile => EVENT_TYPE_RECONCILE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeEvaluationInput {
+    pub path: String,
+    pub event_type: IncrementalEventType,
+    pub previous_state: Option<FileState>,
+    pub current_state: Option<FileState>,
+    pub rename_from: Option<String>,
+    pub rename_to: Option<String>,
+    pub fastpath_skips: u32,
+}
+
+impl ChangeEvaluationInput {
+    #[must_use]
+    pub fn new(path: impl Into<String>, event_type: IncrementalEventType) -> Self {
+        Self {
+            path: path.into(),
+            event_type,
+            previous_state: None,
+            current_state: None,
+            rename_from: None,
+            rename_to: None,
+            fastpath_skips: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn with_previous_state(mut self, state: FileState) -> Self {
+        self.previous_state = Some(state);
+        self
+    }
+
+    #[must_use]
+    pub fn with_current_state(mut self, state: FileState) -> Self {
+        self.current_state = Some(state);
+        self
+    }
+
+    #[must_use]
+    pub fn with_rename_paths(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.rename_from = Some(from.into());
+        self.rename_to = Some(to.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_fastpath_skips(mut self, skips: u32) -> Self {
+        self.fastpath_skips = skips;
+        self
+    }
+}
+
 // ─── Policy Structs ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -304,6 +381,11 @@ impl IncrementalChangeDecision {
     pub fn requires_embedding(&self) -> bool {
         self.queue_action == QUEUE_ACTION_ENQUEUE_EMBED
     }
+
+    #[must_use]
+    pub fn requires_reconcile(&self) -> bool {
+        self.queue_action == QUEUE_ACTION_RECONCILE_FULL
+    }
 }
 
 impl<'de> Deserialize<'de> for IncrementalChangeDecision {
@@ -415,6 +497,233 @@ impl<'de> Deserialize<'de> for IncrementalRecoveryCheckpoint {
 }
 
 impl IncrementalChangeDetectionContractDefinition {
+    /// Evaluate one filesystem change candidate using the contract's
+    /// mtime/size/hash, rename/move, delete, and reconcile rules.
+    ///
+    /// The returned decision is always shaped as a contract v1 decision and is
+    /// valid for serialization. Ambiguous or incomplete inputs favor
+    /// `reconcile_full` over speculative fast-path skipping.
+    #[must_use]
+    pub fn evaluate_change(&self, input: &ChangeEvaluationInput) -> IncrementalChangeDecision {
+        match input.event_type {
+            IncrementalEventType::Create => Self::evaluate_create(input),
+            IncrementalEventType::Modify => self.evaluate_modify(input),
+            IncrementalEventType::Delete => Self::evaluate_delete(input),
+            IncrementalEventType::Rename | IncrementalEventType::Move => {
+                self.evaluate_rename_or_move(input)
+            }
+            IncrementalEventType::Reconcile => Self::reconcile_decision(
+                input,
+                "FSFS_RECONCILE_REQUESTED",
+                1.0,
+                IncrementalEventType::Reconcile,
+            ),
+        }
+    }
+
+    fn evaluate_create(input: &ChangeEvaluationInput) -> IncrementalChangeDecision {
+        if input.current_state.is_some() {
+            return Self::decision(
+                input,
+                IncrementalEventType::Create,
+                DETECTION_MODE_FASTPATH,
+                QUEUE_ACTION_ENQUEUE_EMBED,
+                "FSFS_NEW_FILE_ENQUEUE_EMBED",
+                0.95,
+            );
+        }
+        Self::reconcile_decision(
+            input,
+            "FSFS_CREATE_STATE_MISSING_RECONCILE",
+            0.5,
+            IncrementalEventType::Create,
+        )
+    }
+
+    fn evaluate_modify(&self, input: &ChangeEvaluationInput) -> IncrementalChangeDecision {
+        let (Some(previous), Some(current)) = (&input.previous_state, &input.current_state) else {
+            return Self::reconcile_decision(
+                input,
+                "FSFS_MODIFY_STATE_MISSING_RECONCILE",
+                0.5,
+                IncrementalEventType::Modify,
+            );
+        };
+
+        let mtime_changed =
+            previous.mtime_changed(current, self.fastpath_policy.mtime_granularity_ns);
+        let size_changed = previous.size_changed(current);
+        let content_changed = previous.content_changed(current);
+        let force_hash = input.fastpath_skips >= self.fastpath_policy.max_fastpath_skips;
+
+        if !mtime_changed && !size_changed && !force_hash {
+            return Self::decision(
+                input,
+                IncrementalEventType::Modify,
+                DETECTION_MODE_FASTPATH,
+                QUEUE_ACTION_SKIP_NO_CHANGE,
+                "FSFS_MTIME_SIZE_UNCHANGED",
+                0.99,
+            );
+        }
+
+        if content_changed {
+            return Self::decision(
+                input,
+                IncrementalEventType::Modify,
+                DETECTION_MODE_HASH_CONFIRM,
+                QUEUE_ACTION_ENQUEUE_EMBED,
+                "FSFS_HASH_CONFIRMED_CONTENT_CHANGE",
+                0.97,
+            );
+        }
+
+        let reason = if force_hash {
+            "FSFS_FORCED_HASH_CONFIRMED_NO_CHANGE"
+        } else {
+            "FSFS_HASH_CONFIRMED_NO_CHANGE"
+        };
+        Self::decision(
+            input,
+            IncrementalEventType::Modify,
+            DETECTION_MODE_HASH_CONFIRM,
+            QUEUE_ACTION_SKIP_NO_CHANGE,
+            reason,
+            0.96,
+        )
+    }
+
+    fn evaluate_delete(input: &ChangeEvaluationInput) -> IncrementalChangeDecision {
+        let action = if input.previous_state.is_some() {
+            QUEUE_ACTION_DROP_MISSING
+        } else {
+            QUEUE_ACTION_MARK_STALE
+        };
+        let reason = if input.previous_state.is_some() {
+            "FSFS_DELETE_DROP_MISSING"
+        } else {
+            "FSFS_DELETE_PRIOR_STATE_MISSING_MARK_STALE"
+        };
+        Self::decision(
+            input,
+            IncrementalEventType::Delete,
+            DETECTION_MODE_JOURNAL_REPLAY,
+            action,
+            reason,
+            0.99,
+        )
+    }
+
+    fn evaluate_rename_or_move(&self, input: &ChangeEvaluationInput) -> IncrementalChangeDecision {
+        if input.rename_from.as_deref().is_none_or(str::is_empty)
+            || input.rename_to.as_deref().is_none_or(str::is_empty)
+        {
+            return Self::reconcile_decision(
+                input,
+                "FSFS_RENAME_PATHS_MISSING_RECONCILE",
+                0.5,
+                IncrementalEventType::Reconcile,
+            );
+        }
+
+        let (Some(previous), Some(current)) = (&input.previous_state, &input.current_state) else {
+            return Self::reconcile_decision(
+                input,
+                "FSFS_RENAME_STATE_MISSING_RECONCILE",
+                0.5,
+                IncrementalEventType::Reconcile,
+            );
+        };
+
+        if previous.content_changed(current) {
+            return Self::decision(
+                input,
+                input.event_type,
+                DETECTION_MODE_HASH_CONFIRM,
+                QUEUE_ACTION_ENQUEUE_EMBED,
+                "FSFS_HASH_CONFIRMED_CONTENT_CHANGE",
+                0.97,
+            );
+        }
+
+        if previous.file_id == current.file_id
+            && self
+                .rename_move_policy
+                .same_device_rename_preserves_identity
+        {
+            return Self::decision(
+                input,
+                input.event_type,
+                DETECTION_MODE_FASTPATH,
+                QUEUE_ACTION_SKIP_NO_CHANGE,
+                "FSFS_RENAME_IDENTITY_PRESERVED",
+                0.94,
+            );
+        }
+
+        if input.event_type == IncrementalEventType::Move
+            && self.rename_move_policy.cross_device_move == "treat_as_delete_create"
+        {
+            return Self::decision(
+                input,
+                input.event_type,
+                DETECTION_MODE_HASH_CONFIRM,
+                QUEUE_ACTION_ENQUEUE_EMBED,
+                "FSFS_CROSS_DEVICE_MOVE_DELETE_CREATE",
+                0.85,
+            );
+        }
+
+        Self::decision(
+            input,
+            input.event_type,
+            DETECTION_MODE_HASH_CONFIRM,
+            QUEUE_ACTION_SKIP_NO_CHANGE,
+            "FSFS_MOVE_HASH_CONFIRMED_TRANSFER",
+            0.90,
+        )
+    }
+
+    fn reconcile_decision(
+        input: &ChangeEvaluationInput,
+        reason_code: &str,
+        confidence: f64,
+        event_type: IncrementalEventType,
+    ) -> IncrementalChangeDecision {
+        Self::decision(
+            input,
+            event_type,
+            DETECTION_MODE_FULL_RECONCILE,
+            QUEUE_ACTION_RECONCILE_FULL,
+            reason_code,
+            confidence,
+        )
+    }
+
+    fn decision(
+        input: &ChangeEvaluationInput,
+        event_type: IncrementalEventType,
+        detection_mode: &str,
+        queue_action: &str,
+        reason_code: &str,
+        confidence: f64,
+    ) -> IncrementalChangeDecision {
+        IncrementalChangeDecision {
+            kind: KIND_CHANGE_DECISION.to_owned(),
+            v: CONTRACT_VERSION,
+            path: input.path.clone(),
+            event_type: event_type.as_str().to_owned(),
+            detection_mode: detection_mode.to_owned(),
+            previous_state: input.previous_state.clone(),
+            current_state: input.current_state.clone(),
+            rename_from: input.rename_from.clone(),
+            rename_to: input.rename_to.clone(),
+            queue_action: queue_action.to_owned(),
+            reason_code: reason_code.to_owned(),
+            confidence,
+        }
+    }
+
     fn validate(&self) -> Result<(), &'static str> {
         validate_kind(
             &self.kind,
@@ -638,10 +947,9 @@ impl IncrementalRecoveryCheckpoint {
 }
 
 fn validate_schema_version(value: u32) -> Result<(), &'static str> {
-    if value == CONTRACT_VERSION {
-        Ok(())
-    } else {
-        Err("schema version 1")
+    match value {
+        CONTRACT_VERSION => Ok(()),
+        _ => Err("schema version 1"),
     }
 }
 
@@ -691,6 +999,15 @@ mod tests {
 
     use super::*;
 
+    fn valid_state(file_id: &str, size_bytes: u64, mtime_ns: u64, hash_nibble: &str) -> FileState {
+        FileState {
+            file_id: file_id.to_owned(),
+            size_bytes,
+            mtime_ns,
+            content_hash: hash_nibble.repeat(64),
+        }
+    }
+
     #[test]
     fn default_contract_has_correct_kind_and_version() {
         let contract = IncrementalChangeDetectionContractDefinition::default();
@@ -710,6 +1027,118 @@ mod tests {
     fn default_hash_policy_uses_sha256() {
         let policy = HashPolicy::default();
         assert_eq!(policy.algorithm, "sha256");
+    }
+
+    #[test]
+    fn evaluator_skips_unchanged_fastpath_candidate() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let state = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/lib.rs", IncrementalEventType::Modify)
+                .with_previous_state(state.clone())
+                .with_current_state(state),
+        );
+
+        assert_eq!(decision.event_type, EVENT_TYPE_MODIFY);
+        assert_eq!(decision.detection_mode, DETECTION_MODE_FASTPATH);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_SKIP_NO_CHANGE);
+        assert_eq!(decision.reason_code, "FSFS_MTIME_SIZE_UNCHANGED");
+        assert!(!decision.requires_embedding());
+
+        let json = serde_json::to_string(&decision).expect("serialize decision");
+        let parsed: IncrementalChangeDecision =
+            serde_json::from_str(&json).expect("decision remains schema-valid");
+        assert_eq!(parsed, decision);
+    }
+
+    #[test]
+    fn evaluator_forces_hash_after_fastpath_budget() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let state = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/lib.rs", IncrementalEventType::Modify)
+                .with_previous_state(state.clone())
+                .with_current_state(state)
+                .with_fastpath_skips(contract.fastpath_policy.max_fastpath_skips),
+        );
+
+        assert_eq!(decision.detection_mode, DETECTION_MODE_HASH_CONFIRM);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_SKIP_NO_CHANGE);
+        assert_eq!(decision.reason_code, "FSFS_FORCED_HASH_CONFIRMED_NO_CHANGE");
+    }
+
+    #[test]
+    fn evaluator_enqueues_hash_confirmed_modify() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let previous = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let current = valid_state("dev1:ino1", 100, 1_100_000_000, "b");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/lib.rs", IncrementalEventType::Modify)
+                .with_previous_state(previous)
+                .with_current_state(current),
+        );
+
+        assert_eq!(decision.detection_mode, DETECTION_MODE_HASH_CONFIRM);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_ENQUEUE_EMBED);
+        assert_eq!(decision.reason_code, "FSFS_HASH_CONFIRMED_CONTENT_CHANGE");
+        assert!(decision.requires_embedding());
+    }
+
+    #[test]
+    fn evaluator_delete_never_enqueues_embedding() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let previous = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/lib.rs", IncrementalEventType::Delete)
+                .with_previous_state(previous),
+        );
+
+        assert_eq!(decision.event_type, EVENT_TYPE_DELETE);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_DROP_MISSING);
+        assert!(!decision.requires_embedding());
+    }
+
+    #[test]
+    fn evaluator_preserves_same_device_rename_identity() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let previous = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let current = valid_state("dev1:ino1", 100, 1_100_000_000, "a");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/new.rs", IncrementalEventType::Rename)
+                .with_previous_state(previous)
+                .with_current_state(current)
+                .with_rename_paths("/workspace/src/old.rs", "/workspace/src/new.rs"),
+        );
+
+        assert_eq!(decision.event_type, EVENT_TYPE_RENAME);
+        assert_eq!(decision.detection_mode, DETECTION_MODE_FASTPATH);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_SKIP_NO_CHANGE);
+        assert_eq!(decision.reason_code, "FSFS_RENAME_IDENTITY_PRESERVED");
+        assert_eq!(
+            decision.rename_from.as_deref(),
+            Some("/workspace/src/old.rs")
+        );
+        assert_eq!(decision.rename_to.as_deref(), Some("/workspace/src/new.rs"));
+    }
+
+    #[test]
+    fn evaluator_reconciles_rename_without_paths() {
+        let contract = IncrementalChangeDetectionContractDefinition::default();
+        let previous = valid_state("dev1:ino1", 100, 1_000_000_000, "a");
+        let current = valid_state("dev1:ino1", 100, 1_100_000_000, "a");
+        let decision = contract.evaluate_change(
+            &ChangeEvaluationInput::new("/workspace/src/new.rs", IncrementalEventType::Rename)
+                .with_previous_state(previous)
+                .with_current_state(current),
+        );
+
+        assert_eq!(decision.event_type, EVENT_TYPE_RECONCILE);
+        assert_eq!(decision.queue_action, QUEUE_ACTION_RECONCILE_FULL);
+        assert!(decision.requires_reconcile());
+
+        let json = serde_json::to_string(&decision).expect("serialize decision");
+        serde_json::from_str::<IncrementalChangeDecision>(&json)
+            .expect("missing rename paths produce a valid reconcile decision");
     }
 
     #[test]
