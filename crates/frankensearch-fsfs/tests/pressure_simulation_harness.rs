@@ -20,7 +20,9 @@ use frankensearch_fsfs::pressure::{
     CalibrationGuardConfig, CalibrationGuardState, CalibrationGuardStatus, CalibrationMetrics,
     DegradationControllerConfig, DegradationSignal, DegradationStage, DegradationStateMachine,
     DegradationTrigger, PressureController, PressureControllerConfig, PressureSignal,
-    PressureState, REASON_DEGRADE_RECOVERED,
+    PressureState, REASON_DEGRADE_RECOVERED, REASON_RESOURCE_INITIAL_SEARCH_ADMITTED,
+    REASON_RESOURCE_QUALITY_DEFERRED, ResourceAdmissionMode, ResourceLane,
+    ResourcePressureGovernor, ResourcePressureGovernorConfig, ResourcePressureInput,
 };
 
 // ─── Scenario types ──────────────────────────────────────────────────────
@@ -76,6 +78,20 @@ struct CalibrationEvent {
     confidence_pct: f64,
 }
 
+/// A timestamped resource-governor input.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ResourceAdmissionEvent {
+    timestamp_ms: u64,
+    pressure_state: PressureState,
+    signal: PressureSignalInput,
+    model_load_pct: f64,
+    index_write_pct: f64,
+    active_agents: u16,
+    queued_work: u16,
+    quality_circuit_open: bool,
+    hard_pause_requested: bool,
+}
+
 /// A complete simulation scenario combining all input streams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulationScenario {
@@ -88,6 +104,7 @@ struct SimulationScenario {
     pressure_events: Vec<PressureEvent>,
     degradation_events: Vec<DegradationEvent>,
     calibration_events: Vec<CalibrationEvent>,
+    resource_admission_events: Vec<ResourceAdmissionEvent>,
 }
 
 // ─── Recorded outputs ────────────────────────────────────────────────────
@@ -127,6 +144,22 @@ struct CalibrationRecord {
     fallback_triggered: bool,
 }
 
+/// Recorded resource-admission output for one lane at one timestep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResourceAdmissionRecord {
+    timestamp_ms: u64,
+    lane: ResourceLane,
+    mode: ResourceAdmissionMode,
+    admitted: bool,
+    effective_pressure_state: PressureState,
+    effective_degradation_stage: DegradationStage,
+    reason_code: String,
+    retry_after_ms: u64,
+    queue_budget: u16,
+    cancel_on_pressure_escalation: bool,
+    operator_advice: String,
+}
+
 /// Complete simulation output for golden-comparison and oracle checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulationTrace {
@@ -134,6 +167,7 @@ struct SimulationTrace {
     pressure_trace: Vec<PressureRecord>,
     degradation_trace: Vec<DegradationRecord>,
     calibration_trace: Vec<CalibrationRecord>,
+    resource_admission_trace: Vec<ResourceAdmissionRecord>,
     oracle_results: Vec<OracleResult>,
 }
 
@@ -176,6 +210,7 @@ fn scenario_gradual_ramp_up() -> SimulationScenario {
         pressure_events: events,
         degradation_events: Vec::new(),
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -241,6 +276,7 @@ fn scenario_spike_and_recovery() -> SimulationScenario {
         pressure_events,
         degradation_events,
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -267,6 +303,7 @@ fn scenario_hysteresis_oscillation() -> SimulationScenario {
         pressure_events: events,
         degradation_events: Vec::new(),
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -302,6 +339,7 @@ fn scenario_hard_pause_and_clear() -> SimulationScenario {
         pressure_events: Vec::new(),
         degradation_events: events,
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -375,6 +413,7 @@ fn scenario_calibration_breach_fallback() -> SimulationScenario {
         pressure_events: Vec::new(),
         degradation_events: deg_events,
         calibration_events: cal_events,
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -418,6 +457,7 @@ fn scenario_quality_circuit_breaker() -> SimulationScenario {
         pressure_events: Vec::new(),
         degradation_events: events,
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -445,6 +485,7 @@ fn scenario_multi_profile_comparison() -> SimulationScenario {
         pressure_events: events,
         degradation_events: Vec::new(),
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -502,6 +543,7 @@ fn scenario_insufficient_samples_watch() -> SimulationScenario {
         pressure_events: Vec::new(),
         degradation_events: deg_events,
         calibration_events: cal_events,
+        resource_admission_events: Vec::new(),
     }
 }
 
@@ -550,6 +592,59 @@ fn scenario_long_run_soak_fault_injection() -> SimulationScenario {
         pressure_events,
         degradation_events,
         calibration_events: Vec::new(),
+        resource_admission_events: Vec::new(),
+    }
+}
+
+fn scenario_resource_pressure_governor() -> SimulationScenario {
+    let resource_admission_events = vec![
+        ResourceAdmissionEvent {
+            timestamp_ms: 0,
+            pressure_state: PressureState::Normal,
+            signal: PressureSignalInput::new(35.0, 30.0, 10.0, 20.0),
+            model_load_pct: 10.0,
+            index_write_pct: 10.0,
+            active_agents: 1,
+            queued_work: 0,
+            quality_circuit_open: false,
+            hard_pause_requested: false,
+        },
+        ResourceAdmissionEvent {
+            timestamp_ms: 1_000,
+            pressure_state: PressureState::Constrained,
+            signal: PressureSignalInput::new(78.0, 40.0, 30.0, 45.0),
+            model_load_pct: 90.0,
+            index_write_pct: 85.0,
+            active_agents: 4,
+            queued_work: 12,
+            quality_circuit_open: false,
+            hard_pause_requested: false,
+        },
+        ResourceAdmissionEvent {
+            timestamp_ms: 2_000,
+            pressure_state: PressureState::Emergency,
+            signal: PressureSignalInput::new(160.0, 120.0, 110.0, 140.0),
+            model_load_pct: 200.0,
+            index_write_pct: 200.0,
+            active_agents: 12,
+            queued_work: 96,
+            quality_circuit_open: true,
+            hard_pause_requested: false,
+        },
+    ];
+
+    SimulationScenario {
+        name: "resource_pressure_governor".to_owned(),
+        description: "Resource admission preserves phase-1 search while deferring expensive lanes"
+            .to_owned(),
+        seed: 909,
+        pressure_config: PressureControllerConfig::default(),
+        degradation_config: DegradationControllerConfig::default(),
+        calibration_config: CalibrationGuardConfig::default(),
+        pressure_events: Vec::new(),
+        degradation_events: Vec::new(),
+        calibration_events: Vec::new(),
+        resource_admission_events,
     }
 }
 
@@ -670,6 +765,45 @@ fn run_calibration_simulation(
         }
     }
     (cal_records, deg_records)
+}
+
+fn run_resource_governor_simulation(
+    config: ResourcePressureGovernorConfig,
+    events: &[ResourceAdmissionEvent],
+) -> Vec<ResourceAdmissionRecord> {
+    let governor = ResourcePressureGovernor::new(config).expect("valid resource governor config");
+    let mut records = Vec::with_capacity(events.len().saturating_mul(5));
+
+    for event in events {
+        let input = ResourcePressureInput {
+            timestamp_ms: event.timestamp_ms,
+            host_pressure: event.signal.to_signal(),
+            host_state: event.pressure_state,
+            model_load_pct: event.model_load_pct,
+            index_write_pct: event.index_write_pct,
+            active_agents: event.active_agents,
+            queued_work: event.queued_work,
+            quality_circuit_open: event.quality_circuit_open,
+            hard_pause_requested: event.hard_pause_requested,
+        };
+        for decision in governor.decide_all(input) {
+            records.push(ResourceAdmissionRecord {
+                timestamp_ms: decision.timestamp_ms,
+                lane: decision.lane,
+                mode: decision.mode,
+                admitted: decision.admitted,
+                effective_pressure_state: decision.effective_pressure_state,
+                effective_degradation_stage: decision.effective_degradation_stage,
+                reason_code: decision.reason_code,
+                retry_after_ms: decision.backpressure.retry_after_ms,
+                queue_budget: decision.backpressure.queue_budget,
+                cancel_on_pressure_escalation: decision.backpressure.cancel_on_pressure_escalation,
+                operator_advice: decision.operator_advice,
+            });
+        }
+    }
+
+    records
 }
 
 // ─── Oracle checks ──────────────────────────────────────────────────────
@@ -878,6 +1012,111 @@ fn oracle_breach_reset_on_healthy(records: &[CalibrationRecord]) -> OracleResult
     }
 }
 
+fn oracle_initial_search_not_starved(records: &[ResourceAdmissionRecord]) -> OracleResult {
+    let mut checked = 0_usize;
+    let mut violations = Vec::new();
+
+    for (i, record) in records
+        .iter()
+        .filter(|record| record.lane == ResourceLane::InitialSearch)
+        .enumerate()
+    {
+        checked = checked.saturating_add(1);
+        if !record.admitted || record.mode != ResourceAdmissionMode::Admit {
+            violations.push(format!(
+                "initial-search record {i} was not admitted: mode={:?}",
+                record.mode
+            ));
+        }
+    }
+
+    OracleResult {
+        oracle_name: "resource_initial_search_not_starved".to_owned(),
+        passed: checked > 0 && violations.is_empty(),
+        detail: if checked == 0 {
+            "No initial-search records emitted".to_owned()
+        } else if violations.is_empty() {
+            format!("Initial search admitted for all {checked} pressure samples")
+        } else {
+            format!("{} violations: {}", violations.len(), violations.join("; "))
+        },
+    }
+}
+
+fn oracle_expensive_lanes_shed_before_initial_search(
+    records: &[ResourceAdmissionRecord],
+) -> OracleResult {
+    let emergency_ts: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.effective_pressure_state == PressureState::Emergency
+                && record.lane == ResourceLane::InitialSearch
+                && record.admitted
+        })
+        .map(|record| record.timestamp_ms)
+        .collect();
+
+    let mut violations = Vec::new();
+    for timestamp_ms in emergency_ts {
+        for lane in [
+            ResourceLane::QualityRefinement,
+            ResourceLane::WatchRefresh,
+            ResourceLane::ModelLoad,
+        ] {
+            let Some(record) = records
+                .iter()
+                .find(|record| record.timestamp_ms == timestamp_ms && record.lane == lane)
+            else {
+                violations.push(format!("missing {lane:?} record at {timestamp_ms}"));
+                continue;
+            };
+            if record.admitted {
+                violations.push(format!(
+                    "{lane:?} admitted at emergency timestamp {timestamp_ms}"
+                ));
+            }
+        }
+    }
+
+    OracleResult {
+        oracle_name: "resource_shed_expensive_lanes_first".to_owned(),
+        passed: violations.is_empty(),
+        detail: if violations.is_empty() {
+            "Emergency pressure sheds quality/watch/model lanes before initial search".to_owned()
+        } else {
+            format!("{} violations: {}", violations.len(), violations.join("; "))
+        },
+    }
+}
+
+fn oracle_resource_advice_and_reason_codes(records: &[ResourceAdmissionRecord]) -> OracleResult {
+    let mut violations = Vec::new();
+    for (i, record) in records.iter().enumerate() {
+        if record.reason_code.is_empty() {
+            violations.push(format!("record {i}: empty reason_code"));
+        }
+        if record.operator_advice.is_empty() {
+            violations.push(format!("record {i}: empty operator_advice"));
+        }
+        if record.mode != ResourceAdmissionMode::Admit && record.retry_after_ms == 0 {
+            violations.push(format!("record {i}: non-admit mode has no retry_after_ms"));
+        }
+    }
+
+    OracleResult {
+        oracle_name: "resource_advice_and_metrics_visible".to_owned(),
+        passed: violations.is_empty(),
+        detail: if violations.is_empty() {
+            format!(
+                "All {} resource decisions carry reason codes, advice, and retry signals",
+                records.len()
+            )
+        } else {
+            format!("{} violations: {}", violations.len(), violations.join("; "))
+        },
+    }
+}
+
 fn oracle_determinism(scenario: &SimulationScenario) -> OracleResult {
     // Invariant: running the same scenario twice produces identical output.
     // Uses run_simulation_core (not run_full_simulation) to avoid infinite recursion:
@@ -922,7 +1161,22 @@ fn oracle_determinism(scenario: &SimulationScenario) -> OracleResult {
                     && a.consecutive_breach_count == b.consecutive_breach_count
             });
 
-    let all_match = p_match && d_match && c_match;
+    let r_match = trace1.resource_admission_trace.len() == trace2.resource_admission_trace.len()
+        && trace1
+            .resource_admission_trace
+            .iter()
+            .zip(trace2.resource_admission_trace.iter())
+            .all(|(a, b)| {
+                a.timestamp_ms == b.timestamp_ms
+                    && a.lane == b.lane
+                    && a.mode == b.mode
+                    && a.admitted == b.admitted
+                    && a.reason_code == b.reason_code
+                    && a.retry_after_ms == b.retry_after_ms
+                    && a.queue_budget == b.queue_budget
+            });
+
+    let all_match = p_match && d_match && c_match && r_match;
     OracleResult {
         oracle_name: "deterministic_replay".to_owned(),
         passed: all_match,
@@ -930,7 +1184,7 @@ fn oracle_determinism(scenario: &SimulationScenario) -> OracleResult {
             "Two runs produce identical traces".to_owned()
         } else {
             format!(
-                "Determinism violation: pressure={p_match}, degradation={d_match}, calibration={c_match}"
+                "Determinism violation: pressure={p_match}, degradation={d_match}, calibration={c_match}, resource={r_match}"
             )
         },
     }
@@ -996,11 +1250,21 @@ fn run_simulation_core(scenario: &SimulationScenario) -> SimulationTrace {
             cal_deg_trace
         };
 
+    let resource_admission_trace = if scenario.resource_admission_events.is_empty() {
+        Vec::new()
+    } else {
+        run_resource_governor_simulation(
+            ResourcePressureGovernorConfig::default(),
+            &scenario.resource_admission_events,
+        )
+    };
+
     SimulationTrace {
         scenario_name: scenario.name.clone(),
         pressure_trace,
         degradation_trace,
         calibration_trace,
+        resource_admission_trace,
         oracle_results: Vec::new(),
     }
 }
@@ -1037,6 +1301,21 @@ fn run_full_simulation(scenario: &SimulationScenario) -> SimulationTrace {
             .oracle_results
             .push(oracle_breach_reset_on_healthy(&trace.calibration_trace));
     }
+    if !trace.resource_admission_trace.is_empty() {
+        trace.oracle_results.push(oracle_initial_search_not_starved(
+            &trace.resource_admission_trace,
+        ));
+        trace
+            .oracle_results
+            .push(oracle_expensive_lanes_shed_before_initial_search(
+                &trace.resource_admission_trace,
+            ));
+        trace
+            .oracle_results
+            .push(oracle_resource_advice_and_reason_codes(
+                &trace.resource_admission_trace,
+            ));
+    }
     trace.oracle_results.push(oracle_determinism(scenario));
 
     trace
@@ -1064,6 +1343,12 @@ fn emit_trace_artifact(trace: &SimulationTrace, artifact_dir: &Path) {
     for record in &trace.calibration_trace {
         let line = serde_json::to_string(record).expect("serialize calibration record");
         writeln!(file, "{line}").expect("write calibration record");
+    }
+
+    // Emit resource-admission records
+    for record in &trace.resource_admission_trace {
+        let line = serde_json::to_string(record).expect("serialize resource admission record");
+        writeln!(file, "{line}").expect("write resource admission record");
     }
 
     // Emit oracle results
@@ -1557,6 +1842,56 @@ fn scenario_long_run_soak_fault_injection_stays_within_drift_thresholds() {
 }
 
 #[test]
+fn scenario_resource_governor_preserves_initial_search_and_emits_jsonl_evidence() {
+    let scenario = scenario_resource_pressure_governor();
+    let trace = run_full_simulation(&scenario);
+
+    assert_eq!(
+        trace.resource_admission_trace.len(),
+        scenario.resource_admission_events.len() * 5,
+        "resource governor should emit one decision per lane per sample"
+    );
+    assert!(
+        trace.resource_admission_trace.iter().any(|record| {
+            record.lane == ResourceLane::InitialSearch
+                && record.reason_code == REASON_RESOURCE_INITIAL_SEARCH_ADMITTED
+                && record.admitted
+        }),
+        "initial search admission should be visible in the resource trace"
+    );
+    assert!(
+        trace.resource_admission_trace.iter().any(|record| {
+            record.lane == ResourceLane::QualityRefinement
+                && record.reason_code == REASON_RESOURCE_QUALITY_DEFERRED
+                && !record.admitted
+        }),
+        "quality refinement deferral should be visible in the resource trace"
+    );
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let artifact_dir = tmp.path().join(&scenario.name);
+    emit_trace_artifact(&trace, &artifact_dir);
+    let events_path = artifact_dir.join("simulation_events.jsonl");
+    let contents = fs::read_to_string(&events_path).expect("read resource events jsonl");
+    assert!(
+        contents.contains(REASON_RESOURCE_INITIAL_SEARCH_ADMITTED),
+        "artifact should include initial-search admission reason code"
+    );
+    assert!(
+        contents.contains(REASON_RESOURCE_QUALITY_DEFERRED),
+        "artifact should include quality deferral reason code"
+    );
+
+    for oracle in &trace.oracle_results {
+        assert!(
+            oracle.passed,
+            "Oracle {} failed: {}",
+            oracle.oracle_name, oracle.detail
+        );
+    }
+}
+
+#[test]
 fn all_scenarios_are_deterministic() {
     let scenarios = vec![
         scenario_gradual_ramp_up(),
@@ -1568,6 +1903,7 @@ fn all_scenarios_are_deterministic() {
         scenario_multi_profile_comparison(),
         scenario_insufficient_samples_watch(),
         scenario_long_run_soak_fault_injection(),
+        scenario_resource_pressure_governor(),
     ];
 
     for scenario in &scenarios {
@@ -1670,6 +2006,7 @@ fn full_simulation_suite_all_oracles_pass() {
         scenario_quality_circuit_breaker(),
         scenario_multi_profile_comparison(),
         scenario_insufficient_samples_watch(),
+        scenario_resource_pressure_governor(),
     ];
 
     let mut total_oracles = 0;

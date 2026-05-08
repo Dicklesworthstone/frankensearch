@@ -180,7 +180,9 @@ pub use output_schema::{
 };
 pub use pressure::{
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
-    PressureSnapshot, PressureState, PressureTransition, ProcIoCounters,
+    PressureSnapshot, PressureState, PressureTransition, ProcIoCounters, ResourceAdmissionDecision,
+    ResourceAdmissionMode, ResourceBackpressure, ResourceLane, ResourcePressureGovernor,
+    ResourcePressureGovernorConfig, ResourcePressureInput,
 };
 pub use pressure_profile_contract::{
     ContractSchedulerMode, DEFAULT_PRECEDENCE_ORDER, DriftProtection,
