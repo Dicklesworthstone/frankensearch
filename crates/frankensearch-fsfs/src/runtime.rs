@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use asupersync::fs::{read as async_file_read, read_to_string as async_file_read_to_string};
+use asupersync::fs::{
+    copy as async_file_copy, read as async_file_read, read_to_string as async_file_read_to_string,
+    remove_file as async_file_remove, rename as async_file_rename,
+};
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -4641,7 +4644,7 @@ impl FsfsRuntime {
                     });
                 }
                 Err(_) => {
-                    let _ = fs::remove_file(&socket_path);
+                    let _ = async_file_remove(&socket_path).await;
                 }
             }
         }
@@ -8952,19 +8955,19 @@ impl FsfsRuntime {
                         );
                     } else {
                         upgrade_writer.finish()?;
-                        if let Err(error) = fs::rename(&upgrade_path, &vector_path) {
+                        if let Err(error) = async_file_rename(&upgrade_path, &vector_path).await {
                             warn!(
                                 upgrade = %upgrade_path.display(),
                                 target = %vector_path.display(),
                                 error = %error,
                                 "semantic upgrade rename failed; attempting copy"
                             );
-                            fs::copy(&upgrade_path, &vector_path).map_err(|e| {
-                                SearchError::SubsystemError {
+                            async_file_copy(&upgrade_path, &vector_path)
+                                .await
+                                .map_err(|e| SearchError::SubsystemError {
                                     subsystem: "fsfs.semantic_upgrade.swap",
                                     source: Box::new(e),
-                                }
-                            })?;
+                                })?;
                             push_warning(
                                 &mut recent_warnings,
                                 IndexingWarningSeverity::Warn,
@@ -15308,6 +15311,36 @@ mod tests {
             assert!(
                 source.contains(required),
                 "async fsfs indexing path should use asupersync helper: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_filesystem_mutations_use_asupersync_fs_helpers() {
+        let source = include_str!("runtime.rs");
+        let sync_remove = ["fs", "::remove_file"].concat();
+        let sync_rename = ["fs", "::rename"].concat();
+        let sync_copy = ["fs", "::copy"].concat();
+
+        for forbidden in [
+            format!("{sync_remove}(&socket_path)"),
+            format!("{sync_rename}(&upgrade_path, &vector_path)"),
+            format!("{sync_copy}(&upgrade_path, &vector_path)"),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "async fsfs path still contains blocking filesystem mutation: {forbidden}"
+            );
+        }
+
+        for required in [
+            "async_file_remove(&socket_path).await",
+            "async_file_rename(&upgrade_path, &vector_path).await",
+            "async_file_copy(&upgrade_path, &vector_path).await",
+        ] {
+            assert!(
+                source.contains(required),
+                "async fsfs mutation path should use asupersync helper: {required}"
             );
         }
     }
