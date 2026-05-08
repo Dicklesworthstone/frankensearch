@@ -8,13 +8,15 @@
 //! - stale-state reconciliation guarantees
 
 use serde::{Deserialize, Deserializer, Serialize, de};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ─── Kind Constants ──────────────────────────────────────────────────────────
 
 pub const KIND_CONTRACT_DEFINITION: &str = "fsfs_incremental_change_detection_contract_definition";
 pub const KIND_CHANGE_DECISION: &str = "fsfs_incremental_change_decision";
 pub const KIND_RECOVERY_CHECKPOINT: &str = "fsfs_incremental_recovery_checkpoint";
+pub const KIND_INDEX_FRESHNESS_AUDIT_REPORT: &str = "fsfs_index_freshness_audit_report";
+pub const KIND_INDEX_FRESHNESS_REPAIR_PLAN: &str = "fsfs_index_freshness_repair_plan";
 pub const CONTRACT_VERSION: u32 = 1;
 
 // ─── Event Types ─────────────────────────────────────────────────────────────
@@ -494,6 +496,415 @@ impl<'de> Deserialize<'de> for IncrementalRecoveryCheckpoint {
         checkpoint.validate().map_err(de::Error::custom)?;
         Ok(checkpoint)
     }
+}
+
+// ─── Index Freshness Audit ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessAuditVerdict {
+    Clean,
+    FailClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessFindingKind {
+    MissingCatalog,
+    StaleCatalog,
+    OrphanCatalog,
+    MissingVector,
+    MissingLexical,
+    DoubleIndexed,
+    WatcherCheckpointStale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessRepairActionKind {
+    EnqueueReindex,
+    MarkStale,
+    ReconcileCatalog,
+    RebuildVectorMembership,
+    RebuildLexicalMembership,
+    QuarantineDuplicate,
+    ForceWatcherReconcile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemSnapshotEntry {
+    pub file_key: String,
+    pub path: String,
+    pub content_hash: String,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSnapshotEntry {
+    pub file_key: String,
+    pub path: String,
+    pub content_hash: String,
+    pub revision: u64,
+    pub last_seen_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexMembershipEntry {
+    pub doc_id: String,
+    pub file_key: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherCheckpointSnapshot {
+    pub checkpoint_id: String,
+    pub last_applied_seq: u64,
+    pub pending_changes: u32,
+    pub watermark_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessAuditInput {
+    pub run_id: String,
+    pub filesystem: Vec<FilesystemSnapshotEntry>,
+    pub catalog: Vec<CatalogSnapshotEntry>,
+    pub vector_index: Vec<IndexMembershipEntry>,
+    pub lexical_index: Vec<IndexMembershipEntry>,
+    pub watcher_checkpoint: WatcherCheckpointSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessAuditFinding {
+    pub kind: IndexFreshnessFindingKind,
+    pub file_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub reason_code: String,
+    pub expected_count: u32,
+    pub observed_count: u32,
+    pub repair_action: IndexFreshnessRepairActionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessRepairAction {
+    pub action: IndexFreshnessRepairActionKind,
+    pub file_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub reason_code: String,
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessRepairPlan {
+    pub kind: String,
+    pub v: u32,
+    pub dry_run: bool,
+    pub fail_closed: bool,
+    pub actions: Vec<IndexFreshnessRepairAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessAuditSummary {
+    pub verdict: IndexFreshnessAuditVerdict,
+    pub filesystem_entries: u32,
+    pub catalog_entries: u32,
+    pub vector_memberships: u32,
+    pub lexical_memberships: u32,
+    pub finding_count: u32,
+    pub repair_action_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexFreshnessAuditReport {
+    pub kind: String,
+    pub v: u32,
+    pub input: IndexFreshnessAuditInput,
+    pub summary: IndexFreshnessAuditSummary,
+    pub findings: Vec<IndexFreshnessAuditFinding>,
+    pub repair_plan: IndexFreshnessRepairPlan,
+    pub audit_jsonl_path: String,
+    pub summary_json_path: String,
+    pub replay_command: String,
+}
+
+impl IndexFreshnessAuditReport {
+    #[must_use]
+    pub fn from_input(input: IndexFreshnessAuditInput) -> Self {
+        let findings = classify_index_freshness(&input);
+        let repair_plan = IndexFreshnessRepairPlan::from_findings(&findings);
+        let verdict = if findings.is_empty() {
+            IndexFreshnessAuditVerdict::Clean
+        } else {
+            IndexFreshnessAuditVerdict::FailClosed
+        };
+        let summary = IndexFreshnessAuditSummary {
+            verdict,
+            filesystem_entries: usize_to_u32(input.filesystem.len()),
+            catalog_entries: usize_to_u32(input.catalog.len()),
+            vector_memberships: usize_to_u32(input.vector_index.len()),
+            lexical_memberships: usize_to_u32(input.lexical_index.len()),
+            finding_count: usize_to_u32(findings.len()),
+            repair_action_count: usize_to_u32(repair_plan.actions.len()),
+        };
+        let artifact_root = format!("runs/{}/index_freshness", input.run_id);
+        let replay_command = format!(
+            "scripts/check_fsfs_index_freshness_audit.sh --mode e2e --run-id {}",
+            input.run_id
+        );
+
+        Self {
+            kind: KIND_INDEX_FRESHNESS_AUDIT_REPORT.to_owned(),
+            v: CONTRACT_VERSION,
+            input,
+            summary,
+            findings,
+            repair_plan,
+            audit_jsonl_path: format!("{artifact_root}/audit-events.jsonl"),
+            summary_json_path: format!("{artifact_root}/summary.json"),
+            replay_command,
+        }
+    }
+
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.summary.verdict == IndexFreshnessAuditVerdict::Clean
+    }
+}
+
+impl IndexFreshnessRepairPlan {
+    #[must_use]
+    pub fn from_findings(findings: &[IndexFreshnessAuditFinding]) -> Self {
+        let actions = findings
+            .iter()
+            .map(|finding| IndexFreshnessRepairAction {
+                action: finding.repair_action,
+                file_key: finding.file_key.clone(),
+                path: finding.path.clone(),
+                reason_code: finding.reason_code.clone(),
+                destructive: false,
+            })
+            .collect();
+
+        Self {
+            kind: KIND_INDEX_FRESHNESS_REPAIR_PLAN.to_owned(),
+            v: CONTRACT_VERSION,
+            dry_run: true,
+            fail_closed: !findings.is_empty(),
+            actions,
+        }
+    }
+}
+
+fn classify_index_freshness(input: &IndexFreshnessAuditInput) -> Vec<IndexFreshnessAuditFinding> {
+    let filesystem_by_key = filesystem_by_key(&input.filesystem);
+    let catalog_by_key = catalog_by_key(&input.catalog);
+    let vector_by_file = membership_by_file(&input.vector_index);
+    let lexical_by_file = membership_by_file(&input.lexical_index);
+    let mut findings = Vec::new();
+
+    for (&file_key, fs_entry) in &filesystem_by_key {
+        let Some(catalog_entry) = catalog_by_key.get(file_key) else {
+            findings.push(audit_finding(
+                IndexFreshnessFindingKind::MissingCatalog,
+                file_key,
+                Some(&fs_entry.path),
+                "FSFS_AUDIT_MISSING_CATALOG",
+                1,
+                0,
+            ));
+            continue;
+        };
+
+        if catalog_entry.content_hash != fs_entry.content_hash {
+            findings.push(audit_finding(
+                IndexFreshnessFindingKind::StaleCatalog,
+                file_key,
+                Some(&fs_entry.path),
+                "FSFS_AUDIT_STALE_CATALOG_HASH",
+                1,
+                1,
+            ));
+        }
+
+        push_membership_findings(
+            &mut findings,
+            file_key,
+            &fs_entry.path,
+            vector_by_file.get(file_key).map_or(0, Vec::len),
+            IndexFreshnessFindingKind::MissingVector,
+            IndexFreshnessFindingKind::DoubleIndexed,
+            "FSFS_AUDIT_MISSING_VECTOR_MEMBERSHIP",
+            "FSFS_AUDIT_DOUBLE_VECTOR_MEMBERSHIP",
+        );
+        push_membership_findings(
+            &mut findings,
+            file_key,
+            &fs_entry.path,
+            lexical_by_file.get(file_key).map_or(0, Vec::len),
+            IndexFreshnessFindingKind::MissingLexical,
+            IndexFreshnessFindingKind::DoubleIndexed,
+            "FSFS_AUDIT_MISSING_LEXICAL_MEMBERSHIP",
+            "FSFS_AUDIT_DOUBLE_LEXICAL_MEMBERSHIP",
+        );
+    }
+
+    for (&file_key, catalog_entry) in &catalog_by_key {
+        if !filesystem_by_key.contains_key(file_key) && catalog_entry.deleted_at_ms.is_none() {
+            findings.push(audit_finding(
+                IndexFreshnessFindingKind::OrphanCatalog,
+                file_key,
+                Some(&catalog_entry.path),
+                "FSFS_AUDIT_ORPHAN_CATALOG_ENTRY",
+                0,
+                1,
+            ));
+        }
+    }
+
+    let newest_filesystem_observation = input
+        .filesystem
+        .iter()
+        .map(|entry| entry.observed_at_ms)
+        .max()
+        .unwrap_or(0);
+    if input.watcher_checkpoint.pending_changes > 0
+        || input.watcher_checkpoint.watermark_ms < newest_filesystem_observation
+    {
+        findings.push(audit_finding(
+            IndexFreshnessFindingKind::WatcherCheckpointStale,
+            &input.watcher_checkpoint.checkpoint_id,
+            None,
+            "FSFS_AUDIT_WATCHER_CHECKPOINT_STALE",
+            0,
+            input.watcher_checkpoint.pending_changes,
+        ));
+    }
+
+    findings.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.file_key.cmp(&right.file_key))
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    findings
+}
+
+fn filesystem_by_key(
+    entries: &[FilesystemSnapshotEntry],
+) -> BTreeMap<&str, &FilesystemSnapshotEntry> {
+    entries
+        .iter()
+        .map(|entry| (entry.file_key.as_str(), entry))
+        .collect()
+}
+
+fn catalog_by_key(entries: &[CatalogSnapshotEntry]) -> BTreeMap<&str, &CatalogSnapshotEntry> {
+    entries
+        .iter()
+        .map(|entry| (entry.file_key.as_str(), entry))
+        .collect()
+}
+
+fn membership_by_file(
+    entries: &[IndexMembershipEntry],
+) -> BTreeMap<&str, Vec<&IndexMembershipEntry>> {
+    let mut by_file: BTreeMap<&str, Vec<&IndexMembershipEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_file
+            .entry(entry.file_key.as_str())
+            .or_default()
+            .push(entry);
+    }
+    by_file
+}
+
+fn push_membership_findings(
+    findings: &mut Vec<IndexFreshnessAuditFinding>,
+    file_key: &str,
+    path: &str,
+    observed_count: usize,
+    missing_kind: IndexFreshnessFindingKind,
+    duplicate_kind: IndexFreshnessFindingKind,
+    missing_reason: &str,
+    duplicate_reason: &str,
+) {
+    if observed_count == 0 {
+        findings.push(audit_finding(
+            missing_kind,
+            file_key,
+            Some(path),
+            missing_reason,
+            1,
+            0,
+        ));
+    } else if observed_count > 1 {
+        findings.push(audit_finding(
+            duplicate_kind,
+            file_key,
+            Some(path),
+            duplicate_reason,
+            1,
+            usize_to_u32(observed_count),
+        ));
+    }
+}
+
+fn audit_finding(
+    kind: IndexFreshnessFindingKind,
+    file_key: &str,
+    path: Option<&str>,
+    reason_code: &str,
+    expected_count: u32,
+    observed_count: u32,
+) -> IndexFreshnessAuditFinding {
+    IndexFreshnessAuditFinding {
+        kind,
+        file_key: file_key.to_owned(),
+        path: path.map(str::to_owned),
+        reason_code: reason_code.to_owned(),
+        expected_count,
+        observed_count,
+        repair_action: repair_action_for(kind),
+    }
+}
+
+fn repair_action_for(kind: IndexFreshnessFindingKind) -> IndexFreshnessRepairActionKind {
+    match kind {
+        IndexFreshnessFindingKind::MissingCatalog => {
+            IndexFreshnessRepairActionKind::ReconcileCatalog
+        }
+        IndexFreshnessFindingKind::StaleCatalog => IndexFreshnessRepairActionKind::EnqueueReindex,
+        IndexFreshnessFindingKind::OrphanCatalog => IndexFreshnessRepairActionKind::MarkStale,
+        IndexFreshnessFindingKind::MissingVector => {
+            IndexFreshnessRepairActionKind::RebuildVectorMembership
+        }
+        IndexFreshnessFindingKind::MissingLexical => {
+            IndexFreshnessRepairActionKind::RebuildLexicalMembership
+        }
+        IndexFreshnessFindingKind::DoubleIndexed => {
+            IndexFreshnessRepairActionKind::QuarantineDuplicate
+        }
+        IndexFreshnessFindingKind::WatcherCheckpointStale => {
+            IndexFreshnessRepairActionKind::ForceWatcherReconcile
+        }
+    }
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl IncrementalChangeDetectionContractDefinition {
@@ -995,6 +1406,8 @@ fn is_checkpoint_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::json;
 
     use super::*;
@@ -1005,6 +1418,67 @@ mod tests {
             size_bytes,
             mtime_ns,
             content_hash: hash_nibble.repeat(64),
+        }
+    }
+
+    fn fs_entry(
+        file_key: &str,
+        path: &str,
+        hash_nibble: &str,
+        observed_at_ms: u64,
+    ) -> FilesystemSnapshotEntry {
+        FilesystemSnapshotEntry {
+            file_key: file_key.to_owned(),
+            path: path.to_owned(),
+            content_hash: hash_nibble.repeat(64),
+            observed_at_ms,
+        }
+    }
+
+    fn catalog_entry(
+        file_key: &str,
+        path: &str,
+        hash_nibble: &str,
+        revision: u64,
+        deleted_at_ms: Option<u64>,
+    ) -> CatalogSnapshotEntry {
+        CatalogSnapshotEntry {
+            file_key: file_key.to_owned(),
+            path: path.to_owned(),
+            content_hash: hash_nibble.repeat(64),
+            revision,
+            last_seen_at_ms: 1_000,
+            deleted_at_ms,
+        }
+    }
+
+    fn membership(file_key: &str, source: &str, revision: u64) -> IndexMembershipEntry {
+        IndexMembershipEntry {
+            doc_id: format!("{source}:{file_key}:{revision}"),
+            file_key: file_key.to_owned(),
+            revision,
+        }
+    }
+
+    fn clean_audit_input() -> IndexFreshnessAuditInput {
+        IndexFreshnessAuditInput {
+            run_id: "clean-run".to_owned(),
+            filesystem: vec![fs_entry("src/lib.rs", "/workspace/src/lib.rs", "a", 1_000)],
+            catalog: vec![catalog_entry(
+                "src/lib.rs",
+                "/workspace/src/lib.rs",
+                "a",
+                7,
+                None,
+            )],
+            vector_index: vec![membership("src/lib.rs", "vector", 7)],
+            lexical_index: vec![membership("src/lib.rs", "lexical", 7)],
+            watcher_checkpoint: WatcherCheckpointSnapshot {
+                checkpoint_id: "watcher-clean".to_owned(),
+                last_applied_seq: 42,
+                pending_changes: 0,
+                watermark_ms: 1_000,
+            },
         }
     }
 
@@ -1139,6 +1613,142 @@ mod tests {
         let json = serde_json::to_string(&decision).expect("serialize decision");
         serde_json::from_str::<IncrementalChangeDecision>(&json)
             .expect("missing rename paths produce a valid reconcile decision");
+    }
+
+    #[test]
+    fn index_freshness_audit_clean_fixture_has_no_findings() {
+        let report = IndexFreshnessAuditReport::from_input(clean_audit_input());
+
+        assert!(report.is_clean());
+        assert_eq!(report.kind, KIND_INDEX_FRESHNESS_AUDIT_REPORT);
+        assert!(report.findings.is_empty());
+        assert!(report.repair_plan.dry_run);
+        assert!(!report.repair_plan.fail_closed);
+        assert!(report.repair_plan.actions.is_empty());
+        assert_eq!(
+            report.audit_jsonl_path,
+            "runs/clean-run/index_freshness/audit-events.jsonl"
+        );
+        assert_eq!(
+            report.summary_json_path,
+            "runs/clean-run/index_freshness/summary.json"
+        );
+        assert!(
+            report
+                .replay_command
+                .contains("scripts/check_fsfs_index_freshness_audit.sh --mode e2e")
+        );
+
+        let json = serde_json::to_string(&report).expect("serialize audit report");
+        let parsed: IndexFreshnessAuditReport =
+            serde_json::from_str(&json).expect("audit report roundtrip");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn index_freshness_audit_classifies_drift_cases_deterministically() {
+        let report = IndexFreshnessAuditReport::from_input(IndexFreshnessAuditInput {
+            run_id: "drift-run".to_owned(),
+            filesystem: vec![
+                fs_entry("src/clean.rs", "/workspace/src/clean.rs", "a", 1_000),
+                fs_entry("src/stale.rs", "/workspace/src/stale.rs", "b", 1_100),
+                fs_entry(
+                    "src/missing_catalog.rs",
+                    "/workspace/src/missing_catalog.rs",
+                    "c",
+                    1_200,
+                ),
+                fs_entry(
+                    "src/missing_membership.rs",
+                    "/workspace/src/missing_membership.rs",
+                    "d",
+                    1_300,
+                ),
+                fs_entry(
+                    "src/duplicate.rs",
+                    "/workspace/src/duplicate.rs",
+                    "e",
+                    1_400,
+                ),
+            ],
+            catalog: vec![
+                catalog_entry("src/clean.rs", "/workspace/src/clean.rs", "a", 1, None),
+                catalog_entry("src/stale.rs", "/workspace/src/stale.rs", "f", 2, None),
+                catalog_entry(
+                    "src/missing_membership.rs",
+                    "/workspace/src/missing_membership.rs",
+                    "d",
+                    3,
+                    None,
+                ),
+                catalog_entry(
+                    "src/duplicate.rs",
+                    "/workspace/src/duplicate.rs",
+                    "e",
+                    4,
+                    None,
+                ),
+                catalog_entry("src/orphan.rs", "/workspace/src/orphan.rs", "9", 5, None),
+            ],
+            vector_index: vec![
+                membership("src/clean.rs", "vector", 1),
+                membership("src/stale.rs", "vector", 2),
+                membership("src/duplicate.rs", "vector", 4),
+                membership("src/duplicate.rs", "vector-extra", 4),
+            ],
+            lexical_index: vec![
+                membership("src/clean.rs", "lexical", 1),
+                membership("src/stale.rs", "lexical", 2),
+                membership("src/duplicate.rs", "lexical", 4),
+                membership("src/duplicate.rs", "lexical-extra", 4),
+            ],
+            watcher_checkpoint: WatcherCheckpointSnapshot {
+                checkpoint_id: "watcher-drift".to_owned(),
+                last_applied_seq: 40,
+                pending_changes: 3,
+                watermark_ms: 900,
+            },
+        });
+
+        let kinds = report
+            .findings
+            .iter()
+            .map(|finding| finding.kind)
+            .collect::<BTreeSet<_>>();
+        assert!(kinds.contains(&IndexFreshnessFindingKind::MissingCatalog));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::StaleCatalog));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::OrphanCatalog));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::MissingVector));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::MissingLexical));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::DoubleIndexed));
+        assert!(kinds.contains(&IndexFreshnessFindingKind::WatcherCheckpointStale));
+        assert_eq!(
+            report.summary.verdict,
+            IndexFreshnessAuditVerdict::FailClosed
+        );
+        assert!(report.repair_plan.dry_run);
+        assert!(report.repair_plan.fail_closed);
+        assert!(
+            report
+                .repair_plan
+                .actions
+                .iter()
+                .all(|action| !action.destructive)
+        );
+
+        let reasons = report
+            .findings
+            .iter()
+            .map(|finding| finding.reason_code.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(reasons.contains("FSFS_AUDIT_MISSING_CATALOG"));
+        assert!(reasons.contains("FSFS_AUDIT_STALE_CATALOG_HASH"));
+        assert!(reasons.contains("FSFS_AUDIT_ORPHAN_CATALOG_ENTRY"));
+        assert!(reasons.contains("FSFS_AUDIT_MISSING_VECTOR_MEMBERSHIP"));
+        assert!(reasons.contains("FSFS_AUDIT_MISSING_LEXICAL_MEMBERSHIP"));
+        assert!(reasons.contains("FSFS_AUDIT_DOUBLE_VECTOR_MEMBERSHIP"));
+        assert!(reasons.contains("FSFS_AUDIT_DOUBLE_LEXICAL_MEMBERSHIP"));
+        assert!(reasons.contains("FSFS_AUDIT_WATCHER_CHECKPOINT_STALE"));
     }
 
     #[test]

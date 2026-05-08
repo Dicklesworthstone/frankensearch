@@ -547,6 +547,60 @@ fn test_incremental_recovery_checkpoint_conformance() {
 }
 
 #[test]
+fn test_index_freshness_audit_report_conformance() {
+    use frankensearch_fsfs::incremental_change::{
+        CatalogSnapshotEntry, FilesystemSnapshotEntry, IndexFreshnessAuditInput,
+        IndexFreshnessAuditReport, IndexFreshnessAuditVerdict, IndexMembershipEntry,
+        KIND_INDEX_FRESHNESS_AUDIT_REPORT, WatcherCheckpointSnapshot,
+    };
+
+    let report = IndexFreshnessAuditReport::from_input(IndexFreshnessAuditInput {
+        run_id: "schema-conformance".to_owned(),
+        filesystem: vec![FilesystemSnapshotEntry {
+            file_key: "src/lib.rs".to_owned(),
+            path: "/workspace/src/lib.rs".to_owned(),
+            content_hash: "a".repeat(64),
+            observed_at_ms: 1_000,
+        }],
+        catalog: vec![CatalogSnapshotEntry {
+            file_key: "src/lib.rs".to_owned(),
+            path: "/workspace/src/lib.rs".to_owned(),
+            content_hash: "a".repeat(64),
+            revision: 3,
+            last_seen_at_ms: 1_000,
+            deleted_at_ms: None,
+        }],
+        vector_index: vec![IndexMembershipEntry {
+            doc_id: "vector:src/lib.rs:3".to_owned(),
+            file_key: "src/lib.rs".to_owned(),
+            revision: 3,
+        }],
+        lexical_index: vec![IndexMembershipEntry {
+            doc_id: "lexical:src/lib.rs:3".to_owned(),
+            file_key: "src/lib.rs".to_owned(),
+            revision: 3,
+        }],
+        watcher_checkpoint: WatcherCheckpointSnapshot {
+            checkpoint_id: "schema-clean".to_owned(),
+            last_applied_seq: 3,
+            pending_changes: 0,
+            watermark_ms: 1_000,
+        },
+    });
+
+    assert_eq!(report.kind, KIND_INDEX_FRESHNESS_AUDIT_REPORT);
+    assert_eq!(report.summary.verdict, IndexFreshnessAuditVerdict::Clean);
+    assert!(report.findings.is_empty());
+    assert!(report.repair_plan.dry_run);
+    assert!(!report.repair_plan.fail_closed);
+
+    let serialized = serde_json::to_string_pretty(&report).expect("serialize audit report");
+    let parsed: IndexFreshnessAuditReport =
+        serde_json::from_str(&serialized).expect("parse audit report");
+    assert_eq!(parsed, report);
+}
+
+#[test]
 fn test_incremental_change_invalid_fixtures_are_rejected_by_rust() {
     assert_invalid_rust_fixture::<
         frankensearch_fsfs::incremental_change::IncrementalChangeDetectionContractDefinition,
