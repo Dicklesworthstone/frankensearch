@@ -18,6 +18,10 @@ pub const OPPORTUNITY_MATRIX_SCHEMA_VERSION: &str = "fsfs-opportunity-matrix-v1"
 pub const CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION: &str = "fsfs-crawl-ingest-opt-track-v1";
 /// Schema version for self-calibrating fsfs host/corpus profiles.
 pub const SELF_CALIBRATING_PROFILE_SCHEMA_VERSION: &str = "fsfs-self-calibrating-profile-v1";
+/// Schema version for fsfs model-cache diagnostics.
+pub const MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
+pub const MODEL_CACHE_DIAGNOSTICS_CONTRACT_KIND: &str = "fsfs_model_cache_diagnostics_contract";
+pub const MODEL_CACHE_DIAGNOSTICS_REPORT_KIND: &str = "fsfs_model_cache_diagnostics_report";
 
 /// Reason code emitted when an optimization iteration is accepted.
 pub const ITERATION_REASON_ACCEPTED: &str = "opt.iteration.accepted";
@@ -155,6 +159,444 @@ pub enum ModelCacheState {
     Missing,
     /// Cache availability was not measured.
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheDownloadStatus {
+    Ready,
+    Offline,
+    Disabled,
+    Missing,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheFallbackPath {
+    QualityModel,
+    FastEmbed,
+    HashEmbedder,
+    LexicalOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheAdviceSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheDiagnosticRule {
+    pub rule_id: String,
+    pub state: ModelCacheState,
+    pub reason_code: String,
+    pub severity: ModelCacheAdviceSeverity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheDiagnosticsContractDefinition {
+    pub kind: String,
+    pub v: u32,
+    pub redacted_path_required: bool,
+    pub network_required_in_tests: bool,
+    pub required_fields: Vec<String>,
+    pub advice_env_vars: Vec<String>,
+    pub advice_config_knobs: Vec<String>,
+    pub state_rules: Vec<ModelCacheDiagnosticRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheArtifactIdentity {
+    pub model_id: String,
+    pub revision: String,
+    pub digest_sha256: String,
+    pub redacted_model_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheWarmupDiagnostics {
+    pub state: ModelCacheState,
+    pub warmup_latency_ms: u32,
+    pub cold_load_latency_ms: u32,
+    pub memory_mib: u32,
+    pub download_status: ModelCacheDownloadStatus,
+    pub offline: bool,
+    pub fallback_path: ModelCacheFallbackPath,
+    pub artifact: ModelCacheArtifactIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheOperatorAdvice {
+    pub reason_code: String,
+    pub severity: ModelCacheAdviceSeverity,
+    pub summary: String,
+    pub env_var: String,
+    pub config_knob: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheDiagnosticsReport {
+    pub kind: String,
+    pub v: u32,
+    pub generated_at: String,
+    pub surface: String,
+    pub diagnostics: ModelCacheWarmupDiagnostics,
+    pub advice: Vec<ModelCacheOperatorAdvice>,
+    pub raw_paths_present: bool,
+    pub network_required: bool,
+}
+
+#[must_use]
+pub fn model_cache_diagnostics_contract_definition() -> ModelCacheDiagnosticsContractDefinition {
+    ModelCacheDiagnosticsContractDefinition {
+        kind: MODEL_CACHE_DIAGNOSTICS_CONTRACT_KIND.to_owned(),
+        v: MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION,
+        redacted_path_required: true,
+        network_required_in_tests: false,
+        required_fields: vec![
+            "state".to_owned(),
+            "model_id".to_owned(),
+            "revision".to_owned(),
+            "digest_sha256".to_owned(),
+            "warmup_latency_ms".to_owned(),
+            "memory_mib".to_owned(),
+            "download_status".to_owned(),
+            "offline".to_owned(),
+            "fallback_path".to_owned(),
+        ],
+        advice_env_vars: vec![
+            "FRANKENSEARCH_MODEL_DIR".to_owned(),
+            "FSFS_DOWNLOAD_MODE".to_owned(),
+        ],
+        advice_config_knobs: vec![
+            "indexing.model_dir".to_owned(),
+            "search.fast_only".to_owned(),
+        ],
+        state_rules: vec![
+            ModelCacheDiagnosticRule {
+                rule_id: "warm-ready".to_owned(),
+                state: ModelCacheState::Warm,
+                reason_code: "model_cache.ready".to_owned(),
+                severity: ModelCacheAdviceSeverity::Info,
+            },
+            ModelCacheDiagnosticRule {
+                rule_id: "cold-warmup".to_owned(),
+                state: ModelCacheState::Cold,
+                reason_code: "model_cache.cold.warmup".to_owned(),
+                severity: ModelCacheAdviceSeverity::Warning,
+            },
+            ModelCacheDiagnosticRule {
+                rule_id: "missing-offline".to_owned(),
+                state: ModelCacheState::Missing,
+                reason_code: "model_cache.missing.offline".to_owned(),
+                severity: ModelCacheAdviceSeverity::Error,
+            },
+            ModelCacheDiagnosticRule {
+                rule_id: "unknown-unmeasured".to_owned(),
+                state: ModelCacheState::Unknown,
+                reason_code: "model_cache.unknown.unmeasured".to_owned(),
+                severity: ModelCacheAdviceSeverity::Warning,
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn model_cache_warm_diagnostics_fixture() -> ModelCacheDiagnosticsReport {
+    model_cache_report(
+        ModelCacheState::Warm,
+        18,
+        430,
+        512,
+        ModelCacheDownloadStatus::Ready,
+        false,
+        ModelCacheFallbackPath::QualityModel,
+        "minilm-l6-v2-fixture-rev",
+        "aa",
+        vec![advice(
+            "model_cache.ready",
+            ModelCacheAdviceSeverity::Info,
+            "quality model cache is warm and ready",
+            "FRANKENSEARCH_MODEL_DIR",
+            "indexing.model_dir",
+            "fsfs status --format json",
+        )],
+    )
+}
+
+#[must_use]
+pub fn model_cache_cold_diagnostics_fixture() -> ModelCacheDiagnosticsReport {
+    model_cache_report(
+        ModelCacheState::Cold,
+        420,
+        430,
+        512,
+        ModelCacheDownloadStatus::Ready,
+        false,
+        ModelCacheFallbackPath::QualityModel,
+        "minilm-l6-v2-fixture-rev",
+        "bb",
+        vec![
+            advice(
+                "model_cache.cold.warmup",
+                ModelCacheAdviceSeverity::Warning,
+                "quality model artifacts exist but cold warmup is over budget",
+                "FRANKENSEARCH_MODEL_DIR",
+                "indexing.model_dir",
+                "fsfs doctor --check-models --format json",
+            ),
+            advice(
+                "model_cache.cold.fast_only_escape",
+                ModelCacheAdviceSeverity::Info,
+                "set fast-only when cold model startup is unacceptable",
+                "FSFS_DOWNLOAD_MODE",
+                "search.fast_only",
+                "fsfs search --fast-only --format json",
+            ),
+        ],
+    )
+}
+
+#[must_use]
+pub fn model_cache_missing_offline_diagnostics_fixture() -> ModelCacheDiagnosticsReport {
+    model_cache_report(
+        ModelCacheState::Missing,
+        0,
+        0,
+        0,
+        ModelCacheDownloadStatus::Offline,
+        true,
+        ModelCacheFallbackPath::HashEmbedder,
+        "missing-offline-fixture",
+        "cc",
+        vec![advice(
+            "model_cache.missing.offline",
+            ModelCacheAdviceSeverity::Error,
+            "quality model cache is missing and downloads are disabled",
+            "FSFS_DOWNLOAD_MODE",
+            "search.fast_only",
+            "fsfs download-models --model minilm-l6-v2",
+        )],
+    )
+}
+
+impl ModelCacheDiagnosticsContractDefinition {
+    /// Validates the model-cache diagnostics contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required state rules or operator hints are missing.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != MODEL_CACHE_DIAGNOSTICS_CONTRACT_KIND {
+            return Err("unexpected model-cache contract kind".to_owned());
+        }
+        if self.v != MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION {
+            return Err("unsupported model-cache contract version".to_owned());
+        }
+        if !self.redacted_path_required {
+            return Err("model-cache diagnostics must require redacted paths".to_owned());
+        }
+        if self.network_required_in_tests {
+            return Err("model-cache diagnostics tests must not require network".to_owned());
+        }
+        if !self
+            .advice_env_vars
+            .iter()
+            .any(|env_var| env_var == "FRANKENSEARCH_MODEL_DIR")
+        {
+            return Err("operator advice must mention FRANKENSEARCH_MODEL_DIR".to_owned());
+        }
+        if !self
+            .advice_config_knobs
+            .iter()
+            .any(|knob| knob == "indexing.model_dir")
+        {
+            return Err("operator advice must mention indexing.model_dir".to_owned());
+        }
+
+        let states: BTreeSet<ModelCacheState> =
+            self.state_rules.iter().map(|rule| rule.state).collect();
+        let covers_all_states = [
+            ModelCacheState::Warm,
+            ModelCacheState::Cold,
+            ModelCacheState::Missing,
+            ModelCacheState::Unknown,
+        ]
+        .into_iter()
+        .all(|state| states.contains(&state));
+        if !covers_all_states {
+            return Err("model-cache contract missing state rule".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl ModelCacheDiagnosticsReport {
+    /// Validates a model-cache diagnostics report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report leaks raw paths, requires network, or
+    /// omits actionable operator advice.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != MODEL_CACHE_DIAGNOSTICS_REPORT_KIND {
+            return Err("unexpected model-cache report kind".to_owned());
+        }
+        if self.v != MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION {
+            return Err("unsupported model-cache report version".to_owned());
+        }
+        if self.generated_at.trim().is_empty() || self.surface.trim().is_empty() {
+            return Err("model-cache report missing stable identity fields".to_owned());
+        }
+        if self.raw_paths_present {
+            return Err("model-cache report leaks raw paths".to_owned());
+        }
+        if self.network_required {
+            return Err("model-cache diagnostics must not require network in tests".to_owned());
+        }
+        self.diagnostics.validate()?;
+        if self.advice.is_empty() {
+            return Err("model-cache report must include operator advice".to_owned());
+        }
+        for advice in &self.advice {
+            advice.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ModelCacheWarmupDiagnostics {
+    fn validate(&self) -> Result<(), String> {
+        self.artifact.validate()?;
+        match self.state {
+            ModelCacheState::Warm => {
+                if self.warmup_latency_ms == 0 || self.memory_mib == 0 {
+                    return Err("warm cache diagnostics require latency and memory".to_owned());
+                }
+            }
+            ModelCacheState::Cold => {
+                if self.cold_load_latency_ms < self.warmup_latency_ms {
+                    return Err("cold load latency must be at least warmup latency".to_owned());
+                }
+            }
+            ModelCacheState::Missing => {
+                if self.fallback_path == ModelCacheFallbackPath::QualityModel {
+                    return Err("missing model cache must not use quality fallback".to_owned());
+                }
+            }
+            ModelCacheState::Unknown => {}
+        }
+        Ok(())
+    }
+}
+
+impl ModelCacheArtifactIdentity {
+    fn validate(&self) -> Result<(), String> {
+        if self.model_id.trim().is_empty() || self.revision.trim().is_empty() {
+            return Err("model identity fields must not be empty".to_owned());
+        }
+        if !is_sha256_digest(&self.digest_sha256) {
+            return Err("model digest must be sha256:<64 lowercase hex>".to_owned());
+        }
+        if !is_redacted_model_dir(&self.redacted_model_dir) {
+            return Err("model directory must be redacted".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl ModelCacheOperatorAdvice {
+    fn validate(&self) -> Result<(), String> {
+        if !self.reason_code.starts_with("model_cache.") {
+            return Err("model-cache advice reason code must use model_cache namespace".to_owned());
+        }
+        if self.summary.trim().is_empty()
+            || self.env_var.trim().is_empty()
+            || self.config_knob.trim().is_empty()
+            || self.command.trim().is_empty()
+        {
+            return Err("model-cache operator advice must be actionable".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn model_cache_report(
+    state: ModelCacheState,
+    warmup_latency_ms: u32,
+    cold_load_latency_ms: u32,
+    memory_mib: u32,
+    download_status: ModelCacheDownloadStatus,
+    offline: bool,
+    fallback_path: ModelCacheFallbackPath,
+    revision: &str,
+    digest_pair: &str,
+    advice: Vec<ModelCacheOperatorAdvice>,
+) -> ModelCacheDiagnosticsReport {
+    ModelCacheDiagnosticsReport {
+        kind: MODEL_CACHE_DIAGNOSTICS_REPORT_KIND.to_owned(),
+        v: MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION,
+        generated_at: "2026-05-08T00:00:00Z".to_owned(),
+        surface: "fsfs doctor --check-models --format json".to_owned(),
+        diagnostics: ModelCacheWarmupDiagnostics {
+            state,
+            warmup_latency_ms,
+            cold_load_latency_ms,
+            memory_mib,
+            download_status,
+            offline,
+            fallback_path,
+            artifact: ModelCacheArtifactIdentity {
+                model_id: "sentence-transformers/all-MiniLM-L6-v2".to_owned(),
+                revision: revision.to_owned(),
+                digest_sha256: fixed_sha256(digest_pair),
+                redacted_model_dir: "<redacted:model-cache>/minilm-l6-v2".to_owned(),
+            },
+        },
+        advice,
+        raw_paths_present: false,
+        network_required: false,
+    }
+}
+
+fn advice(
+    reason_code: &str,
+    severity: ModelCacheAdviceSeverity,
+    summary: &str,
+    env_var: &str,
+    config_knob: &str,
+    command: &str,
+) -> ModelCacheOperatorAdvice {
+    ModelCacheOperatorAdvice {
+        reason_code: reason_code.to_owned(),
+        severity,
+        summary: summary.to_owned(),
+        env_var: env_var.to_owned(),
+        config_knob: config_knob.to_owned(),
+        command: command.to_owned(),
+    }
+}
+
+fn fixed_sha256(pair: &str) -> String {
+    format!("sha256:{}", pair.repeat(32))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.chars().all(is_lower_hex_digit))
+}
+
+fn is_lower_hex_digit(ch: char) -> bool {
+    ch.is_ascii_digit() || ('a'..='f').contains(&ch)
+}
+
+fn is_redacted_model_dir(value: &str) -> bool {
+    value.starts_with("<redacted:") && !value.starts_with('/')
 }
 
 /// Host capability snapshot used by the profile recommender.
@@ -990,12 +1432,15 @@ mod tests {
     use super::{
         CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorpusProfileSnapshot, CrawlIngestStage,
         HostProfileSnapshot, ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE,
-        ITERATION_REASON_NO_CHANGE, LeverSnapshot, ModelCacheState, OneLeverIterationProtocol,
-        OpportunityCandidate, OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind,
-        ProfileWorkflow, RecommendedTwoTierConfig, SELF_CALIBRATING_PROFILE_SCHEMA_VERSION,
+        ITERATION_REASON_NO_CHANGE, LeverSnapshot, MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION,
+        ModelCacheFallbackPath, ModelCacheState, OneLeverIterationProtocol, OpportunityCandidate,
+        OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind, ProfileWorkflow,
+        RecommendedTwoTierConfig, SELF_CALIBRATING_PROFILE_SCHEMA_VERSION,
         SearchProfileMeasurements, SelfCalibratingProfileArtifactKind, SelfCalibratingProfileInput,
         SelfCalibratingProfileReport, crawl_ingest_opportunity_matrix,
-        crawl_ingest_optimization_track,
+        crawl_ingest_optimization_track, model_cache_cold_diagnostics_fixture,
+        model_cache_diagnostics_contract_definition,
+        model_cache_missing_offline_diagnostics_fixture, model_cache_warm_diagnostics_fixture,
     };
     use std::collections::BTreeSet;
 
@@ -1451,5 +1896,84 @@ mod tests {
         assert_eq!(decoded, report);
         assert_eq!(decoded.profile.corpus.average_document_bytes(), 5_120);
         assert_eq!(decoded.profile.host.memory_headroom_pct(), 75);
+    }
+
+    #[test]
+    fn model_cache_diagnostics_contract_covers_states_and_operator_knobs() {
+        let contract = model_cache_diagnostics_contract_definition();
+        contract
+            .validate()
+            .expect("model-cache diagnostics contract should validate");
+
+        let states: BTreeSet<ModelCacheState> =
+            contract.state_rules.iter().map(|rule| rule.state).collect();
+        assert_eq!(
+            states,
+            BTreeSet::from([
+                ModelCacheState::Warm,
+                ModelCacheState::Cold,
+                ModelCacheState::Missing,
+                ModelCacheState::Unknown,
+            ])
+        );
+        assert_eq!(contract.v, MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION);
+        assert!(
+            contract
+                .advice_env_vars
+                .contains(&"FRANKENSEARCH_MODEL_DIR".to_owned())
+        );
+        assert!(
+            contract
+                .advice_config_knobs
+                .contains(&"indexing.model_dir".to_owned())
+        );
+        assert!(!contract.network_required_in_tests);
+    }
+
+    #[test]
+    fn model_cache_diagnostics_validate_warm_cold_and_missing_offline() {
+        let warm = model_cache_warm_diagnostics_fixture();
+        warm.validate().expect("warm fixture should validate");
+        assert_eq!(warm.diagnostics.state, ModelCacheState::Warm);
+        assert_eq!(
+            warm.diagnostics.fallback_path,
+            ModelCacheFallbackPath::QualityModel
+        );
+
+        let cold = model_cache_cold_diagnostics_fixture();
+        cold.validate().expect("cold fixture should validate");
+        assert_eq!(cold.diagnostics.state, ModelCacheState::Cold);
+        assert!(
+            cold.advice
+                .iter()
+                .any(|advice| advice.config_knob == "search.fast_only")
+        );
+
+        let missing = model_cache_missing_offline_diagnostics_fixture();
+        missing
+            .validate()
+            .expect("missing offline fixture should validate");
+        assert_eq!(missing.diagnostics.state, ModelCacheState::Missing);
+        assert!(missing.diagnostics.offline);
+        assert_eq!(
+            missing.diagnostics.fallback_path,
+            ModelCacheFallbackPath::HashEmbedder
+        );
+    }
+
+    #[test]
+    fn model_cache_diagnostics_reject_raw_paths_and_missing_advice() {
+        let mut raw_path = model_cache_warm_diagnostics_fixture();
+        raw_path.diagnostics.artifact.redacted_model_dir =
+            "/home/ubuntu/.cache/frankensearch/models".to_owned();
+        let error = raw_path.validate().expect_err("raw path should fail");
+        assert!(error.contains("redacted"));
+
+        let mut missing_advice = model_cache_cold_diagnostics_fixture();
+        missing_advice.advice.clear();
+        let error = missing_advice
+            .validate()
+            .expect_err("missing advice should fail");
+        assert!(error.contains("operator advice"));
     }
 }

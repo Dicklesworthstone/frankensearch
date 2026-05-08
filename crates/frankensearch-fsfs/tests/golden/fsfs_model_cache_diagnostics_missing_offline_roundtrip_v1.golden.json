@@ -1,0 +1,33 @@
+{
+  "kind": "fsfs_model_cache_diagnostics_report",
+  "v": 1,
+  "generated_at": "2026-05-08T00:00:00Z",
+  "surface": "fsfs doctor --check-models --format json",
+  "diagnostics": {
+    "state": "missing",
+    "warmup_latency_ms": 0,
+    "cold_load_latency_ms": 0,
+    "memory_mib": 0,
+    "download_status": "offline",
+    "offline": true,
+    "fallback_path": "hash_embedder",
+    "artifact": {
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "missing-offline-fixture",
+      "digest_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "redacted_model_dir": "<redacted:model-cache>/minilm-l6-v2"
+    }
+  },
+  "advice": [
+    {
+      "reason_code": "model_cache.missing.offline",
+      "severity": "error",
+      "summary": "quality model cache is missing and downloads are disabled",
+      "env_var": "FSFS_DOWNLOAD_MODE",
+      "config_knob": "search.fast_only",
+      "command": "fsfs download-models --model minilm-l6-v2"
+    }
+  ],
+  "raw_paths_present": false,
+  "network_required": false
+}

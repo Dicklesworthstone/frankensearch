@@ -1,0 +1,51 @@
+{
+  "kind": "fsfs_model_cache_diagnostics_contract",
+  "v": 1,
+  "redacted_path_required": true,
+  "network_required_in_tests": false,
+  "required_fields": [
+    "state",
+    "model_id",
+    "revision",
+    "digest_sha256",
+    "warmup_latency_ms",
+    "memory_mib",
+    "download_status",
+    "offline",
+    "fallback_path"
+  ],
+  "advice_env_vars": [
+    "FRANKENSEARCH_MODEL_DIR",
+    "FSFS_DOWNLOAD_MODE"
+  ],
+  "advice_config_knobs": [
+    "indexing.model_dir",
+    "search.fast_only"
+  ],
+  "state_rules": [
+    {
+      "rule_id": "warm-ready",
+      "state": "warm",
+      "reason_code": "model_cache.ready",
+      "severity": "info"
+    },
+    {
+      "rule_id": "cold-warmup",
+      "state": "cold",
+      "reason_code": "model_cache.cold.warmup",
+      "severity": "warning"
+    },
+    {
+      "rule_id": "missing-offline",
+      "state": "missing",
+      "reason_code": "model_cache.missing.offline",
+      "severity": "error"
+    },
+    {
+      "rule_id": "unknown-unmeasured",
+      "state": "unknown",
+      "reason_code": "model_cache.unknown.unmeasured",
+      "severity": "warning"
+    }
+  ]
+}

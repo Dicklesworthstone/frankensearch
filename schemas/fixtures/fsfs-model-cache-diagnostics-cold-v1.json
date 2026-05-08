@@ -1,0 +1,41 @@
+{
+  "kind": "fsfs_model_cache_diagnostics_report",
+  "v": 1,
+  "generated_at": "2026-05-08T00:00:00Z",
+  "surface": "fsfs doctor --check-models --format json",
+  "diagnostics": {
+    "state": "cold",
+    "warmup_latency_ms": 420,
+    "cold_load_latency_ms": 430,
+    "memory_mib": 512,
+    "download_status": "ready",
+    "offline": false,
+    "fallback_path": "quality_model",
+    "artifact": {
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "minilm-l6-v2-fixture-rev",
+      "digest_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "redacted_model_dir": "<redacted:model-cache>/minilm-l6-v2"
+    }
+  },
+  "advice": [
+    {
+      "reason_code": "model_cache.cold.warmup",
+      "severity": "warning",
+      "summary": "quality model artifacts exist but cold warmup is over budget",
+      "env_var": "FRANKENSEARCH_MODEL_DIR",
+      "config_knob": "indexing.model_dir",
+      "command": "fsfs doctor --check-models --format json"
+    },
+    {
+      "reason_code": "model_cache.cold.fast_only_escape",
+      "severity": "info",
+      "summary": "set fast-only when cold model startup is unacceptable",
+      "env_var": "FSFS_DOWNLOAD_MODE",
+      "config_knob": "search.fast_only",
+      "command": "fsfs search --fast-only --format json"
+    }
+  ],
+  "raw_paths_present": false,
+  "network_required": false
+}

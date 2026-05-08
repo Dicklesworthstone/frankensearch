@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-model-cache-diagnostics-v1.schema.json",
+  "title": "fsfs Model Cache Diagnostics v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/diagnosticsReport"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^model_cache\\.[a-z0-9_.]+$"
+    },
+    "cacheState": {
+      "type": "string",
+      "enum": [
+        "warm",
+        "cold",
+        "missing",
+        "unknown"
+      ]
+    },
+    "downloadStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "offline",
+        "disabled",
+        "missing",
+        "failed"
+      ]
+    },
+    "fallbackPath": {
+      "type": "string",
+      "enum": [
+        "quality_model",
+        "fast_embed",
+        "hash_embedder",
+        "lexical_only"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "redactedModelDir": {
+      "type": "string",
+      "pattern": "^<redacted:[a-z0-9_-]+>(/[A-Za-z0-9_.-]+)*$"
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "redacted_path_required",
+        "network_required_in_tests",
+        "required_fields",
+        "advice_env_vars",
+        "advice_config_knobs",
+        "state_rules"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_model_cache_diagnostics_contract"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "redacted_path_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "network_required_in_tests": {
+          "type": "boolean",
+          "const": false
+        },
+        "required_fields": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "advice_env_vars": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "advice_config_knobs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "state_rules": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "$ref": "#/$defs/stateRule"
+          }
+        }
+      }
+    },
+    "stateRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "state",
+        "reason_code",
+        "severity"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "$ref": "#/$defs/cacheState"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "severity": {
+          "$ref": "#/$defs/severity"
+        }
+      }
+    },
+    "diagnosticsReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "generated_at",
+        "surface",
+        "diagnostics",
+        "advice",
+        "raw_paths_present",
+        "network_required"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_model_cache_diagnostics_report"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "generated_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/warmupDiagnostics"
+        },
+        "advice": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/operatorAdvice"
+          }
+        },
+        "raw_paths_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "network_required": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "warmupDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "warmup_latency_ms",
+        "cold_load_latency_ms",
+        "memory_mib",
+        "download_status",
+        "offline",
+        "fallback_path",
+        "artifact"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/cacheState"
+        },
+        "warmup_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cold_load_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_mib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "download_status": {
+          "$ref": "#/$defs/downloadStatus"
+        },
+        "offline": {
+          "type": "boolean"
+        },
+        "fallback_path": {
+          "$ref": "#/$defs/fallbackPath"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifactIdentity"
+        }
+      }
+    },
+    "artifactIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "revision",
+        "digest_sha256",
+        "redacted_model_dir"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "redacted_model_dir": {
+          "$ref": "#/$defs/redactedModelDir"
+        }
+      }
+    },
+    "operatorAdvice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason_code",
+        "severity",
+        "summary",
+        "env_var",
+        "config_knob",
+        "command"
+      ],
+      "properties": {
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "severity": {
+          "$ref": "#/$defs/severity"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "env_var": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config_knob": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

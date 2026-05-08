@@ -96,6 +96,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-incremental-change-detection-") {
         return "fsfs-incremental-change-detection-v1.schema.json";
     }
+    if name.starts_with("fsfs-model-cache-diagnostics-") {
+        return "fsfs-model-cache-diagnostics-v1.schema.json";
+    }
     if name.starts_with("fsfs-packaging-release-install-") {
         return "fsfs-packaging-release-install-v1.schema.json";
     }
@@ -510,6 +513,80 @@ fn test_corpus_privacy_preflight_invalid_fixtures_are_rejected_by_rust() {
             .expect_err("invalid corpus privacy preflight report should fail validation");
         assert!(
             !error.to_string().is_empty(),
+            "fixture {fixture} produced an empty validation error"
+        );
+    }
+}
+
+#[test]
+fn test_model_cache_diagnostics_contract_conformance() {
+    let path = fixture_dir().join("fsfs-model-cache-diagnostics-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::profiling::ModelCacheDiagnosticsContractDefinition =
+        serde_json::from_str(&raw).expect("parse model cache diagnostics contract");
+    parsed
+        .validate()
+        .expect("model cache diagnostics contract should validate");
+    assert_golden_json(
+        "fsfs_model_cache_diagnostics_contract_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_model_cache_diagnostics_warm_conformance() {
+    let path = fixture_dir().join("fsfs-model-cache-diagnostics-warm-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::profiling::ModelCacheDiagnosticsReport =
+        serde_json::from_str(&raw).expect("parse model cache diagnostics warm report");
+    parsed
+        .validate()
+        .expect("model cache diagnostics warm report should validate");
+    assert_golden_json("fsfs_model_cache_diagnostics_warm_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_model_cache_diagnostics_cold_conformance() {
+    let path = fixture_dir().join("fsfs-model-cache-diagnostics-cold-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::profiling::ModelCacheDiagnosticsReport =
+        serde_json::from_str(&raw).expect("parse model cache diagnostics cold report");
+    parsed
+        .validate()
+        .expect("model cache diagnostics cold report should validate");
+    assert_golden_json("fsfs_model_cache_diagnostics_cold_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_model_cache_diagnostics_missing_offline_conformance() {
+    let path = fixture_dir().join("fsfs-model-cache-diagnostics-missing-offline-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::profiling::ModelCacheDiagnosticsReport =
+        serde_json::from_str(&raw).expect("parse model cache diagnostics missing report");
+    parsed
+        .validate()
+        .expect("model cache diagnostics missing report should validate");
+    assert_golden_json(
+        "fsfs_model_cache_diagnostics_missing_offline_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_model_cache_diagnostics_invalid_fixtures_are_rejected_by_rust() {
+    for fixture in [
+        "fsfs-model-cache-diagnostics-invalid-raw-path-v1.json",
+        "fsfs-model-cache-diagnostics-invalid-missing-advice-v1.json",
+    ] {
+        let path = invalid_fixture_dir().join(fixture);
+        let raw = std::fs::read_to_string(&path).expect("read invalid fixture");
+        let parsed: frankensearch_fsfs::profiling::ModelCacheDiagnosticsReport =
+            serde_json::from_str(&raw).expect("parse invalid model cache diagnostics report");
+        let error = parsed
+            .validate()
+            .expect_err("invalid model cache diagnostics report should fail validation");
+        assert!(
+            !error.is_empty(),
             "fixture {fixture} produced an empty validation error"
         );
     }
