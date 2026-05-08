@@ -105,6 +105,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-pressure-profiles-") {
         return "fsfs-pressure-profiles-v1.schema.json";
     }
+    if name.starts_with("fsfs-query-plan-metamorphic-") {
+        return "fsfs-query-plan-metamorphic-v1.schema.json";
+    }
     if name.starts_with("fsfs-provenance-attestation-") {
         return "fsfs-provenance-attestation-v1.schema.json";
     }
@@ -124,7 +127,11 @@ fn schema_for_fixture(name: &str) -> &'static str {
 }
 
 fn is_semantic_invalid_fixture(name: &str) -> bool {
-    matches!(name, "crate-placement-registry-invalid-duplicate-v1.json")
+    matches!(
+        name,
+        "crate-placement-registry-invalid-duplicate-v1.json"
+            | "fsfs-query-plan-metamorphic-invalid-unreported-failure-v1.json"
+    )
 }
 
 fn load_schema<'a>(
@@ -590,6 +597,58 @@ fn test_model_cache_diagnostics_invalid_fixtures_are_rejected_by_rust() {
             "fixture {fixture} produced an empty validation error"
         );
     }
+}
+
+#[test]
+fn test_query_plan_metamorphic_contract_conformance() {
+    let path = fixture_dir().join("fsfs-query-plan-metamorphic-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::QueryPlanMetamorphicContractDefinition =
+        serde_json::from_str(&raw).expect("parse query-plan metamorphic contract");
+    parsed
+        .validate()
+        .expect("query-plan metamorphic contract should validate");
+    assert_golden_json("fsfs_query_plan_metamorphic_contract_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_query_plan_metamorphic_report_conformance() {
+    let path = fixture_dir().join("fsfs-query-plan-metamorphic-report-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::QueryPlanMetamorphicReport =
+        serde_json::from_str(&raw).expect("parse query-plan metamorphic report");
+    parsed
+        .validate()
+        .expect("query-plan metamorphic report should validate");
+    assert_golden_json("fsfs_query_plan_metamorphic_report_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_query_plan_metamorphic_failure_conformance() {
+    let path = fixture_dir().join("fsfs-query-plan-metamorphic-minimized-failure-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::QueryPlanMinimizedFailureFixture =
+        serde_json::from_str(&raw).expect("parse query-plan minimized failure");
+    parsed
+        .validate()
+        .expect("query-plan minimized failure should validate");
+    assert_golden_json("fsfs_query_plan_metamorphic_failure_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_query_plan_metamorphic_invalid_fixtures_are_rejected_by_rust() {
+    let path = invalid_fixture_dir()
+        .join("fsfs-query-plan-metamorphic-invalid-unreported-failure-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read invalid fixture");
+    let parsed: frankensearch_fsfs::QueryPlanMetamorphicReport =
+        serde_json::from_str(&raw).expect("parse invalid query-plan report");
+    let error = parsed
+        .validate()
+        .expect_err("invalid query-plan report should fail validation");
+    assert!(
+        error.contains("failed without minimized fixture"),
+        "unexpected validation error: {error}"
+    );
 }
 
 #[test]

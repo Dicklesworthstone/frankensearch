@@ -256,8 +256,16 @@ pub use query_latency_optimization::{
     query_path_opportunity_matrix,
 };
 pub use query_planning::{
-    DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE, QueryBudgetProfile, QueryFallbackPath,
-    QueryIntentClass, QueryIntentDecision, QueryPlanner, QueryPlannerConfig, RetrievalBudget,
+    DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE, QUERY_PLAN_METAMORPHIC_CONTRACT_KIND,
+    QUERY_PLAN_METAMORPHIC_FAILURE_KIND, QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION,
+    QUERY_PLAN_METAMORPHIC_REPORT_KIND, QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION, QueryBudgetProfile,
+    QueryFallbackPath, QueryIntentClass, QueryIntentDecision, QueryPlanFailureFixturePolicy,
+    QueryPlanGeneratorFamily, QueryPlanGeneratorSpec, QueryPlanInvariant, QueryPlanInvariantResult,
+    QueryPlanInvariantSpec, QueryPlanInvariantStatus, QueryPlanMetamorphicCaseResult,
+    QueryPlanMetamorphicContractDefinition, QueryPlanMetamorphicReport,
+    QueryPlanMetamorphicSummary, QueryPlanMinimizedFailureFixture, QueryPlanObservedDecision,
+    QueryPlanner, QueryPlannerConfig, RetrievalBudget, query_plan_metamorphic_contract_definition,
+    query_plan_metamorphic_minimized_failure_fixture, query_plan_metamorphic_report_fixture,
 };
 pub use ranking_priors::{
     ALL_PRIOR_FAMILIES, DEFAULT_MAX_PRIOR_BOOST, DEFAULT_PATH_PROXIMITY_RADIUS,

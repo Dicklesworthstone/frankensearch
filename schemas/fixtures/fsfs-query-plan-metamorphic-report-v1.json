@@ -1,0 +1,309 @@
+{
+  "kind": "fsfs_query_plan_metamorphic_report",
+  "v": 1,
+  "generated_at": "2026-05-08T00:00:00Z",
+  "generator_version": "fsfs-query-plan-metamorphic-generator-v1",
+  "corpus_dependency": "none",
+  "cases": [
+    {
+      "case_id": "qp-empty-0001",
+      "family": "empty",
+      "seed": 1,
+      "raw_query": "   ",
+      "variant_query": "\n\t  ",
+      "requested_limit": 10,
+      "replay_command": "FSFS_QUERY_PLAN_CASE=qp-empty-0001 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture",
+      "observed": {
+        "normalized_query": "",
+        "variant_normalized_query": "",
+        "intent": "empty",
+        "variant_intent": "empty",
+        "fallback": "empty_query",
+        "mode": "empty",
+        "budget_profile": "empty",
+        "lexical_fanout": 0,
+        "semantic_fanout": 0,
+        "quality_enabled": false,
+        "tie_break_rules": [
+          "doc_id_asc"
+        ]
+      },
+      "invariants": [
+        {
+          "invariant": "canonicalization_idempotent",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.canonicalization_idempotent",
+          "detail": "raw and whitespace variant canonicalization are idempotent"
+        },
+        {
+          "invariant": "classification_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.classification_stable",
+          "detail": "whitespace variant preserves planner classification and execution mode"
+        },
+        {
+          "invariant": "candidate_budget_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.candidate_budget_safe",
+          "detail": "stage candidate budgets stay within resolved retrieval budget"
+        },
+        {
+          "invariant": "replay_command_present",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.replay_command_present",
+          "detail": "case includes FSFS_QUERY_PLAN_CASE replay command"
+        },
+        {
+          "invariant": "empty_query_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.empty_query_safe",
+          "detail": "empty query plans do not enable retrieval stages"
+        }
+      ],
+      "minimized_failure": null
+    },
+    {
+      "case_id": "qp-identifier-0002",
+      "family": "identifier",
+      "seed": 2,
+      "raw_query": "src/query_planning.rs",
+      "variant_query": "  src/query_planning.rs  ",
+      "requested_limit": 8,
+      "replay_command": "FSFS_QUERY_PLAN_CASE=qp-identifier-0002 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture",
+      "observed": {
+        "normalized_query": "src/query_planning.rs",
+        "variant_normalized_query": "src/query_planning.rs",
+        "intent": "identifier",
+        "variant_intent": "identifier",
+        "fallback": "none",
+        "mode": "hybrid_rrf",
+        "budget_profile": "identifier_focused",
+        "lexical_fanout": 48,
+        "semantic_fanout": 16,
+        "quality_enabled": true,
+        "tie_break_rules": [
+          "score_desc",
+          "in_both_sources_desc",
+          "lexical_score_desc",
+          "doc_id_asc"
+        ]
+      },
+      "invariants": [
+        {
+          "invariant": "canonicalization_idempotent",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.canonicalization_idempotent",
+          "detail": "raw and whitespace variant canonicalization are idempotent"
+        },
+        {
+          "invariant": "classification_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.classification_stable",
+          "detail": "whitespace variant preserves planner classification and execution mode"
+        },
+        {
+          "invariant": "candidate_budget_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.candidate_budget_safe",
+          "detail": "stage candidate budgets stay within resolved retrieval budget"
+        },
+        {
+          "invariant": "replay_command_present",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.replay_command_present",
+          "detail": "case includes FSFS_QUERY_PLAN_CASE replay command"
+        },
+        {
+          "invariant": "identifier_lexical_bias",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.identifier_lexical_bias",
+          "detail": "identifier query keeps lexical fanout above semantic fanout"
+        }
+      ],
+      "minimized_failure": null
+    },
+    {
+      "case_id": "qp-negation-0005",
+      "family": "negation",
+      "seed": 5,
+      "raw_query": "rust async -tokio NOT \"blocking runtime\"",
+      "variant_query": " rust   async   -tokio   NOT \"blocking runtime\" ",
+      "requested_limit": 6,
+      "replay_command": "FSFS_QUERY_PLAN_CASE=qp-negation-0005 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture",
+      "observed": {
+        "normalized_query": "rust async -tokio NOT \"blocking runtime\"",
+        "variant_normalized_query": "rust async -tokio NOT \"blocking runtime\"",
+        "intent": "natural_language",
+        "variant_intent": "natural_language",
+        "fallback": "none",
+        "mode": "hybrid_rrf",
+        "budget_profile": "semantic_focused",
+        "lexical_fanout": 12,
+        "semantic_fanout": 48,
+        "quality_enabled": true,
+        "tie_break_rules": [
+          "score_desc",
+          "in_both_sources_desc",
+          "lexical_score_desc",
+          "doc_id_asc"
+        ]
+      },
+      "invariants": [
+        {
+          "invariant": "canonicalization_idempotent",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.canonicalization_idempotent",
+          "detail": "raw and whitespace variant canonicalization are idempotent"
+        },
+        {
+          "invariant": "classification_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.classification_stable",
+          "detail": "whitespace variant preserves planner classification and execution mode"
+        },
+        {
+          "invariant": "candidate_budget_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.candidate_budget_safe",
+          "detail": "stage candidate budgets stay within resolved retrieval budget"
+        },
+        {
+          "invariant": "replay_command_present",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.replay_command_present",
+          "detail": "case includes FSFS_QUERY_PLAN_CASE replay command"
+        },
+        {
+          "invariant": "negation_parsing_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.negation_parsing_stable",
+          "detail": "negation whitespace variant preserves positive terms and exclusions"
+        }
+      ],
+      "minimized_failure": null
+    },
+    {
+      "case_id": "qp-malformed-0007",
+      "family": "malformed_fallback",
+      "seed": 7,
+      "raw_query": "find\u0007secret",
+      "variant_query": "  find\u0007secret  ",
+      "requested_limit": 5,
+      "replay_command": "FSFS_QUERY_PLAN_CASE=qp-malformed-0007 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture",
+      "observed": {
+        "normalized_query": "find\u0007secret",
+        "variant_normalized_query": "find\u0007secret",
+        "intent": "malformed",
+        "variant_intent": "malformed",
+        "fallback": "malformed_lexical_only",
+        "mode": "lexical_only",
+        "budget_profile": "safe_fallback",
+        "lexical_fanout": 10,
+        "semantic_fanout": 0,
+        "quality_enabled": false,
+        "tie_break_rules": [
+          "score_desc",
+          "doc_id_asc"
+        ]
+      },
+      "invariants": [
+        {
+          "invariant": "canonicalization_idempotent",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.canonicalization_idempotent",
+          "detail": "raw and whitespace variant canonicalization are idempotent"
+        },
+        {
+          "invariant": "classification_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.classification_stable",
+          "detail": "whitespace variant preserves planner classification and execution mode"
+        },
+        {
+          "invariant": "candidate_budget_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.candidate_budget_safe",
+          "detail": "stage candidate budgets stay within resolved retrieval budget"
+        },
+        {
+          "invariant": "replay_command_present",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.replay_command_present",
+          "detail": "case includes FSFS_QUERY_PLAN_CASE replay command"
+        },
+        {
+          "invariant": "fallback_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.fallback_safe",
+          "detail": "fallback paths disable unavailable or unsafe quality stages"
+        }
+      ],
+      "minimized_failure": null
+    },
+    {
+      "case_id": "qp-tie-break-0009",
+      "family": "tie_break",
+      "seed": 9,
+      "raw_query": "how does ranking tie break work?",
+      "variant_query": " how does   ranking tie break work? ",
+      "requested_limit": 9,
+      "replay_command": "FSFS_QUERY_PLAN_CASE=qp-tie-break-0009 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture",
+      "observed": {
+        "normalized_query": "how does ranking tie break work?",
+        "variant_normalized_query": "how does ranking tie break work?",
+        "intent": "natural_language",
+        "variant_intent": "natural_language",
+        "fallback": "none",
+        "mode": "hybrid_rrf",
+        "budget_profile": "semantic_focused",
+        "lexical_fanout": 18,
+        "semantic_fanout": 72,
+        "quality_enabled": true,
+        "tie_break_rules": [
+          "score_desc",
+          "in_both_sources_desc",
+          "lexical_score_desc",
+          "doc_id_asc"
+        ]
+      },
+      "invariants": [
+        {
+          "invariant": "canonicalization_idempotent",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.canonicalization_idempotent",
+          "detail": "raw and whitespace variant canonicalization are idempotent"
+        },
+        {
+          "invariant": "classification_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.classification_stable",
+          "detail": "whitespace variant preserves planner classification and execution mode"
+        },
+        {
+          "invariant": "candidate_budget_safe",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.candidate_budget_safe",
+          "detail": "stage candidate budgets stay within resolved retrieval budget"
+        },
+        {
+          "invariant": "replay_command_present",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.replay_command_present",
+          "detail": "case includes FSFS_QUERY_PLAN_CASE replay command"
+        },
+        {
+          "invariant": "tie_break_policy_stable",
+          "status": "pass",
+          "reason_code": "query_plan.invariant.tie_break_policy_stable",
+          "detail": "hybrid RRF plans expose deterministic tie-break precedence"
+        }
+      ],
+      "minimized_failure": null
+    }
+  ],
+  "summary": {
+    "total_cases": 5,
+    "passed_cases": 5,
+    "failed_cases": 0
+  }
+}

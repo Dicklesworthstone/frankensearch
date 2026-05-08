@@ -1,0 +1,487 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-query-plan-metamorphic-v1.schema.json",
+  "title": "fsfs Query Plan Metamorphic Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/metamorphicReport"
+    },
+    {
+      "$ref": "#/$defs/minimizedFailure"
+    }
+  ],
+  "$defs": {
+    "generatorFamily": {
+      "type": "string",
+      "enum": [
+        "empty",
+        "identifier",
+        "short_keyword",
+        "natural_language",
+        "negation",
+        "low_signal_fallback",
+        "malformed_fallback",
+        "capability_fallback",
+        "tie_break"
+      ]
+    },
+    "invariant": {
+      "type": "string",
+      "enum": [
+        "canonicalization_idempotent",
+        "classification_stable",
+        "candidate_budget_safe",
+        "empty_query_safe",
+        "identifier_lexical_bias",
+        "natural_language_semantic_bias",
+        "negation_parsing_stable",
+        "fallback_safe",
+        "tie_break_policy_stable",
+        "replay_command_present"
+      ]
+    },
+    "invariantStatus": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^query_plan\\.invariant\\.[a-z0-9_]+$"
+    },
+    "replayCommand": {
+      "type": "string",
+      "pattern": "^FSFS_QUERY_PLAN_CASE=[A-Za-z0-9_-]+ cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture$"
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "corpus_independent",
+        "generator_version",
+        "generator_families",
+        "invariants",
+        "failure_fixture_policy"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_query_plan_metamorphic_contract"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "corpus_independent": {
+          "type": "boolean",
+          "const": true
+        },
+        "generator_version": {
+          "type": "string",
+          "const": "fsfs-query-plan-metamorphic-generator-v1"
+        },
+        "generator_families": {
+          "type": "array",
+          "minItems": 9,
+          "items": {
+            "$ref": "#/$defs/generatorSpec"
+          }
+        },
+        "invariants": {
+          "type": "array",
+          "minItems": 10,
+          "items": {
+            "$ref": "#/$defs/invariantSpec"
+          }
+        },
+        "failure_fixture_policy": {
+          "$ref": "#/$defs/failureFixturePolicy"
+        }
+      }
+    },
+    "generatorSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "seeds",
+        "description"
+      ],
+      "properties": {
+        "family": {
+          "$ref": "#/$defs/generatorFamily"
+        },
+        "seeds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "invariantSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invariant",
+        "description"
+      ],
+      "properties": {
+        "invariant": {
+          "$ref": "#/$defs/invariant"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "failureFixturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimized_fixture_required",
+        "replay_command_required",
+        "output_path_template",
+        "replay_command_template"
+      ],
+      "properties": {
+        "minimized_fixture_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "replay_command_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "output_path_template": {
+          "type": "string",
+          "pattern": "^artifacts/query-plan-metamorphic/\\{case_id\\}\\.minimized\\.json$"
+        },
+        "replay_command_template": {
+          "type": "string",
+          "pattern": "^FSFS_QUERY_PLAN_CASE=\\{case_id\\} cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture$"
+        }
+      }
+    },
+    "metamorphicReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "generated_at",
+        "generator_version",
+        "corpus_dependency",
+        "cases",
+        "summary"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_query_plan_metamorphic_report"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "generated_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generator_version": {
+          "type": "string",
+          "const": "fsfs-query-plan-metamorphic-generator-v1"
+        },
+        "corpus_dependency": {
+          "type": "string",
+          "const": "none"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/caseResult"
+          }
+        },
+        "summary": {
+          "$ref": "#/$defs/reportSummary"
+        }
+      }
+    },
+    "caseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "family",
+        "seed",
+        "raw_query",
+        "variant_query",
+        "requested_limit",
+        "replay_command",
+        "observed",
+        "invariants",
+        "minimized_failure"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^qp-[a-z0-9-]+-[0-9]{4}$"
+        },
+        "family": {
+          "$ref": "#/$defs/generatorFamily"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "raw_query": {
+          "type": "string"
+        },
+        "variant_query": {
+          "type": "string"
+        },
+        "requested_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "replay_command": {
+          "$ref": "#/$defs/replayCommand"
+        },
+        "observed": {
+          "$ref": "#/$defs/observedDecision"
+        },
+        "invariants": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "$ref": "#/$defs/invariantResult"
+          }
+        },
+        "minimized_failure": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/minimizedFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "observedDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "normalized_query",
+        "variant_normalized_query",
+        "intent",
+        "variant_intent",
+        "fallback",
+        "mode",
+        "budget_profile",
+        "lexical_fanout",
+        "semantic_fanout",
+        "quality_enabled",
+        "tie_break_rules"
+      ],
+      "properties": {
+        "normalized_query": {
+          "type": "string"
+        },
+        "variant_normalized_query": {
+          "type": "string"
+        },
+        "intent": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "identifier",
+            "short_keyword",
+            "natural_language",
+            "uncertain",
+            "malformed"
+          ]
+        },
+        "variant_intent": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "identifier",
+            "short_keyword",
+            "natural_language",
+            "uncertain",
+            "malformed"
+          ]
+        },
+        "fallback": {
+          "type": "string",
+          "enum": [
+            "none",
+            "empty_query",
+            "low_confidence_lexical_bias",
+            "malformed_lexical_only"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "hybrid_rrf",
+            "fast_semantic_only",
+            "lexical_only"
+          ]
+        },
+        "budget_profile": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "identifier_focused",
+            "balanced",
+            "semantic_focused",
+            "safe_fallback"
+          ]
+        },
+        "lexical_fanout": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_fanout": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality_enabled": {
+          "type": "boolean"
+        },
+        "tie_break_rules": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "score_desc",
+              "in_both_sources_desc",
+              "lexical_score_desc",
+              "doc_id_asc"
+            ]
+          }
+        }
+      }
+    },
+    "invariantResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invariant",
+        "status",
+        "reason_code",
+        "detail"
+      ],
+      "properties": {
+        "invariant": {
+          "$ref": "#/$defs/invariant"
+        },
+        "status": {
+          "$ref": "#/$defs/invariantStatus"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "minimizedFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "case_id",
+        "seed",
+        "raw_query",
+        "minimized_query",
+        "violated_invariant",
+        "reason_code",
+        "replay_command"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_query_plan_metamorphic_failure"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "case_id": {
+          "type": "string",
+          "pattern": "^qp-[a-z0-9-]+-[0-9]{4}$"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "raw_query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "minimized_query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "violated_invariant": {
+          "$ref": "#/$defs/invariant"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "replay_command": {
+          "$ref": "#/$defs/replayCommand"
+        }
+      }
+    },
+    "reportSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_cases",
+        "passed_cases",
+        "failed_cases"
+      ],
+      "properties": {
+        "total_cases": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "passed_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_cases": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

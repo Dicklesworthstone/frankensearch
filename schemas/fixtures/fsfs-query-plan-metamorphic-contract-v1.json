@@ -1,0 +1,119 @@
+{
+  "kind": "fsfs_query_plan_metamorphic_contract",
+  "v": 1,
+  "corpus_independent": true,
+  "generator_version": "fsfs-query-plan-metamorphic-generator-v1",
+  "generator_families": [
+    {
+      "family": "empty",
+      "seeds": [
+        1
+      ],
+      "description": "whitespace-only queries exercise the empty no-op path"
+    },
+    {
+      "family": "identifier",
+      "seeds": [
+        2
+      ],
+      "description": "path and symbol-like queries must keep lexical-biased budgets"
+    },
+    {
+      "family": "short_keyword",
+      "seeds": [
+        3
+      ],
+      "description": "short keyword queries must keep balanced candidate fanout"
+    },
+    {
+      "family": "natural_language",
+      "seeds": [
+        4
+      ],
+      "description": "question-shaped queries must keep semantic-biased budgets"
+    },
+    {
+      "family": "negation",
+      "seeds": [
+        5
+      ],
+      "description": "dash and NOT negation variants must parse to the same exclusions"
+    },
+    {
+      "family": "low_signal_fallback",
+      "seeds": [
+        6
+      ],
+      "description": "punctuation-only queries must use a lexical-biased safe fallback"
+    },
+    {
+      "family": "malformed_fallback",
+      "seeds": [
+        7
+      ],
+      "description": "control-character queries must force malformed lexical-only planning"
+    },
+    {
+      "family": "capability_fallback",
+      "seeds": [
+        8
+      ],
+      "description": "missing semantic capability must degrade to lexical-only execution"
+    },
+    {
+      "family": "tie_break",
+      "seeds": [
+        9
+      ],
+      "description": "hybrid plans must expose stable RRF tie-break precedence"
+    }
+  ],
+  "invariants": [
+    {
+      "invariant": "canonicalization_idempotent",
+      "description": "canonicalize_query(canonicalize_query(q)) equals canonicalize_query(q)"
+    },
+    {
+      "invariant": "classification_stable",
+      "description": "whitespace variants keep intent, fallback, mode, and budget profile"
+    },
+    {
+      "invariant": "candidate_budget_safe",
+      "description": "enabled stages never exceed their resolved candidate budgets"
+    },
+    {
+      "invariant": "empty_query_safe",
+      "description": "empty queries return empty mode with zero retrieval fanout"
+    },
+    {
+      "invariant": "identifier_lexical_bias",
+      "description": "identifier queries allocate more lexical than semantic fanout"
+    },
+    {
+      "invariant": "natural_language_semantic_bias",
+      "description": "natural-language queries allocate more semantic than lexical fanout"
+    },
+    {
+      "invariant": "negation_parsing_stable",
+      "description": "negation whitespace variants preserve positive text and exclusions"
+    },
+    {
+      "invariant": "fallback_safe",
+      "description": "uncertain, malformed, and capability fallback paths disable unsafe stages"
+    },
+    {
+      "invariant": "tie_break_policy_stable",
+      "description": "hybrid RRF plans keep score, both-source, lexical-score, doc-id order"
+    },
+    {
+      "invariant": "replay_command_present",
+      "description": "every generated case carries a deterministic replay command"
+    }
+  ],
+  "failure_fixture_policy": {
+    "minimized_fixture_required": true,
+    "replay_command_required": true,
+    "output_path_template": "artifacts/query-plan-metamorphic/{case_id}.minimized.json",
+    "replay_command_template": "FSFS_QUERY_PLAN_CASE={case_id} cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture"
+  }
+}

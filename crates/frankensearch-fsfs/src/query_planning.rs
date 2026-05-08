@@ -6,12 +6,23 @@
 //! - profile-aware budget mapping (latency/fanout/rerank)
 //! - robust fallback behavior for uncertain or malformed input
 
-use frankensearch_core::query_class::QueryClass;
+use frankensearch_core::{
+    canonicalize::{Canonicalizer, DefaultCanonicalizer},
+    parsed_query::ParsedQuery,
+    query_class::QueryClass,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{FsfsConfig, PressureProfile};
 
 /// Default minimum confidence required before using non-fallback budgets.
 pub const DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE: u16 = 650;
+pub const QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION: u32 = 1;
+pub const QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION: &str =
+    "fsfs-query-plan-metamorphic-generator-v1";
+pub const QUERY_PLAN_METAMORPHIC_CONTRACT_KIND: &str = "fsfs_query_plan_metamorphic_contract";
+pub const QUERY_PLAN_METAMORPHIC_REPORT_KIND: &str = "fsfs_query_plan_metamorphic_report";
+pub const QUERY_PLAN_METAMORPHIC_FAILURE_KIND: &str = "fsfs_query_plan_metamorphic_failure";
 
 const MAX_QUERY_CHARS: usize = 4_096;
 
@@ -24,6 +35,180 @@ pub enum QueryIntentClass {
     NaturalLanguage,
     Uncertain,
     Malformed,
+}
+
+/// Corpus-independent generator families used by the query-plan metamorphic
+/// contract suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPlanGeneratorFamily {
+    Empty,
+    Identifier,
+    ShortKeyword,
+    NaturalLanguage,
+    Negation,
+    LowSignalFallback,
+    MalformedFallback,
+    CapabilityFallback,
+    TieBreak,
+}
+
+impl QueryPlanGeneratorFamily {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Identifier => "identifier",
+            Self::ShortKeyword => "short_keyword",
+            Self::NaturalLanguage => "natural_language",
+            Self::Negation => "negation",
+            Self::LowSignalFallback => "low_signal_fallback",
+            Self::MalformedFallback => "malformed_fallback",
+            Self::CapabilityFallback => "capability_fallback",
+            Self::TieBreak => "tie_break",
+        }
+    }
+}
+
+/// Invariants evaluated by the query-plan metamorphic contract suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPlanInvariant {
+    CanonicalizationIdempotent,
+    ClassificationStable,
+    CandidateBudgetSafe,
+    EmptyQuerySafe,
+    IdentifierLexicalBias,
+    NaturalLanguageSemanticBias,
+    NegationParsingStable,
+    FallbackSafe,
+    TieBreakPolicyStable,
+    ReplayCommandPresent,
+}
+
+impl QueryPlanInvariant {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalizationIdempotent => "canonicalization_idempotent",
+            Self::ClassificationStable => "classification_stable",
+            Self::CandidateBudgetSafe => "candidate_budget_safe",
+            Self::EmptyQuerySafe => "empty_query_safe",
+            Self::IdentifierLexicalBias => "identifier_lexical_bias",
+            Self::NaturalLanguageSemanticBias => "natural_language_semantic_bias",
+            Self::NegationParsingStable => "negation_parsing_stable",
+            Self::FallbackSafe => "fallback_safe",
+            Self::TieBreakPolicyStable => "tie_break_policy_stable",
+            Self::ReplayCommandPresent => "replay_command_present",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPlanInvariantStatus {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanGeneratorSpec {
+    pub family: QueryPlanGeneratorFamily,
+    pub seeds: Vec<u64>,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanInvariantSpec {
+    pub invariant: QueryPlanInvariant,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanFailureFixturePolicy {
+    pub minimized_fixture_required: bool,
+    pub replay_command_required: bool,
+    pub output_path_template: String,
+    pub replay_command_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanMetamorphicContractDefinition {
+    pub kind: String,
+    pub v: u32,
+    pub corpus_independent: bool,
+    pub generator_version: String,
+    pub generator_families: Vec<QueryPlanGeneratorSpec>,
+    pub invariants: Vec<QueryPlanInvariantSpec>,
+    pub failure_fixture_policy: QueryPlanFailureFixturePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanInvariantResult {
+    pub invariant: QueryPlanInvariant,
+    pub status: QueryPlanInvariantStatus,
+    pub reason_code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanObservedDecision {
+    pub normalized_query: String,
+    pub variant_normalized_query: String,
+    pub intent: String,
+    pub variant_intent: String,
+    pub fallback: String,
+    pub mode: String,
+    pub budget_profile: String,
+    pub lexical_fanout: usize,
+    pub semantic_fanout: usize,
+    pub quality_enabled: bool,
+    pub tie_break_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanMinimizedFailureFixture {
+    pub kind: String,
+    pub v: u32,
+    pub case_id: String,
+    pub seed: u64,
+    pub raw_query: String,
+    pub minimized_query: String,
+    pub violated_invariant: QueryPlanInvariant,
+    pub reason_code: String,
+    pub replay_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanMetamorphicCaseResult {
+    pub case_id: String,
+    pub family: QueryPlanGeneratorFamily,
+    pub seed: u64,
+    pub raw_query: String,
+    pub variant_query: String,
+    pub requested_limit: Option<usize>,
+    pub replay_command: String,
+    pub observed: QueryPlanObservedDecision,
+    pub invariants: Vec<QueryPlanInvariantResult>,
+    pub minimized_failure: Option<QueryPlanMinimizedFailureFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanMetamorphicSummary {
+    pub total_cases: usize,
+    pub passed_cases: usize,
+    pub failed_cases: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlanMetamorphicReport {
+    pub kind: String,
+    pub v: u32,
+    pub generated_at: String,
+    pub generator_version: String,
+    pub corpus_dependency: String,
+    pub cases: Vec<QueryPlanMetamorphicCaseResult>,
+    pub summary: QueryPlanMetamorphicSummary,
 }
 
 /// Explicit fallback mode used for robust degraded behavior.
@@ -917,6 +1102,872 @@ const fn scale_u64(value: u64, numer: u64, denom: u64) -> u64 {
     }
     let scaled = value.saturating_mul(numer);
     scaled.saturating_add(denom.saturating_sub(1)) / denom
+}
+
+#[must_use]
+pub fn query_plan_metamorphic_contract_definition() -> QueryPlanMetamorphicContractDefinition {
+    QueryPlanMetamorphicContractDefinition {
+        kind: QUERY_PLAN_METAMORPHIC_CONTRACT_KIND.to_owned(),
+        v: QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION,
+        corpus_independent: true,
+        generator_version: QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION.to_owned(),
+        generator_families: vec![
+            generator_spec(
+                QueryPlanGeneratorFamily::Empty,
+                &[1],
+                "whitespace-only queries exercise the empty no-op path",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::Identifier,
+                &[2],
+                "path and symbol-like queries must keep lexical-biased budgets",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::ShortKeyword,
+                &[3],
+                "short keyword queries must keep balanced candidate fanout",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::NaturalLanguage,
+                &[4],
+                "question-shaped queries must keep semantic-biased budgets",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::Negation,
+                &[5],
+                "dash and NOT negation variants must parse to the same exclusions",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::LowSignalFallback,
+                &[6],
+                "punctuation-only queries must use a lexical-biased safe fallback",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::MalformedFallback,
+                &[7],
+                "control-character queries must force malformed lexical-only planning",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::CapabilityFallback,
+                &[8],
+                "missing semantic capability must degrade to lexical-only execution",
+            ),
+            generator_spec(
+                QueryPlanGeneratorFamily::TieBreak,
+                &[9],
+                "hybrid plans must expose stable RRF tie-break precedence",
+            ),
+        ],
+        invariants: vec![
+            invariant_spec(
+                QueryPlanInvariant::CanonicalizationIdempotent,
+                "canonicalize_query(canonicalize_query(q)) equals canonicalize_query(q)",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::ClassificationStable,
+                "whitespace variants keep intent, fallback, mode, and budget profile",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::CandidateBudgetSafe,
+                "enabled stages never exceed their resolved candidate budgets",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::EmptyQuerySafe,
+                "empty queries return empty mode with zero retrieval fanout",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::IdentifierLexicalBias,
+                "identifier queries allocate more lexical than semantic fanout",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::NaturalLanguageSemanticBias,
+                "natural-language queries allocate more semantic than lexical fanout",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::NegationParsingStable,
+                "negation whitespace variants preserve positive text and exclusions",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::FallbackSafe,
+                "uncertain, malformed, and capability fallback paths disable unsafe stages",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::TieBreakPolicyStable,
+                "hybrid RRF plans keep score, both-source, lexical-score, doc-id order",
+            ),
+            invariant_spec(
+                QueryPlanInvariant::ReplayCommandPresent,
+                "every generated case carries a deterministic replay command",
+            ),
+        ],
+        failure_fixture_policy: QueryPlanFailureFixturePolicy {
+            minimized_fixture_required: true,
+            replay_command_required: true,
+            output_path_template:
+                "artifacts/query-plan-metamorphic/{case_id}.minimized.json".to_owned(),
+            replay_command_template:
+                "FSFS_QUERY_PLAN_CASE={case_id} cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture"
+                    .to_owned(),
+        },
+    }
+}
+
+#[must_use]
+pub fn query_plan_metamorphic_report_fixture() -> QueryPlanMetamorphicReport {
+    let cases: Vec<_> = query_plan_seed_cases()
+        .into_iter()
+        .map(evaluate_seed_case)
+        .collect();
+    let failed_cases = cases.iter().filter(|case| case_has_failure(case)).count();
+    let total_cases = cases.len();
+
+    QueryPlanMetamorphicReport {
+        kind: QUERY_PLAN_METAMORPHIC_REPORT_KIND.to_owned(),
+        v: QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION,
+        generated_at: "2026-05-08T00:00:00Z".to_owned(),
+        generator_version: QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION.to_owned(),
+        corpus_dependency: "none".to_owned(),
+        cases,
+        summary: QueryPlanMetamorphicSummary {
+            total_cases,
+            passed_cases: total_cases.saturating_sub(failed_cases),
+            failed_cases,
+        },
+    }
+}
+
+#[must_use]
+pub fn query_plan_metamorphic_minimized_failure_fixture() -> QueryPlanMinimizedFailureFixture {
+    QueryPlanMinimizedFailureFixture {
+        kind: QUERY_PLAN_METAMORPHIC_FAILURE_KIND.to_owned(),
+        v: QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION,
+        case_id: "qp-negation-0005".to_owned(),
+        seed: 5,
+        raw_query: "rust async -tokio NOT \"blocking runtime\"".to_owned(),
+        minimized_query: "rust -tokio".to_owned(),
+        violated_invariant: QueryPlanInvariant::NegationParsingStable,
+        reason_code: "query_plan.invariant.negation_parsing_stable".to_owned(),
+        replay_command:
+            "FSFS_QUERY_PLAN_CASE=qp-negation-0005 cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture"
+                .to_owned(),
+    }
+}
+
+impl QueryPlanMetamorphicContractDefinition {
+    /// Validates the query-plan metamorphic contract definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contract omits required generators, invariants,
+    /// or failure replay semantics.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != QUERY_PLAN_METAMORPHIC_CONTRACT_KIND {
+            return Err("unexpected query-plan contract kind".to_owned());
+        }
+        if self.v != QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION {
+            return Err("unsupported query-plan contract version".to_owned());
+        }
+        if !self.corpus_independent {
+            return Err("query-plan generators must be corpus-independent".to_owned());
+        }
+        if self.generator_version != QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION {
+            return Err("unexpected query-plan generator version".to_owned());
+        }
+        for family in required_generator_families() {
+            if !self
+                .generator_families
+                .iter()
+                .any(|spec| spec.family == family && !spec.seeds.is_empty())
+            {
+                return Err(format!("missing generator family {}", family.as_str()));
+            }
+        }
+        for invariant in required_invariants() {
+            if !self
+                .invariants
+                .iter()
+                .any(|spec| spec.invariant == invariant)
+            {
+                return Err(format!("missing invariant {}", invariant.as_str()));
+            }
+        }
+        if !self.failure_fixture_policy.minimized_fixture_required {
+            return Err("minimized failure fixtures must be required".to_owned());
+        }
+        if !self.failure_fixture_policy.replay_command_required {
+            return Err("failure replay commands must be required".to_owned());
+        }
+        if !self
+            .failure_fixture_policy
+            .replay_command_template
+            .contains("FSFS_QUERY_PLAN_CASE={case_id}")
+        {
+            return Err("replay template must include FSFS_QUERY_PLAN_CASE".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl QueryPlanMetamorphicReport {
+    /// Validates a generated query-plan metamorphic report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when summary counts drift, replay commands are missing,
+    /// or failing cases do not carry minimized fixtures.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != QUERY_PLAN_METAMORPHIC_REPORT_KIND {
+            return Err("unexpected query-plan report kind".to_owned());
+        }
+        if self.v != QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION {
+            return Err("unsupported query-plan report version".to_owned());
+        }
+        if self.generator_version != QUERY_PLAN_METAMORPHIC_GENERATOR_VERSION {
+            return Err("unexpected query-plan report generator version".to_owned());
+        }
+        if self.corpus_dependency != "none" {
+            return Err("query-plan report must be corpus-independent".to_owned());
+        }
+        if self.cases.is_empty() {
+            return Err("query-plan report must include generated cases".to_owned());
+        }
+
+        let failed_cases = self
+            .cases
+            .iter()
+            .filter(|case| case_has_failure(case))
+            .count();
+        if self.summary.total_cases != self.cases.len() {
+            return Err("query-plan report total count does not match cases".to_owned());
+        }
+        if self.summary.failed_cases != failed_cases {
+            return Err("query-plan report failed count does not match invariants".to_owned());
+        }
+        if self.summary.passed_cases + self.summary.failed_cases != self.summary.total_cases {
+            return Err("query-plan report summary counts are inconsistent".to_owned());
+        }
+
+        for case in &self.cases {
+            validate_case(case)?;
+        }
+        Ok(())
+    }
+}
+
+impl QueryPlanMinimizedFailureFixture {
+    /// Validates a minimized failing query-plan fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture is missing its minimized query or replay
+    /// command.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != QUERY_PLAN_METAMORPHIC_FAILURE_KIND {
+            return Err("unexpected query-plan failure kind".to_owned());
+        }
+        if self.v != QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION {
+            return Err("unsupported query-plan failure version".to_owned());
+        }
+        if self.case_id.trim().is_empty() {
+            return Err("query-plan failure fixture requires a case id".to_owned());
+        }
+        if self.minimized_query.trim().is_empty() {
+            return Err("query-plan failure fixture requires a minimized query".to_owned());
+        }
+        if !is_replay_command(&self.replay_command) {
+            return Err("query-plan failure fixture requires a replay command".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueryPlanSeedCase {
+    case_id: &'static str,
+    family: QueryPlanGeneratorFamily,
+    seed: u64,
+    raw_query: &'static str,
+    variant_query: &'static str,
+    requested_limit: Option<usize>,
+    capabilities: QueryExecutionCapabilities,
+}
+
+#[must_use]
+fn generator_spec(
+    family: QueryPlanGeneratorFamily,
+    seeds: &[u64],
+    description: &str,
+) -> QueryPlanGeneratorSpec {
+    QueryPlanGeneratorSpec {
+        family,
+        seeds: seeds.to_vec(),
+        description: description.to_owned(),
+    }
+}
+
+#[must_use]
+fn invariant_spec(invariant: QueryPlanInvariant, description: &str) -> QueryPlanInvariantSpec {
+    QueryPlanInvariantSpec {
+        invariant,
+        description: description.to_owned(),
+    }
+}
+
+#[must_use]
+fn query_plan_seed_cases() -> Vec<QueryPlanSeedCase> {
+    vec![
+        seed_case(
+            "qp-empty-0001",
+            QueryPlanGeneratorFamily::Empty,
+            1,
+            "   ",
+            "\n\t  ",
+            Some(10),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-identifier-0002",
+            QueryPlanGeneratorFamily::Identifier,
+            2,
+            "src/query_planning.rs",
+            "  src/query_planning.rs  ",
+            Some(8),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-short-keyword-0003",
+            QueryPlanGeneratorFamily::ShortKeyword,
+            3,
+            "rust ownership",
+            " rust   ownership ",
+            Some(6),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-natural-language-0004",
+            QueryPlanGeneratorFamily::NaturalLanguage,
+            4,
+            "how does query ranking behave under pressure?",
+            " how   does query ranking behave under pressure? ",
+            Some(7),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-negation-0005",
+            QueryPlanGeneratorFamily::Negation,
+            5,
+            "rust async -tokio NOT \"blocking runtime\"",
+            " rust   async   -tokio   NOT \"blocking runtime\" ",
+            Some(6),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-low-signal-0006",
+            QueryPlanGeneratorFamily::LowSignalFallback,
+            6,
+            "???!!!",
+            "  ???!!!  ",
+            Some(5),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-malformed-0007",
+            QueryPlanGeneratorFamily::MalformedFallback,
+            7,
+            "find\u{0007}secret",
+            "  find\u{0007}secret  ",
+            Some(5),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+        seed_case(
+            "qp-capability-fallback-0008",
+            QueryPlanGeneratorFamily::CapabilityFallback,
+            8,
+            "rust ownership",
+            " rust ownership ",
+            Some(5),
+            QueryExecutionCapabilities {
+                lexical: CapabilityState::Enabled,
+                fast_semantic: CapabilityState::Disabled,
+                quality_semantic: CapabilityState::Disabled,
+                rerank: CapabilityState::Enabled,
+            },
+        ),
+        seed_case(
+            "qp-tie-break-0009",
+            QueryPlanGeneratorFamily::TieBreak,
+            9,
+            "how does ranking tie break work?",
+            " how does   ranking tie break work? ",
+            Some(9),
+            QueryExecutionCapabilities::all_enabled(),
+        ),
+    ]
+}
+
+#[must_use]
+const fn seed_case(
+    case_id: &'static str,
+    family: QueryPlanGeneratorFamily,
+    seed: u64,
+    raw_query: &'static str,
+    variant_query: &'static str,
+    requested_limit: Option<usize>,
+    capabilities: QueryExecutionCapabilities,
+) -> QueryPlanSeedCase {
+    QueryPlanSeedCase {
+        case_id,
+        family,
+        seed,
+        raw_query,
+        variant_query,
+        requested_limit,
+        capabilities,
+    }
+}
+
+#[must_use]
+fn evaluate_seed_case(case: QueryPlanSeedCase) -> QueryPlanMetamorphicCaseResult {
+    let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+    let plan =
+        planner.execution_plan_for_query(case.raw_query, case.requested_limit, case.capabilities);
+    let variant_plan = planner.execution_plan_for_query(
+        case.variant_query,
+        case.requested_limit,
+        case.capabilities,
+    );
+    let replay_command = replay_command(case.case_id);
+    let invariants = evaluate_invariants(case, &plan, &variant_plan, &replay_command);
+    let minimized_failure = invariants
+        .iter()
+        .find(|result| result.status == QueryPlanInvariantStatus::Fail)
+        .map(|result| minimized_failure_for_case(case, result.invariant, &replay_command));
+
+    QueryPlanMetamorphicCaseResult {
+        case_id: case.case_id.to_owned(),
+        family: case.family,
+        seed: case.seed,
+        raw_query: case.raw_query.to_owned(),
+        variant_query: case.variant_query.to_owned(),
+        requested_limit: case.requested_limit,
+        replay_command,
+        observed: observed_decision(&plan, &variant_plan),
+        invariants,
+        minimized_failure,
+    }
+}
+
+#[must_use]
+fn evaluate_invariants(
+    case: QueryPlanSeedCase,
+    plan: &QueryExecutionPlan,
+    variant_plan: &QueryExecutionPlan,
+    replay_command: &str,
+) -> Vec<QueryPlanInvariantResult> {
+    let mut results = vec![
+        canonicalization_invariant(case),
+        classification_stable_invariant(plan, variant_plan),
+        candidate_budget_safe_invariant(plan),
+        invariant_result(
+            QueryPlanInvariant::ReplayCommandPresent,
+            is_replay_command(replay_command),
+            "query_plan.invariant.replay_command_present",
+            "case includes FSFS_QUERY_PLAN_CASE replay command",
+        ),
+    ];
+
+    match case.family {
+        QueryPlanGeneratorFamily::Empty => results.push(empty_query_safe_invariant(plan)),
+        QueryPlanGeneratorFamily::Identifier => {
+            results.push(identifier_lexical_bias_invariant(plan));
+        }
+        QueryPlanGeneratorFamily::NaturalLanguage => {
+            results.push(natural_language_semantic_bias_invariant(plan));
+        }
+        QueryPlanGeneratorFamily::Negation => results.push(negation_parsing_invariant(case)),
+        QueryPlanGeneratorFamily::LowSignalFallback
+        | QueryPlanGeneratorFamily::MalformedFallback
+        | QueryPlanGeneratorFamily::CapabilityFallback => {
+            results.push(fallback_safe_invariant(case, plan));
+        }
+        QueryPlanGeneratorFamily::TieBreak => results.push(tie_break_policy_invariant(plan)),
+        QueryPlanGeneratorFamily::ShortKeyword => {}
+    }
+
+    results
+}
+
+#[must_use]
+fn canonicalization_invariant(case: QueryPlanSeedCase) -> QueryPlanInvariantResult {
+    let canonicalizer = DefaultCanonicalizer::default();
+    let canonical = canonicalizer.canonicalize_query(case.raw_query);
+    let canonical_twice = canonicalizer.canonicalize_query(&canonical);
+    let variant = canonicalizer.canonicalize_query(case.variant_query);
+    let variant_twice = canonicalizer.canonicalize_query(&variant);
+    invariant_result(
+        QueryPlanInvariant::CanonicalizationIdempotent,
+        canonical == canonical_twice && variant == variant_twice,
+        "query_plan.invariant.canonicalization_idempotent",
+        "raw and whitespace variant canonicalization are idempotent",
+    )
+}
+
+#[must_use]
+fn classification_stable_invariant(
+    plan: &QueryExecutionPlan,
+    variant_plan: &QueryExecutionPlan,
+) -> QueryPlanInvariantResult {
+    invariant_result(
+        QueryPlanInvariant::ClassificationStable,
+        plan.intent.intent == variant_plan.intent.intent
+            && plan.intent.fallback == variant_plan.intent.fallback
+            && plan.mode == variant_plan.mode
+            && plan.budget.profile == variant_plan.budget.profile,
+        "query_plan.invariant.classification_stable",
+        "whitespace variant preserves planner classification and execution mode",
+    )
+}
+
+#[must_use]
+fn candidate_budget_safe_invariant(plan: &QueryExecutionPlan) -> QueryPlanInvariantResult {
+    let candidate_budget_safe = plan.budget.limit >= 1
+        && plan.lexical_stage.candidate_budget <= plan.budget.lexical_fanout
+        && plan.semantic_stage.candidate_budget <= plan.budget.semantic_fanout
+        && plan.quality_stage.candidate_budget <= plan.budget.semantic_fanout
+        && plan.rerank_stage.candidate_budget <= plan.budget.rerank_depth;
+    invariant_result(
+        QueryPlanInvariant::CandidateBudgetSafe,
+        candidate_budget_safe,
+        "query_plan.invariant.candidate_budget_safe",
+        "stage candidate budgets stay within resolved retrieval budget",
+    )
+}
+
+#[must_use]
+fn empty_query_safe_invariant(plan: &QueryExecutionPlan) -> QueryPlanInvariantResult {
+    invariant_result(
+        QueryPlanInvariant::EmptyQuerySafe,
+        plan.mode == QueryExecutionMode::Empty
+            && plan.budget.lexical_fanout == 0
+            && plan.budget.semantic_fanout == 0
+            && !plan.lexical_stage.enabled
+            && !plan.semantic_stage.enabled,
+        "query_plan.invariant.empty_query_safe",
+        "empty query plans do not enable retrieval stages",
+    )
+}
+
+#[must_use]
+fn identifier_lexical_bias_invariant(plan: &QueryExecutionPlan) -> QueryPlanInvariantResult {
+    invariant_result(
+        QueryPlanInvariant::IdentifierLexicalBias,
+        plan.intent.intent == QueryIntentClass::Identifier
+            && plan.budget.lexical_fanout > plan.budget.semantic_fanout,
+        "query_plan.invariant.identifier_lexical_bias",
+        "identifier query keeps lexical fanout above semantic fanout",
+    )
+}
+
+#[must_use]
+fn natural_language_semantic_bias_invariant(plan: &QueryExecutionPlan) -> QueryPlanInvariantResult {
+    invariant_result(
+        QueryPlanInvariant::NaturalLanguageSemanticBias,
+        plan.intent.intent == QueryIntentClass::NaturalLanguage
+            && plan.budget.semantic_fanout > plan.budget.lexical_fanout,
+        "query_plan.invariant.natural_language_semantic_bias",
+        "natural-language query keeps semantic fanout above lexical fanout",
+    )
+}
+
+#[must_use]
+fn negation_parsing_invariant(case: QueryPlanSeedCase) -> QueryPlanInvariantResult {
+    let raw = ParsedQuery::parse(case.raw_query);
+    let variant = ParsedQuery::parse(case.variant_query);
+    invariant_result(
+        QueryPlanInvariant::NegationParsingStable,
+        raw.positive == variant.positive
+            && raw.negative_terms == variant.negative_terms
+            && raw.negative_phrases == variant.negative_phrases
+            && raw.negation_count() > 0
+            && !raw.is_positive_empty(),
+        "query_plan.invariant.negation_parsing_stable",
+        "negation whitespace variant preserves positive terms and exclusions",
+    )
+}
+
+#[must_use]
+fn fallback_safe_invariant(
+    case: QueryPlanSeedCase,
+    plan: &QueryExecutionPlan,
+) -> QueryPlanInvariantResult {
+    let fallback_safe = match case.family {
+        QueryPlanGeneratorFamily::LowSignalFallback => {
+            plan.intent.fallback == QueryFallbackPath::LowConfidenceLexicalBias
+                && plan.budget.profile == QueryBudgetProfile::SafeFallback
+                && !plan.quality_stage.enabled
+                && !plan.rerank_stage.enabled
+        }
+        QueryPlanGeneratorFamily::MalformedFallback => {
+            plan.intent.fallback == QueryFallbackPath::MalformedLexicalOnly
+                && plan.mode == QueryExecutionMode::LexicalOnly
+                && !plan.semantic_stage.enabled
+                && !plan.quality_stage.enabled
+        }
+        QueryPlanGeneratorFamily::CapabilityFallback => {
+            plan.mode == QueryExecutionMode::LexicalOnly && !plan.semantic_stage.enabled
+        }
+        _ => true,
+    };
+    invariant_result(
+        QueryPlanInvariant::FallbackSafe,
+        fallback_safe,
+        "query_plan.invariant.fallback_safe",
+        "fallback paths disable unavailable or unsafe quality stages",
+    )
+}
+
+#[must_use]
+fn tie_break_policy_invariant(plan: &QueryExecutionPlan) -> QueryPlanInvariantResult {
+    let expected = vec![
+        FusionTieBreakRule::ScoreDesc,
+        FusionTieBreakRule::InBothSourcesDesc,
+        FusionTieBreakRule::LexicalScoreDesc,
+        FusionTieBreakRule::DocIdAsc,
+    ];
+    invariant_result(
+        QueryPlanInvariant::TieBreakPolicyStable,
+        plan.fusion_policy.strategy == FusionStrategy::Rrf
+            && plan.fusion_policy.tie_break_rules == expected,
+        "query_plan.invariant.tie_break_policy_stable",
+        "hybrid RRF plans expose deterministic tie-break precedence",
+    )
+}
+
+#[must_use]
+fn invariant_result(
+    invariant: QueryPlanInvariant,
+    passed: bool,
+    reason_code: &str,
+    detail: &str,
+) -> QueryPlanInvariantResult {
+    QueryPlanInvariantResult {
+        invariant,
+        status: if passed {
+            QueryPlanInvariantStatus::Pass
+        } else {
+            QueryPlanInvariantStatus::Fail
+        },
+        reason_code: reason_code.to_owned(),
+        detail: detail.to_owned(),
+    }
+}
+
+#[must_use]
+fn observed_decision(
+    plan: &QueryExecutionPlan,
+    variant_plan: &QueryExecutionPlan,
+) -> QueryPlanObservedDecision {
+    QueryPlanObservedDecision {
+        normalized_query: plan.intent.normalized_query.clone(),
+        variant_normalized_query: variant_plan.intent.normalized_query.clone(),
+        intent: intent_name(plan.intent.intent).to_owned(),
+        variant_intent: intent_name(variant_plan.intent.intent).to_owned(),
+        fallback: fallback_name(plan.intent.fallback).to_owned(),
+        mode: mode_name(plan.mode).to_owned(),
+        budget_profile: budget_profile_name(plan.budget.profile).to_owned(),
+        lexical_fanout: plan.budget.lexical_fanout,
+        semantic_fanout: plan.budget.semantic_fanout,
+        quality_enabled: plan.budget.quality_enabled,
+        tie_break_rules: plan
+            .fusion_policy
+            .tie_break_rules
+            .iter()
+            .map(|rule| tie_break_rule_name(*rule).to_owned())
+            .collect(),
+    }
+}
+
+#[must_use]
+fn minimized_failure_for_case(
+    case: QueryPlanSeedCase,
+    invariant: QueryPlanInvariant,
+    replay_command: &str,
+) -> QueryPlanMinimizedFailureFixture {
+    QueryPlanMinimizedFailureFixture {
+        kind: QUERY_PLAN_METAMORPHIC_FAILURE_KIND.to_owned(),
+        v: QUERY_PLAN_METAMORPHIC_SCHEMA_VERSION,
+        case_id: case.case_id.to_owned(),
+        seed: case.seed,
+        raw_query: case.raw_query.to_owned(),
+        minimized_query: minimized_query(case).to_owned(),
+        violated_invariant: invariant,
+        reason_code: format!("query_plan.invariant.{}", invariant.as_str()),
+        replay_command: replay_command.to_owned(),
+    }
+}
+
+#[must_use]
+fn minimized_query(case: QueryPlanSeedCase) -> &'static str {
+    match case.family {
+        QueryPlanGeneratorFamily::Empty => "<whitespace>",
+        QueryPlanGeneratorFamily::Identifier => "src/query_planning.rs",
+        QueryPlanGeneratorFamily::ShortKeyword => "rust ownership",
+        QueryPlanGeneratorFamily::NaturalLanguage => "how does ranking work?",
+        QueryPlanGeneratorFamily::Negation => "rust -tokio",
+        QueryPlanGeneratorFamily::LowSignalFallback => "???",
+        QueryPlanGeneratorFamily::MalformedFallback => "x\u{0007}",
+        QueryPlanGeneratorFamily::CapabilityFallback => "rust ownership",
+        QueryPlanGeneratorFamily::TieBreak => "how does ranking tie break?",
+    }
+}
+
+#[must_use]
+fn replay_command(case_id: &str) -> String {
+    format!(
+        "FSFS_QUERY_PLAN_CASE={case_id} cargo test -p frankensearch-fsfs query_plan_metamorphic_contract_suite -- --nocapture"
+    )
+}
+
+#[must_use]
+fn is_replay_command(command: &str) -> bool {
+    command.contains("FSFS_QUERY_PLAN_CASE=")
+        && command.contains("cargo test -p frankensearch-fsfs")
+        && command.contains("query_plan_metamorphic_contract_suite")
+}
+
+#[must_use]
+fn case_has_failure(case: &QueryPlanMetamorphicCaseResult) -> bool {
+    case.invariants
+        .iter()
+        .any(|result| result.status == QueryPlanInvariantStatus::Fail)
+}
+
+fn validate_case(case: &QueryPlanMetamorphicCaseResult) -> Result<(), String> {
+    if case.case_id.trim().is_empty() {
+        return Err("query-plan case requires a case id".to_owned());
+    }
+    if !is_replay_command(&case.replay_command) {
+        return Err(format!(
+            "query-plan case {} is missing replay command",
+            case.case_id
+        ));
+    }
+    if case.invariants.is_empty() {
+        return Err(format!(
+            "query-plan case {} has no invariants",
+            case.case_id
+        ));
+    }
+    let has_failure = case_has_failure(case);
+    match (&case.minimized_failure, has_failure) {
+        (Some(fixture), true) => {
+            fixture.validate()?;
+            if fixture.case_id != case.case_id {
+                return Err(format!(
+                    "query-plan case {} failure fixture points at {}",
+                    case.case_id, fixture.case_id
+                ));
+            }
+        }
+        (None, true) => {
+            return Err(format!(
+                "query-plan case {} failed without minimized fixture",
+                case.case_id
+            ));
+        }
+        (Some(_), false) => {
+            return Err(format!(
+                "query-plan case {} passed but still carried a failure fixture",
+                case.case_id
+            ));
+        }
+        (None, false) => {}
+    }
+    Ok(())
+}
+
+#[must_use]
+fn required_generator_families() -> [QueryPlanGeneratorFamily; 9] {
+    [
+        QueryPlanGeneratorFamily::Empty,
+        QueryPlanGeneratorFamily::Identifier,
+        QueryPlanGeneratorFamily::ShortKeyword,
+        QueryPlanGeneratorFamily::NaturalLanguage,
+        QueryPlanGeneratorFamily::Negation,
+        QueryPlanGeneratorFamily::LowSignalFallback,
+        QueryPlanGeneratorFamily::MalformedFallback,
+        QueryPlanGeneratorFamily::CapabilityFallback,
+        QueryPlanGeneratorFamily::TieBreak,
+    ]
+}
+
+#[must_use]
+fn required_invariants() -> [QueryPlanInvariant; 10] {
+    [
+        QueryPlanInvariant::CanonicalizationIdempotent,
+        QueryPlanInvariant::ClassificationStable,
+        QueryPlanInvariant::CandidateBudgetSafe,
+        QueryPlanInvariant::EmptyQuerySafe,
+        QueryPlanInvariant::IdentifierLexicalBias,
+        QueryPlanInvariant::NaturalLanguageSemanticBias,
+        QueryPlanInvariant::NegationParsingStable,
+        QueryPlanInvariant::FallbackSafe,
+        QueryPlanInvariant::TieBreakPolicyStable,
+        QueryPlanInvariant::ReplayCommandPresent,
+    ]
+}
+
+#[must_use]
+const fn intent_name(intent: QueryIntentClass) -> &'static str {
+    match intent {
+        QueryIntentClass::Empty => "empty",
+        QueryIntentClass::Identifier => "identifier",
+        QueryIntentClass::ShortKeyword => "short_keyword",
+        QueryIntentClass::NaturalLanguage => "natural_language",
+        QueryIntentClass::Uncertain => "uncertain",
+        QueryIntentClass::Malformed => "malformed",
+    }
+}
+
+#[must_use]
+const fn fallback_name(fallback: QueryFallbackPath) -> &'static str {
+    match fallback {
+        QueryFallbackPath::None => "none",
+        QueryFallbackPath::EmptyQuery => "empty_query",
+        QueryFallbackPath::LowConfidenceLexicalBias => "low_confidence_lexical_bias",
+        QueryFallbackPath::MalformedLexicalOnly => "malformed_lexical_only",
+    }
+}
+
+#[must_use]
+const fn mode_name(mode: QueryExecutionMode) -> &'static str {
+    match mode {
+        QueryExecutionMode::Empty => "empty",
+        QueryExecutionMode::HybridRrf => "hybrid_rrf",
+        QueryExecutionMode::FastSemanticOnly => "fast_semantic_only",
+        QueryExecutionMode::LexicalOnly => "lexical_only",
+    }
+}
+
+#[must_use]
+const fn budget_profile_name(profile: QueryBudgetProfile) -> &'static str {
+    match profile {
+        QueryBudgetProfile::Empty => "empty",
+        QueryBudgetProfile::IdentifierFocused => "identifier_focused",
+        QueryBudgetProfile::Balanced => "balanced",
+        QueryBudgetProfile::SemanticFocused => "semantic_focused",
+        QueryBudgetProfile::SafeFallback => "safe_fallback",
+    }
+}
+
+#[must_use]
+const fn tie_break_rule_name(rule: FusionTieBreakRule) -> &'static str {
+    match rule {
+        FusionTieBreakRule::ScoreDesc => "score_desc",
+        FusionTieBreakRule::InBothSourcesDesc => "in_both_sources_desc",
+        FusionTieBreakRule::LexicalScoreDesc => "lexical_score_desc",
+        FusionTieBreakRule::DocIdAsc => "doc_id_asc",
+    }
 }
 
 #[cfg(test)]
@@ -2281,6 +3332,108 @@ mod tests {
             QueryExecutionCapabilities::all_enabled(),
         );
         assert!(plan.quality_stage.timeout_ms <= 2_000);
+    }
+
+    #[test]
+    fn query_plan_metamorphic_contract_definition_validates() {
+        let contract = super::query_plan_metamorphic_contract_definition();
+        contract
+            .validate()
+            .expect("query-plan metamorphic contract should validate");
+        assert!(contract.corpus_independent);
+        assert_eq!(contract.generator_families.len(), 9);
+        assert_eq!(contract.invariants.len(), 10);
+    }
+
+    #[test]
+    fn query_plan_metamorphic_report_fixture_validates() {
+        let report = super::query_plan_metamorphic_report_fixture();
+        report
+            .validate()
+            .expect("query-plan metamorphic report should validate");
+        assert_eq!(report.summary.total_cases, 9);
+        assert_eq!(report.summary.failed_cases, 0);
+        assert!(
+            report
+                .cases
+                .iter()
+                .any(|case| case.family == super::QueryPlanGeneratorFamily::Negation)
+        );
+        assert!(
+            report
+                .cases
+                .iter()
+                .any(|case| case.family == super::QueryPlanGeneratorFamily::MalformedFallback)
+        );
+    }
+
+    #[test]
+    fn query_plan_metamorphic_contract_suite() {
+        let report = super::query_plan_metamorphic_report_fixture();
+        if let Ok(case_id) = std::env::var("FSFS_QUERY_PLAN_CASE") {
+            let case = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == case_id)
+                .unwrap_or_else(|| panic!("unknown query-plan case {case_id}"));
+            assert!(
+                case.invariants
+                    .iter()
+                    .all(|result| result.status == super::QueryPlanInvariantStatus::Pass),
+                "query-plan case {case_id} failed: {case:?}"
+            );
+            return;
+        }
+
+        report
+            .validate()
+            .expect("query-plan metamorphic report should validate");
+        for case in report.cases {
+            assert!(
+                case.invariants
+                    .iter()
+                    .all(|result| result.status == super::QueryPlanInvariantStatus::Pass),
+                "query-plan case {} failed: {case:?}",
+                case.case_id
+            );
+        }
+    }
+
+    #[test]
+    fn query_plan_metamorphic_failure_fixture_validates() {
+        let fixture = super::query_plan_metamorphic_minimized_failure_fixture();
+        fixture
+            .validate()
+            .expect("query-plan failure fixture should validate");
+    }
+
+    #[test]
+    fn query_plan_metamorphic_report_rejects_unreported_failure() {
+        let mut report = super::query_plan_metamorphic_report_fixture();
+        let first_case = report.cases.first_mut().expect("fixture cases");
+        first_case
+            .invariants
+            .first_mut()
+            .expect("fixture invariants")
+            .status = super::QueryPlanInvariantStatus::Fail;
+        first_case.minimized_failure = None;
+        report.summary.failed_cases = 1;
+        report.summary.passed_cases = report.summary.total_cases - 1;
+
+        let error = report
+            .validate()
+            .expect_err("unreported failure should be rejected");
+        assert!(error.contains("failed without minimized fixture"));
+    }
+
+    #[test]
+    fn query_plan_metamorphic_failure_requires_replay_command() {
+        let mut fixture = super::query_plan_metamorphic_minimized_failure_fixture();
+        fixture.replay_command.clear();
+        let error = fixture
+            .validate()
+            .expect_err("missing replay command should be rejected");
+        assert!(error.contains("replay command"));
     }
 
     // ─── bd-3het tests end ───

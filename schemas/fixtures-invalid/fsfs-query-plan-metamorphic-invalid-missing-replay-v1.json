@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_query_plan_metamorphic_failure",
+  "v": 1,
+  "case_id": "qp-negation-0005",
+  "seed": 5,
+  "raw_query": "rust async -tokio NOT \"blocking runtime\"",
+  "minimized_query": "rust -tokio",
+  "violated_invariant": "negation_parsing_stable",
+  "reason_code": "query_plan.invariant.negation_parsing_stable"
+}
