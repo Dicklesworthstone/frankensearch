@@ -914,7 +914,7 @@ mod tests {
 
         assert!(result.k_source > 0, "k_source must be positive");
         assert!(result.r_repair > 0, "r_repair must be positive");
-        assert!(result.source_size == 1024);
+        assert_eq!(result.source_size, 1024);
         assert!(result.source_hash != 0);
         assert!(!result.encode_time.is_zero() || result.encode_time == std::time::Duration::ZERO);
 

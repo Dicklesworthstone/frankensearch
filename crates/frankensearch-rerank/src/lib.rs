@@ -197,7 +197,7 @@ impl FlashRankReranker {
                 path: model_file.clone(),
                 source: format!("ONNX session creation failed: {e}").into(),
             })?;
-        let mut session_builder = session_builder
+        let session_builder = session_builder
             .with_intra_threads(num_cpus())
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_file.clone(),

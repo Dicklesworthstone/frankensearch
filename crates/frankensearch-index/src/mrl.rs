@@ -1300,9 +1300,12 @@ mod tests {
         assert!((nan_safe(1.0) - 1.0).abs() < f32::EPSILON);
         assert!(nan_safe(0.0).abs() < f32::EPSILON);
         assert!((nan_safe(-1.0) + 1.0).abs() < f32::EPSILON);
-        assert!(nan_safe(f32::NEG_INFINITY) == f32::NEG_INFINITY);
-        assert!(nan_safe(f32::INFINITY) == f32::INFINITY);
-        assert!(nan_safe(f32::NAN) == f32::NEG_INFINITY);
+        let neg_inf = nan_safe(f32::NEG_INFINITY);
+        assert!(neg_inf.is_infinite() && neg_inf.is_sign_negative());
+        let pos_inf = nan_safe(f32::INFINITY);
+        assert!(pos_inf.is_infinite() && pos_inf.is_sign_positive());
+        let nan = nan_safe(f32::NAN);
+        assert!(nan.is_infinite() && nan.is_sign_negative());
     }
 
     #[test]
