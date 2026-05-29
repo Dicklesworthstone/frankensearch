@@ -5,7 +5,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::error::{SearchError, SearchResult};
-use tantivy::indexer::LogMergePolicy;
+use tantivy::indexer::{LogMergePolicy, NoMergePolicy};
 use tantivy::indexer::UserOperation;
 use tantivy::query::{
     AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
@@ -964,6 +964,75 @@ impl CassTantivyIndex {
             }
             Err(err) => Err(tantivy_err(err)),
         }
+    }
+
+    /// Force a full merge while never opening more than `batch_size` segments
+    /// at once, returning the number of merge operations performed.
+    ///
+    /// [`force_merge`](Self::force_merge) merges *all* searchable segments in a
+    /// single `merge()` call, which memory-maps every input segment
+    /// simultaneously. On an index that has accumulated many segments (e.g.
+    /// after a long ingest run with transient auto-merge failures), that single
+    /// call can map more regions than the OS allows (`vm.max_map_count`,
+    /// 65530 by default on Linux) and fail with an out-of-memory / mmap error,
+    /// leaving the caller with no in-wrapper recovery path.
+    ///
+    /// This consolidates the index in bounded passes instead: each iteration
+    /// merges at most `batch_size` segments, so peak mmap pressure is capped at
+    /// `batch_size * files-per-segment` regardless of how many segments exist.
+    /// Repeated passes drive the segment count down to a single top-level
+    /// segment.
+    ///
+    /// For the duration of the operation a [`NoMergePolicy`] is installed: a
+    /// completed `merge()` calls `consider_merge_options()` internally, and the
+    /// default [`LogMergePolicy`] could otherwise schedule its own unbounded
+    /// merge of the remaining same-tier segments — reintroducing exactly the
+    /// mmap pressure we are avoiding. The default merge policy is restored
+    /// before returning so steady-state auto-merge resumes.
+    ///
+    /// `batch_size` is clamped to a minimum of 2 (a batch of 1 can never make
+    /// progress). The writer is held exclusively for the whole call, which can
+    /// take many minutes on a large index; callers should quiesce ingestion
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::SubsystemError`] if segment enumeration or any
+    /// individual batch merge fails. The default merge policy is restored even
+    /// on the error path.
+    pub fn force_merge_bounded(&mut self, batch_size: usize) -> SearchResult<usize> {
+        let batch_size = batch_size.max(2);
+
+        self.writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        let mut merges = 0usize;
+        let outcome: SearchResult<usize> = (|| {
+            loop {
+                let segment_ids = self.index.searchable_segment_ids().map_err(tantivy_err)?;
+                if segment_ids.len() <= 1 {
+                    return Ok(merges);
+                }
+                let take = segment_ids.len().min(batch_size);
+                self.writer
+                    .merge(&segment_ids[..take])
+                    .wait()
+                    .map_err(tantivy_err)?;
+                merges += 1;
+            }
+        })();
+
+        // Restore steady-state auto-merge regardless of success/failure.
+        self.writer
+            .set_merge_policy(Box::<LogMergePolicy>::default());
+
+        if matches!(outcome, Ok(n) if n > 0) {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            LAST_MERGE_TS.store(now_ms, Ordering::Relaxed);
+        }
+
+        outcome
     }
 
     /// Add a batch of cass-compatible documents.
@@ -2741,6 +2810,78 @@ mod cass_query_tests {
         assert!(
             !results.is_empty(),
             "CJK search for '검색' should find the indexed Korean document"
+        );
+    }
+
+    #[test]
+    fn force_merge_bounded_consolidates_segments() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+
+        // Suppress auto-merge during setup so each commit leaves its own
+        // segment; otherwise the default LogMergePolicy could collapse them and
+        // we'd never exercise the bounded multi-pass path.
+        idx.writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        let make_doc = |i: u64| CassDocument {
+            agent: "claude".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: format!("/tmp/test/{i}"),
+            msg_idx: i,
+            created_at: Some(1_700_000_000_000 + i as i64),
+            title: Some(format!("doc {i}")),
+            content: format!("bounded merge segment number {i}"),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+            conversation_id: None,
+        };
+
+        // Five separate commits => five segments (auto-merge suppressed).
+        for i in 0..5u64 {
+            idx.add_cass_documents(&[make_doc(i)]).expect("add");
+            idx.commit().expect("commit");
+        }
+        let before = idx
+            .index
+            .searchable_segment_ids()
+            .expect("segments")
+            .len();
+        assert!(before > 1, "expected multiple segments, got {before}");
+
+        // Bounded merge in batches of 2 must consolidate to a single segment
+        // and restore the default merge policy on the way out.
+        let merges = idx.force_merge_bounded(2).expect("bounded merge");
+        assert!(merges >= 1, "expected at least one bounded merge pass");
+
+        let after = idx
+            .index
+            .searchable_segment_ids()
+            .expect("segments")
+            .len();
+        assert!(
+            after <= 1,
+            "bounded merge should consolidate to <=1 segment, got {after}"
+        );
+
+        // All five documents survive the consolidation.
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        let fields = idx.fields();
+        let query =
+            cass_build_tantivy_query("bounded", &CassQueryFilters::default(), &fields);
+        let results = searcher
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+            )
+            .expect("search");
+        assert_eq!(
+            results.len(),
+            5,
+            "all documents should remain searchable after bounded merge"
         );
     }
 }
