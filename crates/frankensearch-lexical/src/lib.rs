@@ -403,6 +403,10 @@ impl TantivyIndex {
                     "writer mutex future reused after completion during {phase}"
                 ))),
             },
+            asupersync::sync::LockError::TimedOut(deadline) => SearchError::Cancelled {
+                phase: phase.into(),
+                reason: format!("writer lock timed out at {deadline:?}"),
+            },
         }
     }
 
