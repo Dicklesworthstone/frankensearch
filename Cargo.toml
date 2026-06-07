@@ -51,8 +51,16 @@ frankensearch-tui = { version = "0.2.0", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.2.0", path = "crates/frankensearch-ops" }
 
 # Async runtime (structured concurrency, NO tokio)
-# test-internals enables LabRuntime for deterministic testing
-asupersync = { version = "0.3.1", features = ["proc-macros", "test-internals"] }
+# `default-features = false` keeps asupersync's `test-internals` feature out
+# of PRODUCTION builds: requesting it here leaked it into every downstream
+# production graph via Cargo feature unification (HFDT dependency gate RED).
+# Crates that need `asupersync::test_utils` for #[cfg(test)] code re-enable
+# it through their [dev-dependencies] entry:
+#   asupersync = { workspace = true, features = ["test-internals"] }
+# Same fix shape as frankensqlite (#104).
+# Keep this exact pin aligned with HFDT and FrankenSQLite so downstream
+# workspaces resolve a single Asupersync runtime universe.
+asupersync = { version = "=0.3.4", default-features = false, features = ["proc-macros"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
