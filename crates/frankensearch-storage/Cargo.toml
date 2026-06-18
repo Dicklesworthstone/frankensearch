@@ -15,7 +15,7 @@ fsqlite-types = "0.1.2"
 fsqlite-ext-fts5 = { version = "0.1.2", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 tracing = { workspace = true }
 
 [features]

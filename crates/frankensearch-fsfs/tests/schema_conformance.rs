@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use jsonschema::{Draft, JSONSchema};
+use jsonschema::Validator;
 use serde::de::DeserializeOwned;
 
 fn fixture_dir() -> PathBuf {
@@ -138,30 +138,27 @@ fn is_semantic_invalid_fixture(name: &str) -> bool {
 }
 
 fn load_schema<'a>(
-    cache: &'a mut BTreeMap<String, JSONSchema>,
+    cache: &'a mut BTreeMap<String, Validator>,
     schemas: &Path,
     schema_file: &str,
-) -> &'a JSONSchema {
+) -> &'a Validator {
     cache.entry(schema_file.to_owned()).or_insert_with(|| {
         let schema_path = schemas.join(schema_file);
         let raw = fs::read_to_string(&schema_path)
             .unwrap_or_else(|_| panic!("schema file missing: {}", schema_path.display()));
         let schema_json: serde_json::Value =
             serde_json::from_str(&raw).expect("schema should parse as json");
-        JSONSchema::options()
-            .with_draft(Draft::Draft202012)
-            .compile(&schema_json)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to compile schema {}: {error}",
-                    schema_path.display()
-                )
-            })
+        jsonschema::draft202012::new(&schema_json).unwrap_or_else(|error| {
+            panic!(
+                "failed to compile schema {}: {error}",
+                schema_path.display()
+            )
+        })
     })
 }
 
 fn assert_schema_validation(
-    cache: &mut BTreeMap<String, JSONSchema>,
+    cache: &mut BTreeMap<String, Validator>,
     schema_root: &Path,
     fixture_path: &Path,
     should_pass: bool,
@@ -180,10 +177,12 @@ fn assert_schema_validation(
             fixture_path.display()
         )
     });
-    let validation = schema.validate(&value);
     if should_pass {
-        if let Err(errors) = validation {
-            let messages: Vec<String> = errors.map(|err| err.to_string()).collect();
+        let messages: Vec<String> = schema
+            .iter_errors(&value)
+            .map(|err| err.to_string())
+            .collect();
+        if !messages.is_empty() {
             panic!(
                 "fixture {} failed schema {}: {}",
                 fixture_path.display(),
@@ -191,7 +190,7 @@ fn assert_schema_validation(
                 messages.join("; ")
             );
         }
-    } else if validation.is_ok() {
+    } else if schema.is_valid(&value) {
         panic!(
             "fixture {} unexpectedly passed schema {}",
             fixture_path.display(),
@@ -258,7 +257,7 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
 
 #[test]
 fn test_schema_fixtures_validate_against_jsonschema() {
-    let mut cache: BTreeMap<String, JSONSchema> = BTreeMap::new();
+    let mut cache: BTreeMap<String, Validator> = BTreeMap::new();
     let schemas = schema_dir();
 
     for entry in fs::read_dir(fixture_dir()).expect("read fixtures dir") {

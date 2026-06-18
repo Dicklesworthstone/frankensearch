@@ -1,5 +1,33 @@
 # Dependency Upgrade Log
 
+## 2026-06-17 — straggler third-party majors
+
+Two leftovers from earlier passes, finished now. `Cargo.lock` is gitignored in
+this repo, so only the `Cargo.toml` edits are committable; the local lock was
+re-resolved for validation.
+
+- **sha2 0.10 → 0.11 (workspace) in `frankensearch-storage`.** The workspace
+  root already declared `sha2 = "0.11.0"` and every other crate used
+  `sha2 = { workspace = true }`; `frankensearch-storage` was the lone straggler
+  pinning `"0.10"` directly. Switched it to `{ workspace = true }`. No code
+  change — `content_hash.rs` already hex-encodes with a manual `write!("{:02x}")`
+  loop (not the `LowerHex`-on-digest pattern that sha2 0.11 dropped).
+- **jsonschema 0.17 → 0.46 (dev-dep) in `frankensearch-fsfs`.** Migrated the
+  `schema_conformance` test off the removed `JSONSchema` builder API:
+  `JSONSchema::options().with_draft(Draft::Draft202012).compile(&s)` →
+  `jsonschema::draft202012::new(&s)` returning a `Validator`; validation now uses
+  `validator.iter_errors(&value)` (collect-all for should-pass) and
+  `validator.is_valid(&value)` (for should-fail) instead of the old
+  iterator-returning `validate()`.
+
+### Validation
+- `cargo check -p frankensearch-fsfs --tests`: ✅ (jsonschema 0.46 API compiles)
+- `cargo test -p frankensearch-fsfs --test schema_conformance`: ✅ **118 passed,
+  0 failed** — including `test_schema_fixtures_validate_against_jsonschema`.
+- `cargo audit`: no vulnerabilities (3 pre-existing allowed "unmaintained" advisories).
+
+---
+
 **Date:** 2026-02-17  
 **Project:** frankensearch  
 **Language:** Rust
