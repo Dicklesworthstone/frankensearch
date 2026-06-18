@@ -720,6 +720,7 @@ mod tests {
     // -- Snippets --
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn search_with_snippets_returns_highlighted_text() {
         let search = Fts5LexicalSearch::with_defaults();
 
@@ -935,5 +936,134 @@ mod tests {
         let deserialized: Fts5Hit = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.doc_id, "doc1");
         assert!((deserialized.bm25_score - 1.5).abs() < f32::EPSILON);
+    }
+
+    // -- cass#301 merge/finalize scaling probe --
+
+    /// Generate a deterministic, lexically varied document body of roughly
+    /// `target_bytes`. Mixing a finite vocabulary with the doc index keeps the
+    /// posting lists realistic (many shared terms, a few doc-unique terms)
+    /// without any RNG, so the probe is reproducible across runs and hosts.
+    fn synthetic_body(doc_index: usize, target_bytes: usize) -> String {
+        const VOCAB: &[&str] = &[
+            "retry",
+            "backoff",
+            "structured",
+            "concurrency",
+            "channel",
+            "reserve",
+            "commit",
+            "cancel",
+            "region",
+            "scope",
+            "embedder",
+            "lexical",
+            "semantic",
+            "fusion",
+            "rank",
+            "vector",
+            "index",
+            "segment",
+            "merge",
+            "finalize",
+            "tokenizer",
+            "posting",
+            "document",
+            "search",
+            "query",
+            "score",
+            "bm25",
+        ];
+        use std::fmt::Write as _;
+        let mut body = String::with_capacity(target_bytes + 32);
+        let mut counter = doc_index;
+        while body.len() < target_bytes {
+            let word = VOCAB[counter % VOCAB.len()];
+            body.push_str(word);
+            // Sprinkle a doc-unique token so each document has distinct terms.
+            if counter % 11 == 0 {
+                let _ = write!(body, " d{doc_index}t{counter}");
+            }
+            body.push(' ');
+            counter = counter.wrapping_add(1).wrapping_add(doc_index);
+        }
+        body
+    }
+
+    /// cass#301: scaling probe for the frankensearch FTS5 lexical-index build
+    /// path (`Fts5LexicalSearch::index_documents`, the exact path cass drives
+    /// during `cass index --full`).
+    ///
+    /// Feeds an increasing number of documents simulating ~10MB -> ~40MB of
+    /// indexed content and prints the wall-time of the index-build (finalize)
+    /// phase plus a representative search at each size. The reported
+    /// `build_ms_per_mb` (build time normalised by content size) is the
+    /// diagnostic: if it is roughly flat across sizes the build is linear; if
+    /// it climbs ~linearly with content size the build is O(N^2).
+    ///
+    /// Run with:
+    /// `cargo test -p frankensearch-storage --features fts5 --release \
+    ///    fts5_index_build_scaling_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "cass#301 scaling probe: run explicitly with --ignored --nocapture"]
+    fn fts5_index_build_scaling_probe() {
+        use std::time::Instant;
+
+        // ~50 KB per document. Content megabytes => doc_count = mb * 20.
+        const DOC_BYTES: usize = 50 * 1024;
+        let content_mbs: Vec<usize> = std::env::var("FTS5_PROBE_MBS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![10, 20, 30, 40]);
+
+        run_with_cx(|cx| async move {
+            eprintln!(
+                "FTS5_PROBE doc_bytes={DOC_BYTES} sizes_mb={content_mbs:?} (cass#301 build/finalize scaling)"
+            );
+            for &mb in &content_mbs {
+                let doc_count = mb * (1024 * 1024) / DOC_BYTES;
+                let docs: Vec<IndexableDocument> = (0..doc_count)
+                    .map(|i| {
+                        IndexableDocument::new(format!("doc-{i}"), synthetic_body(i, DOC_BYTES))
+                            .with_title(format!("Document {i}"))
+                    })
+                    .collect();
+
+                let search = Fts5LexicalSearch::with_defaults();
+
+                // Index-build / finalize phase — the wedge phase in cass#301.
+                let build_started = Instant::now();
+                search
+                    .index_documents(&cx, &docs)
+                    .await
+                    .expect("index_documents");
+                search.commit(&cx).await.expect("commit");
+                let build_elapsed = build_started.elapsed();
+
+                // Representative query against the freshly built index.
+                let search_started = Instant::now();
+                let hits = search
+                    .search(&cx, "structured concurrency retry", 10)
+                    .await
+                    .expect("search");
+                let search_elapsed = search_started.elapsed();
+
+                let build_ms = build_elapsed.as_secs_f64() * 1_000.0;
+                let search_ms = search_elapsed.as_secs_f64() * 1_000.0;
+                eprintln!(
+                    "FTS5_PROBE content_mb={mb} docs={doc_count} build_ms={build_ms:.1} \
+                     build_ms_per_mb={:.2} search_ms={search_ms:.3} hits={} doc_count={}",
+                    build_ms / mb as f64,
+                    hits.len(),
+                    search.doc_count(),
+                );
+                assert_eq!(search.doc_count(), doc_count);
+            }
+        });
     }
 }
