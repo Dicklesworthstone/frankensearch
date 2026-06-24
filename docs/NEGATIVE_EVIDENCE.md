@@ -33,4 +33,33 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
 
 ## Reverted experiments
 
-_(none yet — entries appended as experiments fail)_
+### 2026-06-24 — multi-accumulator unrolling of the **f16** dot-product kernels (BlackThrush)
+
+**Lever:** rewrite `dot_product_f16_f32` and `dot_product_f16_bytes_f32` to use 4 independent
+`f32x8` accumulators (32 elements/iter) instead of 1, to break the SIMD-add latency chain.
+
+**Measured head-to-head** (`benches/dot_product.rs`, `*_new` = 4-acc, `*_old` = original
+single-acc, same process / same CPU, n=10 000 dots):
+
+| Workload | old (median) | new (median) | ratio new/old | verdict |
+|----------|-------------|-------------|---------------|---------|
+| `dot/dim256/f16_bytes` | 12.483 ms | 13.504 ms | **1.082** | regression |
+| `dot/dim384/f16_bytes` | 17.486 ms | 18.115 ms | **1.036** | regression |
+| `dot/dim256/f16_slice` | 10.242 ms | 14.909 ms | **1.456** | regression (noise-inflated) |
+| `dot/dim384/f16_slice` | 13.489 ms | 14.277 ms | **1.058** | regression |
+
+**Why it fails:** the f16 paths are **decode-bound** — the per-element scalar `f16::to_f32()`
+conversion dominates, so the accumulation latency the change targets is a negligible fraction.
+The restructure (chunks_exact(32) + `try_into` per sub-block + two-phase remainder) only adds
+setup overhead. Reverted these two kernels to the original single-accumulator form.
+
+**Connects to historical revert `816963a`:** the human previously reverted `88c291b`
+("…multi-accumulator unrolling"), which *bundled* this f16 kernel change with a
+`select_nth_unstable` heap-merge (unstable sort → breaks deterministic tie ordering) and a
+16-elem unroll. This measurement isolates the kernel part and confirms it is **not** a win on
+the f16 (default-quantization) path independent of the heap change. Do not re-attempt
+accumulator unrolling on f16 kernels without first making the f16→f32 decode SIMD (a
+branchless `i32x8`/F16C widen), which is the actual bottleneck.
+
+**Kept from the same experiment:** the `f32_bytes` kernel restructure was a genuine ~3× win
+(decode-bound on open-ended slices, not accumulation) → see `docs/PERF_LEDGER.md`.

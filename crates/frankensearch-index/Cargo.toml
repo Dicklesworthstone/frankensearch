@@ -29,6 +29,15 @@ hnsw_rs = { workspace = true, optional = true }
 asupersync = { workspace = true }
 serde_json = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+# For the head-to-head baseline kernels inside benches/dot_product.rs.
+half = { workspace = true }
+wide = { workspace = true }
+
+# SIMD dot-product hot-loop benchmarks (brute-force vector top-k inner loop).
+[[bench]]
+name = "dot_product"
+harness = false
 
 [lints]
 workspace = true

@@ -21,7 +21,19 @@ hot-path ratios and must not be presented as original-comparator wins.
 
 | Date | Crate | Lever | Workload (bench id) | Before | After | Ratio | Status |
 |------|-------|-------|---------------------|--------|-------|-------|--------|
-| _pending_ | frankensearch-index | multi-accumulator + FMA dot product | `dot/*` | — | — | — | measuring |
+| 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
+| 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim384/f32_bytes` | 14.084 ms | 5.333 ms | **0.379** | KEEP |
+
+**Lever:** `dot_product_f32_bytes_f32` (used by f32-quantized FSVI indexes, `search.rs:307,372,492`).
+The old kernel decoded f32s from an open-ended `&stored_bytes[off..]` slice, which the
+compiler could not prove a fixed width for and so did not vectorize the `from_le_bytes`
+decode. Rewriting the decode over fixed `[u8; 32]` sub-blocks (+ 4 independent f32x8
+accumulators) lets it vectorize → **~2.7–3.0× faster**. Measured head-to-head in one
+process via `benches/dot_product.rs` (`f32_bytes_new` vs `f32_bytes_old`), so the ratio is
+immune to which rch worker the run landed on. f16 paths were tried with the same restructure
+but **regressed** (decode is scalar-bound there) and were reverted — see
+`docs/NEGATIVE_EVIDENCE.md`. No dominance-vs-original claim (blocked by `bd-ui41`); this is a
+frankensearch pre-change before/after ratio only.
 
 ## Baselines only
 

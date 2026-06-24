@@ -4,6 +4,43 @@ use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
 use wide::f32x8;
 
+// ── SIMD load/decode helpers ────────────────────────────────────────────────
+//
+// The f32 byte-decoding dot-product kernel below uses four independent f32x8
+// accumulators per 32 elements. A single accumulator serializes on SIMD add
+// latency; four accumulators expose enough instruction-level parallelism to run
+// the loop at throughput instead.
+
+/// Load 8 consecutive `f32` lanes from a fixed 32-element array at a const offset.
+#[inline(always)]
+fn load8_f32<const OFF: usize>(a: &[f32; 32]) -> f32x8 {
+    f32x8::from([
+        a[OFF],
+        a[OFF + 1],
+        a[OFF + 2],
+        a[OFF + 3],
+        a[OFF + 4],
+        a[OFF + 5],
+        a[OFF + 6],
+        a[OFF + 7],
+    ])
+}
+
+/// Decode 8 little-endian `f32` values from a 32-byte block to `f32x8`.
+#[inline(always)]
+fn decode8_f32(b: &[u8; 32]) -> f32x8 {
+    f32x8::from([
+        f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        f32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        f32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+        f32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+        f32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+        f32::from_le_bytes([b[20], b[21], b[22], b[23]]),
+        f32::from_le_bytes([b[24], b[25], b[26], b[27]]),
+        f32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+    ])
+}
+
 /// Dot product between two f32 vectors.
 ///
 /// # Errors
@@ -98,7 +135,6 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
         let query_offset = chunk_index * 8;
 
         let b = &stored_bytes[byte_offset..];
-        // Decode 8 f16s from bytes
         let v0 = f16::from_le_bytes([b[0], b[1]]).to_f32();
         let v1 = f16::from_le_bytes([b[2], b[3]]).to_f32();
         let v2 = f16::from_le_bytes([b[4], b[5]]).to_f32();
@@ -143,30 +179,42 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
         });
     }
 
+    let mut acc0 = f32x8::splat(0.0);
+    let mut acc1 = f32x8::splat(0.0);
+    let mut acc2 = f32x8::splat(0.0);
+    let mut acc3 = f32x8::splat(0.0);
+
+    // Main loop: 32 elements (128 stored bytes) per iteration, 4 accumulators.
+    let groups = dim / 32;
+    for g in 0..groups {
+        let bo = g * 128;
+        let qo = g * 32;
+        let block: &[u8; 128] = stored_bytes[bo..bo + 128]
+            .try_into()
+            .expect("128-byte f32 block");
+        let q: &[f32; 32] = query[qo..qo + 32]
+            .try_into()
+            .expect("32-element query block");
+        acc0 +=
+            decode8_f32(block[0..32].try_into().expect("32-byte sub-block")) * load8_f32::<0>(q);
+        acc1 +=
+            decode8_f32(block[32..64].try_into().expect("32-byte sub-block")) * load8_f32::<8>(q);
+        acc2 +=
+            decode8_f32(block[64..96].try_into().expect("32-byte sub-block")) * load8_f32::<16>(q);
+        acc3 +=
+            decode8_f32(block[96..128].try_into().expect("32-byte sub-block")) * load8_f32::<24>(q);
+    }
+
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+
+    // Tail of full 8-element chunks not covered by the 32-wide main loop.
     let chunks = dim / 8;
-    let mut sum = f32x8::splat(0.0);
-
-    for chunk_index in 0..chunks {
-        let byte_offset = chunk_index * 32;
-        let query_offset = chunk_index * 8;
-
-        let b = &stored_bytes[byte_offset..];
-        // Decode 8 f32s from bytes
-        let v0 = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        let v1 = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-        let v2 = f32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-        let v3 = f32::from_le_bytes([b[12], b[13], b[14], b[15]]);
-        let v4 = f32::from_le_bytes([b[16], b[17], b[18], b[19]]);
-        let v5 = f32::from_le_bytes([b[20], b[21], b[22], b[23]]);
-        let v6 = f32::from_le_bytes([b[24], b[25], b[26], b[27]]);
-        let v7 = f32::from_le_bytes([b[28], b[29], b[30], b[31]]);
-
-        let stored_chunk = f32x8::from([v0, v1, v2, v3, v4, v5, v6, v7]);
-
-        let q = &query[query_offset..];
-        let query_chunk = f32x8::from([q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]]);
-
-        sum += stored_chunk * query_chunk;
+    for chunk_index in (groups * 4)..chunks {
+        let bo = chunk_index * 32;
+        let qo = chunk_index * 8;
+        let block: &[u8; 32] = stored_bytes[bo..bo + 32].try_into().expect("32-byte block");
+        let q: &[f32; 8] = query[qo..qo + 8].try_into().expect("8-element block");
+        sum += decode8_f32(block) * f32x8::from(*q);
     }
 
     let mut result = sum.reduce_add();
