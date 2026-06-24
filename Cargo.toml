@@ -59,11 +59,15 @@ frankensearch-ops = { version = "0.2.0", path = "crates/frankensearch-ops" }
 #   asupersync = { workspace = true, features = ["test-internals"] }
 # Same fix shape as frankensqlite (#104).
 # Keep this pin aligned with HFDT and FrankenSQLite so downstream
-# workspaces resolve a single Asupersync runtime universe. FrankenSQLite
-# moved to 0.3.5 (release-train bump); match it here via the same
-# explicit path so the single Asupersync universe stays unified and a
-# standalone build resolves without the (unpublished) 0.3.5 registry crate.
-asupersync = { version = "=0.3.4", default-features = false, features = ["proc-macros"] }
+# workspaces resolve a single Asupersync runtime universe. The range
+# `>=0.3.4, <0.4` (rather than a hard `=0.3.4`) lets a downstream workspace
+# that patches asupersync to an unpublished 0.3.5 (e.g. mcp_agent_mail_rust's
+# `[patch.crates-io] asupersync = { path = "/dp/asupersync" }`) resolve a
+# single unified runtime, while a standalone frankensearch build still
+# resolves 0.3.4 from crates.io (0.3.5 is unpublished). A hard `=0.3.4`
+# was unsatisfiable under that patch and deadlocked am's whole graph
+# (cargo resolution EXIT 101). [bd-3h229]
+asupersync = { version = ">=0.3.4, <0.4", default-features = false, features = ["proc-macros"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
