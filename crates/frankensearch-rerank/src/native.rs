@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex};
 use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
-use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -240,28 +239,17 @@ impl Model {
     }
 }
 
-/// A reranker worker slot: an owned frankentorch session plus a dedicated
-/// single-thread rayon pool. Each forward runs inside `compute.install(...)` so
-/// that every frankentorch op that uses ambient rayon internally (the f32
-/// attention `bmm`, `softmax`, `layer_norm`, the f32 GEMM path, ...) executes on
-/// this one thread instead of fanning rayon work back onto the doc-dispatch
-/// pool. That separation is what makes holding the session `Mutex` across the
-/// whole forward deadlock-free: a forward can never spawn rayon work that lands
-/// on a doc worker that is itself blocked on another slot's lock (the
-/// nested-rayon + `Mutex` deadlock this replaced).
-struct Slot {
-    model: Mutex<Model>,
-    compute: rayon::ThreadPool,
-}
-
 /// Pure-Rust frankentorch cross-encoder reranker.
 pub struct NativeReranker {
-    /// One session-slot per worker so documents rerank concurrently.
-    /// `FrankenTorchSession` is not `Sync` (it mutates the autograd tape every
-    /// forward), so parallelism uses a pool of slots rather than a shared
-    /// session. The int8 Linear weights are `Arc`-shared across the pool; only
-    /// the f32 embedding/LayerNorm leaves are duplicated per session.
-    slots: Vec<Slot>,
+    /// A single frankentorch session behind a `Mutex`. Documents are reranked in
+    /// a SEQUENTIAL loop, and each forward parallelizes internally across cores
+    /// (the int8 Linear kernel + the f32 attention `bmm` / `softmax` /
+    /// `layer_norm` ops use ambient rayon). Because there is no doc-level
+    /// `par_iter`, nothing nests rayon while holding the lock, so the
+    /// nested-rayon + `Mutex` deadlock is impossible by construction. Per-forward
+    /// parallelism makes the common few-doc rerank fast (each forward uses all
+    /// cores); a batched forward is the deferred next step for large-N throughput.
+    inner: Mutex<Model>,
     tokenizer: Tokenizer,
     max_length: usize,
     name: String,
@@ -325,34 +313,24 @@ impl NativeReranker {
             });
         }
 
-        // Parse + quantize the weights once, then build a pool of sessions from
-        // the shared data so documents can be reranked concurrently. Pool size
-        // tracks the rayon worker count (capped to bound the per-session f32
-        // embedding memory, ~47 MB/session for the word-embedding table).
+        // Parse + quantize the weights once and build a single session. Documents
+        // are reranked sequentially; each forward parallelizes internally across
+        // cores. No pool is needed (and one session keeps the f32 embedding table
+        // resident only once, ~47 MB instead of per-slot copies).
         let shared = parse_weights(&weights_path)?;
-        let pool_size = rayon::current_num_threads().clamp(1, 8);
-        let mut slots = Vec::with_capacity(pool_size);
-        for i in 0..pool_size {
-            let compute = rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .thread_name(move |_| format!("ee-rerank-compute-{i}"))
-                .build()
-                .map_err(|e| rerank_err("compute_pool", e))?;
-            slots.push(Slot { model: Mutex::new(build_model(&shared)?), compute });
-        }
+        let model = build_model(&shared)?;
 
         tracing::info!(
             model = MODEL_NAME,
             linear_int8 = shared.qw.len(),
             f32_params = shared.f32_params.len(),
-            pool_size,
             max_length = DEFAULT_MAX_LENGTH,
             model_dir = %dir.display(),
-            "native frankentorch reranker loaded (int8 linear, pooled, sequential forwards)"
+            "native frankentorch reranker loaded (int8 linear, parallel forward)"
         );
 
         Ok(Self {
-            slots,
+            inner: Mutex::new(model),
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
@@ -536,55 +514,44 @@ impl SyncRerank for NativeReranker {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        let n_slots = self.slots.len();
-        // Rerank documents concurrently across the session pool. The doc-level
-        // `par_iter` runs on the global rayon pool; each forward is dispatched
-        // onto its slot's dedicated single-thread `compute` pool via `install`,
-        // so the frankentorch ops inside the forward (int8 linear, the f32
-        // attention `bmm`, `softmax`, `layer_norm`, ...) run on that one thread
-        // and never fan rayon work back onto the doc-dispatch workers. That
-        // separation is what makes holding the session `Mutex` across the whole
-        // forward deadlock-free — no worker blocks on a lock while waiting for
-        // inner rayon work owned by another blocked worker. `par_iter().collect()`
-        // is index-preserving, so the output order (and `original_rank`) follows
-        // the input and the scores are deterministic regardless of scheduling.
-        documents
-            .par_iter()
-            .enumerate()
-            .map(|(rank, doc)| {
-                let encoding = self
-                    .tokenizer
-                    .encode((query, doc.text.as_str()), true)
-                    .map_err(|e| rerank_err("tokenize", e))?;
-                let mut ids: Vec<i64> =
-                    encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-                let mut typ: Vec<i64> =
-                    encoding.get_type_ids().iter().map(|&t| i64::from(t)).collect();
-                if ids.len() > self.max_length {
-                    ids.truncate(self.max_length);
-                    typ.truncate(self.max_length);
-                }
-                let slot = rayon::current_thread_index().unwrap_or(0) % n_slots;
-                let s = &self.slots[slot];
-                let logit = s.compute.install(|| -> SearchResult<f32> {
-                    let mut model = s.model.lock().map_err(|e| {
-                        rerank_err("lock", format!("reranker mutex poisoned: {e}"))
-                    })?;
-                    model.forward(&ids, &typ)
-                })?;
-                let (score, raw_logit) = if logit.is_finite() {
-                    (sigmoid(logit), Some(logit))
-                } else {
-                    (0.0, None)
-                };
-                Ok(RerankScore {
-                    doc_id: doc.doc_id.clone(),
-                    score,
-                    original_rank: rank,
-                    raw_logit,
-                })
-            })
-            .collect()
+        // Rerank documents in a SEQUENTIAL loop. Each `forward` parallelizes
+        // internally across cores (the int8 Linear kernel and the f32 attention
+        // `bmm` / `softmax` / `layer_norm` ops use ambient rayon), so a single
+        // forward already saturates the machine. Because there is NO doc-level
+        // `par_iter`, no rayon work is ever spawned while the session `Mutex` is
+        // held by a parallel worker, so the nested-rayon + `Mutex` deadlock
+        // cannot occur. Output order (and `original_rank`) follows the input and
+        // the logits are deterministic.
+        let mut model = self
+            .inner
+            .lock()
+            .map_err(|e| rerank_err("lock", format!("reranker mutex poisoned: {e}")))?;
+        let mut out = Vec::with_capacity(documents.len());
+        for (rank, doc) in documents.iter().enumerate() {
+            let encoding = self
+                .tokenizer
+                .encode((query, doc.text.as_str()), true)
+                .map_err(|e| rerank_err("tokenize", e))?;
+            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+            let mut typ: Vec<i64> = encoding.get_type_ids().iter().map(|&t| i64::from(t)).collect();
+            if ids.len() > self.max_length {
+                ids.truncate(self.max_length);
+                typ.truncate(self.max_length);
+            }
+            let logit = model.forward(&ids, &typ)?;
+            let (score, raw_logit) = if logit.is_finite() {
+                (sigmoid(logit), Some(logit))
+            } else {
+                (0.0, None)
+            };
+            out.push(RerankScore {
+                doc_id: doc.doc_id.clone(),
+                score,
+                original_rank: rank,
+                raw_logit,
+            });
+        }
+        Ok(out)
     }
 
     fn id(&self) -> &str {
