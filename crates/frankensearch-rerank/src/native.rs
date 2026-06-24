@@ -2,16 +2,19 @@
 //!
 //! Reimplements the `cross-encoder/ms-marco-MiniLM-L6-v2` `BertForSequenceClassification`
 //! forward pass (6 layers, hidden 384, 12 heads, exact GELU, LayerNorm eps 1e-12,
-//! `[CLS]` pooler + classifier, `sigmoid(logit)`) on frankentorch tensors in **f32**
-//! (bd-1nl13.10), validated against the numpy/ONNX reference (bd-1nl13.2/.3). f32 is
-//! the dominant inference dtype: half the memory and ~2x the throughput of the
-//! original f64 forward, while preserving the reference ranking.
+//! `[CLS]` pooler + classifier, `sigmoid(logit)`) on frankentorch tensors, matching the
+//! ONNX dynamic-quant scheme: an **f32 substrate** (embeddings, LayerNorm, softmax,
+//! GELU, tanh) with **int8 Linear matmuls** (bd-1nl13.10/.15). Every Linear (attention
+//! QKV/output, FFN, pooler, classifier) is statically int8-quantized per output channel
+//! at load; its activation is dynamically int8-quantized per row at forward
+//! (`tensor_linear_int8_dynamic`). Validated against the numpy/ONNX reference
+//! (bd-1nl13.2/.3): the reference ranking is preserved.
 //!
 //! Embedding lookups go through `tensor_index_select` rather than `tensor_embedding`:
 //! `index_select` preserves the weight dtype (f32 in/f32 out, frankentorch-40i), whereas
 //! `tensor_embedding`'s custom gather still materialises f64. The two are semantically
 //! identical here (no `padding_idx`). LayerNorm hits frankentorch's f32 fused no-grad
-//! fast path. The int8 path (bd-1nl13.15) is tracked separately.
+//! fast path.
 //!
 //! The only reranker backend (ort/ONNX was removed in bd-1nl13.6); feature-gated
 //! behind `native`.
@@ -19,9 +22,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use ft_api::FrankenTorchSession;
+use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
 use tokenizers::Tokenizer;
@@ -47,11 +50,31 @@ fn rerank_err(ctx: &str, e: impl std::fmt::Display) -> SearchError {
     }
 }
 
+/// A Linear layer's weights, statically quantized to int8 with per-output-channel
+/// f32 scales, plus its f32 bias. The three buffers are `Arc`-shared so the parsed
+/// weights are stored once and cloned cheaply into every pooled session.
+#[derive(Clone)]
+struct QLinear {
+    /// Row-major `[out, in]` int8 weights.
+    w_i8: Arc<Vec<i8>>,
+    /// Per-output-channel f32 dequantization scales (len `out`).
+    w_scales: Arc<Vec<f32>>,
+    /// f32 bias (len `out`).
+    bias: Arc<Vec<f32>>,
+    out: usize,
+    in_: usize,
+}
+
 /// Owns the frankentorch session and the loaded weight tensors. Mutated during the
 /// forward pass, so it lives behind a `Mutex` in `NativeReranker`.
 struct Model {
     s: FrankenTorchSession,
+    /// f32 leaf nodes for the non-Linear parameters (word/position/token_type
+    /// embeddings and every LayerNorm weight/bias) — these stay in f32.
     w: HashMap<String, TensorNodeId>,
+    /// int8-quantized Linear weights (attention QKV/output, FFN, pooler,
+    /// classifier), keyed by the layer prefix (the weight name minus `.weight`).
+    qw: HashMap<String, QLinear>,
     /// Autograd tape node count captured right after the persistent weights are
     /// loaded. Each forward pass truncates the tape back to this boundary to free
     /// that pass's intermediate activations, so the session does not grow
@@ -69,19 +92,24 @@ impl Model {
             .ok_or_else(|| rerank_err("weights", format!("missing weight tensor {name}")))
     }
 
-    /// y = x @ Wᵀ + b   (weight stored row-major [out, in], PyTorch convention)
+    /// y = x @ Wᵀ + b via the int8 dynamic-quant kernel (weight stored row-major
+    /// [out, in], PyTorch convention). The f32 activation `x` is dynamically
+    /// quantized per-row; the weight is statically int8-quantized per-output-channel;
+    /// the result is dequantized back to an f32 node.
     fn linear(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
-        let w = self.g(&format!("{prefix}.weight"))?;
-        let b = self.g(&format!("{prefix}.bias"))?;
-        let wt = self
-            .s
-            .tensor_transpose(w, 0, 1)
-            .map_err(|e| rerank_err("linear.transpose", e))?;
-        let y = self
-            .s
-            .tensor_matmul(x, wt)
-            .map_err(|e| rerank_err("linear.matmul", e))?;
-        self.s.tensor_add(y, b).map_err(|e| rerank_err("linear.add", e))
+        let q = self
+            .qw
+            .get(prefix)
+            .ok_or_else(|| rerank_err("linear", format!("missing int8 linear weights {prefix}")))?;
+        // Clone the Arcs + copy the dims so the `&self.qw` borrow ends before the
+        // `&mut self.s` borrow below.
+        let w_i8 = Arc::clone(&q.w_i8);
+        let w_scales = Arc::clone(&q.w_scales);
+        let bias = Arc::clone(&q.bias);
+        let (out, in_) = (q.out, q.in_);
+        self.s
+            .tensor_linear_int8_dynamic(x, &w_i8, &w_scales, out, in_, Some(&bias))
+            .map_err(|e| rerank_err("linear.int8", e))
     }
 
     fn ln(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
@@ -277,23 +305,21 @@ impl NativeReranker {
             });
         }
 
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        session.no_grad_enter();
-        let weights = load_f32_safetensors(&mut session, &weights_path)?;
-        // Tape boundary AFTER the persistent weights are created; each forward
-        // truncates back to here to free intermediates while keeping parameters.
-        let weights_boundary = session.autograd_graph_node_count();
+        // Parse + quantize the weights once; build a session from the shared data.
+        let shared = parse_weights(&weights_path)?;
+        let model = build_model(&shared)?;
 
         tracing::info!(
             model = MODEL_NAME,
-            tensors = weights.len(),
+            linear_int8 = shared.qw.len(),
+            f32_params = shared.f32_params.len(),
             max_length = DEFAULT_MAX_LENGTH,
             model_dir = %dir.display(),
-            "native frankentorch reranker loaded"
+            "native frankentorch reranker loaded (int8 linear)"
         );
 
         Ok(Self {
-            inner: Mutex::new(Model { s: session, w: weights, weights_boundary }),
+            inner: Mutex::new(model),
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
@@ -302,12 +328,24 @@ impl NativeReranker {
     }
 }
 
-/// Parse a safetensors file, loading every F32 tensor as an f32 leaf and skipping
-/// any non-F32 tensor (e.g. the I64 `position_ids` buffer, which we regenerate).
-fn load_f32_safetensors(
-    session: &mut FrankenTorchSession,
-    path: &Path,
-) -> SearchResult<HashMap<String, TensorNodeId>> {
+/// A weight tensor is a Linear weight (to be int8-quantized) iff it is a `.weight`
+/// that is neither a LayerNorm gain nor an embedding table.
+fn is_linear_weight(name: &str) -> bool {
+    name.ends_with(".weight") && !name.contains("LayerNorm") && !name.contains("embeddings")
+}
+
+/// Parsed, immutable weight data: int8 Linear weights keyed by layer prefix, plus
+/// the f32 embedding/LayerNorm parameter values. Parsed and quantized once, then
+/// cloned (cheaply, via `Arc`) into each session by [`build_model`].
+struct SharedWeights {
+    qw: HashMap<String, QLinear>,
+    f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)>,
+}
+
+/// Parse a safetensors file: int8-quantize the Linear weights (per output channel)
+/// and keep the embeddings + LayerNorm parameters as f32. Non-F32 tensors (e.g. the
+/// I64 `position_ids` buffer) are skipped — those indices are regenerated at forward.
+fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
     let bytes = fs::read(path).map_err(|e| SearchError::ModelLoadFailed {
         path: path.to_path_buf(),
         source: format!("read safetensors: {e}").into(),
@@ -338,7 +376,8 @@ fn load_f32_safetensors(
         source: "safetensors header is not an object".into(),
     })?;
 
-    let mut weights = HashMap::new();
+    // First pass: read every F32 tensor into raw (name -> (values, shape)).
+    let mut raw: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
     for (name, info) in obj {
         if name == "__metadata__" {
             continue;
@@ -367,28 +406,87 @@ fn load_f32_safetensors(
                 source: format!("safetensors tensor {name} has out-of-range offsets").into(),
             });
         }
-        let raw = &data[start..end];
-        // f32 leaves: keep the safetensors values in their native dtype so the whole
-        // forward stays in f32 (frankentorch's f32 kernels), not upcast to f64.
-        let vals: Vec<f32> = raw
+        let vals: Vec<f32> = data[start..end]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let node = session
-            .tensor_variable_f32(vals, shape, false)
-            .map_err(|e| SearchError::ModelLoadFailed {
-                path: path.to_path_buf(),
-                source: format!("create tensor {name}: {e}").into(),
-            })?;
-        weights.insert(name.clone(), node);
+        raw.insert(name.clone(), (vals, shape));
     }
-    if weights.is_empty() {
+    if raw.is_empty() {
         return Err(SearchError::ModelLoadFailed {
             path: path.to_path_buf(),
             source: "no F32 tensors found in safetensors".into(),
         });
     }
-    Ok(weights)
+
+    // Second pass: classify. Linear `.weight`s are int8-quantized (folding in their
+    // `.bias`, which is then skipped); everything else (embeddings + LayerNorm
+    // weight/bias) stays f32.
+    let mut qw: HashMap<String, QLinear> = HashMap::new();
+    let mut f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)> = HashMap::new();
+    for (name, (vals, shape)) in &raw {
+        if is_linear_weight(name) {
+            let prefix = name.strip_suffix(".weight").expect("ends_with .weight");
+            let out = *shape.first().unwrap_or(&0);
+            let in_ = *shape.get(1).unwrap_or(&0);
+            if out == 0 || in_ == 0 || vals.len() != out * in_ {
+                return Err(SearchError::ModelLoadFailed {
+                    path: path.to_path_buf(),
+                    source: format!(
+                        "linear weight {name} bad shape {shape:?} for {} values",
+                        vals.len()
+                    )
+                    .into(),
+                });
+            }
+            let (w_i8, w_scales) = quantize_per_output_channel_i8(vals, out, in_);
+            let bias = raw
+                .get(&format!("{prefix}.bias"))
+                .map(|(b, _)| b.clone())
+                .unwrap_or_else(|| vec![0.0f32; out]);
+            qw.insert(
+                prefix.to_string(),
+                QLinear {
+                    w_i8: Arc::new(w_i8),
+                    w_scales: Arc::new(w_scales),
+                    bias: Arc::new(bias),
+                    out,
+                    in_,
+                },
+            );
+        } else if name.ends_with(".bias") && !name.contains("LayerNorm") {
+            // Linear bias — already folded into its QLinear above; do not keep as f32.
+            continue;
+        } else {
+            // f32 parameter: embeddings and LayerNorm weight/bias.
+            f32_params.insert(name.clone(), (Arc::new(vals.clone()), shape.clone()));
+        }
+    }
+    if qw.is_empty() {
+        return Err(SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: "no Linear weights found to quantize".into(),
+        });
+    }
+    Ok(SharedWeights { qw, f32_params })
+}
+
+/// Build a fresh session from shared weights: create an f32 leaf for every
+/// embedding/LayerNorm parameter and clone the (Arc-shared) int8 Linear weights.
+fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    session.no_grad_enter();
+    let mut w = HashMap::with_capacity(shared.f32_params.len());
+    for (name, (vals, shape)) in &shared.f32_params {
+        let node = session
+            .tensor_variable_f32(vals.as_ref().clone(), shape.clone(), false)
+            .map_err(|e| rerank_err("build_model", format!("create f32 tensor {name}: {e}")))?;
+        w.insert(name.clone(), node);
+    }
+    // Tape boundary AFTER the persistent f32 leaves are created; each forward
+    // truncates back to here to free intermediates while keeping parameters.
+    let weights_boundary = session.autograd_graph_node_count();
+    Ok(Model { s: session, w, qw: shared.qw.clone(), weights_boundary })
 }
 
 #[inline]
@@ -463,9 +561,10 @@ mod tests {
 
     // (query, document, reference logit) from the validated parity_cases.json
     // (numpy reference in f64, itself validated bit-for-ranking against the real ONNX
-    // model). The forward runs in f32, so logits match the f64 reference to within a
-    // small tolerance (PARITY_TOL) while the ranking is bit-identical.
-    const PARITY_TOL: f64 = 0.1;
+    // model). The forward runs int8 Linear matmuls on an f32 substrate, so logits track
+    // the f64 reference only within an int8 quantization tolerance (PARITY_TOL); the
+    // ranking is what must stay identical (as it did for the original int8 ONNX model).
+    const PARITY_TOL: f64 = 0.6;
     const CASES: &[(&str, &str, f64)] = &[
         (
             "how to fix a failing release workflow",
