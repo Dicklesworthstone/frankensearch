@@ -2,7 +2,7 @@
 
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
-use wide::f32x8;
+use wide::{f32x8, u32x8};
 
 // ── SIMD load/decode helpers ────────────────────────────────────────────────
 //
@@ -41,6 +41,76 @@ fn decode8_f32(b: &[u8; 32]) -> f32x8 {
     ])
 }
 
+// ── Branchless SIMD f16 → f32 widen ─────────────────────────────────────────
+//
+// The f16 dot-product paths are decode-bound: per-element scalar `f16::to_f32()`
+// dominates (see docs/NEGATIVE_EVIDENCE.md). This widens 8 f16 lanes at once via
+// the Giesen "magic multiply" trick (a denormal-as-float multiply renormalizes
+// both normals and subnormals in one shot), with a pure-integer inf/nan fixup.
+//
+// It is **bit-exact** to `f16::to_f32()` for every finite (incl. subnormal) and
+// zero input, and maps inf→inf / nan→nan with the sign preserved (the nan
+// payload's quiet bit may differ, which only affects the bits of a NaN score —
+// never produced by real, finite, L2-normalized embeddings). Exhaustively
+// verified over all 65 536 bit patterns by `simd_f16_widen_is_bit_exact`.
+//
+// Because the decoded f32 values are bit-identical for finite data and the
+// accumulation order is unchanged, every dot-product score is bit-identical to
+// the prior scalar-decode kernel on real corpora — no determinism/golden risk.
+
+/// 2^112 — the Giesen magic factor that rebiases the f16 exponent.
+const F16_WIDEN_MAGIC: f32 = f32::from_bits(0x7780_0000);
+
+/// Widen 8 f16 bit-patterns (held in the low 16 bits of each `u32x8` lane) to f32.
+#[inline(always)]
+fn widen8_f16_lanes(h: u32x8) -> f32x8 {
+    let sign = (h & u32x8::splat(0x0000_8000)) << 16_u32;
+    let exp_mant = (h & u32x8::splat(0x0000_7fff)) << 13_u32;
+    let scaled = bytemuck::cast::<u32x8, f32x8>(exp_mant) * f32x8::splat(F16_WIDEN_MAGIC);
+    let scaled_bits = bytemuck::cast::<f32x8, u32x8>(scaled);
+
+    // inf/nan: f16 exponent field == 0x7c00. Detect via carry out of bit 15
+    // ((he + 0x0400) sets bit 15 iff he == 0x7c00), spread to a full lane mask,
+    // and OR the f32 exponent up to all-ones (0xff << 23).
+    let he = h & u32x8::splat(0x0000_7c00);
+    let carry = (he + u32x8::splat(0x0000_0400)) & u32x8::splat(0x0000_8000);
+    let infnan_mask = (carry >> 15_u32) * u32x8::splat(0xff << 23);
+
+    bytemuck::cast::<u32x8, f32x8>((scaled_bits | infnan_mask) | sign)
+}
+
+/// Decode 8 little-endian f16 values from a 16-byte block to `f32x8` (SIMD widen).
+#[inline(always)]
+fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
+    let lanes: [u32; 8] = [
+        u32::from(u16::from_le_bytes([b[0], b[1]])),
+        u32::from(u16::from_le_bytes([b[2], b[3]])),
+        u32::from(u16::from_le_bytes([b[4], b[5]])),
+        u32::from(u16::from_le_bytes([b[6], b[7]])),
+        u32::from(u16::from_le_bytes([b[8], b[9]])),
+        u32::from(u16::from_le_bytes([b[10], b[11]])),
+        u32::from(u16::from_le_bytes([b[12], b[13]])),
+        u32::from(u16::from_le_bytes([b[14], b[15]])),
+    ];
+    widen8_f16_lanes(bytemuck::cast::<[u32; 8], u32x8>(lanes))
+}
+
+/// Widen 8 consecutive `f16` values (from a fixed array) to `f32x8` (SIMD widen).
+#[inline(always)]
+fn widen8_f16_slice(s: &[f16; 8]) -> f32x8 {
+    let lanes: [u32; 8] = [
+        u32::from(s[0].to_bits()),
+        u32::from(s[1].to_bits()),
+        u32::from(s[2].to_bits()),
+        u32::from(s[3].to_bits()),
+        u32::from(s[4].to_bits()),
+        u32::from(s[5].to_bits()),
+        u32::from(s[6].to_bits()),
+        u32::from(s[7].to_bits()),
+    ];
+    widen8_f16_lanes(bytemuck::cast::<[u32; 8], u32x8>(lanes))
+}
+
 /// Dot product between two f32 vectors.
 ///
 /// # Errors
@@ -64,27 +134,9 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     let mut query_chunks = query.chunks_exact(8);
 
     for (stored_chunk, query_chunk) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
-        let s = [
-            stored_chunk[0].to_f32(),
-            stored_chunk[1].to_f32(),
-            stored_chunk[2].to_f32(),
-            stored_chunk[3].to_f32(),
-            stored_chunk[4].to_f32(),
-            stored_chunk[5].to_f32(),
-            stored_chunk[6].to_f32(),
-            stored_chunk[7].to_f32(),
-        ];
-        let q = [
-            query_chunk[0],
-            query_chunk[1],
-            query_chunk[2],
-            query_chunk[3],
-            query_chunk[4],
-            query_chunk[5],
-            query_chunk[6],
-            query_chunk[7],
-        ];
-        sum += f32x8::from(s) * f32x8::from(q);
+        let s: &[f16; 8] = stored_chunk.try_into().expect("chunks_exact(8) yields 8 elements");
+        let q: &[f32; 8] = query_chunk.try_into().expect("chunks_exact(8) yields 8 elements");
+        sum += widen8_f16_slice(s) * f32x8::from(*q);
     }
 
     let mut result = sum.reduce_add();
@@ -134,22 +186,16 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
         let byte_offset = chunk_index * 16;
         let query_offset = chunk_index * 8;
 
-        let b = &stored_bytes[byte_offset..];
-        let v0 = f16::from_le_bytes([b[0], b[1]]).to_f32();
-        let v1 = f16::from_le_bytes([b[2], b[3]]).to_f32();
-        let v2 = f16::from_le_bytes([b[4], b[5]]).to_f32();
-        let v3 = f16::from_le_bytes([b[6], b[7]]).to_f32();
-        let v4 = f16::from_le_bytes([b[8], b[9]]).to_f32();
-        let v5 = f16::from_le_bytes([b[10], b[11]]).to_f32();
-        let v6 = f16::from_le_bytes([b[12], b[13]]).to_f32();
-        let v7 = f16::from_le_bytes([b[14], b[15]]).to_f32();
+        let block: &[u8; 16] = stored_bytes[byte_offset..byte_offset + 16]
+            .try_into()
+            .expect("16-byte f16 block");
+        let stored_chunk = widen8_f16_bytes(block);
 
-        let stored_chunk = f32x8::from([v0, v1, v2, v3, v4, v5, v6, v7]);
+        let q: &[f32; 8] = query[query_offset..query_offset + 8]
+            .try_into()
+            .expect("8-element query block");
 
-        let q = &query[query_offset..];
-        let query_chunk = f32x8::from([q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]]);
-
-        sum += stored_chunk * query_chunk;
+        sum += stored_chunk * f32x8::from(*q);
     }
 
     let mut result = sum.reduce_add();
@@ -261,6 +307,47 @@ const fn ensure_same_len(expected: usize, found: usize) -> SearchResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exhaustive proof that the SIMD f16->f32 widen matches the scalar reference
+    /// (`f16::to_f32`) for **every** one of the 65 536 f16 bit patterns. Finite,
+    /// zero and subnormal inputs must be bit-identical; inf/nan must map to
+    /// inf/nan with matching sign (the nan payload's quiet bit may legitimately
+    /// differ between the two decode methods).
+    #[test]
+    fn simd_f16_widen_is_bit_exact() {
+        for base in (0u32..=0xFFFF).step_by(8) {
+            let lanes = [
+                base,
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+            ];
+            let widened = widen8_f16_lanes(bytemuck::cast::<[u32; 8], u32x8>(lanes));
+            let out = bytemuck::cast::<f32x8, [f32; 8]>(widened);
+            for (lane, &simd) in lanes.iter().zip(out.iter()) {
+                let bits = u16::try_from(*lane).expect("<= 0xFFFF");
+                let scalar = f16::from_bits(bits).to_f32();
+                if scalar.is_nan() {
+                    assert!(simd.is_nan(), "bits={bits:#06x}: scalar nan, simd={simd}");
+                    assert_eq!(
+                        scalar.is_sign_negative(),
+                        simd.is_sign_negative(),
+                        "bits={bits:#06x}: nan sign mismatch"
+                    );
+                } else {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        simd.to_bits(),
+                        "bits={bits:#06x}: scalar={scalar} simd={simd}"
+                    );
+                }
+            }
+        }
+    }
 
     fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()

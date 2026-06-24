@@ -14,6 +14,7 @@ ann = ["dep:hnsw_rs", "dep:serde_json"]
 frankensearch-core = { workspace = true }
 half = { workspace = true }
 wide = { workspace = true }
+bytemuck = "1"
 memmap2 = { workspace = true }
 crc32fast = { workspace = true }
 rayon = { workspace = true }
