@@ -69,6 +69,48 @@ portable released binary).
 
 ---
 
+## Residual comparator negatives
+
+### 2026-06-25 — BOLD-VERIFY after lexical short-circuit: still not universal dominance (BlackThrush)
+
+**Lever kept elsewhere:** lexical-saturated `Identifier` / `ShortKeyword` queries now skip phase-1
+vector scan + RRF once Tantivy has at least `k` hits. The same BOLD run produced two real
+Tantivy-class p50 wins, recorded in `docs/PERF_LEDGER.md`.
+
+**Measured command (per-crate, warm target dir; local fallback after RCH worker `vmi1153651`
+stalled):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+**Residual rows where frankensearch remained slower than the Tantivy/Lucene/Meilisearch-class
+incumbent, or where the ratio is noise rather than a clean win:**
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Decision |
+|----------|-------------|-------------------|-------------------|------------------------|----------|
+| `top10_exact_identifier/10000` | `2e78365a46a7c3b9` | 143 us | 171 us | **1.196x slower** | no dominance claim |
+| `top10_short_keyword/10000` | `2e78365a46a7c3b9` | 49 us | 66 us | **1.347x slower** | no dominance claim |
+| `top10_quoted_phrase/10000` | `2e78365a46a7c3b9` | 174 us | 177 us | **1.017x** | noise/tie |
+| `top10_natural_language/10000` | `2e78365a46a7c3b9` | 133 us | 893 us | **6.714x slower** | needs different lever |
+| `top10_zero_hit/10000` | `2e78365a46a7c3b9` | 29 us | 624 us | **21.517x slower** | needs zero-hit semantic gate |
+| `limit_all/10000` | `2e78365a46a7c3b9` | 6.068 ms | 7.324 ms | **1.207x slower** | no dominance claim |
+| `top10_short_keyword/100000` | `13f1b0153f5adec9` | 165 us | 179 us | **1.085x slower** | no dominance claim |
+| `top10_quoted_phrase/100000` | `13f1b0153f5adec9` | 968 us | 964 us | **0.996x** | noise/tie |
+| `top10_natural_language/100000` | `13f1b0153f5adec9` | 655 us | 4.047 ms | **6.179x slower** | needs different lever |
+| `top10_high_fanout/100000` | `13f1b0153f5adec9` | 542 us | 561 us | **1.035x slower** | p50/tail still not clean |
+| `top10_zero_hit/100000` | `13f1b0153f5adec9` | 21 us | 2.776 ms | **132.190x slower** | needs zero-hit semantic gate |
+
+**Decision:** keep the scoped short-circuit because it produced real incumbent wins on
+`top10_high_fanout/10000` (0.711x) and `top10_exact_identifier/100000` (0.878x), but do not
+generalize it. The next radical lever should target semantic gating for natural-language and
+zero-hit queries rather than more dot-product work.
+
+---
+
 ## Reverted experiments
 
 ### 2026-06-25 — BOLD-VERIFY: hash-hybrid does **not** beat Tantivy-class BM25 (BlackThrush)

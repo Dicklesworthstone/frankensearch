@@ -32,6 +32,8 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use tempfile::TempDir;
 
 #[cfg(feature = "lexical")]
+use frankensearch_core::query_class::QueryClass;
+#[cfg(feature = "lexical")]
 use frankensearch_core::traits::LexicalSearch;
 #[cfg(feature = "lexical")]
 use frankensearch_core::types::IndexableDocument;
@@ -279,6 +281,19 @@ fn lexical_doc_ids_as_scored(results: &[frankensearch_lexical::LexicalIdHit]) ->
 }
 
 #[cfg(feature = "lexical")]
+fn bold_verify_lexical_short_circuit(
+    query: &BoldVerifyQuery,
+    lexical_count: usize,
+    limit: usize,
+) -> bool {
+    lexical_count >= limit
+        && matches!(
+            QueryClass::classify(query.text),
+            QueryClass::Identifier | QueryClass::ShortKeyword
+        )
+}
+
+#[cfg(feature = "lexical")]
 fn tantivy_only_search(fixture: &BoldVerifyFixture, cx: &asupersync::Cx, query: &BoldVerifyQuery) {
     let limit = query.limit.min(fixture.doc_count);
     black_box(
@@ -302,6 +317,10 @@ fn frankensearch_hash_hybrid_search(
         .search_doc_ids(cx, query.text, candidate_limit)
         .expect("hybrid lexical candidate search");
     let lexical = lexical_doc_ids_as_scored(&lexical_hits);
+    if bold_verify_lexical_short_circuit(query, lexical.len(), limit) {
+        black_box(lexical);
+        return;
+    }
     let query_embedding = fixture.embedder.embed_sync(query.text);
     let semantic = fixture
         .vector
@@ -403,7 +422,9 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let cx = asupersync::Cx::for_testing();
     let sha = git_sha();
     let worker = worker_id();
-    let command = "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3";
+    let command = std::env::var("FRANKENSEARCH_BOLD_VERIFY_COMMAND").unwrap_or_else(|_| {
+        "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1".to_owned()
+    });
 
     for fixture in fixtures {
         for query in BOLD_VERIFY_TOP10_QUERIES
@@ -438,7 +459,7 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
                 "query_class": query.class,
                 "query": query.text,
                 "incumbent": "tantivy_doc_ids",
-                "frankensearch": "hash_hybrid_tantivy_vector_rrf",
+                "frankensearch": "hash_hybrid_lexical_short_circuit_vector_rrf",
                 "incumbent_p50_us": incumbent.p50,
                 "incumbent_p95_us": incumbent.p95,
                 "incumbent_p99_us": incumbent.p99,

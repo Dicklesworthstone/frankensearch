@@ -1023,6 +1023,21 @@ impl TwoTierSearcher {
                         None,
                     );
                 }
+                if let Some(lexical) = lexical_results.as_ref()
+                    && should_lexical_short_circuit(
+                        query_class,
+                        lexical.len(),
+                        k,
+                        self.config.graph_ranking_enabled,
+                    )
+                {
+                    metrics.skip_reason = Some("lexical_short_circuit".to_owned());
+                    metrics.semantic_candidates = 0;
+                    metrics.phase1_vectors_searched = 0;
+                    metrics.vector_search_ms = 0.0;
+                    return Ok(lexical.iter().take(base_candidates).cloned().collect());
+                }
+
                 // Vector search.
                 let search_start = Instant::now();
                 let mut fast_hits = self.index.search_fast_with_params(
@@ -2414,6 +2429,21 @@ fn sanitize_rrf_k(k: f64) -> f64 {
     }
 }
 
+fn should_lexical_short_circuit(
+    query_class: QueryClass,
+    lexical_count: usize,
+    k: usize,
+    graph_ranking_enabled: bool,
+) -> bool {
+    !graph_ranking_enabled
+        && k > 0
+        && lexical_count >= k
+        && matches!(
+            query_class,
+            QueryClass::Identifier | QueryClass::ShortKeyword
+        )
+}
+
 /// Convert `VectorHit` results to `ScoredResult` (semantic-only mode).
 fn vector_hits_to_scored_results(
     hits: &[VectorHit],
@@ -3392,6 +3422,73 @@ mod tests {
                 metrics.phase1_total_ms >= 0.0,
                 "phase-1 latency should remain well-formed"
             );
+        });
+    }
+
+    #[test]
+    fn lexical_short_circuit_skips_vector_scan_for_short_keywords() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher =
+                TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
+
+            let mut initial_sources = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "search",
+                    3,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_sources = results.iter().map(|result| result.source).collect();
+                        }
+                    },
+                )
+                .await
+                .expect("short-keyword search should succeed");
+
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("lexical_short_circuit")
+            );
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.lexical_candidates, 3);
+            assert_eq!(initial_sources, vec![ScoreSource::Lexical; 3]);
+        });
+    }
+
+    #[test]
+    fn lexical_short_circuit_keeps_natural_language_hybrid() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let expected_doc_count = index.doc_count();
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher =
+                TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
+
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "how should the search pipeline rank documents",
+                    3,
+                    |_| None,
+                    |_| {},
+                )
+                .await
+                .expect("natural-language search should stay hybrid");
+
+            assert_ne!(
+                metrics.skip_reason.as_deref(),
+                Some("lexical_short_circuit")
+            );
+            assert_eq!(metrics.phase1_vectors_searched, expected_doc_count);
+            assert!(metrics.semantic_candidates > 0);
+            assert_eq!(metrics.lexical_candidates, 3);
         });
     }
 

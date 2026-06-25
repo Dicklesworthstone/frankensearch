@@ -21,6 +21,39 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## Original-comparator wins
+
+### 2026-06-25 — BOLD-VERIFY lexical-saturated short-circuit (BlackThrush)
+
+**Lever:** after successful fast embedding and lexical search, `TwoTierSearcher` now returns
+lexical-only initial results for `Identifier` / `ShortKeyword` queries when lexical already has
+at least `k` hits and graph ranking is disabled. That skips the phase-1 vector scan and RRF work
+for lexical-saturated queries while preserving the hybrid path for natural-language and zero-hit
+queries.
+
+**Measured command (local fallback after RCH worker `vmi1153651` stalled twice; per-crate,
+warm target dir):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-a/criterion/bold_verify/summary.md`
+and `summary.jsonl`.
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Status |
+|----------|-------------|-------------------|-------------------|------------------------|--------|
+| `bold_verify/top10/10000` `high_fanout` | `2e78365a46a7c3b9` | 114 us | 81 us | **0.711** | KEEP |
+| `bold_verify/top10/100000` `exact_identifier` | `13f1b0153f5adec9` | 1.241 ms | 1.090 ms | **0.878** | KEEP |
+
+**Scope:** this is a targeted lexical-saturation win vs a Tantivy/Lucene/Meilisearch-class
+incumbent, not a universal dominance claim. The same BOLD run still shows slower/noisy rows for
+10k exact identifiers, short-keyword rows, `limit_all`, natural-language, and zero-hit queries;
+those ratios are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 | Date | Crate | Lever | Workload (bench id) | Before | After | Ratio | Status |
 |------|-------|-------|---------------------|--------|-------|-------|--------|
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
