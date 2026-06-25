@@ -197,7 +197,7 @@ fn strip_markdown_line(line: &str) -> String {
     // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
     // Byte-identical to the full path; the header/blockquote/list stripping below
     // still applies. Plain prose and most code-comment text hit this path.
-    let mut result = if line
+    let result = if line
         .bytes()
         .any(|b| matches!(b, b'*' | b'_' | b'`' | b'['))
     {
@@ -214,16 +214,17 @@ fn strip_markdown_line(line: &str) -> String {
         line.to_string()
     };
 
-    // Remove headers (# prefix)
-    result = result.trim_start_matches('#').trim_start().to_string();
+    // Strip leading header (`#`) and blockquote (`>`) prefixes plus their leading
+    // whitespace as a single `&str` chain — no intermediate `to_string()` allocs
+    // (the original did two). Byte-identical: the same trims in the same order.
+    let prefix_stripped = result
+        .trim_start_matches('#')
+        .trim_start()
+        .trim_start_matches('>')
+        .trim_start();
 
-    // Remove blockquote prefix
-    result = result.trim_start_matches('>').trim_start().to_string();
-
-    // Remove list markers
-    result = strip_list_marker(&result);
-
-    result
+    // Remove list markers (allocates the final owned String).
+    strip_list_marker(prefix_stripped)
 }
 
 /// Strip italic underscore markers (`_word_`) while preserving underscores inside

@@ -123,6 +123,39 @@ fn bench_nfc(c: &mut Criterion) {
         });
     });
     mg.finish();
+
+    // Header/blockquote prefix trim: old (two to_string allocs) vs new (one).
+    fn trim_old(line: &str) -> String {
+        let r = line.trim_start_matches('#').trim_start().to_string();
+        r.trim_start_matches('>').trim_start().to_string()
+    }
+    fn trim_new(line: &str) -> String {
+        line.trim_start_matches('#')
+            .trim_start()
+            .trim_start_matches('>')
+            .trim_start()
+            .to_string()
+    }
+    let mut tg = c.benchmark_group("prefix_trim");
+    tg.bench_function("old", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += trim_old(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    tg.bench_function("new", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += trim_new(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    tg.finish();
 }
 
 criterion_group!(benches, bench_nfc);
