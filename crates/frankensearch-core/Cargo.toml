@@ -20,6 +20,13 @@ sha2 = { workspace = true }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
+criterion = { workspace = true }
+unicode-normalization = { workspace = true }
+
+# ASCII fast-path vs full-NFC canonicalization (indexing/query hot path).
+[[bench]]
+name = "canonicalize"
+harness = false
 
 [lints]
 workspace = true

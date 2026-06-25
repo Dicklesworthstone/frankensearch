@@ -74,10 +74,26 @@ impl Default for DefaultCanonicalizer {
     }
 }
 
+/// NFC-normalize with a fast path for ASCII text.
+///
+/// ASCII is always already in NFC (no codepoint has a decomposition/composition),
+/// so for ASCII input — the common case for code and English prose — this skips
+/// the unicode-normalization state machine and copies the bytes directly. This
+/// mirrors the ASCII fast paths in Lucene/Tantivy's analysis chains. Output is
+/// byte-identical to `text.nfc().collect()` for every input.
+#[inline]
+fn nfc_normalize(text: &str) -> String {
+    if text.is_ascii() {
+        text.to_owned()
+    } else {
+        text.nfc().collect()
+    }
+}
+
 impl Canonicalizer for DefaultCanonicalizer {
     fn canonicalize(&self, text: &str) -> String {
         // 1. NFC Unicode normalization (critical for hash stability)
-        let normalized: String = text.nfc().collect();
+        let normalized: String = nfc_normalize(text);
         // 2. Strip markdown and collapse code blocks
         let stripped = self.strip_markdown_and_code(&normalized);
         // 3. Normalize whitespace
@@ -90,7 +106,7 @@ impl Canonicalizer for DefaultCanonicalizer {
 
     fn canonicalize_query(&self, query: &str) -> String {
         // Queries are short — just NFC normalize and trim
-        let normalized: String = query.nfc().collect();
+        let normalized: String = nfc_normalize(query);
         let trimmed = normalized.trim();
         truncate_to_chars(trimmed, self.max_length)
     }
@@ -404,6 +420,30 @@ mod tests {
         let input = "caf\u{0065}\u{0301}";
         let result = canon.canonicalize(input);
         assert!(result.contains("caf\u{00e9}"));
+    }
+
+    #[test]
+    fn nfc_normalize_ascii_fast_path_matches_reference() {
+        use unicode_normalization::UnicodeNormalization;
+        // The ASCII fast path must be byte-identical to the full nfc() pipeline,
+        // and the non-ASCII path must still go through it.
+        let cases = [
+            "",
+            "plain ascii text 123 _-./",
+            "fn main() { let x = 0; }",
+            "café\u{0301}",            // non-ASCII (combining mark)
+            "caf\u{0065}\u{0301}\u{00e9}", // mixed decomposed/precomposed
+            "日本語テキスト",          // non-ASCII
+            "naïve façade",
+        ];
+        for c in cases {
+            let reference: String = c.nfc().collect();
+            assert_eq!(nfc_normalize(c), reference, "input={c:?}");
+            // ASCII inputs must hit the fast path but still equal the reference.
+            if c.is_ascii() {
+                assert_eq!(nfc_normalize(c), c.to_owned(), "ascii fast path {c:?}");
+            }
+        }
     }
 
     #[test]
