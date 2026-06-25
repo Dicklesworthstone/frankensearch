@@ -310,7 +310,9 @@ impl InMemoryVectorIndex {
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
         // Build the int8 slab once, on first use — exact-only callers never pay the
         // O(N·d) quantization or its `N·d`-byte footprint at construction time.
-        let vectors_i8 = self.vectors_i8.get_or_init(|| quantize_i8_slab(&self.vectors));
+        let vectors_i8 = self
+            .vectors_i8
+            .get_or_init(|| quantize_i8_slab(&self.vectors));
 
         // Pass 1: parallel **bounded-heap** int8 scan — each chunk keeps only its
         // top `candidate_count` (never materializing all N scores, unlike a
@@ -900,9 +902,7 @@ mod tests {
             let exact = index.search_top_k(&query, 10, None).unwrap();
             // mult=10 -> 100 candidates of 200; pass-1 recall is 1 here, so the
             // two-pass result must be bit-identical to the exact top-k.
-            let two_pass = index
-                .search_top_k_int8_two_pass(&query, 10, 10)
-                .unwrap();
+            let two_pass = index.search_top_k_int8_two_pass(&query, 10, 10).unwrap();
 
             assert_eq!(two_pass.len(), exact.len(), "qseed={qseed}");
             for w in two_pass.windows(2) {
