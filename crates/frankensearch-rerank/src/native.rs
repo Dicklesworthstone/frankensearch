@@ -124,6 +124,76 @@ fn fast_softmax_last_dim(mut data: Vec<f32>, rows: usize, n: usize, scale: f32) 
     data
 }
 
+/// Exact-form GELU `0.5·x·(1 + erf(x/√2))` for one f32x8 lane group, with `erf`
+/// from the Abramowitz–Stegun 7.1.26 rational×exp approximation (max abs error
+/// 1.5e-7 — at the f32 precision floor, so indistinguishable from libm `erff` for
+/// ranking). `erf` is odd, so it is evaluated on `|z|` and the sign is reapplied.
+#[inline]
+fn gelu_vec8(x: f32x8) -> f32x8 {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let one = f32x8::splat(1.0);
+    let z = x * f32x8::splat(C);
+    let az = z.abs();
+    let t = one / (one + f32x8::splat(0.327_591_1) * az);
+    // erf poly = t·(a1 + t·(a2 + t·(a3 + t·(a4 + t·a5))))  (A–S 7.1.26)
+    let a1 = f32x8::splat(0.254_829_6);
+    let a2 = f32x8::splat(-0.284_496_73);
+    let a3 = f32x8::splat(1.421_413_7);
+    let a4 = f32x8::splat(-1.453_152);
+    let a5 = f32x8::splat(1.061_405_4);
+    let poly = t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))));
+    let erf_abs = one - poly * (-(z * z)).exp();
+    let erf = erf_abs.copysign(z);
+    f32x8::splat(0.5) * x * (one + erf)
+}
+
+/// Scalar GELU matching [`gelu_vec8`] (same A–S erf) for the < 8-element tail.
+#[inline]
+fn gelu_scalar(x: f32) -> f32 {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let z = x * C;
+    let az = z.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * az);
+    let poly = t
+        * (0.254_829_6
+            + t * (-0.284_496_73 + t * (1.421_413_7 + t * (-1.453_152 + t * 1.061_405_4))));
+    let erf = (1.0 - poly * (-(z * z)).exp()).copysign(z);
+    0.5 * x * (1.0 + erf)
+}
+
+/// Vectorized exact-GELU over a flat activation buffer, in place. Replaces the
+/// `tensor_gelu` tape op (scalar libm `erff`) — profiling put GELU at ~10-14% of
+/// the per-doc forward (a wide `[m, 1536]` elementwise transcendental). GELU is
+/// elementwise so chunks are independent and parallelize across the forward's
+/// rayon pool. A–S erf keeps the result within ~1e-7 of exact, so the ranking is
+/// unchanged (validated against the numpy/ONNX reference).
+fn fast_gelu(mut data: Vec<f32>) -> Vec<f32> {
+    let process = |chunk: &mut [f32]| {
+        let n = chunk.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let mut buf = [0.0f32; 8];
+            buf.copy_from_slice(&chunk[i..i + 8]);
+            let g = gelu_vec8(f32x8::new(buf));
+            chunk[i..i + 8].copy_from_slice(&g.to_array());
+            i += 8;
+        }
+        while i < n {
+            chunk[i] = gelu_scalar(chunk[i]);
+            i += 1;
+        }
+    };
+    if data.len() >= 8192 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        // Elementwise, so any chunking is correct; keep chunks a multiple of 8 so
+        // only the final chunk has a scalar tail.
+        data.par_chunks_mut(2048).for_each(process);
+    } else {
+        process(&mut data);
+    }
+    data
+}
+
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
 /// f32 scales, plus its f32 bias. The three buffers are `Arc`-shared so the parsed
 /// weights are stored once and cloned cheaply into every pooled session.
@@ -208,6 +278,25 @@ impl Model {
         self.s
             .tensor_variable(f, vec![vals.len()], false)
             .map_err(|e| rerank_err("index_tensor", e))
+    }
+
+    /// Exact GELU via the vectorized [`fast_gelu`] (A–S erf), replacing the
+    /// `tensor_gelu` tape op's scalar libm `erff`. Round-trips through f32 values +
+    /// a fresh leaf, consistent with the int8 linear (which already returns a
+    /// detached f32 leaf), so there is no live autograd graph to preserve.
+    fn gelu(&mut self, inter: TensorNodeId) -> SearchResult<TensorNodeId> {
+        let shape = self
+            .s
+            .tensor_shape(inter)
+            .map_err(|e| rerank_err("ffn.gelu_shape", e))?;
+        let vals = self
+            .s
+            .tensor_values_f32(inter)
+            .map_err(|e| rerank_err("ffn.gelu_vals", e))?;
+        let g = fast_gelu(vals);
+        self.s
+            .tensor_variable_f32(g, shape, false)
+            .map_err(|e| rerank_err("ffn.gelu_fast", e))
     }
 
     /// [S, H] -> [NH, S, HD]
@@ -319,7 +408,7 @@ impl Model {
             emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
             // feed-forward
             let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
-            let inter = self.s.tensor_gelu(inter).map_err(|e| rerank_err("ffn.gelu", e))?;
+            let inter = self.gelu(inter)?;
             let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
             let sum2 = self.s.tensor_add(emb, ffn).map_err(|e| rerank_err("ffn.residual", e))?;
             emb = self.ln(sum2, &format!("{p}.output.LayerNorm"))?;
@@ -453,7 +542,7 @@ impl Model {
             emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
             // Batched feed-forward.
             let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
-            let inter = self.s.tensor_gelu(inter).map_err(|e| rerank_err("ffn.gelu", e))?;
+            let inter = self.gelu(inter)?;
             let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
             let sum2 = self.s.tensor_add(emb, ffn).map_err(|e| rerank_err("ffn.residual", e))?;
             emb = self.ln(sum2, &format!("{p}.output.LayerNorm"))?;
