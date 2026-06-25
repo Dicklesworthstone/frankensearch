@@ -39,6 +39,12 @@ const NH: usize = 12;
 const HD: usize = H / NH; // 32
 const EPS: f64 = 1e-12;
 const DEFAULT_MAX_LENGTH: usize = 512;
+/// Token budget per batched forward. Documents are reranked in chunks whose total
+/// token count stays under this cap so the chunk's attention intermediates (which
+/// co-exist on the tape until the per-chunk truncate) stay memory-bounded, while
+/// still giving the int8 GEMM a large enough row count to amortize weight loads.
+/// A single document longer than this is still processed alone (one-doc chunk).
+const MAX_BATCH_TOKENS: usize = 2048;
 const MODEL_NAME: &str = "ms-marco-minilm-l-6-v2";
 const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
 const SAFETENSORS_FALLBACK: &str = "model.safetensors";
@@ -206,10 +212,60 @@ impl Model {
             .map_err(|e| rerank_err("heads.transpose", e))
     }
 
-    /// Single-pair forward pass (batch = 1, no padding/mask needed). Returns the raw logit.
+    /// Multi-head self-attention for one sequence: given the per-token `q`/`k`/`v`
+    /// projections (each `[s_len, H]`) returns the context `[s_len, H]`. Shared by
+    /// the single-pair [`Self::forward`] and the batched [`Self::forward_batch`]
+    /// (which calls it on each document's contiguous token slice), so the two paths
+    /// compute byte-identical attention — the batched path is therefore parity-exact
+    /// with the per-doc path, not an approximation.
+    fn attn_block(
+        &mut self,
+        q: TensorNodeId,
+        k: TensorNodeId,
+        v: TensorNodeId,
+        s_len: usize,
+        scale: f64,
+    ) -> SearchResult<TensorNodeId> {
+        let q = self.heads(q, s_len)?;
+        let k = self.heads(k, s_len)?;
+        let v = self.heads(v, s_len)?;
+        let kt = self
+            .s
+            .tensor_transpose(k, 1, 2)
+            .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
+        let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
+        // Fused scale + vectorized-exp softmax over the last dim, replacing the
+        // separate `mul_scalar` + `tensor_softmax` tape ops. The int8 linear already
+        // returns detached f32 leaves, so round-tripping the scores through f32
+        // values + a fresh f32 leaf matches the forward's existing structure.
+        let score_vals = self
+            .s
+            .tensor_values_f32(scores)
+            .map_err(|e| rerank_err("attn.scores_vals", e))?;
+        let prob_vals = fast_softmax_last_dim(score_vals, NH * s_len, s_len, scale as f32);
+        let probs = self
+            .s
+            .tensor_variable_f32(prob_vals, vec![NH, s_len, s_len], false)
+            .map_err(|e| rerank_err("attn.softmax_fast", e))?;
+        let ctx = self.s.tensor_bmm(probs, v).map_err(|e| rerank_err("attn.ctx", e))?;
+        let ctx = self
+            .s
+            .tensor_transpose(ctx, 0, 1)
+            .map_err(|e| rerank_err("attn.ctx_t", e))?;
+        self.s
+            .tensor_reshape(ctx, vec![s_len, H])
+            .map_err(|e| rerank_err("attn.ctx_reshape", e))
+    }
+
+    /// Single-pair forward pass (batch = 1). Returns the raw logit. Retained as the
+    /// per-document reference that [`Self::forward_batch`] is checked against
+    /// (`forward_batch_matches_per_doc`); production reranking always goes through
+    /// the batched path (which handles a one-document batch with negligible
+    /// overhead), so this is `#[cfg(test)]`-only.
     ///
     /// Runs entirely in f32: weights are f32 leaves and every op preserves f32, so
     /// embedding/matmul/softmax/layer_norm all stay in the f32 kernels.
+    #[cfg(test)]
     fn forward(&mut self, ids: &[i64], typ: &[i64]) -> SearchResult<f32> {
         let s_len = ids.len();
         // embeddings: word + position + token_type, then LayerNorm.
@@ -248,37 +304,7 @@ impl Model {
             let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
             let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
             let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
-            let q = self.heads(q, s_len)?;
-            let k = self.heads(k, s_len)?;
-            let v = self.heads(v, s_len)?;
-            let kt = self
-                .s
-                .tensor_transpose(k, 1, 2)
-                .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
-            let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
-            // Fused scale + vectorized-exp softmax over the last dim, replacing the
-            // separate `mul_scalar` + `tensor_softmax` tape ops. The int8 linear
-            // already returns detached f32 leaves, so round-tripping the scores
-            // through f32 values + a fresh f32 leaf here matches the forward's
-            // existing structure (no live autograd graph to preserve).
-            let score_vals = self
-                .s
-                .tensor_values_f32(scores)
-                .map_err(|e| rerank_err("attn.scores_vals", e))?;
-            let prob_vals = fast_softmax_last_dim(score_vals, NH * s_len, s_len, scale as f32);
-            let probs = self
-                .s
-                .tensor_variable_f32(prob_vals, vec![NH, s_len, s_len], false)
-                .map_err(|e| rerank_err("attn.softmax_fast", e))?;
-            let ctx = self.s.tensor_bmm(probs, v).map_err(|e| rerank_err("attn.ctx", e))?;
-            let ctx = self
-                .s
-                .tensor_transpose(ctx, 0, 1)
-                .map_err(|e| rerank_err("attn.ctx_t", e))?;
-            let ctx = self
-                .s
-                .tensor_reshape(ctx, vec![s_len, H])
-                .map_err(|e| rerank_err("attn.ctx_reshape", e))?;
+            let ctx = self.attn_block(q, k, v, s_len, scale)?;
             let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
             let sum1 = self.s.tensor_add(emb, attn).map_err(|e| rerank_err("attn.residual", e))?;
             emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
@@ -310,6 +336,142 @@ impl Model {
         // arena does not grow unbounded across rerank calls.
         self.s.truncate_autograd_graph(self.weights_boundary);
         Ok(logit)
+    }
+
+    /// Batched (multi-document) forward — the throughput lever. Returns one raw
+    /// logit per document, in input order.
+    ///
+    /// Layout is **varlen**: the documents' tokens are concatenated end-to-end
+    /// (NO padding, NO mask) into one `[Σlenₙ, H]` activation. Every per-token op
+    /// (the int8 Linears, LayerNorm, GELU, residuals) runs once over the whole
+    /// `Σlenₙ` rows, so each statically-quantized weight is loaded once and reused
+    /// across all the documents' tokens instead of being re-streamed per document
+    /// — that weight-reuse is what lifts the int8 GEMM toward peak and beats a
+    /// per-document runtime on multi-doc rerank throughput. Self-attention is the
+    /// only op that must stay within a document, so it runs per-doc on each
+    /// document's contiguous token slice via the shared [`Self::attn_block`] — so
+    /// every document gets byte-identical computation to [`Self::forward`] and the
+    /// batched logits are parity-exact, not approximate.
+    ///
+    /// The caller chunks the batch so `Σlenₙ` stays bounded (attention
+    /// intermediates for the whole chunk co-exist on the tape until the final
+    /// truncate); see [`MAX_BATCH_TOKENS`].
+    fn forward_batch(&mut self, batch: &[(Vec<i64>, Vec<i64>)]) -> SearchResult<Vec<f32>> {
+        let n_docs = batch.len();
+        let lens: Vec<usize> = batch.iter().map(|(ids, _)| ids.len()).collect();
+        let total: usize = lens.iter().sum();
+        if total == 0 {
+            return Ok(vec![0.0; n_docs]);
+        }
+        let mut offsets = Vec::with_capacity(n_docs);
+        {
+            let mut o = 0usize;
+            for &l in &lens {
+                offsets.push(o);
+                o += l;
+            }
+        }
+        // Flat token / position / type ids over the concatenated documents. Each
+        // document's positions restart at 0 (positions are intra-document).
+        let mut ids_flat = Vec::with_capacity(total);
+        let mut pos_flat = Vec::with_capacity(total);
+        let mut typ_flat = Vec::with_capacity(total);
+        for (ids, typ) in batch {
+            for (i, (&id, &t)) in ids.iter().zip(typ.iter()).enumerate() {
+                ids_flat.push(id);
+                pos_flat.push(i as i64);
+                typ_flat.push(t);
+            }
+        }
+        // Embeddings → [total, H].
+        let id_t = self.idx(&ids_flat)?;
+        let pos_t = self.idx(&pos_flat)?;
+        let typ_t = self.idx(&typ_flat)?;
+        let we = self.g("bert.embeddings.word_embeddings.weight")?;
+        let pe = self.g("bert.embeddings.position_embeddings.weight")?;
+        let te = self.g("bert.embeddings.token_type_embeddings.weight")?;
+        let e_word = self
+            .s
+            .tensor_index_select(we, 0, id_t)
+            .map_err(|e| rerank_err("embed.word", e))?;
+        let e_pos = self
+            .s
+            .tensor_index_select(pe, 0, pos_t)
+            .map_err(|e| rerank_err("embed.pos", e))?;
+        let e_typ = self
+            .s
+            .tensor_index_select(te, 0, typ_t)
+            .map_err(|e| rerank_err("embed.type", e))?;
+        let mut emb = self
+            .s
+            .tensor_add(e_word, e_pos)
+            .map_err(|e| rerank_err("embed.add", e))?;
+        emb = self.s.tensor_add(emb, e_typ).map_err(|e| rerank_err("embed.add2", e))?;
+        emb = self.ln(emb, "bert.embeddings.LayerNorm")?;
+
+        let scale = 1.0 / (HD as f64).sqrt();
+        for i in 0..L {
+            let p = format!("bert.encoder.layer.{i}");
+            // Batched QKV projections over all documents' tokens at once.
+            let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
+            let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
+            let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
+            // Self-attention per document (each on its own [lenₙ, H] slice), then
+            // re-concatenate the contexts back into one [total, H] activation.
+            let mut ctx_parts = Vec::with_capacity(n_docs);
+            for n in 0..n_docs {
+                let (off, len) = (offsets[n], lens[n]);
+                let qn = self
+                    .s
+                    .tensor_narrow(q, 0, off, len)
+                    .map_err(|e| rerank_err("batch.q_narrow", e))?;
+                let kn = self
+                    .s
+                    .tensor_narrow(k, 0, off, len)
+                    .map_err(|e| rerank_err("batch.k_narrow", e))?;
+                let vn = self
+                    .s
+                    .tensor_narrow(v, 0, off, len)
+                    .map_err(|e| rerank_err("batch.v_narrow", e))?;
+                ctx_parts.push(self.attn_block(qn, kn, vn, len, scale)?);
+            }
+            let ctx = self
+                .s
+                .tensor_cat(&ctx_parts, 0)
+                .map_err(|e| rerank_err("batch.ctx_cat", e))?; // [total, H]
+            let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
+            let sum1 = self.s.tensor_add(emb, attn).map_err(|e| rerank_err("attn.residual", e))?;
+            emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
+            // Batched feed-forward.
+            let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
+            let inter = self.s.tensor_gelu(inter).map_err(|e| rerank_err("ffn.gelu", e))?;
+            let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
+            let sum2 = self.s.tensor_add(emb, ffn).map_err(|e| rerank_err("ffn.residual", e))?;
+            emb = self.ln(sum2, &format!("{p}.output.LayerNorm"))?;
+        }
+        // Pooler on each document's [CLS] row (the first token of each doc, i.e.
+        // row `offsets[n]` in the concatenated activation) → [N, H].
+        let cls_idx: Vec<i64> = offsets.iter().map(|&o| o as i64).collect();
+        let cls_t = self.idx(&cls_idx)?;
+        let cls = self
+            .s
+            .tensor_index_select(emb, 0, cls_t)
+            .map_err(|e| rerank_err("batch.cls_gather", e))?; // [N, H]
+        let pooled = self.linear(cls, "bert.pooler.dense")?;
+        let pooled = self.s.tensor_tanh(pooled).map_err(|e| rerank_err("pooler.tanh", e))?;
+        let logit_t = self.linear(pooled, "classifier")?; // [N, 1]
+        let vals = self
+            .s
+            .tensor_values_f32(logit_t)
+            .map_err(|e| rerank_err("classifier.values", e))?;
+        self.s.truncate_autograd_graph(self.weights_boundary);
+        if vals.len() != n_docs {
+            return Err(rerank_err(
+                "classifier",
+                format!("expected {n_docs} logits, got {}", vals.len()),
+            ));
+        }
+        Ok(vals)
     }
 }
 
@@ -588,20 +750,16 @@ impl SyncRerank for NativeReranker {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        // Rerank documents in a SEQUENTIAL loop. Each `forward` parallelizes
-        // internally across cores (the int8 Linear kernel and the f32 attention
-        // `bmm` / `softmax` / `layer_norm` ops use ambient rayon), so a single
-        // forward already saturates the machine. Because there is NO doc-level
-        // `par_iter`, no rayon work is ever spawned while the session `Mutex` is
-        // held by a parallel worker, so the nested-rayon + `Mutex` deadlock
-        // cannot occur. Output order (and `original_rank`) follows the input and
-        // the logits are deterministic.
-        let mut model = self
-            .inner
-            .lock()
-            .map_err(|e| rerank_err("lock", format!("reranker mutex poisoned: {e}")))?;
-        let mut out = Vec::with_capacity(documents.len());
-        for (rank, doc) in documents.iter().enumerate() {
+        // Tokenize every (query, doc) pair, then rerank in BATCHED chunks: each
+        // chunk is a single `forward_batch` over the concatenated tokens, so the
+        // int8 Linear weights are reused across all the chunk's documents' tokens
+        // (the throughput win). Chunks are bounded by `MAX_BATCH_TOKENS` to keep
+        // the tape memory-bounded. There is NO doc-level `par_iter` — the session
+        // `Mutex` is locked once and the forward parallelizes internally — so the
+        // nested-rayon + `Mutex` deadlock still cannot occur. Output order (and
+        // `original_rank`) follows the input and the logits are deterministic.
+        let mut encoded: Vec<(Vec<i64>, Vec<i64>)> = Vec::with_capacity(documents.len());
+        for doc in documents {
             let encoding = self
                 .tokenizer
                 .encode((query, doc.text.as_str()), true)
@@ -612,19 +770,50 @@ impl SyncRerank for NativeReranker {
                 ids.truncate(self.max_length);
                 typ.truncate(self.max_length);
             }
-            let logit = model.forward(&ids, &typ)?;
-            let (score, raw_logit) = if logit.is_finite() {
-                (sigmoid(logit), Some(logit))
-            } else {
-                (0.0, None)
-            };
-            out.push(RerankScore {
-                doc_id: doc.doc_id.clone(),
-                score,
-                original_rank: rank,
-                raw_logit,
-            });
+            encoded.push((ids, typ));
         }
+
+        let mut model = self
+            .inner
+            .lock()
+            .map_err(|e| rerank_err("lock", format!("reranker mutex poisoned: {e}")))?;
+        let mut logits: Vec<f32> = Vec::with_capacity(documents.len());
+        let mut chunk_start = 0usize;
+        while chunk_start < encoded.len() {
+            // Grow the chunk until adding the next doc would exceed the token
+            // budget; always take at least one doc (a single over-budget doc runs
+            // alone).
+            let mut chunk_end = chunk_start + 1;
+            let mut chunk_tokens = encoded[chunk_start].0.len();
+            while chunk_end < encoded.len()
+                && chunk_tokens + encoded[chunk_end].0.len() <= MAX_BATCH_TOKENS
+            {
+                chunk_tokens += encoded[chunk_end].0.len();
+                chunk_end += 1;
+            }
+            logits.extend(model.forward_batch(&encoded[chunk_start..chunk_end])?);
+            chunk_start = chunk_end;
+        }
+        drop(model);
+
+        let out = documents
+            .iter()
+            .zip(logits)
+            .enumerate()
+            .map(|(rank, (doc, logit))| {
+                let (score, raw_logit) = if logit.is_finite() {
+                    (sigmoid(logit), Some(logit))
+                } else {
+                    (0.0, None)
+                };
+                RerankScore {
+                    doc_id: doc.doc_id.clone(),
+                    score,
+                    original_rank: rank,
+                    raw_logit,
+                }
+            })
+            .collect();
         Ok(out)
     }
 
@@ -719,6 +908,43 @@ mod tests {
         order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
         eprintln!("[native_reranker] ranking(desc)={order:?} expected=[2, 0, 1, 3] max_diff={max_diff:.6}");
         assert_eq!(order, vec![2usize, 0, 1, 3], "ranking must match reference");
+    }
+
+    #[test]
+    fn forward_batch_matches_per_doc() {
+        // The batched (varlen) forward must produce the same logits as running each
+        // document through the single-pair `forward`: it reuses the same attention
+        // per document and every other op is row-wise, so batching is exact, not an
+        // approximation. This is the contract that lets the throughput lever ship
+        // without touching the validated ranking.
+        if !model_available() {
+            eprintln!("[native_reranker] SKIP batch-equiv: model dir not present");
+            return;
+        }
+        let reranker = NativeReranker::load(MODEL_DIR).expect("load native reranker");
+        let query = CASES[0].0;
+        let mut batch: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
+        for (_, document, _) in CASES {
+            let enc = reranker
+                .tokenizer
+                .encode((query, *document), true)
+                .expect("tokenize");
+            let ids: Vec<i64> = enc.get_ids().iter().map(|&x| i64::from(x)).collect();
+            let typ: Vec<i64> = enc.get_type_ids().iter().map(|&x| i64::from(x)).collect();
+            batch.push((ids, typ));
+        }
+        let mut model = reranker.inner.lock().expect("lock");
+        let per_doc: Vec<f32> = batch
+            .iter()
+            .map(|(ids, typ)| model.forward(ids, typ).expect("forward"))
+            .collect();
+        let batched = model.forward_batch(&batch).expect("forward_batch");
+        assert_eq!(batched.len(), per_doc.len());
+        for (i, (b, p)) in batched.iter().zip(&per_doc).enumerate() {
+            let diff = (f64::from(*b) - f64::from(*p)).abs();
+            eprintln!("[native_reranker] doc {i}: batched={b:.6} per_doc={p:.6} diff={diff:.2e}");
+            assert!(diff < 1e-3, "doc {i}: batched {b} vs per-doc {p} diff {diff} too large");
+        }
     }
 
     #[test]
