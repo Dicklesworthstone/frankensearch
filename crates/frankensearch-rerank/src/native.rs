@@ -230,31 +230,36 @@ fn dot_hd(a: &[f32], b: &[f32]) -> f32 {
 /// `Mutex` deadlock class stays closed. The attention math is identical to the bmm
 /// path (within f32 reassociation), so the ranking is unchanged — validated by the
 /// parity + `forward_batch_matches_per_doc` tests.
-fn fused_attention(q: &[f32], k: &[f32], v: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
-    debug_assert_eq!(q.len(), s_len * H);
+fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
+    debug_assert_eq!(qkv.len(), s_len * 3 * H);
     let mut ctx = vec![0.0f32; s_len * H];
     if s_len == 0 {
         return ctx;
     }
+    // `qkv` is the fused QKV linear output `[s_len, 3H]`: Q at column 0, K at column
+    // H, V at column 2H. Each head's HD slice is still contiguous, so the dot / ·V
+    // inner loops are unchanged — only the row stride (3H) and per-operand column
+    // offset differ.
+    const STRIDE: usize = 3 * H;
     let row_attend = |scores: &mut Vec<f32>, i: usize, ctx_row: &mut [f32]| {
         scores.resize(s_len, 0.0);
         for h in 0..NH {
-            let qoff = i * H + h * HD;
-            let q_block = &q[qoff..qoff + HD];
+            let qoff = i * STRIDE + h * HD;
+            let q_block = &qkv[qoff..qoff + HD];
             // scores[j] = Q[i,h] · K[j,h]  (softmax applies the 1/√HD `scale`).
             for (j, sj) in scores.iter_mut().enumerate() {
-                let koff = j * H + h * HD;
-                *sj = dot_hd(q_block, &k[koff..koff + HD]);
+                let koff = j * STRIDE + H + h * HD;
+                *sj = dot_hd(q_block, &qkv[koff..koff + HD]);
             }
             softmax_row_fused(scores, scale);
             // ctx[i,h] = Σ_j scores[j] · V[j,h], accumulators kept in registers.
             let mut acc = [f32x8::splat(0.0); HD / 8];
             for (j, &sj) in scores.iter().enumerate() {
-                let voff = j * H + h * HD;
+                let voff = j * STRIDE + 2 * H + h * HD;
                 let sjv = f32x8::splat(sj);
                 for (c, a) in acc.iter_mut().enumerate() {
                     let mut buf = [0.0f32; 8];
-                    buf.copy_from_slice(&v[voff + c * 8..voff + c * 8 + 8]);
+                    buf.copy_from_slice(&qkv[voff + c * 8..voff + c * 8 + 8]);
                     *a += sjv * f32x8::new(buf);
                 }
             }
@@ -402,7 +407,26 @@ impl Model {
     /// overhead that dominate there); for long sequences the `bmm` path wins (the
     /// `gemm` crate's cache-blocking amortizes the K/V re-reads that the naive fused
     /// loop repeats per query). `FUSED_ATTN_MAX_SEQ` is the measured crossover.
-    fn attn_block(
+    /// Short/medium-sequence attention: `qkv` is the fused QKV linear output
+    /// `[s_len, 3H]`; runs the [`fused_attention`] kernel over it (reading borrowed,
+    /// writing one fresh ctx leaf).
+    fn attn_fused(&mut self, qkv: TensorNodeId, s_len: usize, scale: f64) -> SearchResult<TensorNodeId> {
+        let ctx_vals = {
+            let qkv_v = self
+                .s
+                .tensor_values_f32_borrowed(qkv)
+                .map_err(|e| rerank_err("attn.qkv_vals", e))?;
+            fused_attention(qkv_v, s_len, scale as f32)
+        };
+        self.s
+            .tensor_variable_f32(ctx_vals, vec![s_len, H], false)
+            .map_err(|e| rerank_err("attn.ctx", e))
+    }
+
+    /// Long-sequence attention: separate `q`/`k`/`v` `[s_len, H]` through the batched
+    /// f32 `bmm` with in-place fused-scale softmax (the `gemm` crate's cache-blocking
+    /// wins past `FUSED_ATTN_MAX_SEQ`).
+    fn attn_bmm(
         &mut self,
         q: TensorNodeId,
         k: TensorNodeId,
@@ -410,28 +434,6 @@ impl Model {
         s_len: usize,
         scale: f64,
     ) -> SearchResult<TensorNodeId> {
-        if s_len <= FUSED_ATTN_MAX_SEQ {
-            let ctx_vals = {
-                let qv = self
-                    .s
-                    .tensor_values_f32_borrowed(q)
-                    .map_err(|e| rerank_err("attn.q_vals", e))?;
-                let kv = self
-                    .s
-                    .tensor_values_f32_borrowed(k)
-                    .map_err(|e| rerank_err("attn.k_vals", e))?;
-                let vv = self
-                    .s
-                    .tensor_values_f32_borrowed(v)
-                    .map_err(|e| rerank_err("attn.v_vals", e))?;
-                fused_attention(qv, kv, vv, s_len, scale as f32)
-            };
-            return self
-                .s
-                .tensor_variable_f32(ctx_vals, vec![s_len, H], false)
-                .map_err(|e| rerank_err("attn.ctx", e));
-        }
-        // Long-sequence path: batched f32 bmm with in-place fused-scale softmax.
         let q = self.heads(q, s_len)?;
         let k = self.heads(k, s_len)?;
         let v = self.heads(v, s_len)?;
@@ -455,6 +457,28 @@ impl Model {
         self.s
             .tensor_reshape(ctx, vec![s_len, H])
             .map_err(|e| rerank_err("attn.ctx_reshape", e))
+    }
+
+    /// Self-attention for one document's `[s_len, H]` activation `emb`: routes to the
+    /// fused-QKV + fused-attention kernel for short/medium sequences (one int8 GEMM
+    /// for Q/K/V, no transpose/per-head-launch overhead), or the separate-QKV + bmm
+    /// path for long sequences. Returns the context `[s_len, H]`.
+    fn attention(
+        &mut self,
+        emb: TensorNodeId,
+        p: &str,
+        s_len: usize,
+        scale: f64,
+    ) -> SearchResult<TensorNodeId> {
+        if s_len <= FUSED_ATTN_MAX_SEQ {
+            let qkv = self.linear(emb, &format!("{p}.attention.self.qkv"))?;
+            self.attn_fused(qkv, s_len, scale)
+        } else {
+            let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
+            let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
+            let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
+            self.attn_bmm(q, k, v, s_len, scale)
+        }
     }
 
     /// Single-pair forward pass (batch = 1). Returns the raw logit. Retained as the
@@ -500,11 +524,8 @@ impl Model {
         let scale = 1.0 / (HD as f64).sqrt();
         for i in 0..L {
             let p = format!("bert.encoder.layer.{i}");
-            // self-attention
-            let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
-            let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
-            let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
-            let ctx = self.attn_block(q, k, v, s_len, scale)?;
+            // self-attention (fused-QKV + fused kernel, or separate-QKV + bmm by len)
+            let ctx = self.attention(emb, &p, s_len, scale)?;
             let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
             let sum1 = self.s.tensor_add(emb, attn).map_err(|e| rerank_err("attn.residual", e))?;
             emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
@@ -612,28 +633,44 @@ impl Model {
         let scale = 1.0 / (HD as f64).sqrt();
         for i in 0..L {
             let p = format!("bert.encoder.layer.{i}");
-            // Batched QKV projections over all documents' tokens at once.
-            let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
-            let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
-            let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
             // Self-attention per document (each on its own [lenₙ, H] slice), then
-            // re-concatenate the contexts back into one [total, H] activation.
+            // re-concatenate the contexts back into one [total, H] activation. When
+            // every doc in the chunk is short, take the fused-QKV + fused-attention
+            // path (one batched int8 GEMM for Q/K/V, then the fused kernel per doc);
+            // otherwise fall back to separate-QKV + bmm (rare: a long doc in the
+            // chunk), which avoids both the fused kernel's long-seq slowdown and a
+            // strided column split.
             let mut ctx_parts = Vec::with_capacity(n_docs);
-            for n in 0..n_docs {
-                let (off, len) = (offsets[n], lens[n]);
-                let qn = self
-                    .s
-                    .tensor_narrow(q, 0, off, len)
-                    .map_err(|e| rerank_err("batch.q_narrow", e))?;
-                let kn = self
-                    .s
-                    .tensor_narrow(k, 0, off, len)
-                    .map_err(|e| rerank_err("batch.k_narrow", e))?;
-                let vn = self
-                    .s
-                    .tensor_narrow(v, 0, off, len)
-                    .map_err(|e| rerank_err("batch.v_narrow", e))?;
-                ctx_parts.push(self.attn_block(qn, kn, vn, len, scale)?);
+            if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
+                let qkv = self.linear(emb, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
+                for n in 0..n_docs {
+                    let (off, len) = (offsets[n], lens[n]);
+                    let qkv_n = self
+                        .s
+                        .tensor_narrow(qkv, 0, off, len)
+                        .map_err(|e| rerank_err("batch.qkv_narrow", e))?;
+                    ctx_parts.push(self.attn_fused(qkv_n, len, scale)?);
+                }
+            } else {
+                let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
+                let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
+                let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
+                for n in 0..n_docs {
+                    let (off, len) = (offsets[n], lens[n]);
+                    let qn = self
+                        .s
+                        .tensor_narrow(q, 0, off, len)
+                        .map_err(|e| rerank_err("batch.q_narrow", e))?;
+                    let kn = self
+                        .s
+                        .tensor_narrow(k, 0, off, len)
+                        .map_err(|e| rerank_err("batch.k_narrow", e))?;
+                    let vn = self
+                        .s
+                        .tensor_narrow(v, 0, off, len)
+                        .map_err(|e| rerank_err("batch.v_narrow", e))?;
+                    ctx_parts.push(self.attn_bmm(qn, kn, vn, len, scale)?);
+                }
             }
             let ctx = self
                 .s
@@ -927,6 +964,61 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
             source: "no Linear weights found to quantize".into(),
         });
     }
+
+    // Third pass: fuse each layer's Q/K/V projections into one `[3H, H]` linear
+    // (key `…attention.self.qkv`). The forward then quantizes `emb` once and runs a
+    // single int8 GEMM instead of three — cutting the per-call quant / rayon-launch
+    // / dequant / tape-node overhead that is a real fraction of the short-sequence
+    // forward (the SDOT math itself is at its M4 throughput ceiling). The stacked
+    // weight re-quantizes per output channel, so each of the 3H rows keeps its own
+    // scale and the fused output is byte-identical to the three separate linears.
+    for i in 0..L {
+        let p = format!("bert.encoder.layer.{i}");
+        let parts = ["query", "key", "value"];
+        let mut stacked: Vec<f32> = Vec::with_capacity(3 * H * H);
+        let mut bias: Vec<f32> = Vec::with_capacity(3 * H);
+        let mut ok = true;
+        for part in parts {
+            let wn = format!("{p}.attention.self.{part}.weight");
+            match raw.get(&wn) {
+                Some((vals, shape)) if shape.len() == 2 && shape[0] == H && shape[1] == H => {
+                    stacked.extend_from_slice(vals);
+                    let b = raw
+                        .get(&format!("{p}.attention.self.{part}.bias"))
+                        .map(|(b, _)| b.clone())
+                        .unwrap_or_else(|| vec![0.0f32; H]);
+                    bias.extend_from_slice(&b);
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let (out, in_) = (3 * H, H);
+        let (w_i8, w_scales) = quantize_per_output_channel_i8(&stacked, out, in_);
+        let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
+        let w_i8 = if packed {
+            ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
+        } else {
+            w_i8
+        };
+        qw.insert(
+            format!("{p}.attention.self.qkv"),
+            QLinear {
+                w_i8: Arc::new(w_i8),
+                w_scales: Arc::new(w_scales),
+                bias: Arc::new(bias),
+                out,
+                in_,
+                packed,
+            },
+        );
+    }
+
     Ok(SharedWeights { qw, f32_params })
 }
 
