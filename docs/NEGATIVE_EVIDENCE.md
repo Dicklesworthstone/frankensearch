@@ -33,6 +33,42 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+## Gated levers (measured headroom that can't be landed as library code)
+
+### 2026-06-25 — AVX2 build is the biggest remaining dot-kernel lever, but it's a build-config knob (BlackThrush)
+
+**Finding:** every SIMD win so far is on an **SSE2-class build** (no AVX2/SSE4.1 — the ~1 ns/elem
+f32 dots and the reverted `vpmaddwd` int8 experiment both confirm it). Rebuilding the dot bench
+with `RUSTFLAGS="-C target-feature=+avx2,+fma,+f16c"` (separate target dir) measured, back-to-back:
+
+| Workload | SSE2 | AVX2 | AVX2/SSE2 |
+|----------|------|------|-----------|
+| `dot/dim256/f16_bytes` | 2.09 ms | 0.77 ms | ~0.37 |
+| `dot/dim256/f32_bytes` | 1.49 ms | 0.59 ms | ~0.40 |
+| `dot/dim384/f16_bytes` | 3.20 ms | 1.94 ms | ~0.61 |
+| `dot/dim384/f32_bytes` | 2.30 ms | 1.54 ms | ~0.67 |
+
+**Honest caveat:** these are **cross-run on different rch workers** — the per-dim inconsistency
+(dim256 ~2.5× vs dim384 ~1.6×) shows worker variance is mixed in. A clean same-worker pin was
+attempted on `vmi1149989` but that worker was contended (SSE2 there ran +27% vs its own baseline
+and the AVX2 leg didn't complete). So the real figure is a **~1.5–2.5× range, not a precise ratio**.
+
+**Why it can't be landed as a code lever:**
+- A *published* library cannot assume `-Ctarget-cpu`/`target-feature`; consumers compile with their
+  own flags, and a workspace `.cargo/config.toml` `+avx2` would make the **released `fsfs` binary**
+  crash (illegal instruction) on non-AVX2 hosts.
+- Runtime AVX2 dispatch (`is_x86_feature_detected!` + `#[target_feature]`) needs `unsafe`. The crate
+  is `deny(unsafe_code)` (opt-in allowed, but a hand-written AVX2 intrinsic dot kernel is a large,
+  risky surface — and `wide` only uses compile-time features, so it can't help at runtime).
+
+**Actionable recommendation (not a code change):** deploy targets known to have AVX2 should build
+`fsfs` / the consuming app with `RUSTFLAGS=-Ctarget-cpu=x86-64-v3` (or `native`) for ~1.5–2.5×
+faster vector search for free — `wide` then auto-selects its AVX2 paths. This belongs in the
+packaging/deploy docs, not the library default. **Do not** add workspace-wide `+avx2` (breaks the
+portable released binary).
+
+---
+
 ## Reverted experiments
 
 ### 2026-06-25 — BOLD-VERIFY: hash-hybrid does **not** beat Tantivy-class BM25 (BlackThrush)
