@@ -376,8 +376,11 @@ fn normalize_whitespace(text: &str) -> String {
         }
     }
 
-    // Trim trailing whitespace
-    result.trim_end().to_string()
+    // Drop any trailing space the loop pushed, in place — avoids a second full
+    // allocation via `trim_end().to_string()`.
+    let trimmed_len = result.trim_end().len();
+    result.truncate(trimmed_len);
+    result
 }
 
 /// Filter out low-signal content.
@@ -386,10 +389,12 @@ fn normalize_whitespace(text: &str) -> String {
 /// low-signal pattern, returns empty string.
 fn filter_low_signal(text: &str) -> String {
     let trimmed = text.trim();
-    let lower = trimmed.to_lowercase();
-
+    // `LOW_SIGNAL_CONTENT` is all ASCII, so a case-insensitive ASCII compare is
+    // byte-identical to lowercasing — but `eq_ignore_ascii_case` short-circuits on
+    // a length mismatch and never allocates, instead of lowercasing the *entire*
+    // document (a full alloc + scan) just to compare against a few short patterns.
     for pattern in LOW_SIGNAL_CONTENT {
-        if lower == *pattern {
+        if trimmed.eq_ignore_ascii_case(pattern) {
             return String::new();
         }
     }
@@ -399,6 +404,12 @@ fn filter_low_signal(text: &str) -> String {
 
 /// Truncate string to at most N characters, respecting char boundaries.
 fn truncate_to_chars(text: &str, max_chars: usize) -> String {
+    // Fast path: each char is >= 1 byte, so if the whole text fits in `max_chars`
+    // *bytes* it certainly fits in `max_chars` *chars* — no scan needed (the common
+    // case for short docs/queries).
+    if text.len() <= max_chars {
+        return text.to_owned();
+    }
     for (count, (idx, _)) in text.char_indices().enumerate() {
         if count == max_chars {
             return text[..idx].to_owned();

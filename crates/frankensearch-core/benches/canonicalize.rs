@@ -31,6 +31,22 @@ fn nfc_full(text: &str) -> String {
     text.nfc().collect()
 }
 
+const LOW_SIGNAL: &[&str] = &[
+    "ok", "done", "yes", "no", "thanks", "understood", "sure", "got it", "thank you",
+];
+
+/// Prior `filter_low_signal`: lowercase the entire document, then compare.
+fn filter_old(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    LOW_SIGNAL.iter().any(|p| lower == *p)
+}
+
+/// New: case-insensitive ASCII compare — short-circuits on length, no allocation.
+fn filter_new(text: &str) -> bool {
+    let t = text.trim();
+    LOW_SIGNAL.iter().any(|p| t.eq_ignore_ascii_case(p))
+}
+
 fn bench_nfc(c: &mut Criterion) {
     let ascii_short = "fn main() { let x = retry_backoff(3); }".to_owned();
     let ascii_doc = "The quick brown fox jumps over the lazy dog. ".repeat(50);
@@ -50,6 +66,18 @@ fn bench_nfc(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // filter_low_signal: old (full-doc to_lowercase) vs new (ASCII compare).
+    let mut fg = c.benchmark_group("filter_low_signal");
+    for (name, text) in [("ascii_doc", &ascii_doc), ("ascii_short", &ascii_short)] {
+        fg.bench_with_input(BenchmarkId::new("old", name), text.as_str(), |b, t| {
+            b.iter(|| black_box(filter_old(black_box(t))));
+        });
+        fg.bench_with_input(BenchmarkId::new("new", name), text.as_str(), |b, t| {
+            b.iter(|| black_box(filter_new(black_box(t))));
+        });
+    }
+    fg.finish();
 }
 
 criterion_group!(benches, bench_nfc);
