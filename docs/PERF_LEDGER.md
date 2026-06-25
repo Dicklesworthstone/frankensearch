@@ -23,6 +23,39 @@ marked as original-comparator wins.
 
 ## Original-comparator wins
 
+### 2026-06-25 — BOLD-VERIFY non-semantic zero-hit lexical gate (BlackThrush)
+
+**Lever:** the BOLD hash-hybrid path and `TwoTierSearcher` now stop before hash-vector search
+when a non-semantic fast embedder has no quality tier and lexical search produces zero candidates.
+The same gate also permits lexical-only return for saturated natural-language rows in that
+non-semantic/no-quality mode; that reduced the old catastrophic vector-scan residual but is still
+not a universal Tantivy-class win, so the slower natural-language rows are recorded in
+`docs/NEGATIVE_EVIDENCE.md`.
+
+**Measured command (RCH worker `hz2`, per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`.
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Status |
+|----------|-------------|-------------------|-------------------|------------------------|--------|
+| `bold_verify/top10/100000` `zero_hit` | `13f1b0153f5adec9` | 67 us | 62 us | **0.925** | KEEP |
+
+**Scope:** this is a zero-hit incumbent win for the non-semantic hash/no-quality lane, not a
+claim that hybrid search dominates Tantivy/Lucene/Meilisearch-class BM25 overall. The 10k zero-hit
+row is a p50 tie (43 us vs 44 us; ratio 0.977) with better tails, and natural-language rows remain
+slower at p50; both are recorded as residual evidence.
+
 ### 2026-06-25 — BOLD-VERIFY lexical-saturated short-circuit (BlackThrush)
 
 **Lever:** after successful fast embedding and lexical search, `TwoTierSearcher` now returns

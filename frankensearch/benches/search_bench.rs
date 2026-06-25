@@ -286,11 +286,13 @@ fn bold_verify_lexical_short_circuit(
     lexical_count: usize,
     limit: usize,
 ) -> bool {
-    lexical_count >= limit
-        && matches!(
-            QueryClass::classify(query.text),
-            QueryClass::Identifier | QueryClass::ShortKeyword
-        )
+    let query_class = QueryClass::classify(query.text);
+    lexical_count == 0
+        || (lexical_count >= limit
+            && matches!(
+                query_class,
+                QueryClass::Identifier | QueryClass::ShortKeyword | QueryClass::NaturalLanguage
+            ))
 }
 
 #[cfg(feature = "lexical")]

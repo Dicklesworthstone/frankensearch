@@ -1093,6 +1093,8 @@ impl TwoTierSearcher {
                         lexical.len(),
                         k,
                         self.config.graph_ranking_enabled,
+                        self.fast_embedder.is_semantic(),
+                        self.quality_embedder.is_some(),
                     )
                 {
                     metrics.skip_reason = Some("lexical_short_circuit".to_owned());
@@ -2498,14 +2500,26 @@ fn should_lexical_short_circuit(
     lexical_count: usize,
     k: usize,
     graph_ranking_enabled: bool,
+    fast_embedder_is_semantic: bool,
+    has_quality_embedder: bool,
 ) -> bool {
-    !graph_ranking_enabled
-        && k > 0
-        && lexical_count >= k
+    if graph_ranking_enabled || k == 0 {
+        return false;
+    }
+
+    if lexical_count >= k
         && matches!(
             query_class,
             QueryClass::Identifier | QueryClass::ShortKeyword
         )
+    {
+        return true;
+    }
+
+    !fast_embedder_is_semantic
+        && !has_quality_embedder
+        && (lexical_count == 0
+            || (lexical_count >= k && matches!(query_class, QueryClass::NaturalLanguage)))
 }
 
 /// Convert `VectorHit` results to `ScoredResult` (semantic-only mode).
@@ -3598,6 +3612,64 @@ mod tests {
             assert!(metrics.semantic_candidates > 0);
             assert_eq!(metrics.lexical_candidates, 3);
         });
+    }
+
+    #[test]
+    fn lexical_short_circuit_allows_non_semantic_natural_language_when_saturated() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("custom-hash", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher =
+                TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
+
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "how should the search pipeline rank documents",
+                    3,
+                    |_| None,
+                    |_| {},
+                )
+                .await
+                .expect("non-semantic saturated lexical search should succeed");
+
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("lexical_short_circuit")
+            );
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.lexical_candidates, 3);
+        });
+    }
+
+    #[test]
+    fn lexical_short_circuit_zero_hit_gate_requires_non_semantic_without_quality() {
+        assert!(should_lexical_short_circuit(
+            QueryClass::ShortKeyword,
+            0,
+            10,
+            false,
+            false,
+            false
+        ));
+        assert!(!should_lexical_short_circuit(
+            QueryClass::ShortKeyword,
+            0,
+            10,
+            false,
+            true,
+            false
+        ));
+        assert!(!should_lexical_short_circuit(
+            QueryClass::ShortKeyword,
+            0,
+            10,
+            false,
+            false,
+            true
+        ));
     }
 
     #[cfg(feature = "graph")]

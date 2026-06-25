@@ -71,6 +71,49 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-25 — BOLD-VERIFY after non-semantic zero-hit gate: still scoped, not universal (BlackThrush)
+
+**Lever kept elsewhere:** non-semantic hash/no-quality searches now skip hash-vector work when
+lexical returns zero candidates; the 100k zero-hit BOLD row is a real Tantivy-class win and is
+recorded in `docs/PERF_LEDGER.md`. The same run shows the lever does not make the hash-hybrid path
+universally faster than the Tantivy/Lucene/Meilisearch-class incumbent.
+
+**Measured command (RCH worker `hz2`, per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`.
+
+**Residual rows for `hash_hybrid_tantivy_vector_rrf` vs `tantivy_doc_ids`:**
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Decision |
+|----------|-------------|-------------------|-------------------|------------------------|----------|
+| `top10_short_keyword/10000` | `2e78365a46a7c3b9` | 77 us | 80 us | **1.039x** | noise/tie; no dominance claim |
+| `top10_quoted_phrase/10000` | `2e78365a46a7c3b9` | 146 us | 162 us | **1.110x slower** | no dominance claim |
+| `top10_natural_language/10000` | `2e78365a46a7c3b9` | 148 us | 243 us | **1.642x slower** | needs lower-materialization lexical path |
+| `top10_high_fanout/10000` | `2e78365a46a7c3b9` | 102 us | 122 us | **1.196x slower** | no dominance claim |
+| `top10_zero_hit/10000` | `2e78365a46a7c3b9` | 44 us | 43 us | **0.977x** | p50 tie; tails improved, not a clean p50 win |
+| `limit_all/10000` | `2e78365a46a7c3b9` | 5.720 ms | 5.975 ms | **1.045x slower** | no dominance claim |
+| `top10_exact_identifier/100000` | `13f1b0153f5adec9` | 1.198 ms | 1.228 ms | **1.025x** | p50 noise; p95 regressed |
+| `top10_short_keyword/100000` | `13f1b0153f5adec9` | 190 us | 214 us | **1.126x slower** | no dominance claim |
+| `top10_quoted_phrase/100000` | `13f1b0153f5adec9` | 1.055 ms | 1.041 ms | **0.987x** | noise/tie |
+| `top10_natural_language/100000` | `13f1b0153f5adec9` | 736 us | 768 us | **1.043x slower** | no dominance claim |
+| `top10_high_fanout/100000` | `13f1b0153f5adec9` | 644 us | 685 us | **1.064x slower** | no dominance claim |
+
+**Decision:** keep the zero-hit gate because it turns the 100k zero-hit BOLD row into a clean
+incumbent win and removes the prior catastrophic empty-result vector scan. Do not generalize the
+claim: saturated natural-language still spends too much in lexical over-fetch/materialization and
+needs a separate lever before it can be called Tantivy/Lucene/Meilisearch-class faster.
+
 ### 2026-06-25 — BOLD-VERIFY after lexical short-circuit: still not universal dominance (BlackThrush)
 
 **Lever kept elsewhere:** lexical-saturated `Identifier` / `ShortKeyword` queries now skip phase-1
