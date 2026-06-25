@@ -389,15 +389,16 @@ fn bench_dot(c: &mut Criterion) {
 /// `search_top_k` vs the int8 ADC `search_top_k_int8_two_pass` on a 10k in-memory
 /// index. This measures the actual product capability, not an inline approximation.
 fn bench_inmem_topk(c: &mut Criterion) {
-    for &dim in &[256_usize, 384] {
-        let n = 10_000_usize;
+    // (dim, n): 10k is at the exact path's parallel threshold; 100k probes the
+    // crossover scale where the int8 pass-1 should dominate the selection cost.
+    for &(dim, n) in &[(256_usize, 10_000_usize), (384, 10_000), (384, 100_000)] {
         let corpus = build_corpus(dim, n);
         let q = &corpus.query;
         let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i}")).collect();
         let index = InMemoryVectorIndex::from_vectors(doc_ids, corpus.stored_f32.clone(), dim)
             .expect("build in-memory index");
 
-        let mut group = c.benchmark_group(format!("inmem_topk/dim{dim}"));
+        let mut group = c.benchmark_group(format!("inmem_topk/dim{dim}/n{n}"));
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(3));
 

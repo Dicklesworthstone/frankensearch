@@ -29,7 +29,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use crate::VectorIndex;
-use crate::search::SearchParams;
+use crate::search::{PARALLEL_CHUNK_SIZE, SearchParams};
 use crate::simd::{dot_i8_i8, dot_product_f16_f32};
 
 /// Fully-resident in-memory vector index with f16 quantization.
@@ -304,34 +304,42 @@ impl InMemoryVectorIndex {
             return self.search_top_k(query, limit, None);
         }
 
-        // Pass 1: int8 dot over all vectors; keep the top `limit * multiplier`
-        // candidates (descending int8 score, ascending index — a total order, so
-        // the candidate set is deterministic despite the unstable partition).
         let query_i8 = quantize_i8_query(query);
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
-        // Parallel int8 scan (order-preserving collect) so pass-1 matches the
-        // exact path's rayon parallelism — the 3× int8 win then compounds with it.
-        let mut scored: Vec<(i32, usize)> = (0..count)
+
+        // Pass 1: parallel **bounded-heap** int8 scan — each chunk keeps only its
+        // top `candidate_count` (never materializing all N scores, unlike a
+        // collect-all + select), then merge. This mirrors the exact path's
+        // structure so the 3× int8 dot win is not eaten by selection overhead.
+        // int8 dots peak well below 2^24 for realistic dims, so `i32 as f32` is
+        // exact and preserves the candidate ranking + deterministic index tie-break.
+        // Match the exact path's chunking so pass-1 uses all cores, not ~2.
+        let chunk_size = PARALLEL_CHUNK_SIZE;
+        let chunk_count = count.div_ceil(chunk_size);
+        let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
             .into_par_iter()
-            .map(|index| {
-                let start = index * self.dimension;
-                let stored = &self.vectors_i8[start..start + self.dimension];
-                (dot_i8_i8(stored, &query_i8), index)
+            .map(|chunk_index| {
+                let start = chunk_index * chunk_size;
+                let end = (start + chunk_size).min(count);
+                let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
+                for index in start..end {
+                    let offset = index * self.dimension;
+                    let stored = &self.vectors_i8[offset..offset + self.dimension];
+                    let score = dot_i8_i8(stored, &query_i8) as f32;
+                    insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
+                }
+                heap
             })
             .collect();
-        if candidate_count < scored.len() {
-            scored.select_nth_unstable_by(candidate_count - 1, |a, b| {
-                b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
-            });
-            scored.truncate(candidate_count);
-        }
+        let candidate_heap = merge_partial_heaps(partials, candidate_count);
 
-        // Pass 2: exact f16 rescore of the candidates with the same bounded-heap
-        // selection + tie-break as the exact path, so the final order matches.
+        // Pass 2: exact f16 rescore of the candidates through the SAME bounded-heap
+        // selection + tie-break as the exact path, so the final order matches
+        // `search_top_k` exactly whenever pass-1 retained the true top-k.
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
-        for (_, index) in scored {
-            let score = dot_product_f16_f32(self.vector_slice(index), query)?;
-            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+        for candidate in candidate_heap {
+            let score = dot_product_f16_f32(self.vector_slice(candidate.index), query)?;
+            insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), limit);
         }
         self.resolve_heap(heap)
     }
