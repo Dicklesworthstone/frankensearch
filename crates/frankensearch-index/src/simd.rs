@@ -1,4 +1,5 @@
 //! Portable SIMD dot-product helpers for vector search.
+#![allow(clippy::inline_always)]
 
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
@@ -148,8 +149,12 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     let mut query_chunks = query.chunks_exact(8);
 
     for (stored_chunk, query_chunk) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
-        let s: &[f16; 8] = stored_chunk.try_into().expect("chunks_exact(8) yields 8 elements");
-        let q: &[f32; 8] = query_chunk.try_into().expect("chunks_exact(8) yields 8 elements");
+        let s: &[f16; 8] = stored_chunk
+            .try_into()
+            .expect("chunks_exact(8) yields 8 elements");
+        let q: &[f32; 8] = query_chunk
+            .try_into()
+            .expect("chunks_exact(8) yields 8 elements");
         sum += widen8_f16_slice(s) * f32x8::from(*q);
     }
 
@@ -294,7 +299,7 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 /// quantized vectors are 1 byte/elem (half the bandwidth of f16) and the multiply
 /// accumulates in integer lanes. `i16::mul_widen` keeps every product in full i32
 /// precision, so the only overflow bound is the i32 accumulator (a 512-dim dot of
-/// ±127 values peaks at ~8.3M, far below i32::MAX) — exact for any realistic dim.
+/// ±127 values peaks at ~8.3M, far below `i32::MAX`) — exact for any realistic dim.
 ///
 /// Lengths are assumed equal (caller-guaranteed in the scan); a short tail is
 /// handled scalar. Returns the raw integer dot; the caller applies the dequant
@@ -449,7 +454,10 @@ mod tests {
     #[test]
     fn dot_i8_i8_matches_scalar() {
         fn scalar(a: &[i8], b: &[i8]) -> i32 {
-            a.iter().zip(b).map(|(&x, &y)| i32::from(x) * i32::from(y)).sum()
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| i32::from(x) * i32::from(y))
+                .sum()
         }
         // Lengths that exercise the 8-wide loop, a partial tail, and extremes.
         let to_i8 = |i: usize, m: usize| -> i8 {
@@ -549,7 +557,97 @@ mod tests {
         }
         // Gate on the largest mult; smaller mults are reported for tuning.
         let avg_max = recall_sums[mults.len() - 1] / queries as f64;
-        assert!(avg_max >= 0.80, "int8 two-pass recall@{k} too low: {avg_max:.4}");
+        assert!(
+            avg_max >= 0.80,
+            "int8 two-pass recall@{k} too low: {avg_max:.4}"
+        );
+    }
+
+    /// Viability probe for a **binary-quantization** first pass (Meilisearch-style):
+    /// pack `sign(x_i)` to bits, rank by Hamming agreement (`popcnt` — fast even on
+    /// SSE2, 1/16 the bytes of f16), then exact f16 rescore. Reports recall@10 vs the
+    /// candidate budget so we know whether binary ADC is worth building (it is much
+    /// coarser than int8, so the question is how big a `mult` it needs).
+    #[test]
+    fn binary_quant_recall_at_10() {
+        fn xorshift(s: &mut u64) -> f32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 40) as f32 / (1_u64 << 24) as f32).mul_add(2.0, -1.0)
+        }
+        fn normalize(v: &mut [f32]) {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 1e-9 {
+                for x in v.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+        fn pack_bits(v: &[f32]) -> Vec<u64> {
+            let mut bits = vec![0_u64; v.len().div_ceil(64)];
+            for (i, &x) in v.iter().enumerate() {
+                if x >= 0.0 {
+                    bits[i / 64] |= 1_u64 << (i % 64);
+                }
+            }
+            bits
+        }
+        // Lower hamming distance == more sign agreement == more similar.
+        fn hamming(a: &[u64], b: &[u64]) -> u32 {
+            a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+        }
+
+        let (dim, n, k, queries) = (128_usize, 3000_usize, 10_usize, 25_usize);
+        let mults = [5_usize, 10, 20, 50, 100];
+        let mut state = 0x2468_ace0_1357_9bdf_u64;
+        let mut vecs_f16: Vec<Vec<f16>> = Vec::with_capacity(n);
+        let mut vecs_bits: Vec<Vec<u64>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v: Vec<f32> = (0..dim).map(|_| xorshift(&mut state)).collect();
+            normalize(&mut v);
+            vecs_bits.push(pack_bits(&v));
+            vecs_f16.push(v.iter().map(|&x| f16::from_f32(x)).collect());
+        }
+
+        let mut recall_sums = vec![0.0_f64; mults.len()];
+        for _ in 0..queries {
+            let mut q: Vec<f32> = (0..dim).map(|_| xorshift(&mut state)).collect();
+            normalize(&mut q);
+            let qbits = pack_bits(&q);
+
+            let mut exact: Vec<(f32, usize)> = vecs_f16
+                .iter()
+                .enumerate()
+                .map(|(i, fv)| (dot_product_f16_f32(fv, &q).expect("dot"), i))
+                .collect();
+            exact.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let exact_set: std::collections::HashSet<usize> =
+                exact[..k].iter().map(|&(_, i)| i).collect();
+
+            // Rank by ascending hamming (descending agreement), index tie-break.
+            let mut ranked: Vec<(u32, usize)> = vecs_bits
+                .iter()
+                .enumerate()
+                .map(|(i, bv)| (hamming(bv, &qbits), i))
+                .collect();
+            ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            for (mi, &mult) in mults.iter().enumerate() {
+                let cand = (k * mult).min(ranked.len());
+                let cand_set: std::collections::HashSet<usize> =
+                    ranked[..cand].iter().map(|&(_, i)| i).collect();
+                let hit = exact_set.iter().filter(|i| cand_set.contains(i)).count();
+                recall_sums[mi] += hit as f64 / k as f64;
+            }
+        }
+        for (mi, &mult) in mults.iter().enumerate() {
+            let avg = recall_sums[mi] / queries as f64;
+            println!("binary-quant recall@{k} mult={mult} (n={n}, dim={dim}): {avg:.4}");
+        }
+        // No hard gate — this is a viability probe; just keep it from silently
+        // returning 0 (which would signal a logic error).
+        assert!(recall_sums[mults.len() - 1] / queries as f64 > 0.0);
     }
 
     fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {

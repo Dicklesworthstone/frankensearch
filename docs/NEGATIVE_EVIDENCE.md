@@ -35,6 +35,65 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ## Reverted experiments
 
+### 2026-06-25 — BOLD-VERIFY: hash-hybrid does **not** beat Tantivy-class BM25 (BlackThrush)
+
+**Comparator shipped:** `frankensearch/benches/search_bench.rs` now includes
+`bold_verify_tantivy_class`, a same-corpus Tantivy/Lucene-class incumbent harness:
+Tantivy `search_doc_ids` vs frankensearch hash embedding + FSVI vector search + Tantivy candidates
++ RRF fusion. This is a **negative dominance check**, not a reverted source lever.
+
+**Measured command:** `RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b FRANKENSEARCH_BOLD_VERIFY_EMIT=1
+rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench
+bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3`
+
+**Evidence:** RCH worker `vmi1227854`, git `cc45775` plus the local comparator harness, Criterion
+`new/estimates.json` under
+`/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_tantivy_class`. Ratios are
+frankensearch mean time / Tantivy-class mean time:
+
+| Workload | Tantivy-class mean | frankensearch mean | ratio |
+|----------|--------------------|--------------------|-------|
+| `limit_all_limit_all/10000` | 5.670 ms | 14.170 ms | **2.50x slower** |
+| `top10_exact_identifier/10000` | 99.945 us | 655.294 us | **6.56x slower** |
+| `top10_exact_identifier/100000` | 1.024 ms | 3.836 ms | **3.75x slower** |
+| `top10_short_keyword/10000` | 46.947 us | 574.426 us | **12.24x slower** |
+| `top10_short_keyword/100000` | 162.510 us | 2.985 ms | **18.37x slower** |
+| `top10_quoted_phrase/10000` | 107.002 us | 651.956 us | **6.09x slower** |
+| `top10_quoted_phrase/100000` | 779.212 us | 3.816 ms | **4.90x slower** |
+| `top10_natural_language/10000` | 154.082 us | 756.347 us | **4.91x slower** |
+| `top10_natural_language/100000` | 686.750 us | 3.684 ms | **5.36x slower** |
+| `top10_high_fanout/10000` | 72.079 us | 685.378 us | **9.51x slower** |
+| `top10_high_fanout/100000` | 594.738 us | 3.428 ms | **5.76x slower** |
+| `top10_zero_hit/10000` | 22.383 us | 500.257 us | **22.35x slower** |
+| `top10_zero_hit/100000` | 25.526 us | 2.711 ms | **106.19x slower** |
+
+**Decision:** no Lucene/Tantivy/Meilisearch-class win exists for the current hash-hybrid path.
+Future bold claims need a new lever that changes the cost model (ANN/int8 slab reuse, lexical
+short-circuiting, semantic gating, or a Meilisearch-class prefix/typo comparator), then must reuse
+this head-to-head harness. Do not cite frankensearch hybrid as faster than Tantivy-class BM25 from
+the current implementation.
+
+### 2026-06-25 — binary-quantization ADC is too coarse for top-10; int8 ADC dominates (BlackThrush)
+
+**Lever assessed (not built):** a Meilisearch-style **binary-quantization** first pass — pack
+`sign(x_i)` to bits, rank by Hamming agreement (`popcnt`, fast even on SSE2, 1/16 the bytes of
+f16), then exact f16 rescore. Faster pass-1 than int8, so the question is recall. Measured
+(`binary_quant_recall_at_10`, random L2-normalized vectors, dim=128, n=3000, recall@10):
+
+| candidate mult | 5 | 10 | 20 | 50 | 100 |
+|----------------|------|------|------|------|------|
+| binary recall@10 | 0.54 | 0.71 | 0.85 | 0.96 | **1.00** |
+| (int8 recall@10) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+
+**Conclusion:** binary needs `mult ≈ 100` (k·mult = 1000 candidates) for recall ≈ 1.0, vs int8's
+`mult = 2` (20 candidates) — ~50× coarser. At frankensearch's typical scale that means rescoring a
+large fraction of the corpus, so the **already-shipped int8 ADC two-pass is strictly better** for
+top-10. Binary only pulls ahead at very large N (≫1M), where the *fixed* ~1000-candidate rescore
+is negligible and the super-fast `popcnt` pass-1 dominates. **Do not build binary ADC** unless
+specifically targeting ≫1M-vector corpora. (Probe test kept for reproducibility; no production
+code added.)
+
 ### 2026-06-25 — SIMD-widen int8 dot (`i16x16::dot`/`vpmaddwd`) is SLOWER on this build (BlackThrush)
 
 **Lever:** rewrite `dot_i8_i8` from scalar `i16::from` widening (16 `movsx` per 8 elems) to a

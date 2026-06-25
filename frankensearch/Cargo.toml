@@ -42,7 +42,7 @@ asupersync = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true }
