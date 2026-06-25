@@ -106,10 +106,10 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
 /// matching the multicore the stock softmax kernel had. This stays intra-forward
 /// (the doc loop is sequential), so the nested-rayon + `Mutex` deadlock class
 /// remains closed by construction.
-fn fast_softmax_last_dim(mut data: Vec<f32>, rows: usize, n: usize, scale: f32) -> Vec<f32> {
+fn fast_softmax_inplace(data: &mut [f32], rows: usize, n: usize, scale: f32) {
     debug_assert_eq!(data.len(), rows * n);
     if n == 0 {
-        return data;
+        return;
     }
     // Parallelize only when there is enough work to amortise the fan-out and a
     // pool is actually available; otherwise stay serial (small seq / 1 thread).
@@ -121,7 +121,6 @@ fn fast_softmax_last_dim(mut data: Vec<f32>, rows: usize, n: usize, scale: f32) 
         data.chunks_exact_mut(n)
             .for_each(|row| softmax_row_fused(row, scale));
     }
-    data
 }
 
 /// Exact-form GELU `0.5·x·(1 + erf(x/√2))` for one f32x8 lane group, with `erf`
@@ -167,7 +166,7 @@ fn gelu_scalar(x: f32) -> f32 {
 /// elementwise so chunks are independent and parallelize across the forward's
 /// rayon pool. A–S erf keeps the result within ~1e-7 of exact, so the ranking is
 /// unchanged (validated against the numpy/ONNX reference).
-fn fast_gelu(mut data: Vec<f32>) -> Vec<f32> {
+fn fast_gelu_inplace(data: &mut [f32]) {
     let process = |chunk: &mut [f32]| {
         let n = chunk.len();
         let mut i = 0;
@@ -189,9 +188,8 @@ fn fast_gelu(mut data: Vec<f32>) -> Vec<f32> {
         // only the final chunk has a scalar tail.
         data.par_chunks_mut(2048).for_each(process);
     } else {
-        process(&mut data);
+        process(data);
     }
-    data
 }
 
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
@@ -285,18 +283,15 @@ impl Model {
     /// a fresh leaf, consistent with the int8 linear (which already returns a
     /// detached f32 leaf), so there is no live autograd graph to preserve.
     fn gelu(&mut self, inter: TensorNodeId) -> SearchResult<TensorNodeId> {
-        let shape = self
+        // In-place: `inter` is a single-use intermediate (only the next FFN linear
+        // reads it), so rewrite its storage rather than round-tripping through a
+        // fresh leaf — kills the per-layer extract+reinsert of the wide `[m, 1536]`.
+        let slice = self
             .s
-            .tensor_shape(inter)
-            .map_err(|e| rerank_err("ffn.gelu_shape", e))?;
-        let vals = self
-            .s
-            .tensor_values_f32(inter)
-            .map_err(|e| rerank_err("ffn.gelu_vals", e))?;
-        let g = fast_gelu(vals);
-        self.s
-            .tensor_variable_f32(g, shape, false)
-            .map_err(|e| rerank_err("ffn.gelu_fast", e))
+            .tensor_values_f32_mut(inter)
+            .map_err(|e| rerank_err("ffn.gelu_mut", e))?;
+        fast_gelu_inplace(slice);
+        Ok(inter)
     }
 
     /// [S, H] -> [NH, S, HD]
@@ -332,20 +327,19 @@ impl Model {
             .tensor_transpose(k, 1, 2)
             .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
         let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
-        // Fused scale + vectorized-exp softmax over the last dim, replacing the
-        // separate `mul_scalar` + `tensor_softmax` tape ops. The int8 linear already
-        // returns detached f32 leaves, so round-tripping the scores through f32
-        // values + a fresh f32 leaf matches the forward's existing structure.
-        let score_vals = self
-            .s
-            .tensor_values_f32(scores)
-            .map_err(|e| rerank_err("attn.scores_vals", e))?;
-        let prob_vals = fast_softmax_last_dim(score_vals, NH * s_len, s_len, scale as f32);
-        let probs = self
-            .s
-            .tensor_variable_f32(prob_vals, vec![NH, s_len, s_len], false)
-            .map_err(|e| rerank_err("attn.softmax_fast", e))?;
-        let ctx = self.s.tensor_bmm(probs, v).map_err(|e| rerank_err("attn.ctx", e))?;
+        // Fused scale + vectorized-exp softmax, IN PLACE on the scores storage. The
+        // scores tensor is a single-use intermediate (only the `probs·V` bmm below
+        // reads it), so mutating it directly avoids the per-layer extract+reinsert of
+        // the wide `[NH, S, S]` attention matrix — the dominant softmax overhead. The
+        // mutated node IS `probs`.
+        {
+            let slice = self
+                .s
+                .tensor_values_f32_mut(scores)
+                .map_err(|e| rerank_err("attn.softmax_mut", e))?;
+            fast_softmax_inplace(slice, NH * s_len, s_len, scale as f32);
+        }
+        let ctx = self.s.tensor_bmm(scores, v).map_err(|e| rerank_err("attn.ctx", e))?;
         let ctx = self
             .s
             .tensor_transpose(ctx, 0, 1)
