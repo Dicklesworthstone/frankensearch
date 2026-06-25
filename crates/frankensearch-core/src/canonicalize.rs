@@ -200,7 +200,7 @@ fn strip_markdown_line(line: &str) -> String {
     // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
     // Byte-identical to the full path; the header/blockquote/list stripping below
     // still applies. Plain prose and most code-comment text hit this path.
-    let result = if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
+    if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
         // Remove bold/italic markers
         let mut r = line.replace("**", "");
         r = r.replace("__", "");
@@ -209,21 +209,27 @@ fn strip_markdown_line(line: &str) -> String {
         // Remove inline code backticks
         r = r.replace('`', "");
         // Convert links [text](url) to just text
-        strip_markdown_links(&r)
+        let r = strip_markdown_links(&r);
+        strip_prefixes_and_list_marker(&r)
     } else {
-        line.to_string()
-    };
+        // Fast path: no inline markdown, so operate directly on the borrowed
+        // `line` — the prefix/blockquote trims and list-marker strip only need a
+        // `&str`. This drops the prior `line.to_string()` copy; only the final
+        // owned String (from `strip_list_marker`) is allocated. Byte-identical.
+        strip_prefixes_and_list_marker(line)
+    }
+}
 
-    // Strip leading header (`#`) and blockquote (`>`) prefixes plus their leading
-    // whitespace as a single `&str` chain — no intermediate `to_string()` allocs
-    // (the original did two). Byte-identical: the same trims in the same order.
-    let prefix_stripped = result
+/// Strip leading header (`#`) / blockquote (`>`) prefixes plus their leading
+/// whitespace as a single `&str` chain (no intermediate allocations), then remove
+/// any list marker (which allocates the final owned String). Byte-identical to the
+/// prior two-`to_string` trim chain — same trims in the same order.
+fn strip_prefixes_and_list_marker(s: &str) -> String {
+    let prefix_stripped = s
         .trim_start_matches('#')
         .trim_start()
         .trim_start_matches('>')
         .trim_start();
-
-    // Remove list markers (allocates the final owned String).
     strip_list_marker(prefix_stripped)
 }
 

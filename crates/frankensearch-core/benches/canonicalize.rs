@@ -189,6 +189,51 @@ fn bench_nfc(c: &mut Criterion) {
         b.iter(|| black_box(tail_new(black_box(t))));
     });
     pg.finish();
+
+    // strip_markdown_line fast-path tail (plain lines, no inline markdown):
+    // old copied the line (`to_string`) before trimming, then strip_list_marker
+    // allocated again (2 allocs); new trims the borrowed line and allocates once.
+    // `strip_list_marker` is private, so model its final owned-String step.
+    fn list_marker(s: &str) -> String {
+        s.to_owned() // stand-in for the final owned String strip_list_marker returns
+    }
+    fn smd_old(line: &str) -> String {
+        let result = line.to_string(); // prior fast path copied the whole line
+        let p = result
+            .trim_start_matches('#')
+            .trim_start()
+            .trim_start_matches('>')
+            .trim_start();
+        list_marker(p)
+    }
+    fn smd_new(line: &str) -> String {
+        let p = line
+            .trim_start_matches('#')
+            .trim_start()
+            .trim_start_matches('>')
+            .trim_start();
+        list_marker(p)
+    }
+    let mut sg = c.benchmark_group("strip_markdown_fastpath");
+    sg.bench_function("old", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += smd_old(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    sg.bench_function("new", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += smd_new(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    sg.finish();
 }
 
 criterion_group!(benches, bench_nfc);
