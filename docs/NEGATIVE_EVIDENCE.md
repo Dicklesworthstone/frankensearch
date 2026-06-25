@@ -113,6 +113,50 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-25 — `search_minimal` lexical trait hook regresses decisive BOLD rows (BlackThrush)
+
+**Lever:** add a `LexicalSearch::search_minimal` hook and route the non-semantic hash-tier
+lexical guard through Tantivy `search_doc_ids`, converting those id-only hits back to
+`ScoredResult` without loading stored metadata. The goal was to keep the measured BOLD
+lexical-guard wins while avoiding full stored-document materialization in product code.
+
+**Measured command (per-crate, warm target dir):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error \
+FRANKENSEARCH_BOLD_VERIFY_COMMAND="CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1" \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+**Artifact:** `/data/projects/.rch-targets/frankensearch-cod-a/criterion/bold_verify/summary.jsonl`
+at git `bd3f59e2bc40f2d048bee34feda74ccd1049959b` (`worker="unknown"`; local warm target lane).
+
+| Workload | Corpus hash | Tantivy-class p50 | full guard p50 | minimal guard p50 | minimal/full | minimal/Tantivy-class | Decision |
+|----------|-------------|-------------------|----------------|-------------------|--------------|-----------------------|----------|
+| `top10_exact_identifier/10000` | `2e78365a46a7c3b9` | 141 us | 119 us | 172 us | **1.445** | **1.220x slower** | reject |
+| `top10_high_fanout/10000` | `2e78365a46a7c3b9` | 122 us | 106 us | 122 us | **1.151** | 1.000x tie | reject |
+| `top10_short_keyword/10000` | `2e78365a46a7c3b9` | 59 us | 35 us | 45 us | **1.286** | 0.763x faster | reject vs shipped guard |
+| `top10_quoted_phrase/10000` | `2e78365a46a7c3b9` | 149 us | 145 us | 146 us | 1.007 | 0.980x noise | no keep signal |
+| `top10_natural_language/10000` | `2e78365a46a7c3b9` | 143 us | 151 us | 135 us | 0.894 | 0.944x faster | insufficient |
+| `top10_zero_hit/10000` | `2e78365a46a7c3b9` | 37 us | 36 us | 23 us | 0.639 | 0.622x faster | insufficient |
+| `limit_all/10000` | `2e78365a46a7c3b9` | 11.923 ms | 14.395 ms | 8.208 ms | 0.570 | 0.688x faster | insufficient |
+| `top10_exact_identifier/100000` | `13f1b0153f5adec9` | 1.299 ms | 1.238 ms | 1.246 ms | 1.006 | 0.959x faster | noise |
+| `top10_high_fanout/100000` | `13f1b0153f5adec9` | 611 us | 864 us | 1.000 ms | **1.157** | **1.637x slower** | reject |
+| `top10_natural_language/100000` | `13f1b0153f5adec9` | 737 us | 1.069 ms | 816 us | 0.763 | **1.107x slower** | reject |
+| `top10_quoted_phrase/100000` | `13f1b0153f5adec9` | 1.095 ms | 1.122 ms | 1.049 ms | 0.935 | 0.958x faster | insufficient |
+| `top10_short_keyword/100000` | `13f1b0153f5adec9` | 213 us | 69 us | 187 us | **2.710** | 0.878x faster | reject vs shipped guard |
+| `top10_zero_hit/100000` | `13f1b0153f5adec9` | 69 us | 59 us | 61 us | **1.034** | 0.884x faster | reject vs shipped guard |
+
+**Decision:** reverted the trait hook, Tantivy override, BOLD harness variant, and test. The
+minimal path wins some broad/materialization-heavy rows, but it gives back or destroys the exact
+identifier, high-fanout, and short-keyword rows that make the current lexical guard worth keeping.
+Do not add a public minimal-scored trait method until the backend can skip stored-document loading
+without hurting these high-selectivity paths. A future attempt should target a private id-first
+fusion path that avoids rebuilding owned `ScoredResult` rows for phase 1, then bench against this
+same BOLD harness.
+
 ### 2026-06-25 — BOLD-VERIFY: hash-hybrid does **not** beat Tantivy-class BM25 (BlackThrush)
 
 **Comparator shipped:** `frankensearch/benches/search_bench.rs` now includes
