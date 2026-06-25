@@ -247,29 +247,31 @@ fn strip_prefixes_and_list_marker(s: &str) -> Cow<'_, str> {
 /// when it lies on a word boundary: no adjacent alphanumeric or underscore on
 /// the side facing away from the emphasized span.
 fn strip_italic_underscores(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut keep = vec![true; n];
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
 
-    for i in 0..n {
-        if chars[i] != '_' {
-            continue;
+    // Single pass building the output directly: `prev` tracks the previous source
+    // char (kept or not) and `chars.peek()` supplies the next, so the same
+    // boundary test as before is applied without materializing a `Vec<char>` + a
+    // `Vec<bool>` + a final `collect` (three allocations → one). Byte-identical.
+    let mut result = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let drop_marker = if c == '_' {
+            let prev_is_word = prev.is_some_and(|p| is_word(p) && p != '_');
+            let next_is_word = chars.peek().is_some_and(|&n| is_word(n) && n != '_');
+            // Opening marker: preceded by non-word (or BOL), followed by word.
+            // Closing marker: preceded by word, followed by non-word (or EOL).
+            (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word)
+        } else {
+            false
+        };
+        if !drop_marker {
+            result.push(c);
         }
-        let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
-        let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
-        // Opening marker: preceded by non-word (or BOL), followed by word
-        // Closing marker: preceded by word, followed by non-word (or EOL)
-        if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
-            keep[i] = false;
-        }
+        prev = Some(c);
     }
-
-    chars
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(c, k)| if k { Some(c) } else { None })
-        .collect()
+    result
 }
 
 /// Strip markdown links: `[text](url)` → `text`.
@@ -614,6 +616,54 @@ mod tests {
         assert!(!result.contains("  "));
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
+    }
+
+    #[test]
+    fn strip_italic_underscores_matches_reference() {
+        // Reference: the prior Vec<char> + Vec<bool> + collect implementation.
+        // The single-pass version must be byte-identical for every input,
+        // especially snake_case (underscores kept) vs `_italic_` (markers dropped).
+        fn reference(text: &str) -> String {
+            let chars: Vec<char> = text.chars().collect();
+            let n = chars.len();
+            let mut keep = vec![true; n];
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            for i in 0..n {
+                if chars[i] != '_' {
+                    continue;
+                }
+                let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
+                let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
+                if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
+                    keep[i] = false;
+                }
+            }
+            chars
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(c, k)| if k { Some(c) } else { None })
+                .collect()
+        }
+        let cases = [
+            "",
+            "_",
+            "__",
+            "snake_case_variable",
+            "_italic_",
+            "_emphasized text_",
+            "a _b_ c",
+            "leading_ and _trailing",
+            "mixed snake_case and _italic_ together",
+            "fn compute_value(a_b, c_d) -> retry_count",
+            "naïve_façade_test", // non-ASCII word chars around underscores
+            "x_1_2_y",
+            "_a_b_c_",
+            "trailing_",
+            "_leading",
+        ];
+        for c in cases {
+            assert_eq!(strip_italic_underscores(c), reference(c), "input={c:?}");
+        }
     }
 
     #[test]

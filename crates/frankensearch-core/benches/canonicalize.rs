@@ -255,6 +255,61 @@ fn bench_nfc(c: &mut Criterion) {
                 .trim_start(),
         )
     }
+    // strip_italic_underscores: old (Vec<char> + Vec<bool> + collect = 3 allocs)
+    // vs new (single pass building the output = 1 alloc). Hit by every snake_case
+    // line (common in code search), where almost all underscores are kept.
+    fn siu_old(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let mut keep = vec![true; n];
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        for i in 0..n {
+            if chars[i] != '_' {
+                continue;
+            }
+            let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
+            let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
+            if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
+                keep[i] = false;
+            }
+        }
+        chars
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(c, k)| if k { Some(c) } else { None })
+            .collect()
+    }
+    fn siu_new(text: &str) -> String {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut result = String::with_capacity(text.len());
+        let mut prev: Option<char> = None;
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let drop_marker = c == '_' && {
+                let prev_is_word = prev.is_some_and(|p| is_word(p) && p != '_');
+                let next_is_word = chars.peek().is_some_and(|&n| is_word(n) && n != '_');
+                (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word)
+            };
+            if !drop_marker {
+                result.push(c);
+            }
+            prev = Some(c);
+        }
+        result
+    }
+    let snake_doc = "let retry_count = compute_value(a_b, c_d);\n\
+                     fn handle_error_case(self_ref, max_retries) -> bool_result\n"
+        .repeat(20);
+    debug_assert_eq!(siu_old(&snake_doc), siu_new(&snake_doc));
+    let mut ig = c.benchmark_group("strip_italic_underscores");
+    ig.bench_with_input("old", snake_doc.as_str(), |b, t| {
+        b.iter(|| black_box(siu_old(black_box(t))));
+    });
+    ig.bench_with_input("new", snake_doc.as_str(), |b, t| {
+        b.iter(|| black_box(siu_new(black_box(t))));
+    });
+    ig.finish();
+
     let mut cg = c.benchmark_group("strip_markdown_cow");
     cg.bench_function("string", |b| {
         b.iter(|| {
