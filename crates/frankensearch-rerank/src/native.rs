@@ -224,16 +224,23 @@ fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
     let mut q_hm = vec![0.0f32; NH * s_len * HD];
     let mut kt = vec![0.0f32; NH * HD * s_len];
     let mut v_hm = vec![0.0f32; NH * s_len * HD];
+    // Q and V: contiguous head-major copies (each token's HD block is contiguous).
     for j in 0..s_len {
         let base = j * STRIDE;
         for h in 0..NH {
-            let (qb, kb, vb) = (base + h * HD, base + H + h * HD, base + 2 * H + h * HD);
             let hm = (h * s_len + j) * HD;
-            q_hm[hm..hm + HD].copy_from_slice(&qkv[qb..qb + HD]);
-            v_hm[hm..hm + HD].copy_from_slice(&qkv[vb..vb + HD]);
-            let ktbase = h * HD * s_len;
-            for d in 0..HD {
-                kt[ktbase + d * s_len + j] = qkv[kb + d];
+            q_hm[hm..hm + HD].copy_from_slice(&qkv[base + h * HD..base + h * HD + HD]);
+            v_hm[hm..hm + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+        }
+    }
+    // Kᵀ: each output row `kt[h, d, :]` is written sequentially (contiguous stores)
+    // from the strided source column, instead of strided stores into kt.
+    for h in 0..NH {
+        for d in 0..HD {
+            let col = H + h * HD + d;
+            let row = &mut kt[h * HD * s_len + d * s_len..h * HD * s_len + d * s_len + s_len];
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = qkv[j * STRIDE + col];
             }
         }
     }
