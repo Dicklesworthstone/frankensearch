@@ -322,3 +322,43 @@ demonstrated gain (and a hint of regression). Per "REVERT ~0-gain", reverted to 
 `[u32; 8]` form. The byte-path SIMD load (`c0e9c80`) stays — it showed a consistent directional
 improvement on both dims; the slice path did not. A clean keep/reject would need an in-process
 "SIMD-widen + scalar-load" baseline added to `dot_product.rs` (left for a future pass).
+
+### 2026-06-25 — non-semantic lexical guard is NOT a universal Tantivy-class win (BlackThrush)
+
+**Kept change, bounded claim.** The hash-tier lexical guard is a real improvement over the old
+hash-hybrid path (see `docs/PERF_LEDGER.md`), but the same BOLD-VERIFY run still shows several
+rows slower than the `tantivy_doc_ids` lexical proxy used for Lucene/Tantivy/Meilisearch-class
+comparison.
+
+Command:
+
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error \
+    cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 3
+```
+
+Worker: `vmi1152480` (`[RCH] remote vmi1152480 (804.5s)`). Incumbent:
+`tantivy_doc_ids`.
+
+| Workload | guarded p50 ratio | guarded p95 ratio | verdict |
+|----------|-------------------|-------------------|---------|
+| `top10/10000/exact_identifier` | 1.074 | 1.359 | near, but not a win |
+| `top10/10000/quoted_phrase` | 1.031 | 1.330 | near, but not a win |
+| `top10/10000/natural_language` | 1.040 | 1.067 | near, but not a win |
+| `top10/10000/zero_hit` | 1.000 | 3.333 | p50 parity, tail miss |
+| `top10/100000/exact_identifier` | 1.161 | 1.820 | miss |
+| `top10/100000/short_keyword` | 1.208 | 1.439 | miss |
+| `top10/100000/quoted_phrase` | 2.068 | 1.473 | miss |
+| `top10/100000/high_fanout` | 1.010 | 1.236 | near, but not a win |
+
+**Interpretation:** skipping hash embedding/vector/RRF is necessary but not sufficient for full
+lexical-engine parity. The remaining overhead is in frankensearch's result materialization and
+the fact that the incumbent comparator returns doc ids, while the guarded path produces
+`ScoredResult`-class results. Do not claim Lucene/Tantivy/Meilisearch dominance from this change.
+
+**Next lever:** avoid eager `ScoredResult` string/materialization for lexical-only Phase 1
+(borrowed/id-first result lane or lazy metadata resolution), then rerun the same BOLD matrix.

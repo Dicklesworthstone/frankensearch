@@ -92,6 +92,14 @@ fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
     scaled.max(1)
 }
 
+fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
+    if embedder.is_semantic() || embedder.category() != ModelCategory::HashEmbedder {
+        return false;
+    }
+    let id = embedder.id();
+    id.starts_with("fnv1a-") || id.starts_with("jl-")
+}
+
 /// Progressive two-tier search orchestrator.
 ///
 /// Coordinates fast-tier embedding, optional lexical search, RRF fusion,
@@ -911,15 +919,59 @@ impl TwoTierSearcher {
         let base_candidates =
             candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
 
+        let lexical_short_circuit = self.lexical.is_some()
+            && self.quality_embedder.is_none()
+            && is_shipped_hash_embedder(self.fast_embedder.as_ref());
+
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
         let semantic_budget =
             scaled_budget(base_candidates, query_class.semantic_budget_multiplier());
-        let lexical_budget =
-            scaled_budget(base_candidates, query_class.lexical_budget_multiplier());
+        let lexical_budget = if lexical_short_circuit {
+            candidate_target
+        } else {
+            scaled_budget(base_candidates, query_class.lexical_budget_multiplier())
+        };
 
         let rrf_config = RrfConfig {
             k: self.effective_rrf_k(query_class),
         };
+
+        if lexical_short_circuit && let Some(lex) = self.lexical.as_ref() {
+            let start_lex = Instant::now();
+            let lex_res = lex.search(cx, semantic_query, lexical_budget).await;
+            match lex_res {
+                Ok(results) => {
+                    metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
+                    metrics.lexical_candidates = results.len();
+                    let results = if let Some(exclusions) = normalized_exclusions {
+                        let filtered = filter_scored_results_by_negations(
+                            results, exclusions, text_fn, "lexical",
+                        );
+                        metrics.lexical_candidates = filtered.len();
+                        filtered
+                    } else {
+                        results
+                    };
+                    metrics.skip_reason =
+                        Some("non_semantic_fast_embedder_lexical_short_circuit".to_owned());
+                    metrics.semantic_candidates = 0;
+                    metrics.vector_search_ms = 0.0;
+                    metrics.rrf_fusion_ms = 0.0;
+                    return Ok(results.into_iter().take(k).collect());
+                }
+                Err(e) => {
+                    metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
+                    if matches!(e, SearchError::Cancelled { .. }) {
+                        return Err(e);
+                    }
+                    self.export_error(&e);
+                    tracing::warn!(
+                        error = %e,
+                        "lexical short-circuit failed, falling back to vector path"
+                    );
+                }
+            }
+        }
 
         // If the embedder is an API embedder (genuinely async), we sequentially await
         // the futures to avoid blocking the executor inside `rayon::join` and to prevent
@@ -1004,6 +1056,18 @@ impl TwoTierSearcher {
                 metrics.lexical_candidates = filtered.len();
                 filtered
             });
+        }
+
+        if lexical_short_circuit
+            && let Some(lexical) = lexical_results.as_ref()
+            && fast_embed_result.is_ok()
+        {
+            metrics.skip_reason =
+                Some("non_semantic_fast_embedder_lexical_short_circuit".to_owned());
+            metrics.semantic_candidates = 0;
+            metrics.vector_search_ms = 0.0;
+            metrics.rrf_fusion_ms = 0.0;
+            return Ok(lexical.iter().take(k).cloned().collect());
         }
 
         match fast_embed_result {
@@ -2701,6 +2765,50 @@ mod tests {
         }
     }
 
+    struct NonSemanticEmbedder {
+        id: &'static str,
+        dimension: usize,
+    }
+
+    impl NonSemanticEmbedder {
+        const fn new(id: &'static str, dimension: usize) -> Self {
+            Self { id, dimension }
+        }
+    }
+
+    impl Embedder for NonSemanticEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let dim = self.dimension;
+            Box::pin(async move {
+                let mut vec = vec![0.0; dim];
+                if !vec.is_empty() {
+                    vec[0] = 1.0;
+                }
+                Ok(vec)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
     // ─── Failing Embedder ───────────────────────────────────────────────
 
     struct FailingEmbedder;
@@ -3696,6 +3804,48 @@ mod tests {
 
             assert!(got_initial, "should fall back to lexical-only results");
             assert!(initial_count > 0, "should have lexical results");
+        });
+    }
+
+    #[test]
+    fn non_semantic_fast_embedder_short_circuits_to_lexical() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
+                .with_lexical(lexical);
+
+            let mut initial_results = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "rust ownership",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .expect("lexical short-circuit should succeed");
+
+            assert_eq!(initial_results.len(), 3);
+            assert!(
+                initial_results
+                    .iter()
+                    .all(|result| matches!(result.source, ScoreSource::Lexical))
+            );
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert!(metrics.fast_embed_ms.abs() < f64::EPSILON);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.lexical_candidates, 3);
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_lexical_short_circuit")
+            );
         });
     }
 

@@ -336,6 +336,20 @@ fn frankensearch_hash_hybrid_search(
 }
 
 #[cfg(feature = "lexical")]
+fn frankensearch_hash_lexical_guard_search(
+    fixture: &BoldVerifyFixture,
+    cx: &asupersync::Cx,
+    query: &BoldVerifyQuery,
+) {
+    let limit = query.limit.min(fixture.doc_count);
+    let lexical_hits = fixture
+        .lexical
+        .search_doc_ids(cx, query.text, limit)
+        .expect("lexical-guard candidate search");
+    black_box(lexical_doc_ids_as_scored(&lexical_hits));
+}
+
+#[cfg(feature = "lexical")]
 fn percentile(sorted: &[u128], pct: usize) -> u128 {
     let len = sorted.len();
     let index = len.saturating_mul(pct).div_ceil(100).saturating_sub(1);
@@ -399,6 +413,77 @@ fn bold_verify_output_dir() -> Option<PathBuf> {
 }
 
 #[cfg(feature = "lexical")]
+#[allow(clippy::too_many_arguments)]
+fn write_bold_verify_row(
+    jsonl: &mut BufWriter<File>,
+    markdown: &mut BufWriter<File>,
+    workload: &str,
+    fixture: &BoldVerifyFixture,
+    query: &BoldVerifyQuery,
+    challenger_name: &str,
+    incumbent: LatencyStats,
+    challenger: LatencyStats,
+    sha: &str,
+    worker: &str,
+    command: &str,
+) {
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = challenger.p50 as f64 / incumbent.p50.max(1) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let p95_ratio = challenger.p95 as f64 / incumbent.p95.max(1) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let p99_ratio = challenger.p99 as f64 / incumbent.p99.max(1) as f64;
+    let row = serde_json::json!({
+        "workload": workload,
+        "corpus_docs": fixture.doc_count,
+        "query_class": query.class,
+        "query": query.text,
+        "incumbent": "tantivy_doc_ids",
+        "frankensearch": challenger_name,
+        "incumbent_p50_us": incumbent.p50,
+        "incumbent_p95_us": incumbent.p95,
+        "incumbent_p99_us": incumbent.p99,
+        "frankensearch_p50_us": challenger.p50,
+        "frankensearch_p95_us": challenger.p95,
+        "frankensearch_p99_us": challenger.p99,
+        "ratio": ratio,
+        "p95_ratio": p95_ratio,
+        "p99_ratio": p99_ratio,
+        "rss_bytes": current_rss_bytes(),
+        "git_sha": sha,
+        "worker": worker,
+        "command": command,
+        "corpus_hash": fixture.corpus_hash,
+    });
+    writeln!(jsonl, "{row}").expect("write JSONL row");
+    println!("BOLD_VERIFY_JSONL {row}");
+    writeln!(
+        markdown,
+        "| {workload} | {} | {} | {challenger_name} | {} | {} | {:.3} | {:.3} | {:.3} | {} |",
+        fixture.doc_count,
+        query.class,
+        incumbent.p50,
+        challenger.p50,
+        ratio,
+        p95_ratio,
+        p99_ratio,
+        fixture.corpus_hash,
+    )
+    .expect("write MD row");
+    println!(
+        "BOLD_VERIFY_MD | {workload} | {} | {} | {challenger_name} | {} | {} | {:.3} | {:.3} | {:.3} | {} |",
+        fixture.doc_count,
+        query.class,
+        incumbent.p50,
+        challenger.p50,
+        ratio,
+        p95_ratio,
+        p99_ratio,
+        fixture.corpus_hash,
+    );
+}
+
+#[cfg(feature = "lexical")]
 fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let Some(out_dir) = bold_verify_output_dir() else {
         return;
@@ -410,12 +495,12 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let mut markdown = BufWriter::new(File::create(&markdown_path).expect("create MD summary"));
     writeln!(
         markdown,
-        "| workload | corpus_docs | query_class | incumbent_p50_us | frankensearch_p50_us | ratio | p95_ratio | p99_ratio | corpus_hash |"
+        "| workload | corpus_docs | query_class | frankensearch | incumbent_p50_us | frankensearch_p50_us | ratio | p95_ratio | p99_ratio | corpus_hash |"
     )
     .expect("write MD header");
     writeln!(
         markdown,
-        "|----------|-------------|-------------|------------------|----------------------|-------|-----------|-----------|-------------|"
+        "|----------|-------------|-------------|---------------|------------------|----------------------|-------|-----------|-----------|-------------|"
     )
     .expect("write MD separator");
 
@@ -423,7 +508,7 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let sha = git_sha();
     let worker = worker_id();
     let command = std::env::var("FRANKENSEARCH_BOLD_VERIFY_COMMAND").unwrap_or_else(|_| {
-        "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1".to_owned()
+        "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3".to_owned()
     });
 
     for fixture in fixtures {
@@ -443,63 +528,39 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
             let samples = if fixture.doc_count >= 100_000 { 12 } else { 25 };
             let incumbent =
                 measure_latency_us(|| tantivy_only_search(fixture, &cx, &query), samples);
-            let challenger = measure_latency_us(
+            let hybrid = measure_latency_us(
                 || frankensearch_hash_hybrid_search(fixture, &cx, &query),
                 samples,
             );
-            #[allow(clippy::cast_precision_loss)]
-            let ratio = challenger.p50 as f64 / incumbent.p50.max(1) as f64;
-            #[allow(clippy::cast_precision_loss)]
-            let p95_ratio = challenger.p95 as f64 / incumbent.p95.max(1) as f64;
-            #[allow(clippy::cast_precision_loss)]
-            let p99_ratio = challenger.p99 as f64 / incumbent.p99.max(1) as f64;
-            let row = serde_json::json!({
-                "workload": workload,
-                "corpus_docs": fixture.doc_count,
-                "query_class": query.class,
-                "query": query.text,
-                "incumbent": "tantivy_doc_ids",
-                "frankensearch": "hash_hybrid_lexical_short_circuit_vector_rrf",
-                "incumbent_p50_us": incumbent.p50,
-                "incumbent_p95_us": incumbent.p95,
-                "incumbent_p99_us": incumbent.p99,
-                "frankensearch_p50_us": challenger.p50,
-                "frankensearch_p95_us": challenger.p95,
-                "frankensearch_p99_us": challenger.p99,
-                "ratio": ratio,
-                "p95_ratio": p95_ratio,
-                "p99_ratio": p99_ratio,
-                "rss_bytes": current_rss_bytes(),
-                "git_sha": sha,
-                "worker": worker,
-                "command": command,
-                "corpus_hash": fixture.corpus_hash,
-            });
-            writeln!(jsonl, "{row}").expect("write JSONL row");
-            println!("BOLD_VERIFY_JSONL {row}");
-            writeln!(
-                markdown,
-                "| {workload} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {} |",
-                fixture.doc_count,
-                query.class,
-                incumbent.p50,
-                challenger.p50,
-                ratio,
-                p95_ratio,
-                p99_ratio,
-                fixture.corpus_hash,
-            )
-            .expect("write MD row");
-            println!(
-                "BOLD_VERIFY_MD | {workload} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {} |",
-                fixture.doc_count,
-                query.class,
-                incumbent.p50,
-                challenger.p50,
-                ratio,
-                p95_ratio,
-                p99_ratio,
-                fixture.corpus_hash,
+            write_bold_verify_row(
+                &mut jsonl,
+                &mut markdown,
+                &workload,
+                fixture,
+                &query,
+                "hash_hybrid_tantivy_vector_rrf",
+                incumbent,
+                hybrid,
+                &sha,
+                &worker,
+                &command,
+            );
+            let guarded = measure_latency_us(
+                || frankensearch_hash_lexical_guard_search(fixture, &cx, &query),
+                samples,
+            );
+            write_bold_verify_row(
+                &mut jsonl,
+                &mut markdown,
+                &workload,
+                fixture,
+                &query,
+                "hash_lexical_guard_tantivy",
+                incumbent,
+                guarded,
+                &sha,
+                &worker,
+                &command,
             );
         }
     }
@@ -625,6 +686,21 @@ fn bench_tantivy_class_comparator(c: &mut Criterion) {
                 |b| {
                     b.iter(|| {
                         frankensearch_hash_hybrid_search(
+                            black_box(fixture),
+                            &cx,
+                            black_box(&query),
+                        );
+                    });
+                },
+            );
+            group.bench_function(
+                BenchmarkId::new(
+                    format!("frankensearch_hash_lexical_guard/{workload}"),
+                    fixture.doc_count,
+                ),
+                |b| {
+                    b.iter(|| {
+                        frankensearch_hash_lexical_guard_search(
                             black_box(fixture),
                             &cx,
                             black_box(&query),

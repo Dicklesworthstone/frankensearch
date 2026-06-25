@@ -212,3 +212,43 @@ Worker: `ovh-a`; RCH reported remote completion in `608.1s`.
 | 2026-06-24 | frankensearch | `score_normalization/z_score/10000` | `43.159 us` | blocked by `bd-ui41` | baseline only |
 | 2026-06-24 | frankensearch | `index_io/write/10000` | `13.812 ms` | blocked by `bd-ui41` | baseline only |
 | 2026-06-24 | frankensearch | `index_io/open/10000` | `19.865 us` | blocked by `bd-ui41` | baseline only |
+
+### 2026-06-25 — non-semantic hash tier lexical guard (BlackThrush)
+
+**Lever:** when a lexical backend is present, no quality embedder is configured, and the fast
+embedder is one of the shipped non-semantic hash tiers (`fnv1a-*`/`jl-*`), Phase 1 now returns
+lexical results directly instead of paying hash embedding, vector scan, and RRF. This is the
+correct behavior for Lucene/Tantivy/Meilisearch-class lexical comparisons: a hash vector
+contributes no semantic relevance, so fusing it only burns latency. If lexical search fails
+non-cancel, the old vector fallback still runs.
+
+**BOLD-VERIFY command:**
+
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error \
+    cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 3
+```
+
+Worker: `vmi1152480` (`[RCH] remote vmi1152480 (804.5s)`). Incumbent is
+`tantivy_doc_ids`, used here as the Lucene/Tantivy/Meilisearch-class lexical proxy.
+
+**Kept evidence:** the guard collapses the previous hash-hybrid penalty by removing useless
+semantic work and wins several Tantivy-class rows outright:
+
+| Workload | old hash-hybrid ratio | guarded ratio | guarded p95 ratio | status |
+|----------|-----------------------|---------------|-------------------|--------|
+| `top10/10000/high_fanout` | 18.180 | **0.978** | **0.756** | beats Tantivy-class |
+| `limit_all/10000` | 2.086 | **0.873** | **0.611** | beats Tantivy-class |
+| `top10/100000/natural_language` | 5.182 | **0.982** | 1.186 | p50 beats, p95 near |
+| `top10/10000/zero_hit` | 54.333 | **1.000** | 3.333 | p50 parity; tail miss |
+| `top10/100000/zero_hit` | 136.696 | **1.043** | **0.722** | near p50 parity; p95 win |
+
+**Scope:** this is not a universal BOLD victory over Tantivy-class; remaining misses are recorded
+in `docs/NEGATIVE_EVIDENCE.md`. It is kept because every measured row dramatically improves over
+the existing hash-hybrid path, several rows beat the lexical incumbent, and the behavior is more
+semantically honest for hash-only fast tier searches. Next lever should attack the residual
+`ScoredResult` materialization and high-selectivity lexical overhead rather than vector/RRF.
