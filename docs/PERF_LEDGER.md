@@ -114,8 +114,17 @@ full top-10 pipeline (score all N + select), measured same-process:
 So the int8 ADC two-pass is **~2.6–3.0× faster on the actual top-k search workload with recall@10
 = 1.0** (mult=20, random vectors; both pipelines pay a conservative N-element sort, so production
 bounded-heap selection would only widen the gap). This is the search-level proof, not just a
-kernel ratio. Remaining for the product win: wire it into `search.rs`/`in_memory.rs` behind an
-int8 sidecar (additive, exact f16 fallback) + re-measure recall on a real corpus (`bd-b5wl`).
+kernel ratio.
+
+**Wired into the product (`InMemoryVectorIndex::search_top_k_int8_two_pass`):** the in-memory index
+now precomputes an int8 slab (one corpus-wide max-abs scale, ranking-preserving) at construction
+and exposes an opt-in two-pass method — int8 pass-1 (top `limit·mult`, deterministic total-order
+select) → exact f16 rescore with the *same* bounded-heap selection as the exact path. It is
+**bit-identical** to `search_top_k` whenever pass-1 recall is 1 (proven by
+`int8_two_pass_matches_exact_topk`: identical doc-ids + scores at mult=10 over 200 vectors), and
+falls back to exact if the int8 slab is absent. Existing exact paths are untouched. 351/351 index
+lib tests green. **Remaining:** wire the mmap FSVI `search.rs` path (needs an on-disk int8 sidecar
+artifact) + re-measure recall on a real clustered-embedding corpus and tune `mult` (`bd-b5wl`).
 
 These rows are routing evidence for future levers, not wins.
 

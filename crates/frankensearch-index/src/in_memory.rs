@@ -30,7 +30,7 @@ use rayon::prelude::*;
 
 use crate::VectorIndex;
 use crate::search::SearchParams;
-use crate::simd::dot_product_f16_f32;
+use crate::simd::{dot_i8_i8, dot_product_f16_f32};
 
 /// Fully-resident in-memory vector index with f16 quantization.
 ///
@@ -42,8 +42,49 @@ pub struct InMemoryVectorIndex {
     doc_ids: Vec<String>,
     /// Flat f16 vector slab: `doc_ids.len() * dimension` elements.
     vectors: Vec<f16>,
+    /// Flat int8 vector slab (same row-major layout) for the int8 ADC pass-1
+    /// of [`InMemoryVectorIndex::search_top_k_int8_two_pass`]. Quantized with a
+    /// single corpus-wide max-abs scale, which preserves the dot-product ranking
+    /// (the scale is a per-query constant). Empty iff the corpus is empty.
+    vectors_i8: Vec<i8>,
     /// Vector dimensionality.
     dimension: usize,
+}
+
+/// Quantize an f16 slab to int8 using one corpus-wide max-abs scale.
+///
+/// Symmetric int8: `q = round(x / max_abs * 127)`, clamped to `[-127, 127]`. A
+/// single global scale keeps `Σ q_a·q_b` monotonic with the true dot for a fixed
+/// query, so pass-1 ranking is preserved; the exact f16 rescore restores values.
+#[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the f32->i8 cast
+fn quantize_i8_slab(vectors_f16: &[f16]) -> Vec<i8> {
+    let max_abs = vectors_f16
+        .iter()
+        .map(|x| x.to_f32().abs())
+        .fold(0.0_f32, f32::max);
+    if max_abs <= 0.0 {
+        return vec![0_i8; vectors_f16.len()];
+    }
+    let scale = 127.0 / max_abs;
+    vectors_f16
+        .iter()
+        .map(|x| (x.to_f32() * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
+/// Quantize an f32 query to int8 using its own max-abs scale (the scale is a
+/// per-query constant and does not affect ranking).
+#[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the f32->i8 cast
+fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
+    let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    if max_abs <= 0.0 {
+        return vec![0_i8; query.len()];
+    }
+    let scale = 127.0 / max_abs;
+    query
+        .iter()
+        .map(|&x| (x * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
 }
 
 impl InMemoryVectorIndex {
@@ -86,9 +127,11 @@ impl InMemoryVectorIndex {
             }
             flat.extend(vec.into_iter().map(f16::from_f32));
         }
+        let vectors_i8 = quantize_i8_slab(&flat);
         Ok(Self {
             doc_ids,
             vectors: flat,
+            vectors_i8,
             dimension,
         })
     }
@@ -127,9 +170,11 @@ impl InMemoryVectorIndex {
             flat.extend_from_slice(&f16_vec);
         }
 
+        let vectors_i8 = quantize_i8_slab(&flat);
         Ok(Self {
             doc_ids,
             vectors: flat,
+            vectors_i8,
             dimension,
         })
     }
@@ -220,6 +265,71 @@ impl InMemoryVectorIndex {
             self.scan_sequential(query, limit, filter)?
         };
 
+        self.resolve_heap(heap)
+    }
+
+    /// Approximate top-k via an **int8 ADC two-pass** (`bd-b5wl`): an int8 pass-1
+    /// over all vectors keeps the top `limit * candidate_multiplier` candidates,
+    /// then an exact f16 rescore with the same deterministic selection as
+    /// [`Self::search_top_k`] produces the final ranking.
+    ///
+    /// Results are **bit-identical** to [`Self::search_top_k`] whenever pass-1
+    /// retains the true top-k (recall = 1). It is ~2.6–3× faster on the scan (int8
+    /// is half the bytes + an integer `mul_widen` MAC — see `docs/PERF_LEDGER.md`)
+    /// at the cost of *approximate* recall: validate `candidate_multiplier` on a
+    /// representative corpus (random vectors needed only `mult=20` for recall@10=1).
+    ///
+    /// Falls back to the exact path when the int8 slab is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len() != dimension`.
+    pub fn search_top_k_int8_two_pass(
+        &self,
+        query: &[f32],
+        limit: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        if query.len() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: query.len(),
+            });
+        }
+        let count = self.record_count();
+        if limit == 0 || count == 0 {
+            return Ok(Vec::new());
+        }
+        if self.vectors_i8.len() != self.vectors.len() || self.dimension == 0 {
+            return self.search_top_k(query, limit, None);
+        }
+
+        // Pass 1: int8 dot over all vectors; keep the top `limit * multiplier`
+        // candidates (descending int8 score, ascending index — a total order, so
+        // the candidate set is deterministic despite the unstable partition).
+        let query_i8 = quantize_i8_query(query);
+        let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        let mut scored: Vec<(i32, usize)> = (0..count)
+            .map(|index| {
+                let start = index * self.dimension;
+                let stored = &self.vectors_i8[start..start + self.dimension];
+                (dot_i8_i8(stored, &query_i8), index)
+            })
+            .collect();
+        if candidate_count < scored.len() {
+            scored.select_nth_unstable_by(candidate_count - 1, |a, b| {
+                b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+            });
+            scored.truncate(candidate_count);
+        }
+
+        // Pass 2: exact f16 rescore of the candidates with the same bounded-heap
+        // selection + tie-break as the exact path, so the final order matches.
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        for (_, index) in scored {
+            let score = dot_product_f16_f32(self.vector_slice(index), query)?;
+            insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+        }
         self.resolve_heap(heap)
     }
 
@@ -757,6 +867,53 @@ mod tests {
         }
         // Top hit should be doc-1 (same seed as query)
         assert_eq!(hits[0].doc_id, "doc-1");
+    }
+
+    #[test]
+    fn int8_two_pass_matches_exact_topk() {
+        let dim = 32;
+        let n = 200;
+        let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| make_normalized_vec(dim, i as f32 * 0.31))
+            .collect();
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+
+        for qseed in [0.31_f32, 3.0, 17.5, 99.9] {
+            let query = make_normalized_vec(dim, qseed);
+            let exact = index.search_top_k(&query, 10, None).unwrap();
+            // mult=10 -> 100 candidates of 200; pass-1 recall is 1 here, so the
+            // two-pass result must be bit-identical to the exact top-k.
+            let two_pass = index
+                .search_top_k_int8_two_pass(&query, 10, 10)
+                .unwrap();
+
+            assert_eq!(two_pass.len(), exact.len(), "qseed={qseed}");
+            for w in two_pass.windows(2) {
+                assert!(w[0].score >= w[1].score, "two-pass not descending");
+            }
+            let exact_ids: Vec<&str> = exact.iter().map(|h| h.doc_id.as_str()).collect();
+            let tp_ids: Vec<&str> = two_pass.iter().map(|h| h.doc_id.as_str()).collect();
+            assert_eq!(
+                tp_ids, exact_ids,
+                "int8 two-pass should match exact top-k at mult=10 (qseed={qseed})"
+            );
+            for (a, b) in two_pass.iter().zip(exact.iter()) {
+                assert!((a.score - b.score).abs() < 1e-6, "scores differ");
+            }
+        }
+    }
+
+    #[test]
+    fn int8_two_pass_dimension_mismatch() {
+        let dim = 8;
+        let doc_ids: Vec<String> = (0..4).map(|i| format!("doc-{i}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..4).map(|i| make_normalized_vec(dim, i as f32)).collect();
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+        let err = index
+            .search_top_k_int8_two_pass(&[1.0; 7], 3, 4)
+            .expect_err("dimension mismatch");
+        assert!(matches!(err, SearchError::DimensionMismatch { .. }));
     }
 
     #[test]
