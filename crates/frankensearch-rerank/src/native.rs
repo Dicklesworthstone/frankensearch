@@ -129,7 +129,8 @@ fn fast_softmax_last_dim(mut data: Vec<f32>, rows: usize, n: usize, scale: f32) 
 /// weights are stored once and cloned cheaply into every pooled session.
 #[derive(Clone)]
 struct QLinear {
-    /// Row-major `[out, in]` int8 weights.
+    /// Int8 weights. Row-major `[out, in]` when `packed` is false; NR=4
+    /// panel-interleaved (from `pack_int8_weights_nr4`) when `packed` is true.
     w_i8: Arc<Vec<i8>>,
     /// Per-output-channel f32 dequantization scales (len `out`).
     w_scales: Arc<Vec<f32>>,
@@ -137,6 +138,8 @@ struct QLinear {
     bias: Arc<Vec<f32>>,
     out: usize,
     in_: usize,
+    /// Whether `w_i8` is NR=4-packed (pre-packed SDOT kernel) vs row-major.
+    packed: bool,
 }
 
 /// Owns the frankentorch session and the loaded weight tensors. Mutated during the
@@ -180,10 +183,16 @@ impl Model {
         let w_i8 = Arc::clone(&q.w_i8);
         let w_scales = Arc::clone(&q.w_scales);
         let bias = Arc::clone(&q.bias);
-        let (out, in_) = (q.out, q.in_);
-        self.s
-            .tensor_linear_int8_dynamic(x, &w_i8, &w_scales, out, in_, Some(&bias))
-            .map_err(|e| rerank_err("linear.int8", e))
+        let (out, in_, packed) = (q.out, q.in_, q.packed);
+        if packed {
+            self.s
+                .tensor_linear_int8_dynamic_prepacked(x, &w_i8, &w_scales, out, in_, Some(&bias))
+                .map_err(|e| rerank_err("linear.int8.packed", e))
+        } else {
+            self.s
+                .tensor_linear_int8_dynamic(x, &w_i8, &w_scales, out, in_, Some(&bias))
+                .map_err(|e| rerank_err("linear.int8", e))
+        }
     }
 
     fn ln(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
@@ -687,6 +696,17 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                 });
             }
             let (w_i8, w_scales) = quantize_per_output_channel_i8(vals, out, in_);
+            // Pre-pack the static weights into the NR=4 SDOT tile layout once at
+            // load (the zero-per-forward weight-packing win) on aarch64, where the
+            // packed micro-kernel runs and `out % 4 == 0 && in % 16 == 0` holds for
+            // every linear except the 1-row classifier. Other targets / the
+            // classifier keep row-major + the portable kernel.
+            let packed = cfg!(target_arch = "aarch64") && out % 4 == 0 && in_ % 16 == 0;
+            let w_i8 = if packed {
+                ft_api::pack_int8_weights_nr4(&w_i8, out, in_)
+            } else {
+                w_i8
+            };
             let bias = raw
                 .get(&format!("{prefix}.bias"))
                 .map(|(b, _)| b.clone())
@@ -699,6 +719,7 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                     bias: Arc::new(bias),
                     out,
                     in_,
+                    packed,
                 },
             );
         } else if name.ends_with(".bias") && !name.contains("LayerNorm") {
