@@ -33,6 +33,11 @@ time = { workspace = true }
 asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
 tracing-test = "0.2"
+criterion = { workspace = true }
+
+[[bench]]
+name = "rrf_fuse"
+harness = false
 
 [lints]
 workspace = true

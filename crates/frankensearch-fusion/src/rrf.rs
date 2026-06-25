@@ -12,6 +12,8 @@
 //! Documents appearing in multiple sources get their contributions summed,
 //! which naturally boosts multi-source hits.
 
+use std::collections::hash_map::Entry;
+
 use ahash::AHashMap;
 use frankensearch_core::{FusedHit, ScoredResult, VectorHit};
 use tracing::{Level, debug, instrument};
@@ -200,18 +202,17 @@ pub fn rrf_fuse_with_graph(
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
-        // If we've already seen this doc in this source (lexical), skip it.
-        // We iterate in rank order (0, 1, ...), so the first occurrence is the best one.
-        if let Some(existing) = hits.get(result.doc_id.as_str())
-            && existing.lexical_rank.is_some()
-        {
-            continue;
-        }
-
         let rrf_contribution = rank_contribution(k, rank);
 
-        hits.entry(result.doc_id.as_str())
-            .and_modify(|hit| {
+        // Single hash lookup via `entry` instead of `get` (dedup probe) + `entry`
+        // (update). We iterate in rank order (0, 1, ...), so the first occurrence
+        // is the best one: if this doc already has a lexical rank, keep it and skip.
+        match hits.entry(result.doc_id.as_str()) {
+            Entry::Occupied(mut e) => {
+                let hit = e.get_mut();
+                if hit.lexical_rank.is_some() {
+                    continue;
+                }
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
@@ -219,34 +220,35 @@ pub fn rrf_fuse_with_graph(
                 if hit.semantic_rank.is_some() {
                     hit.in_both_sources = true;
                 }
-            })
-            .or_insert_with(|| FusedHitScratch {
-                doc_id: result.doc_id.as_str(),
-                rrf_score: rrf_contribution,
-                lexical_rank: Some(rank),
-                semantic_rank: None,
-                semantic_index: None,
-                graph_rank: None,
-                lexical_score: Some(result.score),
-                semantic_score: None,
-                graph_score: None,
-                in_both_sources: false,
-            });
+            }
+            Entry::Vacant(e) => {
+                e.insert(FusedHitScratch {
+                    doc_id: result.doc_id.as_str(),
+                    rrf_score: rrf_contribution,
+                    lexical_rank: Some(rank),
+                    semantic_rank: None,
+                    semantic_index: None,
+                    graph_rank: None,
+                    lexical_score: Some(result.score),
+                    semantic_score: None,
+                    graph_score: None,
+                    in_both_sources: false,
+                });
+            }
+        }
     }
 
     // Score semantic results.
     for (rank, hit) in semantic.iter().enumerate() {
-        // If we've already seen this doc in this source (semantic), skip it.
-        if let Some(existing) = hits.get(hit.doc_id.as_str())
-            && existing.semantic_rank.is_some()
-        {
-            continue;
-        }
-
         let rrf_contribution = rank_contribution(k, rank);
 
-        hits.entry(hit.doc_id.as_str())
-            .and_modify(|fh| {
+        // Single hash lookup (see lexical loop): skip if already seen in semantic.
+        match hits.entry(hit.doc_id.as_str()) {
+            Entry::Occupied(mut e) => {
+                let fh = e.get_mut();
+                if fh.semantic_rank.is_some() {
+                    continue;
+                }
                 fh.rrf_score += rrf_contribution;
                 fh.semantic_rank = Some(rank);
                 fh.semantic_score = Some(hit.score);
@@ -255,49 +257,54 @@ pub fn rrf_fuse_with_graph(
                 if fh.lexical_rank.is_some() {
                     fh.in_both_sources = true;
                 }
-            })
-            .or_insert_with(|| FusedHitScratch {
-                doc_id: hit.doc_id.as_str(),
-                rrf_score: rrf_contribution,
-                lexical_rank: None,
-                semantic_rank: Some(rank),
-                semantic_index: Some(hit.index),
-                graph_rank: None,
-                lexical_score: None,
-                semantic_score: Some(hit.score),
-                graph_score: None,
-                in_both_sources: false,
-            });
+            }
+            Entry::Vacant(e) => {
+                e.insert(FusedHitScratch {
+                    doc_id: hit.doc_id.as_str(),
+                    rrf_score: rrf_contribution,
+                    lexical_rank: None,
+                    semantic_rank: Some(rank),
+                    semantic_index: Some(hit.index),
+                    graph_rank: None,
+                    lexical_score: None,
+                    semantic_score: Some(hit.score),
+                    graph_score: None,
+                    in_both_sources: false,
+                });
+            }
+        }
     }
 
     if graph_weight > 0.0 {
         for (rank, result) in graph.iter().enumerate() {
-            // If we've already seen this doc in this source (graph), skip it.
-            if let Some(existing) = hits.get(result.doc_id.as_str())
-                && existing.graph_rank.is_some()
-            {
-                continue;
-            }
-
             let rrf_contribution = rank_contribution(k, rank) * graph_weight;
-            hits.entry(result.doc_id.as_str())
-                .and_modify(|hit| {
+
+            // Single hash lookup (see lexical loop): skip if already seen in graph.
+            match hits.entry(result.doc_id.as_str()) {
+                Entry::Occupied(mut e) => {
+                    let hit = e.get_mut();
+                    if hit.graph_rank.is_some() {
+                        continue;
+                    }
                     hit.rrf_score += rrf_contribution;
                     hit.graph_rank = Some(rank);
                     hit.graph_score = Some(result.score);
-                })
-                .or_insert_with(|| FusedHitScratch {
-                    doc_id: result.doc_id.as_str(),
-                    rrf_score: rrf_contribution,
-                    lexical_rank: None,
-                    semantic_rank: None,
-                    semantic_index: None,
-                    graph_rank: Some(rank),
-                    lexical_score: None,
-                    semantic_score: None,
-                    graph_score: Some(result.score),
-                    in_both_sources: false,
-                });
+                }
+                Entry::Vacant(e) => {
+                    e.insert(FusedHitScratch {
+                        doc_id: result.doc_id.as_str(),
+                        rrf_score: rrf_contribution,
+                        lexical_rank: None,
+                        semantic_rank: None,
+                        semantic_index: None,
+                        graph_rank: Some(rank),
+                        lexical_score: None,
+                        semantic_score: None,
+                        graph_score: Some(result.score),
+                        in_both_sources: false,
+                    });
+                }
+            }
         }
     }
 
