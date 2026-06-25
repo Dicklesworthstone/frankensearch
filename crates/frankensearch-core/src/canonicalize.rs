@@ -98,10 +98,13 @@ impl Canonicalizer for DefaultCanonicalizer {
         let stripped = self.strip_markdown_and_code(&normalized);
         // 3. Normalize whitespace
         let ws_normalized = normalize_whitespace(&stripped);
-        // 4. Filter low-signal content
-        let filtered = filter_low_signal(&ws_normalized);
-        // 5. Truncate to max length
-        truncate_to_chars(&filtered, self.max_length)
+        // 4. Filter low-signal content — drop the whole doc if it's just an ack.
+        if is_low_signal(&ws_normalized) {
+            return String::new();
+        }
+        // 5. Truncate to max length — pass the owned buffer straight through,
+        //    avoiding the old `filter_low_signal` whole-document copy.
+        truncate_to_chars(&ws_normalized, self.max_length)
     }
 
     fn canonicalize_query(&self, query: &str) -> String {
@@ -197,10 +200,7 @@ fn strip_markdown_line(line: &str) -> String {
     // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
     // Byte-identical to the full path; the header/blockquote/list stripping below
     // still applies. Plain prose and most code-comment text hit this path.
-    let result = if line
-        .bytes()
-        .any(|b| matches!(b, b'*' | b'_' | b'`' | b'['))
-    {
+    let result = if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
         // Remove bold/italic markers
         let mut r = line.replace("**", "");
         r = r.replace("__", "");
@@ -396,19 +396,18 @@ fn normalize_whitespace(text: &str) -> String {
 ///
 /// If the entire text (after trimming and lowercasing) matches a known
 /// low-signal pattern, returns empty string.
-fn filter_low_signal(text: &str) -> String {
+/// Whether `text` is a low-signal ack phrase (case-insensitive, trimmed).
+///
+/// Returning a `bool` (vs the old `String`) lets `canonicalize` early-return the
+/// empty string and pass its already-owned buffer straight to truncation — saving
+/// a whole-document copy on the common (non-filtered) path. `LOW_SIGNAL_CONTENT` is
+/// all ASCII, so `eq_ignore_ascii_case` is byte-identical to lowercasing while
+/// short-circuiting on length and never allocating.
+fn is_low_signal(text: &str) -> bool {
     let trimmed = text.trim();
-    // `LOW_SIGNAL_CONTENT` is all ASCII, so a case-insensitive ASCII compare is
-    // byte-identical to lowercasing — but `eq_ignore_ascii_case` short-circuits on
-    // a length mismatch and never allocates, instead of lowercasing the *entire*
-    // document (a full alloc + scan) just to compare against a few short patterns.
-    for pattern in LOW_SIGNAL_CONTENT {
-        if trimmed.eq_ignore_ascii_case(pattern) {
-            return String::new();
-        }
-    }
-
-    text.to_string()
+    LOW_SIGNAL_CONTENT
+        .iter()
+        .any(|pattern| trimmed.eq_ignore_ascii_case(pattern))
 }
 
 /// Truncate string to at most N characters, respecting char boundaries.
@@ -451,9 +450,9 @@ mod tests {
             "",
             "plain ascii text 123 _-./",
             "fn main() { let x = 0; }",
-            "café\u{0301}",            // non-ASCII (combining mark)
+            "café\u{0301}",                // non-ASCII (combining mark)
             "caf\u{0065}\u{0301}\u{00e9}", // mixed decomposed/precomposed
-            "日本語テキスト",          // non-ASCII
+            "日本語テキスト",              // non-ASCII
             "naïve façade",
         ];
         for c in cases {

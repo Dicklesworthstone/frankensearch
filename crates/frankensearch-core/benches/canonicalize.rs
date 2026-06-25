@@ -32,7 +32,15 @@ fn nfc_full(text: &str) -> String {
 }
 
 const LOW_SIGNAL: &[&str] = &[
-    "ok", "done", "yes", "no", "thanks", "understood", "sure", "got it", "thank you",
+    "ok",
+    "done",
+    "yes",
+    "no",
+    "thanks",
+    "understood",
+    "sure",
+    "got it",
+    "thank you",
 ];
 
 /// Prior `filter_low_signal`: lowercase the entire document, then compare.
@@ -156,6 +164,31 @@ fn bench_nfc(c: &mut Criterion) {
         });
     });
     tg.finish();
+
+    // Pipeline tail: old `filter_low_signal` copied the whole doc, then truncate
+    // copied again (2 copies); the bool predicate + pass-through truncates once.
+    fn truncate(s: &str) -> String {
+        if s.len() <= 2000 {
+            s.to_owned()
+        } else {
+            s[..2000].to_owned()
+        }
+    }
+    fn tail_old(ws: &str) -> String {
+        let filtered = ws.to_string(); // old filter_low_signal whole-doc copy
+        truncate(&filtered)
+    }
+    fn tail_new(ws: &str) -> String {
+        truncate(ws) // pass the owned buffer straight through
+    }
+    let mut pg = c.benchmark_group("pipeline_tail");
+    pg.bench_with_input("old", ascii_doc.as_str(), |b, t| {
+        b.iter(|| black_box(tail_old(black_box(t))));
+    });
+    pg.bench_with_input("new", ascii_doc.as_str(), |b, t| {
+        b.iter(|| black_box(tail_new(black_box(t))));
+    });
+    pg.finish();
 }
 
 criterion_group!(benches, bench_nfc);

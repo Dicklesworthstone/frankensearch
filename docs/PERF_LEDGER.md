@@ -96,6 +96,7 @@ those ratios are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-25 | frankensearch-core | `filter_low_signal`: ASCII compare instead of full-doc `to_lowercase` | `filter_low_signal/ascii_short` | 16.7 ns | 8.2 ns | **0.49 (~2×)** | KEEP |
 | 2026-06-25 | frankensearch-core | **`strip_markdown_line`: skip the 4-pass inline replace chain for lines with no inline-markdown chars** | `strip_markdown_inline` (80 plain lines) | 10.17 µs | 4.41 µs | **0.434 (~2.3×)** | KEEP |
 | 2026-06-25 | frankensearch-core | `strip_markdown_line`: chain `#`/`>` prefix trims as one `&str` (1 alloc, not 2) | `prefix_trim` (80 lines) | 2.45 µs | 1.34 µs | **0.549 (~1.8×)** | KEEP |
+| 2026-06-25 | frankensearch-core | **canonicalize tail: drop the 2nd whole-document copy** (`filter_low_signal`→`is_low_signal` bool predicate; pass the owned `ws_normalized` buffer straight to `truncate_to_chars`) | `pipeline_tail` (2.25 KB ascii_doc) | 91.4 ns | 59.4 ns | **0.649 (~1.54×)** | KEEP (BlackThrush) |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim384/f32_bytes` | 14.084 ms | 5.333 ms | **0.379** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators (`BlueGull` pinned-worker confirmation) | `dot/dim256/f32_bytes/10000` | 3.4835 ms | 0.66126 ms | **0.190** | KEEP (`vmi1149989`) |
@@ -104,6 +105,22 @@ those ratios are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-24 | frankensearch-index | **branchless SIMD f16→f32 widen** (default path) | `dot/dim384/f16_bytes` | 7.363 ms | 2.332 ms | **0.317** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim256/f16_slice` | 3.699 ms | 1.348 ms | **0.364** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim384/f16_slice` | 5.536 ms | 2.181 ms | **0.394** | KEEP |
+
+**Lever (canonicalize tail):** `DefaultCanonicalizer::canonicalize` runs on every document at
+index time and every query. The committed tail did two whole-document allocations — the old
+`filter_low_signal` returned `text.to_string()` on the common (non-ack) path, then
+`truncate_to_chars` copied again. Converting the filter to an allocation-free `is_low_signal(&str)
+-> bool` predicate (early-return `String::new()` for acks) lets `canonicalize` pass its already-owned
+`ws_normalized` buffer straight to truncation — one copy, not two. Output is byte-identical (acks →
+`""`, normal docs → same bytes; 893/893 `frankensearch-core` lib tests green, incl. all 33
+canonicalize tests). Measured head-to-head in one process (`pipeline_tail/old` = 2 copies vs
+`/new` = 1 copy, 2.25 KB ascii doc): 91.4 ns → 59.4 ns, **0.649 (~1.54×)**. Frankensearch
+pre-change before/after ratio only (no dominance-vs-original claim; blocked by `bd-ui41`).
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-core --bench canonicalize
+```
 
 **Lever (bd-gfzk):** `dot_product_f16_bytes_f32` / `dot_product_f16_f32` — the **default
 quantization** path (f16 FSVI, `search.rs:288,346,441`). The f16 paths were decode-bound: the
