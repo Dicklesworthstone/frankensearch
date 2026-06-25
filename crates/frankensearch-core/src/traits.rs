@@ -366,6 +366,23 @@ pub fn l2_normalize(vec: &[f32]) -> Vec<f32> {
     vec.iter().map(|x| x * inv_norm).collect()
 }
 
+/// L2-normalizes a vector to unit length **in place**.
+///
+/// Bit-identical to [`l2_normalize`] (same `norm_sq` accumulation, same
+/// `is_finite`/`EPSILON` guard, same `x * inv_norm` scaling, zero vector on zero
+/// norm) but reuses the caller's owned buffer instead of allocating a fresh `Vec` —
+/// for callers that already own the vector (e.g. the hash embedder builds its
+/// accumulator then normalizes it), this drops one dimension-sized allocation.
+pub fn l2_normalize_in_place(vec: &mut [f32]) {
+    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
+        vec.iter_mut().for_each(|x| *x = 0.0);
+        return;
+    }
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    vec.iter_mut().for_each(|x| *x *= inv_norm);
+}
+
 /// Computes cosine similarity between two vectors.
 ///
 /// Returns 0.0 if either vector has zero norm.
@@ -907,6 +924,27 @@ mod tests {
         let v = vec![0.0, 0.0, 0.0];
         let normalized = l2_normalize(&v);
         assert!(normalized.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn l2_normalize_in_place_matches_allocating() {
+        // The in-place variant must be bit-identical to the allocating one for
+        // every input, including zero / near-zero / non-finite norm cases.
+        let cases: &[Vec<f32>] = &[
+            vec![],
+            vec![0.0, 0.0, 0.0],
+            vec![3.0, 4.0],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            vec![-1.5, 0.25, 1e-3, 7.0, -7.0],
+            vec![1e-30, 1e-30],       // near-zero norm → zero vector
+            vec![f32::MAX, f32::MAX], // non-finite norm_sq → zero vector
+        ];
+        for v in cases {
+            let allocating = l2_normalize(v);
+            let mut in_place = v.clone();
+            l2_normalize_in_place(&mut in_place);
+            assert_eq!(in_place, allocating, "input={v:?}");
+        }
     }
 
     #[test]

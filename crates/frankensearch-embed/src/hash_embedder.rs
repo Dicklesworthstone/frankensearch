@@ -15,7 +15,7 @@
 //! | `JLProjection`  | JL-guaranteed  | ~0.10ms  | Better distance preservation   |
 
 use asupersync::Cx;
-use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize_in_place};
 
 /// FNV-1a offset basis (64-bit).
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -105,16 +105,16 @@ impl HashEmbedder {
     /// Synchronous embedding (no async overhead needed for ~0.07ms).
     #[must_use]
     pub fn embed_sync(&self, text: &str) -> Vec<f32> {
-        let tokens = tokenize(text);
-
+        // Each branch consumes the token iterator exactly once, so it is built
+        // lazily per branch — no intermediate `Vec<&str>` allocation.
         match self.algorithm {
-            HashAlgorithm::FnvModular => self.embed_fnv_modular(&tokens),
-            HashAlgorithm::JLProjection { seed } => self.embed_jl(&tokens, seed),
+            HashAlgorithm::FnvModular => self.embed_fnv_modular(tokenize(text)),
+            HashAlgorithm::JLProjection { seed } => self.embed_jl(tokenize(text), seed),
         }
     }
 
     /// FNV-1a modular projection: each token maps to one dimension.
-    fn embed_fnv_modular(&self, tokens: &[&str]) -> Vec<f32> {
+    fn embed_fnv_modular<'a>(&self, tokens: impl Iterator<Item = &'a str>) -> Vec<f32> {
         let mut embedding = vec![0.0_f32; self.dimension];
 
         for token in tokens {
@@ -125,7 +125,10 @@ impl HashEmbedder {
             embedding[index] += sign;
         }
 
-        l2_normalize(&embedding)
+        // Normalize in place: reuse the accumulator we already own instead of
+        // allocating a second dimension-sized vector via `l2_normalize`.
+        l2_normalize_in_place(&mut embedding);
+        embedding
     }
 
     /// Johnson-Lindenstrauss random hyperplane projection.
@@ -133,7 +136,7 @@ impl HashEmbedder {
     /// Each token's contribution is spread across all dimensions using
     /// xorshift64, providing better distance preservation than modular
     /// projection.
-    fn embed_jl(&self, tokens: &[&str], seed: u64) -> Vec<f32> {
+    fn embed_jl<'a>(&self, tokens: impl Iterator<Item = &'a str>, seed: u64) -> Vec<f32> {
         let mut embedding = vec![0.0_f32; self.dimension];
 
         for token in tokens {
@@ -153,7 +156,9 @@ impl HashEmbedder {
             }
         }
 
-        l2_normalize(&embedding)
+        // Normalize in place (see `embed_fnv_modular`): one fewer allocation.
+        l2_normalize_in_place(&mut embedding);
+        embedding
     }
 }
 
@@ -217,10 +222,11 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 ///
 /// Splits on non-alphanumeric characters and filters
 /// tokens shorter than `MIN_TOKEN_LEN`. Case is intentionally preserved.
-fn tokenize(text: &str) -> Vec<&str> {
+fn tokenize(text: &str) -> impl Iterator<Item = &str> {
+    // Lazy: the embedders iterate tokens exactly once, so there is no need to
+    // materialize an intermediate `Vec<&str>`.
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|token| token.len() >= MIN_TOKEN_LEN)
-        .collect()
 }
 
 #[cfg(test)]
@@ -335,26 +341,26 @@ mod tests {
 
     #[test]
     fn tokenize_basic() {
-        let tokens = tokenize("hello world");
+        let tokens: Vec<&str> = tokenize("hello world").collect();
         assert_eq!(tokens, vec!["hello", "world"]);
     }
 
     #[test]
     fn tokenize_filters_short() {
-        let tokens = tokenize("a bb ccc");
+        let tokens: Vec<&str> = tokenize("a bb ccc").collect();
         assert_eq!(tokens, vec!["bb", "ccc"]);
     }
 
     #[test]
     fn tokenize_splits_on_punctuation() {
-        let tokens = tokenize("hello-world.test");
+        let tokens: Vec<&str> = tokenize("hello-world.test").collect();
         assert_eq!(tokens, vec!["hello", "world", "test"]);
     }
 
     #[test]
     fn tokenize_preserves_case_for_hashing() {
         // Tokenize does NOT lowercase — the hash captures case differences
-        let tokens = tokenize("Hello WORLD");
+        let tokens: Vec<&str> = tokenize("Hello WORLD").collect();
         assert_eq!(tokens, vec!["Hello", "WORLD"]);
     }
 

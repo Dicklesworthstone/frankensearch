@@ -137,6 +137,8 @@ negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-25 | frankensearch-core | **`strip_markdown_line`: skip the 4-pass inline replace chain for lines with no inline-markdown chars** | `strip_markdown_inline` (80 plain lines) | 10.17 µs | 4.41 µs | **0.434 (~2.3×)** | KEEP |
 | 2026-06-25 | frankensearch-core | `strip_markdown_line`: chain `#`/`>` prefix trims as one `&str` (1 alloc, not 2) | `prefix_trim` (80 lines) | 2.45 µs | 1.34 µs | **0.549 (~1.8×)** | KEEP |
 | 2026-06-25 | frankensearch-core | **canonicalize tail: drop the 2nd whole-document copy** (`filter_low_signal`→`is_low_signal` bool predicate; pass the owned `ws_normalized` buffer straight to `truncate_to_chars`) | `pipeline_tail` (2.25 KB ascii_doc) | 91.4 ns | 59.4 ns | **0.649 (~1.54×)** | KEEP (BlackThrush) |
+| 2026-06-25 | frankensearch-embed | **hash embedder: drop 2 per-embed allocs** (lazy `tokenize` iterator + `l2_normalize_in_place` on the owned accumulator) | `hash_embed_fnv` (~100-word doc, dim384) | 2.318 µs | 1.961 µs | **0.846 (~1.18×)** | KEEP (BlackThrush) |
+| 2026-06-25 | frankensearch-embed | hash embedder alloc elision — JL path (compute-bound, alloc negligible) | `hash_embed_jl` (~100-word doc, dim384) | 100.27 µs | 102.07 µs | 1.018 (neutral) | KEEP (no regression) |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim384/f32_bytes` | 14.084 ms | 5.333 ms | **0.379** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators (`BlueGull` pinned-worker confirmation) | `dot/dim256/f32_bytes/10000` | 3.4835 ms | 0.66126 ms | **0.190** | KEEP (`vmi1149989`) |
@@ -145,6 +147,26 @@ negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-24 | frankensearch-index | **branchless SIMD f16→f32 widen** (default path) | `dot/dim384/f16_bytes` | 7.363 ms | 2.332 ms | **0.317** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim256/f16_slice` | 3.699 ms | 1.348 ms | **0.364** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim384/f16_slice` | 5.536 ms | 2.181 ms | **0.394** | KEEP |
+
+**Lever (hash embedder alloc elision):** `HashEmbedder::embed_sync` runs on every document at
+index time and every query (the non-semantic `fnv1a-*`/`jl-*` fast tiers, and the frankensearch
+side of the BOLD hash-hybrid comparison). The committed path did two dimension-sized allocations
+per embed: `tokenize` collected a `Vec<&str>`, and `l2_normalize(&embedding)` returned a freshly
+allocated `Vec<f32>`. Now `tokenize` returns a lazy iterator (each embedder consumes tokens exactly
+once) and the new `frankensearch_core::traits::l2_normalize_in_place` normalizes the owned
+accumulator in place — so the only allocation is the accumulator itself. Bit-identical output
+(`l2_normalize_in_place_matches_allocating` proves the in-place form equals `l2_normalize` across
+zero/near-zero/non-finite cases; 286 embed lib tests + the existing `output_is_l2_normalized` /
+`jl_output_is_l2_normalized` green). Measured head-to-head in one process (old 2-alloc vs new
+1-alloc, replicated in `benches/hash_embed.rs`): FNV path **0.846 (~1.18×)**; the JL path is
+compute-bound (O(tokens·dim) xorshift), so its alloc savings vanish into noise (1.018, neutral —
+never a regression). Frankensearch pre-change before/after ratio only (no dominance-vs-original
+claim; `bd-ui41`).
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-embed --bench hash_embed
+```
 
 **Lever (canonicalize tail):** `DefaultCanonicalizer::canonicalize` runs on every document at
 index time and every query. The committed tail did two whole-document allocations — the old
