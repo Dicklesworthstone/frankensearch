@@ -71,6 +71,46 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-25 — BOLD-VERIFY after lexical prefetch budget gate: mixed, not universal (BlackThrush)
+
+**Lever kept elsewhere:** the BOLD hash-hybrid harness now asks Tantivy for only `k` lexical
+candidates, not `3k`, on classes that can legally short-circuit to lexical-only results. The
+target natural-language rows became p50 wins vs the Tantivy/Lucene/Meilisearch-class incumbent and
+are recorded in `docs/PERF_LEDGER.md`. The same run still has slower/noisy rows below.
+
+**Measured command (RCH local fallback; no admissible workers:
+`insufficient_slots=5,hard_preflight=1`; per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_COMMAND='CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`.
+
+**Residual rows for `hash_hybrid_tantivy_vector_rrf` vs `tantivy_doc_ids`:**
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Decision |
+|----------|-------------|-------------------|-------------------|------------------------|----------|
+| `top10_short_keyword/10000` | `2e78365a46a7c3b9` | 43 us | 177 us | **4.116x slower** | no dominance claim |
+| `top10_quoted_phrase/10000` | `2e78365a46a7c3b9` | 301 us | 301 us | **1.000x** | p50 tie; tails slower |
+| `top10_high_fanout/10000` | `2e78365a46a7c3b9` | 171 us | 228 us | **1.333x slower** | no dominance claim |
+| `top10_zero_hit/10000` | `2e78365a46a7c3b9` | 29 us | 46 us | **1.586x slower** | no dominance claim |
+| `limit_all/10000` | `2e78365a46a7c3b9` | 9.832 ms | 10.821 ms | **1.101x slower** | no dominance claim |
+| `top10_quoted_phrase/100000` | `13f1b0153f5adec9` | 1.143 ms | 1.340 ms | **1.172x slower** | no dominance claim |
+
+**Decision:** keep the scoped prefetch-budget gate because it produced clean p50 wins on the
+target natural-language rows (`0.961x` at 10k, `0.962x` at 100k) and several lexical-saturated
+rows. Do not generalize it: quoted phrases, 10k short keywords/high fanout/zero-hit, and
+`limit_all` still need different levers.
+
 ### 2026-06-25 — BOLD-VERIFY after non-semantic zero-hit gate: still scoped, not universal (BlackThrush)
 
 **Lever kept elsewhere:** non-semantic hash/no-quality searches now skip hash-vector work when

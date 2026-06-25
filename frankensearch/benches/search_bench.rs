@@ -296,6 +296,19 @@ fn bold_verify_lexical_short_circuit(
 }
 
 #[cfg(feature = "lexical")]
+fn bold_verify_lexical_prefetch_limit(
+    query: &BoldVerifyQuery,
+    limit: usize,
+    candidate_limit: usize,
+) -> usize {
+    match QueryClass::classify(query.text) {
+        QueryClass::Identifier | QueryClass::ShortKeyword | QueryClass::NaturalLanguage => limit,
+        QueryClass::Empty => 0,
+    }
+    .min(candidate_limit)
+}
+
+#[cfg(feature = "lexical")]
 fn tantivy_only_search(fixture: &BoldVerifyFixture, cx: &asupersync::Cx, query: &BoldVerifyQuery) {
     let limit = query.limit.min(fixture.doc_count);
     black_box(
@@ -314,9 +327,10 @@ fn frankensearch_hash_hybrid_search(
 ) {
     let limit = query.limit.min(fixture.doc_count);
     let candidate_limit = limit.saturating_mul(3).min(fixture.doc_count).max(limit);
+    let lexical_limit = bold_verify_lexical_prefetch_limit(query, limit, candidate_limit);
     let lexical_hits = fixture
         .lexical
-        .search_doc_ids(cx, query.text, candidate_limit)
+        .search_doc_ids(cx, query.text, lexical_limit)
         .expect("hybrid lexical candidate search");
     let lexical = lexical_doc_ids_as_scored(&lexical_hits);
     if bold_verify_lexical_short_circuit(query, lexical.len(), limit) {

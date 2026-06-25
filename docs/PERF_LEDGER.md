@@ -87,6 +87,46 @@ incumbent, not a universal dominance claim. The same BOLD run still shows slower
 10k exact identifiers, short-keyword rows, `limit_all`, natural-language, and zero-hit queries;
 those ratios are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 
+### 2026-06-25 — BOLD-VERIFY lexical prefetch budget gate (BlackThrush)
+
+**Lever:** the BOLD hash-hybrid harness now mirrors the product's lexical short-circuit budget:
+for query classes that can legally return lexical-only (`Identifier`, `ShortKeyword`,
+`NaturalLanguage`), it asks Tantivy for only `k` lexical candidates instead of prefetching `3k`
+and then throwing the surplus away. This is an evidence-harness correction for the shipped
+short-circuit path, not a new product ranking algorithm.
+
+**Measured command (RCH local fallback; no admissible workers:
+`insufficient_slots=5,hard_preflight=1`; per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_COMMAND='CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`.
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Status |
+|----------|-------------|-------------------|-------------------|------------------------|--------|
+| `bold_verify/top10/10000` `exact_identifier` | `2e78365a46a7c3b9` | 205 us | 178 us | **0.868** | KEEP |
+| `bold_verify/top10/10000` `natural_language` | `2e78365a46a7c3b9` | 335 us | 322 us | **0.961** | KEEP |
+| `bold_verify/top10/100000` `exact_identifier` | `13f1b0153f5adec9` | 1.596 ms | 1.540 ms | **0.965** | KEEP, p95 noisy |
+| `bold_verify/top10/100000` `short_keyword` | `13f1b0153f5adec9` | 359 us | 297 us | **0.827** | KEEP |
+| `bold_verify/top10/100000` `natural_language` | `13f1b0153f5adec9` | 972 us | 935 us | **0.962** | KEEP |
+| `bold_verify/top10/100000` `high_fanout` | `13f1b0153f5adec9` | 895 us | 783 us | **0.875** | KEEP |
+| `bold_verify/top10/100000` `zero_hit` | `13f1b0153f5adec9` | 36 us | 24 us | **0.667** | KEEP, tail regressed |
+
+**Scope:** this fixes the BOLD evidence path for lexical-saturated and natural-language
+short-circuit rows. It does not establish universal dominance over Tantivy/Lucene/Meilisearch-class
+BM25; the 10k short-keyword/high-fanout/zero-hit rows, 100k quoted phrase, and `limit_all` remain
+negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 | Date | Crate | Lever | Workload (bench id) | Before | After | Ratio | Status |
 |------|-------|-------|---------------------|--------|-------|-------|--------|
 | 2026-06-25 | frankensearch-core | **ASCII fast-path for NFC canonicalization** (analyzer hot path) | `nfc/ascii_short` | 1.207 µs | 26.7 ns | **0.022 (~45×)** | KEEP (`9d7e8d0`) |
