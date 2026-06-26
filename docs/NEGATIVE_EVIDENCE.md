@@ -74,6 +74,61 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-26 — BOLD int8 two-pass vector wiring is not a Tantivy-class win (BlackThrush)
+
+**Lever tested and reverted:** route the BOLD hash-hybrid challenger through a resident
+`InMemoryVectorIndex::search_top_k_int8_two_pass(..., candidate_multiplier=5)` instead of the
+file-backed exact FSVI vector scan. The candidate kept the Tantivy/Lucene-class incumbent
+untouched, added a one-time exactness gate that compared int8 candidate doc-id order with exact
+FSVI order for every BOLD query that reached the vector path, and passed that gate before timing.
+
+**Measured command (per-crate, warm target dir; RCH local fallback because no worker was
+admissible: `insufficient_slots=4,hard_preflight=1`):**
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+  FRANKENSEARCH_BOLD_VERIFY_OUT=.scratch/bold_verify_int8_candidate_summary \
+  RUST_LOG=off \
+  cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `frankensearch/.scratch/bold_verify_int8_candidate_summary/summary.jsonl`
+(`git_sha=28aa02207d1d81a836b645df80172f197e997437`, `worker=unknown`). The summary-only switch
+was temporary candidate code to avoid the known Criterion tracing flood; it was reverted with the
+int8 wiring. The literal `cargo bench --release` form remains invalid in this checkout, so the
+successful per-crate run used Cargo's `--profile release` form.
+
+**Decision:** rejected and reverted. Even with exact vector-candidate order preserved, the
+Tantivy-class comparator is mostly worse: the int8 path only helps isolated zero-hit / 100k quoted
+rows, while common 10k and 100k rows regress materially.
+
+| Workload | Tantivy-class p50 | Candidate p50 | Candidate / Tantivy-class | Decision |
+|----------|-------------------|---------------|----------------------------|----------|
+| `top10_exact_identifier/10000` | 150 us | 155 us | 1.033 | zero-gain/reverted |
+| `top10_short_keyword/10000` | 160 us | 193 us | **1.206x slower** | reverted |
+| `top10_quoted_phrase/10000` | 273 us | 355 us | **1.300x slower** | reverted |
+| `top10_natural_language/10000` | 223 us | 313 us | **1.404x slower** | reverted |
+| `top10_high_fanout/10000` | 74 us | 108 us | **1.459x slower** | reverted |
+| `top10_zero_hit/10000` | 36 us | 23 us | 0.639 | isolated/no keep |
+| `limit_all/10000` | 14.385 ms | 16.565 ms | **1.152x slower** | reverted |
+| `top10_exact_identifier/100000` | 1.129 ms | 1.229 ms | **1.089x slower** | reverted |
+| `top10_short_keyword/100000` | 292 us | 286 us | 0.979 | zero-gain/reverted |
+| `top10_quoted_phrase/100000` | 1.582 ms | 1.521 ms | 0.961 | isolated/no keep |
+| `top10_natural_language/100000` | 1.086 ms | 1.333 ms | **1.227x slower** | reverted |
+| `top10_high_fanout/100000` | 645 us | 911 us | **1.412x slower** | reverted |
+| `top10_zero_hit/100000` | 30 us | 32 us | **1.067x slower** | reverted |
+
+**Route next:** do not wire int8 two-pass into BOLD hybrid as a blanket replacement. The vector
+primitive is still useful for standalone large-N vector scans, but the BOLD gap is dominated by
+lexical materialization / tracing / RRF overhead on the mixed query stream, not by exact vector scan
+cost alone.
+
 ### 2026-06-26 — Reusing `QueryClass` inside BOLD hybrid search is mixed/noise (BlackThrush)
 
 **Lever tested and reverted:** compute `QueryClass::classify(query.text)` once in
