@@ -123,7 +123,7 @@ fn bench_int8_two_pass(c: &mut Criterion) {
             black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
         });
     });
-    for mult in [5usize, 10] {
+    for mult in [2usize, 3, 5, 10] {
         g.bench_function(format!("int8_mult{mult}"), |b| {
             b.iter(|| {
                 let q = &queries[qi % QUERIES];

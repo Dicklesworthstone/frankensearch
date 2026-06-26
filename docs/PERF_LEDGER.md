@@ -478,12 +478,17 @@ realistic data. Not made the unconditional default because recall=1.0 is empiric
 true top-k ⊆ the int8 candidate set) — safe as an opt-in / large-N path, with a recall gate for
 pathological corpora.
 
-_Scale confirmation:_ re-ran the same clustered bench at **N=100000** (dim=384, k=10 — the BOLD /
-Tantivy-comparison corpus size): recall@10 = **1.0000 at every mult (2, 5, 10, 20)**, i.e. the
-lossless property holds at production scale (the int8 quantization error is scale-independent, so a
-modest `k·mult` candidate set still always contains the true top-10). Latency ratio at 100k is the
-~1.5× from the `dim384/n100k` row above. So the recommendation (use `search_top_k_int8_two_pass`,
-mult≈10) is bulletproof across 10k–100k.
+_Scale confirmation — and the win GROWS with N:_ re-ran the same clustered bench at **N=100000**
+(dim=384, k=10 — the BOLD / Tantivy-comparison corpus size): recall@10 = **1.0000 at every mult
+(2, 5, 10, 20)** (lossless at production scale; int8 quantization error is scale-independent, so a
+modest `k·mult` candidate set still always contains the true top-10). Measured **clustered** latency
+(single run): flat 2131 µs vs int8 mult=5 **862 µs (2.47×)**, mult=10 1187 µs (1.80×) — i.e. the
+relative speedup **grows from ~1.86× at 10k to ~2.47× at 100k**, because the int8 pass-1's halved
+bytes + no-f16-decode advantage scales with N (consistent with the `bd-t8tv` "larger win at scale"
+hypothesis). (The 10k mult sweep is pass-1-bound and worker-noisy — mult 2–10 all land ~1.3–1.6×
+within noise; the clean separation appears at 100k.) So `search_top_k_int8_two_pass` (mult≈10) is a
+**lossless 1.86–2.47× win across 10k–100k, strongest at production scale** — the highest-value
+vector lever, pending the wiring (opt-in / large-N default with an exactness gate).
 
 These rows are routing evidence for future levers, not wins.
 
