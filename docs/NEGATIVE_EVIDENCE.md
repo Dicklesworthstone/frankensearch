@@ -196,6 +196,32 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-25 — `collapse_code_block` slice-join is zero-gain (join allocs dominate) (BlackThrush)
+
+**Lever:** the long-block branch of `collapse_code_block` collected the head/tail lines into
+intermediate `Vec<&str>` (`lines.iter().take(head).copied().collect()` etc.) before `join("\n")`.
+Since `[&str]` joins directly, the candidate replaced those with `lines[..head].join("\n")` and
+`lines[lines.len()-tail..].join("\n")` to drop the two scratch vectors. Byte-identical (34
+canonicalize tests green incl. `collapse_long_code_block`).
+
+**Measured command (per-crate):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-core --bench canonicalize collapse_code_block
+```
+
+In-process old-vs-new A/B (`collapse_code_block`, 60-line block, head=20/tail=10):
+
+| Workload | old (Vec collect + join) | new (slice join) | ratio new/old | verdict |
+|----------|--------------------------|------------------|---------------|---------|
+| `collapse_code_block` | 254.6 ns | 257.2 ns | **1.010** | noise / no gain |
+
+**Why it fails:** the two `Vec<&str>` collects are ~20 and ~10 pointer copies — negligible next to
+the actual work: the two `join("\n")` calls (each allocates + copies the joined output) and the
+final `format!`. `<[&str]>::join` iterates the slice the same way the `collect` did, so eliminating
+the scratch vectors saves nothing measurable. Reverted source + bench (stashed). Code-block
+collapsing is not allocation-bound on the scratch vectors; no lever here.
+
 ### 2026-06-25 — caching the Tantivy `QueryParser` is zero-gain (parse dominates) (BlackThrush)
 
 **Lever:** `TantivyIndex::parse_query_lenient` rebuilt a `QueryParser::for_index(..)` +
