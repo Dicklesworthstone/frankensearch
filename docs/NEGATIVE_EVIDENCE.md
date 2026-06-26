@@ -357,6 +357,28 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-26 — 4-accumulator f16 dot kernel: neutral-to-1.49×-SLOWER (the single accumulator is deliberate) (BlackThrush)
+
+**Cross-kernel-inconsistency probe → rejected, validates the existing design.** `dot_product_f32_bytes_f32`
+uses **4 independent `f32x8` accumulators** (to break the FMA dependency chain — its decode is a cheap
+load+cast, so the loop is sum-chain-bound and ILP helps), but `dot_product_f16_f32` uses a **single**
+accumulator. Hypothesis: the f16 kernel left ILP on the table. Added a faithful `dot_product_f16_f32_4acc`
+(same SIMD widen, 4 accumulators) and A/B'd it in-process against the single-acc kernel
+(`benches/dot_product.rs`, `f16_slice_new` vs `f16_slice_4acc`):
+
+| corpus | 1 accumulator | 4 accumulators | ratio |
+|--------|---------------|----------------|-------|
+| dim256, n=10k | 1589 µs | 1586 µs | 0.998 (neutral) |
+| dim384, n=10k | 2271 µs | 3392 µs | **1.493 (49 % SLOWER)** |
+
+The f16 kernel is **decode/widen-bound, not sum-chain-bound**: the Giesen magic-multiply widen is
+register-heavy, so 4 live accumulators + the widen intermediates spill the SIMD register file — hurting
+badly at dim384 (the production embedding dim). So the f32_bytes/f16 accumulator-count asymmetry is
+**justified, not a missed lever**: cheap-decode kernels want 4 accumulators, expensive-widen kernels want
+1. The single accumulator also **preserves the documented bit-identity** of the f16 dot (see `simd.rs`
+header) — 4 accumulators would reorder the sum and break it. Probe reverted (zero-gain/regression); the
+single-accumulator f16 kernel stays.
+
 ### 2026-06-26 — `ScalarQuantizer::dot_product_quantized` is a SIMD-lever TRAP (test-only, not wired) (BlackThrush)
 
 **Not attempted — flagged to save effort.** `ScalarQuantizer::dot_product_quantized` /
