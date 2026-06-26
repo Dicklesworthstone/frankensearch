@@ -36,5 +36,9 @@ harness = false
 name = "fingerprint"
 harness = false
 
+[[bench]]
+name = "parsed_query"
+harness = false
+
 [lints]
 workspace = true

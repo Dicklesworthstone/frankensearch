@@ -43,6 +43,26 @@ impl ParsedQuery {
     /// - Multiple exclusions are supported: `query -foo -bar`
     #[must_use]
     pub fn parse(raw: &str) -> Self {
+        // Fast path: negation syntax requires one of `-` `"` `\`. With none of
+        // them present (the common query), there are no negations and the positive
+        // part is just the whitespace-normalized input — skip the `Vec<char>`
+        // materialization and the char-by-char parser. Byte-identical: the full
+        // parser would collect the same whitespace-split words and `join(" ")` them.
+        if !raw.bytes().any(|b| matches!(b, b'-' | b'"' | b'\\')) {
+            let mut positive = String::with_capacity(raw.len());
+            for word in raw.split_whitespace() {
+                if !positive.is_empty() {
+                    positive.push(' ');
+                }
+                positive.push_str(word);
+            }
+            return Self {
+                positive,
+                negative_terms: Vec::new(),
+                negative_phrases: Vec::new(),
+            };
+        }
+
         let mut positive_parts = Vec::new();
         let mut negative_terms = Vec::new();
         let mut negative_phrases = Vec::new();
