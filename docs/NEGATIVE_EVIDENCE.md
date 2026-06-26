@@ -1024,3 +1024,54 @@ the fact that the incumbent comparator returns doc ids, while the guarded path p
 
 **Next lever:** avoid eager `ScoredResult` string/materialization for lexical-only Phase 1
 (borrowed/id-first result lane or lazy metadata resolution), then rerun the same BOLD matrix.
+
+### 2026-06-26 — id-first RRF lexical hits are not a BOLD win (BlackThrush)
+
+**Lever tested and reverted:** added a feature-gated `rrf_fuse_lexical_ids` path so the
+hash-hybrid BOLD lane could pass `LexicalIdHit` rows directly into RRF instead of first
+materializing `ScoredResult` rows. This targeted the materialization gap called out in the
+2026-06-25 lexical-guard evidence. Behavior was guarded with
+`cargo test -p frankensearch-fusion --features lexical lexical_id_fusion_matches_scored_rrf --lib`
+through `rch exec` (remote `ovh-a`, pass), but the end-to-end BOLD matrix was mixed and mostly
+worse.
+
+The requested `cargo bench --release` form remains invalid for this harness (`unexpected argument
+'--release'`), so the measured command used the accepted release profile form:
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENABLED=0 \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/frankensearch/.scratch/bold_id_first_candidate_20260626T0658Z \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH executed locally (`[RCH] local`), matching the baseline host. Artifact paths:
+
+- Baseline: `frankensearch/frankensearch/.scratch/bold_id_first_baseline_20260626T0638Z/summary.jsonl`
+- Candidate: `.scratch/bold_id_first_candidate_20260626T0658Z/summary.jsonl`
+
+Hybrid candidate vs Tantivy-class `tantivy_doc_ids` proxy:
+
+| Workload | candidate p50 ratio | candidate p50 us | Tantivy p50 us | verdict |
+|----------|---------------------|------------------|----------------|---------|
+| `top10/10000/exact_identifier` | 1.081 | 160 | 148 | miss |
+| `top10/10000/short_keyword` | 1.073 | 44 | 41 | miss |
+| `top10/10000/quoted_phrase` | 1.111 | 190 | 171 | miss |
+| `top10/10000/natural_language` | 0.710 | 142 | 200 | win row only |
+| `top10/10000/high_fanout` | 1.631 | 137 | 84 | regression |
+| `top10/10000/zero_hit` | 0.219 | 21 | 96 | win row only |
+| `limit_all/10000` | 1.029 | 7753 | 7533 | miss |
+| `top10/100000/exact_identifier` | 0.941 | 1219 | 1295 | win row only |
+| `top10/100000/short_keyword` | 1.100 | 351 | 319 | miss |
+| `top10/100000/quoted_phrase` | 1.033 | 1166 | 1129 | miss |
+| `top10/100000/natural_language` | 1.028 | 821 | 799 | miss |
+| `top10/100000/high_fanout` | 1.059 | 880 | 831 | miss |
+| `top10/100000/zero_hit` | 1.305 | 124 | 95 | regression |
+
+Compared with the baseline artifact, the hybrid p50 ratio worsened on 9 of 13 rows, including
+`top10/10000/high_fanout` (1.156 → 1.631) and `top10/100000/zero_hit` (1.034 → 1.305).
+Because the candidate does not produce a durable Lucene/Tantivy-class win, the code was reverted
+and only this ledger entry is kept. A future attempt should attack the remaining Tantivy wrapper
+overhead without disturbing high-fanout and zero-hit tails.
