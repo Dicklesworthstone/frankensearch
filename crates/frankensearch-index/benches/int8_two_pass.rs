@@ -136,6 +136,37 @@ fn bench_int8_two_pass(c: &mut Criterion) {
             });
         });
     }
+
+    // ── Filtered: exact filtered scan vs filtered int8 two-pass (BitsetFilter
+    // allowing ~half the corpus). The int8 speedup must hold with filtering — the
+    // doc_id-hash prescreen cost is symmetric across both paths. ──
+    let allowed: std::collections::HashSet<u64> = (0..N)
+        .step_by(2)
+        .map(|i| frankensearch_core::filter::fnv1a_hash(format!("doc-{i:06}").as_bytes()))
+        .collect();
+    let filter = frankensearch_core::filter::BitsetFilter::from_hashes(allowed);
+    g.bench_function("flat_filtered", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k(black_box(q), K, Some(&filter))
+                    .expect("flat_filtered"),
+            )
+        });
+    });
+    g.bench_function("int8_filtered_mult5", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k_int8_two_pass_filtered(black_box(q), K, 5, Some(&filter))
+                    .expect("int8_filtered"),
+            )
+        });
+    });
     g.finish();
 }
 

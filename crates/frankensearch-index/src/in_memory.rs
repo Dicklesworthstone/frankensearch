@@ -305,6 +305,21 @@ impl InMemoryVectorIndex {
         limit: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_two_pass_filtered(query, limit, candidate_multiplier, None)
+    }
+
+    /// int8 ADC two-pass with an optional [`SearchFilter`]. Pass-1 pre-screens each
+    /// vector by its precomputed `doc_id` hash (the same `matches_doc_id_hash` path
+    /// the exact scan uses), so **filtered** large-N searches get the int8 speedup
+    /// instead of falling back to the exact scan. The result matches the exact
+    /// filtered top-k whenever pass-1 retains the true filtered top-k.
+    pub fn search_top_k_int8_two_pass_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        candidate_multiplier: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -332,6 +347,10 @@ impl InMemoryVectorIndex {
         // Match the exact path's chunking so pass-1 uses all cores, not ~2.
         let chunk_size = PARALLEL_CHUNK_SIZE;
         let chunk_count = count.div_ceil(chunk_size);
+        // When filtering, build the precomputed doc_id-hash slab once here (before
+        // the parallel section) so pass-1 pre-screens by a hash lookup instead of
+        // re-hashing each doc_id string per vector.
+        let doc_id_hashes = filter.map(|_| self.doc_id_hashes());
         let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
             .into_par_iter()
             .map(|chunk_index| {
@@ -339,6 +358,17 @@ impl InMemoryVectorIndex {
                 let end = (start + chunk_size).min(count);
                 let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
                 for index in start..end {
+                    if let Some(f) = filter {
+                        let passed = match doc_id_hashes
+                            .and_then(|h| f.matches_doc_id_hash(h[index], None))
+                        {
+                            Some(decided) => decided,
+                            None => f.matches(&self.doc_ids[index], None),
+                        };
+                        if !passed {
+                            continue;
+                        }
+                    }
                     let offset = index * self.dimension;
                     let stored = &vectors_i8[offset..offset + self.dimension];
                     let score = dot_i8_i8(stored, &query_i8) as f32;
@@ -1024,6 +1054,46 @@ mod tests {
         }
         // Every allowed doc should be returned (limit 20 ≥ allowed count).
         assert_eq!(hits.len(), allowed.len());
+    }
+
+    #[test]
+    fn int8_two_pass_filtered_matches_exact_filtered() {
+        // The filtered int8 two-pass must return the same top-k as the exact
+        // filtered scan (pass-1 pre-screens by the same doc_id hash; lossless when
+        // pass-1 retains the true filtered top-k at a generous multiplier).
+        use frankensearch_core::filter::BitsetFilter;
+        let dim = 16;
+        let doc_ids: Vec<String> = (0..200).map(|i| format!("doc-{i:04}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..200)
+            .map(|i| make_normalized_vec(dim, i as f32))
+            .collect();
+        let allowed: Vec<String> = doc_ids.iter().step_by(2).cloned().collect();
+        let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+
+        for qseed in [3.0_f32, 17.0, 88.0] {
+            let query = make_normalized_vec(dim, qseed);
+            let exact: Vec<String> = index
+                .search_top_k(&query, 10, Some(&filter))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect();
+            let two_pass: Vec<String> = index
+                .search_top_k_int8_two_pass_filtered(&query, 10, 10, Some(&filter))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect();
+            // Only allowed docs, and identical to the exact filtered top-k.
+            for id in &two_pass {
+                assert!(allowed.contains(id), "two-pass returned filtered-out {id}");
+            }
+            assert_eq!(
+                two_pass, exact,
+                "filtered two-pass != exact (qseed={qseed})"
+            );
+        }
     }
 
     #[test]
