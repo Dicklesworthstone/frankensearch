@@ -299,6 +299,32 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-26 — fusing fingerprint content-hash + char-count is zero-gain (same per-byte work) (BlackThrush)
+
+**Lever:** `Fingerprint::compute` scanned the document twice — `fnv1a_hash(text.as_bytes())` for the
+content hash and `text.chars().count()` for the char count. Fused into one byte pass
+(`content_hash_and_char_count`): accumulate FNV while counting non-continuation bytes
+(`b & 0xC0 != 0x80`, which equals `chars().count()`). Bit-identical — proven by
+`content_hash_and_char_count_matches_reference` across ASCII + 2/3/4-byte UTF-8 (896 core lib tests
+green, +1 new test).
+
+**Measured command (per-crate):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-core --bench fingerprint content_hash_charcount
+```
+
+| Workload | old (2 passes) | new (fused 1 pass) | ratio | verdict |
+|----------|----------------|--------------------|-------|---------|
+| `content_hash_charcount` (~2.2 KB doc) | 2868.3 ns | 2873.4 ns | **1.002** | noise / no gain |
+
+**Why it fails:** fusing two byte passes does not reduce the *per-byte* work — the FNV loop is
+~2 ops/byte and `chars().count()` is ~1 branch/byte; the fused loop does the same total per-byte
+work, just in one loop. The only thing saved is one loop's iteration overhead (negligible), and the
+second pass was already cache-warm (the bytes are hot from the first pass). Reverted source + bench
+(stashed). Lesson: pass-fusion only helps when a pass is *eliminated* (data reused), not when both
+passes touch every byte with comparable per-byte cost.
+
 ### 2026-06-26 — moving `LexicalIdHit` into `ScoredResult` is a mixed BOLD result, not a keep (BlackThrush)
 
 **Lever:** the BOLD comparator's private lexical conversion changed from
