@@ -356,36 +356,43 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
-### 2026-06-26 — HNSW (ANN) is SLOWER than the flat parallel scan at 10k–100k scale (BlackThrush)
+### 2026-06-26 — HNSW (ANN) vs flat parallel scan at 10k: a recall/latency trade, not a default win (BlackThrush)
 
 **Lever evaluated (not wired):** the default vector search is a flat O(N) cosine scan
 (`VectorIndex::search_top_k` — rayon-parallel + SIMD f16 dot + bounded-heap + cutoff). `HnswIndex`
 (behind the `ann` feature, unwired) is an approximate O(log N) graph index — the obvious "radical
-lever" for the scan. Validated it head-to-head before committing to the multi-iteration wiring.
+lever" for the scan. Validated head-to-head via the new gated bench `benches/hnsw_vs_flat.rs`
+(latency + recall@10 sweep over `ef_search`), on **clustered** vectors (64 centroids + noise — the
+realistic embedding structure HNSW exploits; uniform-random vectors are a worst case for ANN recall
+and gave ~½ these recalls).
 
-**Measured command (per-crate; new gated bench `benches/hnsw_vs_flat.rs`):**
+**Measured command (per-crate):**
 ```bash
 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
   rch exec -- cargo bench -p frankensearch-index --features ann --bench hnsw_vs_flat
 ```
 
-| Workload (N=10000, dim=128, k=10) | flat `search_top_k` | HNSW `knn_search` (ef=100) | ratio HNSW/flat | verdict |
-|-----------------------------------|---------------------|----------------------------|-----------------|---------|
-| `hnsw_vs_flat` | 166.978 µs | 473.047 µs | **2.833 (HNSW ~2.8× slower)** | reject at this scale |
+| N=10000, dim=128, k=10 | recall@10 | latency | vs flat |
+|------------------------|-----------|---------|---------|
+| flat `search_top_k` (exact) | 1.000 | 178.4 µs | 1.00× |
+| HNSW `knn_search` ef=10 | 0.725 | 69.1 µs | **2.58× faster** |
+| HNSW ef=20 | 0.850 | 110.3 µs | **1.62× faster** |
+| HNSW ef=40 | 0.925 | 188.5 µs | 0.95× (≈break-even) |
+| HNSW ef=100 | 0.950 | 425.3 µs | 0.42× (2.4× slower) |
 
-**Why it fails (at this scale):** the flat path is **rayon-parallel across cores**, SIMD-vectorized
-(the landed f16/f32 dot kernels), and streams the vector slab **sequentially** (cache-friendly, HW
-prefetch). HNSW `knn_search` is a **serial** graph walk with **random** memory access (scattered
-graph nodes) and an `ef_search=100` beam that visits many candidates — so its O(log N) node count
-loses to the O(N) parallel-SIMD scan until N is far larger. At frankensearch's typical corpus size
-(10k–100k vectors) HNSW is a **net latency loss**; it would only pay off at ≫1M vectors where the
-fixed graph-traversal cost finally beats the (now huge) parallel scan. Recall is moot here — the
-latency loss is decisive regardless.
+**Interpretation — HNSW is a recall/latency *trade*, not a free speedup.** HNSW is faster only by
+sacrificing recall: it beats the flat scan at `ef ≤ 20` (1.6–2.6×) but at **0.72–0.85 recall**; to
+reach high recall (≥0.95) it needs `ef ≥ 100`, where it is **2.4× slower** than flat (break-even is
+~ef=40 / recall 0.925). The flat path is hard to beat because it is **rayon-parallel + SIMD f16 dot +
+sequential/cache-friendly**, whereas HNSW is a **serial** graph walk with **random** memory access.
 
-**Decision:** do **not** wire HNSW as the default (or large-N) vector index for the current target
-scale. The flat parallel-SIMD scan is the right default. Bench kept (gated behind `ann`, no-op
-without it) for re-validation at ≫1M scale, where the crossover may flip. This closes the
-"HNSW-default" recommendation from prior iterations.
+**Decision:** do **not** wire HNSW as the **default** vector index — it would be a recall regression
+for the exact/high-recall path (and slower if you keep recall high). It *is* a legitimate **opt-in
+approximate fast-tier** option (e.g. ef≈20 → 1.6× faster at ~0.85 recall) for latency-sensitive
+callers who accept lossy top-k; that's a feature/behaviour choice, not a perf lever for the exact
+path. Bench kept (gated behind `ann`) for re-validation at larger N (the crossover improves for HNSW
+as N grows). Corrects the earlier uniform-random measurement (which understated recall and called it
+a flat loss).
 
 ### 2026-06-26 — fusing fingerprint content-hash + char-count is zero-gain (same per-byte work) (BlackThrush)
 
