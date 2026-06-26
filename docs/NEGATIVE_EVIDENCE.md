@@ -904,6 +904,35 @@ measured the slice rows as noise-only routing checks, not a kept source change.
 **Decision:** do not ship the f32 slice accumulator rewrite. The committed lever is only
 `dot_product_f32_bytes_f32`, which won on both remote `vmi1149989` and local-fallback checks.
 
+### 2026-06-26 — BOLD re-check: f32/f32 4-accumulator slice dot is still not a win (BlackThrush)
+
+**Lever tested and reverted:** a dirty worktree hunk rewrote
+`dot_product_f32_f32_unchecked` from one `f32x8` accumulator over 8 elements to four accumulators
+over 32 elements. This was the later `ready-to-land f32_f32 4-acc lever` note from the measurement
+blockers table, but it had not been proven head-to-head on this tree. The hunk is a vector
+primitive, not a direct Lucene/Tantivy-class BM25 comparator; because it was reverted, product-level
+Lucene/Tantivy/Meilisearch-class ratios are unchanged.
+
+The requested `cargo bench --release` form failed again with Cargo's
+`unexpected argument '--release'`, so the measured command was:
+
+```bash
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch-index --bench dot_product --profile release \
+  f32_slice -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+RCH fell back local (`no admissible workers`) but the bench is in-process `new` vs `old`, so the
+ratio is still same-run:
+
+| Workload | old single-acc | 4acc candidate | candidate/old | Decision |
+|----------|----------------|----------------|---------------|----------|
+| `dot/dim256/f32_slice` | 2.4522 ms | 2.5077 ms | **1.023** | neutral / revert |
+| `dot/dim384/f32_slice` | 2.9224 ms | 3.0636 ms | **1.048** | regression |
+
+**Decision:** reverted the `simd.rs` hunk. Do not land the f32/f32 4-accumulator slice rewrite from
+the shared worktree; the earlier ready-to-land note is superseded by this BOLD re-check.
+
 ### 2026-06-24 — detached-worktree f16 accumulator candidate (frankensearch-cod-b)
 
 **Context:** a detached worktree at
