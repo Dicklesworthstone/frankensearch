@@ -16,7 +16,7 @@ use asupersync::http::h1::{HttpClient, HttpClientConfig, Method, RedirectPolicy}
 use tracing::{debug, warn};
 
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize_in_place};
 
 use crate::api_provider::ApiProvider;
 use crate::cached_embedder::CachedEmbedder;
@@ -267,15 +267,6 @@ impl ApiEmbedder {
 }
 
 /// L2-normalize a vector in place.
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > f32::EPSILON {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
-}
-
 impl Embedder for ApiEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
@@ -288,7 +279,7 @@ impl Embedder for ApiEmbedder {
                     source: "empty response from API".into(),
                 })
                 .map(|mut v| {
-                    l2_normalize(&mut v);
+                    l2_normalize_in_place(&mut v);
                     v
                 })
         })
@@ -310,7 +301,7 @@ impl Embedder for ApiEmbedder {
             for chunk in texts.chunks(batch_size) {
                 let mut batch = self.request_batch(cx, chunk).await?;
                 for v in &mut batch {
-                    l2_normalize(v);
+                    l2_normalize_in_place(v);
                 }
                 all_embeddings.extend(batch);
             }
@@ -355,7 +346,7 @@ impl Embedder for ApiEmbedder {
             });
         }
         let mut truncated = embedding[..target_dim].to_vec();
-        l2_normalize(&mut truncated);
+        l2_normalize_in_place(&mut truncated);
         Ok(truncated)
     }
 }
@@ -370,14 +361,14 @@ mod tests {
     #[test]
     fn l2_normalize_unit_vector() {
         let mut v = vec![1.0, 0.0, 0.0];
-        l2_normalize(&mut v);
+        l2_normalize_in_place(&mut v);
         assert!((v[0] - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn l2_normalize_general() {
         let mut v = vec![3.0, 4.0];
-        l2_normalize(&mut v);
+        l2_normalize_in_place(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
     }
@@ -385,7 +376,7 @@ mod tests {
     #[test]
     fn l2_normalize_zero_vector() {
         let mut v = vec![0.0, 0.0, 0.0];
-        l2_normalize(&mut v);
+        l2_normalize_in_place(&mut v);
         assert!(v.iter().all(|&x| x == 0.0));
     }
 
