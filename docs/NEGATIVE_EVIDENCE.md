@@ -771,6 +771,37 @@ is negligible and the super-fast `popcnt` pass-1 dominates. **Do not build binar
 specifically targeting ≫1M-vector corpora. (Probe test kept for reproducibility; no production
 code added.)
 
+### 2026-06-26 — 8-accumulator int8 dot is not a robust successor to 4acc (BlackThrush)
+
+**Lever tested and reverted:** extend the shipped `dot_i8_i8` loop from four independent
+`i32x8` accumulators over 32 elements to eight accumulators over 64 elements, then try a narrower
+384-dim-only gate after the global form regressed the 256-dim path. This is a primitive behind the
+int8 ADC pass-1 vector scan, not a direct Lucene/Tantivy-class BM25 comparator; because all code
+was reverted, the product-level Tantivy/Lucene/Meilisearch-class ratios remain the BOLD rows above.
+
+The literal requested command shape with `cargo bench --release` was checked first and Cargo
+rejected it (`unexpected argument '--release'`), so measurements used the equivalent release profile:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- cargo bench -p frankensearch-index --bench dot_product --profile release i8_dot -- --sample-size 10 --warm-up-time 1 --measurement-time 2`.
+
+**Remote `ovh-a`, global 8acc vs bench-local 4acc comparator (Criterion mean):**
+
+| Workload | 4acc comparator | 8acc candidate | candidate/4acc | Decision |
+|----------|-----------------|----------------|-----------------|----------|
+| `dot/dim256/i8_dot` | 376.995 us | 395.577 us | **1.049** | regression |
+| `dot/dim384/i8_dot` | 2.410 ms | 1.092 ms | 0.453 | apparent win, not landable because dim256 regressed |
+
+**Local `rch` fallback, 384-dim-gated retry vs bench-local 4acc comparator (Criterion stdout
+point estimate):**
+
+| Workload | 4acc comparator | gated candidate | candidate/4acc | Decision |
+|----------|-----------------|-----------------|-----------------|----------|
+| `dot/dim256/i8_dot` | 619.51 us | 786.06 us | **1.269** | regression |
+| `dot/dim384/i8_dot` | 1.0314 ms | 1.7042 ms | **1.652** | regression |
+
+**Decision:** reverted the production kernel and the temporary bench-only 4acc comparator. The
+current 4-accumulator implementation remains the only accepted int8 dot ILP lever; do not retry
+8acc without a same-process no-regression proof for 256 and a stable 384 win.
+
 ### 2026-06-25 — SIMD-widen int8 dot (`i16x16::dot`/`vpmaddwd`) is SLOWER on this build (BlackThrush)
 
 **Lever:** rewrite `dot_i8_i8` from scalar `i16::from` widening (16 `movsx` per 8 elems) to a
