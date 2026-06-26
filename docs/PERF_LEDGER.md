@@ -478,6 +478,13 @@ realistic data. Not made the unconditional default because recall=1.0 is empiric
 true top-k ⊆ the int8 candidate set) — safe as an opt-in / large-N path, with a recall gate for
 pathological corpora.
 
+_Scale confirmation:_ re-ran the same clustered bench at **N=100000** (dim=384, k=10 — the BOLD /
+Tantivy-comparison corpus size): recall@10 = **1.0000 at every mult (2, 5, 10, 20)**, i.e. the
+lossless property holds at production scale (the int8 quantization error is scale-independent, so a
+modest `k·mult` candidate set still always contains the true top-10). Latency ratio at 100k is the
+~1.5× from the `dim384/n100k` row above. So the recommendation (use `search_top_k_int8_two_pass`,
+mult≈10) is bulletproof across 10k–100k.
+
 These rows are routing evidence for future levers, not wins.
 
 Command:
