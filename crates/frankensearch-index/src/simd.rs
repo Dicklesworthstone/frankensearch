@@ -358,24 +358,34 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
 }
 
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = f32x8::splat(0.0);
-    let mut a_chunks = a.chunks_exact(8);
-    let mut b_chunks = b.chunks_exact(8);
+    let mut acc0 = f32x8::splat(0.0);
+    let mut acc1 = f32x8::splat(0.0);
+    let mut acc2 = f32x8::splat(0.0);
+    let mut acc3 = f32x8::splat(0.0);
 
-    for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-        let a_arr = [
-            a_chunk[0], a_chunk[1], a_chunk[2], a_chunk[3], a_chunk[4], a_chunk[5], a_chunk[6],
-            a_chunk[7],
-        ];
-        let b_arr = [
-            b_chunk[0], b_chunk[1], b_chunk[2], b_chunk[3], b_chunk[4], b_chunk[5], b_chunk[6],
-            b_chunk[7],
-        ];
-        sum += f32x8::from(a_arr) * f32x8::from(b_arr);
+    let mut a32 = a.chunks_exact(32);
+    let mut b32 = b.chunks_exact(32);
+    for (a_chunk, b_chunk) in a32.by_ref().zip(b32.by_ref()) {
+        let a_block: &[f32; 32] = a_chunk.try_into().expect("chunks_exact(32)");
+        let b_block: &[f32; 32] = b_chunk.try_into().expect("chunks_exact(32)");
+        acc0 += load8_f32::<0>(a_block) * load8_f32::<0>(b_block);
+        acc1 += load8_f32::<8>(a_block) * load8_f32::<8>(b_block);
+        acc2 += load8_f32::<16>(a_block) * load8_f32::<16>(b_block);
+        acc3 += load8_f32::<24>(a_block) * load8_f32::<24>(b_block);
+    }
+
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+    let mut a8 = a32.remainder().chunks_exact(8);
+    let mut b8 = b32.remainder().chunks_exact(8);
+
+    for (a_chunk, b_chunk) in a8.by_ref().zip(b8.by_ref()) {
+        let a_block: &[f32; 8] = a_chunk.try_into().expect("chunks_exact(8)");
+        let b_block: &[f32; 8] = b_chunk.try_into().expect("chunks_exact(8)");
+        sum += f32x8::from(*a_block) * f32x8::from(*b_block);
     }
 
     let mut result = sum.reduce_add();
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a8.remainder().iter().zip(b8.remainder()) {
         result += x * y;
     }
     result
