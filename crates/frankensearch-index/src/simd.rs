@@ -345,6 +345,60 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
     result
 }
 
+/// **Benchmark probe (4-accumulator i8 dot).** Same i8→i16 widen + `mul_widen` as
+/// [`dot_i8_i8`] but with four independent `i32x8` accumulators to break the single-
+/// accumulator integer-add dependency chain. Unlike the f16 dot (decode-bound, where
+/// extra accumulators regress), the i8 decode is a cheap sign-extend, so this kernel
+/// may be sum-chain-bound. Integer sum is associative, so the result is **bit-identical**
+/// to `dot_i8_i8` — no determinism risk; promote it if the bench shows a win.
+#[doc(hidden)]
+pub fn dot_i8_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
+    // Bounds-check-free 8-i8 widen from a fixed 32-byte block at a const offset.
+    #[inline(always)]
+    fn w8<const O: usize>(a: &[i8; 32]) -> i16x8 {
+        i16x8::from([
+            i16::from(a[O]),
+            i16::from(a[O + 1]),
+            i16::from(a[O + 2]),
+            i16::from(a[O + 3]),
+            i16::from(a[O + 4]),
+            i16::from(a[O + 5]),
+            i16::from(a[O + 6]),
+            i16::from(a[O + 7]),
+        ])
+    }
+    let mut acc0 = i32x8::splat(0);
+    let mut acc1 = i32x8::splat(0);
+    let mut acc2 = i32x8::splat(0);
+    let mut acc3 = i32x8::splat(0);
+
+    let mut s32 = stored.chunks_exact(32);
+    let mut q32 = query.chunks_exact(32);
+    for (sc, qc) in s32.by_ref().zip(q32.by_ref()) {
+        let s: &[i8; 32] = sc.try_into().expect("chunks_exact(32)");
+        let q: &[i8; 32] = qc.try_into().expect("chunks_exact(32)");
+        acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+        acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+        acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+        acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+    }
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+
+    // Tail: remaining 8-chunks then scalar — mirror dot_i8_i8 exactly.
+    let mut s8 = s32.remainder().chunks_exact(8);
+    let mut q8 = q32.remainder().chunks_exact(8);
+    for (sc, qc) in s8.by_ref().zip(q8.by_ref()) {
+        let s: &[i8; 8] = sc.try_into().expect("chunks_exact(8)");
+        let q: &[i8; 8] = qc.try_into().expect("chunks_exact(8)");
+        sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+    }
+    let mut result = sum.reduce_add();
+    for (s, q) in s8.remainder().iter().zip(q8.remainder()) {
+        result += i32::from(*s) * i32::from(*q);
+    }
+    result
+}
+
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = f32x8::splat(0.0);
     let mut a_chunks = a.chunks_exact(8);

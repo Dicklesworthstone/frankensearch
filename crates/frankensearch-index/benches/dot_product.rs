@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    InMemoryVectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32,
+    InMemoryVectorIndex, dot_i8_i8, dot_i8_i8_4acc, dot_product_f16_bytes_f32, dot_product_f16_f32,
     dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 use half::f16;
@@ -279,6 +279,18 @@ fn bench_dot(c: &mut Criterion) {
                 let mut acc = 0_i64;
                 for v in &corpus.stored_i8 {
                     acc += i64::from(dot_i8_i8(black_box(v), black_box(qi8)));
+                }
+                black_box(acc)
+            });
+        });
+        // Unlike the decode-bound f16 dot, the i8 decode is a cheap sign-extend, so the
+        // pass-1 kernel may be sum-chain-bound → 4 accumulators (integer-exact, so a
+        // bit-identical change). Probe whether it beats the single accumulator.
+        group.bench_function(BenchmarkId::new("i8_dot_4acc", n), |b| {
+            b.iter(|| {
+                let mut acc = 0_i64;
+                for v in &corpus.stored_i8 {
+                    acc += i64::from(dot_i8_i8_4acc(black_box(v), black_box(qi8)));
                 }
                 black_box(acc)
             });
