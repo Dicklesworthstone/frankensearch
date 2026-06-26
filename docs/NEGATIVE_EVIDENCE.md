@@ -71,6 +71,57 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-26 — Tantivy fast `id` column is a comparator-poisoning loss (BlackThrush)
+
+**Lever tested and reverted:** mark the Tantivy `id` text field as `FAST` and make
+`TantivyIndex::search_doc_ids` pull IDs from the per-segment string fast field instead of loading
+stored docs. This followed the prior stored-doc materialization hypothesis, but Tantivy text fast
+fields are dictionary encoded; resolving each hit still requires `ord_to_str`, and large result
+sets repeatedly pay dictionary lookup/decode costs.
+
+**Measured command (RCH local fallback; no admissible workers:
+`insufficient_slots=5,hard_preflight=1`; per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_COMMAND='RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`. The BOLD summary completed; the remaining Criterion process was interrupted
+afterward because per-iteration tracing produced massive output.
+
+**Why this is rejected:** the candidate changes the same `search_doc_ids` function used by both
+the frankensearch path and the `tantivy_doc_ids` incumbent, so the emitted candidate/incumbent
+ratio is comparator-poisoned. Against the prior mainline Tantivy-class ledger, the hot rows are
+material regressions:
+
+| Workload | Prior main Tantivy-class p50 | Candidate frankensearch p50 | Candidate / prior Tantivy-class | Decision |
+|----------|------------------------------|------------------------------|----------------------------------|----------|
+| `top10_short_keyword/10000` | 43 us | 310 us | **7.209x slower** | reverted |
+| `top10_high_fanout/10000` | 171 us | 245 us | **1.433x slower** | reverted |
+| `top10_zero_hit/10000` | 29 us | 140 us | **4.828x slower** | reverted |
+| `limit_all/10000` | 9.832 ms | 135.282 ms | **13.76x slower** | reverted |
+| `top10_quoted_phrase/100000` | 1.143 ms | 1.130 ms | **0.989x** | isolated/no keep |
+
+Candidate-run examples showing the poisoned incumbent effect:
+
+| Workload | Candidate mutated Tantivy p50 | Candidate frankensearch p50 | Emitted ratio | Why not accepted |
+|----------|-------------------------------|------------------------------|---------------|------------------|
+| `limit_all/10000` | 199.898 ms | 135.282 ms | 0.677 | both sides are >10x slower than prior mainline |
+| `top10_short_keyword/10000` | 284 us | 310 us | 1.092 | still slower than the mutated incumbent and far slower than prior mainline |
+| `top10_zero_hit/100000` | 87 us | 39 us | 0.448 | isolated win, but same code regresses 10k zero-hit and `limit_all` badly |
+
+**Decision:** reverted all source changes. Text fast fields are not the right ID materialization
+primitive for this workload. A future attempt needs an ID retrieval path that does not dictionary
+decode per hit, or it must keep the comparator immutable and measure frankensearch-only changes.
+
 ### 2026-06-25 — BOLD-VERIFY after lexical prefetch budget gate: mixed, not universal (BlackThrush)
 
 **Lever kept elsewhere:** the BOLD hash-hybrid harness now asks Tantivy for only `k` lexical
