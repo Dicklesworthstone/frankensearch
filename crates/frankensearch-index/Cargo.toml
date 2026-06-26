@@ -40,5 +40,10 @@ wide = { workspace = true }
 name = "dot_product"
 harness = false
 
+# HNSW (ANN) vs flat brute-force vector search — lever validation (latency + recall).
+[[bench]]
+name = "hnsw_vs_flat"
+harness = false
+
 [lints]
 workspace = true

@@ -356,6 +356,37 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-26 — HNSW (ANN) is SLOWER than the flat parallel scan at 10k–100k scale (BlackThrush)
+
+**Lever evaluated (not wired):** the default vector search is a flat O(N) cosine scan
+(`VectorIndex::search_top_k` — rayon-parallel + SIMD f16 dot + bounded-heap + cutoff). `HnswIndex`
+(behind the `ann` feature, unwired) is an approximate O(log N) graph index — the obvious "radical
+lever" for the scan. Validated it head-to-head before committing to the multi-iteration wiring.
+
+**Measured command (per-crate; new gated bench `benches/hnsw_vs_flat.rs`):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-index --features ann --bench hnsw_vs_flat
+```
+
+| Workload (N=10000, dim=128, k=10) | flat `search_top_k` | HNSW `knn_search` (ef=100) | ratio HNSW/flat | verdict |
+|-----------------------------------|---------------------|----------------------------|-----------------|---------|
+| `hnsw_vs_flat` | 166.978 µs | 473.047 µs | **2.833 (HNSW ~2.8× slower)** | reject at this scale |
+
+**Why it fails (at this scale):** the flat path is **rayon-parallel across cores**, SIMD-vectorized
+(the landed f16/f32 dot kernels), and streams the vector slab **sequentially** (cache-friendly, HW
+prefetch). HNSW `knn_search` is a **serial** graph walk with **random** memory access (scattered
+graph nodes) and an `ef_search=100` beam that visits many candidates — so its O(log N) node count
+loses to the O(N) parallel-SIMD scan until N is far larger. At frankensearch's typical corpus size
+(10k–100k vectors) HNSW is a **net latency loss**; it would only pay off at ≫1M vectors where the
+fixed graph-traversal cost finally beats the (now huge) parallel scan. Recall is moot here — the
+latency loss is decisive regardless.
+
+**Decision:** do **not** wire HNSW as the default (or large-N) vector index for the current target
+scale. The flat parallel-SIMD scan is the right default. Bench kept (gated behind `ann`, no-op
+without it) for re-validation at ≫1M scale, where the crossover may flip. This closes the
+"HNSW-default" recommendation from prior iterations.
+
 ### 2026-06-26 — fusing fingerprint content-hash + char-count is zero-gain (same per-byte work) (BlackThrush)
 
 **Lever:** `Fingerprint::compute` scanned the document twice — `fnv1a_hash(text.as_bytes())` for the
