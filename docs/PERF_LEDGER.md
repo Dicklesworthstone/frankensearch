@@ -455,6 +455,29 @@ the production path must re-measure recall on a representative corpus. **Remaini
 the mmap FSVI `search.rs` path (on-disk int8 sidecar, where exact also pays page-faults + decode —
 likely a larger win); real-corpus recall + mult tuning.
 
+**2026-06-26 — clustered-data validation (answers the "needs higher mult on real data" caveat):**
+re-ran on **clustered** vectors (64 centroids + noise — the realistic embedding shape, vs the prior
+uniform-random) via the new gated-free bench `benches/int8_two_pass.rs`
+(`cargo bench -p frankensearch-index --bench int8_two_pass`). Result at N=10000, dim=384, k=10:
+
+| candidate_mult | recall@10 (clustered) | latency | ratio vs flat |
+|----------------|-----------------------|---------|---------------|
+| flat exact | 1.000 | 309.7 µs | 1.00× |
+| 2 | **1.0000** | — | — |
+| 5 | **1.0000** | 166.5 µs | **0.538 (1.86×)** |
+| 10 | **1.0000** | 207.2 µs | **0.669 (1.50×)** |
+| 20 | **1.0000** | — | — |
+
+So on clustered data the two-pass is **lossless (recall@10 = 1.0000) down to mult=2** — *easier* than
+random vectors (clear cluster winners always land in the `k·mult` candidate set, and the exact
+rescore fixes the order). It is a **lossless ~1.5–1.86× speedup over the flat parallel-SIMD exact
+scan** at this scale. This is the strongest vector lever found and is the **opposite of HNSW** (which
+trades recall — see `docs/NEGATIVE_EVIDENCE.md`). **Recommendation:** use `search_top_k_int8_two_pass`
+(mult≈10 for safety margin) for in-memory vector search; it is strictly better than flat exact on
+realistic data. Not made the unconditional default because recall=1.0 is empirical (exact iff the
+true top-k ⊆ the int8 candidate set) — safe as an opt-in / large-N path, with a recall gate for
+pathological corpora.
+
 These rows are routing evidence for future levers, not wins.
 
 Command:

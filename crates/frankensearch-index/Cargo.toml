@@ -45,5 +45,10 @@ harness = false
 name = "hnsw_vs_flat"
 harness = false
 
+# int8 ADC two-pass vs flat exact — lever validation (recall + latency over mult).
+[[bench]]
+name = "int8_two_pass"
+harness = false
+
 [lints]
 workspace = true
