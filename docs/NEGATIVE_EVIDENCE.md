@@ -1621,3 +1621,38 @@ i8 decode is a cheap one-op sign-extend while the 4-bit decode is shift-heavy.
 ILP. A real win there must *reduce decode work* (fewer shifts per chunk / a cheaper sign-extend), not
 add accumulators. Do not re-attempt multi-accumulator on `dot_4bit_prepared`. Original-comparator
 ratio vs Lucene/Tantivy/Meilisearch is **N/A** for this isolated vector kernel.
+
+### 2026-06-27 — and cutting a shift (`s>>4` high nibble) ALSO regresses — the decode bottleneck is not shift count (BlackThrush)
+
+**Follow-up to the entry directly above** (closing its own "route next: reduce decode work"). The
+high nibble was decoded as `(s<<8)>>12` (2 shifts). Because `from_i8x16` already copies the byte's
+bit 7 — which *is* the high nibble's sign bit — across bits 8..15, the high nibble can be
+sign-extended in **one** arithmetic shift, `s >> 4`, taking the per-chunk decode from 4 shifts to 3.
+Integer-exact (`dot_packed_4bit_matches_scalar` passed). Hypothesis: a shift-bound decode should
+speed up ~proportionally.
+
+**Measured (in-process A/B, single accumulator both sides; `fourbit_3shift` = lib `s>>4`,
+`fourbit_4shift` = local `(s<<8)>>12`; same prepared query so the ratio isolates only the
+shift-count change; new names served as a freshness sentinel and both appeared).** `3shift/4shift`
+medians:
+
+| dim | 4 shifts (old) | 3 shifts (new) | ratio | environment |
+|-----|----------------|----------------|-------|-------------|
+| 256 | 283.81 µs | 296.18 µs | **1.044** | local |
+| 256 | 379.85 µs | 396.32 µs | **1.043** | rch `ovh-a` |
+| 384 | 357.42 µs | 355.71 µs | 0.995 | local |
+| 384 | 499.98 µs | 520.90 µs | **1.042** | rch `ovh-a` |
+
+**Decision:** rejected and fully reverted (`simd.rs` + bench arms byte-identical to `main` before
+this entry). Two independent environments agree: dropping a shift is **~4 % slower** (dim256 both
+runs, dim384 on the cleaner rch worker; the one local dim384 tie is the noise floor). So the kernel
+is **not shift-throughput-bound** either — removing a shift does not help, and mixing shift amounts
+(`>>4` alongside the `>>12` pair) actually schedules *worse* than the uniform `(s<<k)>>12` pattern
+the optimizer already pairs cleanly. The real binding resource is more likely the per-chunk 16-byte
+load + the two `pmullw` multiplies + the `from_i8x16` widen, which the shifts overlap with on a
+wide-issue core.
+
+**Revised conclusion for `dot_4bit_prepared`:** neither more accumulators nor fewer shifts pay. The
+kernel is already near its local optimum on this SSE2-class build; the remaining lever for 4-bit
+pass-1 is the **AVX2/`vpmaddubsw`-class** path (gated build-config knob, see the AVX2 section above),
+not a portable source rewrite. Stop micro-tuning the `wide`-based nibble decode.
