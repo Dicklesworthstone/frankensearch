@@ -113,6 +113,24 @@ fn bench_int8_two_pass(c: &mut Criterion) {
         );
     }
 
+    // ── 4-bit recall@K sweep (in-memory twin; confirm lossless at a feasible mult). ──
+    for mult in [2usize, 5, 10] {
+        let mut total = 0.0;
+        for (qi, query) in queries.iter().enumerate() {
+            let approx: Vec<String> = index
+                .search_top_k_4bit_two_pass(query, K, mult)
+                .expect("4bit")
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect();
+            total += recall_at_k(&exact[qi], &approx);
+        }
+        eprintln!(
+            "[int8_two_pass] 4bit N={N} dim={DIM} k={K} mult={mult} recall@{K}={:.4}",
+            total / QUERIES as f64
+        );
+    }
+
     // ── Latency: flat exact vs int8 two-pass at mult=5 and mult=10. ──
     let mut qi = 0usize;
     let mut g = c.benchmark_group("int8_two_pass");
@@ -132,6 +150,19 @@ fn bench_int8_two_pass(c: &mut Criterion) {
                     index
                         .search_top_k_int8_two_pass(black_box(q), K, mult)
                         .expect("int8"),
+                )
+            });
+        });
+    }
+    for mult in [5usize, 10] {
+        g.bench_function(format!("fourbit_mult{mult}"), |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(
+                    index
+                        .search_top_k_4bit_two_pass(black_box(q), K, mult)
+                        .expect("4bit"),
                 )
             });
         });

@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::VectorIndex;
 use crate::search::{PARALLEL_CHUNK_SIZE, SearchParams};
-use crate::simd::{dot_i8_i8, dot_product_f16_f32};
+use crate::simd::{dot_i8_i8, dot_packed_4bit, dot_product_f16_f32};
 
 /// Fully-resident in-memory vector index with f16 quantization.
 ///
@@ -49,6 +49,10 @@ pub struct InMemoryVectorIndex {
     /// (the scale is a per-query constant). Built on first two-pass use so exact-only
     /// callers pay neither the quantization work nor its `N·d`-byte footprint.
     vectors_i8: OnceLock<Vec<i8>>,
+    /// Lazily-built packed signed-4-bit quantization (2 dims/byte, `dim.div_ceil(2)`
+    /// bytes/vector — half the int8 slab) for the optional 4-bit two-pass scan
+    /// (`search_top_k_4bit_two_pass`). Built on first 4-bit-two-pass use.
+    vectors_nibbles: OnceLock<Vec<u8>>,
     /// Lazily-built FNV-1a hashes of `doc_ids` (same `frankensearch_core::filter`
     /// hash that `BitsetFilter` uses). Lets the filtered scan call
     /// `SearchFilter::matches_doc_id_hash` with a precomputed hash instead of
@@ -101,6 +105,62 @@ fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
         .collect()
 }
 
+/// Quantize one component to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's
+/// complement in the low 4 bits) given a scale.
+#[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the cast
+fn nibble_of(value: f32, scale: f32) -> u8 {
+    let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
+    (q as u8) & 0x0F
+}
+
+/// Pack an f32 query into signed 4-bit nibbles, 2 dims/byte (low = even dim, high =
+/// odd dim), using the query's own max-abs scale (a per-query constant that does not
+/// change the dot ranking). Matches `pack_4bit_slab`'s layout for `dot_packed_4bit`.
+fn pack_4bit_query(query: &[f32]) -> Vec<u8> {
+    let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+    let mut packed = vec![0_u8; query.len().div_ceil(2)];
+    for (d, &x) in query.iter().enumerate() {
+        let nib = nibble_of(x, scale);
+        if d % 2 == 0 {
+            packed[d / 2] |= nib;
+        } else {
+            packed[d / 2] |= nib << 4;
+        }
+    }
+    packed
+}
+
+/// Pack a contiguous f16 vector slab (`count·dim`) into signed 4-bit nibbles
+/// (`dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale (a constant
+/// factor, so the dot ranking is preserved).
+fn pack_4bit_slab(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let max_abs = vectors_f16
+        .iter()
+        .map(|x| x.to_f32().abs())
+        .fold(0.0_f32, f32::max);
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+    let count = vectors_f16.len() / dim;
+    let bytes_per_vector = dim.div_ceil(2);
+    let mut slab = vec![0_u8; count * bytes_per_vector];
+    for v in 0..count {
+        let base = v * dim;
+        let out = v * bytes_per_vector;
+        for d in 0..dim {
+            let nib = nibble_of(vectors_f16[base + d].to_f32(), scale);
+            if d % 2 == 0 {
+                slab[out + d / 2] |= nib;
+            } else {
+                slab[out + d / 2] |= nib << 4;
+            }
+        }
+    }
+    slab
+}
+
 impl InMemoryVectorIndex {
     /// Build from pre-computed f32 vectors, quantizing to f16.
     ///
@@ -145,6 +205,7 @@ impl InMemoryVectorIndex {
             doc_ids,
             vectors: flat,
             vectors_i8: OnceLock::new(),
+            vectors_nibbles: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
             dimension,
@@ -189,6 +250,7 @@ impl InMemoryVectorIndex {
             doc_ids,
             vectors: flat,
             vectors_i8: OnceLock::new(),
+            vectors_nibbles: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
             dimension,
@@ -401,6 +463,73 @@ impl InMemoryVectorIndex {
         // Pass 2: exact f16 rescore of the candidates through the SAME bounded-heap
         // selection + tie-break as the exact path, so the final order matches
         // `search_top_k` exactly whenever pass-1 retained the true top-k.
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        for candidate in candidate_heap {
+            let score = dot_product_f16_f32(self.vector_slice(candidate.index), query)?;
+            insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), limit);
+        }
+        self.resolve_heap(heap)
+    }
+
+    /// 4-bit (16-level) two-pass exact top-k — the in-memory twin of the FSVI
+    /// `search_top_k_4bit_two_pass`. A parallel pass-1 over a packed signed-4-bit
+    /// slab (`dim/2` bytes/vector — half the int8 slab) via the fused
+    /// `dot_packed_4bit` kernel keeps the top `k·mult`, then an exact f16 rescore
+    /// selects the final top-k. 16 levels are lossless at mult≈5 on realistic
+    /// clustered data; the result matches the exact top-k whenever pass-1 retains it.
+    pub fn search_top_k_4bit_two_pass(
+        &self,
+        query: &[f32],
+        limit: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        if query.len() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: query.len(),
+            });
+        }
+        let count = self.record_count();
+        if limit == 0 || count == 0 {
+            return Ok(Vec::new());
+        }
+        let query_packed = pack_4bit_query(query);
+        let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        let bytes_per_vector = self.dimension.div_ceil(2);
+        let nibbles = self
+            .vectors_nibbles
+            .get_or_init(|| pack_4bit_slab(&self.vectors, self.dimension));
+
+        // Pass 1: parallel bounded-heap 4-bit scan (same chunking + cutoff fast-path
+        // as the int8 two-pass).
+        let chunk_size = PARALLEL_CHUNK_SIZE;
+        let chunk_count = count.div_ceil(chunk_size);
+        let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_index| {
+                let start = chunk_index * chunk_size;
+                let end = (start + chunk_size).min(count);
+                let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
+                let mut cutoff = f32::NEG_INFINITY;
+                for index in start..end {
+                    let offset = index * bytes_per_vector;
+                    let stored = &nibbles[offset..offset + bytes_per_vector];
+                    let score = dot_packed_4bit(stored, &query_packed) as f32;
+                    if heap.len() < candidate_count || score_key(score) >= cutoff {
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
+                        if heap.len() >= candidate_count
+                            && let Some(&worst) = heap.peek()
+                        {
+                            cutoff = score_key(worst.score);
+                        }
+                    }
+                }
+                heap
+            })
+            .collect();
+        let candidate_heap = merge_partial_heaps(partials, candidate_count);
+
+        // Pass 2: exact f16 rescore of the candidates (same selection + tie-break).
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         for candidate in candidate_heap {
             let score = dot_product_f16_f32(self.vector_slice(candidate.index), query)?;
@@ -1012,6 +1141,33 @@ mod tests {
             for (a, b) in two_pass.iter().zip(exact.iter()) {
                 assert!((a.score - b.score).abs() < 1e-6, "scores differ");
             }
+        }
+    }
+
+    #[test]
+    fn four_bit_two_pass_keep_all_matches_exact() {
+        // With a multiplier large enough to retain every record, the exact f16
+        // rescore must reproduce `search_top_k` bit-for-bit — verifying the nibble
+        // pack/unpack, offsets, rescore, and resolve.
+        let dim = 34; // odd-ish, > 32, exercises a partial last packed byte
+        let n = 200;
+        let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| make_normalized_vec(dim, i as f32 * 0.31))
+            .collect();
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+
+        for qseed in [0.31_f32, 3.0, 17.5, 99.9] {
+            let query = make_normalized_vec(dim, qseed);
+            let exact = index.search_top_k(&query, 10, None).unwrap();
+            // mult=20 → candidate_count clamps to n → pass-1 retains all → identical.
+            let two_pass = index.search_top_k_4bit_two_pass(&query, 10, 20).unwrap();
+            let exact_ids: Vec<&str> = exact.iter().map(|h| h.doc_id.as_str()).collect();
+            let tp_ids: Vec<&str> = two_pass.iter().map(|h| h.doc_id.as_str()).collect();
+            assert_eq!(
+                tp_ids, exact_ids,
+                "4bit two-pass (keep-all) should match exact top-k (qseed={qseed})"
+            );
         }
     }
 
