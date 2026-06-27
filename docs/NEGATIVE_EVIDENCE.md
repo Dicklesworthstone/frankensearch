@@ -2001,3 +2001,30 @@ churn) and rejected for the stated structural reason — **no bench needed**:
    `search_doc_ids` path; bit-identical *scoring* must be differentially proven vs Tantivy's parser.
 
 Beyond these, the reachable per-crate compute surface for clean bit-identical wins is **saturated**.
+
+### 2026-06-27 — plain-query parse bypass: ~20× faster to build but NOT rank-equivalent to Tantivy's parser — REVERTED (Cobaltmoth)
+
+**Lever tested and reverted (the route-next from the parser-cache entry above).** `parse_query_lenient`
+runs on every lexical query; for plain queries (ASCII alphanumeric + whitespace, no operators/quotes/
+fields/wildcards/`AND`/`OR`/`NOT`) I built the BM25 `BooleanQuery` directly (`content:tok` + boosted
+`title:tok` per token, `Should`), skipping Tantivy's lenient `QueryParser`. **Construction is hugely
+cheaper** (in-process A/B, `plain_query_build`): 2-term **2855 ns → 145 ns (~19.7×)**, 4-term
+**5557 ns → 357 ns (~15.6×)**.
+
+**But it cannot be made equivalent to the parser's ranking**, across three structural attempts vs a
+differential test (`plain_query_matches_parser`: build fast vs parser, search the same index, compare
+ranked (BM25 score, doc_id)):
+- **Flat** `Should` over all (field,token) leaves → BM25 score off by **~1 ULP** (`9.966056` vs parser
+  `9.966055` on "distributed consensus algorithms") — f32 summation is **not associative**, and the
+  parser's leaf grouping differs. The 81 *existing* lexical tests pass, but the 1-ULP delta **flips
+  TopDocs ranking** at near-ties (score collision → DocAddress tiebreak reorders vs the parser's
+  distinct scores), so it fails even a relaxed doc_id-order + ε-score check.
+- **Nested** per-token (`BooleanQuery[content, title^2]` per token, outer over tokens) → scores **~3×
+  off** (`8.27` vs `2.76`) — structurally wrong; Tantivy's nested `Should` scorer is not a plain sum.
+
+**Decision:** **reverted** (`lib.rs` + `Cargo.toml` byte-identical to `main`; bench + tests removed).
+The parser's exact query tree / BM25 scoring is **not externally replicable** from the public Tantivy
+API, so any hand-built substitute changes ranking. Original-comparator ratio is **N/A** (Tantivy-wrapper
+parse overhead). **Route-next:** a safe win needs Tantivy itself to expose a cheap plain-term query
+builder that yields the parser's exact tree, or the parse cost (~3–6 µs/query, ~5–15 % of a BOLD lexical
+query) must be accepted as comparator-inherent. Do not re-attempt a hand-built plain-query substitute.
