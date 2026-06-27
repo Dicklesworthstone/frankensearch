@@ -32,7 +32,15 @@ fn nfc_full(text: &str) -> String {
 }
 
 const LOW_SIGNAL: &[&str] = &[
-    "ok", "done", "yes", "no", "thanks", "understood", "sure", "got it", "thank you",
+    "ok",
+    "done",
+    "yes",
+    "no",
+    "thanks",
+    "understood",
+    "sure",
+    "got it",
+    "thank you",
 ];
 
 /// Prior `filter_low_signal`: lowercase the entire document, then compare.

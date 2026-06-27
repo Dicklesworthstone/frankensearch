@@ -197,10 +197,7 @@ fn strip_markdown_line(line: &str) -> String {
     // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
     // Byte-identical to the full path; the header/blockquote/list stripping below
     // still applies. Plain prose and most code-comment text hit this path.
-    let result = if line
-        .bytes()
-        .any(|b| matches!(b, b'*' | b'_' | b'`' | b'['))
-    {
+    let result = if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
         // Remove bold/italic markers
         let mut r = line.replace("**", "");
         r = r.replace("__", "");
@@ -451,9 +448,9 @@ mod tests {
             "",
             "plain ascii text 123 _-./",
             "fn main() { let x = 0; }",
-            "café\u{0301}",            // non-ASCII (combining mark)
+            "café\u{0301}",                // non-ASCII (combining mark)
             "caf\u{0065}\u{0301}\u{00e9}", // mixed decomposed/precomposed
-            "日本語テキスト",          // non-ASCII
+            "日本語テキスト",              // non-ASCII
             "naïve façade",
         ];
         for c in cases {
