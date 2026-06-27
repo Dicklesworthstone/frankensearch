@@ -257,7 +257,13 @@ impl AttnScratch {
 /// stays intra-forward, so the nested-rayon + `Mutex` deadlock class remains closed.
 /// Bit-exact to the bmm tape path (within f32 reassociation) — validated by parity +
 /// `forward_batch_matches_per_doc`.
-fn fused_attention(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: f32, out: &mut [f32]) {
+fn fused_attention(
+    scratch: &mut AttnScratch,
+    qkv: &[f32],
+    s_len: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
     debug_assert_eq!(qkv.len(), s_len * 3 * H);
     debug_assert_eq!(out.len(), s_len * H);
     if s_len == 0 {
@@ -267,7 +273,13 @@ fn fused_attention(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: 
     scratch.ensure(s_len);
     let hm = s_len * H;
     let sc = NH * s_len * s_len;
-    let AttnScratch { q_hm, kt, v_hm, scores, ctx_hm } = scratch;
+    let AttnScratch {
+        q_hm,
+        kt,
+        v_hm,
+        scores,
+        ctx_hm,
+    } = scratch;
     let (q_hm, kt, v_hm) = (&mut q_hm[..hm], &mut kt[..hm], &mut v_hm[..hm]);
     let scores = &mut scores[..sc];
     let ctx_hm = &mut ctx_hm[..hm];
@@ -278,7 +290,8 @@ fn fused_attention(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: 
         for h in 0..NH {
             let hmj = (h * s_len + j) * HD;
             q_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + h * HD..base + h * HD + HD]);
-            v_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+            v_hm[hmj..hmj + HD]
+                .copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
         }
     }
     // Kᵀ: each output row `kt[h, d, :]` is written sequentially (contiguous stores)
@@ -321,7 +334,13 @@ fn fused_attention(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: 
 /// collapse to `[1, HD] @ [HD, S]` and `[1, S] @ [S, HD]` per head (m = 1), i.e. ~S×
 /// less attention work than the full `fused_attention`. Bit-exact to row 0 of it.
 /// Reuses the same `scratch` (strict prefixes of the full-attention buffers).
-fn fused_attention_cls(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: f32, out: &mut [f32]) {
+fn fused_attention_cls(
+    scratch: &mut AttnScratch,
+    qkv: &[f32],
+    s_len: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
     debug_assert_eq!(qkv.len(), s_len * 3 * H);
     debug_assert_eq!(out.len(), H);
     if s_len == 0 {
@@ -332,7 +351,13 @@ fn fused_attention_cls(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, sca
     scratch.ensure(s_len);
     let hm = s_len * H;
     let sc = NH * s_len;
-    let AttnScratch { q_hm, kt, v_hm, scores, ctx_hm } = scratch;
+    let AttnScratch {
+        q_hm,
+        kt,
+        v_hm,
+        scores,
+        ctx_hm,
+    } = scratch;
     // Q[CLS] head-major [NH, 1, HD] (token 0's query) uses the first NH*HD == H slots.
     let q_cls = &mut q_hm[..H];
     let (kt, v_hm) = (&mut kt[..hm], &mut v_hm[..hm]);
@@ -345,7 +370,8 @@ fn fused_attention_cls(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, sca
         let base = j * STRIDE;
         for h in 0..NH {
             let hmj = (h * s_len + j) * HD;
-            v_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+            v_hm[hmj..hmj + HD]
+                .copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
         }
     }
     for h in 0..NH {
@@ -431,7 +457,13 @@ impl Model {
         debug_assert_eq!(x.len(), m * q.in_);
         let y = if q.packed {
             ft_api::linear_int8_dynamic_prepacked_f32(
-                x, m, q.in_, &q.w_i8, &q.w_scales, q.out, Some(&q.bias),
+                x,
+                m,
+                q.in_,
+                &q.w_i8,
+                &q.w_scales,
+                q.out,
+                Some(&q.bias),
             )
         } else {
             ft_api::linear_int8_dynamic_f32(x, m, q.in_, &q.w_i8, &q.w_scales, q.out, Some(&q.bias))
@@ -485,10 +517,21 @@ impl Model {
         let mut ctx = vec![0.0f32; total * H];
         for (&off, &len) in offsets.iter().zip(lens) {
             let qkv_doc = &qkv[off * 3 * H..(off + len) * 3 * H];
-            fused_attention(scratch, qkv_doc, len, scale, &mut ctx[off * H..(off + len) * H]);
+            fused_attention(
+                scratch,
+                qkv_doc,
+                len,
+                scale,
+                &mut ctx[off * H..(off + len) * H],
+            );
         }
         let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
-        let emb = self.add_ln_raw(&emb, &attn, total, &format!("{p}.attention.output.LayerNorm"))?;
+        let emb = self.add_ln_raw(
+            &emb,
+            &attn,
+            total,
+            &format!("{p}.attention.output.LayerNorm"),
+        )?;
         // FFN: [total, H] -> [total, INTER] -> GELU -> [total, H].
         let mut inter = self.linear_raw(&emb, total, &format!("{p}.intermediate.dense"))?;
         debug_assert_eq!(inter.len(), total * INTER);
@@ -638,7 +681,12 @@ impl Model {
     /// writing one fresh ctx leaf). Tape-path reference for the single-pair
     /// [`Self::forward`]; production goes through the tape-free `encoder_layer_raw`.
     #[cfg(test)]
-    fn attn_fused(&mut self, qkv: TensorNodeId, s_len: usize, scale: f64) -> SearchResult<TensorNodeId> {
+    fn attn_fused(
+        &mut self,
+        qkv: TensorNodeId,
+        s_len: usize,
+        scale: f64,
+    ) -> SearchResult<TensorNodeId> {
         let ctx_vals = {
             let qkv_v = self
                 .s
@@ -672,7 +720,10 @@ impl Model {
             .s
             .tensor_transpose(k, 1, 2)
             .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
-        let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
+        let scores = self
+            .s
+            .tensor_bmm(q, kt)
+            .map_err(|e| rerank_err("attn.qk", e))?;
         {
             let slice = self
                 .s
@@ -680,7 +731,10 @@ impl Model {
                 .map_err(|e| rerank_err("attn.softmax_mut", e))?;
             fast_softmax_inplace(slice, NH * s_len, s_len, scale as f32);
         }
-        let ctx = self.s.tensor_bmm(scores, v).map_err(|e| rerank_err("attn.ctx", e))?;
+        let ctx = self
+            .s
+            .tensor_bmm(scores, v)
+            .map_err(|e| rerank_err("attn.ctx", e))?;
         let ctx = self
             .s
             .tensor_transpose(ctx, 0, 1)
@@ -773,7 +827,10 @@ impl Model {
             .tensor_narrow(emb, 0, 0, 1)
             .map_err(|e| rerank_err("pooler.narrow", e))?; // [1, H]
         let pooled = self.linear(cls, "bert.pooler.dense")?;
-        let pooled = self.s.tensor_tanh(pooled).map_err(|e| rerank_err("pooler.tanh", e))?;
+        let pooled = self
+            .s
+            .tensor_tanh(pooled)
+            .map_err(|e| rerank_err("pooler.tanh", e))?;
         let logit_t = self.linear(pooled, "classifier")?; // [1, 1]
         let vals = self
             .s
@@ -885,12 +942,25 @@ impl Model {
                 .map_err(|e| rerank_err("batch.emb_extract", e))?;
             for i in 0..L - 1 {
                 let p = format!("bert.encoder.layer.{i}");
-                emb_vals =
-                    self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f, &mut scratch)?;
+                emb_vals = self.encoder_layer_raw(
+                    emb_vals,
+                    total,
+                    &offsets,
+                    &lens,
+                    &p,
+                    scale_f,
+                    &mut scratch,
+                )?;
             }
             let p_last = format!("bert.encoder.layer.{}", L - 1);
             let cls_vals = self.encoder_layer_cls(
-                &emb_vals, &offsets, &lens, total, &p_last, scale_f, &mut scratch,
+                &emb_vals,
+                &offsets,
+                &lens,
+                total,
+                &p_last,
+                scale_f,
+                &mut scratch,
             )?;
             emb = self
                 .s
@@ -948,7 +1018,10 @@ impl Model {
             .tensor_index_select(emb, 0, cls_t)
             .map_err(|e| rerank_err("batch.cls_gather", e))?; // [N, H]
         let pooled = self.linear(cls, "bert.pooler.dense")?;
-        let pooled = self.s.tensor_tanh(pooled).map_err(|e| rerank_err("pooler.tanh", e))?;
+        let pooled = self
+            .s
+            .tensor_tanh(pooled)
+            .map_err(|e| rerank_err("pooler.tanh", e))?;
         let logit_t = self.linear(pooled, "classifier")?; // [N, 1]
         let vals = self
             .s
@@ -1004,7 +1077,10 @@ impl NativeReranker {
         let tok_path = dir.join(TOKENIZER_JSON);
         if !tok_path.is_file() {
             return Err(SearchError::ModelNotFound {
-                name: format!("{MODEL_NAME} (missing {TOKENIZER_JSON} in {})", dir.display()),
+                name: format!(
+                    "{MODEL_NAME} (missing {TOKENIZER_JSON} in {})",
+                    dir.display()
+                ),
             });
         }
         let mut tokenizer =
@@ -1108,10 +1184,12 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
         }
     })?;
     let data = &bytes[header_end..];
-    let obj = header.as_object().ok_or_else(|| SearchError::ModelLoadFailed {
-        path: path.to_path_buf(),
-        source: "safetensors header is not an object".into(),
-    })?;
+    let obj = header
+        .as_object()
+        .ok_or_else(|| SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: "safetensors header is not an object".into(),
+        })?;
 
     // First pass: read every F32 tensor into raw (name -> (values, shape)).
     let mut raw: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
@@ -1119,14 +1197,21 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
         if name == "__metadata__" {
             continue;
         }
-        let dtype = info.get("dtype").and_then(serde_json::Value::as_str).unwrap_or("");
+        let dtype = info
+            .get("dtype")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if dtype != "F32" {
             continue; // skip I64 position_ids and any non-float buffers
         }
         let shape: Vec<usize> = info
             .get("shape")
             .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|u| u as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         let offsets = info
             .get("data_offsets")
@@ -1135,8 +1220,14 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                 path: path.to_path_buf(),
                 source: format!("safetensors tensor {name} missing data_offsets").into(),
             })?;
-        let start = offsets.first().and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-        let end = offsets.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let start = offsets
+            .first()
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let end = offsets
+            .get(1)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
         if start > end || end > data.len() {
             return Err(SearchError::ModelLoadFailed {
                 path: path.to_path_buf(),
@@ -1292,7 +1383,13 @@ fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
     // Tape boundary AFTER the persistent f32 leaves are created; each forward
     // truncates back to here to free intermediates while keeping parameters.
     let weights_boundary = session.autograd_graph_node_count();
-    Ok(Model { s: session, w, qw: shared.qw.clone(), raw_params, weights_boundary })
+    Ok(Model {
+        s: session,
+        w,
+        qw: shared.qw.clone(),
+        raw_params,
+        weights_boundary,
+    })
 }
 
 #[inline]
@@ -1324,7 +1421,11 @@ impl SyncRerank for NativeReranker {
                 .encode((query, doc.text.as_str()), true)
                 .map_err(|e| rerank_err("tokenize", e))?;
             let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-            let mut typ: Vec<i64> = encoding.get_type_ids().iter().map(|&t| i64::from(t)).collect();
+            let mut typ: Vec<i64> = encoding
+                .get_type_ids()
+                .iter()
+                .map(|&t| i64::from(t))
+                .collect();
             if ids.len() > self.max_length {
                 ids.truncate(self.max_length);
                 typ.truncate(self.max_length);
@@ -1435,7 +1536,10 @@ mod tests {
     }
 
     fn doc(id: &str, text: &str) -> RerankDocument {
-        RerankDocument { doc_id: id.to_owned(), text: text.to_owned() }
+        RerankDocument {
+            doc_id: id.to_owned(),
+            text: text.to_owned(),
+        }
     }
 
     #[test]
@@ -1465,7 +1569,9 @@ mod tests {
         }
         let mut order: Vec<usize> = (0..logits.len()).collect();
         order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-        eprintln!("[native_reranker] ranking(desc)={order:?} expected=[2, 0, 1, 3] max_diff={max_diff:.6}");
+        eprintln!(
+            "[native_reranker] ranking(desc)={order:?} expected=[2, 0, 1, 3] max_diff={max_diff:.6}"
+        );
         assert_eq!(order, vec![2usize, 0, 1, 3], "ranking must match reference");
     }
 
@@ -1502,7 +1608,10 @@ mod tests {
         for (i, (b, p)) in batched.iter().zip(&per_doc).enumerate() {
             let diff = (f64::from(*b) - f64::from(*p)).abs();
             eprintln!("[native_reranker] doc {i}: batched={b:.6} per_doc={p:.6} diff={diff:.2e}");
-            assert!(diff < 1e-3, "doc {i}: batched {b} vs per-doc {p} diff {diff} too large");
+            assert!(
+                diff < 1e-3,
+                "doc {i}: batched {b} vs per-doc {p} diff {diff} too large"
+            );
         }
     }
 
@@ -1526,11 +1635,15 @@ mod tests {
         }
         let reranker = NativeReranker::load(MODEL_DIR).expect("load");
         // whitespace-only doc
-        let ws = reranker.rerank_sync("q", &[doc("ws", "   ")]).expect("whitespace ok");
+        let ws = reranker
+            .rerank_sync("q", &[doc("ws", "   ")])
+            .expect("whitespace ok");
         assert_eq!(ws.len(), 1);
         // very long doc (forces truncation well beyond max_length)
         let long_text = "memory safety ".repeat(400);
-        let lng = reranker.rerank_sync("rust", &[doc("long", &long_text)]).expect("long ok");
+        let lng = reranker
+            .rerank_sync("rust", &[doc("long", &long_text)])
+            .expect("long ok");
         assert_eq!(lng.len(), 1);
         assert!(lng[0].score.is_finite());
         eprintln!(
@@ -1551,8 +1664,12 @@ mod tests {
             .enumerate()
             .map(|(i, (_, d, _))| doc(&format!("d{i}"), d))
             .collect();
-        let run1 = reranker.rerank_sync("what is the capital of france", &docs).expect("run1");
-        let run2 = reranker.rerank_sync("what is the capital of france", &docs).expect("run2");
+        let run1 = reranker
+            .rerank_sync("what is the capital of france", &docs)
+            .expect("run1");
+        let run2 = reranker
+            .rerank_sync("what is the capital of france", &docs)
+            .expect("run2");
         assert_eq!(run1.len(), run2.len());
         for (a, b) in run1.iter().zip(run2.iter()) {
             assert_eq!(a.doc_id, b.doc_id);
@@ -1596,7 +1713,10 @@ mod tests {
             .rerank_sync("what is the capital of france", &docs)
             .expect("rerun");
         for (a, b) in scored.iter().zip(again.iter()) {
-            assert_eq!(a.raw_logit, b.raw_logit, "parallel rerank must be deterministic");
+            assert_eq!(
+                a.raw_logit, b.raw_logit,
+                "parallel rerank must be deterministic"
+            );
         }
         eprintln!(
             "[native_reranker] {}-doc concurrent rerank OK (no deadlock, deterministic)",
