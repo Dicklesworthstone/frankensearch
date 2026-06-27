@@ -1403,3 +1403,57 @@ Hybrid candidate vs Tantivy-class proxy:
 The old 100k quoted-phrase miss from 2026-06-25 was 2.068x, so this lever did narrow the biggest
 stale measured gap, but it still failed p50 parity against the Tantivy-class proxy and introduced
 too many mixed rows. Per the revert rule, the code was restored and only this ledger entry is kept.
+
+### 2026-06-27 — count-free top-k (drop the `Count` collector) is a mixed result, not a clean win (CopperLark)
+
+**Lever tested and reverted:** `execute_query_with_offset` runs `(TopDocs::with_limit(k).order_by_score(), Count)`.
+The `Count` collector must visit *every* matching document, which forces Tantivy to disable the
+block-max WAND top-k pruning that `TopDocs` can otherwise use to skip low-scoring blocks.
+`search_doc_ids` (the `tantivy_doc_ids` Lucene/Tantivy/Meilisearch-class BOLD proxy **and** the
+hybrid lexical-candidate source) only reads `.hits` and **discards `total_count`** — so the Count
+work is wasted there. The lever added a count-free `execute_top_k` (identical ranked hits, no
+`Count`), routed `search_doc_ids` through it, and kept a `#[doc(hidden)] search_doc_ids_counted`
+baseline so a new per-crate bench (`crates/frankensearch-lexical/benches/doc_ids_topk.rs`) could
+A/B `free` vs `counted` in one binary on a 100k in-RAM index.
+
+**Conformance:** GREEN — `cargo test -p frankensearch-lexical --lib` = **79 passed; 0 failed**. The
+collector choice does not change which docs `TopDocs` returns, so both paths yield identical ids.
+
+**Command** (RCH fell back to local — `[RCH] local (no admissible workers: insufficient_slots=3)`):
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-lexical --bench doc_ids_topk \
+    -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+**Measured `free`/`counted` ratio (median; `< 1.0` = count-free faster):**
+
+| Corpus / workload | counted | free | ratio | verdict |
+|-------------------|---------|------|-------|---------|
+| BOLD-mirror `high_fanout` (`search`) | 630.6 us | 637.1 us | **1.010** | neutral |
+| BOLD-mirror `short_keyword` (`rust ownership`) | 233.9 us | 63.3 us | **0.271** | big win |
+| BOLD-mirror `quoted_phrase` (`"reciprocal rank fusion"`) | 1.825 ms | 1.083 ms | **0.593** | win |
+| BOLD-mirror `natural_language` (7-term) | 728.6 us | 1.508 ms | **2.070** | regression (noisy 0.99–2.23 ms) |
+| synthetic uniform-vocab `high_fanout` (1 term) | 286.0 us | 222.3 us | 0.777 | win |
+| synthetic `union3` / `natural` / `phrase` (multi-term) | — | — | 1.66 / 3.56 / 1.12 | regressions |
+
+**Interpretation:** count-free WAND wins large on *selective* queries (`short_keyword` 0.271,
+`quoted_phrase` 0.593 — two of the actual BOLD gap rows) but **regresses ~2x on
+`natural_language`**, a broad disjunction dominated by the corpus-wide `search` term (present in
+every BOLD doc): WAND pays its block-max bookkeeping but can't prune a near-universal posting list,
+so it loses to the plain `Count` linear scan. This is the known block-max-WAND pathology for
+low-IDF disjunctions. Because a real BOLD workload regresses ~2x, the change **cannot land
+unconditionally** (repo rule: regression > 1.03 → revert), so all code was reverted and only this
+entry is kept.
+
+**Ratio vs Lucene/Tantivy/Meilisearch = N/A:** the in-repo `tantivy_doc_ids` proxy *is*
+`search_doc_ids`, so this collector change would move the proxy and the hybrid identically — the
+BOLD *ratio* vs the proxy is unchanged by construction. The A/B above isolates the collector-choice
+effect (what real count-free-WAND engines experience), not a head-to-head incumbent ratio.
+
+**Real lever for a future agent:** a *query-adaptive* collector — count-free (`TopDocs` alone, WAND)
+for selective queries (short-keyword / phrase / identifier), counted (full scan) for broad
+natural-language disjunctions that include a corpus-saturating term. Validate on a realistic
+Zipfian corpus *without* a universal term (where `natural_language` may also win) before landing;
+do not re-attempt the unconditional drop.
