@@ -5,6 +5,7 @@
 //! - optional quality-tier rescoring from `vector.quality.idx`
 //! - doc-id alignment between both tiers
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -382,16 +383,29 @@ impl TwoTierIndex {
             });
         }
 
+        // Precompute `doc_id → latest WAL entry index` once, instead of an O(W)
+        // reverse linear scan of the quality WAL **per hit** (was O(hits·W); the
+        // exact scan in `search.rs` already precomputes a WAL map). `&str` keys
+        // borrow the WAL doc_ids (no clone); forward insert keeps the latest
+        // (highest-index) entry, matching the prior rev-scan-first-match. Empty
+        // WAL → non-allocating empty map, so the common (compacted) path is neutral.
+        let wal_latest: HashMap<&str, usize> = {
+            let mut m = HashMap::with_capacity(quality_index.wal_entries.len());
+            for (i, entry) in quality_index.wal_entries.iter().enumerate() {
+                m.insert(entry.doc_id.as_str(), i);
+            }
+            m
+        };
+
         let mut scores = Vec::with_capacity(hits.len());
         for hit in hits {
             let mut found_score = None;
 
-            let hash = crate::fnv1a_hash(hit.doc_id.as_bytes());
-            for entry in quality_index.wal_entries.iter().rev() {
-                if entry.doc_id_hash == hash && entry.doc_id == hit.doc_id {
-                    found_score = Some(dot_product_f32_f32(&entry.embedding, query_vec)?);
-                    break;
-                }
+            if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
+                found_score = Some(dot_product_f32_f32(
+                    &quality_index.wal_entries[i].embedding,
+                    query_vec,
+                )?);
             }
 
             if found_score.is_none() {
