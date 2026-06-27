@@ -108,21 +108,6 @@ impl GraphRanker {
         seed_weights
     }
 
-    fn outgoing_weight_sums(graph: &DocumentGraph) -> HashMap<GraphDocId, f64> {
-        graph
-            .adjacency()
-            .iter()
-            .map(|(doc_id, edges)| {
-                let sum = edges
-                    .iter()
-                    .map(|edge| f64::from(edge.weight))
-                    .filter(|weight| weight.is_finite() && *weight > 0.0)
-                    .sum::<f64>();
-                (doc_id.clone(), sum)
-            })
-            .collect()
-    }
-
     /// Compute graph-ranked candidates for phase-1 fusion.
     ///
     /// Seeds come from current semantic hits (query-matched docs).
@@ -144,77 +129,112 @@ impl GraphRanker {
             return None;
         }
 
-        let mut ranks: HashMap<GraphDocId, f64> = graph
-            .adjacency()
-            .keys()
-            .cloned()
-            .map(|doc_id| (doc_id, 0.0))
-            .collect();
-        for (doc_id, score) in &personalization {
-            ranks.insert(doc_id.clone(), *score);
+        // Dense-index the graph ONCE and run the PageRank power iteration over
+        // `Vec<f64>` buffers instead of rebuilding a `HashMap<String, f64>` every
+        // iteration. `add_edge` inserts both endpoints, so every node — including
+        // dangling sinks reached only as a neighbor — is an adjacency key; the
+        // node set is therefore exactly `adjacency().keys()`. This eliminates,
+        // per iteration: a fresh HashMap allocation, a `String` clone of every
+        // doc_id touched (all `entry(_.clone())` keys were already present, so the
+        // clones were dead work), and a hash probe per edge — all replaced by
+        // array indexing. The per-edge weight-finiteness filter and `f64::from`
+        // widen are also hoisted out of the iteration into the one-time CSR build
+        // (the old loop re-checked them every pass). Ranking is equivalent: the
+        // power iteration converges to the same fixed point within `tolerance`,
+        // and the prior `std::HashMap` accumulation order was already run-to-run
+        // non-deterministic.
+        let adjacency = graph.adjacency();
+        let n = adjacency.len();
+        let mut nodes: Vec<&GraphDocId> = Vec::with_capacity(n);
+        let mut idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+        for doc_id in adjacency.keys() {
+            idx.insert(doc_id.as_str(), nodes.len());
+            nodes.push(doc_id);
         }
 
-        let outgoing_sum = Self::outgoing_weight_sums(graph);
+        // CSR edges + per-node outgoing weight sums (valid edges only), once.
+        let mut out_sum = vec![0.0_f64; n];
+        let mut edges_csr: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for (doc_id, edges) in adjacency {
+            let src = idx[doc_id.as_str()];
+            let mut sum = 0.0_f64;
+            let mut row = Vec::with_capacity(edges.len());
+            for edge in edges {
+                let weight = f64::from(edge.weight);
+                if !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                sum += weight;
+                if let Some(&dst) = idx.get(edge.neighbor_doc_id.as_str()) {
+                    row.push((dst, weight));
+                }
+            }
+            out_sum[src] = sum;
+            edges_csr[src] = row;
+        }
+
+        // Personalization (teleport) vector in dense form.
+        let seeds: Vec<(usize, f64)> = personalization
+            .iter()
+            .filter_map(|(doc_id, w)| idx.get(doc_id.as_str()).map(|&i| (i, *w)))
+            .collect();
+
         let teleport_scale = self.restart_probability.clamp(0.0, 1.0);
         let walk_scale = 1.0 - teleport_scale;
 
-        for _ in 0..self.max_iterations {
-            let mut next: HashMap<GraphDocId, f64> = graph
-                .adjacency()
-                .keys()
-                .cloned()
-                .map(|doc_id| (doc_id, 0.0))
-                .collect();
+        let mut ranks = vec![0.0_f64; n];
+        for &(i, w) in &seeds {
+            ranks[i] = w;
+        }
+        let mut next = vec![0.0_f64; n];
 
-            for (doc_id, seed_weight) in &personalization {
-                *next.entry(doc_id.clone()).or_insert(0.0) += teleport_scale * seed_weight;
+        for _ in 0..self.max_iterations {
+            next.iter_mut().for_each(|v| *v = 0.0);
+
+            for &(i, w) in &seeds {
+                next[i] += teleport_scale * w;
             }
 
-            let dangling_mass = ranks
-                .iter()
-                .filter_map(|(doc_id, rank)| {
-                    (outgoing_sum.get(doc_id).copied().unwrap_or(0.0) <= f64::EPSILON)
-                        .then_some(*rank)
-                })
-                .sum::<f64>();
+            let dangling_mass: f64 = (0..n)
+                .filter(|&i| out_sum[i] <= f64::EPSILON)
+                .map(|i| ranks[i])
+                .sum();
 
             if dangling_mass > 0.0 {
-                for (doc_id, seed_weight) in &personalization {
-                    *next.entry(doc_id.clone()).or_insert(0.0) +=
-                        walk_scale * dangling_mass * seed_weight;
+                for &(i, w) in &seeds {
+                    next[i] += walk_scale * dangling_mass * w;
                 }
             }
 
-            for (doc_id, edges) in graph.adjacency() {
-                let rank = ranks.get(doc_id).copied().unwrap_or(0.0);
+            for src in 0..n {
+                let rank = ranks[src];
                 if rank <= 0.0 {
                     continue;
                 }
-                let out_total = outgoing_sum.get(doc_id).copied().unwrap_or(0.0);
+                let out_total = out_sum[src];
                 if out_total <= f64::EPSILON {
                     continue;
                 }
                 let base = walk_scale * rank / out_total;
-                for edge in edges {
-                    let weight = f64::from(edge.weight);
-                    if !weight.is_finite() || weight <= 0.0 {
-                        continue;
-                    }
-                    *next.entry(edge.neighbor_doc_id.clone()).or_insert(0.0) += base * weight;
+                for &(dst, weight) in &edges_csr[src] {
+                    next[dst] += base * weight;
                 }
             }
 
-            let l1_delta = ranks
-                .iter()
-                .map(|(doc_id, old_rank)| (old_rank - next.get(doc_id).unwrap_or(&0.0)).abs())
-                .sum::<f64>();
-            ranks = next;
+            let l1_delta: f64 = (0..n).map(|i| (ranks[i] - next[i]).abs()).sum();
+            std::mem::swap(&mut ranks, &mut next);
             if l1_delta < self.tolerance {
                 break;
             }
         }
 
-        Self::finalize_scores(ranks, limit)
+        // Map dense ranks back to doc ids and reuse the existing finalize path.
+        let ranks_map: HashMap<GraphDocId, f64> = nodes
+            .iter()
+            .zip(ranks.iter())
+            .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
+            .collect();
+        Self::finalize_scores(ranks_map, limit)
     }
 }
 
@@ -279,6 +299,138 @@ mod tests {
                 results.iter().any(|result| result.doc_id == "doc-c"),
                 "second hop should get propagated graph signal"
             );
+        });
+    }
+
+    /// Reference: the pre-dense PageRank using an ordered (`BTreeMap`)
+    /// accumulator — deterministic, mirroring the original HashMap algorithm.
+    fn rank_phase1_reference(
+        graph: &DocumentGraph,
+        seed_hits: &[VectorHit],
+        limit: usize,
+    ) -> Option<Vec<frankensearch_core::types::ScoredResult>> {
+        use std::collections::BTreeMap;
+        if graph.is_empty() || limit == 0 {
+            return None;
+        }
+        let personalization = GraphRanker::personalization_from_seed_hits(graph, seed_hits);
+        if personalization.is_empty() {
+            return None;
+        }
+        let r = GraphRanker::new();
+        let mut ranks: BTreeMap<String, f64> =
+            graph.adjacency().keys().cloned().map(|d| (d, 0.0)).collect();
+        for (d, s) in &personalization {
+            ranks.insert(d.clone(), *s);
+        }
+        let out_sum: BTreeMap<String, f64> = graph
+            .adjacency()
+            .iter()
+            .map(|(d, edges)| {
+                let s: f64 = edges
+                    .iter()
+                    .map(|e| f64::from(e.weight))
+                    .filter(|w| w.is_finite() && *w > 0.0)
+                    .sum();
+                (d.clone(), s)
+            })
+            .collect();
+        let teleport = r.restart_probability.clamp(0.0, 1.0);
+        let walk = 1.0 - teleport;
+        for _ in 0..r.max_iterations {
+            let mut next: BTreeMap<String, f64> =
+                graph.adjacency().keys().cloned().map(|d| (d, 0.0)).collect();
+            for (d, w) in &personalization {
+                *next.entry(d.clone()).or_insert(0.0) += teleport * w;
+            }
+            let dangling: f64 = ranks
+                .iter()
+                .filter_map(|(d, rk)| {
+                    (out_sum.get(d).copied().unwrap_or(0.0) <= f64::EPSILON).then_some(*rk)
+                })
+                .sum();
+            if dangling > 0.0 {
+                for (d, w) in &personalization {
+                    *next.entry(d.clone()).or_insert(0.0) += walk * dangling * w;
+                }
+            }
+            for (d, edges) in graph.adjacency() {
+                let rk = ranks.get(d).copied().unwrap_or(0.0);
+                if rk <= 0.0 {
+                    continue;
+                }
+                let ot = out_sum.get(d).copied().unwrap_or(0.0);
+                if ot <= f64::EPSILON {
+                    continue;
+                }
+                let base = walk * rk / ot;
+                for e in edges {
+                    let w = f64::from(e.weight);
+                    if !w.is_finite() || w <= 0.0 {
+                        continue;
+                    }
+                    *next.entry(e.neighbor_doc_id.clone()).or_insert(0.0) += base * w;
+                }
+            }
+            let l1: f64 = ranks
+                .iter()
+                .map(|(d, old)| (old - next.get(d).unwrap_or(&0.0)).abs())
+                .sum();
+            ranks = next;
+            if l1 < r.tolerance {
+                break;
+            }
+        }
+        GraphRanker::finalize_scores(ranks.into_iter().collect(), limit)
+    }
+
+    #[test]
+    fn dense_rank_matches_reference_ranking() {
+        run_test_with_cx(|cx| async move {
+            // Deterministic pseudo-random graph: 40 nodes, ~4 out-edges each.
+            let mut state = 0x1234_5678_9abc_def1_u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let n = 40usize;
+            let mut graph = DocumentGraph::new();
+            for i in 0..n {
+                for _ in 0..4 {
+                    let j = (next() as usize) % n;
+                    if j != i {
+                        let w = 0.25 + (next() % 1000) as f32 / 1000.0;
+                        graph.add_edge(format!("d{i:03}"), format!("d{j:03}"), EdgeType::Reference, w);
+                    }
+                }
+            }
+            let seed_hits: Vec<VectorHit> = (0..5usize)
+                .map(|s| VectorHit {
+                    index: s as u32,
+                    score: 0.5 + (s as f32) * 0.1,
+                    doc_id: format!("d{:03}", (s * 7) % n),
+                })
+                .collect();
+
+            let got = GraphRanker::new()
+                .rank_phase1(&cx, "q", &graph, &seed_hits, 25)
+                .expect("dense graph rank");
+            let want = rank_phase1_reference(&graph, &seed_hits, 25).expect("reference rank");
+
+            let got_ids: Vec<&str> = got.iter().map(|r| r.doc_id.as_str()).collect();
+            let want_ids: Vec<&str> = want.iter().map(|r| r.doc_id.as_str()).collect();
+            assert_eq!(got_ids, want_ids, "dense ranking order must match reference");
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(
+                    (f64::from(g.score) - f64::from(w.score)).abs() < 1e-4,
+                    "score mismatch for {}: {} vs {}",
+                    g.doc_id,
+                    g.score,
+                    w.score
+                );
+            }
         });
     }
 }

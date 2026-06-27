@@ -1782,3 +1782,16 @@ counterpart in a lexical comparator's `doc_ids` path, so this narrows frankensea
 diversity-rerank latency rather than beating a Tantivy/Lucene/Meili primitive head-to-head. It is
 also **off the default BOLD lane** (only runs when diversity rerank is enabled), so it does not move
 the `hash_hybrid_tantivy_vector_rrf` rows; its value is making the MMR feature cheap when used.
+
+### 2026-06-27 — graph-rank dense PageRank is a real win, but original-comparator ratio is N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** `GraphRanker::rank_phase1` now runs the power iteration over a
+dense integer-indexed `Vec<f64>` (+ CSR edges, reused buffers) instead of rebuilding a
+`HashMap<String, f64>` and clone-keying `entry()` every iteration — **~11.9× at n500/deg6 and
+n2000/deg8**, ranking-equivalent (`dense_rank_matches_reference_ranking` GREEN vs a `BTreeMap`
+reference of the original algorithm; the old `std::HashMap` sum order was already non-deterministic, so
+nothing exact was pinned). Recorded here to hold the original-comparator honesty bar: the **ratio vs
+Lucene/Tantivy/Meilisearch is N/A**, and additionally this is behind the **off-by-default `graph`
+feature**, so it does not appear in any default build or BOLD lane. Query-biased PageRank over a
+document graph has no counterpart in a lexical comparator's `doc_ids` path; this makes the optional
+graph-rank stage ~12× cheaper when enabled, not a head-to-head primitive win.
