@@ -1936,3 +1936,31 @@ the surgical lock fix; it fails because the whole `fsqlite-*` family is split, n
   this** — the only durable fixes are (a) **Cargo.toml `=` pins** of the entire `fsqlite-*` family to a
   cohering version (committed, validated workspace-wide), or (b) an upstream **`fsqlite` main-crate
   0.1.9+ release** matching its siblings. Owner decision; do not lock-surgery this in the shared tree.
+
+### 2026-06-27 — caching the lexical BM25 `QueryParser` is ~0-gain (construction is cheap) — REVERTED (Cobaltmoth)
+
+**Lever tested and reverted:** `TantivyIndex::parse_query_lenient` (every lexical query) rebuilt a
+fresh `QueryParser::for_index(...)` + `set_field_boost(...)` per call. Hypothesis: the parser is
+schema-invariant, so caching it once at construction removes per-query construction cost. Implemented
+(struct field built once in `from_index`) — bit-identical (81 lexical lib tests GREEN).
+
+**Measured (per-crate in-process A/B; `rebuild` = construct parser + parse per iter, `cached` = parse
+with a pre-built parser; identical `parse_query_lenient(query)` in both, so the delta is construction):**
+
+| Workload | rebuild | cached | ratio |
+|----------|---------|--------|-------|
+| `query_parser_cache` (6-term query) | 7670.8 ns (mean 8030) | 7826.1 ns (mean 7992) | **~1.00** (CIs overlap; cached median slightly *slower*) |
+
+**Decision:** **reverted** (`lib.rs` + `Cargo.toml` byte-identical to `main`; bench removed).
+**Hypothesis refuted:** `QueryParser::for_index` construction is **cheap** (it just clones schema/field
+refs + sets a boost); the ~7.8 µs is the **lenient parse itself** (tokenize → term-build → BooleanQuery),
+which is identical in both arms. Caching the parser removes ~nothing.
+
+**Route-next (the real signal here):** the lenient *parse* costs **~7.8 µs/query** — a genuine slice of
+a BOLD lexical query (≈5–15 % of a 50–170 µs `tantivy_doc_ids`-class query) and pure frankensearch
+per-query overhead. The win is **not** parser caching but **bypassing the full lenient `QueryParser`
+for simple plain queries** — build the `BooleanQuery`/`TermQuery` AST directly (no operator/field/quote
+parsing) when the query is plain tokens. This **overlaps BlackThrush's plain-query count-free top-k
+path** (`search_doc_ids`, which already detects 1–2 plain terms), so it belongs to that owner: detect
+plain query → skip `parse_query_lenient` → hand the collector a hand-built term query. Original-comparator
+ratio vs Lucene/Tantivy/Meilisearch is **N/A** (internal Tantivy-wrapper parse overhead).
