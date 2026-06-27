@@ -129,6 +129,58 @@ evidence only: BOLD rows are mixed, and the apparent exact-identifier improvemen
 attributable because the BOLD harness changed concurrently. A clean retry must start from an
 isolated worktree or first land/reject the unowned exact-ID alias and `doc_id` map edits.
 
+### 2026-06-27 - BOLD exact-identifier alias is a synthetic shortcut, not a landable win (BlackThrush)
+
+**Lever tested and reverted:** add a bench-harness-only alias from query text `doc 000042` to
+document id `doc-000042`, then return a synthetic one-row `ScoredResult` with score `1.0` from the
+frankensearch challenger before running Tantivy/vector search. This creates a dramatic exact-ID
+timing row, but it changes result cardinality and ranking semantics instead of optimizing the real
+search path, so it is not conformance-green.
+
+**Measured command (per-crate, warm target dir; RCH remote `vmi1227854`, 477.7s):**
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_COMMAND,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/frankensearch-exact-alias-reject-20260627-current/.scratch/bold_exact_alias_candidate_20260627T0108Z \
+FRANKENSEARCH_BOLD_VERIFY_COMMAND='AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact note: the remote bench printed `BOLD_VERIFY_ARTIFACTS` but did not sync summary files back
+to the local worktree. Evidence is the captured run log:
+`.scratch/bold_exact_alias_candidate_20260627T0108Z/run.log`, which contains 26
+`BOLD_VERIFY_JSONL` rows (`git_sha=unknown` in the emitted rows). The literal
+`cargo bench --release` form is still rejected by Cargo in this checkout; the equivalent per-crate
+release-profile command is `--profile release`.
+
+**Observed ratios vs the Tantivy/Lucene/Meilisearch-class proxy:**
+
+| Workload | Tantivy-class p50 | Exact-alias candidate p50 | Candidate / Tantivy-class | Decision |
+|----------|-------------------|---------------------------|----------------------------|----------|
+| `top10_exact_identifier/10000` | 127 us | 0 us | 0.000 | invalid synthetic fast path |
+| `top10_short_keyword/10000` | 43 us | 49 us | **1.140x slower** | reverted |
+| `top10_quoted_phrase/10000` | 152 us | 156 us | 1.026 | zero-gain/reverted |
+| `top10_natural_language/10000` | 128 us | 143 us | **1.117x slower** | reverted |
+| `top10_high_fanout/10000` | 110 us | 84 us | 0.764 | isolated/no keep |
+| `top10_zero_hit/10000` | 17 us | 17 us | 1.000 | zero-gain/reverted |
+| `limit_all/10000` | 6.091 ms | 7.368 ms | **1.210x slower** | reverted |
+| `top10_exact_identifier/100000` | 1.034 ms | 0 us | 0.000 | invalid synthetic fast path |
+| `top10_short_keyword/100000` | 181 us | 191 us | **1.055x slower** | reverted |
+| `top10_quoted_phrase/100000` | 974 us | 750 us | 0.770 | isolated/no keep |
+| `top10_natural_language/100000` | 711 us | 726 us | 1.021 | zero-gain/reverted |
+| `top10_high_fanout/100000` | 621 us | 644 us | **1.037x slower** | reverted |
+| `top10_zero_hit/100000` | 18 us | 15 us | 0.833 | isolated/no keep |
+
+**Decision:** reverted the source patch and landed no code. Do not retry this as a bench-level
+shortcut. A future exact-identifier lever must be product-real, preserve the top-k result contract
+with tests, and compare against the same Tantivy/Lucene/Meilisearch-class BOLD proxy without
+synthetic zero-time rows.
+
 ### 2026-06-26 — BOLD int8 two-pass vector wiring is not a Tantivy-class win (BlackThrush)
 
 **Lever tested and reverted:** route the BOLD hash-hybrid challenger through a resident
