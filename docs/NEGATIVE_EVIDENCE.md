@@ -236,6 +236,38 @@ primitive is still useful for standalone large-N vector scans, but the BOLD gap 
 lexical materialization / tracing / RRF overhead on the mixed query stream, not by exact vector scan
 cost alone.
 
+### 2026-06-27 — `id` FAST field for lexical materialization is a large regression (BlackThrush)
+
+**Lever tested and reverted:** the int8 reject above routed next to "the BOLD gap is dominated by
+lexical materialization." `TantivyIndex::search_doc_ids` reads each hit's `id` via `load_doc` — a
+full stored-document decompress per hit. Hypothesis: mark the `id` field `FAST` and read it
+columnar (`segment_reader.fast_fields().str("id")` → `term_ords(doc).next()` + `ord_to_str`),
+skipping the docstore decompress entirely. One `StrColumn` cached per segment; docstore fallback for
+pre-FAST indexes. Existing 79 lexical tests passed (ids identical), so it is correctness-neutral.
+
+**Measured (per-crate A/B bench `doc_id_materialize`, in-memory Tantivy, 20k high-fanout corpus —
+every doc matches — median µs over 80 samples; FAST-field vs docstore `search_doc_ids`):**
+
+| hits (limit) | FAST-field id | docstore id | FAST / docstore |
+|--------------|---------------|-------------|------------------|
+| 30   |    408 µs |  154 µs | **2.65× slower** |
+| 100  |   1016 µs |  191 µs | **5.32× slower** |
+| 300  |   2882 µs |  281 µs | **10.3× slower** |
+| 1000 |  11078 µs |  606 µs | **18.3× slower** |
+
+**Decision:** rejected and fully reverted (schema `FAST` flag, the columnar read, the temp bench).
+`StrColumn::ord_to_str` resolves each ordinal through the dictionary SSTable (a seek + decode per
+hit) — far more expensive than decompressing a small stored doc, and it gets monotonically worse
+with hit count. Tantivy's docstore also amortizes via per-block decompression caching across nearby
+hit addresses, which a per-ordinal dictionary lookup cannot. A string fast field is the wrong tool
+for id materialization.
+
+**Route next:** the materialization cost is real but NOT fixable with a string fast field. Still
+plausible: a *numeric* fast field carrying a dense doc ordinal + an external ordinal→doc_id table
+(skips the dictionary, but needs segment/delete-aware mapping), or simply fetching fewer lexical
+candidates into materialization. Combined with the int8 reject, the BOLD high-fanout gap is bounded
+by docstore materialization + RRF + tracing — none cheaply removable by a single primitive swap.
+
 ### 2026-06-26 — Reusing `QueryClass` inside BOLD hybrid search is mixed/noise (BlackThrush)
 
 **Lever tested and reverted:** compute `QueryClass::classify(query.text)` once in
