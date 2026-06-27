@@ -56,14 +56,19 @@ fn l2_norm_collect(vec: &[f32]) -> Vec<f32> {
 fn l2_norm_in_place(vec: &mut [f32]) {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
     if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
-        vec.iter_mut().for_each(|x| *x = 0.0);
+        for x in vec.iter_mut() {
+            *x = 0.0;
+        }
         return;
     }
     let inv_norm = 1.0 / norm_sq.sqrt();
-    vec.iter_mut().for_each(|x| *x *= inv_norm);
+    for x in vec.iter_mut() {
+        *x *= inv_norm;
+    }
 }
 
 // ── FNV modular embed: old (2 allocs) vs new (1 alloc) ───────────────────────
+#[allow(clippy::cast_possible_truncation)]
 fn fnv_old(text: &str) -> Vec<f32> {
     let tokens = tokenize_vec(text);
     let mut e = vec![0.0_f32; DIM];
@@ -75,6 +80,7 @@ fn fnv_old(text: &str) -> Vec<f32> {
     }
     l2_norm_collect(&e)
 }
+#[allow(clippy::cast_possible_truncation)]
 fn fnv_new(text: &str) -> Vec<f32> {
     let mut e = vec![0.0_f32; DIM];
     for token in tokenize_iter(text) {
@@ -105,29 +111,15 @@ fn jl_old(text: &str) -> Vec<f32> {
     l2_norm_collect(&e)
 }
 fn jl_new(text: &str) -> Vec<f32> {
-    let mut e = vec![0.0_f32; DIM];
-    for token in tokenize_iter(text) {
-        let hash = fnv1a_hash(token.as_bytes());
-        let mut state = (JL_SEED ^ hash) | 1;
-        for dim in &mut e {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let sign = if (state & 1) == 0 { 1.0 } else { -1.0 };
-            *dim += sign;
-        }
-    }
-    l2_norm_in_place(&mut e);
-    e
+    jl_ilp4(text)
 }
 
 // ── JL projection: scalar single-chain vs interleaved (ILP) inner loops ──────
-// All variants share `jl_old`'s accumulation semantics; the accumulator only
-// ever holds an exact integer-valued f32 (sum of ±1, |v| ≪ 2^24), so lane
-// reordering is bit-identical. This isolates the ILP win on the latency-bound
-// xorshift recurrence (each step's 3 shift→xor ops depend on the prior step).
+// All variants share `jl_old`'s accumulation semantics. The accumulator holds
+// exact small integer-valued f32 sums of +/-1 signs, so lane reordering is
+// bit-identical while exposing more independent xorshift chains to the CPU.
 fn jl_accumulate_one(e: &mut [f32], mut state: u64) {
-    for dim in e.iter_mut() {
+    for dim in e {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -143,8 +135,8 @@ fn jl_ilp2(text: &str) -> Vec<f32> {
         st[n] = (JL_SEED ^ fnv1a_hash(token.as_bytes())) | 1;
         n += 1;
         if n == 2 {
-            let (mut s0, mut s1) = (st[0], st[1]);
-            for dim in e.iter_mut() {
+            let [mut s0, mut s1] = st;
+            for dim in &mut e {
                 s0 ^= s0 << 13;
                 s0 ^= s0 >> 7;
                 s0 ^= s0 << 17;
@@ -158,8 +150,8 @@ fn jl_ilp2(text: &str) -> Vec<f32> {
             n = 0;
         }
     }
-    for &s in &st[..n] {
-        jl_accumulate_one(&mut e, s);
+    for &state in &st[..n] {
+        jl_accumulate_one(&mut e, state);
     }
     l2_norm_in_place(&mut e);
     e
@@ -173,8 +165,8 @@ fn jl_ilp4(text: &str) -> Vec<f32> {
         st[n] = (JL_SEED ^ fnv1a_hash(token.as_bytes())) | 1;
         n += 1;
         if n == 4 {
-            let (mut s0, mut s1, mut s2, mut s3) = (st[0], st[1], st[2], st[3]);
-            for dim in e.iter_mut() {
+            let [mut s0, mut s1, mut s2, mut s3] = st;
+            for dim in &mut e {
                 s0 ^= s0 << 13;
                 s0 ^= s0 >> 7;
                 s0 ^= s0 << 17;
@@ -196,8 +188,8 @@ fn jl_ilp4(text: &str) -> Vec<f32> {
             n = 0;
         }
     }
-    for &s in &st[..n] {
-        jl_accumulate_one(&mut e, s);
+    for &state in &st[..n] {
+        jl_accumulate_one(&mut e, state);
     }
     l2_norm_in_place(&mut e);
     e
@@ -217,36 +209,41 @@ fn bench_hash_embed(c: &mut Criterion) {
     debug_assert_eq!(jl_old(&doc), jl_ilp2(&doc));
     debug_assert_eq!(jl_old(&doc), jl_ilp4(&doc));
 
-    let mut fg = c.benchmark_group("hash_embed_fnv");
-    fg.bench_with_input("old", doc.as_str(), |b, t| {
-        b.iter(|| black_box(fnv_old(black_box(t))));
-    });
-    fg.bench_with_input("new", doc.as_str(), |b, t| {
-        b.iter(|| black_box(fnv_new(black_box(t))));
-    });
-    fg.finish();
+    {
+        let mut fg = c.benchmark_group("hash_embed_fnv");
+        fg.bench_with_input("old", doc.as_str(), |b, t| {
+            b.iter(|| black_box(fnv_old(black_box(t))));
+        });
+        fg.bench_with_input("new", doc.as_str(), |b, t| {
+            b.iter(|| black_box(fnv_new(black_box(t))));
+        });
+        fg.finish();
+    }
 
-    let mut jg = c.benchmark_group("hash_embed_jl");
-    jg.bench_with_input("old", doc.as_str(), |b, t| {
-        b.iter(|| black_box(jl_old(black_box(t))));
-    });
-    jg.bench_with_input("new", doc.as_str(), |b, t| {
-        b.iter(|| black_box(jl_new(black_box(t))));
-    });
-    jg.finish();
+    {
+        let mut jg = c.benchmark_group("hash_embed_jl");
+        jg.bench_with_input("old", doc.as_str(), |b, t| {
+            b.iter(|| black_box(jl_old(black_box(t))));
+        });
+        jg.bench_with_input("new", doc.as_str(), |b, t| {
+            b.iter(|| black_box(jl_new(black_box(t))));
+        });
+        jg.finish();
+    }
 
-    // ILP A/B on the latency-bound xorshift inner loop.
-    let mut ig = c.benchmark_group("hash_embed_jl_ilp");
-    ig.bench_with_input("scalar", doc.as_str(), |b, t| {
-        b.iter(|| black_box(jl_old(black_box(t))));
-    });
-    ig.bench_with_input("ilp2", doc.as_str(), |b, t| {
-        b.iter(|| black_box(jl_ilp2(black_box(t))));
-    });
-    ig.bench_with_input("ilp4", doc.as_str(), |b, t| {
-        b.iter(|| black_box(jl_ilp4(black_box(t))));
-    });
-    ig.finish();
+    {
+        let mut ig = c.benchmark_group("hash_embed_jl_ilp");
+        ig.bench_with_input("scalar", doc.as_str(), |b, t| {
+            b.iter(|| black_box(jl_old(black_box(t))));
+        });
+        ig.bench_with_input("ilp2", doc.as_str(), |b, t| {
+            b.iter(|| black_box(jl_ilp2(black_box(t))));
+        });
+        ig.bench_with_input("ilp4", doc.as_str(), |b, t| {
+            b.iter(|| black_box(jl_ilp4(black_box(t))));
+        });
+        ig.finish();
+    }
 }
 
 criterion_group!(benches, bench_hash_embed);

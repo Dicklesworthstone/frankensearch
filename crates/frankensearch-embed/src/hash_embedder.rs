@@ -189,7 +189,7 @@ const JL_LANES: usize = 4;
 /// as the pre-ILP scalar path.
 #[inline]
 fn jl_accumulate_one(embedding: &mut [f32], mut state: u64) {
-    for dim in embedding.iter_mut() {
+    for dim in embedding {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -203,8 +203,8 @@ fn jl_accumulate_one(embedding: &mut [f32], mut state: u64) {
 /// kept (the branchless form regressed — LLVM already emits a conditional move).
 #[inline]
 fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
-    let (mut s0, mut s1, mut s2, mut s3) = (states[0], states[1], states[2], states[3]);
-    for dim in embedding.iter_mut() {
+    let [mut s0, mut s1, mut s2, mut s3] = *states;
+    for dim in embedding {
         s0 ^= s0 << 13;
         s0 ^= s0 >> 7;
         s0 ^= s0 << 17;
@@ -345,7 +345,10 @@ mod tests {
                 let embedder = HashEmbedder::new(dim, HashAlgorithm::JLProjection { seed });
                 let got = embedder.embed_sync(text);
                 let want = embed_jl_scalar_reference(dim, seed, text);
-                assert_eq!(got, want, "ILP JL must be bit-identical (dim={dim}, seed={seed})");
+                assert_eq!(
+                    got, want,
+                    "ILP JL must be bit-identical (dim={dim}, seed={seed})"
+                );
             }
         }
     }
