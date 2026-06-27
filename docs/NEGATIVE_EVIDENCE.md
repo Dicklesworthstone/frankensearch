@@ -1821,3 +1821,36 @@ dominate, so removing just the key clone moves ~5%. A real federated-fuse win wo
 `appeared_in` `BTreeSet<String>` churn (e.g. dedup shard names to a small interned id set), not the
 key clone. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (federated cross-shard
 fusion has no lexical-comparator counterpart). Do not re-attempt the key-clone/sort micro-opt alone.
+
+### 2026-06-27 — reachable unowned compute surface is mined out; route-next handoff (Cobaltmoth)
+
+Surveyed for a NEW clean lever after landing JL-ILP (`87892cd`), MMR running-max (`5f8b59c`), and
+graph-rank dense PageRank (`9ef90fe`). **Rejected without benching** (structural reason, not a wasted
+bench cycle) — recorded so the converging swarm does not re-survey these:
+
+- **`core::l2_normalize` / `l2_normalize_in_place` multi-accumulator** — the sum-of-squares is a
+  single-accumulator f32 reduction (latency-bound, not auto-vectorized), ~2–4× headroom *in isolation*.
+  Rejected: **non-bit-identical** (f32 reorder) on a CORE primitive with 6 callers (every embedder +
+  quantization + prf), and the absolute embed-level impact is tiny — ~0.35 µs of a 50 µs JL / 2 µs FNV
+  embed. Changes every stored embedding's low bits ⇒ cross-cutting conformance risk for ~0 default-path
+  gain. If ever pursued: must be a local per-embedder change with a no-golden + recall check, not a core
+  edit.
+- **`core::cosine_similarity` fusion/ILP** — used only by tests + the embed orthogonality test; MMR and
+  index have their own cosine. Not on any hot path. No-op to optimize.
+- **`fusion::prf::prf_expand`** — already auto-vectorized SAXPY (centroid + interpolate are element-wise
+  slice ops); only the small norm reduction has headroom (same f32-reorder caveat). Not worth it.
+- **`storage::content_hash`** — SHA-256; can't speed without changing hash semantics/collision-resistance
+  (breaks the `content_hashes` dedup table). `core::fingerprint` FNV+charcount fusion already tried
+  (1.002, noise — entry above).
+- **`fusion::federated` BTreeSet churn** — the real lever (see entry above), but federated is a niche
+  non-default mode; deprioritized.
+
+**Where the biggest measured gap vs ORIG actually lives (owned / inherent, not a clean grab):** the BOLD
+`hash_hybrid_tantivy_vector_rrf` vs `tantivy_doc_ids` residual (natural_language / short_keyword) is
+bounded by **lexical query execution + ScoredResult materialization** in `frankensearch-lexical`
+(`TantivyIndex::search` does a full `searcher.doc()` store read per hit) and the **int8/4-bit vector
+scan** in `frankensearch-index/simd.rs` — both actively iterated by BlackThrush this session (FSVI 4-bit
+`e8ec816`/`fbe177e`, doc-id top-k). The store read is shared with the incumbent and the metadata parse
+is absent on the BOLD corpus, so the residual is largely *inherent hybrid overhead*, not a single-primitive
+swap. Route-next for whoever owns `frankensearch-lexical`: a `LexicalSearch` trait method that returns
+id+score **without** materializing the stored doc (the trait only exposes `search()` → full doc today).
