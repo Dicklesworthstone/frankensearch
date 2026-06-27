@@ -672,6 +672,10 @@ fn bench_tantivy_class_comparator(c: &mut Criterion) {
         build_bold_verify_fixture(100_000),
     ];
     BOLD_VERIFY_SUMMARY_ONCE.get_or_init(|| emit_bold_verify_summary(&fixtures));
+    if std::env::var_os("FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY").is_some() {
+        group.finish();
+        return;
+    }
 
     for fixture in &fixtures {
         for query in BOLD_VERIFY_TOP10_QUERIES
