@@ -1469,7 +1469,7 @@ Literal requested command failed because this checkout's Cargo rejects `cargo be
 
 ```bash
 AGENT_NAME=BlackThrush \
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
   rch exec -- cargo bench --release -p frankensearch-lexical \
     --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 ```
@@ -1479,28 +1479,28 @@ Measured command:
 ```bash
 AGENT_NAME=BlackThrush \
 RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
-  rch exec -- env RUST_LOG=off \
-    cargo bench -p frankensearch-lexical --profile release \
-      --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+    --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 ```
 
-RCH executed locally (`[RCH] local`; no admissible workers). Criterion artifacts:
-`/data/projects/.rch-targets/frankensearch-cod-a/criterion/doc_ids_topk/*/new/estimates.json`.
+RCH executed on `hz2` (`[RCH] remote hz2 (382.8s)`). Criterion artifacts:
+`/data/projects/.rch-targets/frankensearch-cod-b/criterion/doc_ids_topk/*/new/estimates.json`.
 
 Per-crate Tantivy-wrapper ratios:
 
 | Workload | Query shape | counted median | new median | ratio | verdict |
 |----------|-------------|----------------|------------|-------|---------|
-| `high_fanout` | single plain token | 223.950 us | 204.231 us | **0.912** | kept narrow win |
-| `union3` | multi-token boolean fallback | 588.615 us | 652.272 us | 1.108 | not claimed |
-| `natural` | multi-token boolean fallback | 1343.659 us | 1069.351 us | 0.796 | not claimed |
-| `phrase` | phrase fallback | 1869.183 us | 1626.897 us | 0.870 | not claimed |
+| `high_fanout` | single plain token | 499.086 us | 239.233 us | **0.479** | kept narrow win |
+| `union3` | multi-token boolean fallback | 804.545 us | 926.472 us | 1.152 | not claimed |
+| `natural` | multi-token boolean fallback | 1141.046 us | 1312.298 us | 1.150 | not claimed |
+| `phrase` | phrase fallback | 1140.312 us | 1414.064 us | 1.240 | not claimed |
 
 The ratio above is against the prior counted Tantivy top-k wrapper in frankensearch, used here as
 the local Lucene/Tantivy/Meilisearch-class lexical collector proxy. The non-simple rows are retained
-as negative evidence rather than a claimed win; they stay on the counted path in source, so their
-mixed ratios are treated as Criterion order/cache noise plus guard overhead. This is not a new BOLD
+as negative evidence rather than a claimed win; they stay on the counted path in source and are
+dominated by the extra guard plus noisy tracing-heavy Criterion order. This is not a new BOLD
 end-to-end dominance claim over Lucene, Tantivy, or Meilisearch: the accepted original-comparator
 ratio is **N/A** for this isolated wrapper primitive, while full hybrid BOLD gaps remain governed by
 the existing comparator ledger rows.

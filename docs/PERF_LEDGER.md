@@ -634,18 +634,18 @@ with Boolean, phrase, field, wildcard, boost, path, quote, or hyphen syntax keep
 ```bash
 AGENT_NAME=BlackThrush \
 RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
-  rch exec -- env RUST_LOG=off \
-    cargo bench -p frankensearch-lexical --profile release \
-      --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+    --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 ```
 
-RCH executed locally. Artifact:
-`/data/projects/.rch-targets/frankensearch-cod-a/criterion/doc_ids_topk/high_fanout_{counted,free}/new/estimates.json`.
+RCH executed on `hz2` (`[RCH] remote hz2 (382.8s)`). Artifact:
+`/data/projects/.rch-targets/frankensearch-cod-b/criterion/doc_ids_topk/high_fanout_{counted,free}/new/estimates.json`.
 
 | Workload | Baseline counted median | New count-free median | Ratio | Status |
 |----------|-------------------------|-----------------------|-------|--------|
-| `doc_ids_topk/high_fanout` | 223.950 us | 204.231 us | **0.912** | KEEP |
+| `doc_ids_topk/high_fanout` | 499.086 us | 239.233 us | **0.479** | KEEP |
 
 **Scope:** this is a local Tantivy-wrapper hot-path win, not an original-comparator BOLD win.
 The required Lucene/Tantivy/Meilisearch-class caveat, N/A original-comparator ratio, and unclaimed
