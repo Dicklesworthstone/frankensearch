@@ -775,3 +775,44 @@ corroborated by a concurrent run on a different worker/target dir (`scalar` 98.0
 Original-comparator (BOLD vs Tantivy/Lucene/Meilisearch) ratio is **N/A** — this reduces
 frankensearch-internal embedding compute the incumbents do not have; it narrows the end-to-end gap
 on jl-tier searches rather than beating a Tantivy primitive head-to-head.
+
+### 2026-06-27 — MMR re-rank: incremental running-max + hoisted norms (Cobaltmoth)
+
+**Lever:** `mmr_rerank` (diversity re-ranking) greedily picks `k` of `n` candidates; its inner
+sweep did two redundant things, both pure frankensearch per-rerank overhead:
+1. **O(k²·n) → O(k·n) cosine evals.** Each round recomputed `max(sim(i, j) for j in selected)` from
+   scratch over the whole growing `selected` set. Now a per-candidate running max
+   (`max_sim_to_selected`) is updated once per selection, so every `sim(i, selected_doc)` is computed
+   exactly once. `f64::max` is associative ⇒ the running max equals the per-round fold bit-for-bit.
+2. **3 reductions → 1 per pair.** `cosine_sim` re-derived both vectors' L2 norms on every pair even
+   though an embedding's norm is loop-invariant. Norms are hoisted once per candidate (`root_norms`),
+   leaving only the dot reduction per pair (`cosine_sim_pre`). Bit-identical for uniform-dimension
+   embeddings (the MMR contract); ragged dims fall back to per-pair `cosine_sim`.
+
+**Bit-identical:** the dot loop and accumulation order are unchanged, `root_norms[i]·root_norms[j]`
+reproduces the prior `norm_a.sqrt()·norm_b.sqrt()`, and the running max reproduces the per-round fold
+— the selected index list is unchanged. Proven by `incremental_norm_hoist_matches_bruteforce`
+(dims 8/64/384 × n 3/16/60 × k 1/5/n vs a brute-force reference) + all 32 `mmr` tests GREEN.
+
+**Measured command (per-crate, in-process A/B — host-independent ratio):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fusion --bench mmr_rerank
+```
+
+`old` = per-round full recompute + per-pair norms (replicated); `new` = running-max + hoisted norms.
+dim 384. Medians:
+
+| Workload (n cand, k results, dim384) | old | new | Ratio | Status |
+|--------------------------------------|-----|-----|-------|--------|
+| `mmr_rerank/n100_k20` | 5.387 ms | 581.9 µs | **0.108 (~9.3×)** | KEEP |
+| `mmr_rerank/n200_k50` | 65.10 ms | 2.800 ms | **0.043 (~23.3×)** | KEEP |
+
+The gain grows with `k` (the O(k²·n)→O(k·n) factor compounding with the 3→1 reduction hoist).
+
+**Scope:** a local hot-path win on the diversity-rerank (MMR) path — pure frankensearch compute the
+Tantivy/Lucene/Meilisearch lexical incumbents never perform. Original-comparator ratio is **N/A**
+(recorded in `docs/NEGATIVE_EVIDENCE.md`); it narrows end-to-end latency when diversity rerank is
+enabled rather than beating a comparator primitive head-to-head.

@@ -1768,3 +1768,16 @@ already emits a conditional move; the `if (state & 1) == 0 { 1.0 } else { -1.0 }
 retained in each lane. The win here is purely from breaking the single-chain shift→xor dependency,
 not from the sign select. `ilp2` (~1.47×) is left in the bench as the curve point showing the gain
 scales with lanes up to the shift-port limit.
+
+### 2026-06-27 — MMR running-max + norm-hoist is a real win, but original-comparator ratio is N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** `mmr_rerank` now keeps a per-candidate running max similarity
+(O(k²·n)→O(k·n) cosine evals) and hoists each embedding's L2 norm out of the pair loop (3 reductions
+→ 1). Bit-identical (selection list unchanged; `incremental_norm_hoist_matches_bruteforce` GREEN);
+measured **~9.3× at n100/k20 and ~23.3× at n200/k50** in-process. Recorded here only to hold the
+original-comparator honesty bar: the **ratio vs Lucene/Tantivy/Meilisearch is N/A**. MMR diversity
+re-ranking is a frankensearch-only stage that operates on already-retrieved candidates — it has no
+counterpart in a lexical comparator's `doc_ids` path, so this narrows frankensearch's own
+diversity-rerank latency rather than beating a Tantivy/Lucene/Meili primitive head-to-head. It is
+also **off the default BOLD lane** (only runs when diversity rerank is enabled), so it does not move
+the `hash_hybrid_tantivy_vector_rrf` rows; its value is making the MMR feature cheap when used.

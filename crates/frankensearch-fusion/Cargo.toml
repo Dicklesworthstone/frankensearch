@@ -43,5 +43,9 @@ harness = false
 name = "sync_int8_fetch"
 harness = false
 
+[[bench]]
+name = "mmr_rerank"
+harness = false
+
 [lints]
 workspace = true

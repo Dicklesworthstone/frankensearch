@@ -149,6 +149,37 @@ pub fn mmr_rerank(
     let mut selected: Vec<usize> = Vec::with_capacity(k);
     let mut remaining: Vec<bool> = vec![true; n];
 
+    // Hoist each candidate's L2 norm (root of sum-of-squares) OUT of the
+    // O(k·n) similarity evaluations: `cosine_sim` re-derived `norm_a`/`norm_b`
+    // on every pair even though an embedding's norm is loop-invariant. Computing
+    // it once leaves only the dot-product reduction per pair (3 reductions -> 1).
+    // Bit-identical when all embeddings share a dimension (the MMR contract):
+    // the dot loop is unchanged and `root_norms[i] * root_norms[j]` equals the
+    // prior `norm_a.sqrt() * norm_b.sqrt()`. Falls back to the per-pair
+    // `cosine_sim` if dimensions are ragged (defensive; never happens in
+    // practice) so behaviour is preserved in every case.
+    let dim0 = embeddings[0].len();
+    let uniform_dim = embeddings[..n].iter().all(|e| e.len() == dim0);
+    let root_norms: Option<Vec<f64>> = uniform_dim.then(|| {
+        embeddings[..n]
+            .iter()
+            .map(|e| {
+                let mut norm = 0.0_f64;
+                for &x in *e {
+                    let x = f64::from(x);
+                    norm += x * x;
+                }
+                norm.sqrt()
+            })
+            .collect()
+    });
+    let sim = |i: usize, j: usize| -> f64 {
+        match &root_norms {
+            Some(rn) => cosine_sim_pre(embeddings[i], embeddings[j], rn[i], rn[j]),
+            None => cosine_sim(embeddings[i], embeddings[j]),
+        }
+    };
+
     // Select first document: pure relevance (highest score).
     // Use `fold` instead of `max_by` to ensure we pick the *first* occurrence
     // of the maximum score, preserving stable ordering for ties.
@@ -164,6 +195,20 @@ pub fn mmr_rerank(
     selected.push(first);
     remaining[first] = false;
 
+    // Running max cosine similarity of each candidate to the selected set,
+    // updated incrementally as documents are selected. The previous code
+    // recomputed `max(sim(i, j) for j in selected)` from scratch every round
+    // (O(k^2 . n) cosine evaluations); maintaining the running max touches each
+    // `sim(i, selected_doc)` exactly once (O(k . n)). `f64::max` is associative,
+    // so the running max equals the per-round fold bit-for-bit, hence the same
+    // MMR scores and the same selection order.
+    let mut max_sim_to_selected = vec![f64::NEG_INFINITY; n];
+    for i in 0..n {
+        if remaining[i] {
+            max_sim_to_selected[i] = sim(i, first);
+        }
+    }
+
     // Greedy selection for remaining k-1 slots.
     for _ in 1..k {
         let mut best_idx = usize::MAX;
@@ -174,12 +219,7 @@ pub fn mmr_rerank(
                 continue;
             }
 
-            // Max similarity to any already-selected document.
-            let max_sim = selected
-                .iter()
-                .map(|&j| cosine_sim(embeddings[i], embeddings[j]))
-                .fold(f64::NEG_INFINITY, f64::max);
-
+            let max_sim = max_sim_to_selected[i];
             let mmr = lambda.mul_add(norm_scores[i], -(diversity_weight * max_sim));
 
             if mmr > best_mmr {
@@ -194,6 +234,17 @@ pub fn mmr_rerank(
 
         selected.push(best_idx);
         remaining[best_idx] = false;
+
+        // Fold the newly selected document into every remaining candidate's
+        // running max similarity.
+        for i in 0..n {
+            if remaining[i] {
+                let s = sim(i, best_idx);
+                if s > max_sim_to_selected[i] {
+                    max_sim_to_selected[i] = s;
+                }
+            }
+        }
     }
 
     selected
@@ -226,12 +277,144 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
     dot / denom
 }
 
+/// Cosine similarity using **precomputed** L2 norms (`root_a` = `(Σ aᵢ²).sqrt()`,
+/// likewise `root_b`). Only the dot-product reduction runs per pair; the norms
+/// are hoisted by the caller. Bit-identical to [`cosine_sim`] for equal-length
+/// vectors — the dot loop and accumulation order are identical, and
+/// `root_a * root_b` reproduces the prior `norm_a.sqrt() * norm_b.sqrt()`.
+fn cosine_sim_pre(a: &[f32], b: &[f32], root_a: f64, root_b: f64) -> f64 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+
+    let mut dot = 0.0_f64;
+    for i in 0..len {
+        dot += f64::from(a[i]) * f64::from(b[i]);
+    }
+
+    let denom = root_a * root_b;
+    if denom < f64::EPSILON {
+        return 0.0;
+    }
+
+    dot / denom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    // ── Incremental / norm-hoist refactor equivalence ─────────────────────
+
+    /// Brute-force reference: recompute max similarity over the full selected
+    /// set every round, with per-pair norms (the pre-refactor algorithm).
+    fn mmr_rerank_reference(
+        scores: &[f64],
+        embeddings: &[&[f32]],
+        k: usize,
+        config: &MmrConfig,
+    ) -> Vec<usize> {
+        let n = scores.len().min(config.candidate_pool);
+        if n == 0 || k == 0 {
+            return Vec::new();
+        }
+        let k = k.min(n);
+        let lambda = config.clamped_lambda();
+        let diversity_weight = 1.0 - lambda;
+        let (mn, mx) = scores[..n].iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(mn, mx), &s| {
+                if s.is_finite() { (mn.min(s), mx.max(s)) } else { (mn, mx) }
+            },
+        );
+        let range = mx - mn;
+        let norm_scores: Vec<f64> = scores[..n]
+            .iter()
+            .map(|&s| {
+                if !s.is_finite() {
+                    0.0
+                } else if range < f64::EPSILON {
+                    1.0
+                } else {
+                    (s - mn) / range
+                }
+            })
+            .collect();
+        let mut selected = Vec::new();
+        let mut remaining = vec![true; n];
+        let first = norm_scores[..n]
+            .iter()
+            .enumerate()
+            .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| {
+                if s > bs { (i, s) } else { (bi, bs) }
+            })
+            .0;
+        selected.push(first);
+        remaining[first] = false;
+        for _ in 1..k {
+            let mut best_idx = usize::MAX;
+            let mut best_mmr = f64::NEG_INFINITY;
+            for i in 0..n {
+                if !remaining[i] {
+                    continue;
+                }
+                let max_sim = selected
+                    .iter()
+                    .map(|&j| cosine_sim(embeddings[i], embeddings[j]))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mmr = lambda.mul_add(norm_scores[i], -(diversity_weight * max_sim));
+                if mmr > best_mmr {
+                    best_mmr = mmr;
+                    best_idx = i;
+                }
+            }
+            if best_idx == usize::MAX {
+                break;
+            }
+            selected.push(best_idx);
+            remaining[best_idx] = false;
+        }
+        selected
+    }
+
+    #[test]
+    fn incremental_norm_hoist_matches_bruteforce() {
+        // Deterministic pseudo-random embeddings (xorshift) over a few dims/sizes.
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.55,
+            candidate_pool: 1000,
+            ..Default::default()
+        };
+        for &dim in &[8_usize, 64, 384] {
+            for &n in &[3_usize, 16, 60] {
+                let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ (dim as u64).wrapping_mul(n as u64);
+                let mut next = || {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                };
+                let embeddings: Vec<Vec<f32>> =
+                    (0..n).map(|_| (0..dim).map(|_| next()).collect()).collect();
+                let refs: Vec<&[f32]> =
+                    embeddings.iter().map(std::vec::Vec::as_slice).collect();
+                let scores: Vec<f64> = (0..n).map(|i| (i as f64 * 7.0 % 11.0) / 11.0).collect();
+                for &k in &[1_usize, 5, n] {
+                    let got = mmr_rerank(&scores, &refs, k, &config);
+                    let want = mmr_rerank_reference(&scores, &refs, k, &config);
+                    assert_eq!(
+                        got, want,
+                        "MMR selection must be bit-identical (dim={dim}, n={n}, k={k})"
+                    );
+                }
+            }
+        }
     }
 
     // ── Basic selection ──────────────────────────────────────────────────
