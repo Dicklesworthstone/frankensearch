@@ -1795,3 +1795,29 @@ Lucene/Tantivy/Meilisearch is N/A**, and additionally this is behind the **off-b
 feature**, so it does not appear in any default build or BOLD lane. Query-biased PageRank over a
 document graph has no counterpart in a lexical comparator's `doc_ids` path; this makes the optional
 graph-rank stage ~12× cheaper when enabled, not a head-to-head primitive win.
+
+### 2026-06-27 — federated RRF fuse clone-elim + unstable sort is only ~1.05× — REVERTED (Cobaltmoth)
+
+**Lever tested and reverted:** `federated::accumulate_doc` calls `docs.entry(hit.doc_id.clone())` on
+every shard hit, cloning the `String` key even on the common occupied path (a doc in N shards is hit
+N times, inserted once). Replaced with a `get_mut` probe (borrowed key) that only clones on a genuine
+insert, and switched `into_ranked_hits` from a stable `sort_by` to `sort_unstable_by` (the comparator
+is a total order via the `doc_id` tiebreak, so order-identical). Both changes are **bit-identical**.
+
+**Measured (per-crate in-process A/B, replicas of old vs new over multi-shard input with ~60–70% doc
+overlap so most accumulate calls hit the occupied path):**
+
+| Workload (shards, hits/shard, unique docs) | old | new | ratio |
+|--------------------------------------------|-----|-----|-------|
+| `federated_fuse/s5_h200_u400` | 142.67 µs | 136.01 µs | **0.953 (~1.05×)** — CIs overlap |
+| `federated_fuse/s10_h500_u1500` | 814.08 µs | 777.02 µs | **0.954 (~1.05×)** |
+
+**Decision:** **reverted** (`federated.rs` + `Cargo.toml` byte-identical to `main`; bench removed).
+~1.05× is marginal — the small case's CIs overlap, and federated multi-shard search is a niche,
+non-default deployment mode. **Root cause the gain is small:** the doc_id key clone is only *one* of
+several per-call `String` allocations — `appeared_in.insert(shard_name.to_owned())` and the
+primary-update `shard_name.to_owned()` / `hit.clone()` (template) all still allocate every call and
+dominate, so removing just the key clone moves ~5%. A real federated-fuse win would need to attack the
+`appeared_in` `BTreeSet<String>` churn (e.g. dedup shard names to a small interned id set), not the
+key clone. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (federated cross-shard
+fusion has no lexical-comparator counterpart). Do not re-attempt the key-clone/sort micro-opt alone.
