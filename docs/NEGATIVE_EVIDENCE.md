@@ -268,6 +268,39 @@ plausible: a *numeric* fast field carrying a dense doc ordinal + an external ord
 candidates into materialization. Combined with the int8 reject, the BOLD high-fanout gap is bounded
 by docstore materialization + RRF + tracing — none cheaply removable by a single primitive swap.
 
+### 2026-06-27 — Lazy doc_id cache for `search_doc_ids` is ~0-gain on the biggest gap (BlackThrush)
+
+**Lever tested and reverted:** the materialization route-next, take 2 — instead of a fast field
+(refuted above, slower) cache each hit's `id` lazily per `(segment, local-doc)` in a lock-free
+`OnceLock<String>` grid on `TantivyIndex`, keyed by the searcher's segment set (rebuilt on
+commit/merge). First access decompresses the stored doc; repeat access — the rotating BOLD query
+stream re-hits the same high-BM25 docs — returns a cached `String` clone. Correctness-neutral: all 79
+lexical tests pass (incl. the upsert→commit invalidation path).
+
+**Measured (per-crate A/B bench `doc_id_cache`, in-memory Tantivy, 20k high-fanout corpus, cache
+warmed; median µs over 100 samples; cached `search_doc_ids` vs the docstore baseline):**
+
+| hits (limit) | cached | docstore | cached / docstore |
+|--------------|--------|----------|--------------------|
+| 30   | 156 µs | 151 µs | **1.03 (~0-gain)** |
+| 100  | 162 µs | 184 µs | 0.88 (1.14×) |
+| 300  | 185 µs | 267 µs | 0.69 (1.44×) |
+| 1000 | 244 µs | 549 µs | 0.44 (2.25×) |
+
+**Decision:** rejected and fully reverted (cache field, struct, the `search_doc_ids` path, temp
+bench — lexical crate left byte-identical to HEAD). The win scales with hit count, but the **biggest**
+BOLD gap (top10 `high_fanout`/`natural_language`) fetches only `limit·3 ≈ 30` candidates, where the
+cache is ~0-gain (1.03×, within noise). The docstore materialization is **~0.41 µs/hit** (≈12 µs at
+30 hits) — a small slice of the ~645–911 µs top10/100k latency — so materialization is **not** the
+top10 bottleneck, and an O(N) cell grid + per-doc memory for the common path is not justified by a
+large-`limit`-only (e.g. `limit_all`) benefit.
+
+**Route next:** materialization dominates only at very large fetch limits (`limit_all`), not the
+top10 hybrid gap. With the int8, str-FAST-field, and now doc_id-cache rejects, the top10
+high_fanout/NL gap is bounded by lexical query execution (BM25 over many matches) + RRF + tracing —
+none addressable by a single materialization/vector primitive swap; the realistic next probe is the
+RRF/tracing overhead on the mixed stream, or accepting the gap as comparator-inherent.
+
 ### 2026-06-26 — Reusing `QueryClass` inside BOLD hybrid search is mixed/noise (BlackThrush)
 
 **Lever tested and reverted:** compute `QueryClass::classify(query.text)` once in
