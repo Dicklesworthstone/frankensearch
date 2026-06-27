@@ -77,8 +77,9 @@ pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
 pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{
-    cosine_similarity_f16, dot_i8_i8, dot_packed_4bit, dot_product_f16_bytes_f32,
-    dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
+    PreparedQuery4bit, cosine_similarity_f16, dot_4bit_prepared, dot_i8_i8, dot_packed_4bit,
+    dot_product_f16_bytes_f32, dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
+    prepare_4bit_query,
 };
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,

@@ -24,11 +24,11 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    InMemoryVectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32,
-    dot_product_f32_bytes_f32, dot_product_f32_f32,
+    InMemoryVectorIndex, dot_4bit_prepared, dot_i8_i8, dot_product_f16_bytes_f32,
+    dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
 };
 use half::f16;
-use wide::f32x8;
+use wide::{f32x8, i8x16, i16x16};
 
 // ── Baselines: the original single-accumulator kernels (pre-change) ─────────
 // Copied verbatim from the prior `simd.rs` so the head-to-head isolates the
@@ -88,6 +88,45 @@ fn dot_i8_i8_baseline(stored: &[i8], query: &[i8]) -> i32 {
         result += i32::from(*s) * i32::from(*q);
     }
     result
+}
+
+fn nibble_lo(b: u8) -> i32 {
+    i32::from(((b << 4) as i8) >> 4)
+}
+
+fn nibble_hi(b: u8) -> i32 {
+    i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+}
+
+/// The pre-query-prep 4-bit dot: decode stored and query nibbles for every vector.
+fn dot_packed_4bit_baseline(stored: &[u8], query: &[u8]) -> i32 {
+    let mut sum = 0_i32;
+    let mut acc = i16x16::splat(0);
+    let mut pending = 0_usize;
+    let mut s16 = stored.chunks_exact(16);
+    let mut q16 = query.chunks_exact(16);
+    for (sc, qc) in s16.by_ref().zip(q16.by_ref()) {
+        let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
+        let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
+        let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
+        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
+        let s_low = (s << 12_i32) >> 12_i32;
+        let s_high = (s << 8_i32) >> 12_i32;
+        let q_low = (q << 12_i32) >> 12_i32;
+        let q_high = (q << 8_i32) >> 12_i32;
+        acc += s_low * q_low + s_high * q_high;
+        pending += 1;
+        if pending == 16 {
+            sum += i32::from(acc.reduce_add());
+            acc = i16x16::splat(0);
+            pending = 0;
+        }
+    }
+    sum += i32::from(acc.reduce_add());
+    for (sb, qb) in s16.remainder().iter().zip(q16.remainder()) {
+        sum += nibble_lo(*sb) * nibble_lo(*qb) + nibble_hi(*sb) * nibble_hi(*qb);
+    }
+    sum
 }
 
 fn dot_f16_f32_baseline(stored: &[f16], query: &[f32]) -> f32 {
@@ -239,11 +278,13 @@ fn gen_f32(state: &mut u64) -> f32 {
 struct Corpus {
     query: Vec<f32>,
     query_i8: Vec<i8>,
+    query_4bit: Vec<u8>,
     stored_f32: Vec<Vec<f32>>,
     stored_f16: Vec<Vec<f16>>,
     stored_f16_bytes: Vec<Vec<u8>>,
     stored_f32_bytes: Vec<Vec<u8>>,
     stored_i8: Vec<Vec<i8>>,
+    stored_4bit: Vec<Vec<u8>>,
 }
 
 /// Symmetric int8 quantization of a unit-range f32 (`gen_f32` yields [-1, 1]).
@@ -258,21 +299,47 @@ fn quantize_i8(x: f32) -> i8 {
     }
 }
 
+fn quantize_4bit(x: f32) -> i8 {
+    let scaled = (x * 7.0).round();
+    if scaled >= 7.0 {
+        7
+    } else if scaled <= -7.0 {
+        -7
+    } else {
+        scaled as i8
+    }
+}
+
+fn pack_4bit_vector(v: &[f32]) -> Vec<u8> {
+    v.chunks(2)
+        .map(|pair| {
+            let lo = quantize_4bit(pair[0]) as u8 & 0x0f;
+            let hi = pair
+                .get(1)
+                .map_or(0, |x| (quantize_4bit(*x) as u8 & 0x0f) << 4);
+            lo | hi
+        })
+        .collect()
+}
+
 fn build_corpus(dim: usize, n: usize) -> Corpus {
     let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ (dim as u64).wrapping_mul(0x1234_5678);
     let query: Vec<f32> = (0..dim).map(|_| gen_f32(&mut state)).collect();
     let query_i8: Vec<i8> = query.iter().copied().map(quantize_i8).collect();
+    let query_4bit = pack_4bit_vector(&query);
 
     let mut stored_f32 = Vec::with_capacity(n);
     let mut stored_f16 = Vec::with_capacity(n);
     let mut stored_f16_bytes = Vec::with_capacity(n);
     let mut stored_f32_bytes = Vec::with_capacity(n);
     let mut stored_i8 = Vec::with_capacity(n);
+    let mut stored_4bit = Vec::with_capacity(n);
 
     for _ in 0..n {
         let v: Vec<f32> = (0..dim).map(|_| gen_f32(&mut state)).collect();
         let v16: Vec<f16> = v.iter().copied().map(f16::from_f32).collect();
         let vi8: Vec<i8> = v.iter().copied().map(quantize_i8).collect();
+        let v4 = pack_4bit_vector(&v);
         let mut b16 = Vec::with_capacity(dim * 2);
         for x in &v16 {
             b16.extend_from_slice(&x.to_le_bytes());
@@ -286,16 +353,19 @@ fn build_corpus(dim: usize, n: usize) -> Corpus {
         stored_f16_bytes.push(b16);
         stored_f32_bytes.push(b32);
         stored_i8.push(vi8);
+        stored_4bit.push(v4);
     }
 
     Corpus {
         query,
         query_i8,
+        query_4bit,
         stored_f32,
         stored_f16,
         stored_f16_bytes,
         stored_f32_bytes,
         stored_i8,
+        stored_4bit,
     }
 }
 
@@ -331,6 +401,32 @@ fn bench_dot(c: &mut Criterion) {
                 let mut acc = 0_i64;
                 for v in &corpus.stored_i8 {
                     acc += i64::from(dot_i8_i8_baseline(black_box(v), black_box(qi8)));
+                }
+                black_box(acc)
+            });
+        });
+
+        // 4-bit pass-1 candidate: the production scan can decode the query nibbles
+        // once, then reuse those lanes for every stored vector. The old path decoded
+        // both operands for every dot.
+        let q4_prepared = prepare_4bit_query(&corpus.query_4bit);
+        group.bench_function(BenchmarkId::new("fourbit_prepared_new", n), |b| {
+            b.iter(|| {
+                let mut acc = 0_i64;
+                for v in &corpus.stored_4bit {
+                    acc += i64::from(dot_4bit_prepared(black_box(v), black_box(&q4_prepared)));
+                }
+                black_box(acc)
+            });
+        });
+        group.bench_function(BenchmarkId::new("fourbit_prepared_old", n), |b| {
+            b.iter(|| {
+                let mut acc = 0_i64;
+                for v in &corpus.stored_4bit {
+                    acc += i64::from(dot_packed_4bit_baseline(
+                        black_box(v),
+                        black_box(&corpus.query_4bit),
+                    ));
                 }
                 black_box(acc)
             });

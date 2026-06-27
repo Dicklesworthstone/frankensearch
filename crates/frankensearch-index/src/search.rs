@@ -323,7 +323,9 @@ impl VectorIndex {
             let count = self.record_count();
             let dim = self.dimension();
             let byte_len = count * dim * 2;
-            quantize_f16_bytes_to_i8(&self.data[self.vectors_offset..self.vectors_offset + byte_len])
+            quantize_f16_bytes_to_i8(
+                &self.data[self.vectors_offset..self.vectors_offset + byte_len],
+            )
         })
     }
 
@@ -366,7 +368,14 @@ impl VectorIndex {
         let slab = self.nibbles_slab();
 
         let candidate_heap = if count < PARALLEL_THRESHOLD {
-            self.nibble_scan_range(slab, &query_packed, bytes_per_vector, 0, count, candidate_count)
+            self.nibble_scan_range(
+                slab,
+                &query_packed,
+                bytes_per_vector,
+                0,
+                count,
+                candidate_count,
+            )
         } else {
             let chunk_count = count.div_ceil(PARALLEL_CHUNK_SIZE);
             let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
@@ -444,7 +453,10 @@ impl VectorIndex {
             let count = self.record_count();
             let dim = self.dimension();
             let byte_len = count * dim * 2;
-            pack_4bit_f16_bytes(&self.data[self.vectors_offset..self.vectors_offset + byte_len], dim)
+            pack_4bit_f16_bytes(
+                &self.data[self.vectors_offset..self.vectors_offset + byte_len],
+                dim,
+            )
         })
     }
 
@@ -1001,8 +1013,7 @@ fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
         let base = v * dim * 2;
         let out = v * bytes_per_vector;
         for d in 0..dim {
-            let value =
-                f16::from_le_bytes([bytes[base + d * 2], bytes[base + d * 2 + 1]]).to_f32();
+            let value = f16::from_le_bytes([bytes[base + d * 2], bytes[base + d * 2 + 1]]).to_f32();
             let nib = nibble_of(value, scale);
             if d % 2 == 0 {
                 slab[out + d / 2] |= nib;
@@ -1149,8 +1160,7 @@ mod tests {
             .map(|i| {
                 (0..dim)
                     .map(|j| {
-                        let mut s = (i as u64)
-                            .wrapping_mul(2_654_435_761)
+                        let mut s = (i as u64).wrapping_mul(2_654_435_761)
                             ^ (j as u64).wrapping_mul(40_503);
                         s ^= s >> 13;
                         ((s & 0xffff) as f32 / 65_535.0) - 0.5
@@ -1196,8 +1206,7 @@ mod tests {
             .map(|i| {
                 (0..dim)
                     .map(|j| {
-                        let mut s = (i as u64)
-                            .wrapping_mul(2_654_435_761)
+                        let mut s = (i as u64).wrapping_mul(2_654_435_761)
                             ^ (j as u64).wrapping_mul(40_503);
                         s ^= s >> 13;
                         ((s & 0xffff) as f32 / 65_535.0) - 0.5

@@ -411,12 +411,12 @@ pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     let mut acc = i16x16::splat(0);
     let mut pending = 0_usize;
     let mut s16 = stored.chunks_exact(16);
-    for (i, sc) in s16.by_ref().enumerate() {
+    for (sc, (q_low, q_high)) in s16.by_ref().zip(query.low.iter().zip(&query.high)) {
         let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
         let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
         let s_low = (s << 12_i32) >> 12_i32;
         let s_high = (s << 8_i32) >> 12_i32;
-        acc += s_low * query.low[i] + s_high * query.high[i];
+        acc += s_low * *q_low + s_high * *q_high;
         pending += 1;
         if pending == 16 {
             sum += i32::from(acc.reduce_add());
@@ -597,10 +597,18 @@ mod tests {
             let s: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) % 256) as u8).collect();
             let q: Vec<u8> = (0..len).map(|i| ((i * 53 + 7) % 256) as u8).collect();
             assert_eq!(dot_packed_4bit(&s, &q), scalar(&s, &q), "len={len}");
+            let prepared = prepare_4bit_query(&q);
+            assert_eq!(
+                dot_4bit_prepared(&s, &prepared),
+                scalar(&s, &q),
+                "prepared len={len}"
+            );
         }
         // All nibbles = -7 (0x99 byte): each dim contributes 49.
         let a = vec![0x99_u8; 16];
         assert_eq!(dot_packed_4bit(&a, &a), 32 * 49);
+        let prepared = prepare_4bit_query(&a);
+        assert_eq!(dot_4bit_prepared(&a, &prepared), 32 * 49);
     }
 
     /// End-to-end quality gate for the int8 ADC two-pass (`bd-b5wl`): does an int8
