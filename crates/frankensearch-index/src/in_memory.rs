@@ -483,6 +483,20 @@ impl InMemoryVectorIndex {
         limit: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_4bit_two_pass_filtered(query, limit, candidate_multiplier, None)
+    }
+
+    /// 4-bit two-pass with an optional [`SearchFilter`]. Pass-1 pre-screens each
+    /// vector by its precomputed `doc_id` hash (the same path the int8 two-pass and
+    /// exact scan use), so **filtered** searches keep the 4-bit speedup. Result
+    /// matches the exact filtered top-k whenever pass-1 retains the true filtered top-k.
+    pub fn search_top_k_4bit_two_pass_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        candidate_multiplier: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -501,9 +515,10 @@ impl InMemoryVectorIndex {
             .get_or_init(|| pack_4bit_slab(&self.vectors, self.dimension));
 
         // Pass 1: parallel bounded-heap 4-bit scan (same chunking + cutoff fast-path
-        // as the int8 two-pass).
+        // + filter pre-screen as the int8 two-pass).
         let chunk_size = PARALLEL_CHUNK_SIZE;
         let chunk_count = count.div_ceil(chunk_size);
+        let doc_id_hashes = filter.map(|_| self.doc_id_hashes());
         let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
             .into_par_iter()
             .map(|chunk_index| {
@@ -512,6 +527,17 @@ impl InMemoryVectorIndex {
                 let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
                 let mut cutoff = f32::NEG_INFINITY;
                 for index in start..end {
+                    if let Some(f) = filter {
+                        let passed = match doc_id_hashes
+                            .and_then(|h| f.matches_doc_id_hash(h[index], None))
+                        {
+                            Some(decided) => decided,
+                            None => f.matches(&self.doc_ids[index], None),
+                        };
+                        if !passed {
+                            continue;
+                        }
+                    }
                     let offset = index * bytes_per_vector;
                     let stored = &nibbles[offset..offset + bytes_per_vector];
                     let score = dot_packed_4bit(stored, &query_packed) as f32;

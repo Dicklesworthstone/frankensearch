@@ -85,11 +85,13 @@ fn bench_sync_int8_fetch(c: &mut Criterion) {
 
     let mut qi = 0usize;
     let mut g = c.benchmark_group("sync_int8_fetch");
-    g.bench_function("int8_fetch", |b| {
+    // Default path: the fast tier now uses the 4-bit two-pass (wired in
+    // search_fast_hits); this arm measures the end-to-end 4-bit-fetch hybrid.
+    g.bench_function("fast_fetch_4bit", |b| {
         b.iter(|| {
             let q = &queries[qi % QUERIES];
             qi += 1;
-            black_box(int8.search_collect(black_box(q), K).expect("int8"))
+            black_box(int8.search_collect(black_box(q), K).expect("fast"))
         });
     });
     g.bench_function("exact_fetch", |b| {

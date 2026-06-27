@@ -305,20 +305,19 @@ impl SyncTwoTierSearcher {
             // Explicit params: honour the exact scan + parallelism configuration.
             Some(params) => fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
             // Default: the fast tier is a *reranked candidate generator* (its hits
-            // are re-scored by the quality tier + RRF), so use the int8 two-pass
-            // (parallel + cutoff, ~1.9–2.5× faster than the exact f16 scan,
-            // recall=1.0 at mult=10 on validated 10k–100k corpora) instead of the
+            // are re-scored by the quality tier + RRF), so use the 4-bit two-pass
+            // (parallel + cutoff, the fastest lossless primitive — ~1.4× faster than
+            // the int8 two-pass and ~3× faster than the exact f16 scan) instead of the
             // exact scan. Lossless candidate set → identical fused top-k.
             None => {
-                // mult=5 keeps the candidate set lossless (recall=1.0 validated at
-                // 100k) while being ~1.38× faster than mult=10 (higher cutoff → fewer
-                // pass-1 inserts + a smaller pass-2 rescore) — `fetch` is already a
-                // candidate over-fetch, so a large extra multiplier is wasteful.
-                const INT8_FAST_TIER_MULT: usize = 5;
-                fast_index.search_top_k_int8_two_pass_filtered(
+                // mult=5 keeps the 4-bit candidate set lossless (recall=1.0 validated
+                // at 10k–100k); `fetch` is already a candidate over-fetch, so a larger
+                // multiplier is wasteful.
+                const FAST_TIER_MULT: usize = 5;
+                fast_index.search_top_k_4bit_two_pass_filtered(
                     query_vec,
                     fetch,
-                    INT8_FAST_TIER_MULT,
+                    FAST_TIER_MULT,
                     filter,
                 )
             }
