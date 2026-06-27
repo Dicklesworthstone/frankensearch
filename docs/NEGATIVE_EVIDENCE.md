@@ -1656,3 +1656,48 @@ wide-issue core.
 kernel is already near its local optimum on this SSE2-class build; the remaining lever for 4-bit
 pass-1 is the **AVX2/`vpmaddubsw`-class** path (gated build-config knob, see the AVX2 section above),
 not a portable source rewrite. Stop micro-tuning the `wide`-based nibble decode.
+
+### 2026-06-27 — columnar `id` FAST field for ranked-id retrieval is SLOWER than the row store (BlackThrush)
+
+**Lever tested and reverted:** the ranked-id paths (`search_doc_ids`, the hybrid lexical guard) read
+each hit's `doc_id` by loading the **full stored document** (`searcher.doc(addr)`, which decompresses
+the whole store block carrying id + the large `content` + title + metadata) just to extract the tiny
+`id`. Classic row-store → column-store fix: mark `id` as a Tantivy string **FAST field**
+(`(STRING | STORED).set_fast(None)`) and read the id from the columnar fast field, skipping the store
+block. Backward-compatible (fall back to the store when the fast field is absent), and validated
+**bit-identical** — `search_doc_ids_matches_counted_baseline` + all 81 lexical tests stayed GREEN,
+and `reopen_preserves_documents` confirms the schema change round-trips.
+
+**Measured (per-crate `doc_ids_topk` A/B, `rch` worker `ovh-a`, `--measurement-time 4`; `id_fast` =
+columnar, `id_store` = stored-doc baseline; new arm names served as a freshness sentinel and
+appeared).** Lower is faster; ratio = fast / store (>1 = fast field SLOWER):
+
+| corpus | workload | id_store | id_fast | ratio |
+|--------|----------|----------|---------|-------|
+| 100k × 12-word | high_fanout | 198 µs | 457 µs | **2.30** |
+| 100k × 12-word | union3 | 792 µs | 949 µs | **1.20** |
+| 100k × 12-word | natural | 1.039 ms | 1.418 ms | **1.36** |
+| 100k × 12-word | phrase | 1.462 ms | 1.648 ms | **1.13** |
+| 20k × 400-word | high_fanout | 125 µs | 412 µs | **3.30** |
+| 20k × 400-word | natural | 1.406 ms | 1.583 ms | **1.13** |
+
+(An earlier un-hoisted version that re-opened the column **per hit** was even worse — high_fanout
+3.4× — because `FastFieldReaders::str` re-deserializes the column dictionary on every call. Hoisting
+the open to once-per-segment cut that to 2.3× but did not flip the sign.)
+
+**Decision:** rejected and fully reverted (`crates/frankensearch-lexical/src/lib.rs` + bench
+byte-identical to `main`; `git diff` empty before this entry — reverted via Edit, as `dcg` blocks
+`git checkout -- <path>`). **Hypothesis refuted:** I expected large docs to win because store-block
+decompression of big `content` should dominate — but the store stayed *faster* on the 400-word
+corpus (125 µs), so the bottleneck is **not** store decompression. Root cause: `id` is a
+**high-cardinality unique string** (`doc-000000`…), so its columnar dictionary is an SSTable as large
+as the data, and `StrColumn::ord_to_str` pays a per-doc SSTable dictionary lookup (index walk +
+dictionary-block decompress) that is *slower* than reading the small, warm LZ4 store block. Fast
+fields win for **low-cardinality** columns (few distinct values → tiny dictionary), not for unique
+ids.
+
+**Route next:** do not re-attempt fast-field / columnar `doc_id` retrieval — it is corpus-independent
+slower here for unique ids. If store-load is ever the proven bottleneck for big docs, the lever is a
+**dedicated minimal id-only stored field** or storing the id in a numeric fast field (dense u64 →
+no dictionary), not the string columnar path. Original-comparator ratio vs Lucene/Tantivy/Meili is
+N/A — this is an internal id-materialization micro-lever on the Tantivy-wrapping crate.
