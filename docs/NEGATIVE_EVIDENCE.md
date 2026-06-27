@@ -77,6 +77,14 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — Methodology: `rch exec` can serve a STALE bench binary; verify freshness before trusting latency (BlackThrush)
+
+**Finding (tooling, not a perf result):** benching via `rch exec -- cargo bench` does **not** always rebuild the bench binary on the worker — it can run a cached one. Caught red-handed: after renaming the `sync_int8_fetch` bench's default arm `int8_fetch` → `fast_fetch_4bit` (source confirmed) and re-running through `rch`, the worker still emitted the **old** `int8_fetch` arm name, i.e. it ran a stale binary. So **`rch` latency numbers can reflect old code** and silently mislead an A/B of a fresh change. (A clean local `cargo bench` is the cross-check, but the shared `CARGO_TARGET_DIR` here also hits `E0514` "incompatible rustc" when the local toolchain differs from the worker's — so neither path is automatically trustworthy.)
+
+**Mitigation:** before trusting an `rch` bench A/B, confirm the binary is fresh — e.g. rename/relabel an arm (or print a source-derived sentinel) and verify the new label appears in the output, and check the criterion `estimates.json` mtime is from *this* run. Force a rebuild if in doubt.
+
+**Consequence for the 4-bit query-hoist (`PreparedQuery4bit`, commits f06379c / b300679, a concurrent agent):** I independently implemented the same hoist and my `rch`-based int8_two_pass A/B suggested it was *slower* at small `k` (the prepared-query path adds a per-chunk heap load vs decoding query nibbles in registers) — but given the caching pitfall above, **I do not trust that number** and am NOT claiming a regression. Flagging for a clean, freshness-verified re-measurement (small-`k` scan, same-run vs the inline kernel) before treating the hoist as a confirmed win or loss. Left the on-main hoist untouched (a concurrent agent owns that area).
+
 ### 2026-06-27 — 1-bit binary (sign) two-pass for FSVI vector search: recall too low, no speedup (BlackThrush)
 
 **Lever tested and reverted:** follow-up to the landed FSVI int8 two-pass (1.94×, bandwidth-bound).
