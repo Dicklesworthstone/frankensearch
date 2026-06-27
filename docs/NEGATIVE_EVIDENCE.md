@@ -1356,3 +1356,50 @@ to 0.825x (33 us vs 40 us), but `top10/100000/exact_identifier` still lost at 2.
 reverted. A future lever must either make the hybrid exact-hit path terminate on high-confidence
 identifier hits without changing recall contracts, or move to a separate exact-id lookup structure
 that is not also granted to the Tantivy-class incumbent.
+
+### 2026-06-27 — sparse lexical underfill short-circuit is not a BOLD win (BlackThrush)
+
+**Lever tested and reverted:** changed the BOLD hash-hybrid harness so any under-filled
+`search_doc_ids` result (`lexical_count < limit`) short-circuited before hash embedding, vector
+scan, and RRF. This came from the query-processing decision-barrier pattern in the alien-graveyard
+dig: when the fast tier is a non-semantic hash and Tantivy has already proven the lexical result
+set is sparse, extra vector/RRF work has no semantic recall value. It is also aligned with the
+production `TwoTierSearcher` hash-only lexical path, but the BOLD matrix did not produce a durable
+Lucene/Tantivy/Meilisearch-class win.
+
+Command:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- env \
+    FRANKENSEARCH_BOLD_VERIFY_OUT=/tmp/frankensearch-bold-sparse-lexical-blackthrush-20260627 \
+    FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+    FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+    RUST_LOG=off \
+    cargo bench -p frankensearch --features lexical --profile release \
+      --bench search_bench bold_verify_tantivy_class \
+      -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH executed locally (`[RCH] local`; no admissible worker). Artifact:
+`/tmp/frankensearch-bold-sparse-lexical-blackthrush-20260627/summary.jsonl`. Incumbent:
+`tantivy_doc_ids`, used as the Lucene/Tantivy/Meilisearch-class proxy.
+Required `frankensearch-cod-b` reruns were attempted after the revert, but did not emit BOLD rows
+before the local harness returned code 130, so no code change is shipped from this evidence.
+
+Hybrid candidate vs Tantivy-class proxy:
+
+| Workload | candidate p50 ratio | candidate p95 ratio | candidate p50 us | Tantivy p50 us | verdict |
+|----------|---------------------|---------------------|------------------|----------------|---------|
+| `top10/100000/quoted_phrase` | 1.107 | 0.906 | 1295 | 1170 | p50 miss; p95 win only |
+| `top10/100000/exact_identifier` | 0.945 | 1.007 | 1698 | 1797 | p50 win only |
+| `top10/100000/short_keyword` | 0.996 | 1.003 | 249 | 250 | noise/parity |
+| `top10/10000/quoted_phrase` | 1.197 | 1.873 | 231 | 193 | regression |
+| `top10/100000/natural_language` | 1.506 | 1.530 | 1337 | 888 | regression |
+| `limit_all/10000` | 1.196 | 1.251 | 11566 | 9671 | regression |
+
+The old 100k quoted-phrase miss from 2026-06-25 was 2.068x, so this lever did narrow the biggest
+stale measured gap, but it still failed p50 parity against the Tantivy-class proxy and introduced
+too many mixed rows. Per the revert rule, the code was restored and only this ledger entry is kept.
