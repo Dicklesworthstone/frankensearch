@@ -1878,3 +1878,38 @@ vs 741.499 us through `search_doc_ids` (ratio **1.062**) while `union3` was 0.99
 0.982. Treat the natural row as guard/measurement overhead, not a claimed win; the code deliberately
 keeps 3+ term natural-language queries off the count-free collector because broad disjunctions were
 already rejected in this ledger.
+
+### 2026-06-27 — BLOCKER: `frankensearch-storage` / `frankensearch-fsfs` fail to compile (fsqlite dep skew) (Cobaltmoth)
+
+**Blocker, not a perf result.** Any `cargo build/test/bench -p frankensearch-storage` or
+`-p frankensearch-fsfs` fails at compile with:
+
+```
+error[E0308]: mismatched types
+  fsqlite-0.1.2/src/migrate.rs:198:35
+    SqliteValue::Text(Arc::from(migration.name)),
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `SmallText`, found `Arc<_, _>`
+  (SqliteValue::Text(SmallText) defined in fsqlite-types-0.1.9/src/value.rs:665)
+error: could not compile `fsqlite` (lib) due to 1 previous error
+```
+
+**Root cause:** the committed `Cargo.lock` pins `fsqlite 0.1.2` but `fsqlite-types 0.1.9`. Both
+`crates/frankensearch-storage/Cargo.toml` and `crates/frankensearch-fsfs/Cargo.toml` declare
+`fsqlite = "0.1.2"` + `fsqlite-types = "0.1.2"` (caret → `^0.1.x`), and the resolver took the latest
+`fsqlite-types 0.1.9`. But `fsqlite 0.1.2`'s source uses the **old** `SqliteValue::Text(Arc<…>)` API,
+while `fsqlite-types 0.1.9` changed it to `Text(SmallText)` — an upstream **breaking change inside a
+`0.1.x` line** (semver violation in `fsqlite-types`). Reproduced on two RCH workers (`ovh-a`, `hz2`),
+exit 101 each. **Not caused by this session** — my change did not touch `Cargo.lock`; the skew is in
+the committed lock and blocks the whole `storage → fsqlite` graph (so `fsfs` too).
+
+**Impact:** all perf work on `frankensearch-storage` and `frankensearch-fsfs` is currently un-buildable
+(can't bench, can't run conformance). A clean, provably-bit-identical sniff-loop vectorization for
+`fsfs::SniffFeatures::from_bytes` (per-file null/non-printable/high-bit histogram: per-byte
+`u32::saturating_add` → branchless `u64` + saturate-cast, SIMD-able) was written and **reverted
+unmeasured** because of this — fsfs would not compile to test or bench it.
+
+**Fix (needs a shared-infra owner — out of scope for "git add only your own files"):** pin
+`fsqlite-types` to the version `fsqlite 0.1.2` was built against, e.g. in both Cargo.tomls
+`fsqlite-types = "=0.1.2"`, then `cargo update -p fsqlite-types --precise 0.1.2` to rewrite the lock;
+or bump `fsqlite` to a release compatible with `fsqlite-types 0.1.9`. Until then, route perf digs to
+crates outside the `storage`/`fsfs` graph.
