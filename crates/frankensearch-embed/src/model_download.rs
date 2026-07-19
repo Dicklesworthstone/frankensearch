@@ -26,6 +26,7 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use crate::model_manifest::{ModelFile, ModelLifecycle, ModelManifest};
 
 static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_MAX_MODEL_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -40,6 +41,8 @@ pub struct DownloadConfig {
     pub user_agent: String,
     /// Maximum redirects to follow.
     pub max_redirects: u32,
+    /// Maximum size of one downloaded model artifact.
+    pub max_response_bytes: usize,
 }
 
 impl Default for DownloadConfig {
@@ -49,6 +52,7 @@ impl Default for DownloadConfig {
             retry_base_delay: Duration::from_secs(1),
             user_agent: format!("frankensearch/{}", env!("CARGO_PKG_VERSION")),
             max_redirects: 5,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         }
     }
 }
@@ -121,6 +125,7 @@ impl ModelDownloader {
         let mut client_config = HttpClientConfig::default();
         client_config.redirect_policy = RedirectPolicy::Limited(config.max_redirects);
         client_config.user_agent = Some(config.user_agent.clone());
+        client_config.max_body_size = Some(config.max_response_bytes);
         Self {
             config,
             client: HttpClient::with_config(client_config),
@@ -705,6 +710,10 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_base_delay, Duration::from_secs(1));
         assert_eq!(config.max_redirects, 5);
+        assert_eq!(
+            config.max_response_bytes,
+            DEFAULT_MAX_MODEL_ARTIFACT_BYTES
+        );
         assert!(config.user_agent.starts_with("frankensearch/"));
     }
 
@@ -777,6 +786,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -834,6 +844,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -878,6 +889,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -918,6 +930,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -965,6 +978,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -1210,6 +1224,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -1240,6 +1255,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
