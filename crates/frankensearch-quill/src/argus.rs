@@ -5159,6 +5159,119 @@ mod tests {
         ReferenceScorer::boolean(clauses)
     }
 
+    /// Build a nested pure-term union: `group_sizes` slices the flat term
+    /// arrays into per-group multi-field unions (each a `sealed_union`), wrapped
+    /// in an outer `Should` union. With `block_max` present each group's terms
+    /// carry ceilings, so the outer union is grouped-`MaxScore` eligible.
+    #[allow(clippy::too_many_arguments)]
+    fn sealed_grouped_union<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        group_sizes: &[usize],
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        let mut outer = Vec::new();
+        let mut offset = 0_usize;
+        for &size in group_sizes {
+            let end = offset + size;
+            let group = sealed_union(
+                &posting_lists[offset..end],
+                block_max.map(|bounds| &bounds[offset..end]),
+                fieldnorms,
+                snapshot,
+                &rows_by_term[offset..end],
+                &boosts[offset..end],
+                segment_num_docs,
+            )?;
+            outer.push(ScorerClause::should(group));
+            offset = end;
+        }
+        ReferenceScorer::boolean(outer)
+    }
+
+    #[test]
+    fn grouped_max_score_matches_exhaustive_and_prunes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 8_192;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        // Two multi-field groups of two terms. group0 (high ceiling) is active
+        // at doc 0 (window 0) and doc 5_000 (window 1), so it stays *essential*;
+        // group1 (low ceiling) holds doc 5_000 and — uniquely — doc 6_000. With
+        // k=1 the heap fills on doc 0 (score ~2e8), so in window 1 group1 is
+        // non-essential and doc 6_000 (present only in group1) is skipped while
+        // the true top-1 (doc 0) is preserved bit-for-bit.
+        let rows_by_term = vec![
+            vec![Posting::new(0, 1), Posting::new(5_000, 1)],
+            vec![Posting::new(0, 1), Posting::new(5_000, 1)],
+            vec![Posting::new(5_000, 1)],
+            vec![Posting::new(6_000, 1)],
+        ];
+        let boosts = [1.0e8, 1.0e8, 1.0, 1.0];
+        let group_sizes = [2_usize, 2_usize];
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut oracle = sealed_grouped_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+            &group_sizes,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_grouped_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+            &group_sizes,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let stats = candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_hits = candidate_collector.finish()?.hits;
+
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, 0);
+        assert!(
+            stats.max_score_windows >= 1,
+            "grouped MaxScore should prune at least one window (got {stats:?})"
+        );
+        Ok(())
+    }
+
     fn assert_hits_bit_exact(actual: &[ScoredDoc], expected: &[ScoredDoc]) {
         assert_eq!(actual.len(), expected.len(), "hit count differs");
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
