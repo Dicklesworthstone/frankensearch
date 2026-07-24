@@ -852,6 +852,14 @@ pub struct SearchConfig {
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     pub explain: bool,
+    /// Opt in to bounded lexical shadow-oracle comparisons.
+    pub shadow_mode: bool,
+    /// Deterministic shadow sample rate in basis points.
+    pub shadow_sample_rate_basis_points: u16,
+    /// Maximum concurrently admitted shadow comparisons.
+    pub shadow_max_in_flight: usize,
+    /// Accepted absolute lexical score delta.
+    pub shadow_score_epsilon: f32,
 }
 
 impl Default for SearchConfig {
@@ -863,6 +871,10 @@ impl Default for SearchConfig {
             quality_timeout_ms: 500,
             fast_only: false,
             explain: false,
+            shadow_mode: false,
+            shadow_sample_rate_basis_points: 1_000,
+            shadow_max_in_flight: 2,
+            shadow_score_epsilon: 1.0e-5,
         }
     }
 }
@@ -998,6 +1010,10 @@ struct SearchConfigPatch {
     quality_timeout_ms: Option<u64>,
     fast_only: Option<bool>,
     explain: Option<bool>,
+    shadow_mode: Option<bool>,
+    shadow_sample_rate_basis_points: Option<u16>,
+    shadow_max_in_flight: Option<usize>,
+    shadow_score_epsilon: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -1149,6 +1165,10 @@ pub struct ContractSearchConfig {
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     pub explain: bool,
+    pub shadow_mode: bool,
+    pub shadow_sample_rate_basis_points: u16,
+    pub shadow_max_in_flight: usize,
+    pub shadow_score_epsilon: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1212,6 +1232,10 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 quality_timeout_ms: config.search.quality_timeout_ms,
                 fast_only: config.search.fast_only,
                 explain: config.search.explain,
+                shadow_mode: config.search.shadow_mode,
+                shadow_sample_rate_basis_points: config.search.shadow_sample_rate_basis_points,
+                shadow_max_in_flight: config.search.shadow_max_in_flight,
+                shadow_score_epsilon: config.search.shadow_score_epsilon,
             },
             pressure: ContractPressureConfig {
                 profile: config.pressure.profile,
@@ -2001,6 +2025,18 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(explain) = search.explain {
             config.search.explain = explain;
         }
+        if let Some(shadow_mode) = search.shadow_mode {
+            config.search.shadow_mode = shadow_mode;
+        }
+        if let Some(sample_rate) = search.shadow_sample_rate_basis_points {
+            config.search.shadow_sample_rate_basis_points = sample_rate;
+        }
+        if let Some(max_in_flight) = search.shadow_max_in_flight {
+            config.search.shadow_max_in_flight = max_in_flight;
+        }
+        if let Some(score_epsilon) = search.shadow_score_epsilon {
+            config.search.shadow_score_epsilon = score_epsilon;
+        }
     }
 
     if let Some(pressure) = patch.pressure {
@@ -2176,6 +2212,47 @@ fn apply_env_overrides(
         env_override(env, "FRANKENSEARCH_SEARCH_EXPLAIN", "FSFS_SEARCH_EXPLAIN")
     {
         config.search.explain = parse_bool(value, "search.explain")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_LEXICAL_SHADOW",
+        "FSFS_SEARCH_SHADOW_MODE",
+    ) {
+        config.search.shadow_mode = match value.trim().to_ascii_lowercase().as_str() {
+            "off" => false,
+            "quill" => true,
+            _ => parse_bool(value, "search.shadow_mode")?,
+        };
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_SHADOW_SAMPLE_RATE_BASIS_POINTS",
+        "FSFS_SEARCH_SHADOW_SAMPLE_RATE_BASIS_POINTS",
+    ) {
+        config.search.shadow_sample_rate_basis_points =
+            parse_u16(value, "search.shadow_sample_rate_basis_points")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_SHADOW_MAX_IN_FLIGHT",
+        "FSFS_SEARCH_SHADOW_MAX_IN_FLIGHT",
+    ) {
+        config.search.shadow_max_in_flight = parse_usize(value, "search.shadow_max_in_flight")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_SHADOW_SCORE_EPSILON",
+        "FSFS_SEARCH_SHADOW_SCORE_EPSILON",
+    ) {
+        config.search.shadow_score_epsilon = parse_f32(value, "search.shadow_score_epsilon")?;
         keys_used.push(key.into());
     }
 
@@ -2471,6 +2548,10 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "quality_timeout_ms",
                 "fast_only",
                 "explain",
+                "shadow_mode",
+                "shadow_sample_rate_basis_points",
+                "shadow_max_in_flight",
+                "shadow_score_epsilon",
             ]
             .into_iter()
             .collect(),
@@ -2637,6 +2718,35 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "search.quality_timeout_ms".into(),
             value: config.search.quality_timeout_ms.to_string(),
             reason: "must be >= 50".into(),
+        });
+    }
+
+    if u64::from(config.search.shadow_sample_rate_basis_points)
+        > frankensearch_core::SHADOW_SAMPLE_DENOMINATOR
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "search.shadow_sample_rate_basis_points".into(),
+            value: config.search.shadow_sample_rate_basis_points.to_string(),
+            reason: format!(
+                "must be between 0 and {}",
+                frankensearch_core::SHADOW_SAMPLE_DENOMINATOR
+            ),
+        });
+    }
+
+    if !(1..=1_024).contains(&config.search.shadow_max_in_flight) {
+        return Err(SearchError::InvalidConfig {
+            field: "search.shadow_max_in_flight".into(),
+            value: config.search.shadow_max_in_flight.to_string(),
+            reason: "must be between 1 and 1024".into(),
+        });
+    }
+
+    if !config.search.shadow_score_epsilon.is_finite() || config.search.shadow_score_epsilon < 0.0 {
+        return Err(SearchError::InvalidConfig {
+            field: "search.shadow_score_epsilon".into(),
+            value: config.search.shadow_score_epsilon.to_string(),
+            reason: "must be finite and non-negative".into(),
         });
     }
 
@@ -2900,6 +3010,24 @@ fn parse_u8(value: &str, field: &str) -> SearchResult<u8> {
 fn parse_f64(value: &str, field: &str) -> SearchResult<f64> {
     let parsed = value
         .parse::<f64>()
+        .map_err(|_| SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "expected floating-point number".into(),
+        })?;
+    if !parsed.is_finite() {
+        return Err(SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "value must be finite (not NaN or Infinity)".into(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_f32(value: &str, field: &str) -> SearchResult<f32> {
+    let parsed = value
+        .parse::<f32>()
         .map_err(|_| SearchError::InvalidConfig {
             field: field.into(),
             value: value.into(),
@@ -3199,7 +3327,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_reported_as_warnings() {
         let file = "\
-[search]\nshadow_mode = true\n";
+[search]\nshadow_unknown = true\n";
         let result = load_from_str(
             Some(file),
             None,
@@ -3211,7 +3339,7 @@ mod tests {
 
         assert!(result.warnings.iter().any(|warning| warning.reason_code
             == "config.unknown_key.warning"
-            && warning.field == "search.shadow_mode"));
+            && warning.field == "search.shadow_unknown"));
     }
 
     #[test]
@@ -4534,6 +4662,10 @@ mod tests {
         assert_eq!(cfg.quality_timeout_ms, 500);
         assert!(!cfg.fast_only);
         assert!(!cfg.explain);
+        assert!(!cfg.shadow_mode);
+        assert_eq!(cfg.shadow_sample_rate_basis_points, 1_000);
+        assert_eq!(cfg.shadow_max_in_flight, 2);
+        assert!((cfg.shadow_score_epsilon - 1.0e-5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -5001,6 +5133,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shadow_config_is_known_default_off_and_validated() {
+        let file = "\
+[search]
+shadow_mode = true
+shadow_sample_rate_basis_points = 2500
+shadow_max_in_flight = 4
+shadow_score_epsilon = 0.0002
+";
+        let result = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load shadow config");
+        assert!(result.config.search.shadow_mode);
+        assert_eq!(result.config.search.shadow_sample_rate_basis_points, 2_500);
+        assert_eq!(result.config.search.shadow_max_in_flight, 4);
+        assert!((result.config.search.shadow_score_epsilon - 0.0002).abs() < f32::EPSILON);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.field.starts_with("search.shadow_"))
+        );
+
+        assert_invalid_field(
+            "[search]\nshadow_sample_rate_basis_points = 10001\n",
+            "search.shadow_sample_rate_basis_points",
+        );
+        assert_invalid_field(
+            "[search]\nshadow_max_in_flight = 0\n",
+            "search.shadow_max_in_flight",
+        );
+        assert_invalid_field(
+            "[search]\nshadow_score_epsilon = -0.1\n",
+            "search.shadow_score_epsilon",
+        );
+    }
+
     // ── ConfigLoadResult::to_loaded_event ──
 
     #[test]
@@ -5028,6 +5202,7 @@ mod tests {
             super::CONFIG_LOADED_EMIT_FIELDS.map(str::to_owned).to_vec()
         );
         assert_eq!(event.redaction_applied, super::PrivacyConfig::default());
+        assert!(result.config.search.shadow_mode);
         assert!(
             event
                 .warnings
@@ -5040,10 +5215,12 @@ mod tests {
                 .iter()
                 .all(|warning| { warning.severity == super::ConfigDiagnosticSeverity::Warn })
         );
-        assert!(event.warnings.iter().any(|warning| {
-            warning.reason_code == "config.unknown_key.warning"
-                && warning.field == "search.shadow_mode"
-        }));
+        assert!(
+            event
+                .warnings
+                .iter()
+                .all(|warning| warning.field != "search.shadow_mode")
+        );
         assert!(event.warnings.iter().any(|warning| {
             warning.reason_code == super::CONFIG_FAST_ONLY_WARNING_CODE
                 && warning.field == "search.fast_only"

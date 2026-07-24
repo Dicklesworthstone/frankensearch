@@ -1,0 +1,181 @@
+{
+  "schema": "quill-fast-numeric-columns-evidence-v1",
+  "generated_at_utc": "2026-07-24T10:50:27Z",
+  "bead": {
+    "id": "bd-quill-e5-delta-nnqf.6",
+    "status": "pass",
+    "title": "Persist fast numeric columns and bound sparse range scans",
+    "implemented_lane": "persisted numeric fast columns",
+    "separate_rejected_lane": {
+      "name": "snapshot-cache string Range and Glob expansion",
+      "decision": "rejected and reverted by cc",
+      "measured_delta": "-1.30%",
+      "implementation_included_here": false,
+      "ledger": "bead comment 1739"
+    }
+  },
+  "revisions": {
+    "implementation_revision": "4aad05313da51b8e8a5b313ba691f8f177727098",
+    "implementation_base_revision": "6ebfecf2635f657f0c4c95b57f02b58bb007958c",
+    "claim_revision": "9a81c682"
+  },
+  "architecture": {
+    "canonical_storage": "FSLX NUMERIC",
+    "column_predicate": "FieldKind::I64 or FieldKind::U64 with indexed || fast",
+    "producers": [
+      "ColumnarAccumulator and Scribe flush",
+      "DeltaSegment and Delta flush",
+      "Q1 concatenation",
+      "compaction"
+    ],
+    "legal_schema_proved": {
+      "fast": true,
+      "indexed": false,
+      "stored": false
+    },
+    "range_lowering": {
+      "old": "scan every global docid in the leaf span and decode STOREDMETA",
+      "new": "binary-search the typed NUMERIC pair run, iterate only bounded entries, filter snapshot-live docids, sort and deduplicate survivors",
+      "old_complexity": "O(docid span)",
+      "new_complexity": "O(log N + M + M log M), where M is the bounded pair count",
+      "stored_metadata_dependency": false,
+      "cancellation": "checked before the scan, every 1024 bounded entries, and after the scan"
+    },
+    "snapshot_semantics": {
+      "sealed": "filters manifest tombstones before scorer construction",
+      "delta": "encodes only live rows and rechecks live visibility while materializing",
+      "planning_cardinality": "retains the physical numeric value count and leaf document domain"
+    }
+  },
+  "format_contract": {
+    "default_schema_now_requires_numeric": true,
+    "golden_generator": "existing production EncodedSegment writer",
+    "repeat_generation_byte_identical": true,
+    "fixture": "crates/frankensearch-quill/tests/fixtures/fslx-v1-golden.hex",
+    "file_len": 985,
+    "section_count": 10,
+    "numeric_section": {
+      "offset": 832,
+      "len": 11,
+      "xxh3": "f32b8ca94e2a52bc"
+    },
+    "header_crc32": "3e9c358f",
+    "file_xxh3": "3d1c857073b5390f",
+    "trailer_crc32": "47525d26",
+    "readback": "pinned fixture, section table, payloads, hashes, owned reader, and borrowed reader all verify"
+  },
+  "behavioral_proof": {
+    "fast_only_unstored_numeric_seals_sparse_column": [
+      "NUMERIC present",
+      "STOREDMETA absent",
+      "missing value remains absent",
+      "u64::MAX round-trips"
+    ],
+    "default_fast_only_ord_range_executes_and_validates_before_leaf_iteration": [
+      "default fast-only ord range executes",
+      "inclusive and exclusive bounds",
+      "ranked and scoreless collectors",
+      "boost score bits",
+      "pre-cancelled Cx returns phase numeric range"
+    ],
+    "range_set_and_glob_lowering_is_identical_across_residency": [
+      "fast-only stored:false range",
+      "all-Delta",
+      "mixed Delta and sealed",
+      "all-sealed",
+      "sparse Q1 lease gap",
+      "ordered document ids and f32 score bits identical"
+    ],
+    "numeric_roundtrip_preserves_typed_extremes_and_range_bounds": [
+      "i64::MIN",
+      "i64::MAX",
+      "u64::MAX",
+      "included and excluded bounds",
+      "reversed range is empty",
+      "signedness mismatch is typed"
+    ],
+    "sparse_numeric_seal_rebases_both_types_through_u32_max": true,
+    "delta_seal_sidecars": [
+      "tombstoned rows excluded from the sealed image",
+      "missing numeric values remain sparse",
+      "Delta seal bytes equal direct Scribe flush bytes"
+    ],
+    "keeper_fixture": "production-shaped test segments now carry a canonical sparse ord NUMERIC section",
+    "full_quill_library": {
+      "passed": 478,
+      "failed": 0,
+      "ignored": 2
+    }
+  },
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo test -p frankensearch-quill pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads --lib -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "261.5s"
+    },
+    {
+      "command": "cargo test -p frankensearch-quill --lib",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "passed": 478,
+      "failed": 0,
+      "ignored": 2,
+      "elapsed": "173.2s"
+    },
+    {
+      "command": "cargo check --workspace --all-targets",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "remote_command_elapsed": "334.7s",
+      "elapsed": "345.7s"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "remote_command_elapsed": "345.8s",
+      "elapsed": "356.5s",
+      "rch_history_build_id": "29945322578903071"
+    }
+  ],
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly --edition 2024 --check <all edited Rust files>",
+      "result": "pass"
+    },
+    "git_diff_check": "pass",
+    "workspace_cargo_fmt": {
+      "result": "excluded",
+      "detail": "A non-mutating local cargo fmt --check diagnostic was accidentally invoked and exited nonzero only on unrelated committed frankensearch-ops files. It made no changes and is inadmissible under the strict remote-only Cargo policy. Scoped direct nightly rustfmt is the formatting authority."
+    },
+    "ubs": {
+      "result": "excluded",
+      "reason": "UBS Rust scans launch hidden local Cargo subchecks, which are inadmissible under the campaign's strict remote-only Cargo policy."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "file_reservations": [
+      12276,
+      12277,
+      12278,
+      12279,
+      12280,
+      12281,
+      12282,
+      12283,
+      12284
+    ],
+    "reservation_conflicts": 0,
+    "agent_mail_thread": "bd-quill-e5-delta-nnqf.6"
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "Every authoritative Cargo gate ran through RCH with RCH_REQUIRE_REMOTE=1. The accidental local cargo fmt diagnostic was non-mutating, failed only on unrelated files, and is explicitly excluded."
+  }
+}

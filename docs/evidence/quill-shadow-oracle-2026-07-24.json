@@ -1,0 +1,217 @@
+{
+  "schema": "quill-shadow-oracle-evidence-v1",
+  "generated_at_utc": "2026-07-24T09:06:08Z",
+  "bead": {
+    "id": "bd-quill-duel-shadow-oracle-t6oo",
+    "status": "pass",
+    "title": "Dark-launch shadow oracle + divergence capture"
+  },
+  "revisions": {
+    "implementation_revision": "7e3a8dbfe3bcc8b57cbdcd94a9e7ddacffd03549",
+    "implementation_base_revision": "aecc11c596eca144f01658fa8f850de48c46cad6"
+  },
+  "feature_contract": {
+    "compile_feature": "frankensearch-fsfs/shadow-oracle",
+    "default_enabled": false,
+    "runtime_default_enabled": false,
+    "serving_engine": "quill",
+    "shadow_oracle": "retained Tantivy index",
+    "serving_result_mutation": false,
+    "preflip_adapter": "The generic ShadowLexical wrapper can serve an incumbent LexicalSearch while mirroring index, commit, and sampled query work to any shadow backend.",
+    "postflip_adapter": "The fsfs ShadowLexicalObserver compares direct snippet-preserving Quill candidates with a retained Tantivy oracle without changing Quill results.",
+    "lifecycle": {
+      "task_owner": "asupersync structured region",
+      "bounded_in_flight": true,
+      "max_in_flight_default": 2,
+      "cancel_safe_serving": true,
+      "generation_drift_pauses_comparison": true
+    },
+    "load_shedding": {
+      "deterministic_sampling_default_basis_points": 1000,
+      "cpu_pressure": true,
+      "io_pressure": true,
+      "manual_pressure": true,
+      "query_admission_cost": "O(1) atomic reads"
+    }
+  },
+  "artifact_contract": {
+    "directory": ".quill-shadow",
+    "streams": {
+      "divergences": {
+        "path": ".quill-shadow/divergences.jsonl",
+        "schema_version": 2,
+        "contents": [
+          "generation",
+          "query",
+          "top_k",
+          "divergence_class",
+          "corpus_hash",
+          "serving_ranked_hits",
+          "shadow_ranked_hits",
+          "score_epsilon"
+        ],
+        "exact_comparisons_emitted": false
+      },
+      "degradations": {
+        "path": ".quill-shadow/degradations.jsonl",
+        "schema_version": 1,
+        "typed_kinds": [
+          "oracle_unavailable",
+          "corpus_export",
+          "index",
+          "commit",
+          "search",
+          "runtime_unavailable",
+          "artifact_write",
+          "generation_drift",
+          "pressure_sample"
+        ]
+      },
+      "observations": {
+        "path": ".quill-shadow/observations.jsonl",
+        "schema_version": 1,
+        "purpose": "Records every completed comparison so doctor can distinguish a clean oracle from an oracle that never ran."
+      }
+    },
+    "durability": "append-only JSONL with file sync",
+    "corpus_hash": "deterministic SHA-256 over sorted, unique live documents",
+    "validation": [
+      "known schema version",
+      "64-character hexadecimal corpus hash",
+      "sorted unique corpus documents",
+      "recomputed corpus hash equality",
+      "ranked-hit rank and score invariants",
+      "divergence stream excludes exact comparisons"
+    ],
+    "shrinker": {
+      "consumer": "frankensearch-quill-gauntlet::ShrinkDriver",
+      "legacy_schema_v1_retained": true,
+      "production_schema_v2_supported": true,
+      "production_roundtrip_test": "shrink_shadow_line_roundtrips_production_schema"
+    }
+  },
+  "failure_contract": {
+    "shadow_index_error_propagates_to_serving": false,
+    "shadow_commit_error_propagates_to_serving": false,
+    "shadow_search_error_propagates_to_serving": false,
+    "artifact_error_propagates_to_serving": false,
+    "doctor": [
+      "disabled mode passes",
+      "requested mode without compile feature warns",
+      "malformed artifact fails",
+      "divergence or degradation stream warns",
+      "enabled mode without observations warns",
+      "clean observation stream passes"
+    ],
+    "tracing_fields": [
+      "serve_latency",
+      "shadow_latency",
+      "divergence_class",
+      "shed_reason"
+    ]
+  },
+  "behavioral_proof": {
+    "core": [
+      "divergence classification",
+      "artifact schema and doctor summary",
+      "exact deterministic sampling",
+      "CPU and IO shedding",
+      "shadow failure noninterference",
+      "LabRuntime quiescence and noninterference with seed 0x5ad00001",
+      "structured lifecycle",
+      "250ms slow shadow wall-clock nonblocking guard",
+      "deterministic corpus hash"
+    ],
+    "fsfs": [
+      "real Quill-serving versus Tantivy-oracle end-to-end comparison",
+      "clean, degraded, and missing-feature doctor states",
+      "scheduler-owned application and socket roots",
+      "idle shutdown and slow-client socket lifecycle"
+    ],
+    "lexical": "Tantivy export includes only live committed documents and returns deterministic sorted content.",
+    "gauntlet": "Both the legacy and production divergence records feed the real shrink driver."
+  },
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo test -p frankensearch-core -p frankensearch-quill-gauntlet -p frankensearch-fsfs shadow --features frankensearch-fsfs/shadow-oracle",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "core_passed": 8,
+      "fsfs_passed": 3,
+      "gauntlet_passed": 2,
+      "failed": 0,
+      "elapsed": "461.1s"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --features frankensearch-fsfs/shadow-oracle -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "result": "pass",
+      "elapsed": "204.3s"
+    },
+    {
+      "command": "cargo check --workspace --all-targets --features frankensearch-fsfs/shadow-oracle",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "result": "pass",
+      "elapsed": "198.1s"
+    },
+    {
+      "command": "cargo test -p frankensearch-fsfs serve_socket --features frankensearch-fsfs/shadow-oracle",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "passed": 3,
+      "failed": 0,
+      "elapsed": "300.3s"
+    },
+    {
+      "command": "cargo test -p frankensearch-lexical all_doc_ids_enumerates_only_live_committed_documents",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 1,
+      "failed": 0,
+      "elapsed": "264.1s"
+    }
+  ],
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly --edition 2024 --check <all edited Rust files>",
+      "result": "pass"
+    },
+    "cargo_fmt_remote_attempt": {
+      "command": "RCH_REQUIRE_REMOTE=1 rch exec -- cargo fmt --check",
+      "result": "inadmissible",
+      "error": "RCH-E301: non-compilation command; remote required; refusing local fallback",
+      "interpretation": "No local Cargo fallback was used; direct nightly rustfmt is the formatting authority."
+    },
+    "git_diff_check": "pass",
+    "ubs": {
+      "result": "excluded",
+      "reason": "UBS Rust scans launch hidden local Cargo subchecks, which are inadmissible under the campaign's strict remote-only Cargo policy."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "file_reservations": [
+      12254,
+      12255,
+      12256,
+      12257,
+      12258,
+      12259,
+      12260,
+      12261,
+      12262,
+      12263,
+      12264,
+      12265
+    ],
+    "reservation_conflicts": 0,
+    "agent_mail_thread": "bd-quill-duel-shadow-oracle-t6oo"
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "Every authoritative Cargo gate ran through RCH with RCH_REQUIRE_REMOTE=1. Direct rustfmt and JSON validation do not invoke Cargo."
+  }
+}

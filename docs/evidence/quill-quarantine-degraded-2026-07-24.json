@@ -1,0 +1,185 @@
+{
+  "schema": "quill-quarantine-degraded-evidence-v1",
+  "generated_at_utc": "2026-07-24T13:20:51Z",
+  "bead": {
+    "id": "bd-quill-duel-quarantine-zje7",
+    "status": "pass",
+    "title": "Quarantine unrepairable Quill segments and synchronously restore lexical freshness",
+    "implemented_lane": "opt-in durable writer quarantine coupled to fsfs freshness audit and reindex"
+  },
+  "revisions": {
+    "implementation_revision": "3fa54a8a2cd6ef5f5c767d89ed188b8004df8fc0",
+    "implementation_base_revision": "1be5726434fbef9eb653418a8ec77f5a94d30ac6"
+  },
+  "quarantine_contract": {
+    "default_library_policy": "fail closed",
+    "fsfs_watch_policy": "quarantine unrepairable segments",
+    "search_only_policy": "open degraded and report loudly",
+    "retention": "segment and repair sidecar are renamed to collision-safe .quarantine artifacts and never deleted",
+    "publish_order": [
+      "repair attempt fails",
+      "corrupt source and sidecar are durably renamed",
+      "directory is synchronized",
+      "a successor MANIFEST omitting the quarantined segment is published"
+    ],
+    "reopen_behavior": "every open discovers retained quarantine artifacts, emits a typed warning, and exposes degraded metadata",
+    "missing_estimate": "known document ranges are reported when available; aged-out ranges are counted explicitly as unknown"
+  },
+  "freshness_repair_contract": {
+    "audit_mapping": "MissingLexical -> EnqueueReindex",
+    "watch_start": "the paired manifest freshness audit runs synchronously before the watcher starts",
+    "repair": "source text is recanonicalized and lexical plus vector membership is restored without duplicating the already-certified catalog transaction",
+    "postcondition": "the post-repair audit must be clean before watch startup proceeds",
+    "vector_membership": "freshness inspection includes both compacted FSVI records and resident WAL entries"
+  },
+  "degraded_surface": {
+    "keeper_stats": [
+      "degraded",
+      "quarantined_segments",
+      "estimated_missing_docs",
+      "unknown_missing_doc_segments"
+    ],
+    "search_json": "index_freshness includes all quarantine degradation fields",
+    "doctor": "reports quarantine count and known or unknown missing-document estimates with remediation guidance",
+    "telemetry": "quill.keeper.segment_quarantined is emitted with the segment id, retained path, estimate, and mandatory-audit marker"
+  },
+  "behavioral_proof": [
+    {
+      "test": "frankensearch_quill::keeper::unrepairable_segment_is_fail_closed_by_default_and_retained_when_opted_in",
+      "proves": [
+        "default writer open fails closed",
+        "opt-in writer open quarantines corrupt FSLX and .fec",
+        "successor snapshot excludes the corrupt segment",
+        "quarantine bytes remain on disk and are included in managed disk accounting",
+        "read-only reopen remains visibly degraded"
+      ]
+    },
+    {
+      "test": "frankensearch_fsfs::runtime::watch_quarantine_audit_reindexes_missing_lexical_membership_before_start",
+      "proves": [
+        "production Quill segment protection and corruption",
+        "writer quarantine",
+        "MissingLexical audit finding",
+        "synchronous EnqueueReindex backfill",
+        "clean post-repair audit",
+        "search result recovery",
+        "search-only JSON and doctor degraded surfacing",
+        "retained quarantine artifact"
+      ]
+    },
+    {
+      "test": "frankensearch_fsfs::runtime::runtime_index_rejects_undurable_checkpoint_and_rebuilds_exact_generation",
+      "proves": [
+        "one-shot rebuild can delete stale Quill rows after a staged upsert",
+        "the lexical backend commits any dirty scalar generation before delete",
+        "the repaired generation is exact"
+      ]
+    }
+  ],
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo test -p frankensearch-quill --features durability --lib unrepairable_segment_is_fail_closed_by_default_and_retained_when_opted_in -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "result": "pass",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "cargo test -p frankensearch-fsfs --lib watch_quarantine_audit_reindexes_missing_lexical_membership_before_start",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "result": "pass",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "cargo test -p frankensearch-fsfs --lib runtime::tests::runtime_index_rejects_undurable_checkpoint_and_rebuilds_exact_generation -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "passed": 1,
+      "failed": 0,
+      "elapsed": "7m06s"
+    },
+    {
+      "command": "cargo check --workspace --all-targets",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "5m21s"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "7m38s"
+    }
+  ],
+  "workspace_test_diagnostic": {
+    "command": "cargo test --workspace",
+    "environment": "RCH_REQUIRE_REMOTE=1",
+    "worker": "ovh-a",
+    "result": "invalidated by isolated environmental failure",
+    "remote_elapsed": "7m06s",
+    "observed": [
+      "the quarantine end-to-end test passed",
+      "the exact-generation rebuild regression passed",
+      "1836 other frankensearch-fsfs tests passed and one was ignored",
+      "one unrelated updater test failed to execute a just-written shell fixture with Linux ETXTBSY"
+    ],
+    "sole_failure": {
+      "test": "runtime::tests::verify_binary_returning_valid_version_output_passes",
+      "error": "Os { code: 26, kind: ExecutableFileBusy, message: \"Text file busy\" }",
+      "classification": "one-off remote-worker temporary-path collision",
+      "isolated_rerun": {
+        "command": "cargo test -p frankensearch-fsfs --lib runtime::tests::verify_binary_returning_valid_version_output_passes -- --nocapture",
+        "environment": "RCH_REQUIRE_REMOTE=1",
+        "worker": "hz1",
+        "result": "pass",
+        "passed": 1,
+        "failed": 0,
+        "elapsed": "8m35s"
+      }
+    }
+  },
+  "invalidated_diagnostics": [
+    {
+      "observation": "the first workspace test attempt did not compile because a storage batch context was retained across the spawned CLI future",
+      "resolution": "the quarantine reindex path now performs only lexical and vector membership restoration; paired manifests already certify the storage transaction",
+      "authority": "superseded by the passing workspace check, Clippy gate, and targeted end-to-end test"
+    },
+    {
+      "observation": "the first exact-generation rerun still failed after committing only same-flush buffered documents",
+      "resolution": "QuillLexicalBackend now checks the Quill index's actual dirty state and commits before every delete",
+      "authority": "superseded by the passing production-shaped targeted test and its pass in the workspace run"
+    }
+  ],
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly --edition 2024 --check <all edited Rust files>",
+      "result": "pass"
+    },
+    "git_diff_check": "pass",
+    "workspace_cargo_fmt": {
+      "result": "excluded",
+      "detail": "RCH rejected cargo fmt --check with RCH-E301 because it is not a remote compilation command. No local Cargo fallback was used; direct nightly rustfmt is authoritative."
+    },
+    "ubs": {
+      "result": "excluded",
+      "detail": "UBS reported that TOML and Markdown are unsupported and checked nothing. Rust UBS was not run because it launches hidden local Cargo subchecks, which are inadmissible under the strict remote-only policy."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "agent_mail": {
+      "result": "degraded",
+      "detail": "The Agent Mail corruption circuit breaker opened on a malformed database. No unauthorized repair was attempted; Git, Beads, and isolated-worktree state remained authoritative."
+    },
+    "peer_owned_changes_preserved": true
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "Every authoritative Cargo command ran through RCH with RCH_REQUIRE_REMOTE=1."
+  }
+}

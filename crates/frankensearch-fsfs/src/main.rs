@@ -185,7 +185,6 @@ fn main() -> SearchResult<()> {
             })?;
     let shutdown = Arc::new(ShutdownCoordinator::new());
     shutdown.register_signals()?;
-    let cx = Cx::for_request();
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)
         || app_runtime.config().indexing.watch_mode
         || command == CliCommand::Daemon
@@ -215,7 +214,8 @@ fn main() -> SearchResult<()> {
 
     let shutdown_for_run = Arc::clone(&shutdown);
 
-    let run_result = scheduler.block_on(async move {
+    let run_task = scheduler.handle().spawn(async move {
+        let cx = Cx::current().expect("asupersync runtime installs a request context");
         let run_result = if run_with_shutdown {
             app_runtime
                 .run_mode_with_shutdown(&cx, interface_mode, shutdown_for_run.as_ref())
@@ -230,6 +230,7 @@ fn main() -> SearchResult<()> {
 
         run_result
     });
+    let run_result = scheduler.block_on(run_task);
     shutdown.stop_signal_listener();
 
     if shutdown.is_force_exit_requested() {

@@ -1449,7 +1449,7 @@ const fn glob_limit_error(field_ord: u16, limit: usize, actual: usize) -> TermDi
     }
 }
 
-fn trailing_star_prefix(pattern: &[u8]) -> Option<&[u8]> {
+pub(crate) fn trailing_star_prefix(pattern: &[u8]) -> Option<&[u8]> {
     let first_star = pattern.iter().position(|byte| *byte == b'*')?;
     pattern[first_star..]
         .iter()
@@ -1660,6 +1660,15 @@ impl<'dict, 'bytes> TermCursor<'dict, 'bytes> {
             term: key.get(2..).unwrap_or_default(),
             metadata: current.metadata,
         })
+    }
+
+    /// Zero-based prefix-compressed block containing the current term.
+    ///
+    /// Returns `None` after exhaustion. Query execution uses this only for
+    /// coarse cancellation and deterministic fuel checkpoints.
+    #[must_use]
+    pub fn current_block_index(&self) -> Option<usize> {
+        self.current.map(|_| self.block_index)
     }
 
     /// Advance once in composite-key order.

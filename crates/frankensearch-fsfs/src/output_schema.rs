@@ -425,6 +425,10 @@ pub struct IndexFreshnessPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_publish_unix: Option<i64>,
     pub live_writer: bool,
+    pub degraded: bool,
+    pub quarantined_segments: usize,
+    pub estimated_missing_docs: u64,
+    pub unknown_missing_doc_segments: usize,
 }
 
 /// Search payload embedded in `OutputEnvelope::data` for `fsfs search`.
@@ -1171,6 +1175,10 @@ mod tests {
                 published_generation: 42,
                 last_publish_unix: Some(1_700_000_000),
                 live_writer: true,
+                degraded: true,
+                quarantined_segments: 1,
+                estimated_missing_docs: 7,
+                unknown_missing_doc_segments: 0,
             });
         assert!(!payload.is_empty());
 
@@ -1185,6 +1193,10 @@ mod tests {
                 published_generation: 42,
                 last_publish_unix: Some(1_700_000_000),
                 live_writer: true,
+                degraded: true,
+                quarantined_segments: 1,
+                estimated_missing_docs: 7,
+                unknown_missing_doc_segments: 0,
             })
         );
         assert_eq!(

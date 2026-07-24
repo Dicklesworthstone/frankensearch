@@ -1,3 +1,11 @@
+//! External CASS Tantivy-format interoperability.
+//!
+//! NOTE: this module is intentionally not a fallback for native Quill. It
+//! reads and writes the external CASS tool's schema-v8 Tantivy indexes at
+//! `<base>/index/v8/`, so removing it before CASS migrates to FSLX (or drops
+//! the integration) would break a foreign-format boundary. The facade exposes
+//! it only through `cass-compat`; default builds do not include this crate.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

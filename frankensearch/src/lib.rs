@@ -136,7 +136,7 @@
 //! | `lexical`    | Pre-flip Tantivy BM25 compatibility lane               |
 //! | `quill`      | Native Quill lexical engine and builder integration     |
 //! | `lexical-tantivy` | Explicit Tantivy oracle/comparator surface       |
-//! | `cass-compat` | External CASS Tantivy-format interoperability           |
+//! | `cass-compat` | External CASS schema-v8 Tantivy-format interoperability |
 //! | `rerank`     | `FlashRank` cross-encoder reranking                    |
 //! | `ann`        | HNSW approximate nearest-neighbor index                |
 //! | `download`   | Model auto-download from `HuggingFace` via asupersync  |

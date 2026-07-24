@@ -1,0 +1,206 @@
+{
+  "schema": "quill-query-fuel-metering-evidence-v1",
+  "generated_at_utc": "2026-07-24T14:56:27Z",
+  "bead": {
+    "id": "bd-quill-duel-fuel-metering-dg0r",
+    "status": "pass",
+    "title": "Fuel-metered, cancel-aware query execution",
+    "implemented_lane": "coarse deterministic query-work admission at segment, dictionary-block, posting-block, and phrase-position boundaries"
+  },
+  "revisions": {
+    "implementation_revision": "ae5baa0dbc433f3a92591f93e8f652e406ecdbeb",
+    "implementation_base_revision": "3c5d9ccdf05f9436bafd39eb54645a045b6e5bbe"
+  },
+  "contract": {
+    "default_budget": 10000000,
+    "work_units": [
+      "one sealed or Delta segment transition",
+      "one prefix-compressed sealed dictionary block or logical 16-term Delta dictionary block",
+      "one sealed posting block or logical 128-posting Delta block",
+      "one phrase candidate document admitted for position verification"
+    ],
+    "inner_loop_policy": "no checkpoints occur inside posting unpack, BM25 scoring, or position-merge inner loops",
+    "cancellation": "every coarse checkpoint observes Cx cancellation and returns QuillIndexError::Cancelled with a stable phase",
+    "fuel_exhaustion": "QuillIndexError::QueryFuelExhausted reports the admitted total plus deterministic segment, dictionary-block, posting-block, and position-document counters",
+    "determinism": "queries whose conservative upper bound can exceed the budget execute the metered segment path serially, making the exhaustion point and progress tuple schedule-independent",
+    "ordinary_fast_path": "a conservative preflight upper bound disables atomic fuel accounting when the complete query is provably below budget; cancellation checks remain at coarse boundaries and ordinary sealed fan-out remains enabled",
+    "configuration_identity": "query_fuel_budget participates in the gauntlet Quill configuration hash"
+  },
+  "adversarial_proof": {
+    "glob": {
+      "query": "content:rust*",
+      "budget": 4,
+      "repeated_diagnostics": [
+        4,
+        4,
+        1,
+        3,
+        0,
+        0
+      ],
+      "tuple_fields": [
+        "budget",
+        "consumed",
+        "segments_touched",
+        "dictionary_blocks",
+        "posting_blocks",
+        "position_docs"
+      ]
+    },
+    "phrase": {
+      "query": "\"rust ownership\"",
+      "budget": 7,
+      "repeated_diagnostics": [
+        7,
+        7,
+        1,
+        4,
+        2,
+        0
+      ],
+      "tuple_fields": [
+        "budget",
+        "consumed",
+        "segments_touched",
+        "dictionary_blocks",
+        "posting_blocks",
+        "position_docs"
+      ]
+    },
+    "default_budget": "both ranked and scoreless execution complete for the glob and phrase fixture queries without fuel exhaustion"
+  },
+  "cancellation_proof": {
+    "test": "index::tests::query_fuel_checkpoint_diagnostics_and_cancellation_are_deterministic",
+    "runtime": "LabRuntime",
+    "schedule_seeds": [
+      "0x00000000f0e10000",
+      "0x00000000f0e10001",
+      "0x00000000f0e10002",
+      "0x00000000f0e10003"
+    ],
+    "checkpoint_kinds": [
+      "segment",
+      "dictionary_block",
+      "posting_block",
+      "position_document"
+    ],
+    "result": "all schedules observed typed cancellation, quiesced, passed oracles, and reported no invariant violations"
+  },
+  "qg6_no_regression": {
+    "scope": "normative QG-6 smoke slice query/identifier/k10/100k with the smoke corpus cap of 500 documents",
+    "gate_activation_claimed": false,
+    "reason": "QG-6 remains provisional and the full 20-cell matrix was not run; this same-worker before/after slice is the bead's checkpoint-overhead acceptance evidence",
+    "worker": "ovh-a",
+    "environment": "RCH_WORKER=ovh-a RCH_REQUIRE_REMOTE=1 RUST_LOG=warn QUILL_PERF_SCALE=smoke QUILL_PERF_GATE=QG-6 QUILL_PERF_RUNS=10",
+    "run_window": "fuel-metering-same-worker",
+    "baseline": {
+      "revision": "3c5d9ccdf05f9436bafd39eb54645a045b6e5bbe",
+      "p50_ms": 0.908371,
+      "p95_ms": 1.025841,
+      "p99_ms": 1.025841,
+      "cv_pct": 5.410,
+      "runs": 10
+    },
+    "candidate": {
+      "revision": "ae5baa0dbc433f3a92591f93e8f652e406ecdbeb",
+      "p50_ms": 0.915296,
+      "p95_ms": 0.933389,
+      "p99_ms": 0.933389,
+      "cv_pct": 0.897,
+      "runs": 10
+    },
+    "candidate_over_baseline": 1.007623537,
+    "p50_delta_ms": 0.006925,
+    "p50_delta_pct": 0.762354,
+    "acceptance_band_pct": 10.0,
+    "result": "pass"
+  },
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo test -p frankensearch-quill adversarial_glob_and_phrase_queries_exhaust_fuel_deterministically -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 1,
+      "failed": 0,
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -p frankensearch-quill query_fuel_checkpoint_diagnostics_and_cancellation_are_deterministic -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1149989",
+      "passed": 1,
+      "failed": 0,
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -p frankensearch-quill",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1227854",
+      "passed": 480,
+      "failed": 0,
+      "ignored": 2,
+      "doctests_passed": 2,
+      "result": "pass"
+    },
+    {
+      "command": "cargo check --workspace --all-targets",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1149989",
+      "result": "pass",
+      "remote_command_elapsed": "5m29s"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1227854",
+      "result": "pass",
+      "remote_command_elapsed": "5m49s"
+    },
+    {
+      "command": "cargo clippy -p frankensearch-quill -p frankensearch-quill-gauntlet --all-targets -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1227854",
+      "result": "pass",
+      "remote_command_elapsed": "3m41s"
+    },
+    {
+      "command": "cargo clippy -p frankensearch-quill --tests -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1149989",
+      "result": "pass",
+      "remote_command_elapsed": "3m26s"
+    }
+  ],
+  "invalidated_benchmark": {
+    "command": "QUILL_E49_SCALE=full QUILL_E49_ROUNDS=41 QUILL_E49_LIMIT=10 cargo bench -p frankensearch-quill --features bench-internals --profile release --bench segment_fanout_ab",
+    "environment": "RCH_WORKER=ovh-a RCH_REQUIRE_REMOTE=1",
+    "revision": "3c5d9ccdf05f9436bafd39eb54645a045b6e5bbe",
+    "result": "inadmissible pre-measurement harness failure",
+    "failure": "the untouched baseline fixture expected eight sealed segments, but tier fanout merged them to one before timing",
+    "resolution": "no timing row was used; the normative QG-6 matrix supplied the same-worker before/after evidence"
+  },
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly --edition 2024 --check <all edited Rust files>",
+      "result": "pass"
+    },
+    "git_diff_check": "pass",
+    "ubs": {
+      "result": "excluded",
+      "reason": "UBS Rust scans launch hidden local Cargo subchecks, which are inadmissible under the campaign's strict remote-only Cargo policy."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "agent_mail": {
+      "result": "degraded",
+      "detail": "The Agent Mail corruption circuit breaker remained open. No unauthorized repair was attempted; Git, Beads, and the isolated worktree remained authoritative."
+    },
+    "peer_owned_changes_preserved": true
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "Every authoritative Cargo command ran through RCH with RCH_REQUIRE_REMOTE=1. Strict routing failures were surfaced and never replaced by local Cargo."
+  }
+}

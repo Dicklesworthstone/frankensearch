@@ -293,7 +293,7 @@ Fixture IDs are stable and additive. Editing expected behavior requires a contra
 
 ### 9.3 Freshness surfacing
 
-`segment_stats()` carries `published_generation`, `last_publish_unix` (from the MANIFEST v2 witness; absent for v1-era or in-memory images), and `live_writer` (from the D1 LOCK record plus POSIX `kill(pid, 0)` liveness — never from mtime staleness). Status surfaces (`fsfs status`, `--format json` search responses) carry this `index_freshness` block verbatim once the fsfs port lands (e7.2); they must never report InProcess freshness while serving CrossProcess readers.
+`segment_stats()` carries `published_generation`, `last_publish_unix` (from the MANIFEST v2 witness; absent for v1-era or in-memory images), and `live_writer` (from the D1 LOCK record plus POSIX `kill(pid, 0)` liveness — never from mtime staleness). It also carries the fail-loud quarantine state: `degraded`, `quarantined_segments`, `estimated_missing_docs`, and `unknown_missing_doc_segments`. Status surfaces (`fsfs status`, `--format json` search responses) carry this `index_freshness` block verbatim once the fsfs port lands (e7.2); they must never report InProcess freshness while serving CrossProcess readers or omit a persisted quarantine from degraded output.
 
 ### 9.4 Honest-topology measurement rule
 
@@ -316,6 +316,21 @@ Deltas)`. No cancellation point is allowed between durable MANIFEST authority
 and the local epoch swap. Readers that already pinned the old epoch retain the
 old Delta; later readers see the sealed Keeper. Thus seal publication has no
 visibility gap even though visibility and durability remain distinct states.
+
+### 9.6 Unrepairable-segment quarantine
+
+`QuillConfig::quarantine_on_unrepairable` is false by default. A
+durability-enabled library writer therefore preserves the hard open error and
+does not mutate an unrepairable segment. The fsfs watch topology enables the
+policy because it also owns the mandatory recovery loop: the corrupt FSLX and
+repair sidecar are atomically retained under `.quarantine` names, a durable
+successor MANIFEST omits the segment, and the watcher synchronously runs the
+index-freshness audit before it starts. Every `MissingLexical` finding becomes
+an `EnqueueReindex` action; watcher startup fails closed unless the post-reindex
+audit is clean. Search-only readers never perform this mutation. Once a
+quarantine exists they open the retained healthy generation, log the degraded
+state on every open, and expose it through doctor, status, and JSON search
+freshness metadata.
 
 The public scorer and collectors execute the currently supported query tree
 (`All`, term, exact phrase, Boolean, boost, string and numeric range, string and

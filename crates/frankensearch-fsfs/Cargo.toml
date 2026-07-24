@@ -15,6 +15,8 @@ embedded-models = ["frankensearch-embed/bundled-default-models", "frankensearch-
 vendored-openssl = ["openssl"]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
 bench-internals = ["frankensearch-core/bench-internals"]
+# Transitional G2.5 oracle dependency. Runtime opt-in remains default-off.
+shadow-oracle = ["dep:frankensearch-lexical"]
 
 [lib]
 path = "src/lib.rs"
@@ -27,7 +29,9 @@ path = "src/main.rs"
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
 frankensearch-index = { workspace = true }
-frankensearch-quill = { workspace = true }
+frankensearch-quill = { workspace = true, features = ["durability"] }
+frankensearch-durability = { workspace = true }
+frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-storage = { workspace = true }
 frankensearch-tui = { workspace = true }
 ftui-core = { workspace = true }

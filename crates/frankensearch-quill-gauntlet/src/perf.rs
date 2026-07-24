@@ -619,8 +619,10 @@ pub fn machine_fingerprint() -> String {
 
 /// Linux peak resident set size in bytes from `VmHWM`.
 ///
-/// Other operating systems return `None`; the Apple implementation is owned by
-/// E8.4, while E8.1 records the absence instead of fabricating a value.
+/// Other operating systems return `None`. The isolated macOS benchmark child
+/// is wrapped in `/usr/bin/time -l` and parsed by
+/// [`parse_macos_time_max_rss_bytes`] instead of fabricating an in-process
+/// value.
 #[must_use]
 pub fn peak_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -632,6 +634,24 @@ pub fn peak_rss_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// Parse the byte-valued peak RSS row emitted by macOS `/usr/bin/time -l`.
+///
+/// The parser requires the complete four-word label so unrelated counters such
+/// as `peak memory footprint` cannot be mistaken for resident-set evidence.
+#[must_use]
+pub fn parse_macos_time_max_rss_bytes(report: &str) -> Option<u64> {
+    report.lines().find_map(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        let bytes = fields.next()?.parse::<u64>().ok()?;
+        (fields.next() == Some("maximum")
+            && fields.next() == Some("resident")
+            && fields.next() == Some("set")
+            && fields.next() == Some("size")
+            && fields.next().is_none())
+        .then_some(bytes)
+    })
 }
 
 fn parse_linux_vmhwm_bytes(status: &str) -> Option<u64> {
@@ -765,6 +785,25 @@ mod tests {
         );
         assert_eq!(parse_linux_vmhwm_bytes("VmHWM: 12 MB"), None);
         assert_eq!(parse_linux_vmhwm_bytes("VmRSS: 12 kB"), None);
+    }
+
+    #[test]
+    fn macos_time_parser_requires_the_exact_peak_rss_label() {
+        let report = "\
+        0.12 real 0.10 user 0.02 sys
+        1212416  maximum resident set size
+        9122317  instructions retired
+        917696  peak memory footprint
+";
+        assert_eq!(parse_macos_time_max_rss_bytes(report), Some(1_212_416));
+        assert_eq!(
+            parse_macos_time_max_rss_bytes("917696 peak memory footprint"),
+            None
+        );
+        assert_eq!(
+            parse_macos_time_max_rss_bytes("1212416 maximum resident set size bytes"),
+            None
+        );
     }
 
     #[test]

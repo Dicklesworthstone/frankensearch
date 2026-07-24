@@ -29,6 +29,7 @@ asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 criterion = { workspace = true }
 unicode-normalization = { workspace = true }
+tempfile = "3"
 
 # ASCII fast-path vs full-NFC canonicalization (indexing/query hot path).
 [[bench]]

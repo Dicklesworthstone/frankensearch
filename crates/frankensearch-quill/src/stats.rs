@@ -28,6 +28,15 @@ pub struct SegmentStats {
     pub last_publish_unix: Option<i64>,
     /// Whether this process currently owns a live writer.
     pub live_writer: bool,
+    /// Whether retained quarantined segments require loud degraded surfacing.
+    pub degraded: bool,
+    /// Number of retained FSLX quarantine artifacts.
+    pub quarantined_segments: usize,
+    /// Saturating sum of known at-seal rows from quarantined segments.
+    pub estimated_missing_docs: u64,
+    /// Quarantined segments whose row estimate has aged out of MANIFEST
+    /// history.
+    pub unknown_missing_doc_segments: usize,
 }
 
 impl SegmentStats {

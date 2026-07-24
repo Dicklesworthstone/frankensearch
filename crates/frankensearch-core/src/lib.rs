@@ -32,6 +32,7 @@ pub mod observability_lint;
 pub mod parsed_query;
 pub mod query_class;
 pub mod repair;
+pub mod shadow;
 pub mod simd;
 pub mod time_travel;
 pub mod tracing_config;
@@ -126,6 +127,16 @@ pub use parsed_query::ParsedQuery;
 pub use repair::{
     CorruptionEvent, CorruptionPolicy, DegradedReason, DetectionMethod, RepairAttempt,
     RepairOrchestrator, RepairOutcome, RepairProvider, ServiceState,
+};
+pub use shadow::{
+    AlwaysAdmitShadowLoad, AtomicShadowLoadProbe, SHADOW_ARTIFACT_DIRECTORY,
+    SHADOW_DEGRADATION_SCHEMA_VERSION, SHADOW_DEGRADATIONS_FILE, SHADOW_DIVERGENCE_SCHEMA_VERSION,
+    SHADOW_DIVERGENCES_FILE, SHADOW_OBSERVATION_SCHEMA_VERSION, SHADOW_OBSERVATIONS_FILE,
+    SHADOW_SAMPLE_DENOMINATOR, ShadowArtifactSummary, ShadowDegradationKind,
+    ShadowDegradationRecord, ShadowDivergenceClass, ShadowDivergenceRecord, ShadowDocument,
+    ShadowLexical, ShadowLexicalConfig, ShadowLexicalObserver, ShadowLoadProbe,
+    ShadowObservationRecord, ShadowQuery, ShadowRankedHit, ShadowShedReason, ShadowStatus,
+    append_shadow_degradation, compute_shadow_corpus_hash,
 };
 pub use simd::scale_f32_in_place;
 pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, TimeTravelResult};

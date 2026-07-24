@@ -292,7 +292,7 @@ fn commit<E: LexicalSearch>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
-fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
     let corpus = corpus_for(count);
@@ -307,6 +307,26 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
         }
     };
     count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    if spec.gate != PerfGate::Qg8 || arm != EngineArm::Quill {
+        return bulk_metric_unpooled(context, spec, arm);
+    }
+
+    let threads = spec.threads.expect("QG-8 thread count");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("build QG-8 Quill thread pool")
+        .install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                threads,
+                "QG-8 Quill cell escaped its pinned Rayon pool"
+            );
+            bulk_metric_unpooled(context, spec, arm)
+        })
 }
 
 fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
@@ -684,7 +704,16 @@ fn memory_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) ->
     let count = context
         .scale
         .document_count(spec.document_count.expect("memory corpus count"));
-    let output = Command::new(std::env::current_exe().expect("QG benchmark executable"))
+    let executable = std::env::current_exe().expect("QG benchmark executable");
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("/usr/bin/time");
+        command.arg("-l").arg(&executable);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new(executable);
+    let output = command
         .env("QUILL_PERF_CHILD_MODE", "memory")
         .env("QUILL_PERF_CHILD_ENGINE", arm.label())
         .env("QUILL_PERF_CHILD_COUNT", count.to_string())
@@ -715,13 +744,27 @@ fn memory_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) ->
         .lines()
         .find_map(|line| line.strip_prefix("quill-perf-child\t"))
         .expect("RSS child measurement");
-    let (rss, bytes) = measurement
+    let measurement_columns = measurement
         .split_once('\t')
         .expect("RSS child measurement columns");
     if spec.metric == "peak_rss_bytes" {
-        rss.parse::<u64>().expect("RSS child byte count") as f64
+        #[cfg(target_os = "macos")]
+        let rss_bytes = frankensearch_quill_gauntlet::parse_macos_time_max_rss_bytes(
+            std::str::from_utf8(&output.stderr).expect("macOS time report UTF-8"),
+        )
+        .expect("macOS time report peak RSS row");
+        #[cfg(not(target_os = "macos"))]
+        let rss_bytes = measurement_columns
+            .0
+            .parse::<u64>()
+            .expect("RSS child byte count");
+        rss_bytes as f64
     } else {
-        bytes.parse::<u64>().expect("index child byte count") as f64 / count as f64
+        measurement_columns
+            .1
+            .parse::<u64>()
+            .expect("index child byte count") as f64
+            / count as f64
     }
 }
 

@@ -39,18 +39,21 @@ pub use grimoire::{
     TermScratch, TermSectionLengths,
 };
 pub use index::{
-    QuillHit, QuillIndex, QuillIndexError, QuillSearchIndex, QuillSearchResult,
-    QuillSearchSnapshot, QuillSnippetHit, SnapshotError, SnapshotPublisher,
+    QuillDocumentWitness, QuillHit, QuillIndex, QuillIndexError, QuillSearchIndex,
+    QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit, SnapshotError, SnapshotPublisher,
+    indexable_document_content_hash,
 };
+#[cfg(feature = "durability")]
+pub use keeper::UnrepairableSegmentPolicy;
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
     CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, CurrentPointer,
     CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, GarbageCollectionOptions,
     GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LoadedManifest,
     MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
-    ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment,
-    ResolvedCurrent, ResolvedDocumentId, SegmentSizeTier, TierMergePlan, TierMergePolicy,
-    TierPolicyError, TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC,
+    ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, QuarantinedSegment,
+    RecoveredSegment, ResolvedCurrent, ResolvedDocumentId, SegmentSizeTier, TierMergePlan,
+    TierMergePolicy, TierPolicyError, TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC,
     WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version, plan_tier_merge,
     publish_current, resolve_current, unpack_engine_version,
 };

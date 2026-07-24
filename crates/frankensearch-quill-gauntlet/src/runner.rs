@@ -2960,29 +2960,42 @@ impl ShrinkDriver {
         make_subject: &mut ShrinkEngineFactory,
         make_oracle: &mut ShrinkEngineFactory,
     ) -> Result<ShrunkReproduction, ShrinkError> {
-        let record: ShadowDivergenceRecord =
+        let envelope: serde_json::Value =
             serde_json::from_str(line).map_err(|error| ShrinkError::InvalidShadowRecord {
                 reason: error.to_string(),
             })?;
-        if record.schema_version != 1 {
-            return Err(ShrinkError::InvalidShadowRecord {
-                reason: format!("unsupported shadow record schema {}", record.schema_version),
-            });
-        }
-        if record.documents.is_empty() {
-            return Err(ShrinkError::InvalidShadowRecord {
-                reason: "shadow record carries no documents".to_owned(),
-            });
-        }
-        let request = ShrinkRequest {
-            documents: record.documents,
-            corpus_manifest_hash: format!(
-                "{}#gen-{}",
-                record.corpus_manifest_hash, record.stamped_generation
-            ),
-            query: record.query,
-            evidence_case: record.evidence_case,
-            divergence_class: record.divergence_class,
+        let schema_version = envelope
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| ShrinkError::InvalidShadowRecord {
+                reason: "shadow record has no integer schema_version".to_owned(),
+            })?;
+        let request = match schema_version {
+            1 => {
+                let record: ShadowDivergenceRecord =
+                    serde_json::from_value(envelope).map_err(|error| {
+                        ShrinkError::InvalidShadowRecord {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                legacy_shadow_request(record)?
+            }
+            version
+                if version == u64::from(frankensearch_core::SHADOW_DIVERGENCE_SCHEMA_VERSION) =>
+            {
+                let record: frankensearch_core::ShadowDivergenceRecord =
+                    serde_json::from_value(envelope).map_err(|error| {
+                        ShrinkError::InvalidShadowRecord {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                production_shadow_request(record)?
+            }
+            unsupported => {
+                return Err(ShrinkError::InvalidShadowRecord {
+                    reason: format!("unsupported shadow record schema {unsupported}"),
+                });
+            }
         };
         self.shrink(cx, &request, make_subject, make_oracle).await
     }
@@ -3055,6 +3068,102 @@ impl ShrinkDriver {
             self.comparator_config,
         )?)
     }
+}
+
+fn legacy_shadow_request(record: ShadowDivergenceRecord) -> Result<ShrinkRequest, ShrinkError> {
+    if record.documents.is_empty() {
+        return Err(ShrinkError::InvalidShadowRecord {
+            reason: "shadow record carries no documents".to_owned(),
+        });
+    }
+    Ok(ShrinkRequest {
+        documents: record.documents,
+        corpus_manifest_hash: format!(
+            "{}#gen-{}",
+            record.corpus_manifest_hash, record.stamped_generation
+        ),
+        query: record.query,
+        evidence_case: record.evidence_case,
+        divergence_class: record.divergence_class,
+    })
+}
+
+fn production_shadow_request(
+    record: frankensearch_core::ShadowDivergenceRecord,
+) -> Result<ShrinkRequest, ShrinkError> {
+    record
+        .validate()
+        .map_err(|reason| ShrinkError::InvalidShadowRecord { reason })?;
+    let manifest_generation = record.manifest_generation;
+    let corpus_hash = record.corpus_hash;
+    let query_text = record.query.text;
+    let limit =
+        u64::try_from(record.query.limit).map_err(|_| ShrinkError::InvalidShadowRecord {
+            reason: "shadow query limit does not fit u64".to_owned(),
+        })?;
+    let query_kind = if query_text.split_whitespace().nth(1).is_some() {
+        GeneratedQueryKind::MultiTerm
+    } else {
+        GeneratedQueryKind::Term
+    };
+    let query_id = format!("shadow-generation-{manifest_generation}");
+    let query = GeneratedQueryCase {
+        id: query_id.clone(),
+        syntax: QuerySyntax::Default,
+        query_kind,
+        query: query_text.clone(),
+        limit,
+        offset: 0,
+        count_requested: true,
+        filters: crate::generator::GeneratedQueryFilters::default(),
+        expected_divergence: None,
+        source: "shadow-oracle".to_owned(),
+    };
+    let mut evidence_case = DifferentialCase::new(query_id, query_text, limit);
+    evidence_case.metadata = DifferentialCaseMetadata {
+        generator_id: Some("shadow-oracle-v2".to_owned()),
+        generator_seed: Some(manifest_generation),
+        corpus_hash: Some(corpus_hash.clone()),
+    };
+    let divergence_class = match record.classification {
+        frankensearch_core::ShadowDivergenceClass::ScoreEpsilon => DivergenceClass::ScoreEpsilon,
+        frankensearch_core::ShadowDivergenceClass::TieOrder => DivergenceClass::TieOrder,
+        frankensearch_core::ShadowDivergenceClass::RankMismatch
+        | frankensearch_core::ShadowDivergenceClass::ScoreMismatch => DivergenceClass::RankMismatch,
+        frankensearch_core::ShadowDivergenceClass::Exact => {
+            return Err(ShrinkError::InvalidShadowRecord {
+                reason: "divergence stream cannot contain exact comparisons".to_owned(),
+            });
+        }
+    };
+    let documents = record
+        .documents
+        .into_iter()
+        .map(|document| {
+            let created_at_ms = document
+                .metadata
+                .get("created_at_ms")
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default();
+            GeneratedDocument {
+                id: document.id,
+                title: document.title,
+                content: document.content,
+                created_at_ms,
+                cass: None,
+                metadata: document.metadata,
+                pathology: None,
+                unicode_lane: crate::generator::UnicodeLane::Mixed,
+            }
+        })
+        .collect();
+    Ok(ShrinkRequest {
+        documents,
+        corpus_manifest_hash: format!("{corpus_hash}#gen-{manifest_generation}"),
+        query,
+        evidence_case,
+        divergence_class,
+    })
 }
 
 struct ShrinkBudget {
@@ -6205,6 +6314,71 @@ mod tests {
                 .await
                 .expect_err("unsupported schema fails closed");
             assert!(matches!(error, ShrinkError::InvalidShadowRecord { .. }));
+        });
+    }
+
+    #[test]
+    fn shrink_shadow_line_roundtrips_production_schema() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let documents = shrink_fixture_documents(8)
+                .into_iter()
+                .map(|document| frankensearch_core::ShadowDocument {
+                    id: document.id,
+                    content: document.content,
+                    title: document.title,
+                    metadata: document.metadata,
+                })
+                .collect::<Vec<_>>();
+            let record = frankensearch_core::ShadowDivergenceRecord {
+                schema_version: frankensearch_core::SHADOW_DIVERGENCE_SCHEMA_VERSION,
+                manifest_generation: 73,
+                corpus_hash: frankensearch_core::compute_shadow_corpus_hash(&documents),
+                documents,
+                query: frankensearch_core::ShadowQuery {
+                    text: "zzz alpha beta gamma".to_owned(),
+                    limit: 10,
+                    fusion_candidates: true,
+                },
+                serving_top_k: vec![frankensearch_core::ShadowRankedHit {
+                    rank: 1,
+                    document_id: "doc-004".to_owned(),
+                    score_bits: 1.0_f32.to_bits(),
+                    lexical_score_bits: Some(1.0_f32.to_bits()),
+                }],
+                shadow_top_k: vec![frankensearch_core::ShadowRankedHit {
+                    rank: 1,
+                    document_id: "doc-003".to_owned(),
+                    score_bits: 1.0_f32.to_bits(),
+                    lexical_score_bits: Some(1.0_f32.to_bits()),
+                }],
+                classification: frankensearch_core::ShadowDivergenceClass::RankMismatch,
+                serve_latency_micros: 17,
+                shadow_latency_micros: 31,
+            };
+            record.validate().expect("production schema validates");
+            let line = serde_json::to_string(&record).expect("serialize production record");
+            let driver = ShrinkDriver::new(
+                ComparatorConfig::default(),
+                SemanticContract::scalar_g1a(),
+                DEFAULT_SHRINK_FUEL,
+            );
+            let reproduction = driver
+                .shrink_shadow_line(&cx, &line, &mut make_honest(), &mut make_skewed("doc-004"))
+                .await
+                .expect("production shadow record shrinks");
+            assert_eq!(reproduction.original_document_count, 8);
+            assert_eq!(reproduction.original_query_text, "zzz alpha beta gamma");
+            assert!(
+                reproduction
+                    .original_corpus_manifest_hash
+                    .ends_with("#gen-73")
+            );
+            assert!(
+                reproduction
+                    .minimized_documents
+                    .iter()
+                    .any(|document| document.id == "doc-004")
+            );
         });
     }
 

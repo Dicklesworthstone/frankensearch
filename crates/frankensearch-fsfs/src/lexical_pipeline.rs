@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use asupersync::Cx;
 use compact_str::CompactString;
 use frankensearch_core::{IndexableDocument, LexicalSearch, SearchError, SearchResult};
-use frankensearch_quill::QuillIndex;
+use frankensearch_quill::{QuillIndex, indexable_document_content_hash};
 use tracing::debug;
 
 use crate::config::IngestionClass;
@@ -512,6 +512,19 @@ pub struct QuillLexicalBackend<'a> {
     pending: Vec<LexicalAction>,
 }
 
+/// Classification totals from one crash-resumable Quill flush.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuillResumeStats {
+    /// Durable IDHASH miss; a new row was staged.
+    pub absent: u64,
+    /// Durable IDMAP hash matched; the existing docid was preserved.
+    pub unchanged: u64,
+    /// Durable IDMAP hash differed; an upsert was staged.
+    pub changed: u64,
+    /// A stale durable identifier was tombstoned.
+    pub deleted: u64,
+}
+
 impl<'a> QuillLexicalBackend<'a> {
     #[must_use]
     pub const fn new(index: &'a QuillIndex) -> Self {
@@ -535,8 +548,26 @@ impl<'a> QuillLexicalBackend<'a> {
     ///
     /// Returns the typed Quill failure converted to the workspace search error.
     pub async fn flush(&mut self, cx: &Cx) -> SearchResult<()> {
+        self.flush_inner(cx, false).await.map(|_| ())
+    }
+
+    /// Flush planned actions while preserving exact durable rows on restart.
+    ///
+    /// Each upsert probes Quill's published IDHASH. An equal IDMAP content
+    /// witness is skipped, a mismatch is upserted, and a miss is inserted.
+    /// Unchanged documents therefore retain their original Q1 docids.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed Quill identity, hashing, indexing, or deletion failures.
+    pub async fn flush_resumable(&mut self, cx: &Cx) -> SearchResult<QuillResumeStats> {
+        self.flush_inner(cx, true).await
+    }
+
+    async fn flush_inner(&mut self, cx: &Cx, resumable: bool) -> SearchResult<QuillResumeStats> {
         let actions = std::mem::take(&mut self.pending);
         let mut documents = Vec::new();
+        let mut stats = QuillResumeStats::default();
 
         for action in actions {
             match action {
@@ -551,6 +582,21 @@ impl<'a> QuillLexicalBackend<'a> {
                     let mut document = IndexableDocument::new(doc_id, content);
                     document.title = title;
                     document.metadata = metadata;
+                    if resumable {
+                        let candidate_hash = indexable_document_content_hash(&document)?;
+                        match self.index.document_witness(&document.id)? {
+                            Some(witness) if witness.content_hash == candidate_hash => {
+                                stats.unchanged = stats.unchanged.saturating_add(1);
+                                continue;
+                            }
+                            Some(_) => {
+                                stats.changed = stats.changed.saturating_add(1);
+                            }
+                            None => {
+                                stats.absent = stats.absent.saturating_add(1);
+                            }
+                        }
+                    }
                     documents.push(document);
                 }
                 LexicalAction::Delete { doc_id, .. } => {
@@ -558,7 +604,12 @@ impl<'a> QuillLexicalBackend<'a> {
                         LexicalSearch::index_documents(self.index, cx, &documents).await?;
                         documents.clear();
                     }
-                    let _deleted = self.index.delete_document(cx, &doc_id).await?;
+                    if self.index.has_uncommitted_changes() {
+                        LexicalSearch::commit(self.index, cx).await?;
+                    }
+                    if self.index.delete_document(cx, &doc_id).await? {
+                        stats.deleted = stats.deleted.saturating_add(1);
+                    }
                 }
                 LexicalAction::Skip { .. } => {}
             }
@@ -566,7 +617,7 @@ impl<'a> QuillLexicalBackend<'a> {
         if !documents.is_empty() {
             LexicalSearch::index_documents(self.index, cx, &documents).await?;
         }
-        Ok(())
+        Ok(stats)
     }
 }
 
@@ -1046,6 +1097,324 @@ mod tests {
                     .expect("query deleted Quill document")
                     .is_empty()
             );
+
+            let mixed = [
+                LexicalMutation::upsert(
+                    "doc-c",
+                    4,
+                    IngestionClass::FullSemanticLexical,
+                    "delta replacement body",
+                    "mixed barrier",
+                ),
+                LexicalMutation::delete("doc-b", 4, IngestionClass::LexicalOnly, "mixed barrier"),
+            ];
+            pipeline
+                .apply_incremental(&mixed)
+                .expect("plan mixed Quill barrier");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("flush upsert before delete barrier");
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "delta", 10)
+                    .expect("query mixed upsert")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-c"]
+            );
+            assert!(
+                index
+                    .search_doc_ids(&cx, "beta", 10)
+                    .expect("query mixed delete")
+                    .is_empty()
+            );
+
+            let staged = [LexicalMutation::upsert(
+                "doc-d",
+                5,
+                IngestionClass::FullSemanticLexical,
+                "epsilon pending body",
+                "cross-flush barrier",
+            )];
+            pipeline
+                .apply_incremental(&staged)
+                .expect("plan cross-flush upsert");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("stage cross-flush upsert");
+            assert!(index.has_uncommitted_changes());
+
+            let cross_flush_delete = [LexicalMutation::delete(
+                "doc-c",
+                6,
+                IngestionClass::FullSemanticLexical,
+                "cross-flush barrier",
+            )];
+            pipeline
+                .apply_incremental(&cross_flush_delete)
+                .expect("plan cross-flush delete");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("commit prior upsert before cross-flush delete");
+            assert!(
+                index
+                    .search_doc_ids(&cx, "delta", 10)
+                    .expect("query cross-flush delete")
+                    .is_empty()
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "epsilon", 10)
+                    .expect("query cross-flush upsert")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-d"]
+            );
+        });
+    }
+
+    #[test]
+    fn quill_resumable_flush_preserves_equal_docid_and_replaces_hash_mismatch() {
+        run_test_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("create resumable Quill fixture");
+            let mut pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+            let initial = [
+                LexicalMutation::upsert(
+                    "stable",
+                    1,
+                    IngestionClass::FullSemanticLexical,
+                    "common stable body",
+                    "initial",
+                ),
+                LexicalMutation::upsert(
+                    "changed",
+                    1,
+                    IngestionClass::FullSemanticLexical,
+                    "common old body",
+                    "initial",
+                ),
+            ];
+            pipeline.apply_initial(&initial).expect("plan initial rows");
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("flush initial rows");
+            index.commit(&cx).await.expect("commit initial rows");
+            let stable_before = index
+                .document_witness("stable")
+                .expect("probe stable row")
+                .expect("stable row");
+            let changed_before = index
+                .document_witness("changed")
+                .expect("probe changed row")
+                .expect("changed row");
+
+            let resumed = [
+                initial[0].clone(),
+                LexicalMutation::upsert(
+                    "changed",
+                    2,
+                    IngestionClass::FullSemanticLexical,
+                    "common replacement body",
+                    "resume_changed",
+                ),
+                LexicalMutation::upsert(
+                    "absent",
+                    1,
+                    IngestionClass::FullSemanticLexical,
+                    "common new body",
+                    "resume_absent",
+                ),
+            ];
+            pipeline.apply_initial(&resumed).expect("plan resumed rows");
+            let resume_stats = pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("classify resumed rows");
+            assert_eq!(resume_stats.unchanged, 1);
+            assert_eq!(resume_stats.changed, 1);
+            assert_eq!(resume_stats.absent, 1);
+            assert_eq!(resume_stats.deleted, 0);
+            index.commit(&cx).await.expect("commit resumed rows");
+
+            let stable_after = index
+                .document_witness("stable")
+                .expect("probe stable row after resume")
+                .expect("stable row after resume");
+            let changed_after = index
+                .document_witness("changed")
+                .expect("probe changed row after resume")
+                .expect("changed row after resume");
+            assert_eq!(
+                stable_after, stable_before,
+                "equal content must preserve both docid and IDMAP hash"
+            );
+            assert_ne!(
+                changed_after.global_docid, changed_before.global_docid,
+                "hash mismatch must allocate a fresh Q1 docid"
+            );
+            assert_ne!(changed_after.content_hash, changed_before.content_hash);
+            assert!(
+                index
+                    .search_doc_ids(&cx, "old", 10)
+                    .expect("query tombstoned content")
+                    .is_empty()
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "replacement", 10)
+                    .expect("query replacement content")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["changed"]
+            );
+        });
+    }
+
+    #[test]
+    fn quill_resumable_bulk_reopens_each_cadence_with_result_equivalence() {
+        run_test_with_cx(|cx| async move {
+            let documents = (0..7)
+                .map(|ordinal| {
+                    LexicalMutation::upsert(
+                        format!("doc-{ordinal}"),
+                        1,
+                        IngestionClass::FullSemanticLexical,
+                        format!("common crash resumable document {ordinal}"),
+                        "bulk_fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let config = || QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                scribe_shard_budget_bytes: 1,
+                bulk_load_mode: true,
+                bulk_publish_segment_cadence: 2,
+                tier_fanout: 8,
+                ..QuillConfig::default()
+            };
+
+            for published_prefix in [2_usize, 4, 6] {
+                let root = tempfile::tempdir().expect("bulk cadence root");
+                let resumed_path = root.path().join("resumed");
+                let control_path = root.path().join("control");
+                let partial = QuillIndex::create(&cx, &resumed_path, config())
+                    .await
+                    .expect("create partial bulk index");
+                let mut partial_pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&partial));
+                partial_pipeline
+                    .apply_initial(&documents[..published_prefix])
+                    .expect("plan partial prefix");
+                partial_pipeline
+                    .backend_mut()
+                    .flush(&cx)
+                    .await
+                    .expect("flush partial prefix");
+                assert_eq!(
+                    partial.doc_count(),
+                    u64::try_from(published_prefix).expect("prefix fits u64"),
+                    "prefix={published_prefix}: cadence publication must be durable"
+                );
+                let prefix_witnesses = documents[..published_prefix]
+                    .iter()
+                    .map(|document| {
+                        partial
+                            .document_witness(&document.doc_id)
+                            .expect("probe prefix")
+                            .expect("published prefix row")
+                    })
+                    .collect::<Vec<_>>();
+                drop(partial_pipeline);
+                drop(partial);
+
+                let resumed = QuillIndex::open(&cx, &resumed_path, config())
+                    .await
+                    .expect("reopen partial bulk index");
+                let mut resumed_pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&resumed));
+                resumed_pipeline
+                    .apply_initial(&documents)
+                    .expect("plan resumed corpus");
+                let stats = resumed_pipeline
+                    .backend_mut()
+                    .flush_resumable(&cx)
+                    .await
+                    .expect("resume corpus through IDHASH");
+                assert_eq!(
+                    stats.unchanged,
+                    u64::try_from(published_prefix).expect("prefix fits u64")
+                );
+                assert_eq!(
+                    stats.absent,
+                    u64::try_from(documents.len() - published_prefix).expect("suffix fits u64")
+                );
+                assert_eq!(stats.changed, 0);
+                drop(resumed_pipeline);
+                resumed
+                    .finish_bulk_load(&cx)
+                    .await
+                    .expect("finish resumed bulk index");
+                for (document, expected) in
+                    documents[..published_prefix].iter().zip(prefix_witnesses)
+                {
+                    assert_eq!(
+                        resumed
+                            .document_witness(&document.doc_id)
+                            .expect("probe resumed prefix")
+                            .expect("resumed prefix row"),
+                        expected,
+                        "prefix={published_prefix}: unchanged row must retain its docid"
+                    );
+                }
+
+                let control = QuillIndex::create(&cx, &control_path, config())
+                    .await
+                    .expect("create uninterrupted control");
+                let mut control_pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&control));
+                control_pipeline
+                    .apply_initial(&documents)
+                    .expect("plan control corpus");
+                control_pipeline
+                    .backend_mut()
+                    .flush(&cx)
+                    .await
+                    .expect("flush control corpus");
+                drop(control_pipeline);
+                control
+                    .finish_bulk_load(&cx)
+                    .await
+                    .expect("finish control corpus");
+
+                let result_artifact = |index: &QuillIndex| {
+                    index
+                        .search_doc_ids(&cx, "common", documents.len())
+                        .expect("query result artifact")
+                        .into_iter()
+                        .map(|hit| (hit.document_id, hit.score.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    result_artifact(&resumed),
+                    result_artifact(&control),
+                    "prefix={published_prefix}: resumed and uninterrupted results must match"
+                );
+            }
         });
     }
 

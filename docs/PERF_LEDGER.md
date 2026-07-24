@@ -6992,3 +6992,43 @@ the exact release bench graph, or a fully reserved worker that can link it
 inside ten minutes; retain the 32/32 exact-order and recall@10=1.0000 proof,
 require A/A wholly within 0.97–1.03, and require both Criterion arm CVs below
 5%.
+
+## 2026-07-24 — REJECT: dictionary preflight cannot profitably demand-gate low-cost Quill BLOCKMAX opening (`bd-quill-e8-perf-doctrine-x4e4.5.2`, RoseMaple)
+
+The candidate made sealed direct 9+-term unions validate DOCLEN and POSTINGS,
+look up every root term in TERMDICT, and reproduce Argus's live active-clause
+count plus total posting cost before allowing BLOCKMAX to open. Direct 2–8-term
+MaxScore remained unchanged; exact-count, zero-limit, nested/unsupported,
+absent-term, below-cost, and Delta-only cases stayed exhaustive. Structural
+section-table lengths let dictionary parsing avoid touching BLOCKMAX while the
+preflight ran.
+
+A strict-remote focused test on `hz2` passed the complete opening contract:
+below-threshold, absent, exact-count, zero-limit, and nested queries left the
+BLOCKMAX checksum witness cold and cached zero bounds; one eligible 9-term
+query opened BLOCKMAX and cached exactly nine bounds; selected corrupt BLOCKMAX
+failed closed while the below-cost query ignored it; Delta-only search stayed
+exhaustive. Candidate and exhaustive rows matched exact global doc IDs and
+`f32::to_bits()` scores at `k={1,10,100,1000}`.
+
+The keep decision used one strict-remote release-profile binary on the same
+`hz2` worker. The fixture had 1,024 sealed documents, nine live direct terms,
+and total posting cost 9,216, deliberately below the existing 16,384 BMW gate.
+Twenty-one paired rounds measured setup-inclusive fresh-handle cold queries
+with one inner iteration and resident-handle warm queries with seven inner
+iterations. Ratios are demand-gated/eager, so values above one are slower:
+
+| state | A/A median [p5, p95] | demand-gated/eager median [p5, p95] | decidable |
+|---|---:|---:|---:|
+| cold | 0.998542 [0.963435, 1.006618] | 1.002419 [0.956571, 1.035464] | no |
+| warm | 1.003926 [0.991398, 1.010064] | **1.063222 [1.011056, 1.258719]** | **yes, regression** |
+
+**Decision: REJECT.** Cold is wholly inside the measured null floor, while
+warm demand gating is a clear 6.32% median regression. The extra dictionary
+traversal duplicates work that ordinary lowering must still perform, so the
+avoided low-cost BLOCKMAX validation cannot amortize the preflight. Production,
+test instrumentation, and the temporary profile were manually restored
+byte-for-byte; only this evidence ships. Do not retry a separate dictionary
+preflight. A future attempt must fuse eligibility accounting into the single
+term-lowering traversal while deferring BLOCKMAX validation, then beat both
+this same-binary cold null and warm regression with exact parity intact.

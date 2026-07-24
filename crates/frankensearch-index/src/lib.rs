@@ -523,6 +523,26 @@ impl VectorIndex {
         self.wal_entries.len()
     }
 
+    /// Return the document ids with live membership in either the compacted
+    /// main index or the resident write-ahead log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] if a live main-index document
+    /// id cannot be decoded.
+    pub fn live_doc_ids(&self) -> SearchResult<std::collections::HashSet<String>> {
+        let mut ids = std::collections::HashSet::with_capacity(
+            self.record_count().saturating_add(self.wal_record_count()),
+        );
+        for record_index in 0..self.record_count() {
+            if !self.is_deleted(record_index) {
+                ids.insert(self.doc_id_at(record_index)?.to_owned());
+            }
+        }
+        ids.extend(self.wal_entries.iter().map(|entry| entry.doc_id.clone()));
+        Ok(ids)
+    }
+
     /// Whether the WAL is large enough that compaction is recommended.
     ///
     /// Returns `true` when the WAL exceeds either the absolute threshold
@@ -2951,6 +2971,10 @@ mod tests {
             .append("wal-0", &[0.0, 1.0, 0.0, 0.0])
             .expect("append");
         assert_eq!(index.wal_record_count(), 1);
+        assert_eq!(
+            index.live_doc_ids().expect("live document ids"),
+            std::collections::HashSet::from(["main-0".to_owned(), "wal-0".to_owned()])
+        );
 
         // Search should find both main and WAL entries.
         let hits = index

@@ -77,6 +77,14 @@ impl FieldKind {
             Self::U64 { .. } => 4,
         }
     }
+
+    /// Whether this numeric field owns a persisted NUMERIC column.
+    pub(crate) const fn has_numeric_column(self) -> bool {
+        match self {
+            Self::I64 { indexed, fast } | Self::U64 { indexed, fast } => indexed || fast,
+            Self::Keyword | Self::Text { .. } | Self::StoredOnly => false,
+        }
+    }
 }
 
 /// One field in a compile-time schema table.

@@ -1,0 +1,200 @@
+{
+  "schema": "quill-e6-5-labruntime-v1",
+  "generated_at_utc": "2026-07-24T07:05:51Z",
+  "bead": {
+    "id": "bd-quill-e6-gauntlet-scale-rm3q.5",
+    "status": "pass",
+    "title": "LabRuntime determinism + concurrency suites (engine-wide)"
+  },
+  "revisions": {
+    "implementation_revision": "94b5a5e265543bc91289cc72b18d6fa9143de203",
+    "implementation_base_revision": "bddbdcf529e0dc419fa2f5c6137c1f189494e783",
+    "proof_revision": "4dc5b500a23b82bfb365b1732b583345253114a5",
+    "rebased_onto": "bddbdcf529e0dc419fa2f5c6137c1f189494e783"
+  },
+  "campaign": {
+    "runtime": "asupersync::lab::LabRuntime",
+    "pinned_seeds": [
+      "0xe650000000000001",
+      "0xe65000000000001d",
+      "0xe650000000000101",
+      "0xe650000000001009"
+    ],
+    "random_seed_environment": "QUILL_E6_5_RANDOM_SEEDS",
+    "nightly_random_seed_count": 16,
+    "failure_replay_contract": {
+      "seed": true,
+      "trace_fingerprint": true,
+      "assertion_context": true
+    },
+    "direct_suites": [
+      {
+        "test": "e6_5_labruntime_concurrent_ingest_and_search_are_snapshot_atomic",
+        "proves": [
+          "uncommitted ingest is invisible",
+          "readers observe only the complete predecessor or successor artifact",
+          "held predecessor snapshots remain unchanged",
+          "the final visible snapshot is the committed successor"
+        ]
+      },
+      {
+        "test": "e6_5_labruntime_cancelled_commit_and_seal_waiters_publish_nothing",
+        "proves": [
+          "cancelled commit lock waiters publish no generation",
+          "cancelled delta-seal lock waiters publish no generation",
+          "cancellation creates no visibility gap",
+          "retry state is preserved and an exact retry succeeds"
+        ]
+      },
+      {
+        "test": "e6_5_labruntime_watch_stream_is_continuous_and_reopens_exactly",
+        "proves": [
+          "seed, batch replacement, delete, and staged newcomer generations are each atomic",
+          "interleaved readers observe every complete generation without a torn artifact",
+          "two durable reopen cycles reproduce the final query artifact exactly"
+        ]
+      },
+      {
+        "test": "e6_5_labruntime_same_seed_replays_identical_segments_and_queries",
+        "proves": [
+          "the same scheduled seed produces identical manifests",
+          "the same scheduled seed produces byte-identical segments",
+          "the same scheduled seed produces identical ranked and scoreless query artifacts"
+        ]
+      }
+    ]
+  },
+  "composed_engine_wide_coverage": {
+    "cancel_at_await": {
+      "ingest_session": "E3.9 cancelled-ingest waiter schedule",
+      "seal": "E6.5 cancelled delta-seal waiter schedule",
+      "merge": "E3.9 cancelled-merge waiter schedule",
+      "commit": "E6.5 cancelled commit waiter schedule"
+    },
+    "crash_and_recover": {
+      "direct_e6_5": "The watch suite performs two durable close-and-reopen loops after scheduled atomic generations.",
+      "inherited_e3_9": "The E3.9 schedule matrix remains green and covers concurrent publication/cancellation composition.",
+      "inherited_keeper": "The full Quill suite includes the existing deterministic Keeper publish, crash-window, checkpoint-order, interrupted-install, and recovery matrices.",
+      "scope_note": "Mid-publication checkpoint injection is inherited from the Keeper suites; the new E6.5 watch test does not claim to inject a process crash inside an individual filesystem operation."
+    },
+    "resource_oracles": "Every LabRuntime schedule is required to quiesce under the existing report oracle; failed schedules report the replay seed and trace fingerprint."
+  },
+  "tantivy_contrast": {
+    "finding": "The incumbent Tantivy engine does not expose its internal indexing and merge task graph to asupersync LabRuntime.",
+    "consequence": "It cannot provide this campaign's exact seeded task schedule, LabRuntime quiescence oracle, or trace-fingerprint replay contract. This is a structural Quill capability rather than a Tantivy differential claim."
+  },
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo test --locked -p frankensearch-quill e6_5_ -- --nocapture",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 4,
+      "failed": 0,
+      "random_seeds_per_suite": 0,
+      "scheduled_suite_seeds": 16,
+      "elapsed": "306.1s"
+    },
+    {
+      "command": "cargo test --locked -p frankensearch-quill e6_5_",
+      "environment": "QUILL_E6_5_RANDOM_SEEDS=2 RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "passed": 4,
+      "failed": 0,
+      "random_seeds_per_suite": 2,
+      "pinned_seeds_per_suite": 4,
+      "scheduled_suite_seeds": 24,
+      "elapsed": "191.8s"
+    },
+    {
+      "command": "cargo test --locked -p frankensearch-quill e3_9_",
+      "environment": "QUILL_E3_9_RANDOM_SEEDS=2 RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "passed": 3,
+      "failed": 0,
+      "random_seeds_per_suite": 2,
+      "pinned_seeds_per_suite": 4,
+      "scheduled_suite_seeds": 18,
+      "elapsed": "200.9s"
+    },
+    {
+      "command": "cargo test --locked -p frankensearch-quill --all-features",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "vmi1227854",
+      "unit_passed": 507,
+      "unit_ignored": 2,
+      "doctest_passed": 2,
+      "failed": 0,
+      "elapsed": "417.8s"
+    },
+    {
+      "command": "cargo clippy --locked -p frankensearch-quill --all-targets --all-features --message-format short -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "318.7s"
+    },
+    {
+      "command": "cargo check --locked --workspace --all-targets",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "367.9s"
+    }
+  ],
+  "post_rebase_validation": {
+    "upstream_revision": "bddbdcf529e0dc419fa2f5c6137c1f189494e783",
+    "upstream_change": "Dormant grouped-MaxScore candidate machinery for nested unions changed another section of the same Quill source file.",
+    "randomized_all_feature_suite": {
+      "command": "cargo test --locked -p frankensearch-quill --all-features",
+      "environment": "QUILL_E6_5_RANDOM_SEEDS=2 QUILL_E3_9_RANDOM_SEEDS=2 RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "unit_passed": 507,
+      "unit_ignored": 2,
+      "doctest_passed": 2,
+      "failed": 0,
+      "expanded_schedule_seeds": 42,
+      "elapsed": "200.8s"
+    },
+    "quill_clippy": {
+      "command": "cargo clippy --locked -p frankensearch-quill --all-targets --all-features --message-format short -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "260.2s"
+    }
+  },
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly crates/frankensearch-quill/src/index.rs",
+      "result": "pass"
+    },
+    "git_diff_check": "pass",
+    "ubs": {
+      "result": "reviewed-not-pass",
+      "scope": [
+        "crates/frankensearch-quill/src/index.rs",
+        ".github/workflows/ci.yml"
+      ],
+      "reported": {
+        "critical": 96,
+        "warnings": 2808,
+        "info": 258
+      },
+      "interpretation": "The file-wide Rust findings are the existing test panic/assertion and false secret-comparison heuristic inventory; no unsafe-code finding or new production defect was identified. UBS-internal local Cargo subchecks are inadmissible under this campaign's remote-only policy and are excluded from authoritative evidence."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "file_reservations": [
+      12246,
+      12247,
+      12248
+    ],
+    "agent_mail": "Reservations were granted conflict-free. Completion messaging remains subject to the known Agent Mail database-integrity failure, so Git, worktree state, and Beads are coordination truth."
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "All authoritative Cargo gates above ran through RCH with RCH_REQUIRE_REMOTE=1. No local Cargo result is included."
+  }
+}

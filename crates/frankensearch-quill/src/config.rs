@@ -24,6 +24,13 @@ pub const DEFAULT_COMPACTION_TOMBSTONE_DENSITY: f64 = 0.20;
 pub const DEFAULT_MERGE_MAX_HOLE_RATIO: f64 = 0.50;
 /// Default maximum number of terms produced by one glob expansion.
 pub const DEFAULT_GLOB_EXPANSION_LIMIT: usize = 16_384;
+/// Default deterministic query-work budget.
+///
+/// One unit is charged per segment transition, dictionary block, posting
+/// block, or phrase candidate whose positions are verified. Ten million keeps
+/// ordinary and fixture-corpus queries on the zero-contention fast path while
+/// bounding adversarial glob and phrase tails.
+pub const DEFAULT_QUERY_FUEL_BUDGET: u64 = 10_000_000;
 /// Default cap on independent ingest shards.
 pub const DEFAULT_MAX_INGEST_SHARDS: usize = 32;
 /// Default cross-process visibility bound: one second between the first
@@ -56,6 +63,8 @@ pub struct QuillConfig {
     pub merge_max_hole_ratio: f64,
     /// Maximum terms a glob may expand into before returning a typed error.
     pub glob_expansion_limit: usize,
+    /// Deterministic coarse work-unit ceiling for one query.
+    pub query_fuel_budget: u64,
     /// Upper bound on independent ingest shards.
     pub max_ingest_shards: usize,
     /// Force one deterministic shard for replay and conformance runs.
@@ -64,6 +73,13 @@ pub struct QuillConfig {
     /// the writer must run a seal-and-publish barrier instead of waiting for
     /// the ordinary cadence (visibility contract, `max_visibility_lag_ms`).
     pub max_visibility_lag_ms: u64,
+    /// Permit a durability-enabled writer to quarantine an unrepairable
+    /// segment and publish a degraded successor that omits it.
+    ///
+    /// This is deliberately off for library embedders. Applications that turn
+    /// it on must couple the resulting degraded snapshot to a freshness audit
+    /// and backfill path.
+    pub quarantine_on_unrepairable: bool,
 }
 
 impl Default for QuillConfig {
@@ -79,9 +95,11 @@ impl Default for QuillConfig {
             compaction_tombstone_density: DEFAULT_COMPACTION_TOMBSTONE_DENSITY,
             merge_max_hole_ratio: DEFAULT_MERGE_MAX_HOLE_RATIO,
             glob_expansion_limit: DEFAULT_GLOB_EXPANSION_LIMIT,
+            query_fuel_budget: DEFAULT_QUERY_FUEL_BUDGET,
             max_ingest_shards: DEFAULT_MAX_INGEST_SHARDS,
             deterministic_ingest: false,
             max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
+            quarantine_on_unrepairable: false,
         }
     }
 }
@@ -127,6 +145,13 @@ impl QuillConfig {
         )?;
         require_fraction_closed("merge_max_hole_ratio", self.merge_max_hole_ratio)?;
         require_positive("glob_expansion_limit", self.glob_expansion_limit)?;
+        if self.query_fuel_budget == 0 {
+            return Err(invalid_config(
+                "query_fuel_budget",
+                &self.query_fuel_budget,
+                "must be greater than zero",
+            ));
+        }
         require_positive("max_ingest_shards", self.max_ingest_shards)?;
         if self.max_visibility_lag_ms == 0 {
             return Err(invalid_config(
@@ -213,9 +238,11 @@ mod tests {
                 compaction_tombstone_density: 0.20,
                 merge_max_hole_ratio: 0.50,
                 glob_expansion_limit: 16_384,
+                query_fuel_budget: 10_000_000,
                 max_ingest_shards: 32,
                 deterministic_ingest: false,
                 max_visibility_lag_ms: 1_000,
+                quarantine_on_unrepairable: false,
             }
         );
         assert!(QuillConfig::default().validate().is_ok());
@@ -254,6 +281,13 @@ mod tests {
         assert!(config.validate().is_ok());
         config.merge_max_hole_ratio = 1.01;
         assert!(config.validate().is_err());
+
+        config = QuillConfig::default();
+        config.query_fuel_budget = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "query_fuel_budget"
+        ));
 
         config = QuillConfig::default();
         config.max_visibility_lag_ms = 0;

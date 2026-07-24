@@ -169,6 +169,32 @@ pub enum ArgusError {
         /// Global Quill document id whose phrase positions were required.
         global_docid: u32,
     },
+    /// A coarse query-execution checkpoint observed structured cancellation.
+    #[error("query execution cancelled during {phase}")]
+    QueryCancelled {
+        /// Stable query phase.
+        phase: &'static str,
+    },
+    /// Deterministic coarse work exceeded the configured query fuel budget.
+    #[error(
+        "query fuel exhausted after {consumed}/{budget} units \
+         (segments={segments_touched}, dictionary_blocks={dictionary_blocks}, \
+         posting_blocks={posting_blocks}, position_docs={position_docs})"
+    )]
+    QueryFuelExhausted {
+        /// Configured work-unit ceiling.
+        budget: u64,
+        /// Successfully admitted work units before exhaustion.
+        consumed: u64,
+        /// Segment transitions admitted before exhaustion.
+        segments_touched: u64,
+        /// Prefix-compressed dictionary blocks admitted before exhaustion.
+        dictionary_blocks: u64,
+        /// Posting blocks admitted before exhaustion.
+        posting_blocks: u64,
+        /// Candidate documents admitted for position verification.
+        position_docs: u64,
+    },
     /// A phrase plan cannot describe an exact positional query.
     #[error("invalid exact phrase: {reason}")]
     InvalidPhrase {
@@ -255,6 +281,35 @@ pub enum ArgusError {
     },
 }
 
+/// One coarse, deterministic query-work boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryWorkKind {
+    /// Entering one sealed or Delta segment.
+    Segment,
+    /// Entering one prefix-compressed term-dictionary block.
+    DictionaryBlock,
+    /// Decoding or entering one posting block.
+    PostingBlock,
+    /// Verifying positions for one phrase candidate document.
+    PositionDocument,
+}
+
+/// Cancel-aware deterministic query-work admission.
+///
+/// Implementations must be thread-safe because ordinary, comfortably
+/// under-budget queries may still fan sealed segments across Rayon. Fuel
+/// exhaustion itself is executed serially by the shipping facade so its
+/// progress diagnostics are schedule-independent.
+pub trait QueryWorkCheckpoint: Send + Sync {
+    /// Admit `units` of one coarse work kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArgusError::QueryCancelled`] or
+    /// [`ArgusError::QueryFuelExhausted`] before the guarded work begins.
+    fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError>;
+}
+
 /// Forward-only posting access shared by sealed and future delta segments.
 ///
 /// A cursor starts on its first posting. `advance` is an inclusive lower-bound
@@ -330,6 +385,28 @@ pub trait PostingCursor {
     fn current_block_last_doc(&self) -> Option<u32> {
         None
     }
+
+    /// Stable zero-based work-block ordinal for coarse query checkpoints.
+    ///
+    /// Sealed cursors report their validated POSTINGS block. Delta cursors
+    /// report their logical 128-posting block. Cursors whose postings were
+    /// already charged while materializing may retain the default `None`.
+    fn current_work_block(&self) -> Option<u64> {
+        None
+    }
+
+    /// Number of block entries performed since `previous`.
+    ///
+    /// Sealed skip seeks decode only their destination block, so the default
+    /// charges one when the ordinal changes. Sequential Delta cursors override
+    /// this to charge every traversed logical block.
+    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+        match (previous, self.current_work_block()) {
+            (_, None) => 0,
+            (Some(previous), Some(current)) if previous == current => 0,
+            _ => 1,
+        }
+    }
 }
 
 impl<T> PostingCursor for Box<T>
@@ -386,6 +463,144 @@ where
 
     fn current_block_last_doc(&self) -> Option<u32> {
         (**self).current_block_last_doc()
+    }
+
+    fn current_work_block(&self) -> Option<u64> {
+        (**self).current_work_block()
+    }
+
+    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+        (**self).work_blocks_since(previous)
+    }
+}
+
+enum PostingCheckpoint<'a> {
+    Shared(Arc<dyn QueryWorkCheckpoint + 'a>),
+    Borrowed(&'a dyn QueryWorkCheckpoint),
+}
+
+impl PostingCheckpoint<'_> {
+    fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+        match self {
+            Self::Shared(checkpoint) => checkpoint.admit(kind, units),
+            Self::Borrowed(checkpoint) => checkpoint.admit(kind, units),
+        }
+    }
+
+    fn as_borrowed(&self) -> &dyn QueryWorkCheckpoint {
+        match self {
+            Self::Shared(checkpoint) => checkpoint.as_ref(),
+            Self::Borrowed(checkpoint) => *checkpoint,
+        }
+    }
+}
+
+/// Posting cursor wrapper that checks cancellation and fuel only when a coarse
+/// posting block is entered.
+pub struct CheckpointPostingCursor<'a> {
+    inner: Box<dyn PostingCursor + 'a>,
+    checkpoint: PostingCheckpoint<'a>,
+}
+
+impl<'a> CheckpointPostingCursor<'a> {
+    /// Wrap a freshly opened cursor and admit its already-decoded first block.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed checkpoint error before scorer construction continues.
+    pub fn new<C>(
+        inner: C,
+        checkpoint: Arc<dyn QueryWorkCheckpoint + 'a>,
+    ) -> Result<Self, ArgusError>
+    where
+        C: PostingCursor + 'a,
+    {
+        let cursor = Self {
+            inner: Box::new(inner),
+            checkpoint: PostingCheckpoint::Shared(checkpoint),
+        };
+        if cursor.inner.current_work_block().is_some() {
+            cursor.checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+        }
+        Ok(cursor)
+    }
+
+    fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
+        let units = self.inner.work_blocks_since(previous);
+        self.checkpoint.admit(QueryWorkKind::PostingBlock, units)
+    }
+}
+
+impl PostingCursor for CheckpointPostingCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.inner.doc()
+    }
+
+    fn freq(&self) -> Option<u32> {
+        self.inner.freq()
+    }
+
+    fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+        self.inner.positions_handle()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.inner.size_hint()
+    }
+
+    fn cost(&self) -> u64 {
+        self.inner.cost()
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        self.inner.segment_num_docs()
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        let previous = self.inner.current_work_block();
+        let moved = self.inner.next()?;
+        self.checkpoint_move(previous)?;
+        Ok(moved)
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        let previous = self.inner.current_work_block();
+        let moved = self.inner.advance(target)?;
+        self.checkpoint_move(previous)?;
+        Ok(moved)
+    }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        let inner = self.inner.fork_for_pruning()?;
+        Some(Box::new(CheckpointPostingCursor {
+            inner,
+            checkpoint: PostingCheckpoint::Borrowed(self.checkpoint.as_borrowed()),
+        }))
+    }
+
+    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        self.inner.term_score_upper_bound(live_avgdl, weight)
+    }
+
+    fn supports_block_max(&self) -> bool {
+        self.inner.supports_block_max()
+    }
+
+    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        self.inner
+            .current_block_score_upper_bound(live_avgdl, weight)
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        self.inner.current_block_last_doc()
+    }
+
+    fn current_work_block(&self) -> Option<u64> {
+        self.inner.current_work_block()
+    }
+
+    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+        self.inner.work_blocks_since(previous)
     }
 }
 
@@ -623,6 +838,15 @@ impl PostingCursor for SealedPostingCursor<'_> {
         };
         cursor.block_last_doc()
     }
+
+    fn current_work_block(&self) -> Option<u64> {
+        match &self.inner {
+            SealedCursorInner::Docs(cursor) => cursor.block_index().map(|block| block as u64),
+            SealedCursorInner::Positions(cursor) => {
+                cursor.posting_block_index().map(|block| block as u64)
+            }
+        }
+    }
 }
 
 impl PositionsReader for SealedPostingCursor<'_> {
@@ -819,6 +1043,18 @@ impl PostingCursor for DeltaPostingCursor<'_> {
 
     fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
         self.block_max?.score_upper_bound(live_avgdl, weight)
+    }
+
+    fn current_work_block(&self) -> Option<u64> {
+        self.current_ordinal.map(|ordinal| u64::from(ordinal) / 128)
+    }
+
+    fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+        match (previous, self.current_work_block()) {
+            (_, None) => 0,
+            (Some(previous), Some(current)) if current >= previous => current - previous,
+            _ => 1,
+        }
     }
 }
 
@@ -1390,6 +1626,7 @@ pub struct PhraseScorer<'a> {
     current_frequency: u32,
     decode_scratch: Vec<u32>,
     position_indices: Vec<usize>,
+    checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
 }
 
 impl<'a> PhraseScorer<'a> {
@@ -1410,6 +1647,30 @@ impl<'a> PhraseScorer<'a> {
         fieldnorms: F,
         snapshot: Bm25FieldSnapshot,
         field_boost: f32,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        Self::new_with_checkpoint(terms, fieldnorms, snapshot, field_boost, None)
+    }
+
+    /// Build one exact phrase scorer with a coarse position-verification
+    /// checkpoint.
+    ///
+    /// The checkpoint runs once per candidate document before position rows
+    /// are inspected by the matcher. It is never called inside the tight
+    /// position-merge loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new`], plus typed
+    /// cancellation or fuel exhaustion from the initial alignment.
+    pub fn new_with_checkpoint<F>(
+        terms: Vec<PhraseTerm<'a>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+        checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
     ) -> Result<Self, ArgusError>
     where
         F: FieldNormReader + 'a,
@@ -1587,6 +1848,7 @@ impl<'a> PhraseScorer<'a> {
             current_frequency: 0,
             decode_scratch: Vec::new(),
             position_indices,
+            checkpoint,
         };
         scorer.align()?;
         Ok(scorer)
@@ -1649,6 +1911,9 @@ impl<'a> PhraseScorer<'a> {
     }
 
     fn phrase_frequency(&mut self, doc: u32) -> Result<u32, ArgusError> {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.admit(QueryWorkKind::PositionDocument, 1)?;
+        }
         for slot_index in 0..self.slots.len() {
             self.decode_slot_positions(slot_index, doc)?;
         }
@@ -2072,10 +2337,10 @@ impl<'a> ReferenceScorer<'a> {
 
     /// Build one numeric-range scorer from an already materialized sorted doc set.
     ///
-    /// Fast-only numeric columns are retained outside NUMERIC, so the index layer
-    /// scans their leaf-local column and supplies the exact matches here. Planning
-    /// metadata and constant-score behavior remain identical to NUMERIC-backed
-    /// ranges.
+    /// The index layer binary-searches the persisted NUMERIC pair run, filters
+    /// snapshot-visible documents with cancellation checks, and supplies the
+    /// exact matches here. Planning metadata and constant-score behavior remain
+    /// identical to the direct NUMERIC range constructor.
     pub(crate) fn materialized_numeric_range(
         field_ord: u16,
         docids: Vec<u32>,

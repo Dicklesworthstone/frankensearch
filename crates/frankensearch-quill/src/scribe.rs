@@ -1202,7 +1202,7 @@ impl<'a> StoredFieldValue<'a> {
     }
 }
 
-/// One schema-typed indexed numeric value supplied for a document.
+/// One schema-typed indexed-or-fast numeric value supplied for a document.
 ///
 /// Numeric values are retained in a dedicated typed column for NUMERIC. When
 /// the descriptor also sets `stored=true`, Scribe writes the same canonical
@@ -1287,8 +1287,8 @@ pub enum AccumulatorError {
         /// Stable schema field name.
         field_name: &'static str,
     },
-    /// A typed numeric value named a non-indexed numeric field.
-    #[error("numeric field {field_ord} ({field_name}) is not indexed")]
+    /// A typed numeric value named a field with no NUMERIC column.
+    #[error("numeric field {field_ord} ({field_name}) is neither indexed nor fast")]
     NonIndexedNumericField {
         /// Rejected field ordinal.
         field_ord: u16,
@@ -1645,7 +1645,7 @@ impl StoredFieldColumns {
     }
 }
 
-/// One schema-ordered indexed numeric column.
+/// One schema-ordered indexed-or-fast numeric column.
 ///
 /// Values align with completed documents, not sparse lease ordinals. `None`
 /// represents an absent optional value or a segment-range hole introduced when
@@ -1777,9 +1777,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .fields
             .iter()
             .filter_map(|field| match field.kind {
-                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
-                    Some(NumericFieldColumns::new(field.id))
-                }
+                kind if kind.has_numeric_column() => Some(NumericFieldColumns::new(field.id)),
                 _ => None,
             })
             .collect();
@@ -1844,7 +1842,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         self.add_document_with_values(doc_ord, values, &[], stored_values)
     }
 
-    /// Add one complete document with typed indexed numeric values.
+    /// Add one complete document with typed indexed-or-fast numeric values.
     ///
     /// Numeric fields marked `stored` automatically retain the exact canonical
     /// little-endian scalar bytes. Missing numeric fields remain absent.
@@ -1865,10 +1863,11 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
 
     /// Add one complete document with typed numeric and opaque stored values.
     ///
-    /// A field may appear in only one input slice. For a stored indexed numeric
-    /// field, prefer `numeric_values`: Scribe derives its canonical stored
-    /// bytes automatically. `stored_values` remains accepted for such a field
-    /// when the bytes are exactly one schema-typed little-endian scalar.
+    /// A field may appear in only one input slice. For a stored
+    /// indexed-or-fast numeric field, prefer `numeric_values`: Scribe derives
+    /// its canonical stored bytes automatically. `stored_values` remains
+    /// accepted for such a field when the bytes are exactly one schema-typed
+    /// little-endian scalar.
     ///
     /// # Errors
     ///
@@ -1976,10 +1975,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                 });
             }
             match (field.kind, value.value) {
-                (FieldKind::I64 { indexed: true, .. }, NumericValue::I64(_))
-                | (FieldKind::U64 { indexed: true, .. }, NumericValue::U64(_)) => {}
+                (FieldKind::I64 { indexed, fast }, NumericValue::I64(_)) if indexed || fast => {}
+                (FieldKind::U64 { indexed, fast }, NumericValue::U64(_)) if indexed || fast => {}
                 (
-                    FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. },
+                    FieldKind::I64 {
+                        indexed: false,
+                        fast: false,
+                    }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: false,
+                    },
                     _,
                 ) => {
                     return Err(AccumulatorError::NonIndexedNumericField {
@@ -2289,7 +2295,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         &self.numeric_fields
     }
 
-    /// Look up one indexed numeric field's typed column.
+    /// Look up one indexed-or-fast numeric field's typed column.
     #[must_use]
     pub fn numeric_field(&self, field_ord: u16) -> Option<&NumericFieldColumns> {
         self.numeric_fields
@@ -3126,12 +3132,7 @@ fn encode_delta_numeric(
         .schema()
         .fields
         .iter()
-        .filter(|field| {
-            matches!(
-                field.kind,
-                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
-            )
-        })
+        .filter(|field| field.kind.has_numeric_column())
         .collect::<Vec<_>>();
     if numeric_fields.is_empty() {
         return Ok(None);
@@ -4724,6 +4725,20 @@ mod tests {
     const INDEXED_NUMERIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
         name: "scribe-indexed-numeric-v1",
         fields: &INDEXED_NUMERIC_FIELDS,
+    };
+
+    const FAST_ONLY_NUMERIC_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        id: 0,
+        name: "fast_sequence",
+        kind: FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        },
+        stored: false,
+    }];
+    const FAST_ONLY_NUMERIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "scribe-fast-only-numeric-v1",
+        fields: &FAST_ONLY_NUMERIC_FIELDS,
     };
 
     const SIGNED_UNSIGNED_NUMERIC_FIELDS: [FieldDescriptor; 2] = [
@@ -6792,6 +6807,11 @@ mod tests {
             .capacity()
             .saturating_mul(std::mem::size_of::<StoredFieldColumns>());
         assert!(outer_stored_fields > 0);
+        let outer_numeric_fields = accumulator
+            .numeric_fields
+            .capacity()
+            .saturating_mul(std::mem::size_of::<NumericFieldColumns>());
+        assert!(outer_numeric_fields > 0);
         let exact_components = accumulator
             .terms
             .bytes_reserved()
@@ -6809,6 +6829,14 @@ mod tests {
                     .stored_fields
                     .iter()
                     .map(StoredFieldColumns::bytes_reserved)
+                    .sum::<usize>(),
+            )
+            .saturating_add(outer_numeric_fields)
+            .saturating_add(
+                accumulator
+                    .numeric_fields
+                    .iter()
+                    .map(NumericFieldColumns::bytes_reserved)
                     .sum::<usize>(),
             )
             .saturating_add(
@@ -7870,6 +7898,58 @@ mod tests {
                 .entries()
                 .collect::<Vec<_>>(),
             vec![crate::quiver::NumericEntry::u64(42, 0)]
+        );
+    }
+
+    #[test]
+    fn fast_only_unstored_numeric_seals_sparse_column() {
+        let mut accumulator = ColumnarAccumulator::new(FAST_ONLY_NUMERIC_SCHEMA)
+            .expect("valid fast-only numeric schema");
+        accumulator
+            .add_document_with_numeric(0, &[], &[IndexedNumericValue::u64(0, u64::MAX)])
+            .expect("fast-only value accumulates");
+        accumulator
+            .add_document_with_numeric(17, &[], &[])
+            .expect("missing fast-only value accumulates");
+        assert!(accumulator.stored_fields().is_empty());
+
+        let documents = [
+            FlushDocumentInput::new(0, "present", 1),
+            FlushDocumentInput::new(17, "missing", 2),
+        ];
+        let encoded = flush_accumulator(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id: 9,
+                lease_docid_base: 0,
+                created_unix_s: 0,
+                engine_version: 0,
+                documents: &documents,
+            },
+        )
+        .expect("fast-only unstored field seals");
+        let reader = SegmentReader::from_owned(encoded.into_bytes(), FAST_ONLY_NUMERIC_SCHEMA)
+            .expect("fast-only segment reopens");
+        assert!(
+            reader
+                .section(SectionKind::STOREDMETA)
+                .expect("section lookup")
+                .is_none()
+        );
+        let numeric = reader
+            .section(SectionKind::NUMERIC)
+            .expect("NUMERIC checksum")
+            .expect("fast-only schema requires NUMERIC");
+        let section =
+            crate::quiver::NumericSection::parse(numeric, FAST_ONLY_NUMERIC_SCHEMA, 0, 18)
+                .expect("fast-only NUMERIC validates");
+        assert_eq!(
+            section
+                .field(0)
+                .expect("fast-only column")
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![crate::quiver::NumericEntry::u64(u64::MAX, 0)]
         );
     }
 

@@ -58,7 +58,7 @@ impl SectionKind {
     pub const IDMAP: Self = Self(6);
     /// External identifier to global docid hash table.
     pub const IDHASH: Self = Self(7);
-    /// Optional indexed numeric columns.
+    /// Optional indexed or fast numeric columns.
     pub const NUMERIC: Self = Self(8);
     /// Optional stored-field bytes.
     pub const STOREDMETA: Self = Self(9);
@@ -1400,7 +1400,7 @@ where
         expected[usize::from(kind.raw())] = true;
     }
     expected[usize::from(SectionKind::POSITIONS.raw())] = schema_has_positions(schema);
-    expected[usize::from(SectionKind::NUMERIC.raw())] = schema_has_indexed_numeric(schema);
+    expected[usize::from(SectionKind::NUMERIC.raw())] = schema_has_numeric_columns(schema);
     expected[usize::from(SectionKind::STOREDMETA.raw())] = schema_has_stored_fields(schema);
     for raw in usize::from(SectionKind::TERMDICT.raw())..=usize::from(SectionKind::STATS.raw()) {
         if seen[raw] != expected[raw] {
@@ -1448,13 +1448,11 @@ fn schema_has_positions(schema: SchemaDescriptor) -> bool {
     })
 }
 
-fn schema_has_indexed_numeric(schema: SchemaDescriptor) -> bool {
-    schema.fields.iter().any(|field| {
-        matches!(
-            field.kind,
-            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
-        )
-    })
+fn schema_has_numeric_columns(schema: SchemaDescriptor) -> bool {
+    schema
+        .fields
+        .iter()
+        .any(|field| field.kind.has_numeric_column())
 }
 
 fn schema_has_stored_fields(schema: SchemaDescriptor) -> bool {
@@ -1715,7 +1713,7 @@ mod tests {
         name: "segment-test-indexed-u64",
         fields: &U64_FIELDS,
     };
-    const PINNED_DEFAULT_ENTRIES: [SectionEntry; 9] = [
+    const PINNED_DEFAULT_ENTRIES: [SectionEntry; 10] = [
         SectionEntry {
             kind: SectionKind::TERMDICT,
             flags: 0,
@@ -1766,21 +1764,28 @@ mod tests {
             xxh3: 0x2518_0e76_4f5a_2769,
         },
         SectionEntry {
-            kind: SectionKind::STOREDMETA,
+            kind: SectionKind::NUMERIC,
             flags: 0,
             offset: 832,
+            len: 11,
+            xxh3: 0xf32b_8ca9_4e2a_52bc,
+        },
+        SectionEntry {
+            kind: SectionKind::STOREDMETA,
+            flags: 0,
+            offset: 896,
             len: 12,
             xxh3: 0xffff_1c57_4139_b461,
         },
         SectionEntry {
             kind: SectionKind::STATS,
             flags: 0,
-            offset: 896,
+            offset: 960,
             len: 13,
             xxh3: 0xd325_c744_07be_efd7,
         },
     ];
-    const PINNED_DEFAULT_PAYLOADS: [&[u8]; 9] = [
+    const PINNED_DEFAULT_PAYLOADS: [&[u8]; 10] = [
         &[0x01, 0x12, 0x23, 0x34],
         &[0x02, 0x13, 0x24, 0x35, 0x46],
         &[0x03, 0x14, 0x25, 0x36, 0x47, 0x58],
@@ -1788,6 +1793,9 @@ mod tests {
         &[0x05, 0x16, 0x27, 0x38, 0x49, 0x5a, 0x6b, 0x7c],
         &[0x06, 0x17, 0x28, 0x39, 0x4a, 0x5b, 0x6c, 0x7d, 0x8e],
         &[0x07, 0x18, 0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0xa0],
+        &[
+            0x08, 0x19, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x90, 0xa1, 0xb2,
+        ],
         &[
             0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x80, 0x91, 0xa2, 0xb3, 0xc4,
         ],
@@ -1821,7 +1829,7 @@ mod tests {
             let kind = SectionKind::from_raw(raw);
             let present = match kind {
                 SectionKind::POSITIONS => schema_has_positions(schema),
-                SectionKind::NUMERIC => schema_has_indexed_numeric(schema),
+                SectionKind::NUMERIC => schema_has_numeric_columns(schema),
                 SectionKind::STOREDMETA => schema_has_stored_fields(schema),
                 _ => true,
             };
@@ -1987,12 +1995,12 @@ mod tests {
                 doc_count: 5,
                 created_unix_s: 1_726_000_123,
                 engine_version: 0x0002_0001,
-                section_count: 9,
+                section_count: 10,
             }
         );
         assert_eq!(reader.section_entries(), &PINNED_DEFAULT_ENTRIES);
-        assert_eq!(reader.file_len(), 921);
-        assert_eq!(reader.file_xxh3(), 0x21db_dd03_9fa7_9ed3);
+        assert_eq!(reader.file_len(), 985);
+        assert_eq!(reader.file_xxh3(), 0x3d1c_8570_73b5_390f);
         for (entry, payload) in PINNED_DEFAULT_ENTRIES.iter().zip(PINNED_DEFAULT_PAYLOADS) {
             assert_eq!(
                 reader.section(entry.kind)?.expect("pinned fixture section"),
@@ -2015,14 +2023,14 @@ mod tests {
         let trailer_crc = read_u32_at(first.as_bytes(), trailer_start + 8).expect("trailer crc");
         assert_eq!(
             &first.as_bytes()[..FILE_PREFIX_LEN],
-            b"FSLXSEG\0\x01\0\0\0\x34\x01\0\0"
+            b"FSLXSEG\0\x01\0\0\0\x50\x01\0\0"
         );
-        assert_eq!(first.file_len(), 921);
-        assert_eq!(header_len, 308);
+        assert_eq!(first.file_len(), 985);
+        assert_eq!(header_len, 336);
         assert_eq!(first.header().schema_id, 0xa312_ebf6_d136_07a5);
-        assert_eq!(header_crc, 0x13e9_953f);
-        assert_eq!(first.file_xxh3(), 0x21db_dd03_9fa7_9ed3);
-        assert_eq!(trailer_crc, 0xbc49_3767);
+        assert_eq!(header_crc, 0x3e9c_358f);
+        assert_eq!(first.file_xxh3(), 0x3d1c_8570_73b5_390f);
+        assert_eq!(trailer_crc, 0x4752_5d26);
         assert_eq!(first.section_entries(), &PINNED_DEFAULT_ENTRIES);
         assert_eq!(first.as_bytes(), pinned_v1_fixture()?);
         assert_eq!(first.as_bytes(), second.as_bytes());
@@ -2137,7 +2145,7 @@ mod tests {
             );
             assert_eq!(
                 reader.section(SectionKind::NUMERIC)?.is_some(),
-                schema_has_indexed_numeric(schema)
+                schema_has_numeric_columns(schema)
             );
             assert_eq!(
                 reader.section(SectionKind::STOREDMETA)?.is_some(),
@@ -2146,7 +2154,7 @@ mod tests {
             reader.verify()?;
         }
 
-        assert!(schema_has_indexed_numeric(U64_SCHEMA));
+        assert!(schema_has_numeric_columns(U64_SCHEMA));
         let mut missing_u64_numeric = fixture_sections(U64_SCHEMA, false);
         assert!(
             missing_u64_numeric

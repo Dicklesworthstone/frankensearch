@@ -1,0 +1,188 @@
+{
+  "schema": "quill-resumable-bulk-evidence-v1",
+  "generated_at_utc": "2026-07-24T09:54:35Z",
+  "bead": {
+    "id": "bd-quill-duel-resumable-bulk-68jm",
+    "status": "pass",
+    "title": "Crash-resumable bulk builds with IDMAP content witnesses"
+  },
+  "revisions": {
+    "implementation_revision": "6c5478dc4ca4b49f3325914ea41f3a615797b0ad",
+    "claim_revision": "d337bc5e366b6eefbc30035641a399a6ec18f78a",
+    "prerequisites": {
+      "fslx_registry": "c67a71756717cdc5efd9370b2fc23caa53290d59",
+      "idmap_idhash_codec": "dbdcc85baef7371712832b157d9b1d8ad7c87f9f",
+      "keeper_bulk_publish_cadence": "bc210b777f60286bac06cfc85b21e9dd135406ba",
+      "fsfs_quill_port": "373d61b84b13d264919a694d5a2ae35246df33e7",
+      "fsfs_planned_chunk_fidelity": "35b09e2e7b29ab9cdb43639a174c98dd6bbf8a5c"
+    }
+  },
+  "acceptance_contract": {
+    "format_registry": {
+      "version": "1.0.2",
+      "witness": "unseeded xxh3-64 over Quill's canonical document preimage",
+      "bytes_per_positional_row": 8,
+      "holes_are_zero": true
+    },
+    "intermediate_publish": {
+      "configuration": "bulk_publish_segment_cadence",
+      "normal_commit_choreography": true,
+      "recovery_boundary": "last published cumulative generation"
+    },
+    "resume_classification": {
+      "idhash_miss": "stage new document",
+      "idhash_hit_equal_idmap_hash": "skip staging and preserve the exact Q1 docid",
+      "idhash_hit_different_idmap_hash": "upsert under a fresh Q1 docid and tombstone the old row",
+      "stale_identifier": "delete only after the current corpus traversal proves it absent"
+    },
+    "public_witness_api": {
+      "type": "QuillDocumentWitness",
+      "fields": [
+        "global_docid",
+        "content_hash"
+      ],
+      "lookup": "QuillIndex::document_witness",
+      "candidate_hash": "indexable_document_content_hash"
+    },
+    "structured_runtime_fields": [
+      "lexical_resume_absent",
+      "lexical_resume_unchanged",
+      "lexical_resume_changed",
+      "stale_lexical_candidates",
+      "stale_lexical_deleted"
+    ]
+  },
+  "crash_matrix": {
+    "fixture_documents": 7,
+    "bulk_publish_segment_cadence": 2,
+    "published_prefix_rows": [
+      {
+        "published_documents": 2,
+        "crash_then_reopen": true,
+        "unchanged_classified": 2,
+        "absent_classified": 5,
+        "stable_witnesses_preserved": true,
+        "result_equivalence": "exact ordered document ids and f32 score bits"
+      },
+      {
+        "published_documents": 4,
+        "crash_then_reopen": true,
+        "unchanged_classified": 4,
+        "absent_classified": 3,
+        "stable_witnesses_preserved": true,
+        "result_equivalence": "exact ordered document ids and f32 score bits"
+      },
+      {
+        "published_documents": 6,
+        "crash_then_reopen": true,
+        "unchanged_classified": 6,
+        "absent_classified": 1,
+        "stable_witnesses_preserved": true,
+        "result_equivalence": "exact ordered document ids and f32 score bits"
+      }
+    ],
+    "uninterrupted_control": true,
+    "query": "common",
+    "failed_rows": 0
+  },
+  "real_fsfs_e2e": {
+    "documents": 1100,
+    "first_durable_checkpoint_documents": 1024,
+    "restart_reopens_partial_vector_and_quill_generations": true,
+    "stable_row": {
+      "global_docid_preserved": true,
+      "content_hash_preserved": true
+    },
+    "changed_row": {
+      "source_changed_after_checkpoint": true,
+      "old_global_docid_replaced": true,
+      "old_content_hash_replaced": true,
+      "replacement_query_visible": true
+    },
+    "final_vector_lexical_manifest_id_sets_equal": true,
+    "final_complete_sentinel": true
+  },
+  "authoritative_remote_gates": [
+    {
+      "command": "cargo check -p frankensearch-quill -p frankensearch-fsfs --tests",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "333.8s"
+    },
+    {
+      "command": "cargo test -p frankensearch-fsfs resum --lib",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 7,
+      "failed": 0,
+      "test_elapsed": "5.23s",
+      "elapsed": "434.7s"
+    },
+    {
+      "command": "cargo test -p frankensearch-quill id_hash_roundtrip_reopen_collisions_and_duplicate_rejection --lib",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 1,
+      "failed": 0,
+      "elapsed": "271.2s"
+    },
+    {
+      "command": "cargo test -p frankensearch-quill identity_resolution_handles_repeated_upserts_and_duplicate_live_rows --lib",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "passed": 1,
+      "failed": 0,
+      "elapsed": "261.5s"
+    },
+    {
+      "command": "cargo check --workspace --all-targets",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "327.9s"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "341.2s"
+    }
+  ],
+  "format_and_static_review": {
+    "rustfmt": {
+      "command": "rustfmt +nightly --edition 2024 --check <all edited Rust files>",
+      "result": "pass"
+    },
+    "cargo_fmt": {
+      "result": "excluded",
+      "reason": "RCH classifies cargo fmt as a non-compilation command and strict remote-only policy forbids its local fallback; direct nightly rustfmt is the formatting authority."
+    },
+    "git_diff_check": "pass",
+    "ubs": {
+      "result": "excluded",
+      "reason": "UBS Rust scans launch hidden local Cargo subchecks, which are inadmissible under the campaign's strict remote-only Cargo policy."
+    }
+  },
+  "coordination": {
+    "agent": "RoseMaple",
+    "file_reservations": [
+      12268,
+      12269,
+      12270,
+      12271,
+      12272,
+      12273,
+      12274,
+      12275
+    ],
+    "reservation_conflicts": 0,
+    "agent_mail_thread": "bd-quill-duel-resumable-bulk-68jm"
+  },
+  "remote_only": {
+    "required": true,
+    "authoritative_local_cargo_fallback": false,
+    "note": "Every authoritative Cargo gate ran through RCH with RCH_REQUIRE_REMOTE=1. Direct rustfmt, git inspection, and JSON validation do not invoke Cargo."
+  }
+}

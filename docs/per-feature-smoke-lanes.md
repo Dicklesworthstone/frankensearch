@@ -39,6 +39,35 @@ scripts/check_feature_matrix.sh --mode validate
 | `full` | `cargo check -p frankensearch --lib --no-default-features --features full` | `cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact --nocapture` | `feature-smoke-full.json` |
 | `full-fts5` | `cargo check -p frankensearch --lib --no-default-features --features full-fts5` | `cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact --nocapture` | `feature-smoke-full-fts5.json` |
 
+## CASS compatibility retirement register
+
+`cass-compat` is a foreign-format interop lane, not an incomplete Quill
+migration. The external CASS tool owns schema-v8 Tantivy indexes under
+`<base>/index/v8/`; `frankensearch-lexical::cass_compat` must continue reading
+and writing that format while the integration exists. The facade dependency
+chain is explicit:
+
+```text
+cass-compat -> lexical-tantivy -> lexical -> frankensearch-lexical
+```
+
+The default facade feature set is only `hash`, so this chain must never enter a
+default build. CI protects both sides of the boundary: the dedicated
+`cass-compat` lane above compile-checks and executes its exact behavior test,
+while the all-features facade check prevents the cfg-gated adapter from
+silently rotting.
+
+Delete the lane only after coordination with the CASS project confirms one of
+these external events:
+
+1. CASS migrates the integration from its schema-v8 Tantivy index to FSLX; or
+2. CASS drops the frankensearch index integration.
+
+At that point, remove the facade feature and re-export, the dedicated smoke
+lane and behavior test, and the CASS interop half of
+`frankensearch-lexical` together. Native Quill reaching feature completeness
+is not, by itself, a deletion signal.
+
 CI runs the same script once per lane and uploads the generated artifact files
 with deterministic names. Each per-lane artifact includes the lane name,
 feature set, compile command, behavior test command, and status. The companion

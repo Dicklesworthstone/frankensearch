@@ -136,8 +136,8 @@ pub enum DeltaError {
         field_ord: u16,
         field_name: &'static str,
     },
-    /// A typed numeric value named a non-indexed numeric field.
-    #[error("delta numeric field {field_ord} ({field_name}) is not indexed")]
+    /// A typed numeric value named a field with no NUMERIC column.
+    #[error("delta numeric field {field_ord} ({field_name}) is neither indexed nor fast")]
     NonIndexedNumericField {
         field_ord: u16,
         field_name: &'static str,
@@ -216,7 +216,7 @@ pub struct DeltaFieldNorm {
     pub fieldnorm_id: u8,
 }
 
-/// One schema-typed indexed numeric value retained for sealing.
+/// One schema-typed indexed-or-fast numeric value retained for sealing.
 ///
 /// When the descriptor also sets `stored=true`, the delta derives the exact
 /// canonical eight little-endian stored bytes automatically.
@@ -917,7 +917,7 @@ impl DeltaSnapshot {
         self.segment.content_hash(global_docid)
     }
 
-    /// Physical indexed numeric value, including a tombstoned row.
+    /// Physical indexed-or-fast numeric value, including a tombstoned row.
     #[must_use]
     pub fn numeric_value(&self, field_ord: u16, global_docid: u32) -> Option<NumericValue> {
         self.segment.numeric_value(field_ord, global_docid)
@@ -1026,12 +1026,10 @@ impl DeltaSegment {
             .fields
             .iter()
             .filter_map(|field| match field.kind {
-                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
-                    Some(NumericColumn {
-                        field_ord: field.id,
-                        values: Vec::new(),
-                    })
-                }
+                kind if kind.has_numeric_column() => Some(NumericColumn {
+                    field_ord: field.id,
+                    values: Vec::new(),
+                }),
                 _ => None,
             })
             .collect();
@@ -1188,7 +1186,7 @@ impl DeltaSegment {
     /// Apply one complete document with every sidecar required for sealing.
     ///
     /// Numeric and stored values may be in any order, but a field may appear in
-    /// only one input slice. A stored indexed numeric supplied through
+    /// only one input slice. A stored indexed-or-fast numeric supplied through
     /// `numeric_values` receives canonical little-endian stored bytes. Supplying
     /// its exact eight stored bytes instead also populates the numeric column.
     /// A budget crossing accepts the entire row and reports `seal_required`; a
@@ -1611,10 +1609,17 @@ impl DeltaSegment {
                 });
             }
             match (field.kind, value.value) {
-                (FieldKind::I64 { indexed: true, .. }, NumericValue::I64(_))
-                | (FieldKind::U64 { indexed: true, .. }, NumericValue::U64(_)) => {}
+                (FieldKind::I64 { indexed, fast }, NumericValue::I64(_)) if indexed || fast => {}
+                (FieldKind::U64 { indexed, fast }, NumericValue::U64(_)) if indexed || fast => {}
                 (
-                    FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. },
+                    FieldKind::I64 {
+                        indexed: false,
+                        fast: false,
+                    }
+                    | FieldKind::U64 {
+                        indexed: false,
+                        fast: false,
+                    },
                     _,
                 ) => {
                     return Err(DeltaError::NonIndexedNumericField {
@@ -1871,7 +1876,7 @@ impl DeltaSegment {
         self.document_content_hashes.get(row).copied().flatten()
     }
 
-    /// Physical indexed numeric value, including a tombstoned row.
+    /// Physical indexed-or-fast numeric value, including a tombstoned row.
     #[must_use]
     pub fn numeric_value(&self, field_ord: u16, global_docid: u32) -> Option<NumericValue> {
         let row = self.document_docids.binary_search(&global_docid).ok()?;
@@ -2645,17 +2650,20 @@ mod tests {
     #[test]
     fn seal_sidecars_survive_tombstones_freeze_and_writer_reset() -> Result<(), DeltaError> {
         let mut delta = DeltaSegment::new(VALUE_SCHEMA, 0, usize::MAX)?;
-        let fast_only = 31_u64.to_le_bytes();
+        let fast_only = 31_u64;
         delta.apply_document_with_values(
             0,
             DocId::from("same-id"),
             0x1122_3344_5566_7788,
             &value_norms(1),
             &[],
-            &[DeltaNumericValue::i64(1, -7), DeltaNumericValue::u64(2, 9)],
+            &[
+                DeltaNumericValue::i64(1, -7),
+                DeltaNumericValue::u64(2, 9),
+                DeltaNumericValue::u64(3, fast_only),
+            ],
             &[
                 DeltaStoredValue::new(0, b"first-keyword"),
-                DeltaStoredValue::new(3, &fast_only),
                 DeltaStoredValue::new(4, b"first-opaque"),
             ],
         )?;
@@ -2663,29 +2671,37 @@ mod tests {
         assert_eq!(delta.content_hash(0), Some(0x1122_3344_5566_7788));
         assert_eq!(delta.numeric_value(1, 0), Some(NumericValue::I64(-7)));
         assert_eq!(delta.numeric_value(2, 0), Some(NumericValue::U64(9)));
-        assert_eq!(delta.numeric_value(3, 0), None);
+        assert_eq!(
+            delta.numeric_value(3, 0),
+            Some(NumericValue::U64(fast_only))
+        );
         assert_eq!(delta.stored_value(0, 0), Some(b"first-keyword".as_slice()));
         assert_eq!(
             delta.stored_value(1, 0),
             Some((-7_i64).to_le_bytes().as_slice())
         );
         assert_eq!(delta.stored_value(2, 0), None);
-        assert_eq!(delta.stored_value(3, 0), Some(fast_only.as_slice()));
+        assert_eq!(
+            delta.stored_value(3, 0),
+            Some(fast_only.to_le_bytes().as_slice())
+        );
         assert_eq!(delta.stored_value(4, 0), Some(b"first-opaque".as_slice()));
         assert_eq!(delta.bytes_used(), delta.recompute_bytes_used());
 
         let signed_from_stored = 42_i64.to_le_bytes();
-        let next_fast_only = 63_u64.to_le_bytes();
+        let next_fast_only = 63_u64;
         let replacement = delta.apply_document_with_values(
             1,
             DocId::from("same-id"),
             0x8877_6655_4433_2211,
             &value_norms(0),
             &[],
-            &[DeltaNumericValue::u64(2, 17)],
+            &[
+                DeltaNumericValue::u64(2, 17),
+                DeltaNumericValue::u64(3, next_fast_only),
+            ],
             &[
                 DeltaStoredValue::new(1, &signed_from_stored),
-                DeltaStoredValue::new(3, &next_fast_only),
                 DeltaStoredValue::new(4, b"second-opaque"),
             ],
         )?;
@@ -2704,6 +2720,10 @@ mod tests {
         assert!(frozen.segment().is_tombstoned(0));
         assert_eq!(frozen.content_hash(0), Some(0x1122_3344_5566_7788));
         assert_eq!(frozen.numeric_value(1, 1), Some(NumericValue::I64(42)));
+        assert_eq!(
+            frozen.numeric_value(3, 1),
+            Some(NumericValue::U64(next_fast_only))
+        );
         assert_eq!(frozen.stored_value(4, 1), Some(b"second-opaque".as_slice()));
 
         delta.reset_after_seal(0)?;
@@ -2771,14 +2791,19 @@ mod tests {
         assert!(matches!(
             delta.apply_document_with_values(
                 0,
-                DocId::from("not-indexed"),
+                DocId::from("fast-wrong-type"),
                 1,
                 &value_norms(0),
                 &[],
-                &[DeltaNumericValue::u64(3, 1)],
+                &[DeltaNumericValue::i64(3, -1)],
                 &[],
             ),
-            Err(DeltaError::NonIndexedNumericField { field_ord: 3, .. })
+            Err(DeltaError::NumericTypeMismatch {
+                field_ord: 3,
+                expected: "u64",
+                actual: "i64",
+                ..
+            })
         ));
         assert_eq!(delta.memory_stats(), initial);
 

@@ -891,9 +891,7 @@ fn repair_action_for(kind: IndexFreshnessFindingKind) -> IndexFreshnessRepairAct
         IndexFreshnessFindingKind::MissingVector => {
             IndexFreshnessRepairActionKind::RebuildVectorMembership
         }
-        IndexFreshnessFindingKind::MissingLexical => {
-            IndexFreshnessRepairActionKind::RebuildLexicalMembership
-        }
+        IndexFreshnessFindingKind::MissingLexical => IndexFreshnessRepairActionKind::EnqueueReindex,
         IndexFreshnessFindingKind::DoubleIndexed => {
             IndexFreshnessRepairActionKind::QuarantineDuplicate
         }
@@ -1722,6 +1720,10 @@ mod tests {
         assert!(kinds.contains(&IndexFreshnessFindingKind::MissingLexical));
         assert!(kinds.contains(&IndexFreshnessFindingKind::DoubleIndexed));
         assert!(kinds.contains(&IndexFreshnessFindingKind::WatcherCheckpointStale));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == IndexFreshnessFindingKind::MissingLexical
+                && finding.repair_action == IndexFreshnessRepairActionKind::EnqueueReindex
+        }));
         assert_eq!(
             report.summary.verdict,
             IndexFreshnessAuditVerdict::FailClosed

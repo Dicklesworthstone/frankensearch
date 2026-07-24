@@ -1527,6 +1527,74 @@ impl TantivyIndex {
         Ok(ids)
     }
 
+    /// Export every live committed document for exact-generation shadow replay.
+    ///
+    /// Results are ordered by document id. Duplicate ids from legacy indexes
+    /// collapse deterministically to the last live segment/document address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if a stored live document cannot be loaded or its
+    /// metadata payload is malformed.
+    pub fn all_documents(&self) -> SearchResult<Vec<IndexableDocument>> {
+        let searcher = self.reader.searcher();
+        let mut documents = std::collections::BTreeMap::new();
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let segment_ord =
+                u32::try_from(segment_ord).map_err(|_| SearchError::InvalidConfig {
+                    field: "tantivy.segment_ord".to_owned(),
+                    value: segment_ord.to_string(),
+                    reason: "segment ordinal must fit in u32".to_owned(),
+                })?;
+            for doc_id in 0..segment.max_doc() {
+                if segment.is_deleted(doc_id) {
+                    continue;
+                }
+                let doc = load_doc(&searcher, DocAddress::new(segment_ord, doc_id))?;
+                let Some(id) = doc
+                    .get_first(self.fields.id)
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let content = doc
+                    .get_first(self.fields.content)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let title = doc
+                    .get_first(self.fields.title)
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let metadata = doc
+                    .get_first(self.fields.metadata_json)
+                    .and_then(|value| value.as_str())
+                    .map_or_else(
+                        || Ok(std::collections::HashMap::new()),
+                        |json| {
+                            serde_json::from_str(json).map_err(|error| {
+                                SearchError::SubsystemError {
+                                    subsystem: "tantivy.shadow_export",
+                                    source: Box::new(error),
+                                }
+                            })
+                        },
+                    )?;
+                documents.insert(
+                    id.to_owned(),
+                    IndexableDocument {
+                        id: id.to_owned(),
+                        content,
+                        title,
+                        metadata,
+                    },
+                );
+            }
+        }
+        Ok(documents.into_values().collect())
+    }
+
     /// Pre-optimization baseline for [`Self::search_doc_ids`] that retains the
     /// discarded total-count collector. This is used only by the `doc_ids_topk`
     /// benchmark so the optimized and counted paths can be compared in one
@@ -2683,6 +2751,16 @@ mod tests {
                 idx.all_doc_ids().expect("enumerate ids"),
                 vec![DocId::from("doc-a"), DocId::from("doc-c")]
             );
+            let exported = idx.all_documents().expect("export documents");
+            assert_eq!(
+                exported
+                    .iter()
+                    .map(|document| document.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["doc-a", "doc-c"]
+            );
+            assert_eq!(exported[0].content, "alpha");
+            assert_eq!(exported[1].content, "gamma");
         });
     }
 
