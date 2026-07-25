@@ -53,6 +53,18 @@ target_codex/
 target_*/
 target-codex*/
 
+# Remote compilation helper target pool. Named plural with no separator; a
+# symlink into /data/tmp/rch-targets-pool, regenerated per job.
+.rch-targets/
+.rch-target*/
+
+# Agent scratch trees. Grow without bound and are reclaimed by mtime.
+.scratch/
+
+# Compiled Rust artifacts left behind by ad-hoc lint/probe builds run outside
+# any target directory (e.g. liblint_probe.rlib at the repo root).
+*.rlib
+
 # Compiler crash reports
 rustc-ice-*.txt
 
