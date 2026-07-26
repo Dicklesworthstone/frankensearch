@@ -1,0 +1,255 @@
+{
+  "_comment": [
+    "Ground truth for SEMANTIC (vector) retrieval over the Treasure Island fixture.",
+    "",
+    "Every query is phrased to describe a scene CONCEPTUALLY while deliberately",
+    "avoiding the distinctive vocabulary the passage itself uses. 'a ragged",
+    "castaway who has survived alone for years' must find the Ben Gunn chapter",
+    "without sharing the words 'marooned', 'maroon' or 'Gunn' with it.",
+    "",
+    "This is the point of the fixture: a BM25 arm cannot answer these, and",
+    "neither can a degraded FNV-1a hash embedder, because hashing carries no",
+    "meaning. Only a real sentence embedder can. The test asserts the gap",
+    "between the semantic embedder's hit rate and the hash embedder's, so it",
+    "fails loudly if semantic search silently degrades.",
+    "",
+    "`expect_chapters` is satisfied if ANY listed chapter appears in the top-k.",
+    "`avoid_terms` are words the query must NOT contain — asserted by the test",
+    "so that nobody can later 'fix' a failing query by leaking the answer's",
+    "vocabulary into it."
+  ],
+  "top_k": 5,
+  "queries": [
+    {
+      "name": "eavesdropped_mutiny",
+      "query": "a young lad hidden inside a cask secretly learns the sailors plan to turn against their officers",
+      "expect_chapters": [
+        11
+      ],
+      "avoid_terms": [
+        "apple",
+        "barrel",
+        "mutiny"
+      ],
+      "note": "Ch 11 — Jim hides in the apple barrel and overhears Silver recruiting for the mutiny."
+    },
+    {
+      "name": "lone_castaway",
+      "query": "a ragged solitary castaway who has survived by himself for three years on an empty shore",
+      "expect_chapters": [
+        15
+      ],
+      "avoid_terms": [
+        "maroon",
+        "marooned",
+        "gunn",
+        "cheese"
+      ],
+      "note": "Ch 15 — Ben Gunn, three years alone on the island."
+    },
+    {
+      "name": "digging_for_riches",
+      "query": "the party digs in the ground hunting for wealth hidden long ago by a dead buccaneer",
+      "expect_chapters": [
+        31,
+        32,
+        33
+      ],
+      "avoid_terms": [
+        "treasure-hunt",
+        "pointer"
+      ],
+      "note": "Ch 31-33 — the treasure hunt following Flint's directions."
+    },
+    {
+      "name": "parley_terms",
+      "query": "the opposing leader walks up to the fort wanting to bargain and settle the quarrel",
+      "expect_chapters": [
+        20
+      ],
+      "avoid_terms": [
+        "embassy",
+        "truce",
+        "parley"
+      ],
+      "note": "Ch 20 — Silver's Embassy; he comes to the stockade to make terms."
+    },
+    {
+      "name": "duel_aloft",
+      "query": "a struggle to the death high above the deck while scrambling up the mast",
+      "expect_chapters": [
+        26
+      ],
+      "avoid_terms": [
+        "israel",
+        "hands",
+        "rigging"
+      ],
+      "note": "Ch 26 — Jim and Israel Hands fight in the rigging."
+    },
+    {
+      "name": "frightening_lodger",
+      "query": "a rough old sailor rents a room at a quiet seaside tavern and terrifies everyone there",
+      "expect_chapters": [
+        1,
+        2
+      ],
+      "avoid_terms": [
+        "benbow",
+        "inn",
+        "sea-dog"
+      ],
+      "note": "Ch 1-2 — Billy Bones lodging at the Admiral Benbow."
+    },
+    {
+      "name": "blind_messenger",
+      "query": "a sightless stranger presses a paper of condemnation into another man's hand",
+      "expect_chapters": [
+        3
+      ],
+      "avoid_terms": [
+        "black spot",
+        "pew",
+        "blind"
+      ],
+      "note": "Ch 3 — blind Pew delivers the black spot to Billy Bones."
+    },
+    {
+      "name": "adrift_small_craft",
+      "query": "drifting helplessly alone at sea in a tiny fragile homemade craft tossed by the swell",
+      "expect_chapters": [
+        23,
+        24
+      ],
+      "avoid_terms": [
+        "coracle",
+        "ebb-tide"
+      ],
+      "note": "Ch 23-24 — Jim adrift in Ben Gunn's coracle."
+    },
+    {
+      "name": "opening_the_sea_chest",
+      "query": "a boy and his mother unlock a dead lodger's heavy trunk to take only what they are owed",
+      "expect_chapters": [
+        4
+      ],
+      "avoid_terms": [
+        "sea-chest",
+        "chest"
+      ],
+      "note": "Ch 4 - Jim and his mother open Billy Bones's chest."
+    },
+    {
+      "name": "trampled_in_the_road",
+      "query": "riders come down the road at a gallop and a fleeing sightless beggar is knocked down and killed",
+      "expect_chapters": [
+        5
+      ],
+      "avoid_terms": [
+        "blind",
+        "pew",
+        "trampled"
+      ],
+      "note": "Ch 5 - Pew is ridden down by the revenue officers' horses."
+    },
+    {
+      "name": "leaving_for_the_port",
+      "query": "the lad says goodbye to his home and travels to a busy harbour town where a vessel is being fitted out",
+      "expect_chapters": [
+        7
+      ],
+      "avoid_terms": [
+        "bristol",
+        "voyage"
+      ],
+      "note": "Ch 7 - I Go to Bristol."
+    },
+    {
+      "name": "murder_in_the_marsh",
+      "query": "he watches from hiding as one crewman kills another with a blade among the boggy ground",
+      "expect_chapters": [
+        14
+      ],
+      "avoid_terms": [
+        "first blow",
+        "marsh"
+      ],
+      "note": "Ch 14 - Jim witnesses Silver murder Tom."
+    },
+    {
+      "name": "assault_repelled",
+      "query": "the defenders inside the wooden walls fight off a rush of attackers and count their dead",
+      "expect_chapters": [
+        21
+      ],
+      "avoid_terms": [
+        "attack",
+        "stockade"
+      ],
+      "note": "Ch 21 - The Attack."
+    },
+    {
+      "name": "surgeon_tends_enemies",
+      "query": "having given his word of honour, the physician crosses over to treat the sick and injured among his foes",
+      "expect_chapters": [
+        30
+      ],
+      "avoid_terms": [
+        "parole",
+        "doctor",
+        "livesey"
+      ],
+      "note": "Ch 30 - On Parole."
+    },
+    {
+      "name": "dividing_the_fortune",
+      "query": "the survivors share out the wealth and each goes on to a different life back at home",
+      "expect_chapters": [
+        34
+      ],
+      "avoid_terms": [
+        "and last",
+        "treasure"
+      ],
+      "note": "Ch 34 - And Last."
+    },
+    {
+      "name": "secret_council",
+      "query": "the trustworthy few gather quietly in the captain's quarters to decide how to handle the traitors",
+      "expect_chapters": [
+        12
+      ],
+      "avoid_terms": [
+        "council of war",
+        "council"
+      ],
+      "note": "Ch 12 - Council of War."
+    }
+  ],
+  "min_semantic_hits": 10,
+  "max_hash_only_hits": 1,
+  "min_semantic_only_hits": 5,
+  "_criterion": [
+    "REVISED 2026-07-26 after the first real run produced semantic 6/8 vs hash 3/8.",
+    "",
+    "The original criterion capped the hash control at an ABSOLUTE 2/8. That was",
+    "wrong, because HashEmbedder is not noise: it hashes TOKENS into dimensions, so",
+    "a document sharing words with the query gets a higher cosine. It behaves as a",
+    "degenerate bag-of-words matcher with no IDF. Capping it absolutely therefore",
+    "measures how much incidental vocabulary a query shares with its answer, not",
+    "whether semantic retrieval works.",
+    "",
+    "(That property is also the likely reason the production degradation went",
+    "unnoticed for so long: the fallback returns plausible-looking hits, not",
+    "obvious garbage. See bd-a6zt.)",
+    "",
+    "The property actually worth asserting is PAIRED DOMINANCE: on the same query,",
+    "does the real embedder succeed where the degraded one fails? So we count",
+    "discordant pairs and apply a sign test.",
+    "  semantic_only_hits >= 5 and hash_only_hits <= 1  =>  one-sided sign test",
+    "  p = P(X >= 5 | n = 6, p0 = 0.5) = 7/64 ~ 0.109 worst case, and",
+    "  p = 0.5^5 = 0.031 when hash_only_hits == 0.",
+    "16 queries is the minimum that can clear p < 0.05 at all; the previous 8",
+    "could not, which is why the first run's 3-0 split gave only p = 0.125."
+  ]
+}

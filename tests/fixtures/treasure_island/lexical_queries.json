@@ -1,0 +1,99 @@
+{
+  "_comment": [
+    "Ground truth for lexical (BM25) retrieval over the Treasure Island fixture.",
+    "",
+    "Two independent assertions per query:",
+    "",
+    "  PRECISION (always applied) — `must_contain` is a substring that EVERY",
+    "  returned passage must contain, case-insensitively. This is the assertion",
+    "  that the lexical arm is doing exact matching rather than returning",
+    "  plausible-looking noise, and it holds for every term regardless of how",
+    "  common it is.",
+    "",
+    "  RECALL (only where honest) — `expect_chapters` lists chapters of which at",
+    "  least one must appear within `recall_limit` hits. This is deliberately",
+    "  restricted to terms whose occurrences really are concentrated in a known",
+    "  stretch of the book. For a name like Flint or Hispaniola that recurs",
+    "  throughout, BM25's top hits are whichever passages have the highest term",
+    "  density, which is NOT a property worth asserting -- so those queries carry",
+    "  an empty `expect_chapters` and are checked for precision only. Asserting a",
+    "  chapter there would be testing term-density accidents, not retrieval.",
+    "",
+    "Chapter numbers are the sequential 1..34 indices emitted by the fixture",
+    "(see tests/fixtures/treasure_island/README.md)."
+  ],
+  "search_limit": 10,
+  "recall_limit": 40,
+  "queries": [
+    {
+      "name": "rare_boat_word",
+      "term": "coracle",
+      "must_contain": "coracle",
+      "expect_chapters": [23, 24, 25],
+      "note": "Ben Gunn's homemade boat. A rare word confined to Jim's sea adventure -- the strongest precision+recall signal in the book."
+    },
+    {
+      "name": "marooned_character",
+      "term": "Gunn",
+      "must_contain": "gunn",
+      "expect_chapters": [15, 16, 17, 18, 19, 30, 31, 32, 33, 34],
+      "note": "Ben Gunn is introduced in 'The Man of the Island' (15) and recurs to the end."
+    },
+    {
+      "name": "fortification",
+      "term": "stockade",
+      "must_contain": "stockade",
+      "expect_chapters": [16, 17, 18, 19, 20, 21],
+      "note": "The Part Four siege sequence."
+    },
+    {
+      "name": "inn_name",
+      "term": "Benbow",
+      "must_contain": "benbow",
+      "expect_chapters": [1, 2, 3, 4, 5, 6],
+      "note": "The Admiral Benbow inn dominates Part One."
+    },
+    {
+      "name": "ship_name",
+      "term": "Hispaniola",
+      "must_contain": "hispaniola",
+      "expect_chapters": [],
+      "note": "The schooner. Recurs from Part Two to the end -- precision only, no honest chapter expectation."
+    },
+    {
+      "name": "doctor",
+      "term": "Livesey",
+      "must_contain": "livesey",
+      "expect_chapters": [],
+      "note": "Named in the opening paragraph but present throughout -- precision only."
+    },
+    {
+      "name": "captain",
+      "term": "Smollett",
+      "must_contain": "smollett",
+      "expect_chapters": [],
+      "note": "Present from Part Two onward -- precision only."
+    },
+    {
+      "name": "dead_pirate",
+      "term": "Flint",
+      "must_contain": "flint",
+      "expect_chapters": [],
+      "note": "Invoked constantly by the crew across the whole novel -- precision only."
+    }
+  ],
+  "must_return_nothing": [
+    {
+      "term": "photosynthesis",
+      "note": "Modern scientific term; cannot occur in a 19th-century sea novel."
+    },
+    {
+      "term": "cryptocurrency",
+      "note": "Anachronism guard -- proves we are not returning arbitrary filler."
+    },
+    {
+      "term": "zzzqqxvw",
+      "note": "Non-word guard."
+    }
+  ]
+}

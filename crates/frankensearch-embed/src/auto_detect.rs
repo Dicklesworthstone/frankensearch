@@ -30,9 +30,12 @@ use asupersync::Cx;
     any(feature = "model2vec", feature = "fastembed")
 ))]
 use asupersync::sync::OnceCell;
-#[cfg(not(any(feature = "model2vec", feature = "fastembed", feature = "api")))]
-use tracing::info;
+// `warn` is needed unconditionally: `report_readiness` escalates a hash-only
+// stack in every build, including the default `hash`-only one that compiles
+// none of the model backends.
 #[cfg(any(feature = "model2vec", feature = "fastembed", feature = "api"))]
+use tracing::{debug, info, warn};
+#[cfg(not(any(feature = "model2vec", feature = "fastembed", feature = "api")))]
 use tracing::{info, warn};
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -326,12 +329,7 @@ impl EmbedderStack {
             })?;
 
         let stack = Self::from_parts(fast, quality);
-        info!(
-            availability = ?stack.availability,
-            fast = stack.fast.id(),
-            quality = stack.quality.as_ref().map(|embedder| embedder.id()),
-            "embedder stack ready"
-        );
+        stack.report_readiness();
         Ok(stack)
     }
 
@@ -350,13 +348,44 @@ impl EmbedderStack {
             })?;
 
         let stack = Self::from_parts(fast, quality);
+        stack.report_readiness();
+        Ok(stack)
+    }
+
+    /// Report what auto-detection actually produced.
+    ///
+    /// A `HashOnly` stack is not a working semantic search engine. FNV-1a
+    /// vectors carry no meaning, and [`TwoTierSearcher`] treats a shipped hash
+    /// fast-embedder as a reason to skip the vector arm outright — so the
+    /// caller receives an ordinary-looking `Ok` holding lexical-only results.
+    /// Announcing that at `info!` is precisely how "semantic search never
+    /// works" reaches users as silence, so it is escalated to `warn!` and
+    /// carries the full actionable diagnosis from
+    /// [`degradation_message`](Self::degradation_message) — which until now had
+    /// no production caller at all.
+    ///
+    /// [`TwoTierSearcher`]: https://docs.rs/frankensearch/latest/frankensearch/struct.TwoTierSearcher.html
+    fn report_readiness(&self) {
+        let quality = self.quality.as_ref().map(|embedder| embedder.id());
+        if matches!(self.availability, TwoTierAvailability::HashOnly) {
+            let detail = self.degradation_message().unwrap_or_default();
+            warn!(
+                availability = ?self.availability,
+                fast = self.fast.id(),
+                quality,
+                detail = %detail,
+                "SEMANTIC SEARCH UNAVAILABLE: no embedding model was found, so \
+                 retrieval fell back to non-semantic hash vectors. Vector search \
+                 will not return meaningful results until a model is installed."
+            );
+            return;
+        }
         info!(
-            availability = ?stack.availability,
-            fast = stack.fast.id(),
-            quality = stack.quality.as_ref().map(|embedder| embedder.id()),
+            availability = ?self.availability,
+            fast = self.fast.id(),
+            quality,
             "embedder stack ready"
         );
-        Ok(stack)
     }
 
     /// Apply MRL-style dimensionality reduction where supported.
@@ -1398,7 +1427,17 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
         .collect();
 
     for candidate in candidates {
-        if !manifest_files_exist(&manifest, &candidate) {
+        let missing = missing_manifest_files(&manifest, &candidate);
+        if !missing.is_empty() {
+            if candidate.is_dir() {
+                debug!(
+                    model = POTION_MODEL_NAME,
+                    tier = "fast",
+                    path = %candidate.display(),
+                    missing = ?missing,
+                    "model directory exists but is incomplete, skipping candidate"
+                );
+            }
             continue;
         }
         if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
@@ -1465,7 +1504,17 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
         .collect();
 
     for candidate in candidates {
-        if !manifest_files_exist(&manifest, &candidate) {
+        let missing = missing_manifest_files(&manifest, &candidate);
+        if !missing.is_empty() {
+            if candidate.is_dir() {
+                debug!(
+                    model = MINILM_MODEL_NAME,
+                    tier = "quality",
+                    path = %candidate.display(),
+                    missing = ?missing,
+                    "model directory exists but is incomplete, skipping candidate"
+                );
+            }
             continue;
         }
         if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
@@ -1628,12 +1677,20 @@ fn materialize_bundled_default_models(model_root: Option<&Path>) {
 #[cfg(not(feature = "bundled-default-models"))]
 const fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
 
+/// Manifest-required files that are absent from `model_dir`.
+///
+/// Returns the names rather than a bool so a candidate that exists but is
+/// incomplete — a half-finished download — can say which files it is short of.
+/// That directory looks installed to a user and is silently skipped here, which
+/// makes it one of the harder "why is semantic search off?" cases to diagnose.
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
-fn manifest_files_exist(manifest: &ModelManifest, model_dir: &Path) -> bool {
+fn missing_manifest_files<'a>(manifest: &'a ModelManifest, model_dir: &Path) -> Vec<&'a str> {
     manifest
         .files
         .iter()
-        .all(|file| model_dir.join(&file.name).is_file())
+        .filter(|file| !model_dir.join(&file.name).is_file())
+        .map(|file| file.name.as_str())
+        .collect()
 }
 
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
