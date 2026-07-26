@@ -81,7 +81,9 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }
 proptest = { workspace = true }
-jsonschema = "0.46"
+# Fixtures are in-memory/local; the default HTTP resolver pulls the forbidden
+# reqwest/hyper/Tokio stack without providing any test coverage value.
+jsonschema = { version = "0.46", default-features = false }
 criterion = { workspace = true }
 
 [[bench]]
