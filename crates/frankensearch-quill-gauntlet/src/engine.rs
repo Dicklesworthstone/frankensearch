@@ -4572,6 +4572,240 @@ mod tests {
         });
     }
 
+    /// E4.10 deferred-fusion-candidate envelope, ported from the incumbent's
+    /// `deferred_fusion_candidates_restore_exact_metadata` and
+    /// `search_results_have_lexical_source` and run engine-parameterized over
+    /// the Quill subject and the Tantivy oracle (bd-quill-e4-argus-3ycz.10).
+    ///
+    /// `LexicalSearch` — not the internal collector — is what hybrid fusion
+    /// consumes, so the whole envelope has to agree: the cheap candidate path
+    /// must be bit-identical to the full path except for deferred metadata,
+    /// hydration must restore exactly the metadata the full path would have
+    /// returned (including when only a strict subset of candidates survives
+    /// fusion), hydration must not perturb order or scores, and winners that
+    /// never came from the lexical pool must be left untouched.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn e410_deferred_fusion_candidate_envelope_matches_on_both_engines() {
+        use frankensearch_core::{LexicalSearch, ScoreSource, ScoredResult};
+
+        const E410_FUSION_QUERY: &str = "rust";
+        const E410_FUSION_LIMIT: usize = 10;
+
+        /// Assert the whole deferred-candidate contract on one engine and
+        /// return its hydrated candidates for cross-engine comparison.
+        async fn assert_deferred_envelope(
+            cx: &Cx,
+            engine: &dyn LexicalSearch,
+            label: &str,
+        ) -> Vec<ScoredResult> {
+            let full = engine
+                .search(cx, E410_FUSION_QUERY, E410_FUSION_LIMIT)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: full search failed: {error}"));
+            assert!(
+                full.len() >= 2,
+                "{label}: fixture must produce a multi-hit ranking, got {}",
+                full.len(),
+            );
+
+            let mut candidates = engine
+                .search_fusion_candidates(cx, E410_FUSION_QUERY, E410_FUSION_LIMIT)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: fusion candidates failed: {error}"));
+            assert!(
+                engine.fusion_metadata_is_deferred(),
+                "{label}: the candidate path must advertise deferred metadata",
+            );
+            assert_eq!(
+                candidates.len(),
+                full.len(),
+                "{label}: candidate arity must match the full path",
+            );
+            assert!(
+                candidates.iter().all(|result| result.metadata.is_none()),
+                "{label}: deferred candidates must carry no stored metadata",
+            );
+
+            for (rank, (candidate, expected)) in candidates.iter().zip(&full).enumerate() {
+                assert_eq!(
+                    candidate.doc_id, expected.doc_id,
+                    "{label}: rank {rank} document identity",
+                );
+                assert_eq!(
+                    candidate.score.to_bits(),
+                    expected.score.to_bits(),
+                    "{label}: rank {rank} score bits",
+                );
+                assert_eq!(
+                    candidate.lexical_score.map(f32::to_bits),
+                    expected.lexical_score.map(f32::to_bits),
+                    "{label}: rank {rank} lexical score bits",
+                );
+                for (path, result) in [("candidate", candidate), ("full", expected)] {
+                    assert_eq!(
+                        result.source,
+                        ScoreSource::Lexical,
+                        "{label}/{path}: rank {rank} score source",
+                    );
+                    assert!(
+                        result.lexical_score.is_some_and(|score| score > 0.0),
+                        "{label}/{path}: rank {rank} must carry a positive lexical score",
+                    );
+                    assert!(
+                        result.index.is_none()
+                            && result.fast_score.is_none()
+                            && result.quality_score.is_none()
+                            && result.rerank_score.is_none()
+                            && result.explanation.is_none(),
+                        "{label}/{path}: rank {rank} must populate only the lexical channel",
+                    );
+                }
+            }
+
+            // Fusion hydrates the winners, which is generally a strict subset
+            // of the candidate pool: hydrating one winner must restore exactly
+            // what the full path returned for that document.
+            let mut winner = candidates[..1].to_vec();
+            engine
+                .hydrate_fusion_metadata(cx, &mut winner)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: winner-subset hydration failed: {error}"));
+            assert_eq!(
+                winner[0].metadata, full[0].metadata,
+                "{label}: subset hydration must restore the winner's metadata",
+            );
+
+            engine
+                .hydrate_fusion_metadata(cx, &mut candidates)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: hydration failed: {error}"));
+            for (rank, (candidate, expected)) in candidates.iter().zip(&full).enumerate() {
+                assert_eq!(
+                    candidate.metadata, expected.metadata,
+                    "{label}: rank {rank} hydrated metadata must equal the full path",
+                );
+                assert_eq!(
+                    candidate.doc_id, expected.doc_id,
+                    "{label}: rank {rank} hydration must not reorder candidates",
+                );
+                assert_eq!(
+                    candidate.score.to_bits(),
+                    expected.score.to_bits(),
+                    "{label}: rank {rank} hydration must not perturb scores",
+                );
+            }
+
+            // A winner that reached fusion from the semantic arm alone carries
+            // no lexical score; hydration must ignore it rather than invent
+            // metadata for a document it never retrieved.
+            let mut semantic_only = vec![candidates[0].clone()];
+            semantic_only[0].metadata = None;
+            semantic_only[0].lexical_score = None;
+            semantic_only[0].source = ScoreSource::SemanticFast;
+            engine
+                .hydrate_fusion_metadata(cx, &mut semantic_only)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: semantic-only hydration failed: {error}"));
+            assert!(
+                semantic_only[0].metadata.is_none(),
+                "{label}: hydration must ignore winners with no lexical score",
+            );
+
+            candidates
+        }
+
+        let revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let mut subject = QuillSubject::in_memory(e55_config(), "e410-fusion-subject", false)
+            .expect("E4.10 fusion Quill subject");
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, false)
+            .expect("E4.10 fusion Tantivy oracle");
+        // Three documents match `rust` at distinct (tf, |d|) pairs so the
+        // ranking is total, and each carries different stored metadata so a
+        // mis-keyed hydration cannot pass by accident.
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new("doc-1", "rust ownership and borrowing")
+                .with_title("rust guide")
+                .with_metadata("lang", "rust")
+                .with_metadata("kind", "guide"),
+            frankensearch_core::IndexableDocument::new(
+                "doc-2",
+                "rust rust rust async runtimes and executors",
+            )
+            .with_title("concurrency")
+            .with_metadata("lang", "rust"),
+            frankensearch_core::IndexableDocument::new("doc-3", "python data pipelines")
+                .with_title("etl")
+                .with_metadata("lang", "python"),
+            frankensearch_core::IndexableDocument::new("doc-4", "rust embedded systems")
+                .with_title("no_std"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            subject
+                .claim_fresh_campaign()
+                .expect("claim E4.10 fusion subject campaign");
+            subject
+                .index_mut()
+                .expect("E4.10 fusion subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 fusion subject corpus");
+            subject
+                .index_mut()
+                .expect("E4.10 fusion subject index")
+                .commit(&cx)
+                .await
+                .expect("commit E4.10 fusion subject corpus");
+            subject
+                .mark_committed()
+                .expect("publish E4.10 fusion subject campaign");
+
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim E4.10 fusion oracle campaign");
+            oracle
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 fusion oracle corpus");
+            oracle
+                .mark_committed()
+                .expect("publish E4.10 fusion oracle campaign");
+
+            let quill_candidates = assert_deferred_envelope(
+                &cx,
+                subject.index().expect("E4.10 fusion subject index"),
+                "quill",
+            )
+            .await;
+            let oracle_candidates =
+                assert_deferred_envelope(&cx, oracle.index(), "tantivy-oracle").await;
+
+            assert_eq!(
+                quill_candidates
+                    .iter()
+                    .map(|result| result.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                oracle_candidates
+                    .iter()
+                    .map(|result| result.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                "deferred candidate ranking must agree across engines",
+            );
+            for (rank, (quill, tantivy)) in
+                quill_candidates.iter().zip(&oracle_candidates).enumerate()
+            {
+                assert_eq!(
+                    quill.metadata, tantivy.metadata,
+                    "rank {rank} ({}): hydrated metadata must agree across engines",
+                    quill.doc_id,
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn doclen_and_raw_stats_match_tantivy_before_and_after_delete() {
