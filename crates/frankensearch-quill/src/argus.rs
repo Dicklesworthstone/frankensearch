@@ -2516,6 +2516,43 @@ impl<'a> ReferenceScorer<'a> {
         let ScorerNode::Union(union) = &self.node else {
             return Ok(false);
         };
+        // A group's remaining documents are NOT `union.active`. The group is
+        // itself a buffered union that has already scored a window and drained
+        // the corresponding children, so its remaining set is the union of
+        // three disjoint parts. Enumerating only the third silently drops the
+        // first two from the root's candidate set (`bd-bt2t`).
+
+        // (1) The document the group is currently positioned on.
+        if let Some(doc) = union.current
+            && u64::from(doc) < horizon_end
+        {
+            docs.push(doc);
+        }
+
+        // (2) Buffered residue: scored but not yet consumed by `next()`.
+        // Covers [group window_start, group horizon).
+        if let Some(window_start) = union.window_start {
+            for (offset, score) in union
+                .score_window
+                .iter()
+                .enumerate()
+                .skip(union.scan_offset)
+            {
+                if score.is_none() {
+                    continue;
+                }
+                let doc = u64::from(window_start).saturating_add(offset as u64);
+                if doc >= horizon_end {
+                    break;
+                }
+                docs.push(u32::try_from(doc).map_err(|_| {
+                    ArgusError::CursorInvariant("buffered union residue docid does not fit u32")
+                })?);
+            }
+        }
+
+        // (3) Live children, which the group's own fill already advanced to at
+        // least its horizon — so this cannot overlap (2).
         for child in &union.active {
             let Some(mut cursor) = child.competitive_term_cursor() else {
                 return Ok(false);
@@ -3678,6 +3715,20 @@ struct BufferedUnionScorer<'a> {
     current_score: f32,
     segment_num_docs: u32,
     pruning_stats: UnionPruningStats,
+    /// Whole-group score ceiling captured once at construction, before the
+    /// first refill drains any child into [`Self::score_window`].
+    ///
+    /// This must not be recomputed from [`Self::active`]: a group whose
+    /// postings all land inside one `UNION_HORIZON` window has an empty
+    /// `active` immediately after construction, yet its buffered residue can
+    /// still realize scores. A sum over *all* original children stays a valid
+    /// upper bound for any surviving subset — looser as the group drains,
+    /// never lower than a realized score, which is the rank-safety
+    /// precondition the grouped candidate path relies on (`bd-bt2t`).
+    ///
+    /// `None` when any original child was not a bounded direct term, so
+    /// callers fail closed for the whole lifetime of the group.
+    group_ceiling: Option<f32>,
 }
 
 impl<'a> BufferedUnionScorer<'a> {
@@ -3692,6 +3743,20 @@ impl<'a> BufferedUnionScorer<'a> {
                 count: UNION_HORIZON,
             })?;
         score_window.resize(UNION_HORIZON, None);
+        // Capture the whole-group ceiling from the original children, before
+        // the refill below drains any of them into the score window.
+        let group_ceiling = if scorers
+            .iter()
+            .all(ReferenceScorer::competitive_is_direct_term)
+        {
+            conservative_optional_bound_sum(
+                scorers
+                    .iter()
+                    .map(ReferenceScorer::competitive_score_upper_bound),
+            )
+        } else {
+            None
+        };
         let mut scorer = Self {
             active: scorers,
             score_window,
@@ -3701,6 +3766,7 @@ impl<'a> BufferedUnionScorer<'a> {
             current_score: 0.0,
             segment_num_docs,
             pruning_stats: UnionPruningStats::default(),
+            group_ceiling,
         };
         if scorer.refill()? {
             scorer.advance_buffered();
@@ -3749,20 +3815,19 @@ impl<'a> BufferedUnionScorer<'a> {
     /// ceiling is rounded outward and never falls below a realized group score
     /// — a rank-safety precondition for the follow-up grouped candidate path.
     ///
-    /// NOTE (`bd-bt2t`): returning `None` once `active` has drained is currently
-    /// load-bearing for CORRECTNESS, not just a conservative default — it is the
-    /// only thing keeping [`Self::group_competitive_docs`] from being reached in
-    /// a state where it silently enumerates zero documents. Do not "fix" this to
-    /// use a construction-time cache without fixing that consumer first.
-    fn group_upper_bound(&self) -> Option<f32> {
-        if self.active.is_empty() {
-            return None;
-        }
-        conservative_optional_bound_sum(
-            self.active
-                .iter()
-                .map(ReferenceScorer::competitive_score_upper_bound),
-        )
+    /// Reads the construction-time [`Self::group_ceiling`] rather than summing
+    /// over `active`. `active` is NOT the group's remaining-work set: a group
+    /// whose postings all fall inside one window drains to empty at
+    /// construction while its scores live on in `score_window`, so a live sum
+    /// would report `None` for a group that can still realize hits — the
+    /// `max_score_windows: 0` regression in `bd-bt2t`.
+    ///
+    /// Safe to consume only because [`ReferenceScorer::group_competitive_docs`]
+    /// now enumerates buffered residue alongside live cursors. Before that fix
+    /// this returning `Some` for a drained group meant silently dropping its
+    /// documents from the top-k; the two changes must stay together.
+    const fn group_upper_bound(&self) -> Option<f32> {
+        self.group_ceiling
     }
 
     fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
@@ -5462,6 +5527,120 @@ mod tests {
             offset = end;
         }
         ReferenceScorer::boolean(outer)
+    }
+
+    /// The drained-group pin (`bd-bt2t`). An ESSENTIAL group whose postings all
+    /// fall inside one `UNION_HORIZON` window drains to an empty `active` and
+    /// carries its remaining documents as buffered residue instead. Candidate
+    /// discovery must enumerate that residue; enumerating only `active` reports
+    /// the group as having no documents in the window and the root silently
+    /// drops them from the top-k.
+    ///
+    /// This case CANNOT be pinned by `grouped_max_score_matches_exhaustive_and_prunes`:
+    /// that fixture runs at k=1 where the dropped documents tie the incumbent
+    /// at exactly `2e8` (the ~1.0 contribution is below the f32 ULP of ~16 at
+    /// that magnitude) and lose the ascending-docid tie-break anyway — so
+    /// deleting them changes nothing observable, and a broken fix passes. Here
+    /// the drained group's documents must WIN the top-k outright, so losing
+    /// them changes both the ranking and the hit count.
+    #[test]
+    fn grouped_max_score_drained_essential_group_keeps_its_documents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 8_192;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        // group0 = terms {A, B, C}, group1 = terms {D, E}.
+        //   A holds the early docs 0/1/2 and fills the k=3 heap in window 0,
+        //     establishing a cutoff that only group0 can beat.
+        //   B and C hold 5000/5001/5002. When the root advances group0 past the
+        //     first horizon, group0 refills onto [5000, 9096) where B and C both
+        //     exhaust inside the window: active EMPTY, current = 5000, residue
+        //     = {5001, 5002}. That is the state under test.
+        //   D and E (docs 6000/6001, unit boost) keep group1 non-essential, so
+        //     the window genuinely prunes rather than degenerating to exhaustive.
+        let rows_by_term = vec![
+            vec![Posting::new(0, 1), Posting::new(1, 1), Posting::new(2, 1)],
+            vec![
+                Posting::new(5_000, 1),
+                Posting::new(5_001, 1),
+                Posting::new(5_002, 1),
+            ],
+            vec![
+                Posting::new(5_000, 1),
+                Posting::new(5_001, 1),
+                Posting::new(5_002, 1),
+            ],
+            vec![Posting::new(6_000, 1)],
+            vec![Posting::new(6_001, 1)],
+        ];
+        let boosts = [1.0e8, 1.0e8, 1.0e8, 1.0, 1.0];
+        let group_sizes = [3_usize, 2_usize];
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut oracle = sealed_grouped_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+            &group_sizes,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(3, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_grouped_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+            &group_sizes,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(3, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let stats = candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_hits = candidate_collector.finish()?.hits;
+
+        // The drained group's documents outscore the heap incumbents 2:1, so
+        // losing the residue would change the ranking AND shrink the hit count.
+        assert_eq!(
+            oracle_hits
+                .iter()
+                .map(|hit| hit.global_docid)
+                .collect::<Vec<_>>(),
+            vec![5_000, 5_001, 5_002],
+            "exhaustive top-3 must be the drained group's documents",
+        );
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert!(
+            stats.max_score_windows >= 1,
+            "grouped MaxScore should prune at least one window (got {stats:?})"
+        );
+        Ok(())
     }
 
     #[test]
@@ -8835,6 +9014,13 @@ mod tests {
         Ok(())
     }
 
+    // Uses `frankensearch_core::bench_support`, which is feature-gated. This
+    // compiled on default features only by accident: an unconditional
+    // `frankensearch-lexical` dev-dependency carrying `bench-internals`
+    // unified `frankensearch-core/bench-internals` on for every Quill test
+    // build. Once that dependency became optional the free ride ended, so the
+    // gate is now declared where the dependency actually is (bd-552b).
+    #[cfg(feature = "bench-internals")]
     #[test]
     #[ignore = "remote-only E4.4 disjunction performance profile"]
     fn e44_disjunction_profile_100k_and_1m() -> Result<(), Box<dyn std::error::Error>> {
