@@ -299,8 +299,8 @@ pub use frankensearch_embed::model_registry::{EmbedderRegistry, RegisteredEmbedd
 // ─── Vector index (always available) ────────────────────────────────────────
 
 pub use frankensearch_index::{
-    InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex, TwoTierIndexBuilder, VectorIndex,
-    VectorIndexWriter,
+    InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex, TwoTierIndexBuilder,
+    TwoTierIndexPaths, VectorIndex, VectorIndexWriter,
 };
 
 #[cfg(feature = "ann")]

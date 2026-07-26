@@ -553,6 +553,112 @@ pub enum QueryParserConfigError {
     },
 }
 
+/// A posting-list capability an operator needs from every field it names.
+///
+/// Centralizing this (`bd-vmpb`) keeps capability knowledge in one table rather
+/// than scattering `positions: true` special cases through lowering, so a new
+/// operator cannot silently bypass the check: it must declare what it reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexCapability {
+    /// The operator reads a position list, so the field must be indexed with
+    /// `positions: true`.
+    Positions,
+}
+
+impl fmt::Display for IndexCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Positions => formatter.write_str("positions"),
+        }
+    }
+}
+
+/// A query names an operator the index cannot serve on that field.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum QueryCapabilityError {
+    /// A position-dependent operator named a field indexed without positions.
+    #[error(
+        "operator {operator} requires {capability} on field {field} of schema {schema}, \
+         which is indexed without them"
+    )]
+    PositionsRequired {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Field the operator named, by schema name where resolvable.
+        field: String,
+        /// Operator that requires the capability.
+        operator: QueryExplanation,
+        /// Capability the operator requires.
+        capability: IndexCapability,
+    },
+}
+
+/// Capabilities `query` requires that `schema` does not provide.
+///
+/// Position-independent operators — `Term`, `Range`, `Set`, `Glob`, `Boolean`,
+/// `Boost`, `All`, `Empty` — never read a position list and are therefore valid
+/// against a positionless index, matching and ranking identically to a
+/// positioned one over the same documents. Only `Phrase` consumes positions.
+///
+/// A single-term phrase is exempt on purpose: it degenerates to a term match
+/// and reads no positions, which is the same rule lowering already applies.
+///
+/// # Errors
+///
+/// Returns [`QueryCapabilityError::PositionsRequired`] naming the schema, the
+/// field, and the operator — never a bare "unsupported query".
+pub fn validate_index_capabilities(
+    query: &Query,
+    schema: SchemaDescriptor,
+) -> Result<(), QueryCapabilityError> {
+    match query {
+        // Position-independent: nothing to check.
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => Ok(()),
+        Query::Phrase { fields, terms, .. } => {
+            if terms.len() < 2 {
+                return Ok(());
+            }
+            for field in fields {
+                let descriptor = schema
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.id == field.field_id);
+                let positioned = matches!(
+                    descriptor.map(|descriptor| descriptor.kind),
+                    Some(FieldKind::Text {
+                        positions: true,
+                        ..
+                    })
+                );
+                if !positioned {
+                    return Err(QueryCapabilityError::PositionsRequired {
+                        schema: schema.name,
+                        field: descriptor.map_or_else(
+                            || format!("#{}", field.field_id),
+                            |descriptor| descriptor.name.to_owned(),
+                        ),
+                        operator: QueryExplanation::Phrase,
+                        capability: IndexCapability::Positions,
+                    });
+                }
+            }
+            Ok(())
+        }
+        Query::Boolean { clauses, .. } => {
+            for clause in clauses {
+                validate_index_capabilities(&clause.query, schema)?;
+            }
+            Ok(())
+        }
+        Query::Boost { query, .. } => validate_index_capabilities(query, schema),
+    }
+}
+
 /// Shipping lenient parser for the default `[content, title^2]` expansion.
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultQueryParser {
@@ -648,11 +754,25 @@ fn required_default_field(
             field: name,
         });
     };
+    // Positions are deliberately NOT required here (`bd-vmpb`). A position-free
+    // text index is a valid, smaller, faster configuration: every
+    // position-independent operator — bare term, prefix, boolean, range, set,
+    // glob — matches and ranks identically with or without them, because none
+    // of them reads a position list. Requiring `positions: true` to *construct*
+    // the parser made a positionless schema unqueryable end to end, so
+    // `DefaultQueryParser::new` failed before any query could be parsed and the
+    // QG positions_off fixture aborted the whole matrix run.
+    //
+    // What a default field genuinely requires is the intended analyzer, so the
+    // term text a query produces matches the term text indexing produced.
+    // Position-dependent operators are rejected later and precisely, by
+    // [`validate_index_capabilities`], which names the offending field and
+    // operator instead of disabling the schema wholesale.
     if !matches!(
         field.kind,
         FieldKind::Text {
             analyzer: AnalyzerKind::FrankensearchDefault,
-            positions: true,
+            ..
         }
     ) {
         return Err(QueryParserConfigError::InvalidDefaultField {
@@ -5997,6 +6117,157 @@ mod tests {
         assert_eq!(negative[0].occur, Occur::MustNot);
     }
 
+    /// A position-free text schema is a valid, smaller index configuration.
+    /// Before `bd-vmpb` it was unqueryable end to end: `DefaultQueryParser::new`
+    /// refused to construct, so the QG `positions_off` fixture panicked and
+    /// aborted every QG-1 matrix run before any evidence could be written.
+    const POSITIONLESS_FIELDS: [FieldDescriptor; 2] = [
+        FieldDescriptor {
+            id: 0,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+    ];
+    const POSITIONLESS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "query-parser-positionless-test",
+        fields: &POSITIONLESS_FIELDS,
+    };
+
+    #[test]
+    fn positionless_default_fields_are_accepted_and_parse_position_independent_queries() {
+        let parser = DefaultQueryParser::new(POSITIONLESS_SCHEMA)
+            .expect("a positionless default-analyzed schema must bind a parser (bd-vmpb)");
+
+        // Every position-independent operator must parse AND clear the
+        // capability gate on a positionless index.
+        for query in [
+            "alpha",
+            "alpha beta",
+            "alpha OR beta",
+            "alpha AND beta",
+            "-alpha beta",
+            "content:alpha",
+            "alph*",
+        ] {
+            let parsed = parser.parse(query);
+            validate_index_capabilities(&parsed.query, POSITIONLESS_SCHEMA).unwrap_or_else(
+                |error| panic!("{query:?} is position-independent and must be servable: {error}"),
+            );
+        }
+    }
+
+    /// The capability gate rejects a phrase the *parser* cannot produce.
+    ///
+    /// Phrases reach lowering as ASTs too (`search_preparsed`-style entry
+    /// points construct `Query` directly), and that path has no parser
+    /// diagnostic in front of it, so the gate is what stands between a
+    /// positionless index and a phrase it cannot execute.
+    #[test]
+    fn capability_gate_rejects_a_constructed_phrase_on_positionless_fields() {
+        let phrase = Query::Phrase {
+            fields: vec![QueryField::new(0, 1.0)],
+            terms: vec![
+                PositionedTerm {
+                    position: 0,
+                    text: "alpha".to_owned(),
+                },
+                PositionedTerm {
+                    position: 1,
+                    text: "beta".to_owned(),
+                },
+            ],
+            slop: 0,
+            prefix: false,
+        };
+
+        let error = validate_index_capabilities(&phrase, POSITIONLESS_SCHEMA)
+            .expect_err("a multi-term phrase reads positions and cannot be served");
+        let QueryCapabilityError::PositionsRequired {
+            schema,
+            field,
+            operator,
+            capability,
+        } = error;
+        assert_eq!(schema, "query-parser-positionless-test");
+        // The error names the offending FIELD, not a bare "unsupported query".
+        assert_eq!(field, "content");
+        assert_eq!(operator, QueryExplanation::Phrase);
+        assert_eq!(capability, IndexCapability::Positions);
+
+        // Nesting must not launder it.
+        let nested = Query::Boolean {
+            clauses: vec![BooleanClause {
+                occur: Occur::Should,
+                query: phrase,
+            }],
+            operator: None,
+        };
+        assert!(validate_index_capabilities(&nested, POSITIONLESS_SCHEMA).is_err());
+    }
+
+    /// PINS A KNOWN GAP, it does not bless it (`bd-vmpb`).
+    ///
+    /// On a positionless schema the parser drops a multi-term phrase branch at
+    /// `query.rs:2681` and the whole query lowers to `Empty`, so the search
+    /// returns **nothing** and the only trace is a diagnostic the caller has to
+    /// go looking for. Silently matching nothing is worse than erroring: the
+    /// bead requires a typed `PositionsRequired` naming field and operator.
+    ///
+    /// This test exists so the current behaviour cannot change unnoticed while
+    /// that half of `bd-vmpb` is outstanding. When the parser surfaces the
+    /// capability failure to callers, invert it.
+    #[test]
+    fn positionless_schema_currently_drops_phrases_to_empty_with_only_a_diagnostic() {
+        let parser =
+            DefaultQueryParser::new(POSITIONLESS_SCHEMA).expect("bind positionless parser");
+        let parsed = parser.parse("\"alpha beta\"");
+
+        assert_eq!(
+            parsed.query,
+            Query::Empty,
+            "known gap: the phrase branch is dropped rather than reported"
+        );
+        assert!(
+            parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind
+                == QueryDiagnosticKind::UnsupportedField
+                && diagnostic.message.contains("without positions")),
+            "the drop must at least be diagnosed: {:?}",
+            parsed.diagnostics
+        );
+    }
+
+    #[test]
+    fn single_term_phrase_needs_no_positions() {
+        let parser =
+            DefaultQueryParser::new(POSITIONLESS_SCHEMA).expect("bind positionless parser");
+        let parsed = parser.parse("\"alpha\"");
+        // A one-term phrase degenerates to a term match and reads no position
+        // list, which is the same exemption lowering already applies.
+        validate_index_capabilities(&parsed.query, POSITIONLESS_SCHEMA)
+            .expect("a single-term phrase reads no positions");
+    }
+
+    #[test]
+    fn positioned_schema_still_serves_phrases() {
+        let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).expect("bind shipping parser");
+        let parsed = parser.parse("\"alpha beta\"");
+        validate_index_capabilities(&parsed.query, DEFAULT_SCHEMA)
+            .expect("positionful behaviour must be unchanged");
+    }
+
     #[test]
     fn schemas_without_both_default_fields_are_rejected() {
         assert!(matches!(
@@ -6004,13 +6275,17 @@ mod tests {
             Err(QueryParserConfigError::MissingDefaultField { field: "title", .. })
         ));
 
-        const NO_POSITIONS_FIELDS: [FieldDescriptor; 2] = [
+        // A default field with the WRONG ANALYZER is still rejected: query-time
+        // term text would not match the text indexing produced, so the schema
+        // genuinely cannot be served. Positions are a separate axis — see
+        // `positionless_default_fields_are_accepted` (`bd-vmpb`).
+        const WRONG_ANALYZER_FIELDS: [FieldDescriptor; 2] = [
             FieldDescriptor {
                 id: 0,
                 name: "content",
                 kind: FieldKind::Text {
-                    analyzer: Analyzer::FrankensearchDefault,
-                    positions: false,
+                    analyzer: Analyzer::CassHyphenNormalize,
+                    positions: true,
                 },
                 stored: true,
             },
@@ -6024,12 +6299,12 @@ mod tests {
                 stored: true,
             },
         ];
-        const NO_POSITIONS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
-            name: "query-parser-no-positions-test",
-            fields: &NO_POSITIONS_FIELDS,
+        const WRONG_ANALYZER_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+            name: "query-parser-wrong-analyzer-test",
+            fields: &WRONG_ANALYZER_FIELDS,
         };
         assert!(matches!(
-            DefaultQueryParser::new(NO_POSITIONS_SCHEMA),
+            DefaultQueryParser::new(WRONG_ANALYZER_SCHEMA),
             Err(QueryParserConfigError::InvalidDefaultField {
                 field: "content",
                 ..

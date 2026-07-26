@@ -17,7 +17,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use frankensearch_index::TwoTierIndex;
+use frankensearch_index::{TwoTierIndex, TwoTierIndexPaths};
 
 /// Sentinel file name written alongside indices after a successful build.
 pub const SENTINEL_FILENAME: &str = ".frankensearch_index_meta";
@@ -288,6 +288,37 @@ impl StalenessDetector for SentinelFileDetector {
 // Index cache
 // ---------------------------------------------------------------------------
 
+/// Retained constructor contract used for every cache reload.
+#[derive(Clone, Debug)]
+enum IndexOpenSpec {
+    Directory(PathBuf),
+    Explicit(TwoTierIndexPaths),
+}
+
+fn absolute_from(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+impl IndexOpenSpec {
+    fn open(&self, config: TwoTierConfig) -> SearchResult<TwoTierIndex> {
+        match self {
+            Self::Directory(dir) => TwoTierIndex::open(dir, config),
+            Self::Explicit(paths) => TwoTierIndex::open_with_paths(paths, config),
+        }
+    }
+
+    const fn explicit_paths(&self) -> Option<&TwoTierIndexPaths> {
+        match self {
+            Self::Directory(_) => None,
+            Self::Explicit(paths) => Some(paths),
+        }
+    }
+}
+
 /// Cached, atomically-replaceable wrapper around [`TwoTierIndex`].
 ///
 /// Uses [`Arc`] + [`RwLock`] for lock-free reads and atomic replacement.
@@ -315,8 +346,10 @@ pub struct IndexCache {
     inner: RwLock<Arc<TwoTierIndex>>,
     /// Staleness detection strategy.
     detector: Box<dyn StalenessDetector>,
-    /// Directory containing the index files.
-    dir: PathBuf,
+    /// How the index must be reopened after an on-disk update.
+    open_spec: IndexOpenSpec,
+    /// Directory containing the cache sentinel and other staleness state.
+    state_dir: PathBuf,
     /// Configuration for opening replacement indices.
     config: TwoTierConfig,
 }
@@ -335,17 +368,62 @@ impl IndexCache {
         config: TwoTierConfig,
         detector: Box<dyn StalenessDetector>,
     ) -> SearchResult<Self> {
-        let index = TwoTierIndex::open(dir, config.clone())?;
+        let current_dir = std::env::current_dir()?;
+        let state_dir = absolute_from(dir, &current_dir);
+        let open_spec = IndexOpenSpec::Directory(state_dir.clone());
+        let index = open_spec.open(config.clone())?;
         debug!(
             target: "frankensearch.cache",
-            dir = %dir.display(),
+            state_dir = %state_dir.display(),
             doc_count = index.doc_count(),
             "index cache opened"
         );
         Ok(Self {
             inner: RwLock::new(Arc::new(index)),
             detector,
-            dir: dir.to_path_buf(),
+            open_spec,
+            state_dir,
+            config,
+        })
+    }
+
+    /// Open an index cache from explicit consumer-owned artifact paths.
+    ///
+    /// `state_dir` remains the home for the cache sentinel and other staleness
+    /// metadata; index artifacts may use any paths accepted by
+    /// [`TwoTierIndex::open_with_paths`]. The explicit path contract is retained
+    /// and reused by every subsequent [`reload`](Self::reload). Relative
+    /// artifact and state paths are frozen against the current directory at
+    /// construction, so later process-directory changes cannot retarget a
+    /// reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`TwoTierIndex::open_with_paths`].
+    pub fn open_with_paths(
+        paths: TwoTierIndexPaths,
+        state_dir: &Path,
+        config: TwoTierConfig,
+        detector: Box<dyn StalenessDetector>,
+    ) -> SearchResult<Self> {
+        let current_dir = std::env::current_dir()?;
+        let paths = paths.into_absolute_from(&current_dir)?;
+        let state_dir = absolute_from(state_dir, &current_dir);
+        let open_spec = IndexOpenSpec::Explicit(paths);
+        let index = open_spec.open(config.clone())?;
+        debug!(
+            target: "frankensearch.cache",
+            state_dir = %state_dir.display(),
+            fast_index = %index.fast_index_path().display(),
+            quality_index = ?index.quality_index_path(),
+            doc_count = index.doc_count(),
+            "index cache opened from explicit paths"
+        );
+        Ok(Self {
+            inner: RwLock::new(Arc::new(index)),
+            detector,
+            open_spec,
+            state_dir,
             config,
         })
     }
@@ -378,12 +456,14 @@ impl IndexCache {
     ///
     /// Existing readers holding `Arc<TwoTierIndex>` from [`current()`](Self::current)
     /// are unaffected. The old index is dropped when its last `Arc` reference
-    /// goes out of scope.
+    /// goes out of scope. This does not rebind the cache's original directory
+    /// or explicit-path contract; a later [`reload`](Self::reload) always
+    /// reopens that retained contract.
     pub fn replace(&self, new_index: TwoTierIndex) {
         let mut guard = self.write_index();
         debug!(
             target: "frankensearch.cache",
-            dir = %self.dir.display(),
+            state_dir = %self.state_dir.display(),
             old_count = guard.doc_count(),
             new_count = new_index.doc_count(),
             "replacing cached index"
@@ -395,9 +475,10 @@ impl IndexCache {
     ///
     /// # Errors
     ///
-    /// Returns errors from `TwoTierIndex::open`.
+    /// Returns errors from the constructor represented by this cache's original
+    /// directory or explicit-path contract.
     pub fn reload(&self) -> SearchResult<()> {
-        let new_index = TwoTierIndex::open(&self.dir, self.config.clone())?;
+        let new_index = self.open_spec.open(self.config.clone())?;
         self.replace(new_index);
         Ok(())
     }
@@ -409,7 +490,7 @@ impl IndexCache {
     /// Returns errors from the staleness detector.
     pub fn check_staleness(&self) -> SearchResult<IndexStaleness> {
         let index = self.current();
-        self.detector.check(&self.dir, &index)
+        self.detector.check(&self.state_dir, &index)
     }
 
     /// Quick boolean staleness check.
@@ -419,13 +500,19 @@ impl IndexCache {
     /// Returns errors from the staleness detector.
     pub fn is_stale(&self) -> SearchResult<bool> {
         let index = self.current();
-        self.detector.is_stale(&self.dir, &index)
+        self.detector.is_stale(&self.state_dir, &index)
     }
 
-    /// Directory containing the index files.
+    /// Directory containing the cache sentinel and other staleness state.
     #[must_use]
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.state_dir
+    }
+
+    /// Explicit artifact paths retained for reloads, when configured.
+    #[must_use]
+    pub const fn index_paths(&self) -> Option<&TwoTierIndexPaths> {
+        self.open_spec.explicit_paths()
     }
 
     /// Reference to the current configuration.
@@ -440,7 +527,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_index::{
-        Quantization, TwoTierIndex, VECTOR_INDEX_FAST_FILENAME, VectorIndex,
+        Quantization, TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FAST_FILENAME, VectorIndex,
     };
 
     use super::*;
@@ -459,10 +546,14 @@ mod tests {
     }
 
     fn write_fast_index(dir: &Path, records: &[(&str, Vec<f32>)]) {
-        let dim = records.first().map_or(4, |(_, v)| v.len());
         let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index(&path, records);
+    }
+
+    fn write_index(path: &Path, records: &[(&str, Vec<f32>)]) {
+        let dim = records.first().map_or(4, |(_, v)| v.len());
         let mut writer =
-            VectorIndex::create_with_revision(&path, "potion-128M", "v1", dim, Quantization::F16)
+            VectorIndex::create_with_revision(path, "potion-128M", "v1", dim, Quantization::F16)
                 .expect("writer");
         for (doc_id, vec) in records {
             writer.write_record(doc_id, vec).expect("write");
@@ -794,6 +885,100 @@ mod tests {
     }
 
     #[test]
+    fn cache_explicit_paths_survive_update_and_reload() {
+        let state_dir = temp_dir("cache-explicit-reload");
+        let fast_path = state_dir.join("index-potion-4.fsvi");
+        write_index(&fast_path, &sample_records());
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let cache = IndexCache::open_with_paths(
+            paths.clone(),
+            &state_dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new()),
+        )
+        .expect("open explicit-path cache");
+        let old = cache.current();
+
+        assert_eq!(old.doc_count(), 3);
+        assert_eq!(old.fast_index_path(), fast_path);
+        assert_eq!(cache.index_paths(), Some(&paths));
+        assert!(!state_dir.join(VECTOR_INDEX_FAST_FILENAME).exists());
+
+        write_index(
+            &fast_path,
+            &[
+                ("doc-x", vec![1.0, 0.0, 0.0, 0.0]),
+                ("doc-y", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        cache.reload().expect("reload explicit path");
+
+        assert_eq!(old.doc_count(), 3);
+        assert_eq!(cache.current().doc_count(), 2);
+        assert_eq!(cache.current().fast_index_path(), fast_path);
+        assert!(!state_dir.join(VECTOR_INDEX_FAST_FILENAME).exists());
+    }
+
+    #[test]
+    fn cache_explicit_relative_paths_survive_cwd_change() {
+        const CHILD_ROOT_ENV: &str = "FRANKENSEARCH_RELATIVE_CACHE_TEST_ROOT";
+        const TEST_NAME: &str = "cache::tests::cache_explicit_relative_paths_survive_cwd_change";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let original_dir = root.join("original");
+            let later_dir = root.join("later");
+            std::env::set_current_dir(&original_dir).expect("enter original child cwd");
+
+            let relative_fast_path = PathBuf::from("index-potion-4.fsvi");
+            write_index(&original_dir.join(&relative_fast_path), &sample_records());
+            let cache = IndexCache::open_with_paths(
+                TwoTierIndexPaths::new(&relative_fast_path),
+                Path::new("."),
+                TwoTierConfig::default(),
+                Box::new(SentinelFileDetector::new()),
+            )
+            .expect("open relative-path cache");
+
+            let retained_paths = cache.index_paths().expect("retained explicit paths");
+            assert!(retained_paths.fast_index().is_absolute());
+            assert!(cache.dir().is_absolute());
+            assert_eq!(
+                retained_paths.fast_index(),
+                original_dir.join(&relative_fast_path)
+            );
+
+            std::env::set_current_dir(&later_dir).expect("enter later child cwd");
+            write_index(
+                retained_paths.fast_index(),
+                &[
+                    ("doc-x", vec![1.0, 0.0, 0.0, 0.0]),
+                    ("doc-y", vec![0.0, 1.0, 0.0, 0.0]),
+                ],
+            );
+            cache.reload().expect("reload after cwd change");
+            assert_eq!(cache.current().doc_count(), 2);
+            assert_eq!(
+                cache.current().fast_index_path(),
+                original_dir.join(relative_fast_path)
+            );
+            return;
+        }
+
+        let root = temp_dir("cache-relative-cwd");
+        std::fs::create_dir_all(root.join("original")).expect("create original cwd");
+        std::fs::create_dir_all(root.join("later")).expect("create later cwd");
+        let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ROOT_ENV, &root)
+            .status()
+            .expect("run isolated cwd-change child");
+        assert!(status.success(), "cwd-change child failed: {status}");
+    }
+
+    #[test]
     fn cache_check_staleness_no_sentinel() {
         let dir = temp_dir("cache-stale");
         write_fast_index(&dir, &sample_records());
@@ -853,7 +1038,15 @@ mod tests {
             Box::new(SentinelFileDetector::new()),
         )
         .expect_err("should fail");
-        assert!(matches!(err, SearchError::IndexNotFound { .. }));
+        let error_debug = format!("{err:?}");
+        let paths = if let SearchError::IndexCandidatesNotFound { paths } = err {
+            paths
+        } else {
+            Vec::new()
+        };
+        assert_eq!(paths.len(), 2, "unexpected error: {error_debug}");
+        assert!(paths.iter().any(|path| path.ends_with("vector.fast.idx")));
+        assert!(paths.iter().any(|path| path.ends_with("vector.idx")));
     }
 
     #[test]

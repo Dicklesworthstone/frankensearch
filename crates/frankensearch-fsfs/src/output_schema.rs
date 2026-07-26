@@ -740,7 +740,9 @@ pub const fn error_code_for(err: &frankensearch_core::SearchError) -> &'static s
         SearchError::IndexCorrupted { .. } => OutputErrorCode::INDEX_CORRUPTED,
         SearchError::IndexVersionMismatch { .. } => OutputErrorCode::INDEX_VERSION_MISMATCH,
         SearchError::DimensionMismatch { .. } => OutputErrorCode::DIMENSION_MISMATCH,
-        SearchError::IndexNotFound { .. } => OutputErrorCode::INDEX_NOT_FOUND,
+        SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
+            OutputErrorCode::INDEX_NOT_FOUND
+        }
         SearchError::QueryParseError { .. } => OutputErrorCode::QUERY_PARSE_ERROR,
         SearchError::SearchTimeout { .. } => OutputErrorCode::SEARCH_TIMEOUT,
         SearchError::FederatedInsufficientResponses { .. } => {
@@ -832,6 +834,17 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
              Expected index at: {}",
             path.display()
         )),
+        SearchError::IndexCandidatesNotFound { paths } => {
+            let searched = paths
+                .iter()
+                .map(|path| format!("  - {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!(
+                "Run: fsfs index <directory>\n\
+                 No vector index exists at any searched path:\n{searched}"
+            ))
+        }
         SearchError::IndexCorrupted { path, .. } => Some(format!(
             "Run: fsfs index --force <directory>\n\
              This will rebuild the index at: {}",
@@ -905,7 +918,7 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
              Re-downloading ensures integrity."
                 .to_owned(),
         ),
-        SearchError::IndexNotFound { .. } => Some(
+        SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => Some(
             "No search index exists yet. You need to index a directory of files \
              before you can search."
                 .to_owned(),
@@ -1645,6 +1658,25 @@ mod tests {
         };
         let out = output_error_from(&err);
         assert!(out.field.is_none());
+    }
+
+    #[test]
+    fn output_error_from_candidate_paths_names_every_attempt() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::IndexCandidatesNotFound {
+            paths: vec![
+                PathBuf::from("/data/vector.fast.idx"),
+                PathBuf::from("/data/vector.idx"),
+            ],
+        };
+        let out = output_error_from(&err);
+        assert_eq!(out.code, OutputErrorCode::INDEX_NOT_FOUND);
+        assert!(out.message.contains("/data/vector.fast.idx"));
+        assert!(out.message.contains("/data/vector.idx"));
+        let suggestion = out.suggestion.expect("candidate-path suggestion");
+        assert!(suggestion.contains("/data/vector.fast.idx"));
+        assert!(suggestion.contains("/data/vector.idx"));
     }
 
     // ─── Helpful Error Messages (bd-2w7x.31) ──────────────────────────

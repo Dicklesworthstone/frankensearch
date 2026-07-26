@@ -96,8 +96,8 @@ pub use simd::{
     quantize_f16_slab_to_i8_generic,
 };
 pub use two_tier::{
-    TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
-    VECTOR_INDEX_QUALITY_FILENAME,
+    TwoTierIndex, TwoTierIndexBuilder, TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME,
+    VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
 #[cfg(feature = "ann")]
 pub use two_tier::{VECTOR_ANN_FAST_FILENAME, VECTOR_ANN_QUALITY_FILENAME};

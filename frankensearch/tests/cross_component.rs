@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use frankensearch::TwoTierIndexPaths;
 use frankensearch_core::canonicalize::DefaultCanonicalizer;
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
 use frankensearch_core::error::SearchError;
@@ -58,23 +59,30 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn write_fast_index(dir: &std::path::Path, records: &[(&str, Vec<f32>)]) {
-    let dim = records.first().map_or(4, |(_, v)| v.len());
     let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
-    let mut writer =
-        VectorIndex::create_with_revision(&path, "potion-128M", "v1", dim, Quantization::F16)
-            .expect("create writer");
-    for (doc_id, vec) in records {
-        writer.write_record(doc_id, vec).expect("write record");
-    }
-    writer.finish().expect("finish index");
+    write_index_at(&path, "potion-128M", "v1", records);
 }
 
 fn write_quality_index(dir: &std::path::Path, records: &[(&str, Vec<f32>)]) {
-    let dim = records.first().map_or(4, |(_, v)| v.len());
     let path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-    let mut writer =
-        VectorIndex::create_with_revision(&path, "MiniLM-L6-v2", "v1", dim, Quantization::F16)
-            .expect("create writer");
+    write_index_at(&path, "MiniLM-L6-v2", "v1", records);
+}
+
+fn write_index_at(
+    path: &std::path::Path,
+    embedder_id: &str,
+    embedder_revision: &str,
+    records: &[(&str, Vec<f32>)],
+) {
+    let dim = records.first().map_or(4, |(_, vector)| vector.len());
+    let mut writer = VectorIndex::create_with_revision(
+        path,
+        embedder_id,
+        embedder_revision,
+        dim,
+        Quantization::F16,
+    )
+    .expect("create writer");
     for (doc_id, vec) in records {
         writer.write_record(doc_id, vec).expect("write record");
     }
@@ -213,6 +221,57 @@ fn two_tier_index_fast_and_quality_alignment() {
         .expect("quality scores");
     // shared-1 should have highest quality score (its quality embedding is close to query)
     assert!(quality_scores[0].unwrap() > quality_scores[1].unwrap());
+}
+
+#[test]
+fn embedder_named_explicit_paths_search_and_reopen_without_copying() {
+    let dir = temp_dir("embedder-explicit-layout");
+    let fast_path = dir.join("index-fnv1a-384.fsvi");
+    let quality_path = dir.join("index-minilm-384.fsvi");
+    let mut fast_a = vec![0.0; 384];
+    let mut fast_b = vec![0.0; 384];
+    fast_a[0] = 1.0;
+    fast_b[1] = 1.0;
+    let mut quality_a = vec![0.0; 384];
+    let mut quality_b = vec![0.0; 384];
+    quality_a[2] = 1.0;
+    quality_b[3] = 1.0;
+    write_index_at(
+        &fast_path,
+        "fnv1a-384",
+        "hash-fnv1a-modular-v1",
+        &[("doc-a", fast_a), ("doc-b", fast_b)],
+    );
+    write_index_at(
+        &quality_path,
+        "minilm-384",
+        "native-minilm-v1:test",
+        &[("doc-a", quality_a), ("doc-b", quality_b)],
+    );
+    let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+
+    let index =
+        TwoTierIndex::open_with_paths(&paths, TwoTierConfig::default()).expect("first open");
+    let mut query = vec![0.0; 384];
+    query[0] = 1.0;
+    let hits = index
+        .search_fast(&query, 2)
+        .expect("search custom fast tier");
+    assert_eq!(hits[0].doc_id, "doc-a");
+    assert_eq!(index.fast_embedder_id(), "fnv1a-384");
+    assert_eq!(index.quality_embedder_id(), Some("minilm-384"));
+    drop(index);
+
+    let reopened = TwoTierIndex::open_with_paths(&paths, TwoTierConfig::default())
+        .expect("reopen exact paths");
+    assert_eq!(reopened.fast_index_path(), fast_path);
+    assert_eq!(reopened.quality_index_path(), Some(quality_path.as_path()));
+    assert_eq!(
+        reopened.search_fast(&query, 2).expect("search")[0].doc_id,
+        "doc-a"
+    );
+    assert!(!dir.join(VECTOR_INDEX_FAST_FILENAME).exists());
+    assert!(!dir.join(VECTOR_INDEX_QUALITY_FILENAME).exists());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -688,10 +747,15 @@ fn index_not_found_propagates_through_cache() {
         Box::new(SentinelFileDetector::new()),
     )
     .expect_err("should fail");
-    assert!(
-        matches!(err, SearchError::IndexNotFound { .. }),
-        "expected IndexNotFound, got: {err:?}"
-    );
+    let error_debug = format!("{err:?}");
+    let paths = if let SearchError::IndexCandidatesNotFound { paths } = err {
+        paths
+    } else {
+        Vec::new()
+    };
+    assert_eq!(paths.len(), 2, "unexpected error: {error_debug}");
+    assert!(paths.iter().any(|path| path.ends_with("vector.fast.idx")));
+    assert!(paths.iter().any(|path| path.ends_with("vector.idx")));
 }
 
 #[test]

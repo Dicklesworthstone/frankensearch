@@ -874,11 +874,18 @@ fn hnsw_save_lock_path(path: &Path) -> SearchResult<PathBuf> {
     Ok(parent.join(HNSW_SAVE_LOCK_DIRECTORY).join(lock_name))
 }
 
-fn acquire_hnsw_save_lock(path: &Path) -> SearchResult<std::fs::File> {
-    let lock_path = hnsw_save_lock_path(path)?;
+pub(crate) fn hnsw_save_lock_artifact_path(path: &Path) -> SearchResult<PathBuf> {
+    hnsw_save_lock_path(path)
+}
+
+pub(crate) fn materialize_hnsw_save_lock_artifact(lock_path: &Path) -> SearchResult<PathBuf> {
     let lock_directory = lock_path
         .parent()
-        .ok_or_else(|| ann_corrupted(path, "HNSW save lock has no parent directory"))?;
+        .ok_or_else(|| ann_corrupted(lock_path, "HNSW save lock has no parent directory"))?;
+    let artifact_parent = lock_directory
+        .parent()
+        .ok_or_else(|| ann_corrupted(lock_path, "HNSW save lock directory has no parent"))?;
+    std::fs::create_dir_all(artifact_parent)?;
     match std::fs::create_dir(lock_directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -907,6 +914,40 @@ fn acquire_hnsw_save_lock(path: &Path) -> SearchResult<std::fs::File> {
             lock_directory.display()
         ))));
     }
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(SearchError::Io(std::io::Error::other(format!(
+                "persistent HNSW save lock '{}' is not a local regular file",
+                lock_path.display()
+            ))));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(SearchError::Io(error)),
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open persistent HNSW save lock '{}': {error}",
+                    lock_path.display()
+                ),
+            ))
+        })?;
+    lock.sync_all().map_err(SearchError::Io)?;
+    sync_hnsw_directory(lock_directory)?;
+    std::fs::canonicalize(lock_path).map_err(SearchError::Io)
+}
+
+fn acquire_hnsw_save_lock(path: &Path) -> SearchResult<std::fs::File> {
+    let lock_path = hnsw_save_lock_path(path)?;
+    let _identity = materialize_hnsw_save_lock_artifact(&lock_path)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

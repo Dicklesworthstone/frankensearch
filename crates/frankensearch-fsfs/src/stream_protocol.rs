@@ -273,7 +273,8 @@ pub const fn failure_category_for_error(err: &SearchError) -> StreamFailureCateg
         SearchError::IndexCorrupted { .. }
         | SearchError::IndexVersionMismatch { .. }
         | SearchError::DimensionMismatch { .. }
-        | SearchError::IndexNotFound { .. } => StreamFailureCategory::Index,
+        | SearchError::IndexNotFound { .. }
+        | SearchError::IndexCandidatesNotFound { .. } => StreamFailureCategory::Index,
         SearchError::EmbedderUnavailable { .. }
         | SearchError::EmbeddingFailed { .. }
         | SearchError::ModelNotFound { .. }
@@ -1017,6 +1018,12 @@ mod tests {
         assert_eq!(
             failure_category_for_error(&SearchError::IndexNotFound {
                 path: "test".into(),
+            }),
+            StreamFailureCategory::Index
+        );
+        assert_eq!(
+            failure_category_for_error(&SearchError::IndexCandidatesNotFound {
+                paths: vec!["vector.fast.idx".into(), "vector.idx".into()],
             }),
             StreamFailureCategory::Index
         );

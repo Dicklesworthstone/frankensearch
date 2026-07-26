@@ -882,6 +882,7 @@ const fn search_error_kind(error: &SearchError) -> &'static str {
         SearchError::IndexVersionMismatch { .. } => "index_version_mismatch",
         SearchError::DimensionMismatch { .. } => "dimension_mismatch",
         SearchError::IndexNotFound { .. } => "index_not_found",
+        SearchError::IndexCandidatesNotFound { .. } => "index_not_found",
         SearchError::QueryParseError { .. } => "query_parse_error",
         SearchError::SearchTimeout { .. } => "search_timeout",
         SearchError::FederatedInsufficientResponses { .. } => "federated_insufficient_responses",
@@ -1651,6 +1652,12 @@ mod tests {
                 found: 0,
             }),
             "dimension_mismatch"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::IndexCandidatesNotFound {
+                paths: vec!["vector.fast.idx".into(), "vector.idx".into()],
+            }),
+            "index_not_found"
         );
         assert_eq!(
             search_error_kind(&SearchError::DurabilityDisabled),

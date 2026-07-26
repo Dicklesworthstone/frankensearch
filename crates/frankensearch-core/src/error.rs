@@ -6,7 +6,8 @@ use std::path::PathBuf;
 /// The `TwoTierSearcher` catches transient errors and degrades gracefully: fast embedding
 /// failures can still yield lexical-only initial results when lexical retrieval is available,
 /// `RerankFailed` skips reranking, and `SearchTimeout` yields initial results.
-/// Only `IndexNotFound` and `InvalidConfig` prevent search from starting.
+/// Only `IndexNotFound`, `IndexCandidatesNotFound`, and `InvalidConfig`
+/// prevent search from starting.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     // === Embedding errors ===
@@ -91,6 +92,15 @@ pub enum SearchError {
     IndexNotFound {
         /// Expected path.
         path: PathBuf,
+    },
+
+    /// No vector index file exists at any of the candidate paths.
+    #[error(
+        "Vector index not found at any candidate path: {paths:?}. Run index_documents() first, or check FRANKENSEARCH_DATA_DIR."
+    )]
+    IndexCandidatesNotFound {
+        /// Candidate paths, in lookup order.
+        paths: Vec<PathBuf>,
     },
 
     // === Search errors ===
@@ -248,6 +258,16 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("index_documents()"), "should suggest recovery");
+
+        let err = SearchError::IndexCandidatesNotFound {
+            paths: vec![
+                PathBuf::from("/tmp/vector.fast.idx"),
+                PathBuf::from("/tmp/vector.idx"),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/vector.fast.idx"));
+        assert!(msg.contains("/tmp/vector.idx"));
 
         let err = SearchError::DimensionMismatch {
             expected: 256,

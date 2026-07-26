@@ -163,9 +163,9 @@ pub const fn classify_search_error(error: &SearchError) -> DegradationFailureKin
         SearchError::EmbedderUnavailable { .. }
         | SearchError::ModelNotFound { .. }
         | SearchError::ModelLoadFailed { .. } => DegradationFailureKind::MissingQualityModel,
-        SearchError::InvalidConfig { .. } | SearchError::IndexNotFound { .. } => {
-            DegradationFailureKind::CacheMiss
-        }
+        SearchError::InvalidConfig { .. }
+        | SearchError::IndexNotFound { .. }
+        | SearchError::IndexCandidatesNotFound { .. } => DegradationFailureKind::CacheMiss,
         SearchError::EmbeddingFailed { .. }
         | SearchError::RerankerUnavailable { .. }
         | SearchError::RerankFailed { .. }
@@ -397,6 +397,23 @@ mod tests {
                 .is_some_and(|text| text.contains("Search timed out"))
         );
         assert!(advice.preserves_initial_results);
+    }
+
+    #[test]
+    fn candidate_path_miss_is_classified_as_cache_miss() {
+        let error = SearchError::IndexCandidatesNotFound {
+            paths: vec!["vector.fast.idx".into(), "vector.idx".into()],
+        };
+        let advice = advice_for_search_error("index discovery", None, &error);
+
+        assert_eq!(advice.failure, DegradationFailureKind::CacheMiss);
+        assert_eq!(advice.reason_code, "degrade.advice.cache_miss");
+        assert!(
+            advice
+                .original_error
+                .as_deref()
+                .is_some_and(|text| text.contains("vector.fast.idx"))
+        );
     }
 
     #[test]

@@ -13409,7 +13409,13 @@ impl FsfsRuntime {
                     watcher.stop().await;
                     self.finalize_shutdown(cx, reason, Some(&vi_handle)).await?;
                 }
-                Err(ref error) if matches!(error, SearchError::IndexNotFound { .. }) => {
+                Err(ref error)
+                    if matches!(
+                        error,
+                        SearchError::IndexNotFound { .. }
+                            | SearchError::IndexCandidatesNotFound { .. }
+                    ) =>
+                {
                     warn!(
                         error = %error,
                         "watch mode skipped: no existing index found; run 'fsfs index' first"

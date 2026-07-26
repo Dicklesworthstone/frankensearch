@@ -101,6 +101,7 @@ wide = "1.1.1"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
+same-file = "1.0.6"
 
 # Embedder dependencies (feature-gated per crate)
 # Default features pull in native-tls (openssl-sys), which breaks
