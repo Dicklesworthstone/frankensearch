@@ -5459,8 +5459,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_max_score_matches_exhaustive_and_prunes()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn grouped_max_score_matches_exhaustive_and_prunes() -> Result<(), Box<dyn std::error::Error>> {
         const NUM_DOCS: u32 = 8_192;
         let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
         let encoded_doclens = EncodedDocLenSection::encode(
