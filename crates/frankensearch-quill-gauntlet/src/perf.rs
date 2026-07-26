@@ -982,13 +982,7 @@ impl PairedExperimentResult {
 
 #[derive(Debug)]
 pub struct ValidatedPair {
-    // Bridge: read by `perf_evidence::estimate_hierarchical_latency`, whose
-    // `lib.rs` module declaration lands with the in-flight V3 export tranche.
-    // These allows keep the committed base warning-free until that export
-    // exists and are removed by the bd-uh2f.1 bench-wiring commit.
-    #[allow(dead_code)]
     pub block_id: u64,
-    #[allow(dead_code)]
     pub group_id: Option<u64>,
     pub control_value: f64,
     pub treatment_value: f64,

@@ -32,10 +32,14 @@ use frankensearch_quill::{
     SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
-    DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PerfCellResult, PerfCellSpec,
-    PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfQueryClass, PerfTopology,
-    PositionMode, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, machine_fingerprint,
-    peak_rss_bytes, validate_matrix,
+    BuildIdentity, ColdCacheEvidence, CorpusIdentity, DistributionSummary, EvidenceCell,
+    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence,
+    PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
+    PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample,
+    PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
+    PositionMode, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, estimate_paired_experiment,
+    machine_fingerprint, peak_rss_bytes, seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -655,22 +659,52 @@ fn stage_deletes(
     }
 }
 
-fn query_text(query_class: PerfQueryClass) -> &'static str {
+/// Per-class query groups for hierarchical latency evidence. The first entry
+/// of each class is the legacy single-query text, so flat consumers keep the
+/// exact workload they always measured.
+const QG6_QUERY_GROUPS: usize = 4;
+
+fn query_texts(query_class: PerfQueryClass) -> &'static [&'static str; QG6_QUERY_GROUPS] {
     match query_class {
-        PerfQueryClass::Identifier => "term00042",
-        PerfQueryClass::ShortKeyword => "term00001",
-        PerfQueryClass::NaturalLanguage => "term00001 term00007 generated record",
-        PerfQueryClass::Phrase => "\"term00001 term00002\"",
-        PerfQueryClass::Boolean => "term00001 OR term00002",
+        PerfQueryClass::Identifier => &["term00042", "term00137", "term00256", "term00301"],
+        PerfQueryClass::ShortKeyword => &["term00001", "term00002", "term00005", "term00011"],
+        PerfQueryClass::NaturalLanguage => &[
+            "term00001 term00007 generated record",
+            "term00002 term00013 generated record",
+            "term00005 term00011 generated record",
+            "term00003 term00017 generated record",
+        ],
+        PerfQueryClass::Phrase => &[
+            "\"term00001 term00002\"",
+            "\"term00002 term00003\"",
+            "\"term00003 term00004\"",
+            "\"term00005 term00006\"",
+        ],
+        PerfQueryClass::Boolean => &[
+            "term00001 OR term00002",
+            "term00003 OR term00004",
+            "term00002 OR term00005",
+            "term00001 OR term00007",
+        ],
     }
 }
 
-fn query_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn query_text(query_class: PerfQueryClass) -> &'static str {
+    query_texts(query_class)[0]
+}
+
+fn query_metric(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    query_override: Option<&str>,
+) -> f64 {
     let count = context
         .scale
         .document_count(spec.document_count.expect("query corpus count"));
     let corpus = corpus_for(count);
-    let query = query_text(spec.query_class.expect("query class"));
+    let query =
+        query_override.unwrap_or_else(|| query_text(spec.query_class.expect("query class")));
     let k = spec.k.expect("query k");
     let elapsed = match arm {
         EngineArm::Quill => {
@@ -852,6 +886,15 @@ fn dependency_surface_metric() -> f64 {
 }
 
 fn measure_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    measure_metric_with_query(context, spec, arm, None)
+}
+
+fn measure_metric_with_query(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    query_override: Option<&str>,
+) -> f64 {
     match spec.gate {
         PerfGate::Qg1 if spec.metric == "tokenize_docs_per_second" => {
             tokenize_metric(context, spec)
@@ -861,7 +904,7 @@ fn measure_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -
         PerfGate::Qg3 => watch_metric(context, spec, arm),
         PerfGate::Qg4 => commit_metric(context, spec, arm),
         PerfGate::Qg5 => compaction_metric(context, spec, arm),
-        PerfGate::Qg6 => query_metric(context, spec, arm),
+        PerfGate::Qg6 => query_metric(context, spec, arm, query_override),
         PerfGate::Qg7 => memory_metric(context, spec, arm),
         PerfGate::Qg9 => cold_open_metric(context, spec, arm),
         PerfGate::Qg10 => dependency_surface_metric(),
@@ -887,81 +930,329 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
     numerator / denominator.max(f64::MIN_POSITIVE)
 }
 
-struct PairedSamples {
-    arm_a: Vec<f64>,
-    arm_b: Vec<f64>,
-    ratios_b_over_a: Vec<f64>,
-    checksum: u64,
+/// Evidence-layer measurement context shared by every cell in one run.
+struct EvidenceContext {
+    config: PairedEstimatorConfig,
+    policy: EvidencePolicy,
+    sample_provenance: PerfSampleProvenance,
 }
 
-fn paired(
+fn metric_semantics(metric: &str) -> PerfMetricSemantics {
+    match metric {
+        "docs_per_second" | "tokenize_docs_per_second" | "updates_per_second" => {
+            PerfMetricSemantics::GaugeHigherIsBetter
+        }
+        _ => PerfMetricSemantics::GaugeLowerIsBetter,
+    }
+}
+
+fn operation_scope(spec: &PerfCellSpec) -> PerfOperationScope {
+    PerfOperationScope {
+        operation_id: format!("{}.{}.{}", spec.gate, spec.fixture, spec.metric),
+        version: 1,
+        semantics: metric_semantics(&spec.metric),
+        unit: unit(spec).to_owned(),
+    }
+}
+
+fn fixture_seed(fixture: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in fixture.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+struct StreamPlan<'a> {
+    control: EngineArm,
+    treatment: EngineArm,
+    rounds: usize,
+    seed: u64,
+    block_id_base: u64,
+    sample_id_base: u64,
+    group_id: Option<u64>,
+    query_override: Option<&'a str>,
+}
+
+/// Measure one paired raw-sample stream with a seeded balanced randomized
+/// first-arm schedule, warmup separation, and monotonic per-sample intervals.
+fn paired_raw_stream(
     context: &BenchContext,
     spec: &PerfCellSpec,
-    arm_a: EngineArm,
-    arm_b: EngineArm,
-    runs: usize,
-) -> PairedSamples {
-    let mut reference_samples = Vec::with_capacity(runs);
-    let mut comparison_samples = Vec::with_capacity(runs);
-    let mut ratios = Vec::with_capacity(runs);
-    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
-    for round in 0..runs {
-        let (measured_a, measured_b) = if round % 2 == 0 {
-            (
-                black_box(measure_metric(context, spec, arm_a)),
-                black_box(measure_metric(context, spec, arm_b)),
-            )
-        } else {
-            let measured_b = black_box(measure_metric(context, spec, arm_b));
-            let measured_a = black_box(measure_metric(context, spec, arm_a));
-            (measured_a, measured_b)
+    evidence: &EvidenceContext,
+    scope: &PerfOperationScope,
+    origin: Instant,
+    plan: &StreamPlan<'_>,
+) -> Vec<PerfRawSample> {
+    let order = seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
+    for _ in 0..evidence.policy.warmup_rounds {
+        let _ = black_box(measure_metric_with_query(
+            context,
+            spec,
+            plan.control,
+            plan.query_override,
+        ));
+        let _ = black_box(measure_metric_with_query(
+            context,
+            spec,
+            plan.treatment,
+            plan.query_override,
+        ));
+    }
+    let mut samples = Vec::with_capacity(plan.rounds * 2);
+    for (round, first_arm) in order.into_iter().enumerate() {
+        let round_index = u64::try_from(round).expect("round fits u64");
+        let block_id = plan.block_id_base + round_index;
+        let control_sample_id = plan.sample_id_base + round_index * 2;
+        let treatment_sample_id = control_sample_id + 1;
+        let control_first = first_arm == PerfSampleArm::Control;
+        let run_arm = |engine: EngineArm,
+                       sample_arm: PerfSampleArm,
+                       sample_order: PerfSampleOrder,
+                       sample_id: u64| {
+            let started_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
+            let value = black_box(measure_metric_with_query(
+                context,
+                spec,
+                engine,
+                plan.query_override,
+            ));
+            let mut ended_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
+            if ended_ns <= started_ns {
+                ended_ns = started_ns + 1;
+            }
+            PerfRawSample {
+                block_id,
+                sample_id,
+                arm: sample_arm,
+                order: sample_order,
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: evidence.sample_provenance.clone(),
+                started_ns,
+                ended_ns,
+                work_units: None,
+                byte_count: None,
+                observed_value: Some(value),
+                group_id: plan.group_id,
+            }
         };
-        let round_ratio = black_box(ratio(measured_b, measured_a));
-        checksum ^= measured_a.to_bits().rotate_left(13);
-        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-        checksum ^= measured_b.to_bits().rotate_left(31);
-        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-        checksum ^= round_ratio.to_bits().rotate_left(47);
-        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-        reference_samples.push(measured_a);
-        comparison_samples.push(measured_b);
-        ratios.push(round_ratio);
+        if control_first {
+            samples.push(run_arm(
+                plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::First,
+                control_sample_id,
+            ));
+            samples.push(run_arm(
+                plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::Second,
+                treatment_sample_id,
+            ));
+        } else {
+            samples.push(run_arm(
+                plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::First,
+                treatment_sample_id,
+            ));
+            samples.push(run_arm(
+                plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::Second,
+                control_sample_id,
+            ));
+        }
     }
-    black_box(checksum);
-    PairedSamples {
-        arm_a: reference_samples,
-        arm_b: comparison_samples,
-        ratios_b_over_a: ratios,
-        checksum,
-    }
+    samples
 }
 
-fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec<PerfCellResult> {
+fn arm_values(samples: &[PerfRawSample], arm: PerfSampleArm) -> Vec<f64> {
+    samples
+        .iter()
+        .filter(|sample| sample.arm == arm)
+        .map(|sample| sample.observed_value.expect("gauge sample value"))
+        .collect()
+}
+
+fn block_ratios_treatment_over_control(samples: &[PerfRawSample]) -> Vec<f64> {
+    let mut by_block: BTreeMap<u64, (Option<f64>, Option<f64>)> = BTreeMap::new();
+    for sample in samples {
+        let entry = by_block.entry(sample.block_id).or_default();
+        match sample.arm {
+            PerfSampleArm::Control => entry.0 = sample.observed_value,
+            PerfSampleArm::Treatment => entry.1 = sample.observed_value,
+        }
+    }
+    by_block
+        .values()
+        .map(|(control, treatment)| {
+            ratio(
+                treatment.expect("treatment block value"),
+                control.expect("control block value"),
+            )
+        })
+        .collect()
+}
+
+fn values_checksum(samples: &[PerfRawSample]) -> u64 {
+    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+    for sample in samples {
+        checksum ^= sample
+            .observed_value
+            .expect("gauge sample value")
+            .to_bits()
+            .rotate_left(13);
+        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    checksum
+}
+
+struct CellCollection {
+    results: Vec<PerfCellResult>,
+    evidence: Option<EvidenceCell>,
+}
+
+fn collect_cell(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    runs: usize,
+    evidence: &EvidenceContext,
+) -> CellCollection {
     if spec.gate == PerfGate::Qg10 {
         let samples = (0..runs)
             .map(|_| dependency_surface_metric())
             .collect::<Vec<_>>();
-        return vec![PerfCellResult {
+        let results = vec![PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
             engine: "default_feature_graph".to_owned(),
             unit: unit(spec).to_owned(),
             distribution: DistributionSummary::from_samples(&samples).expect("QG-10 distribution"),
         }];
+        let cell = EvidenceCell::facts(
+            EvidenceCellSpec {
+                gate: spec.gate,
+                fixture: spec.fixture.clone(),
+                metric: spec.metric.clone(),
+                unit: unit(spec).to_owned(),
+                role: EvidenceRole::Diagnostic,
+                cold_cache: None,
+            },
+            samples,
+            &evidence.policy,
+        )
+        .expect("QG-10 facts evidence cell");
+        return CellCollection {
+            results,
+            evidence: Some(cell),
+        };
     }
+
+    let scope = operation_scope(spec);
+    let origin = Instant::now();
+    let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
 
     // Contract order is deliberate: establish this invocation's A/A floor
     // through the exact paired routine, then measure the Quill/Tantivy claim.
-    let null = paired(context, spec, EngineArm::Tantivy, EngineArm::Tantivy, runs);
-    let real = paired(context, spec, EngineArm::Tantivy, EngineArm::Quill, runs);
+    let (null_samples, effect_samples) = if spec.gate == PerfGate::Qg6 {
+        let per_group = runs
+            .div_ceil(QG6_QUERY_GROUPS)
+            .max(evidence.policy.min_group_pairs);
+        let queries = query_texts(spec.query_class.expect("query class"));
+        let mut null_samples = Vec::new();
+        let mut effect_samples = Vec::new();
+        for (group_index, query) in queries.iter().enumerate() {
+            let group = u64::try_from(group_index).expect("group index");
+            let group_seed = cell_seed ^ group.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            null_samples.extend(paired_raw_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                &StreamPlan {
+                    control: EngineArm::Tantivy,
+                    treatment: EngineArm::Tantivy,
+                    rounds: per_group,
+                    seed: group_seed ^ 0xaa,
+                    block_id_base: group * 10_000,
+                    sample_id_base: 1_000_000 + group * 10_000,
+                    group_id: Some(group),
+                    query_override: Some(query),
+                },
+            ));
+            effect_samples.extend(paired_raw_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                &StreamPlan {
+                    control: EngineArm::Tantivy,
+                    treatment: EngineArm::Quill,
+                    rounds: per_group,
+                    seed: group_seed,
+                    block_id_base: group * 10_000,
+                    sample_id_base: group * 10_000,
+                    group_id: Some(group),
+                    query_override: Some(query),
+                },
+            ));
+        }
+        (null_samples, effect_samples)
+    } else {
+        let null = paired_raw_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            &StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Tantivy,
+                rounds: runs,
+                seed: cell_seed ^ 0xaa,
+                block_id_base: 0,
+                sample_id_base: 1_000_000,
+                group_id: None,
+                query_override: None,
+            },
+        );
+        let effect = paired_raw_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            &StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Quill,
+                rounds: runs,
+                seed: cell_seed,
+                block_id_base: 0,
+                sample_id_base: 0,
+                group_id: None,
+                query_override: None,
+            },
+        );
+        (null, effect)
+    };
+
     let quill_distribution =
-        DistributionSummary::from_samples(&real.arm_b).expect("Quill distribution");
+        DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Treatment))
+            .expect("Quill distribution");
     let oracle_distribution =
-        DistributionSummary::from_samples(&real.arm_a).expect("oracle distribution");
+        DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Control))
+            .expect("oracle distribution");
     let paired_distribution =
-        DistributionSummary::from_samples(&real.ratios_b_over_a).expect("paired distribution");
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(&effect_samples))
+            .expect("paired distribution");
     let null_distribution =
-        DistributionSummary::from_samples(&null.ratios_b_over_a).expect("null distribution");
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(&null_samples))
+            .expect("null distribution");
     eprintln!(
         "[quill-perf-paired] fixture={} null_median={:.6} null_ci95=[{:.6},{:.6}] \
          null_cv_pct={:.3} ab_median={:.6} ab_ci95=[{:.6},{:.6}] ab_cv_pct={:.3} \
@@ -975,15 +1266,41 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
         paired_distribution.median_ci95_low,
         paired_distribution.median_ci95_high,
         paired_distribution.cv_pct,
-        null.checksum ^ real.checksum.rotate_left(29),
+        values_checksum(&null_samples) ^ values_checksum(&effect_samples).rotate_left(29),
     );
 
-    let absolute_engine = if spec.metric == "tokenize_docs_per_second" {
+    let experiment = estimate_paired_experiment(&effect_samples, &null_samples, &evidence.config)
+        .expect("paired estimator rejected harness-produced streams");
+    let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
+    let cold_cache = (spec.gate == PerfGate::Qg9).then(|| ColdCacheEvidence {
+        procedure: "same-process index drop and reopen; the OS page cache is not dropped"
+            .to_owned(),
+        verified: false,
+    });
+    let cell = EvidenceCell::evaluate(
+        EvidenceCellSpec {
+            gate: spec.gate,
+            fixture: spec.fixture.clone(),
+            metric: spec.metric.clone(),
+            unit: unit(spec).to_owned(),
+            role: if is_tokenizer_null {
+                EvidenceRole::Diagnostic
+            } else {
+                EvidenceRole::Required
+            },
+            cold_cache,
+        },
+        experiment,
+        &evidence.policy,
+    )
+    .expect("evidence cell evaluation");
+
+    let absolute_engine = if is_tokenizer_null {
         "quill_tokenizer"
     } else {
         EngineArm::Quill.label()
     };
-    vec![
+    let results = vec![
         PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
@@ -994,7 +1311,7 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
         PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
-            engine: if spec.metric == "tokenize_docs_per_second" {
+            engine: if is_tokenizer_null {
                 "quill_tokenizer_null".to_owned()
             } else {
                 EngineArm::Tantivy.label().to_owned()
@@ -1016,7 +1333,11 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
             unit: "ratio".to_owned(),
             distribution: null_distribution,
         },
-    ]
+    ];
+    CellCollection {
+        results,
+        evidence: Some(cell),
+    }
 }
 
 fn selected_cells(matrix: &PerfMatrixSpec, scale: MatrixScale) -> Vec<PerfCellSpec> {
@@ -1093,6 +1414,102 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn build_profile_label() -> &'static str {
+    if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    }
+}
+
+fn build_identity(bench_elf_sha256: &str, revision: &str) -> BuildIdentity {
+    let porcelain = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    let git_dirty = porcelain
+        .as_deref()
+        .is_some_and(|status| !status.trim().is_empty());
+    let worktree_state_sha256 = git_dirty.then(|| {
+        let diff = Command::new("git")
+            .args(["diff", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+            .unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(porcelain.as_deref().unwrap_or_default().as_bytes());
+        hasher.update(&diff);
+        lower_hex(&hasher.finalize())
+    });
+    let cargo_lock_sha256 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+        .ok()
+        .map(|bytes| lower_hex(&Sha256::digest(&bytes)));
+    let rustc_version = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|version| version.trim().to_owned())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    BuildIdentity {
+        executable_sha256: bench_elf_sha256.to_owned(),
+        git_revision: revision.to_owned(),
+        git_dirty,
+        worktree_state_sha256,
+        cargo_lock_sha256,
+        rustc_version,
+        target_triple: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        build_profile: build_profile_label().to_owned(),
+        cargo_features: vec!["perf-harness".to_owned(), "tantivy-oracle".to_owned()],
+    }
+}
+
+fn corpus_identity(
+    context: &BenchContext,
+    cells: &[PerfCellSpec],
+    corpus_hash: &str,
+) -> CorpusIdentity {
+    let document_count = cells
+        .iter()
+        .map(|cell| {
+            context
+                .scale
+                .document_count(cell.document_count.unwrap_or_default())
+        })
+        .max()
+        .unwrap_or_default();
+    let query_set_sha256 = {
+        let mut hasher = Sha256::new();
+        for class in [
+            PerfQueryClass::Identifier,
+            PerfQueryClass::ShortKeyword,
+            PerfQueryClass::NaturalLanguage,
+            PerfQueryClass::Phrase,
+            PerfQueryClass::Boolean,
+        ] {
+            for query in query_texts(class) {
+                hasher.update(query.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        Some(lower_hex(&hasher.finalize()))
+    };
+    CorpusIdentity {
+        corpus_sha256: corpus_hash.to_owned(),
+        query_set_sha256,
+        qrels_sha256: None,
+        document_count,
+        content_bytes: None,
+        generator_seed: CORPUS_SEED,
+        generator_revision: "synthetic-zipf-s11-vocab8192-doc4096-v1".to_owned(),
+    }
+}
+
 fn metric_duration(context: &BenchContext, spec: &PerfCellSpec, value: f64) -> Duration {
     let seconds = match spec.metric.as_str() {
         "docs_per_second" | "tokenize_docs_per_second" => {
@@ -1166,15 +1583,6 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         "QUILL_PERF_RUNS must preserve the >=10-run law"
     );
 
-    let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
-    for spec in &selected {
-        by_gate
-            .entry(spec.gate)
-            .or_default()
-            .extend(collect_cell(&context, spec, configured_runs));
-        register_criterion_cell(c, &context, spec);
-    }
-
     let output_dir = output_dir();
     let revision = git_revision(scale);
     let run_window = std::env::var("QUILL_PERF_RUN_WINDOW")
@@ -1183,6 +1591,66 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
     let corpus_hash = corpus_manifest_hash(&context, &selected);
+    let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0x5155_494c_4c45_5644);
+    let evidence_context = EvidenceContext {
+        config: PairedEstimatorConfig::predeclared(bootstrap_seed),
+        policy: EvidencePolicy::predeclared(),
+        sample_provenance: PerfSampleProvenance {
+            run_id: run_id.clone(),
+            executable_sha256: bench_elf_sha256.to_owned(),
+            corpus_sha256: corpus_hash.clone(),
+            worker_id: machine_fingerprint(),
+            build_profile: build_profile_label().to_owned(),
+        },
+    };
+    let mut machine = MachineIdentity::capture();
+
+    let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
+    let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
+    for spec in &selected {
+        let collection = collect_cell(&context, spec, configured_runs, &evidence_context);
+        by_gate
+            .entry(spec.gate)
+            .or_default()
+            .extend(collection.results);
+        if let Some(cell) = collection.evidence {
+            evidence_by_gate.entry(spec.gate).or_default().push(cell);
+        }
+        register_criterion_cell(c, &context, spec);
+    }
+    machine.finish();
+
+    let provenance = EvidenceProvenance {
+        run_id: run_id.clone(),
+        run_window: run_window.clone(),
+        manifest_sha256: manifest_hash.clone(),
+        build: build_identity(bench_elf_sha256, &revision),
+        machine,
+        peak_rss: PeakRssEvidence::capture(),
+        corpus: corpus_identity(&context, &selected, &corpus_hash),
+    };
+    for (gate, cells) in evidence_by_gate {
+        let artifact = PerfEvidenceArtifact::assemble(
+            gate,
+            evidence_context.policy.clone(),
+            provenance.clone(),
+            cells,
+        )
+        .expect("assemble QG evidence artifact");
+        let paths = artifact
+            .write_atomic(&output_dir)
+            .expect("write QG evidence artifact");
+        eprintln!(
+            "[quill-evidence] gate={gate} status={} ratchet_admissible={} json={} table={}",
+            artifact.gate_status,
+            artifact.ratchet_admissible(),
+            display_path(&paths.json),
+            display_path(&paths.table),
+        );
+    }
     for (gate, cells) in by_gate {
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
