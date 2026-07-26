@@ -34,7 +34,7 @@ normal/build tree has 205 unique package/version pairs and **zero**
 Tantivy-family tree rows; enabling `tantivy-oracle` has 289 unique pairs and
 16 Tantivy-family tree rows.
 
-This was Lane B work: **no benchmark and no worker were used after the
+This was Lane B work: **no benchmark or measurement worker was used after the
 allocation addendum**. Static validation passed direct Rust formatting, TOML
 and YAML parsing, and `git diff --check`. Low-priority local checks passed both
 new binaries, the default Quill library, and the opt-in `tantivy-oracle`
@@ -42,6 +42,19 @@ library. Default and oracle no-run test builds passed; focused candidate parity
 passed the randomized and lane-edge scalar checks, the shipping-incumbent
 oracle check, and the exhaustive 1–129-byte lane sweep. Focused Clippy passed
 with `-D warnings`, and targeted UBS reported zero critical findings.
+
+Post-freeze compile-only verification on 2026-07-26 closed the operational
+link predicate without consuming a measurement window or executing either
+binary. Every Cargo launch was preceded by `df -h /data` (at least 526 GiB
+free), used strict remote mode with `CARGO_TARGET_DIR` unset, and built a clean
+committed baseline. `int8_vs_f16_fast_ab` at `0f1b3805` linked on `hz2` in
+9m10s. A cold `tokenizer_simd_ab` route at `acbfdd49` first linked on `hz1` in
+10m04s, which is outside the strict ten-minute predicate and is not counted;
+a distinct cold route with unchanged admission sources linked on `hz2` in
+7m07s. Both commands used `--profile release-perf --features
+bench-internals`; neither binary was run. The admission repair is therefore
+build-proven, while the historical tokenizer A/B remains undecidable and the
+top-k performance claim remains un-revalidated.
 
 QG evidence was audited rather than invented. QG-1 through QG-9 still have
 only `*.unmeasured.latest.json` placeholders. The exact QG-10 dependency probe
