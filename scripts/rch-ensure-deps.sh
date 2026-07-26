@@ -6,6 +6,14 @@
 # path dependencies (asupersync, frankensqlite, fast_cmaes, frankentui)
 # that don't exist on workers by default.
 #
+# In worker mode this also warms cargo's SHARED caches (crates.io index + the
+# frankentorch git dependency). Those are not part of the synced project, so a
+# cold worker-scoped target pool fetches them over the network *before* it can
+# start compiling — and that has repeatedly pushed benchmark jobs past their
+# admission window without ever linking a binary (docs/NEGATIVE_EVIDENCE.md:
+# bd-l5x3, bd-3srq, bd-r3rd). `--check` now reports a cold cargo git cache as
+# an issue so the condition is visible before a measurement window is spent.
+#
 # Local usage:
 #   scripts/rch-ensure-deps.sh              # Auto-detect and fix if needed
 #   scripts/rch-ensure-deps.sh --force      # Force re-clone even if present
@@ -40,6 +48,19 @@ FRANKENTUI_REPO="https://github.com/Dicklesworthstone/frankentui.git"
 FRANKENTUI_REF="4f2803a7c99d4fc439f3503e93c69e9ca68f354c"
 
 RCH_REMOTE_DEPS_DIR="${RCH_REMOTE_DEPS_DIR:-/tmp/rch/frankensearch}"
+
+# Absolute path rch rsyncs the project to on a worker. Used only to warm cargo's
+# caches; absence is tolerated (the worker simply has not synced yet).
+RCH_REMOTE_PROJECT_DIR="${RCH_REMOTE_PROJECT_DIR:-/data/projects/frankensearch}"
+
+# Workspace git dependency (frankentorch: ft-api / ft-autograd / ft-core), pinned
+# in the root Cargo.toml. Unlike the sibling PATH deps above, cargo resolves this
+# over the network, and it is fetched during workspace resolution even for a
+# build that does not link it. On a cold worker-scoped target pool that fetch —
+# together with the crates.io index update — runs before compilation starts and
+# has repeatedly pushed benchmark jobs past their admission window without ever
+# linking (see docs/NEGATIVE_EVIDENCE.md: bd-l5x3, bd-3srq, bd-r3rd).
+FRANKENTORCH_REF="c305306b251753099620ad5fe02e78c07c167cf6"
 
 # ─── Resolve paths ──────────────────────────────────────────────────────────
 
@@ -243,7 +264,8 @@ bootstrap_remote_worker() {
         "${ASUPERSYNC_REPO}" "${ASUPERSYNC_REF}" \
         "${FRANKENSQLITE_REPO}" "${FRANKENSQLITE_REF}" \
         "${FAST_CMAES_REPO}" "${FAST_CMAES_REF}" \
-        "${FRANKENTUI_REPO}" "${FRANKENTUI_REF}" <<'EOF'
+        "${FRANKENTUI_REPO}" "${FRANKENTUI_REF}" \
+        "${RCH_REMOTE_PROJECT_DIR}" "${FRANKENTORCH_REF}" <<'EOF'
 set -euo pipefail
 
 mode="$1"
@@ -256,6 +278,8 @@ fast_cmaes_repo="$7"
 fast_cmaes_ref="$8"
 frankentui_repo="${9:-}"
 frankentui_ref="${10:-}"
+project_dir="${11:-/data/projects/frankensearch}"
+frankentorch_ref="${12:-}"
 
 log()  { echo "[rch-deps][remote] $*"; }
 warn() { echo "[rch-deps][remote] WARNING: $*" >&2; }
@@ -296,6 +320,47 @@ check_dep_remote() {
     fi
 }
 
+# Is the pinned frankentorch revision already in cargo's git database? If not,
+# the next cold build pays a network fetch before it can start compiling.
+cargo_git_cache_warm() {
+    local cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    local db_dir="${cargo_home}/git/db"
+    [[ -d "${db_dir}" ]] || return 1
+    local repo
+    for repo in "${db_dir}"/frankentorch-*; do
+        [[ -d "${repo}" ]] || continue
+        if git --git-dir="${repo}" cat-file -e "${frankentorch_ref}^{commit}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Populate the crates.io index and every git dependency in cargo's shared caches
+# so a cold worker-scoped target pool starts compiling immediately instead of
+# spending its admission window on the network.
+warm_cargo_caches_remote() {
+    if [[ ! -f "${project_dir}/Cargo.toml" ]]; then
+        log "cargo caches: ${project_dir} not synced yet, skipping warm"
+        return 0
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "cargo caches: cargo not on PATH, skipping warm"
+        return 0
+    fi
+    if [[ "${mode}" != "--force" ]] && cargo_git_cache_warm; then
+        log "cargo caches: frankentorch ${frankentorch_ref:0:12} already cached, skipping"
+        return 0
+    fi
+    log "cargo caches: fetching registry index + git deps (one-time)..."
+    # Never fail the bootstrap on a fetch problem — a cold cache is slow, not broken.
+    if cargo fetch --locked --manifest-path "${project_dir}/Cargo.toml" >/dev/null 2>&1; then
+        log "cargo caches: warm."
+    else
+        warn "cargo caches: 'cargo fetch --locked' failed; cold builds stay slow"
+    fi
+}
+
 mkdir -p "${deps_dir}"
 
 if [[ "${mode}" == "--check" ]]; then
@@ -305,6 +370,12 @@ if [[ "${mode}" == "--check" ]]; then
     check_dep_remote "${deps_dir}/frankensqlite" || missing=$((missing + 1))
     check_dep_remote "${deps_dir}/fast_cmaes" || missing=$((missing + 1))
     check_dep_remote "${deps_dir}/frankentui" || missing=$((missing + 1))
+    if cargo_git_cache_warm; then
+        echo "  OK: cargo git cache (frankentorch ${frankentorch_ref:0:12})"
+    else
+        echo "  COLD: cargo git cache (frankentorch ${frankentorch_ref:0:12}) — next cold build pays a network fetch"
+        missing=$((missing + 1))
+    fi
     if [[ "${missing}" -gt 0 ]]; then
         warn "${missing} issue(s) found"
         exit 1
@@ -320,6 +391,7 @@ clone_or_update_remote "${fast_cmaes_repo}" "${deps_dir}/fast_cmaes" "${fast_cma
 if [[ -n "${frankentui_repo}" && -n "${frankentui_ref}" ]]; then
     clone_or_update_remote "${frankentui_repo}" "${deps_dir}/frankentui" "${frankentui_ref}"
 fi
+warm_cargo_caches_remote
 log "Done."
 EOF
 }
