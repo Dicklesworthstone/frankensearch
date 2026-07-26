@@ -878,6 +878,7 @@ const fn search_error_kind(error: &SearchError) -> &'static str {
         SearchError::EmbeddingFailed { .. } => "embedding_failed",
         SearchError::ModelNotFound { .. } => "model_not_found",
         SearchError::ModelLoadFailed { .. } => "model_load_failed",
+        SearchError::UnverifiableRemoteSpace { .. } => "unverifiable_remote_space",
         SearchError::IndexCorrupted { .. } => "index_corrupted",
         SearchError::IndexVersionMismatch { .. } => "index_version_mismatch",
         SearchError::DimensionMismatch { .. } => "dimension_mismatch",
@@ -1645,6 +1646,13 @@ mod tests {
                 name: String::new()
             }),
             "model_not_found"
+        );
+        assert_eq!(
+            search_error_kind(&SearchError::UnverifiableRemoteSpace {
+                producer: "cass-indexer".to_owned(),
+                reason: "missing canonical identity".to_owned(),
+            }),
+            "unverifiable_remote_space"
         );
         assert_eq!(
             search_error_kind(&SearchError::DimensionMismatch {

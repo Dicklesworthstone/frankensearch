@@ -507,6 +507,8 @@ impl OutputErrorCode {
     pub const MODEL_NOT_FOUND: &str = "model_not_found";
     /// Model files exist but failed to load.
     pub const MODEL_LOAD_FAILED: &str = "model_load_failed";
+    /// An embedding producer did not supply a verifiable canonical space identity.
+    pub const UNVERIFIABLE_REMOTE_SPACE: &str = "unverifiable_remote_space";
     /// Vector index file is corrupted.
     pub const INDEX_CORRUPTED: &str = "index_corrupted";
     /// Index file version mismatch.
@@ -549,6 +551,7 @@ pub const ALL_OUTPUT_ERROR_CODES: &[&str] = &[
     OutputErrorCode::EMBEDDING_FAILED,
     OutputErrorCode::MODEL_NOT_FOUND,
     OutputErrorCode::MODEL_LOAD_FAILED,
+    OutputErrorCode::UNVERIFIABLE_REMOTE_SPACE,
     OutputErrorCode::INDEX_CORRUPTED,
     OutputErrorCode::INDEX_VERSION_MISMATCH,
     OutputErrorCode::DIMENSION_MISMATCH,
@@ -737,6 +740,7 @@ pub const fn error_code_for(err: &frankensearch_core::SearchError) -> &'static s
         SearchError::EmbeddingFailed { .. } => OutputErrorCode::EMBEDDING_FAILED,
         SearchError::ModelNotFound { .. } => OutputErrorCode::MODEL_NOT_FOUND,
         SearchError::ModelLoadFailed { .. } => OutputErrorCode::MODEL_LOAD_FAILED,
+        SearchError::UnverifiableRemoteSpace { .. } => OutputErrorCode::UNVERIFIABLE_REMOTE_SPACE,
         SearchError::IndexCorrupted { .. } => OutputErrorCode::INDEX_CORRUPTED,
         SearchError::IndexVersionMismatch { .. } => OutputErrorCode::INDEX_VERSION_MISMATCH,
         SearchError::DimensionMismatch { .. } => OutputErrorCode::DIMENSION_MISMATCH,
@@ -772,7 +776,8 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
         }
         SearchError::EmbedderUnavailable { .. }
         | SearchError::ModelNotFound { .. }
-        | SearchError::ModelLoadFailed { .. } => exit_code::MODEL_UNAVAILABLE,
+        | SearchError::ModelLoadFailed { .. }
+        | SearchError::UnverifiableRemoteSpace { .. } => exit_code::MODEL_UNAVAILABLE,
         SearchError::Cancelled { .. } => exit_code::INTERRUPTED,
         _ => exit_code::RUNTIME_ERROR,
     }
@@ -786,7 +791,15 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
 
     let code = error_code_for(err);
     let exit = exit_code_for(err);
-    let message = err.to_string();
+    let message = match err {
+        SearchError::UnverifiableRemoteSpace { producer, .. } => format!(
+            "Embedding space from {} is unverifiable. Refuse semantic comparison; require a \
+             producer-authenticated immutable identity, or use a verified local embedder or \
+             lexical fallback.",
+            bounded_public_producer(producer)
+        ),
+        _ => err.to_string(),
+    };
 
     let field = match err {
         SearchError::InvalidConfig { field, .. } => Some(field.clone()),
@@ -821,13 +834,19 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
             "Default semantic models are bundled but not available in the active cache path.\n\
              Ensure FRANKENSEARCH_MODEL_DIR is writable and run: fsfs status\n\
              Optional override: fsfs download-models --model {name}\n\
-             Check cache: fsfs doctor --check-models"
+             Check cache: fsfs doctor --format json"
         )),
         SearchError::ModelLoadFailed { path, .. } => Some(format!(
             "The model file at {} may be corrupted.\n\
              Try: fsfs download-models --force --model <name>\n\
-             Or run: fsfs doctor --fix",
+             Then verify: fsfs doctor --format json",
             path.display()
+        )),
+        SearchError::UnverifiableRemoteSpace { producer, .. } => Some(format!(
+            "The embedding producer {:?} did not prove its canonical model identity.\n\
+             Configure a producer-authenticated immutable identity, or select a verified local embedder or lexical-only mode.\n\
+             Rebuild the semantic index only when intentionally changing its canonical embedding identity.",
+            bounded_public_producer(producer)
         )),
         SearchError::IndexNotFound { path } => Some(format!(
             "Run: fsfs index <directory>\n\
@@ -897,6 +916,19 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
     }
 }
 
+fn bounded_public_producer(producer: &str) -> &str {
+    if !producer.is_empty()
+        && producer.len() <= 128
+        && producer
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        producer
+    } else {
+        "<redacted-embedding-producer>"
+    }
+}
+
 /// Return explanatory context about why a [`SearchError`] matters.
 #[must_use]
 fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
@@ -916,6 +948,12 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
         SearchError::ModelLoadFailed { .. } => Some(
             "A corrupted model file can produce wrong results or crash the ONNX runtime. \
              Re-downloading ensures integrity."
+                .to_owned(),
+        ),
+        SearchError::UnverifiableRemoteSpace { .. } => Some(
+            "Vectors from an unidentified embedding space cannot be compared safely. \
+             Lexical results remain usable, but semantic search must stay unavailable until \
+             both the query embedder and index generation prove the same canonical identity."
                 .to_owned(),
         ),
         SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => Some(
@@ -1199,7 +1237,14 @@ mod tests {
         let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.returned_hits, 2);
-        assert_eq!(decoded.degradation_advice.len(), 6);
+        assert_eq!(decoded.degradation_advice.len(), 7);
+        assert_eq!(
+            decoded
+                .degradation_advice
+                .get("degrade.advice.embedding_space_unverifiable")
+                .map(|advice| advice.reason_code.as_str()),
+            Some("degrade.advice.embedding_space_unverifiable")
+        );
         assert_eq!(
             decoded.index_freshness,
             Some(IndexFreshnessPayload {
@@ -1477,6 +1522,13 @@ mod tests {
                 OutputErrorCode::MODEL_NOT_FOUND,
             ),
             (
+                SearchError::UnverifiableRemoteSpace {
+                    producer: "cass-indexer".into(),
+                    reason: "missing canonical identity".into(),
+                },
+                OutputErrorCode::UNVERIFIABLE_REMOTE_SPACE,
+            ),
+            (
                 SearchError::IndexNotFound {
                     path: PathBuf::from("/tmp"),
                 },
@@ -1621,6 +1673,50 @@ mod tests {
             source: Box::new(std::io::Error::other("corrupted")),
         };
         assert_eq!(exit_code_for(&err), exit_code::MODEL_UNAVAILABLE);
+
+        let err = SearchError::UnverifiableRemoteSpace {
+            producer: "cass-indexer".into(),
+            reason: "missing canonical identity".into(),
+        };
+        assert_eq!(exit_code_for(&err), exit_code::MODEL_UNAVAILABLE);
+        let output = output_error_from(&err);
+        assert_eq!(output.code, OutputErrorCode::UNVERIFIABLE_REMOTE_SPACE);
+        assert!(output.suggestion.as_deref().is_some_and(|suggestion| {
+            suggestion.contains("producer-authenticated immutable identity")
+                && suggestion.contains("only when intentionally changing")
+        }));
+        assert!(
+            output
+                .context
+                .as_deref()
+                .is_some_and(|context| context.contains("cannot be compared safely"))
+        );
+    }
+
+    #[test]
+    fn public_unverifiable_space_output_redacts_directly_constructed_sensitive_fields() {
+        use frankensearch_core::SearchError;
+
+        let sensitive_marker = ["do-not", "emit", "credential"].join("-");
+        let err = SearchError::UnverifiableRemoteSpace {
+            producer: format!("https://user:{sensitive_marker}@embedding.example/v1\nforged"),
+            reason: format!(
+                "provider body contained query text and {sensitive_marker}: {}",
+                "x".repeat(8_192)
+            ),
+        };
+        let output = output_error_from(&err);
+        let json = serde_json::to_string(&output).expect("serialize public output error");
+
+        assert!(json.contains("<redacted-embedding-producer>"));
+        assert!(!json.contains(&sensitive_marker));
+        assert!(!json.contains("provider body"));
+        assert!(!json.contains("query text"));
+        assert!(!json.contains("\\nforged"));
+        assert!(
+            json.len() < 4_096,
+            "public error output must remain bounded"
+        );
     }
 
     #[test]

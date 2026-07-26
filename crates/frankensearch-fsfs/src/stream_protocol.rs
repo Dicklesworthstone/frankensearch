@@ -279,6 +279,7 @@ pub const fn failure_category_for_error(err: &SearchError) -> StreamFailureCateg
         | SearchError::EmbeddingFailed { .. }
         | SearchError::ModelNotFound { .. }
         | SearchError::ModelLoadFailed { .. }
+        | SearchError::UnverifiableRemoteSpace { .. }
         | SearchError::RerankerUnavailable { .. }
         | SearchError::RerankFailed { .. } => StreamFailureCategory::Model,
         SearchError::SearchTimeout { .. }
@@ -803,6 +804,35 @@ mod tests {
     }
 
     #[test]
+    fn unverifiable_embedding_space_has_one_coherent_non_retryable_terminal_contract() {
+        let err = SearchError::UnverifiableRemoteSpace {
+            producer: "cass-indexer".into(),
+            reason: "missing producer-authenticated fingerprint".into(),
+        };
+        let terminal = terminal_event_from_error(&err, 0, 3);
+
+        assert_eq!(terminal.status, StreamTerminalStatus::Failed);
+        assert_eq!(
+            terminal.exit_code,
+            crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+        );
+        assert_eq!(
+            terminal.failure_category,
+            Some(StreamFailureCategory::Model)
+        );
+        assert!(matches!(terminal.retry, StreamRetryDirective::None));
+        let output = terminal
+            .error
+            .expect("failed terminal carries output error");
+        assert_eq!(output.code, "unverifiable_remote_space");
+        assert_eq!(
+            output.exit_code,
+            crate::adapters::cli::exit_code::MODEL_UNAVAILABLE
+        );
+        assert!(output.message.contains("Refuse semantic comparison"));
+    }
+
+    #[test]
     fn terminal_event_from_error_retryable_io() {
         let err = SearchError::Io(io::Error::other("network jitter"));
         let terminal = terminal_event_from_error(&err, 1, 3);
@@ -1058,6 +1088,13 @@ mod tests {
             }),
             StreamFailureCategory::Model
         );
+        assert_eq!(
+            failure_category_for_error(&SearchError::UnverifiableRemoteSpace {
+                producer: "cass-indexer".into(),
+                reason: "missing canonical identity".into(),
+            }),
+            StreamFailureCategory::Model
+        );
     }
 
     #[test]
@@ -1140,6 +1177,10 @@ mod tests {
         assert!(!is_retryable_error(&SearchError::DimensionMismatch {
             expected: 256,
             found: 384,
+        }));
+        assert!(!is_retryable_error(&SearchError::UnverifiableRemoteSpace {
+            producer: "cass-indexer".into(),
+            reason: "missing canonical identity".into(),
         }));
         assert!(!is_retryable_error(&SearchError::Cancelled {
             phase: "p".into(),

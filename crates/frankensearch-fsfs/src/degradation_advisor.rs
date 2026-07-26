@@ -5,7 +5,7 @@ use std::path::Path;
 use frankensearch_core::SearchError;
 use serde::{Deserialize, Serialize};
 
-pub const DEGRADATION_ADVICE_SCHEMA_VERSION: &str = "fsfs.degradation.advice.v1";
+pub const DEGRADATION_ADVICE_SCHEMA_VERSION: &str = "fsfs.degradation.advice.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,6 +13,7 @@ pub enum DegradationFailureKind {
     RefinementFailed,
     LexicalFallback,
     MissingQualityModel,
+    UnverifiableEmbeddingSpace,
     Timeout,
     CorruptIndex,
     CacheMiss,
@@ -25,6 +26,7 @@ impl DegradationFailureKind {
             Self::RefinementFailed => "degrade.advice.refinement_failed",
             Self::LexicalFallback => "degrade.advice.lexical_fallback",
             Self::MissingQualityModel => "degrade.advice.quality_model_missing",
+            Self::UnverifiableEmbeddingSpace => "degrade.advice.embedding_space_unverifiable",
             Self::Timeout => "degrade.advice.timeout",
             Self::CorruptIndex => "degrade.advice.index_corrupt",
             Self::CacheMiss => "degrade.advice.cache_miss",
@@ -37,6 +39,9 @@ impl DegradationFailureKind {
             Self::RefinementFailed => "quality refinement failed; initial results remain usable",
             Self::LexicalFallback => "semantic retrieval fell back to lexical search",
             Self::MissingQualityModel => "quality model unavailable; refinement skipped",
+            Self::UnverifiableEmbeddingSpace => {
+                "semantic index and query embedding identities cannot be proven compatible"
+            }
             Self::Timeout => "quality stage exceeded its latency budget",
             Self::CorruptIndex => "index artifact could not be read safely",
             Self::CacheMiss => "expected cache artifact was missing or stale",
@@ -49,6 +54,7 @@ impl DegradationFailureKind {
             Self::RefinementFailed
             | Self::LexicalFallback
             | Self::MissingQualityModel
+            | Self::UnverifiableEmbeddingSpace
             | Self::Timeout
             | Self::CacheMiss => true,
             Self::CorruptIndex => false,
@@ -163,6 +169,9 @@ pub const fn classify_search_error(error: &SearchError) -> DegradationFailureKin
         SearchError::EmbedderUnavailable { .. }
         | SearchError::ModelNotFound { .. }
         | SearchError::ModelLoadFailed { .. } => DegradationFailureKind::MissingQualityModel,
+        SearchError::UnverifiableRemoteSpace { .. } => {
+            DegradationFailureKind::UnverifiableEmbeddingSpace
+        }
         SearchError::InvalidConfig { .. }
         | SearchError::IndexNotFound { .. }
         | SearchError::IndexCandidatesNotFound { .. } => DegradationFailureKind::CacheMiss,
@@ -186,6 +195,7 @@ pub fn synthetic_degradation_advice_fixture() -> Vec<DegradationAdvice> {
         DegradationFailureKind::RefinementFailed,
         DegradationFailureKind::LexicalFallback,
         DegradationFailureKind::MissingQualityModel,
+        DegradationFailureKind::UnverifiableEmbeddingSpace,
         DegradationFailureKind::Timeout,
         DegradationFailureKind::CorruptIndex,
         DegradationFailureKind::CacheMiss,
@@ -208,6 +218,7 @@ const fn severity_for(failure: DegradationFailureKind) -> DegradationAdviceSever
     match failure {
         DegradationFailureKind::RefinementFailed
         | DegradationFailureKind::MissingQualityModel
+        | DegradationFailureKind::UnverifiableEmbeddingSpace
         | DegradationFailureKind::Timeout
         | DegradationFailureKind::CacheMiss => DegradationAdviceSeverity::Warn,
         DegradationFailureKind::LexicalFallback => DegradationAdviceSeverity::Info,
@@ -263,6 +274,26 @@ fn next_actions_for(
                 "degrade.action.download_models",
                 "Populate the configured model cache when quality refinement is required.",
                 Some("fsfs download-models --verify".to_owned()),
+            ),
+        ],
+        DegradationFailureKind::UnverifiableEmbeddingSpace => vec![
+            action(
+                1,
+                "degrade.action.keep_lexical_only",
+                "Keep lexical results, but do not admit semantic scores from an unidentified embedding space.",
+                None,
+            ),
+            action(
+                2,
+                "degrade.action.configure_verified_identity",
+                "Select a producer-authenticated immutable identity that matches the existing index, or use a verified local embedder.",
+                None,
+            ),
+            action(
+                3,
+                "degrade.action.reindex_after_identity_change",
+                "Rebuild in place only if you intentionally change the canonical embedding identity.",
+                Some(format!("fsfs index --full --index-dir {index_dir} .")),
             ),
         ],
         DegradationFailureKind::Timeout => vec![
@@ -358,6 +389,7 @@ mod tests {
                 "degrade.advice.refinement_failed",
                 "degrade.advice.lexical_fallback",
                 "degrade.advice.quality_model_missing",
+                "degrade.advice.embedding_space_unverifiable",
                 "degrade.advice.timeout",
                 "degrade.advice.index_corrupt",
                 "degrade.advice.cache_miss",
@@ -414,6 +446,46 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("vector.fast.idx"))
         );
+    }
+
+    #[test]
+    fn unverifiable_embedding_space_keeps_only_lexical_results_and_requires_identity_proof() {
+        let error = SearchError::UnverifiableRemoteSpace {
+            producer: "cass-indexer".to_owned(),
+            reason: "missing canonical model fingerprint".to_owned(),
+        };
+        let advice = advice_for_search_error(
+            "semantic query",
+            Some(Path::new("/tmp/project/.frankensearch")),
+            &error,
+        );
+
+        assert_eq!(
+            advice.failure,
+            DegradationFailureKind::UnverifiableEmbeddingSpace
+        );
+        assert_eq!(
+            advice.reason_code,
+            "degrade.advice.embedding_space_unverifiable"
+        );
+        assert!(advice.preserves_initial_results);
+        let actions = advice
+            .next_actions
+            .iter()
+            .map(|action| {
+                format!(
+                    "{} {}",
+                    action.action,
+                    action.command.as_deref().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(actions.contains("lexical results"));
+        assert!(actions.contains("producer-authenticated immutable identity"));
+        assert!(actions.contains("only if you intentionally change"));
+        assert!(actions.contains("fsfs index --full --index-dir"));
+        assert!(!actions.to_ascii_lowercase().contains("delete"));
     }
 
     #[test]

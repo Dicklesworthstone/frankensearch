@@ -1023,6 +1023,10 @@ fn observe_search_error(error: &SearchError) -> LexicalErrorObservation {
         SearchError::ModelLoadFailed { path: _, source: _ } => {
             (LexicalErrorClass::Embedding, "model_load_failed".to_owned())
         }
+        SearchError::UnverifiableRemoteSpace { producer: _, reason: _ } => (
+            LexicalErrorClass::Integrity,
+            "unverifiable_remote_space".to_owned(),
+        ),
         SearchError::IndexCorrupted { path: _, detail: _ } => {
             (LexicalErrorClass::Index, "index_corrupted".to_owned())
         }
