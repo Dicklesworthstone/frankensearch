@@ -16149,3 +16149,75 @@ worker-scoped target containing the exact `int8_vs_f16_fast_ab` release graph,
 or when a fully reserved worker can link it inside ten minutes. Then require
 32/32 exact-order and recall@10=1.0000, an A/A band wholly within 0.97–1.03,
 and both Criterion arm CVs below 5% before making any fresh top-k claim.
+
+### 2026-07-25 — BLOCKER (not a lever REJECT): grouped `MaxScore` prunes ZERO windows, so the E8.5.1 gate stays CLOSED (`bd-quill-e8-perf-doctrine-x4e4.5.1`, `bd-bt2t`, SageCardinal)
+
+Campaign `perf-campaign-20260725`, cc/STRUCTURAL lane. The planned lever was to
+open the rank-pruning query gate for nested pure-term unions — the shape
+`alpha OR beta` lowers to over `content`+`title`, i.e. what nearly every default
+query becomes. That shape currently fails `query_has_prunable_root_union`
+outright, so the root scores **every** 4096-doc window with no cutoff, and the
+grouped candidate machinery landed dormant in `229348dd`.
+
+**Premise verified in code, then falsified by test.** The rank-safety argument
+holds: only the collector-driven root union receives a cutoff
+(`argus.rs:4336`), nested group unions refill via `refill_with_cutoff(None)`
+(`argus.rs:3737`) and therefore sum their per-field contributions in the
+exhaustive path's order — which is what makes f32 score-**bit** parity
+attainable and why flattening was correctly rejected. `fill_candidate_window`
+scores every active child at each candidate doc, and
+`grouped_max_score_candidates` uses the identical strict `bound < cutoff`
+predicate as the term path, so a group whose bound equals the cutoff stays
+essential (tie-safe, as pinned by
+`maxscore_equal_cutoff_keeps_better_docid_and_negative_weight_falls_back`).
+
+But the machinery's own pinned proof **fails on `main`**:
+
+```
+argus::tests::grouped_max_score_matches_exhaustive_and_prunes
+panicked at crates/frankensearch-quill/src/argus.rs:5532
+grouped MaxScore should prune at least one window
+(got UnionPruningStats { max_score_windows: 0, block_max_wand_windows: 0,
+                         blocks_skipped: 0, candidate_docs: 0 })
+```
+
+Its bit-parity assertions pass — results are correct. The **pruning** claim is
+what is false: `candidate_docs: 0` means `competitive_candidates` never
+returned candidates and every window fell through to `fill_exhaustive_window`.
+
+**This is not attributable to the gate work.** `git diff` against
+`crates/frankensearch-quill/src/argus.rs` is empty in the working tree; the
+failing test and the machinery it exercises are byte-identical to `main`.
+
+**Merge-semantic root cause (textually clean, behaviourally not).** The test
+landed in `1b5a1018` (Jul 24 17:10). Deterministic query-fuel metering landed in
+`ae5baa0d` (Jul 24 10:56) on a parallel branch and only reached this line
+through merge `afb7800d`. The test was therefore written and green on a tree
+that never contained `ae5baa0d`, which introduced `CheckpointPostingCursor` — a
+`PostingCursor` wrapper whose `fork_for_pruning` (`argus.rs:573`) delegates
+inward. `competitive_cursor` (`argus.rs:1419`) needs both `fork_for_pruning`
+and `term_score_upper_bound` to be `Some`; `group_competitive_docs` fails closed
+when any child lacks one, and `grouped_max_score_candidates` then returns
+`Ok(None)`. Both sides merged cleanly as text and nothing re-ran the test.
+The term-granular sibling still passes with `max_score_windows == 1`, so the
+breakage is specific to the grouped path — that asymmetry is the clue to start
+from.
+
+**Decision: DO NOT ACTIVATE. Ledgered blocker, no performance claim made, and
+no A/B run** — timing a lever that provably prunes nothing would measure only
+the cost of opening BLOCKMAX. `index.rs` ships the full shape classification
+(`UnionChildKind::{DirectTerms, TermGroups, Mixed}`) behind
+`GROUPED_MAX_SCORE_ENABLED = false`, which is **behaviour-neutral**: nested
+unions keep failing the gate exactly as before and no BLOCKMAX is opened for
+their terms. The 484-test suite is unchanged by this diff apart from the
+pre-existing failure above.
+
+**Retry predicate (concrete):** flip `GROUPED_MAX_SCORE_ENABLED` to `true` only
+when (1) `argus::tests::grouped_max_score_matches_exhaustive_and_prunes` passes
+with `max_score_windows >= 1` on unmodified production source, AND (2)
+`benches/grouped_maxscore_ab.rs` reports `pruned/exhaustive` medians outside
+their own same-invocation A/A null p5–p95 band on at least the `grouped2` and
+`grouped4` cells, AND (3) bit-parity holds at k={1,10,100,1000} across all
+cells. Per the fleet harness contract, decide on the median-CI — **never** on
+`cv`, which is unreachable below ~12% on this hardware and does not track
+decidability.
