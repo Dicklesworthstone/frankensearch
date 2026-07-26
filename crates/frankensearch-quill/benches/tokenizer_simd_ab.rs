@@ -25,21 +25,26 @@ use std::hint::black_box;
 use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_quill::Analyzer;
 use frankensearch_quill::scribe::{
-    BoundaryMaskTokenizer, FrankensearchTokenizer, TokenAnalyzer, analyze_default_scalar_reference,
+    AnalyzedToken, BoundaryMaskTokenizer, FrankensearchTokenizer, TokenAnalyzer,
+    analyze_default_scalar_reference,
 };
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Fold one token's identity (source offsets + normalized bytes) into a running
-/// digest. Shared across all arms so cross-implementation parity is one compare.
+/// Fold one token's identity (offsets, position metadata, and normalized bytes)
+/// into a running digest. Shared across all timed arms.
 #[inline]
-fn fold_token(mut digest: u64, offset_from: usize, offset_to: usize, text: &str) -> u64 {
-    digest ^= u64::try_from(offset_from).unwrap_or(u64::MAX);
+fn fold_token(mut digest: u64, token: &AnalyzedToken) -> u64 {
+    digest ^= u64::try_from(token.offset_from).unwrap_or(u64::MAX);
     digest = digest.wrapping_mul(FNV_PRIME);
-    digest ^= u64::try_from(offset_to).unwrap_or(u64::MAX);
+    digest ^= u64::try_from(token.offset_to).unwrap_or(u64::MAX);
     digest = digest.wrapping_mul(FNV_PRIME);
-    for byte in text.bytes() {
+    digest ^= u64::from(token.position);
+    digest = digest.wrapping_mul(FNV_PRIME);
+    digest ^= u64::try_from(token.position_length).unwrap_or(u64::MAX);
+    digest = digest.wrapping_mul(FNV_PRIME);
+    for byte in token.text.bytes() {
         digest ^= u64::from(byte);
         digest = digest.wrapping_mul(FNV_PRIME);
     }
@@ -49,17 +54,23 @@ fn fold_token(mut digest: u64, offset_from: usize, offset_to: usize, text: &str)
 fn quill_digest<A: TokenAnalyzer>(analyzer: &mut A, text: &str) -> u64 {
     let mut digest = FNV_OFFSET;
     analyzer.analyze(Analyzer::FrankensearchDefault, text, &mut |token| {
-        digest = fold_token(digest, token.offset_from, token.offset_to, &token.text);
+        digest = fold_token(digest, token);
     });
     digest
 }
 
-fn quill_scalar_digest(text: &str) -> u64 {
-    let mut digest = FNV_OFFSET;
-    analyze_default_scalar_reference(text, &mut |token| {
-        digest = fold_token(digest, token.offset_from, token.offset_to, &token.text);
+fn quill_tokens<A: TokenAnalyzer>(analyzer: &mut A, text: &str) -> Vec<AnalyzedToken> {
+    let mut tokens = Vec::new();
+    analyzer.analyze(Analyzer::FrankensearchDefault, text, &mut |token| {
+        tokens.push(token.clone());
     });
-    digest
+    tokens
+}
+
+fn scalar_tokens(text: &str) -> Vec<AnalyzedToken> {
+    let mut tokens = Vec::new();
+    analyze_default_scalar_reference(text, &mut |token| tokens.push(token.clone()));
+    tokens
 }
 
 /// Realistic mostly-ASCII corpus (English prose + code identifiers + IDs) with a
@@ -134,14 +145,14 @@ fn measure_default_tokenizer() {
     // Parity before timing: every arm must emit the identical token stream.
     let mut candidate = BoundaryMaskTokenizer::default();
     let mut shipping = FrankensearchTokenizer::default();
-    let scalar_ref = quill_scalar_digest(&text);
+    let scalar_ref = scalar_tokens(&text);
     assert_eq!(
-        quill_digest(&mut candidate, &text),
+        quill_tokens(&mut candidate, &text),
         scalar_ref,
         "Quill boundary-mask tokenizer diverged from the scalar char-walk reference"
     );
     assert_eq!(
-        quill_digest(&mut shipping, &text),
+        quill_tokens(&mut shipping, &text),
         scalar_ref,
         "retained shipping SWAR tokenizer diverged from the scalar char-walk reference"
     );
@@ -209,16 +220,16 @@ fn measure_default_tokenizer() {
 fn measure_long_token_tokenizer() {
     let text = long_token_corpus();
 
-    let scalar_ref = quill_scalar_digest(&text);
+    let scalar_ref = scalar_tokens(&text);
     let mut candidate = BoundaryMaskTokenizer::default();
     let mut shipping = FrankensearchTokenizer::default();
     assert_eq!(
-        quill_digest(&mut candidate, &text),
+        quill_tokens(&mut candidate, &text),
         scalar_ref,
         "Quill boundary-mask tokenizer diverged from the scalar reference on the long-token corpus"
     );
     assert_eq!(
-        quill_digest(&mut shipping, &text),
+        quill_tokens(&mut shipping, &text),
         scalar_ref,
         "retained shipping SWAR tokenizer diverged from the scalar reference on the long-token corpus"
     );

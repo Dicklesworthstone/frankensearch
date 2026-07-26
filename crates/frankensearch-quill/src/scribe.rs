@@ -220,8 +220,10 @@ pub struct FrankensearchTokenizer {
 impl sealed::Sealed for FrankensearchTokenizer {}
 
 /// Boundary-mask candidate retained only for the same-binary admission probe
-/// and exact-parity tests. The shipping [`FrankensearchTokenizer`] remains the
-/// existing two-pass SWAR implementation until measurement admits this lever.
+/// and exact-parity tests.
+///
+/// The shipping [`FrankensearchTokenizer`] remains the existing two-pass SWAR
+/// implementation until measurement admits this lever.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Clone, Default)]
 pub struct BoundaryMaskTokenizer {
@@ -4786,11 +4788,14 @@ mod tests {
     use crate::segment::SegmentReader;
     #[cfg(feature = "tantivy-oracle")]
     use frankensearch_lexical::tantivy_crate::tokenizer::TokenStream;
+    #[cfg(feature = "tantivy-oracle")]
     use serde_json::Value;
     use std::hash::BuildHasherDefault;
 
+    #[cfg(feature = "tantivy-oracle")]
     const LANGUAGE_CONTRACT_FIXTURE: &str =
         include_str!("../../../tests/fixtures/quill_language_contract.json");
+    #[cfg(feature = "tantivy-oracle")]
     const SHARED_CORPUS_FIXTURE: &str = include_str!("../../../tests/fixtures/corpus.json");
 
     /// Degenerate hasher: every key hashes to 0, forcing every intern through
@@ -5082,6 +5087,7 @@ mod tests {
         tokens
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_tokens(analyzer_kind: AnalyzerKind, text: &str) -> Vec<AnalyzedToken> {
         let mut analyzer = CassAnalyzer::default();
         let mut tokens = Vec::new();
@@ -5122,6 +5128,7 @@ mod tests {
         tokens
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn fixture_input(case: &Value) -> String {
         if let Some(input) = case.get("input").and_then(Value::as_str) {
             return input.to_owned();
@@ -5141,6 +5148,7 @@ mod tests {
         repeat.repeat(usize::try_from(count).expect("fixture repeat count fits usize"))
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn expected_fixture_tokens(case: &Value) -> Option<Vec<AnalyzedToken>> {
         case.get("expected_tokens")?.as_array().map(|tokens| {
             tokens
@@ -7292,6 +7300,7 @@ mod tests {
 
     /// First token-stream divergence as `(source byte offset, lane index mod 32)`
     /// so a failing lane-edge sweep case pinpoints the straddling boundary.
+    #[cfg(feature = "tantivy-oracle")]
     fn first_divergent_offset(a: &[AnalyzedToken], b: &[AnalyzedToken]) -> Option<(usize, usize)> {
         for (ta, tb) in a.iter().zip(b.iter()) {
             if ta != tb {

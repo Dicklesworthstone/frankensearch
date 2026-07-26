@@ -57,6 +57,11 @@ pub struct BenchExecutableIdentity {
 ///
 /// Call this before constructing Criterion or emitting any other benchmark
 /// output. Hashing happens outside every measured region.
+///
+/// # Errors
+///
+/// Returns an I/O error if the current executable path cannot be resolved or
+/// the executing binary cannot be read.
 pub fn print_bench_elf_sha256() -> io::Result<BenchExecutableIdentity> {
     let path = std::env::current_exe()?;
     let executable = std::fs::read(&path)?;

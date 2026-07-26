@@ -21,7 +21,10 @@ bench-internals = ["frankensearch-core/bench-internals"]
 # Tantivy differential tests are valuable oracle coverage, but they must remain
 # opt-in: a crate-wide dev-dependency made every Quill test and bench compile
 # the full lexical/Tantivy graph and repeatedly missed the admission window.
-tantivy-oracle = ["dep:frankensearch-lexical"]
+tantivy-oracle = [
+    "dep:frankensearch-lexical",
+    "frankensearch-lexical/tantivy-oracle",
+]
 
 [dependencies]
 frankensearch-core = { workspace = true }

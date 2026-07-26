@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Tracked local half of the performance-ledger integrity gate.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "${repo_root}/scripts/check_ledger_null_control.sh" --staged

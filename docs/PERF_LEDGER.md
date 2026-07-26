@@ -1,5 +1,70 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-25 — INFRA CHANGE / QG HOLD: admission probes now link without their crate-wide dev graphs; no QG is activated (`bd-7dbw`, `bd-l5x3`, `bd-3srq`, Codex)
+
+The campaign audit selected two priority instrument repairs. Under the
+corrected six-class taxonomy, `bd-l5x3` is a valid but undecidable A/B rather
+than VOID: its favorable 0.8223 median sits inside an inadmissibly broad A/A
+interval. `bd-3srq` is an untimed quarantine, not a REJECT class; it never
+emitted a binary. Static graph attribution found 114 Quill dev-only packages;
+76 came from the
+`frankensearch-lexical`/Tantivy oracle even though only oracle differentials
+needed them. The GitHub ratchet had a second admission defect: workflow-scope
+`concurrency` referenced `matrix.gate`, a context that does not exist until job
+expansion, so GitHub rejected the workflow before creating any jobs.
+
+Commit `bf982ae4` keeps both candidate paths non-production and repairs the
+instrument:
+
+- `int8_vs_f16_fast_ab` and `tokenizer_simd_ab` are explicit ordinary binaries,
+  so `cargo run --profile release-perf ... --bin ...` does not link Criterion
+  or unrelated crate-wide dev dependencies before the ELF can self-report.
+- `release-perf` now uses the normative thin-LTO setting instead of inheriting
+  release's fat LTO.
+- Quill's Tantivy differential coverage is opt-in through
+  `tantivy-oracle`; the default library/test and tokenizer-probe graphs remain
+  Tantivy-free. The boundary-mask implementation exists only under
+  `test`/`bench-internals`; shipping `FrankensearchTokenizer` is unchanged.
+- The ratchet workflow now uses matrix-specific concurrency at job scope.
+- QG-10 counts the complete `tantivy`/`tantivy-*` family, closing the false-pass
+  hole where a direct `tantivy-fst` dependency would previously count as zero.
+
+The current package graph confirms the admission split: Quill's default
+normal/build tree has 205 unique package/version pairs and **zero**
+Tantivy-family tree rows; enabling `tantivy-oracle` has 289 unique pairs and
+16 Tantivy-family tree rows.
+
+This was Lane B work: **no benchmark and no worker were used after the
+allocation addendum**. Static validation passed direct Rust formatting, TOML
+and YAML parsing, and `git diff --check`. Low-priority local checks passed both
+new binaries, the default Quill library, and the opt-in `tantivy-oracle`
+library. Default and oracle no-run test builds passed; focused candidate parity
+passed the randomized and lane-edge scalar checks, the shipping-incumbent
+oracle check, and the exhaustive 1–129-byte lane sweep. Focused Clippy passed
+with `-D warnings`, and targeted UBS reported zero critical findings.
+
+QG evidence was audited rather than invented. QG-1 through QG-9 still have
+only `*.unmeasured.latest.json` placeholders. The exact QG-10 dependency probe
+at `bf982ae4` is deterministic and currently **fails** its post-flip target:
+
+| graph | unique package/version pairs | Tantivy-family tree rows |
+|---|---:|---:|
+| `cargo tree --locked --offline -p frankensearch` | 213 | **0** |
+| `cargo tree --locked --offline -p frankensearch --features lexical` | 292 | **16** |
+
+**Decision: retain the admission repair; HOLD all QG activation and the Quill
+default flip.** This is not a performance KEEP. None of the ten `activated`
+flags changed, and no performance number is certified. Concrete retry
+predicate: obtain an authorized Lane M
+window, run full candidate and distinct-pass rerun artifacts from the same
+revision/machine for each QG, require `laws_attested=true`, identical
+self-reported ELF SHA-256, admissible same-invocation A/A median CIs, and an
+`Allow` ratchet result before committing each baseline and flipping its gate.
+For QG-10, retry after `--features lexical` routes to Quill and the hardened
+family count is exactly zero in both candidate and rerun. Make Quill the
+default only after QG-1 through QG-10 are all active with committed real
+baselines.
+
 ## 2026-07-23 — KEEP: Quill `TermInterner::bytes_used` O(1) running counter — −12.7% ingest instructions (`bd-w4j5`, cc)
 
 First lever in the INGEST vein (the query-decode profile vein was mined). An ingest-heavy local

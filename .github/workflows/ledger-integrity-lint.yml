@@ -1,9 +1,9 @@
 name: Ledger Integrity Lint
 
 # Refuses a NEW rejected-lever row that cannot distinguish the lever from the
-# harness. See scripts/check_ledger_null_control.sh for the contract, and
-# docs/LEDGER_RESURRECTION.md for the audit that motivated it (205 of 220 void
-# rows in this ledger are VOID-NONULL).
+# harness, and refuses a KEEP without an executing-binary SHA-256. See
+# scripts/check_ledger_null_control.sh for the contract and
+# docs/LEDGER_RESURRECTION.md for the audit that motivated it.
 #
 # Ledger integrity DECAYS: across the fleet, repos that audited once and
 # institutionalized the check sit near 1.7% void, while repos that audited and
@@ -25,7 +25,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Gate newly added REJECT rows
+      - name: Gate newly added REJECT and KEEP rows
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
@@ -39,6 +39,6 @@ jobs:
           echo "Gating ledger rows added since ${BASE_REF}"
           scripts/check_ledger_null_control.sh --since "${BASE_REF}"
 
-      - name: Report historical backlog (never fails)
+      - name: Report mechanical historical backlog (never fails)
         if: always()
         run: scripts/check_ledger_null_control.sh --all

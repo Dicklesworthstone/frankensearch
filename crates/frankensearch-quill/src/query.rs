@@ -3862,6 +3862,7 @@ fn cass_finish_native_clauses(mut clauses: Vec<BooleanClause>) -> Option<CassNod
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tantivy-oracle")]
     use std::collections::BTreeSet;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -3879,6 +3880,7 @@ mod tests {
         Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor,
         FieldKind, SchemaDescriptor,
     };
+    #[cfg(feature = "tantivy-oracle")]
     use crate::scribe::{CassAnalyzer, cass_generate_edge_ngrams};
 
     const TYPED_FIELDS: [FieldDescriptor; 7] = [
@@ -3957,6 +3959,7 @@ mod tests {
         title: &'static str,
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[derive(Debug, Clone, Copy)]
     struct CassEvalDoc {
         msg_idx: u64,
@@ -3982,6 +3985,7 @@ mod tests {
         terms
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_analyzed_terms(text: &str, analyzer_kind: AnalyzerKind) -> Vec<PositionedTerm> {
         let mut analyzer = CassAnalyzer::default();
         let mut terms = Vec::new();
@@ -3992,6 +3996,7 @@ mod tests {
         terms
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_field_text(doc: CassEvalDoc, field_id: u16) -> Option<&'static str> {
         match CASS_SEMANTIC_SCHEMA.fields.get(usize::from(field_id))?.name {
             "agent" => Some(doc.agent),
@@ -4004,6 +4009,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_field_terms(doc: CassEvalDoc, field_id: u16) -> Vec<PositionedTerm> {
         let Some(field) = CASS_SEMANTIC_SCHEMA.fields.get(usize::from(field_id)) else {
             return Vec::new();
@@ -4024,12 +4030,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_term_matches(doc: CassEvalDoc, field: QueryField, needle: &str) -> bool {
         cass_field_terms(doc, field.field_id)
             .iter()
             .any(|term| term.text == needle)
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_phrase_matches(doc: CassEvalDoc, field: QueryField, phrase: &[PositionedTerm]) -> bool {
         let haystack = cass_field_terms(doc, field.field_id);
         let Some(first) = phrase.first() else {
@@ -4048,6 +4056,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_bound_matches(
         value: i64,
         lower: &Bound<QueryValue>,
@@ -4068,6 +4077,7 @@ mod tests {
         lower_matches && upper_matches
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn star_glob_matches(pattern: &str, text: &str) -> bool {
         let pattern = pattern.chars().collect::<Vec<_>>();
         let text = text.chars().collect::<Vec<_>>();
@@ -4094,6 +4104,7 @@ mod tests {
         pattern[pattern_index..].iter().all(|ch| *ch == '*')
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn cass_ast_matches(query: &Query, doc: CassEvalDoc) -> bool {
         match query {
             Query::Empty => false,

@@ -10,9 +10,85 @@ Source of truth for the audit: `docs/NEGATIVE_EVIDENCE.md` @ `da149fd9`
 (16,151 lines, 398 `###` entries). Per campaign §4, **no row is ever deleted** —
 this file annotates, it does not rewrite history.
 
+## 0. Six-class taxonomy correction (authoritative)
+
+The fleet-wide frankenfs taxonomy supersedes the v1 C1–C5 counts and ranking
+below. These are the six classes, verbatim in meaning:
+
+| Class | Hand-adjudication rule |
+|---|---|
+| `VALID-PROFILE` | Rejected before any source edit on a named frame with non-zero self-time plus a computed Amdahl ceiling. |
+| `VALID-MECHANISM` | No A/A null, but refuted on a **counted** mechanism—unchanged instructions, cycles, syscalls, allocations, or faults—because a null control cannot change the fact that no work was removed. |
+| `VALID-AB` | A/B with a recorded A/A null and the effect sits inside it. |
+| `VOID-CV` | Killed **only** by a `cv < 5%` gate. |
+| `VOID-ZEROSELF` | The target frame had approximately zero percent self-time in the profile the benchmark actually ran. |
+| `VOID-NONULL` | A near-1.0 A/B, no A/A null, and no counted mechanism. |
+
+The mechanical screen found 399 sections: 54 surveys and 345
+verdict-shaped sections. Hand adjudication then removed four sections that
+never timed from the REJECT denominator: an untimed candidate is a
+`BLOCKED`/`UNTIMED` quarantine, not a seventh resurrection class. The corrected
+six-class census is therefore:
+
+| Class | Rows |
+|---|---:|
+| `VALID-PROFILE` | 1 |
+| `VALID-MECHANISM` | 68 |
+| `VALID-AB` | 56 |
+| `VOID-CV` | **0** |
+| `VOID-ZEROSELF` | 11 |
+| `VOID-NONULL` | **205** |
+| **Six-class total** | **341** |
+| **VOID total** | **216 / 341 (63.3%)** |
+
+The four untimed quarantines explain the earlier mechanical
+`220 / 345 (63.8%)` figure; they are still measurement work, but they are not
+REJECT evidence. The raw screen found only 9/345 verdict-shaped sections with
+an executing-ELF SHA-256 and only two with explicit target-frame self-time.
+Those provenance counts are reported on the raw denominator so this correction
+does not silently change what was counted.
+
+The important correction is mechanical: a row that contains an A/A null is not
+`VOID-CV`, even when an obsolete CV rule participated in its prose verdict.
+Accordingly, `bd-l5x3` is `VALID-AB`, not VOID: its A/B median 0.8223 lies
+inside its own extremely broad A/A interval `[0.7606, 1.2099]`. That evidence
+does not refute the lever, but it does correctly say the run is undecidable.
+The old ranked queue in §4 is retained as v1 audit history, not as the current
+rerun order.
+
+`bd-b5wl` (`vpmaddubs` pass-1 scan wiring) is a high-EV future retry, but not a
+VOID row: its recorded A/A makes it `VALID-AB`. It has 44.54% attributed
+self-time, full correctness proof, and two same-binary runs that disagreed on a
+shared worker. Its concrete retry predicate is an authorized Lane M window on
+a quiet pinned `x86-64-v3` worker, with the same ELF SHA-256,
+same-invocation A/A and A/B, and a median-CI/null-floor decision. No corrected
+top-five VOID rerun was performed in Lane B.
+
+### Ranking limit and resurrection queue
+
+The requested “top five VOID rows by target-frame self-time” cannot be produced
+honestly from this ledger. Only two verdict-shaped rows record target-frame
+self-time at all: `bd-b5wl` records 44.54% but is `VALID-AB`, while `bd-i40y`
+records approximately 0% and is `VOID-ZEROSELF`. Inventing four missing
+self-time values would repeat the provenance failure this audit is meant to
+remove.
+
+The hand-read fallback queue below is therefore **not** a self-time ranking. It
+keeps the one high-attribution retry first, then preserves the four untimed
+measurement quarantines with concrete predicates. A Lane M owner may execute
+these; Lane B did not benchmark them.
+
+| Order | Entry | Audit status | Concrete retry predicate |
+|---:|---|---|---|
+| 1 | `bd-b5wl` — `vpmaddubs` pass-1 scan | `VALID-AB`, 44.54% self-time | Quiet pinned `x86-64-v3`; one executing ELF SHA-256; full parity; same-invocation A/A and A/B; decide only on median CI versus the null floor. |
+| 2 | `bd-3srq` — direct gated ANN probe | `BLOCKED/UNTIMED` quarantine | Use the repaired directly linked probe; preserve 32/32 ordering and recall 1.0; record the executing ELF SHA-256; collect same-invocation A/A and A/B; gate only on median CI. |
+| 3 | `bd-btgh` — mmap int8 SIMD byte store | `BLOCKED/UNTIMED` quarantine | Warm release artifact on one worker; exact 10k-by-384 byte parity; one executing ELF SHA-256; same-invocation A/A and A/B; median-CI decision. |
+| 4 | `bd-x99j` — adaptive NQC single shift | `BLOCKED/UNTIMED` quarantine | Reopen only with the exact single-shift candidate and bit-parity fixture; warm one release ELF; same-invocation A/A and A/B; median-CI decision. |
+| 5 | `bd-q9u4` — hyphen decomposition allocation | `BLOCKED/UNTIMED` quarantine | Exact lexical benchmark artifact; full token-text, offset, and position parity; warm one release ELF; same-invocation A/A and A/B; median-CI decision. |
+
 ---
 
-## 1. Headline yield
+## 1. Superseded v1 headline yield
 
 | Metric | Count | % |
 |---|---:|---:|
@@ -170,17 +246,41 @@ audit **confirmed a rejection** — the queue is not a list of assumed wins.
 
 **Honest yield this round: 398 audited / 295 void / 0 re-run / 0 re-won.**
 
-The re-runs are blocked on the same instrument problem the audit itself
-identified: campaign §3c lists frankensearch as INSTRUMENT-blocked, and nothing
-in this session cleared it — `rch queue` showed every frankensearch slot sharing
-workers with frankenmermaid, frankenredis and franken_networkx jobs throughout.
-Re-running rank #1 on a shared worker would reproduce exactly the ±20% A/A band
-that voided it three times already. **Reporting a re-run under those conditions
-would manufacture a fourth void row, not a resurrection.**
+### 5a. Lane B admission follow-up (2026-07-25)
 
-The prerequisite is a worker-pinning capability (campaign §3b names the same
-need for ISA-sensitive lanes). Filed as a blocker on the campaign thread rather
-than burned as a fourth failed attempt.
+The allocation addendum reassigned frankensearch to BUILD/FIX and explicitly
+forbade benchmarking or taking a worker. Commit `bf982ae4` therefore fixes the
+instrument without pretending to complete a resurrection:
+
+- former v1 rank 1 (`bd-l5x3`) now has a retained, bench-only boundary-mask
+  candidate and a direct `cargo run --profile release-perf` probe. It performs exact
+  candidate/shipping/scalar parity before a same-invocation shipping/shipping
+  A/A and candidate/shipping A/B; the production tokenizer is unchanged.
+- former v1 rank 2 (`bd-3srq`) is likewise a direct probe rather than a
+  Criterion bench, preserving the 32-query recall/order oracle plus A/A and A/B.
+- both probes self-report the executing ELF SHA-256 and decide only on
+  bootstrap median CIs/null-floor separation. `cv_pct` is not a gate.
+- thin LTO, opt-in Quill/Tantivy oracle dependencies, and valid job-scope
+  workflow concurrency remove the three observed pre-timing admission costs.
+
+The corrected taxonomy makes `bd-l5x3` a valid but undecidable A/B rather than
+a VOID row; `bd-3srq` is an untimed quarantine outside the REJECT denominator.
+The former v1 queue is not the current top-five rerun order, and no
+resurrection result changed: honest yield remains **0 re-run / 0 re-won**.
+Retry only in an authorized measurement window using the repaired same-binary
+contract. Three REJECTs still require a vein switch; BLOCKED/UNTIMED and
+inactive-gate quarantines do not count as lever REJECTs.
+
+The original audit stopped here because `rch queue` showed every frankensearch
+slot sharing workers with other campaign jobs. Re-running rank 1 then would
+have reproduced the ±20% A/A band that voided it three times already.
+**Reporting a re-run under those conditions would have manufactured a fourth
+void row, not a resurrection.**
+
+The follow-up clears the source-level admission defects, not the measurement
+allocation. The remaining prerequisite is an authorized Lane M window on an
+isolated/pinned worker. That request belongs on the campaign thread instead of
+being burned as another invalid attempt.
 
 ---
 
@@ -189,11 +289,40 @@ than burned as a fourth failed attempt.
 1. **An `INVALID`/`UNTIMED` row is not negative evidence.** It belongs in a
    blocker log, not in `NEGATIVE_EVIDENCE.md`, because the "grep the ledger
    before proposing a lever" hard gate then suppresses an unmeasured lever
-   forever. 30 entries are currently mis-filed this way.
+   forever. The v1 screen over-counted this shape; the corrected verdict screen
+   quarantines four such sections outside the REJECT denominator.
 2. **Never gate on `cv`** (§2.3). Gate on: claimed ratio outside the arm's A/A
    null 95% CI with a 2× margin. Report `cv` as provenance only.
 3. **Every timed row records the ELF sha256 of the binary that produced it**,
-   self-reported by the bench binary from `env::current_exe()` (§2.1). 2.8%
-   compliance today.
-4. **A/A null control in the same invocation, always** (§2.2). 16.8% today.
+   self-reported by the bench binary from `env::current_exe()` (§2.1). The
+   corrected raw screen found 9/345.
+4. **A/A null control in the same invocation, always** (§2.2).
 5. The `bd-r3rd` closeout (§3 above) is the worked example. Copy it verbatim.
+
+## 7. Institutionalized preflight
+
+Commit-time enforcement lives in `scripts/check_ledger_null_control.sh`.
+Before proposing a lever, provide both its name and target surface:
+
+```bash
+scripts/check_ledger_null_control.sh \
+  --candidate 'proposed lever' \
+  --surface 'crate::module::target_function'
+```
+
+Exit 0 means no prior negative-evidence section matched. Exit 2 prints the
+matching section and its retry predicate, and blocks the candidate until the
+predicate is satisfied or the lane switches veins.
+
+The staged-row mode reads each complete section from the staged blob rather
+than grepping detached added lines. It returns exit 2 when:
+
+- a new REJECT has neither numeric same-invocation A/A evidence nor an
+  explicitly unchanged counted mechanism; or
+- a new KEEP has no executing ELF/binary SHA-256.
+
+The tracked `.githooks/pre-commit` invokes that mode, and this checkout uses
+`core.hooksPath=.githooks`. The same check runs in
+`.github/workflows/ledger-integrity-lint.yml`, so bypassing a local hook does
+not bypass the repository gate. `--all` is deliberately labeled a mechanical
+screen and never treated as hand adjudication.

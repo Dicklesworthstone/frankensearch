@@ -1,180 +1,432 @@
 #!/usr/bin/env bash
-# check_ledger_null_control.sh — refuse a REJECT row that cannot distinguish
-# the lever from the harness.
+# Candidate and write-side preflight for the performance ledgers.
 #
-# WHY THIS EXISTS
-# ---------------
-# The 2026-07-25 Ledger Resurrection audit classified 345 REJECT-verdict rows in
-# docs/NEGATIVE_EVIDENCE.md under the frankenfs six-class taxonomy:
+# Exit 0 = clear, exit 2 = BLOCKED, exit 64 = usage or repository error.
 #
-#     VOID-NONULL     205    <- 93% of all voids
-#     VOID-ZEROSELF    11
-#     VOID-UNMEASURED   4
-#     VOID-CV           0
-#     VOID total      220 / 345 = 63.8%
+# The six resurrection classes are:
+#   VALID-PROFILE, VALID-MECHANISM, VALID-AB,
+#   VOID-CV, VOID-ZEROSELF, VOID-NONULL.
 #
-# VOID-NONULL means: an A/B ran, the row was rejected on a near-1.0 wall ratio,
-# and NO A/A null control and NO counted mechanism were recorded — so the row
-# cannot distinguish "the lever does nothing" from "the harness cannot see it".
-# Those rejections are unfalsifiable, and because the house rule is to grep the
-# ledger before proposing a lever, each one permanently suppresses a candidate
-# that may never have been measured at all.
-#
-# The fleet's own evidence is that this DECAYS and that auditing once is not
-# enough: repos that audited once and institutionalized the check sit at ~1.7%
-# void; repos that never did sit at 25-91%. So this is the write-side gate.
-#
-# CONTRACT
-# --------
-# A newly added REJECT row must record at least one of:
-#   (a) an A/A null control  — the effect can be compared against the bench's
-#       own noise floor; or
-#   (b) a counted mechanism  — instructions / cycles / syscalls / allocations /
-#       page faults / "already auto-vectorizes" / "no work removed". A null
-#       control cannot change the fact that no work was removed, so a mechanism
-#       refutation is sound WITHOUT one (frankenfs VALID-MECHANISM).
-#
-# Rows that never obtained a measurement must say so (BLOCKED / UNTIMED /
-# INVALID) rather than claiming REJECT — an unmeasured lever is not a rejected
-# lever, and conflating them is what produced the VOID-UNMEASURED class.
-#
-# Exit codes:  0 = OK   2 = BLOCKED (contract violation)   1 = usage/IO error
-#
-# Only NEWLY ADDED rows are gated. The 220 historical void rows are left alone
-# deliberately: repository Rule 1 forbids deleting them, and rewriting history
-# is not the goal — stopping the bleeding is.
+# This guard deliberately does not infer a verdict from a loose keyword hit.
+# It gates the complete newly added section from the staged/committed blob.
+# A new REJECT needs a positive, same-invocation A/A record or a counted
+# no-change mechanism. A new KEEP needs the executing ELF/binary SHA-256.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEDGER="${ROOT_DIR}/docs/NEGATIVE_EVIDENCE.md"
 MODE="staged"
 SINCE_REF=""
+CANDIDATE=""
+SURFACE=""
+LEDGER_OVERRIDE=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
-                                            [--ledger <path>]
+Usage:
+  scripts/check_ledger_null_control.sh --candidate <lever> --surface <target>
+  scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
+  scripts/check_ledger_null_control.sh --install-hook
 
-  --staged        Gate rows added in the staged diff (default; pre-commit use).
-  --since <ref>   Gate rows added since a git ref (CI use, e.g. origin/main).
-  --all           Audit the whole ledger and REPORT ONLY (never blocks). Use to
-                  measure the historical backlog, not as a gate.
+Options:
+  --candidate <text>  Search NEGATIVE_EVIDENCE before proposing a lever.
+  --surface <text>    Function/path/target surface paired with --candidate.
+  --staged            Gate newly added staged rows (default; pre-commit).
+  --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
+  --all               Mechanical whole-ledger report; never blocks.
+  --ledger <path>     Override the default ledger set (test/diagnostic use).
+  --install-hook      Point this checkout at the tracked .githooks directory.
 
-Exit: 0 ok · 2 BLOCKED (a new REJECT row lacks a null control AND a mechanism)
-      1 usage/IO error
+Row contract:
+  REJECT: record either
+    * "A/A null: <numeric evidence> ... same invocation", or
+    * a counted instructions/cycles/syscalls/allocations/faults line explicitly
+      saying the count is unchanged, identical, flat, or the same.
+  KEEP: record "ELF sha256: <64 hex>" or "binary sha256: <64 hex>".
+
+Exit 0 means clear. Exit 2 means BLOCKED. Exit 64 means usage/IO failure.
 USAGE
+}
+
+need_value() {
+  if [[ $# -lt 2 || -z "$2" ]]; then
+    echo "ERROR: $1 requires a value" >&2
+    exit 64
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --staged) MODE="staged"; shift ;;
-    --all)    MODE="all"; shift ;;
-    --since)  MODE="since"; SINCE_REF="${2:-}"; shift 2 ;;
-    --ledger) LEDGER="${2:-}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    --candidate)
+      need_value "$@"
+      MODE="candidate"
+      CANDIDATE="$2"
+      shift 2
+      ;;
+    --surface)
+      need_value "$@"
+      SURFACE="$2"
+      shift 2
+      ;;
+    --staged)
+      MODE="staged"
+      shift
+      ;;
+    --since)
+      need_value "$@"
+      MODE="since"
+      SINCE_REF="$2"
+      shift 2
+      ;;
+    --all)
+      MODE="all"
+      shift
+      ;;
+    --ledger)
+      need_value "$@"
+      LEDGER_OVERRIDE="$2"
+      shift 2
+      ;;
+    --install-hook)
+      MODE="install-hook"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument: $1" >&2
+      usage >&2
+      exit 64
+      ;;
   esac
 done
 
-if [[ ! -f "${LEDGER}" ]]; then
-  echo "ERROR: ledger not found: ${LEDGER}" >&2
-  exit 1
-fi
-if [[ "${MODE}" == "since" && -z "${SINCE_REF}" ]]; then
-  echo "ERROR: --since requires a git ref" >&2
-  exit 1
-fi
+resolve_ledger() {
+  local requested="$1"
+  if [[ "${requested}" == /* ]]; then
+    LEDGER_ABS="${requested}"
+  else
+    LEDGER_ABS="${ROOT_DIR}/${requested}"
+  fi
+  if [[ ! -f "${LEDGER_ABS}" ]]; then
+    echo "ERROR: ledger not found: ${LEDGER_ABS}" >&2
+    exit 64
+  fi
+  LEDGER_REL="${LEDGER_ABS#"${ROOT_DIR}/"}"
+  if [[ "${LEDGER_REL}" == "${LEDGER_ABS}" ]]; then
+    echo "ERROR: ledger must be inside ${ROOT_DIR}: ${LEDGER_ABS}" >&2
+    exit 64
+  fi
+}
 
-REL_LEDGER="${LEDGER#"${ROOT_DIR}/"}"
+install_hook() {
+  local tracked_hook="${ROOT_DIR}/.githooks/pre-commit"
+  local configured
+  if [[ ! -x "${tracked_hook}" ]]; then
+    echo "ERROR: tracked pre-commit hook is missing or not executable: ${tracked_hook}" >&2
+    return 64
+  fi
+  configured="$(git -C "${ROOT_DIR}" config --get core.hooksPath || true)"
+  if [[ -n "${configured}" && "${configured}" != ".githooks" ]]; then
+    echo "BLOCKED: refusing to replace existing core.hooksPath=${configured}" >&2
+    return 2
+  fi
+  git -C "${ROOT_DIR}" config core.hooksPath .githooks
+  echo "[ledger-preflight] installed: core.hooksPath=.githooks"
+}
 
-# ─── Collect the text to inspect ────────────────────────────────────────────
-# The ledger is append-only, so added lines from a diff reconstruct whole
-# sections. Strip the leading '+' and drop diff headers.
-collect() {
+candidate_preflight() {
+  resolve_ledger "${LEDGER_OVERRIDE:-docs/NEGATIVE_EVIDENCE.md}"
+  if [[ -z "${CANDIDATE}" || -z "${SURFACE}" ]]; then
+    echo "ERROR: --candidate and --surface are both required" >&2
+    return 64
+  fi
+
+  awk -v candidate="${CANDIDATE}" -v surface="${SURFACE}" \
+      -v ledger="${LEDGER_REL}" '
+    function is_entry_heading(line) {
+      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+    }
+    function flush(    low, retry_text) {
+      if (header == "") return
+      low = tolower(text)
+      if (index(low, tolower(candidate)) == 0 &&
+          index(low, tolower(surface)) == 0) {
+        header = ""; text = ""; retry = ""; return
+      }
+      hits++
+      print "  " ledger ":" start_line
+      print "    " header
+      retry_text = (retry == "" ? "(none recorded)" : retry)
+      print "    retry: " retry_text
+      print ""
+      header = ""; text = ""; retry = ""
+    }
+    {
+      if (is_entry_heading($0)) {
+        flush()
+        header = $0
+        sub(/^##+ /, "", header)
+        start_line = FNR
+        text = $0 "\n"
+        next
+      }
+      if (header != "") {
+        text = text $0 "\n"
+        if (retry == "" && tolower($0) ~ /retry (predicate|condition|only|if|on|when)/) {
+          retry = $0
+          sub(/^[[:space:]>*-]+/, "", retry)
+        }
+      }
+    }
+    END {
+      flush()
+      if (hits == 0) {
+        print "[ledger-preflight] CLEAR — no prior row matched candidate=\"" \
+              candidate "\" surface=\"" surface "\""
+        exit 0
+      }
+      print "[ledger-preflight] BLOCKED — prior negative-evidence row(s) cover candidate=\"" \
+            candidate "\" surface=\"" surface "\""
+      print "Satisfy and cite the retry predicate, or switch veins."
+      exit 2
+    }
+  ' "${LEDGER_ABS}"
+}
+
+diff_stream() {
+  local rel="$1"
+  # A sentinel avoids the empty-first-file FNR==NR trap in awk.
+  printf '%s\n' "__FRANKENSEARCH_DIFF_SENTINEL__"
   case "${MODE}" in
     staged)
-      git -C "${ROOT_DIR}" diff --cached -U0 -- "${REL_LEDGER}" 2>/dev/null \
-        | sed -n 's/^+\([^+].*\)$/\1/p; s/^+$//p' || true
+      git -C "${ROOT_DIR}" diff --cached -U0 -- "${rel}"
       ;;
     since)
-      git -C "${ROOT_DIR}" diff -U0 "${SINCE_REF}" -- "${REL_LEDGER}" 2>/dev/null \
-        | sed -n 's/^+\([^+].*\)$/\1/p; s/^+$//p' || true
+      git -C "${ROOT_DIR}" diff -U0 "${SINCE_REF}...HEAD" -- "${rel}"
       ;;
     all)
-      cat "${LEDGER}"
+      # No hunks are needed in report mode; awk checks every entry.
       ;;
   esac
 }
 
-# Stream to a temp file rather than a shell variable: --all inspects ~16k lines,
-# and round-tripping that through "$(...)" plus printf is pathologically slow.
-WORK="$(mktemp)"
-VIOL="$(mktemp)"
-cleanup() { rm -f "${WORK}" "${VIOL}"; }
-trap cleanup EXIT
+blob_stream() {
+  local rel="$1"
+  local abs="$2"
+  case "${MODE}" in
+    staged)
+      if ! git -C "${ROOT_DIR}" show ":${rel}" 2>/dev/null; then
+        # An untracked override is useful for diagnostics; default ledgers are
+        # tracked, so reaching this branch during normal pre-commit is an error.
+        if [[ -n "${LEDGER_OVERRIDE}" ]]; then
+          command cat "${abs}"
+        else
+          return 64
+        fi
+      fi
+      ;;
+    since|all)
+      command cat "${abs}"
+      ;;
+  esac
+}
 
-collect >"${WORK}"
-if [[ ! -s "${WORK}" ]]; then
-  echo "[ledger-gate] no new ledger rows to check."
-  exit 0
-fi
+lint_one() {
+  local requested="$1"
+  resolve_ledger "${requested}"
 
-# ─── Adjudicate each '### ' section ─────────────────────────────────────────
-# A section is GATED when its header announces a rejected candidate. Rows that
-# are surveys, corrections, keeps, or explicit blockers are not rejections.
-awk '
-  function flush_section() {
-    if (header == "") return
-    is_reject = (header ~ /REJECT|REJECTED|WASH|regress|REGRESS|not a win|NO-LAND|below.bar|BELOW-FLOOR/)
-    is_exempt = (header ~ /SURVEY|ROUTE-NEXT|CORRECTION|RETRACT|RESOLVED|LANDED|KEEP|AUDIT|inventory|METHODOLOGY|Methodology|BLOCKED|UNTIMED|INVALID|HOLD|NULL \(profiling/)
-    if (is_reject && !is_exempt) {
-      has_null = (body ~ /A\/A/)
-      has_mech = (body ~ /instruction|cycles|syscall|allocation|page fault|perf stat|auto-?vector|no work (is |was )?removed|same per-byte work|identical (instruction|work)|zero-gain/)
-      if (!has_null && !has_mech) print header
+  awk -v mode="${MODE}" -v ledger="${LEDGER_REL}" '
+    function has_hex64(line,    fields, n, i) {
+      n = split(line, fields, /[^[:xdigit:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (length(fields[i]) == 64) return 1
+      }
+      return 0
     }
-    header = ""; body = ""
-  }
-  /^### / { flush_section(); header = $0; body = ""; next }
-  { body = body "\n" $0 }
-  END { flush_section() }
-' "${WORK}" >"${VIOL}"
+    function is_entry_heading(line) {
+      # This ledger has used both ## and ### for entries. Date-bearing headings
+      # are entries; undated headings are grouping labels.
+      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+    }
+    function note_line(line,    low, absent, metric, decisive) {
+      low = tolower(line)
 
-if [[ ! -s "${VIOL}" ]]; then
-  echo "[ledger-gate] OK — every new REJECT row records a null control or a counted mechanism."
-  exit 0
-fi
+      if (low ~ /same[- ]invocation|same binary invocation/) {
+        same_invocation = 1
+      }
 
-COUNT="$(grep -c '^###' "${VIOL}" || true)"
+      absent = (low ~ /no (a\/a|null[- ]control)|without (an )?(a\/a|null[- ]control)|\
+(a\/a|null[- ]control).*(missing|absent|not recorded|none)/)
+      if (!absent &&
+          low ~ /(a\/a|null[- ]control|null floor|null_median_ratio)/ &&
+          line ~ /[0-9][.][0-9]/) {
+        numeric_null = 1
+      }
 
-if [[ "${MODE}" == "all" ]]; then
-  echo "[ledger-gate] REPORT (--all never blocks): ${COUNT} historical rows lack both."
-  head -20 "${VIOL}"
-  exit 0
-fi
+      metric = (low ~ /(instructions?|cycles?|syscalls?|allocations?|page faults?|faults?)/)
+      decisive = (low ~ /(unchanged|identical|flat|same count|counts? (were |are )?the same|\
+no (counted )?change|0([.]0+)?% change)/)
+      absent = (low ~ /(not measured|not recorded|missing|unavailable|no counted mechanism)/)
+      if (metric && decisive && !absent) {
+        counted_mechanism = 1
+      }
 
-cat >&2 <<EOF
-[ledger-gate] BLOCKED — ${COUNT} new REJECT row(s) record neither an A/A null
-control nor a counted mechanism, so they cannot distinguish the lever from the
-harness. This is the VOID-NONULL class: 205 of 220 voids in this ledger.
+      if (low ~ /(elf|binary|executable)/ &&
+          low ~ /sha-?256|sha256/ &&
+          has_hex64(line)) {
+        binary_sha = 1
+      }
+    }
+    function flush(    upper, explicit_reject, explicit_keep, exempt,
+                       is_reject, is_keep, new_entry, has_null) {
+      if (header == "") return
+      new_entry = (mode == "all" || added[start_line])
+      if (!new_entry) {
+        header = ""; evidence = ""; return
+      }
 
+      checked++
+      upper = toupper(header)
+      explicit_reject = (upper ~ /REJECT|REFUT|NO[- ]?SHIP|NO[- ]?LAND|\
+NOT A (WIN|LEVER)|REGRESS|WASH/)
+      explicit_keep = (upper ~ /KEEP|LANDED|SHIPPED|MEASURED WIN/)
+      exempt = (upper ~ /SURVEY|ROUTE[- ]NEXT|CORRECTION|RETRACT|RESOLVED|\
+AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
+
+      is_keep = explicit_keep
+      is_reject = explicit_reject
+      if (ledger ~ /NEGATIVE_EVIDENCE[.]md$/ &&
+          !explicit_keep && !exempt) {
+        is_reject = 1
+      }
+      has_null = numeric_null && same_invocation
+
+      if (is_reject && !has_null && !counted_mechanism) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED REJECT " ledger ":" start_line
+          print "  " header
+          print "  missing: same-invocation numeric A/A null OR counted no-change mechanism"
+        }
+      }
+      if (is_keep && !binary_sha) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED KEEP " ledger ":" start_line
+          print "  " header
+          print "  missing: executing ELF/binary SHA-256"
+        }
+      }
+
+      header = ""; evidence = ""; decision_lines = ""
+      numeric_null = 0; same_invocation = 0
+      counted_mechanism = 0; binary_sha = 0
+    }
+
+    FNR == NR {
+      if ($0 ~ /^@@ /) {
+        hunk = $0
+        sub(/^@@ -[^ ]+ [+]/, "", hunk)
+        sub(/ .*/, "", hunk)
+        split(hunk, range, ",")
+        first = range[1] + 0
+        count = (length(range[2]) ? range[2] + 0 : 1)
+        for (i = 0; i < count; i++) added[first + i] = 1
+      }
+      next
+    }
+
+    {
+      if (is_entry_heading($0)) {
+        flush()
+        header = $0
+        sub(/^##+ /, "", header)
+        start_line = FNR
+        note_line($0)
+        next
+      }
+      if (header != "") {
+        note_line($0)
+        low = tolower($0)
+        if (low ~ /(verdict|decision|outcome|status)[[:space:]:-]/) {
+          decision_lines = decision_lines "\n" $0
+        }
+      }
+    }
+    END {
+      flush()
+      if (mode == "all") {
+        print "[ledger-gate] mechanical report " ledger \
+              ": checked=" (checked + 0) " violations=" (violations + 0)
+        exit 0
+      }
+      if (violations > 0) exit 2
+      print "[ledger-gate] OK " ledger ": checked_new_rows=" (checked + 0)
+      exit 0
+    }
+  ' <(diff_stream "${LEDGER_REL}") <(blob_stream "${LEDGER_REL}" "${LEDGER_ABS}")
+}
+
+lint_ledgers() {
+  local ledgers
+  local status=0
+
+  if [[ "${MODE}" == "since" && -z "${SINCE_REF}" ]]; then
+    echo "ERROR: --since requires a git ref" >&2
+    return 64
+  fi
+  if [[ "${MODE}" == "since" ]] &&
+     ! git -C "${ROOT_DIR}" rev-parse --verify --quiet "${SINCE_REF}^{commit}" >/dev/null; then
+    echo "ERROR: --since ref is not a commit: ${SINCE_REF}" >&2
+    return 64
+  fi
+  if [[ -n "${LEDGER_OVERRIDE}" ]]; then
+    ledgers=("${LEDGER_OVERRIDE}")
+  else
+    ledgers=("docs/NEGATIVE_EVIDENCE.md" "docs/PERF_LEDGER.md")
+  fi
+
+  for ledger in "${ledgers[@]}"; do
+    resolve_ledger "${ledger}"
+    if [[ "${MODE}" == "staged" && -z "${LEDGER_OVERRIDE}" ]] &&
+       ! git -C "${ROOT_DIR}" cat-file -e ":${LEDGER_REL}" 2>/dev/null; then
+      echo "ERROR: staged ledger blob is unavailable: ${LEDGER_REL}" >&2
+      return 64
+    fi
+    if lint_one "${ledger}"; then
+      local rc=0
+    else
+      local rc=$?
+      if [[ ${rc} -eq 64 ]]; then
+        return 64
+      fi
+      status=2
+    fi
+  done
+
+  if [[ ${status} -eq 2 ]]; then
+    cat >&2 <<'EOF'
+
+[ledger-gate] BLOCKED. A new REJECT must distinguish the lever from the
+harness with a numeric same-invocation A/A null, or refute it with a counted
+unchanged mechanism. A new KEEP must identify the executing ELF/binary SHA-256.
+Never use cv_pct as the decision gate.
 EOF
-cat "${VIOL}" >&2
-cat >&2 <<'EOF'
+  fi
+  return "${status}"
+}
 
-To clear this, add ONE of:
-  * an A/A null control from the SAME invocation (frankensearch_core::bench_support
-    paired_median_ratio + decidable_against), so the effect is compared against
-    the bench's own floor; or
-  * a counted mechanism showing no work was removed — instructions, cycles,
-    syscalls, allocations, or page faults unchanged. That is sound WITHOUT a
-    null control, because a null cannot change "no work was removed".
-
-If the candidate never actually got timed, say so: title the row BLOCKED or
-UNTIMED rather than REJECT. An unmeasured lever is not a rejected lever, and
-recording it as one suppresses a candidate that was never measured.
-
-Never gate on cv_pct — it is unreachable below ~12% on this hardware and does
-not track decidability (campaign 2.3).
-EOF
-exit 2
+case "${MODE}" in
+  candidate)
+    candidate_preflight
+    ;;
+  install-hook)
+    install_hook
+    ;;
+  staged|since|all)
+    lint_ledgers
+    ;;
+esac

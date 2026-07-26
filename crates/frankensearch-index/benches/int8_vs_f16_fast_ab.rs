@@ -117,6 +117,10 @@ fn measure() {
         (recall - 1.0).abs() < 1e-9,
         "int8 two-pass must be candidate-lossless vs f16 exact (got {recall:.4})"
     );
+    assert_eq!(
+        exact_match, QUERIES,
+        "int8 two-pass must preserve exact top-k rank order for every query"
+    );
 
     // Closure factories: each call returns a fresh runner (own rotation counter,
     // `index`/`queries` by copied reference) so the same arm can be handed to
