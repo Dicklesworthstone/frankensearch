@@ -817,6 +817,20 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
     elapsed.as_secs_f64() * 1_000.0
 }
 
+fn cargo_tree_line_is_tantivy_family(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(mut package) = fields.next() else {
+        return false;
+    };
+    for version in fields {
+        if (package == "tantivy" || package.starts_with("tantivy-")) && version.starts_with('v') {
+            return true;
+        }
+        package = version;
+    }
+    false
+}
+
 fn dependency_surface_metric() -> f64 {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
@@ -833,7 +847,7 @@ fn dependency_surface_metric() -> f64 {
     assert!(output.status.success(), "QG-10 cargo tree failed");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains("tantivy v"))
+        .filter(|line| cargo_tree_line_is_tantivy_family(line))
         .count() as f64
 }
 

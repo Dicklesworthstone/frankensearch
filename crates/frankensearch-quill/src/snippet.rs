@@ -340,8 +340,11 @@ mod tests {
         collapse_overlapping_ranges, compare_candidates,
     };
     use crate::schema::Analyzer;
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::{IndexableDocument, LexicalSearch};
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_lexical::{SnippetConfig as OracleSnippetConfig, TantivyIndex};
+    #[cfg(feature = "tantivy-oracle")]
     use std::collections::BTreeMap;
 
     fn terms(entries: &[(&str, u64)]) -> Vec<SnippetTerm> {
@@ -506,6 +509,7 @@ mod tests {
         assert_eq!(missing_generator.snippet_or_prefix("   "), None);
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn oversized_nonmatch_still_advances_oracle_fragment_geometry() {
         use frankensearch_lexical::tantivy_crate::{
@@ -557,6 +561,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn native_output_matches_pinned_tantivy_oracle() {
         const TARGET: &str = "common alpha beta gamma rust";

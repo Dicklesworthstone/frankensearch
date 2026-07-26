@@ -11,12 +11,12 @@
 //!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
-//!   rch exec -- cargo bench -p frankensearch-index --bench int8_vs_f16_fast_ab
+//!   rch exec -- cargo run --profile release-perf -p frankensearch-index \
+//!     --features bench-internals --bin int8_vs_f16_fast_ab
 //! ```
 
 use std::hint::black_box;
 
-use criterion::Criterion;
 use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_index::{Quantization, VectorIndex};
 
@@ -62,7 +62,7 @@ fn make_vector(centroids: &[Vec<f32>], c: usize, noise_seed: u64) -> Vec<f32> {
     )
 }
 
-fn bench(c: &mut Criterion) {
+fn measure() {
     let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
         .map(|c| normalize(raw_vector(0xc000_0000 + c as u64)))
         .collect();
@@ -118,9 +118,9 @@ fn bench(c: &mut Criterion) {
         "int8 two-pass must be candidate-lossless vs f16 exact (got {recall:.4})"
     );
 
-    // Closure factories: each call returns a FRESH runner (own rotation counter, `index`/`queries`
-    // by copied reference) so the same arm can be handed to the null, lever, and criterion phases
-    // without being moved-from.
+    // Closure factories: each call returns a fresh runner (own rotation counter,
+    // `index`/`queries` by copied reference) so the same arm can be handed to
+    // the null and lever phases without being moved-from.
     let index_ref = &index;
     let queries_ref = &queries;
     let mk_f16 = || {
@@ -176,14 +176,6 @@ fn bench(c: &mut Criterion) {
         }
     );
 
-    {
-        let mut g = c.benchmark_group("int8_vs_f16_fast");
-        g.sample_size(30);
-        g.bench_function("f16_exact", |b| b.iter(mk_f16()));
-        g.bench_function("int8_two_pass", |b| b.iter(mk_i8()));
-        g.finish();
-    }
-
     eprintln!(
         "[artifact] retained index={} (repository policy forbids benchmark teardown deletion)",
         path.display()
@@ -192,7 +184,5 @@ fn bench(c: &mut Criterion) {
 
 fn main() {
     let _identity = print_bench_elf_sha256().expect("hash executing top-k benchmark");
-    let mut criterion = Criterion::default().configure_from_args();
-    bench(&mut criterion);
-    criterion.final_summary();
+    measure();
 }

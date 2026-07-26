@@ -1,43 +1,32 @@
-//! Default-analyzer tokenizer A/B: Quill's SWAR byte classifier vs the scalar
-//! char-walk reference, with the shipping fused scalar and the legacy Tantivy
-//! `SimpleTokenizer + LowerCaser` chain as orientation arms (bd-quill-e1-scribe-bejd.1).
+//! Default-analyzer tokenizer admission probe: the `bd-l5x3` boundary-mask
+//! candidate vs Quill's shipping two-pass SWAR classifier.
 //!
 //! Tokenization is a *full-scan classify*: every input byte is visited to find
 //! token boundaries, which is precisely the shape where SWAR/SIMD pays — unlike
 //! the `memchr`/`contains` early-exit scans that regress when fused (bd-5hz0).
-//! The decisive lever is `quill_scalar` vs `quill_simd`: identical token model,
-//! identical emission, so the only difference is boundary-finding (char-walk vs
-//! 8-bytes-per-word SWAR). The A/A null is scalar-vs-scalar; the ratio is
-//! `simd / scalar`, so a median `< 1.0` outside the null floor is a decidable win.
+//! The A/A null and A/B run in one process through the shared median-CI harness.
+//! The scalar implementation is retained as a parity oracle, not a timed arm.
 //!
-//! Two corpora, because the payoff is length-dependent: `corpus` is realistic
-//! short (~6-byte) space-separated tokens, where SWAR is ≈parity (the scalar
-//! char-walk already has an ASCII byte fast-path, so ~6-byte tokens barely fill
-//! one 8-lane window — the run-to-run sign is inside the fleet's noise);
-//! `long_token_corpus` is 24–48 byte tokens (hashes/base64/UUIDs/identifiers)
-//! with long separator runs, where SWAR amortizes its per-window mask and wins
-//! decidably (~1.2–1.5×). Adopting SWAR as the default is therefore neutral on
-//! prose and a real win on the long tokens common in code/log/data corpora.
+//! Two corpora pin the intended short-token gain and prevent a long-token
+//! regression. Production stays on the shipping implementation until a later
+//! measurement window admits the candidate.
 //!
-//! All four arms are asserted byte-identical (offsets + text) before timing, so
-//! any ranking/recall-affecting divergence fails the bench rather than shipping.
+//! Both implementations and the scalar oracle are asserted byte-identical
+//! (offsets + text) before timing.
 //!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
-//!   rch exec -- cargo bench -p frankensearch-quill --features bench-internals \
-//!     --profile release --bench tokenizer_simd_ab
+//!   rch exec -- cargo run --profile release-perf -p frankensearch-quill \
+//!     --features bench-internals --bin tokenizer_simd_ab
 //! ```
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
-use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_lexical::default_tokenizer_for_bench;
+use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_quill::Analyzer;
 use frankensearch_quill::scribe::{
-    FrankensearchTokenizer, TokenAnalyzer, analyze_default_scalar_reference,
+    BoundaryMaskTokenizer, FrankensearchTokenizer, TokenAnalyzer, analyze_default_scalar_reference,
 };
-use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, TokenStream};
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -57,7 +46,7 @@ fn fold_token(mut digest: u64, offset_from: usize, offset_to: usize, text: &str)
     digest
 }
 
-fn quill_simd_digest(analyzer: &mut FrankensearchTokenizer, text: &str) -> u64 {
+fn quill_digest<A: TokenAnalyzer>(analyzer: &mut A, text: &str) -> u64 {
     let mut digest = FNV_OFFSET;
     analyzer.analyze(Analyzer::FrankensearchDefault, text, &mut |token| {
         digest = fold_token(digest, token.offset_from, token.offset_to, &token.text);
@@ -71,22 +60,6 @@ fn quill_scalar_digest(text: &str) -> u64 {
         digest = fold_token(digest, token.offset_from, token.offset_to, &token.text);
     });
     digest
-}
-
-fn tantivy_digest(analyzer: &mut TextAnalyzer, text: &str) -> u64 {
-    let mut digest = FNV_OFFSET;
-    let mut stream = analyzer.token_stream(text);
-    while stream.advance() {
-        let token = stream.token();
-        digest = fold_token(digest, token.offset_from, token.offset_to, &token.text);
-    }
-    digest
-}
-
-fn legacy_tantivy_tokenizer() -> TextAnalyzer {
-    TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(LowerCaser)
-        .build()
 }
 
 /// Realistic mostly-ASCII corpus (English prose + code identifiers + IDs) with a
@@ -155,73 +128,75 @@ fn long_token_corpus() -> String {
     text
 }
 
-fn bench_default_tokenizer(c: &mut Criterion) {
+fn measure_default_tokenizer() {
     let text = corpus();
 
     // Parity before timing: every arm must emit the identical token stream.
-    let mut simd = FrankensearchTokenizer::default();
-    let mut fused = default_tokenizer_for_bench();
-    let mut legacy = legacy_tantivy_tokenizer();
+    let mut candidate = BoundaryMaskTokenizer::default();
+    let mut shipping = FrankensearchTokenizer::default();
     let scalar_ref = quill_scalar_digest(&text);
     assert_eq!(
-        quill_simd_digest(&mut simd, &text),
+        quill_digest(&mut candidate, &text),
         scalar_ref,
-        "Quill SWAR tokenizer diverged from the scalar char-walk reference"
+        "Quill boundary-mask tokenizer diverged from the scalar char-walk reference"
     );
     assert_eq!(
-        tantivy_digest(&mut fused, &text),
+        quill_digest(&mut shipping, &text),
         scalar_ref,
-        "shipping fused scalar tokenizer diverged from the Quill reference"
+        "retained shipping SWAR tokenizer diverged from the scalar char-walk reference"
     );
-    assert_eq!(
-        tantivy_digest(&mut legacy, &text),
-        scalar_ref,
-        "legacy SimpleTokenizer+LowerCaser diverged from the Quill reference"
-    );
-
-    // NULL (scalar vs scalar), then the lever (scalar=ORIG vs SWAR).
-    // Ratio = simd/scalar, < 1.0 = SWAR classifier wins. `inner` batches ~16
-    // full-corpus passes (~4ms) so per-batch scheduler jitter on a shared worker
-    // does not dominate a ~250µs single pass (an earlier inner=4 run produced an
-    // unusably wide ~0.86..1.16 A/A null floor).
+    // NULL (shipping vs shipping), then the lever (shipping vs boundary mask).
+    // Ratio = candidate/shipping, < 1.0 = boundary batching wins. `inner`
+    // batches 64 full-corpus passes so per-batch scheduler jitter does not
+    // dominate a sub-250µs single pass.
+    let mut shipping_a = FrankensearchTokenizer::default();
+    let mut shipping_b = FrankensearchTokenizer::default();
     let null = paired_median_ratio(
         41,
-        16,
+        64,
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_a, black_box(&text)));
         },
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_b, black_box(&text)));
         },
     );
-    let mut simd_a = FrankensearchTokenizer::default();
+    let mut shipping_c = FrankensearchTokenizer::default();
+    let mut candidate_a = BoundaryMaskTokenizer::default();
     let lever = paired_median_ratio(
         41,
-        16,
+        64,
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_c, black_box(&text)));
         },
         || {
-            black_box(quill_simd_digest(&mut simd_a, black_box(&text)));
+            black_box(quill_digest(&mut candidate_a, black_box(&text)));
         },
     );
     eprintln!(
-        "[null]  tokenizer_simd/{}KiB: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        "[null] tokenizer_boundary_mask/{}KiB shipping/shipping median {:.4} \
+         median_ci95 [{:.4}, {:.4}] p5 {:.4} p95 {:.4} admissible={} ({} rounds)",
         text.len() / 1024,
         null.median,
+        null.median_ci95_low,
+        null.median_ci95_high,
         null.p5,
         null.p95,
+        null.is_admissible_null(),
         null.rounds
     );
     eprintln!(
-        "[lever] tokenizer_simd/{}KiB: simd/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        "[lever] tokenizer_boundary_mask/{}KiB candidate/shipping median {:.4} \
+         median_ci95 [{:.4}, {:.4}] p5 {:.4} p95 {:.4} -> {}",
         text.len() / 1024,
         lever.median,
+        lever.median_ci95_low,
+        lever.median_ci95_high,
         lever.p5,
         lever.p95,
         if lever.decidable_against(&null) {
             if lever.median < 1.0 {
-                "DECIDABLE WIN (SWAR classifier faster)"
+                "DECIDABLE WIN (boundary batching faster)"
             } else {
                 "DECIDABLE REGRESSION"
             }
@@ -229,76 +204,73 @@ fn bench_default_tokenizer(c: &mut Criterion) {
             "INSIDE NULL FLOOR (not decidable)"
         }
     );
-
-    let mut group = c.benchmark_group("default_tokenizer");
-    group.sample_size(30);
-    group.bench_function("legacy_tantivy/48KiB", |b| {
-        let mut analyzer = legacy_tantivy_tokenizer();
-        b.iter(|| black_box(tantivy_digest(&mut analyzer, black_box(&text))));
-    });
-    group.bench_function("shipping_fused_scalar/48KiB", |b| {
-        let mut analyzer = default_tokenizer_for_bench();
-        b.iter(|| black_box(tantivy_digest(&mut analyzer, black_box(&text))));
-    });
-    group.bench_function("quill_scalar/48KiB", |b| {
-        b.iter(|| black_box(quill_scalar_digest(black_box(&text))));
-    });
-    group.bench_function("quill_simd/48KiB", |b| {
-        let mut analyzer = FrankensearchTokenizer::default();
-        b.iter(|| black_box(quill_simd_digest(&mut analyzer, black_box(&text))));
-    });
-    group.finish();
 }
 
-fn bench_long_token_tokenizer(c: &mut Criterion) {
+fn measure_long_token_tokenizer() {
     let text = long_token_corpus();
 
     let scalar_ref = quill_scalar_digest(&text);
-    let mut simd = FrankensearchTokenizer::default();
+    let mut candidate = BoundaryMaskTokenizer::default();
+    let mut shipping = FrankensearchTokenizer::default();
     assert_eq!(
-        quill_simd_digest(&mut simd, &text),
+        quill_digest(&mut candidate, &text),
         scalar_ref,
-        "Quill SWAR tokenizer diverged from the scalar reference on the long-token corpus"
+        "Quill boundary-mask tokenizer diverged from the scalar reference on the long-token corpus"
+    );
+    assert_eq!(
+        quill_digest(&mut shipping, &text),
+        scalar_ref,
+        "retained shipping SWAR tokenizer diverged from the scalar reference on the long-token corpus"
     );
 
+    let mut shipping_a = FrankensearchTokenizer::default();
+    let mut shipping_b = FrankensearchTokenizer::default();
     let null = paired_median_ratio(
         41,
-        16,
+        64,
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_a, black_box(&text)));
         },
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_b, black_box(&text)));
         },
     );
-    let mut simd_a = FrankensearchTokenizer::default();
+    let mut shipping_c = FrankensearchTokenizer::default();
+    let mut candidate_a = BoundaryMaskTokenizer::default();
     let lever = paired_median_ratio(
         41,
-        16,
+        64,
         || {
-            black_box(quill_scalar_digest(black_box(&text)));
+            black_box(quill_digest(&mut shipping_c, black_box(&text)));
         },
         || {
-            black_box(quill_simd_digest(&mut simd_a, black_box(&text)));
+            black_box(quill_digest(&mut candidate_a, black_box(&text)));
         },
     );
     eprintln!(
-        "[null]  tokenizer_simd_long/{}KiB: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        "[null] tokenizer_boundary_mask_long/{}KiB shipping/shipping median {:.4} \
+         median_ci95 [{:.4}, {:.4}] p5 {:.4} p95 {:.4} admissible={} ({} rounds)",
         text.len() / 1024,
         null.median,
+        null.median_ci95_low,
+        null.median_ci95_high,
         null.p5,
         null.p95,
+        null.is_admissible_null(),
         null.rounds
     );
     eprintln!(
-        "[lever] tokenizer_simd_long/{}KiB: simd/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        "[lever] tokenizer_boundary_mask_long/{}KiB candidate/shipping median {:.4} \
+         median_ci95 [{:.4}, {:.4}] p5 {:.4} p95 {:.4} -> {}",
         text.len() / 1024,
         lever.median,
+        lever.median_ci95_low,
+        lever.median_ci95_high,
         lever.p5,
         lever.p95,
         if lever.decidable_against(&null) {
             if lever.median < 1.0 {
-                "DECIDABLE WIN (SWAR classifier faster)"
+                "DECIDABLE WIN (boundary batching faster)"
             } else {
                 "DECIDABLE REGRESSION"
             }
@@ -306,18 +278,10 @@ fn bench_long_token_tokenizer(c: &mut Criterion) {
             "INSIDE NULL FLOOR (not decidable)"
         }
     );
-
-    let mut group = c.benchmark_group("long_token_tokenizer");
-    group.sample_size(30);
-    group.bench_function("quill_scalar/48KiB", |b| {
-        b.iter(|| black_box(quill_scalar_digest(black_box(&text))));
-    });
-    group.bench_function("quill_simd/48KiB", |b| {
-        let mut analyzer = FrankensearchTokenizer::default();
-        b.iter(|| black_box(quill_simd_digest(&mut analyzer, black_box(&text))));
-    });
-    group.finish();
 }
 
-criterion_group!(benches, bench_default_tokenizer, bench_long_token_tokenizer);
-criterion_main!(benches);
+fn main() {
+    let _identity = print_bench_elf_sha256().expect("hash executing tokenizer benchmark");
+    measure_default_tokenizer();
+    measure_long_token_tokenizer();
+}

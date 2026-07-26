@@ -238,5 +238,9 @@ strip = true
 
 [profile.release-perf]
 inherits = "release"
+# The normative QG manifest specifies thin LTO. Inheriting release's fat LTO
+# made cold bench-only links exceed the admission window before either the
+# executable hash or A/A control could run (bd-l5x3, bd-3srq).
+lto = "thin"
 debug = "line-tables-only"
 strip = false

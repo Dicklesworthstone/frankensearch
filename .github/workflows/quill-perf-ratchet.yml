@@ -14,7 +14,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: quill-perf-ratchet-${{ github.event_name }}-${{ github.ref }}-${{ matrix.gate }}
+  # `matrix` is unavailable at workflow scope. Referencing `matrix.gate` here
+  # made GitHub reject the workflow before creating any jobs.
+  group: quill-perf-ratchet-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -25,6 +27,9 @@ jobs:
     name: Ratchet ${{ matrix.gate }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    concurrency:
+      group: quill-perf-ratchet-${{ github.event_name }}-${{ github.ref }}-${{ matrix.gate }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:

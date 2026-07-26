@@ -5,6 +5,10 @@ description = "FSVI vector index, SIMD dot product, and top-k search for franken
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# Every retained Criterion bench is declared explicitly below. The top-k
+# admission probe is instead a normal binary so Cargo does not link this
+# package's unrelated dev-dependency graph before emitting evidence.
+autobenches = false
 
 [features]
 default = []
@@ -104,9 +108,11 @@ name = "real_embed_ann"
 harness = false
 
 # FSVI (file-backed) int8 two-pass vs flat exact — standalone large-N vector search.
-[[bench]]
+[[bin]]
 name = "int8_vs_f16_fast_ab"
-harness = false
+path = "benches/int8_vs_f16_fast_ab.rs"
+test = false
+bench = false
 required-features = ["bench-internals"]
 
 [[bench]]

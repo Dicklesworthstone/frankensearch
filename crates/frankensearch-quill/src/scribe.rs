@@ -219,6 +219,18 @@ pub struct FrankensearchTokenizer {
 
 impl sealed::Sealed for FrankensearchTokenizer {}
 
+/// Boundary-mask candidate retained only for the same-binary admission probe
+/// and exact-parity tests. The shipping [`FrankensearchTokenizer`] remains the
+/// existing two-pass SWAR implementation until measurement admits this lever.
+#[cfg(any(test, feature = "bench-internals"))]
+#[derive(Debug, Clone, Default)]
+pub struct BoundaryMaskTokenizer {
+    token: AnalyzedToken,
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl sealed::Sealed for BoundaryMaskTokenizer {}
+
 #[inline]
 fn tokenizer_next_char(text: &str, offset: usize) -> Option<(char, usize)> {
     let remaining = text.get(offset..)?;
@@ -372,6 +384,136 @@ fn scan_token_end(text: &str, from: usize) -> (usize, bool) {
                 cursor = next;
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl TokenAnalyzer for BoundaryMaskTokenizer {
+    fn supports(&self, analyzer: AnalyzerKind) -> bool {
+        analyzer == AnalyzerKind::FrankensearchDefault
+    }
+
+    fn analyze(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+        const NO_TOKEN: usize = usize::MAX;
+        let bytes = text.as_bytes();
+        let len = text.len();
+        let mut cursor = 0;
+        let mut position = 0_u32;
+        let mut offset_from = NO_TOKEN;
+        let mut all_ascii = true;
+
+        while cursor < len {
+            if cursor + SWAR_LANES <= len {
+                let word = swar_load(bytes, cursor);
+                if word & SWAR_HIGH == 0 {
+                    let alnum = swar_ascii_alnum_mark(word);
+                    let prior_lane = if offset_from == NO_TOKEN { 0 } else { 0x80 };
+                    let mut transitions = alnum ^ ((alnum << 8) | prior_lane);
+                    while transitions != 0 {
+                        let lane = (transitions.trailing_zeros() as usize) / SWAR_LANES;
+                        let lane_mark = 0x80_u64 << (lane * SWAR_LANES);
+                        let at = cursor + lane;
+                        transitions &= !lane_mark;
+
+                        if alnum & lane_mark != 0 {
+                            debug_assert_eq!(offset_from, NO_TOKEN);
+                            offset_from = at;
+                            all_ascii = true;
+                        } else {
+                            debug_assert_ne!(offset_from, NO_TOKEN);
+                            self.token.text.clear();
+                            let source = &text[offset_from..at];
+                            if all_ascii {
+                                self.token.text.push_str(source);
+                                self.token.text.make_ascii_lowercase();
+                            } else {
+                                for source_char in source.chars() {
+                                    self.token.text.extend(source_char.to_lowercase());
+                                }
+                            }
+                            self.token.position = position;
+                            self.token.offset_from = offset_from;
+                            self.token.offset_to = at;
+                            self.token.position_length = 1;
+                            sink(&self.token);
+
+                            position = next_token_position(position);
+                            offset_from = NO_TOKEN;
+                        }
+                    }
+                    cursor += SWAR_LANES;
+                    continue;
+                }
+            }
+
+            let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
+                break;
+            };
+            if tokenizer_is_alphanumeric(ch) {
+                if offset_from == NO_TOKEN {
+                    offset_from = cursor;
+                    all_ascii = ch.is_ascii();
+                } else {
+                    all_ascii &= ch.is_ascii();
+                }
+            } else if offset_from != NO_TOKEN {
+                self.token.text.clear();
+                let source = &text[offset_from..cursor];
+                if all_ascii {
+                    self.token.text.push_str(source);
+                    self.token.text.make_ascii_lowercase();
+                } else {
+                    for source_char in source.chars() {
+                        self.token.text.extend(source_char.to_lowercase());
+                    }
+                }
+                self.token.position = position;
+                self.token.offset_from = offset_from;
+                self.token.offset_to = cursor;
+                self.token.position_length = 1;
+                sink(&self.token);
+
+                position = next_token_position(position);
+                offset_from = NO_TOKEN;
+            }
+            cursor = next;
+        }
+
+        if offset_from != NO_TOKEN {
+            self.token.text.clear();
+            let source = &text[offset_from..len];
+            if all_ascii {
+                self.token.text.push_str(source);
+                self.token.text.make_ascii_lowercase();
+            } else {
+                for source_char in source.chars() {
+                    self.token.text.extend(source_char.to_lowercase());
+                }
+            }
+            self.token.position = position;
+            self.token.offset_from = offset_from;
+            self.token.offset_to = len;
+            self.token.position_length = 1;
+            sink(&self.token);
+        }
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.token.text.capacity()
+    }
+
+    fn reset(&mut self) {
+        self.token.text.clear();
+        self.token.position = 0;
+        self.token.offset_from = 0;
+        self.token.offset_to = 0;
+        self.token.position_length = 0;
     }
 }
 
@@ -4642,6 +4784,7 @@ mod tests {
     use crate::quiver::{IdHashSection, IdMapSection, PositionList, PostingList, StatsSection};
     use crate::schema::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor};
     use crate::segment::SegmentReader;
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_lexical::tantivy_crate::tokenizer::TokenStream;
     use serde_json::Value;
     use std::hash::BuildHasherDefault;
@@ -4911,6 +5054,16 @@ mod tests {
         tokens
     }
 
+    fn boundary_mask_tokens(text: &str) -> Vec<AnalyzedToken> {
+        let mut analyzer = BoundaryMaskTokenizer::default();
+        let mut tokens = Vec::new();
+        analyzer.analyze(AnalyzerKind::FrankensearchDefault, text, &mut |token| {
+            tokens.push(token.clone());
+        });
+        tokens
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn incumbent_tokens(text: &str) -> Vec<AnalyzedToken> {
         let mut analyzer = frankensearch_lexical::default_tokenizer_for_bench();
         let mut stream = analyzer.token_stream(text);
@@ -4936,6 +5089,7 @@ mod tests {
         tokens
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn incumbent_cass_tokens(analyzer_kind: AnalyzerKind, text: &str) -> Vec<AnalyzedToken> {
         let mut index = frankensearch_lexical::tantivy_crate::Index::create_in_ram(
             frankensearch_lexical::cass_compat::cass_build_schema(),
@@ -5017,6 +5171,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn scalar_reference_executes_fixture_and_matches_shipping_incumbent() {
         let fixture: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
@@ -5151,14 +5306,17 @@ mod tests {
     #[test]
     fn swar_default_matches_scalar_reference_on_lane_edge_cases() {
         for &case in LANE_EDGE_CASES {
+            let shipping = analyzed_tokens(case);
+            assert_eq!(shipping, scalar_reference_tokens(case));
             assert_eq!(
-                analyzed_tokens(case),
-                scalar_reference_tokens(case),
-                "SWAR analyzer diverged from the scalar char-walk reference for {case:?}"
+                boundary_mask_tokens(case),
+                shipping,
+                "boundary-mask candidate diverged from shipping SWAR for {case:?}"
             );
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn swar_default_matches_shipping_incumbent_on_lane_edge_cases() {
         for &case in LANE_EDGE_CASES {
@@ -5195,13 +5353,19 @@ mod tests {
                 input.push(ALPHABET[idx]);
             }
             assert_eq!(
+                boundary_mask_tokens(&input),
+                analyzed_tokens(&input),
+                "boundary-mask candidate diverged from shipping SWAR for {input:?}"
+            );
+            assert_eq!(
                 analyzed_tokens(&input),
                 scalar_reference_tokens(&input),
-                "SWAR analyzer diverged from the scalar char-walk reference for {input:?}"
+                "boundary-mask analyzer diverged from the scalar char-walk reference for {input:?}"
             );
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn native_cass_executes_fixture_and_matches_shipping_incumbent() {
         let fixture: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
@@ -5262,6 +5426,7 @@ mod tests {
         assert_eq!(executed, 8, "all CASS analyzer fixtures must execute");
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn native_cass_matches_incumbent_at_token_boundaries_and_script_edges() {
         for analyzer_kind in [
@@ -5290,6 +5455,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn generated_prefix_pipeline_matches_incumbent_composition() {
         for input in [
@@ -5317,6 +5483,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn native_cass_matches_incumbent_across_shared_fixture_corpus() {
         let fixture: Value = serde_json::from_str(SHARED_CORPUS_FIXTURE)
@@ -5354,6 +5521,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn seeded_cass_differential_matches_incumbent_and_named_slow_oracles() {
         const SEED: u64 = 0xE102_CA55_5C12_1BE5;
@@ -5415,6 +5583,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_cjk_range_endpoints_and_neighbors_match_slow_oracle() {
         const RANGES: [(u32, u32); 9] = [
@@ -5452,6 +5621,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_filter_order_preserves_parts_bigrams_and_position_gaps() {
         let oversized_compound = format!("{}-{}", "A".repeat(130), "B".repeat(130));
@@ -5494,6 +5664,7 @@ mod tests {
         assert_eq!(gap_tokens[0].position, 1);
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_helpers_execute_contract_fixture_and_match_slow_oracles() {
         let fixture: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
@@ -5561,6 +5732,7 @@ mod tests {
         assert_eq!(executed, 5, "all native CASS helper fixtures must execute");
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_helper_boundaries_match_slow_oracles() {
         let inputs = [
@@ -7137,6 +7309,7 @@ mod tests {
         Some((off, off % 32))
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e18_tokenizer_lane_edge_sweep_1_to_129_bytes_matches_scalar_and_incumbent() {
         // Sweep a separator (hence a token start AND end) across every byte
@@ -7184,6 +7357,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e18_cass_family_parity_including_cjk_extension_b() {
         // CJK Extension-B (U+20000..=U+2A6DF, 4-byte UTF-8) is inside

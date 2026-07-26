@@ -6422,6 +6422,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn phrase_scorer_matches_tantivy_corpus_docs_ranks_and_score_bits()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6534,6 +6535,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn phrase_same_position_alternatives_are_reviewed_or_divergence()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -3866,8 +3866,11 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::traits::LexicalSearch;
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::types::IndexableDocument;
+    #[cfg(feature = "tantivy-oracle")]
     use frankensearch_lexical::TantivyIndex;
     use serde_json::{Value, json};
 
@@ -4670,6 +4673,7 @@ mod tests {
         assert!(executed >= 39, "the full harvested CASS contract slice ran");
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_helpers_match_the_shipping_adapter() {
         use frankensearch_lexical::{
@@ -4784,6 +4788,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn cass_parser_result_sets_match_the_shipping_tantivy_builder() {
         use frankensearch_lexical::tantivy_crate::collector::DocSetCollector;
@@ -5022,6 +5027,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn parser_result_sets_match_the_pinned_tantivy_adapter() {
         const DOCS: [EvalDoc; 10] = [

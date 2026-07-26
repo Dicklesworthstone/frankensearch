@@ -6,6 +6,10 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# All retained Criterion benches are declared explicitly below. The bd-l5x3
+# admission probe is a normal binary so unrelated dev dependencies are not
+# linked before it can emit its executable hash and A/A control.
+autobenches = false
 
 [features]
 default = []
@@ -14,11 +18,16 @@ default = []
 durability = ["dep:frankensearch-durability"]
 # Same-binary A/B helpers are available only to explicit benchmark builds.
 bench-internals = ["frankensearch-core/bench-internals"]
+# Tantivy differential tests are valuable oracle coverage, but they must remain
+# opt-in: a crate-wide dev-dependency made every Quill test and bench compile
+# the full lexical/Tantivy graph and repeatedly missed the admission window.
+tantivy-oracle = ["dep:frankensearch-lexical"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-durability = { workspace = true, optional = true }
+frankensearch-lexical = { workspace = true, optional = true, features = ["bench-internals"] }
 asupersync = { workspace = true }
 arc-swap = { workspace = true }
 wide = { workspace = true }
@@ -42,16 +51,11 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 # Deterministic LabRuntime helpers remain test-only.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
-frankensearch-lexical = { workspace = true, features = ["bench-internals"] }
 # Dev-only: A/B benches self-report the SHA-256 of their own ELF so a published
 # ratio is bound to the binary that produced it (fleet bench-harness contract
 # part 1). rch builds into an opaque per-worker pool target dir, so a hash taken
 # outside the process proves nothing about which binary ran.
 sha2 = { workspace = true }
-# Dev-only: the legacy `SimpleTokenizer + LowerCaser` arm of the tokenizer A/B
-# bench. Already built for this crate transitively via frankensearch-lexical, so
-# this adds no compile cost and keeps Tantivy out of Quill's shipped graph.
-tantivy = { workspace = true }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }
 
@@ -79,9 +83,11 @@ name = "compaction_ab"
 harness = false
 required-features = ["bench-internals"]
 
-[[bench]]
+[[bin]]
 name = "tokenizer_simd_ab"
-harness = false
+path = "benches/tokenizer_simd_ab.rs"
+test = false
+bench = false
 required-features = ["bench-internals"]
 
 [[bench]]
