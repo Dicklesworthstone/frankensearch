@@ -34,7 +34,7 @@ use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocumen
 use frankensearch_durability::FileProtector;
 #[cfg(feature = "durability")]
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
-use frankensearch_embed::auto_detect::EmbedderStack;
+use frankensearch_embed::auto_detect::{EmbedderStack, TwoTierAvailability};
 use frankensearch_index::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME,
@@ -59,6 +59,27 @@ pub struct IndexBuildStats {
     pub embed_ms: f64,
     /// Whether a quality-tier index was built.
     pub has_quality_index: bool,
+    /// Embedder availability this generation was actually built with.
+    ///
+    /// The index is written with the vector identity of whatever embedder was
+    /// resolved, so a [`TwoTierAvailability::HashOnly`] build produces a
+    /// permanently non-semantic generation: installing a model afterwards
+    /// cannot repair it, because the stored vectors are hashes. Callers that
+    /// care about semantic quality must inspect this rather than assume the
+    /// build was semantic — a degraded build otherwise succeeds silently and
+    /// returns plausible-looking hits at query time (`bd-a6zt`).
+    pub embedder_availability: TwoTierAvailability,
+}
+
+impl IndexBuildStats {
+    /// Whether this generation was built with a degraded embedder stack.
+    ///
+    /// `true` means the index content itself is degraded, not merely the
+    /// current process configuration.
+    #[must_use]
+    pub const fn is_degraded_generation(&self) -> bool {
+        self.embedder_availability.is_degraded()
+    }
 }
 
 /// Progress update during index building.
@@ -208,6 +229,26 @@ impl IndexBuilder {
             Some(stack) => stack,
             None => EmbedderStack::auto_detect_with(Some(&self.data_dir))?,
         };
+
+        // A degraded stack here is not a transient runtime condition: the
+        // vectors written below carry this embedder's identity, so the
+        // generation is permanently degraded and a later model install cannot
+        // repair it — only a compatible rebuild can. Say so loudly at the
+        // moment of writing rather than letting it surface as mysteriously
+        // poor relevance much later (`bd-a6zt`). Checked for a caller-supplied
+        // stack too: passing a hash stack explicitly is just as consequential.
+        let embedder_availability = stack.availability();
+        if embedder_availability.is_degraded() {
+            tracing::warn!(
+                availability = %embedder_availability,
+                data_dir = %self.data_dir.display(),
+                fast_embedder = %stack.fast().id(),
+                detail = stack.degradation_message().unwrap_or_default(),
+                "building index with a DEGRADED embedder stack; this generation is written with \
+                 that embedder's vector identity and installing a model later will NOT repair it \
+                 — a compatible rebuild is required",
+            );
+        }
 
         let fast_embedder = stack.fast_arc();
         let quality_embedder = stack.quality_arc();
@@ -453,6 +494,7 @@ impl IndexBuilder {
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
             embed_ms,
             has_quality_index: has_quality,
+            embedder_availability,
         };
 
         // Match the former borrowed-input lifetime: failed documents remain resident until the
@@ -793,6 +835,85 @@ mod tests {
             dim: 4,
         });
         EmbedderStack::from_parts(fast, None)
+    }
+
+    /// A hash-only build must report itself as a DEGRADED generation
+    /// (`bd-a6zt` Cause A). The vectors written carry the hash embedder's
+    /// identity, so this index can never answer semantically and installing a
+    /// model later cannot repair it — yet the build succeeds and returns
+    /// plausible results at query time. Without a machine-readable signal on
+    /// the build result there is nothing for a caller to check, which is
+    /// exactly how this shipped unnoticed.
+    #[test]
+    fn build_reports_hash_only_generation_as_degraded() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let hash_stack = EmbedderStack::from_parts(
+                Arc::new(frankensearch_embed::HashEmbedder::default_256()) as Arc<dyn Embedder>,
+                None,
+            );
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(hash_stack)
+                .add_document("doc-1", "Hello world")
+                .add_document("doc-2", "Distributed consensus")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.doc_count, 2, "the degraded build still succeeds");
+            assert_eq!(
+                stats.embedder_availability,
+                TwoTierAvailability::HashOnly,
+                "a hash-only stack must be reported, not inferred",
+            );
+            assert!(
+                stats.is_degraded_generation(),
+                "hash-only generations are permanently non-semantic and must say so",
+            );
+        });
+    }
+
+    /// The converse, so the signal cannot be a constant `true`: a healthy
+    /// two-tier build must report `Full` and must NOT be flagged degraded.
+    #[test]
+    fn build_reports_healthy_generation_as_not_degraded() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.embedder_availability, TwoTierAvailability::Full);
+            assert!(!stats.is_degraded_generation());
+        });
+    }
+
+    /// A semantic fast tier with no quality tier is degraded too, but it is a
+    /// *different* degradation: the generation is still semantic, so it is
+    /// repairable by adding a quality model without a rebuild. Pinning both
+    /// arms keeps the two cases from collapsing into one boolean.
+    #[test]
+    fn build_reports_fast_only_generation_as_degraded_but_semantic() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(fast_only_stack())
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.embedder_availability, TwoTierAvailability::FastOnly);
+            assert!(stats.is_degraded_generation());
+            assert_ne!(
+                stats.embedder_availability,
+                TwoTierAvailability::HashOnly,
+                "fast-only must not be conflated with the non-semantic hash case",
+            );
+        });
     }
 
     #[test]
@@ -1153,6 +1274,7 @@ mod tests {
             total_ms: 42.0,
             embed_ms: 30.0,
             has_quality_index: true,
+            embedder_availability: TwoTierAvailability::Full,
         };
         let cloned = stats.clone();
         assert_eq!(cloned.doc_count, 5);

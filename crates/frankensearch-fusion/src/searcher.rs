@@ -221,6 +221,23 @@ impl TwoTierSearcher {
             );
         }
 
+        // Say once, at construction, that this searcher has no semantic fast
+        // tier. Per-query the condition is already recorded as
+        // `skip_reason = "non_semantic_fast_embedder_lexical_short_circuit"`,
+        // but a metrics field nobody reads is why hash-only deployments look
+        // healthy: queries succeed and return plausible lexical hits. Logging
+        // it per query would spam a hot path, so it belongs here (`bd-a6zt`).
+        if is_shipped_hash_embedder(fast_embedder.as_ref()) {
+            tracing::warn!(
+                fast_embedder = %fast_embedder.id(),
+                "TwoTierSearcher constructed with a NON-SEMANTIC hash fast embedder; semantic \
+                 retrieval is unavailable and results will be lexical-only where a lexical \
+                 backend is attached. If a semantic model is expected, the index generation \
+                 must be rebuilt with it — installing a model alone does not repair an index \
+                 whose vectors carry hash identity",
+            );
+        }
+
         Self {
             index,
             fast_embedder,
