@@ -16189,19 +16189,73 @@ returned candidates and every window fell through to `fill_exhaustive_window`.
 `crates/frankensearch-quill/src/argus.rs` is empty in the working tree; the
 failing test and the machinery it exercises are byte-identical to `main`.
 
-**Merge-semantic root cause (textually clean, behaviourally not).** The test
-landed in `1b5a1018` (Jul 24 17:10). Deterministic query-fuel metering landed in
-`ae5baa0d` (Jul 24 10:56) on a parallel branch and only reached this line
-through merge `afb7800d`. The test was therefore written and green on a tree
-that never contained `ae5baa0d`, which introduced `CheckpointPostingCursor` — a
-`PostingCursor` wrapper whose `fork_for_pruning` (`argus.rs:573`) delegates
-inward. `competitive_cursor` (`argus.rs:1419`) needs both `fork_for_pruning`
-and `term_score_upper_bound` to be `Some`; `group_competitive_docs` fails closed
-when any child lacks one, and `grouped_max_score_candidates` then returns
-`Ok(None)`. Both sides merged cleanly as text and nothing re-ran the test.
-The term-granular sibling still passes with `max_score_windows == 1`, so the
-breakage is specific to the grouped path — that asymmetry is the clue to start
-from.
+**Root cause: `group_upper_bound` reads `active`, but a buffered union drains
+`active` the moment it fills a window.**
+
+`BufferedUnionScorer::new` (`argus.rs:3684`) ends with
+`if scorer.refill()? { scorer.advance_buffered(); }` — *every* union fills its
+first window at construction. `fill_exhaustive_window` (`argus.rs:3800`) walks
+each child across that window and **swap-removes** any child whose cursor
+exhausts:
+
+```rust
+self.active[index].next()?;
+if self.active[index].doc().is_none() { self.active.swap_remove(index); break; }
+```
+
+So a group whose postings all fall inside one 4096-doc window has an **empty
+`active`** immediately after construction — its scores live in `score_window`,
+not in `active`. `group_upper_bound` (`argus.rs:3751`) opens with
+`if self.active.is_empty() { return None; }`, so `competitive_is_groupable`
+returns `false`, the all-groupable branch is skipped, control falls through to
+`2..=MAX_SCORE_MAX_CLAUSES => return Ok(None)`, and every window scores
+exhaustively.
+
+In the fixture (`rows_by_term = [[0,5000],[0,5000],[5000],[6000]]`, groups
+`[2,2]`): group0's window is `[0,4096)` and its `next()` lands on 5000 ≥ horizon,
+so it is *not* removed and keeps `active == 2`. Group1's own first window starts
+at 5000 with horizon `[5000,9096)` — **both** its postings are inside, both terms
+exhaust, and `group1.active` becomes empty. One ineligible child is enough.
+
+**Why the term path is unaffected** (the asymmetry that pointed here): a direct
+`Term` child's `competitive_score_upper_bound` reads
+`term.term_score_upper_bound`, captured once in `TermScorer::new`
+(`argus.rs:1332`) and independent of drain state. Only the *group* ceiling was
+made to depend on live `active` membership.
+
+The merge timeline (`1b5a1018` authored Jul 24 17:10 against a tree lacking
+`ae5baa0d`, which arrived via `afb7800d`) explains why nobody re-ran the test,
+but the defect is structural and would fail with or without that merge. An
+earlier reading of this row blamed `CheckpointPostingCursor`; that hypothesis
+was wrong.
+
+**The obvious fix is a correctness trap — do not apply it alone.** Caching the
+whole-group ceiling at construction (before the refill drains `active`) was
+implemented here and then **reverted**, because checking the consumer first
+showed it turns "prunes nothing" into "silently returns wrong results":
+
+`group_competitive_docs` (`argus.rs:2511`) enumerates a group's candidate docs
+**only** from `union.active`. With `active` empty — exactly the state the ceiling
+fix makes eligible — the loop body never runs and it returns `Ok(true)` having
+pushed **zero docs**. The caller reads that as "this essential group has no
+documents in the window", so the root never visits them: **documents silently
+dropped from the top-k.**
+
+That path is unreachable today *precisely because* `group_upper_bound` returns
+`None` for a drained group. **The `None`-on-empty-`active` is therefore
+load-bearing for correctness, not a conservative default.** A comment saying so
+now sits on `group_upper_bound` so the next reader does not repeat the near-miss.
+
+**Correct sequencing:** (1) make `group_competitive_docs` enumerate the group's
+*real* remaining set — `{current}` ∪ buffered residue (`score_window` offsets
+≥ `scan_offset` that are `Some`) ∪ docs reachable from live child cursors — or
+fail closed when it cannot; (2) add a fixture whose group lies entirely inside
+one 4096-doc window (the existing fixture's group1, terms `[5000]` and `[6000]`,
+is already that shape) and pin bit-parity vs exhaustive **before** the path
+becomes reachable; (3) only then cache the ceiling at construction — that part
+is sound, since a sum over all original children stays a valid upper bound for
+any surviving subset; (4) require `max_score_windows >= 1` with all bit-parity
+assertions still green.
 
 **Decision: DO NOT ACTIVATE. Ledgered blocker, no performance claim made, and
 no A/B run** — timing a lever that provably prunes nothing would measure only
@@ -16209,8 +16263,23 @@ the cost of opening BLOCKMAX. `index.rs` ships the full shape classification
 (`UnionChildKind::{DirectTerms, TermGroups, Mixed}`) behind
 `GROUPED_MAX_SCORE_ENABLED = false`, which is **behaviour-neutral**: nested
 unions keep failing the gate exactly as before and no BLOCKMAX is opened for
-their terms. The 484-test suite is unchanged by this diff apart from the
-pre-existing failure above.
+their terms.
+
+Behaviour-neutrality is empirical, not merely argued. Same tree, same worker,
+only the constant differing:
+
+| gate | result |
+|---|---|
+| open (`true`) | 480 passed, **2** failed |
+| closed (`false`) | 481 passed, **1** failed |
+
+The test that flips is
+`index::tests::mixed_snapshot_disjunction_count_free_matches_exhaustive_at_pinned_k`,
+which asserts *"nested fallback must not validate title BLOCKMAX metadata"*
+(expects `cached_rank_pruning_term_count == 2`; saw `3` with the gate open).
+That is exactly the contract this gate governs, and it passes again once the
+gate is closed. The single remaining failure is the pre-existing `bd-bt2t`
+above, which fails identically on unmodified `main`.
 
 **Retry predicate (concrete):** flip `GROUPED_MAX_SCORE_ENABLED` to `true` only
 when (1) `argus::tests::grouped_max_score_matches_exhaustive_and_prunes` passes

@@ -3326,6 +3326,14 @@ impl QuillReader {
     /// snapshots are intentionally excluded: the lever under measurement is
     /// sealed-segment scoring only.
     ///
+    /// `rank_pruning` overrides the shipping gate when `Some`, which is what
+    /// lets a single binary time the pruned and exhaustive arms against each
+    /// other (`bd-quill-e8-perf-doctrine-x4e4.5.1`). `None` uses the shipping
+    /// decision. Overriding it to `true` never makes an ineligible shape prune:
+    /// the runtime strategy selection in `argus::competitive_candidates` fails
+    /// closed on its own, so this only controls whether pruning metadata is
+    /// opened at all.
+    ///
     /// # Errors
     ///
     /// Returns the same typed parsing, lowering, collection, and cancellation
@@ -3337,12 +3345,14 @@ impl QuillReader {
         query: &str,
         limit: usize,
         fan_out: bool,
+        rank_pruning: Option<bool>,
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
         let mut parsed = self.parser.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
-        let rank_pruning = limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        let rank_pruning = limit != 0
+            && rank_pruning.unwrap_or_else(|| query_has_prunable_root_union(&parsed.query, 1.0));
         let mut collector = TopDocsCollector::new(limit, 0)?;
         let work_upper_bound =
             query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
@@ -4646,9 +4656,10 @@ impl QuillIndex {
         query: &str,
         limit: usize,
         fan_out: bool,
+        rank_pruning: Option<bool>,
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
         self.reader
-            .bench_search_sealed_forced(cx, query, limit, fan_out)
+            .bench_search_sealed_forced(cx, query, limit, fan_out, rank_pruning)
     }
 }
 
@@ -5553,11 +5564,61 @@ const fn bound_topology_kind(bound: &Bound<QueryValue>) -> u8 {
     }
 }
 
+/// Gate for deferred grouped `MaxScore` over nested pure-term unions
+/// (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
+///
+/// **Currently `false`: the shape machinery below is complete and rank-safe,
+/// but the runtime candidate path it feeds does not actually prune yet.**
+///
+/// `argus::tests::grouped_max_score_matches_exhaustive_and_prunes` — the test
+/// landed in `1b5a1018` specifically to prove grouped `MaxScore` prunes — fails
+/// on `main` with `max_score_windows: 0`. Its bit-parity assertions pass, so
+/// results are correct; the *pruning* claim is what is false. The test was
+/// written against a tree that did not yet contain the deterministic
+/// query-fuel metering from `ae5baa0d`, which arrived afterwards through merge
+/// `afb7800d`; both sides merged cleanly as text and nothing re-ran the test.
+///
+/// Flipping this to `true` would therefore open BLOCKMAX for every nested
+/// union's terms — i.e. pay the metadata cost on the *most common* query shape
+/// — while the root still scores exhaustively. That is pure cost for no
+/// measured benefit, so the gate stays closed until the pruning regression is
+/// fixed and the A/B in `benches/grouped_maxscore_ab.rs` shows a decidable win.
+///
+/// With this `false`, nested unions fail the rank-pruning gate exactly as they
+/// did before this change: the shape classification below is inert, no BLOCKMAX
+/// is opened for their terms, and every such query keeps the pre-existing
+/// POSTINGS-only exhaustive path. Direct-term `MaxScore`/BMW is unaffected
+/// either way.
+///
+/// **To activate:** fix the pruning regression, then flip this to `true` — no
+/// other edit is required.
+const GROUPED_MAX_SCORE_ENABLED: bool = false;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrunableScorerShape {
     Empty,
     Term,
-    Union { children: usize, direct_terms: bool },
+    Union {
+        children: usize,
+        kind: UnionChildKind,
+    },
+}
+
+/// What a prunable union's children lower to, which decides which runtime
+/// pruning strategy (if any) can consume the union.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnionChildKind {
+    /// Every child lowers to a single direct term cursor, so the union feeds
+    /// term-granular `MaxScore` or block-max WAND.
+    DirectTerms,
+    /// Every child is itself a union of direct terms — a pure-term group, i.e.
+    /// the multi-field terms a default query lowers to. Such a union feeds
+    /// deferred grouped `MaxScore`, which decides essential vs. non-essential
+    /// at *group* granularity (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
+    TermGroups,
+    /// Mixed children or deeper nesting: no runtime strategy consumes it, so
+    /// the union stays POSTINGS-only.
+    Mixed,
 }
 
 /// Mirror the score-tree topology that lowering will build without opening any
@@ -5578,7 +5639,7 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
                 1 => PrunableScorerShape::Term,
                 children => PrunableScorerShape::Union {
                     children,
-                    direct_terms: true,
+                    kind: UnionChildKind::DirectTerms,
                 },
             })
         }
@@ -5590,6 +5651,7 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
             let mut children = 0_usize;
             let mut singleton = PrunableScorerShape::Empty;
             let mut direct_terms = true;
+            let mut term_groups = true;
             for clause in clauses {
                 let shape = prunable_scorer_shape(&clause.query, inherited_boost)?;
                 if shape == PrunableScorerShape::Empty {
@@ -5597,6 +5659,13 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
                 }
                 children = children.checked_add(1)?;
                 direct_terms &= shape == PrunableScorerShape::Term;
+                term_groups &= matches!(
+                    shape,
+                    PrunableScorerShape::Union {
+                        kind: UnionChildKind::DirectTerms,
+                        ..
+                    }
+                );
                 singleton = shape;
             }
             Some(match children {
@@ -5604,7 +5673,15 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
                 1 => singleton,
                 _ => PrunableScorerShape::Union {
                     children,
-                    direct_terms,
+                    // A child is never both a term and a union, so at most one
+                    // of these holds once `children >= 1`.
+                    kind: if direct_terms {
+                        UnionChildKind::DirectTerms
+                    } else if term_groups {
+                        UnionChildKind::TermGroups
+                    } else {
+                        UnionChildKind::Mixed
+                    },
                 },
             })
         }
@@ -5622,14 +5699,31 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
     }
 }
 
+/// Whether the root scorer can actually consume rank-pruning metadata, and so
+/// whether opening BLOCKMAX for its terms is worth the setup cost.
+///
+/// Mirrors the runtime strategy selection in `argus::competitive_candidates`
+/// exactly — admitting a shape no strategy consumes would pay for BLOCKMAX and
+/// still score exhaustively.
 fn query_has_prunable_root_union(query: &Query, inherited_boost: f32) -> bool {
-    matches!(
-        prunable_scorer_shape(query, inherited_boost),
-        Some(PrunableScorerShape::Union {
-            children: 2..=MAX_SCORE_MAX_CLAUSES | BMW_MIN_CLAUSES..,
-            direct_terms: true,
-        })
-    )
+    match prunable_scorer_shape(query, inherited_boost) {
+        Some(PrunableScorerShape::Union { children, kind }) => match kind {
+            // Direct-term roots take `MaxScore` (2..=8 clauses) or block-max
+            // WAND (9+), both term-granular.
+            UnionChildKind::DirectTerms => {
+                matches!(children, 2..=MAX_SCORE_MAX_CLAUSES | BMW_MIN_CLAUSES..)
+            }
+            // Grouped roots take deferred grouped `MaxScore` only. Grouped BMW
+            // does not exist (a group has no physical block-max list of its
+            // own), so wider grouped roots stay POSTINGS-only rather than
+            // paying for metadata nothing reads.
+            UnionChildKind::TermGroups => {
+                GROUPED_MAX_SCORE_ENABLED && matches!(children, 2..=MAX_SCORE_MAX_CLAUSES)
+            }
+            UnionChildKind::Mixed => false,
+        },
+        Some(PrunableScorerShape::Empty | PrunableScorerShape::Term) | None => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11844,23 +11938,73 @@ mod tests {
     #[test]
     fn rank_pruning_gate_matches_runtime_union_capabilities() {
         let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).expect("bind shipping parser");
-        let nested_two = parser.parse("alpha OR beta");
-        assert!(
-            !query_has_prunable_root_union(&nested_two.query, 1.0),
-            "nested field unions eagerly score their own windows and must stay exhaustive"
-        );
-
         let direct_two = parser.parse("content:alpha OR content:beta");
         assert!(
             query_has_prunable_root_union(&direct_two.query, 1.0),
             "two direct term children are MaxScore-capable"
         );
 
+        // Nested multi-field unions stay POSTINGS-only while
+        // `GROUPED_MAX_SCORE_ENABLED` is false. Admitting them would open
+        // BLOCKMAX for their terms, and the runtime candidate path does not yet
+        // prune (see that constant's docs), so this is the shipping behaviour
+        // until the pruning regression is fixed.
+        // When `GROUPED_MAX_SCORE_ENABLED` flips to `true`, this assertion is
+        // the one to invert — the shape assertions below stay as they are.
+        let nested_two = parser.parse("alpha OR beta");
+        assert!(
+            !query_has_prunable_root_union(&nested_two.query, 1.0),
+            "nested field unions must not open BLOCKMAX while grouped MaxScore is dormant"
+        );
+
         let nested_nine = parser
             .parse("alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta OR theta OR iota");
         assert!(
             !query_has_prunable_root_union(&nested_nine.query, 1.0),
-            "nine default multi-field children cannot supply physical BMW blocks"
+            "nine default multi-field children cannot supply physical BMW blocks, and grouped \
+             MaxScore stops at MAX_SCORE_MAX_CLAUSES"
+        );
+
+        // Shape classification is pinned directly so it cannot rot while the
+        // gate is closed: these are the inputs that decide eligibility the
+        // moment `GROUPED_MAX_SCORE_ENABLED` flips.
+        assert!(
+            matches!(
+                prunable_scorer_shape(&nested_two.query, 1.0),
+                Some(PrunableScorerShape::Union {
+                    children: 2,
+                    kind: UnionChildKind::TermGroups,
+                })
+            ),
+            "a default two-word query lowers to two pure-term groups"
+        );
+        assert!(
+            matches!(
+                prunable_scorer_shape(&direct_two.query, 1.0),
+                Some(PrunableScorerShape::Union {
+                    children: 2,
+                    kind: UnionChildKind::DirectTerms,
+                })
+            ),
+            "field-scoped children lower to direct terms, not groups"
+        );
+        // A root mixing a direct term with a multi-field group satisfies neither
+        // the all-direct-terms nor the all-groupable runtime branch, so it can
+        // never be admitted regardless of the gate.
+        let mixed = parser.parse("content:alpha OR beta");
+        assert!(
+            matches!(
+                prunable_scorer_shape(&mixed.query, 1.0),
+                Some(PrunableScorerShape::Union {
+                    children: 2,
+                    kind: UnionChildKind::Mixed,
+                })
+            ),
+            "a mixed direct-term/group root is consumed by no pruning strategy"
+        );
+        assert!(
+            !query_has_prunable_root_union(&mixed.query, 1.0),
+            "a mixed root must never open BLOCKMAX"
         );
 
         let direct_nine = parser.parse(

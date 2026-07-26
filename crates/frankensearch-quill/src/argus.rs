@@ -3748,6 +3748,12 @@ impl<'a> BufferedUnionScorer<'a> {
     /// [`conservative_optional_bound_sum`] as the term `MaxScore` path so the
     /// ceiling is rounded outward and never falls below a realized group score
     /// — a rank-safety precondition for the follow-up grouped candidate path.
+    ///
+    /// NOTE (`bd-bt2t`): returning `None` once `active` has drained is currently
+    /// load-bearing for CORRECTNESS, not just a conservative default — it is the
+    /// only thing keeping [`Self::group_competitive_docs`] from being reached in
+    /// a state where it silently enumerates zero documents. Do not "fix" this to
+    /// use a construction-time cache without fixing that consumer first.
     fn group_upper_bound(&self) -> Option<f32> {
         if self.active.is_empty() {
             return None;

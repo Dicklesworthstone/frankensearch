@@ -147,10 +147,10 @@ fn absolute_us(calls: u32, mut run: impl FnMut()) -> f64 {
 fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limit: usize, index: &QuillIndex) {
     for (query_name, query) in QUERIES {
         let serial_page = index
-            .bench_search_sealed_forced(cx, query, limit, false)
+            .bench_search_sealed_forced(cx, query, limit, false, None)
             .expect("serial sealed page");
         let fanned_page = index
-            .bench_search_sealed_forced(cx, query, limit, true)
+            .bench_search_sealed_forced(cx, query, limit, true, None)
             .expect("fanned sealed page");
         assert_eq!(
             serial_page, fanned_page,
@@ -164,14 +164,14 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limit: usize, index: &QuillI
             || {
                 black_box(
                     index
-                        .bench_search_sealed_forced(cx, black_box(query), limit, false)
+                        .bench_search_sealed_forced(cx, black_box(query), limit, false, None)
                         .expect("null arm a"),
                 );
             },
             || {
                 black_box(
                     index
-                        .bench_search_sealed_forced(cx, black_box(query), limit, false)
+                        .bench_search_sealed_forced(cx, black_box(query), limit, false, None)
                         .expect("null arm b"),
                 );
             },
@@ -182,14 +182,14 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limit: usize, index: &QuillI
             || {
                 black_box(
                     index
-                        .bench_search_sealed_forced(cx, black_box(query), limit, false)
+                        .bench_search_sealed_forced(cx, black_box(query), limit, false, None)
                         .expect("serial arm"),
                 );
             },
             || {
                 black_box(
                     index
-                        .bench_search_sealed_forced(cx, black_box(query), limit, true)
+                        .bench_search_sealed_forced(cx, black_box(query), limit, true, None)
                         .expect("fanned arm"),
                 );
             },
@@ -197,14 +197,14 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limit: usize, index: &QuillI
         let serial_us = absolute_us(16, || {
             black_box(
                 index
-                    .bench_search_sealed_forced(cx, black_box(query), limit, false)
+                    .bench_search_sealed_forced(cx, black_box(query), limit, false, None)
                     .expect("serial absolute"),
             );
         });
         let fanned_us = absolute_us(16, || {
             black_box(
                 index
-                    .bench_search_sealed_forced(cx, black_box(query), limit, true)
+                    .bench_search_sealed_forced(cx, black_box(query), limit, true, None)
                     .expect("fanned absolute"),
             );
         });
