@@ -202,12 +202,10 @@ impl DecisionState {
     }
 
     const fn decision(&self) -> PerfGateDecision {
-        if self.fatal {
+        if self.fatal || self.blocked {
             PerfGateDecision::Block
         } else if self.quarantined {
             PerfGateDecision::Quarantine
-        } else if self.blocked {
-            PerfGateDecision::Block
         } else {
             PerfGateDecision::Allow
         }
@@ -1283,6 +1281,21 @@ mod tests {
     }
 
     #[test]
+    fn decision_severity_is_fatal_then_block_then_quarantine_then_allow() {
+        let mut state = DecisionState::default();
+        assert_eq!(state.decision(), PerfGateDecision::Allow);
+
+        state.quarantine("test.quarantine", "inconclusive evidence");
+        assert_eq!(state.decision(), PerfGateDecision::Quarantine);
+
+        state.block("test.block", "decisive regression");
+        assert_eq!(state.decision(), PerfGateDecision::Block);
+
+        state.fatal("test.fatal", "invalid artifact");
+        assert_eq!(state.decision(), PerfGateDecision::Block);
+    }
+
+    #[test]
     fn clean_activated_same_revision_rerun_allows_promotion() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let candidate = qg2_artifact("new", 161.0, 100.0);
@@ -1400,9 +1413,11 @@ mod tests {
     #[test]
     fn ci_overlapping_apparent_regression_is_quarantined_not_blocked() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
-        let mut candidate = qg2_artifact("new", 100.0, 100.0);
-        candidate.cells[0].distribution.median_ci95_low = 90.0;
+        let mut candidate = qg2_artifact("new", 150.0, 100.0);
+        candidate.cells[0].distribution.median_ci95_low = 140.0;
         candidate.cells[0].distribution.median_ci95_high = 170.0;
+        candidate.cells[2].distribution.median_ci95_low = 1.4;
+        candidate.cells[2].distribution.median_ci95_high = 1.7;
         let mut rerun = candidate.clone();
         rerun.run_id = "rerun".to_owned();
         let result = evaluate(

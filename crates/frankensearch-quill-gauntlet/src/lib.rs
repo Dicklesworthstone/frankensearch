@@ -52,11 +52,15 @@ pub use generator::{
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use perf::{
-    DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,
-    PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PerfCellResult, PerfCellSpec,
-    PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfQueryClass, PerfTopology,
-    PositionMode, machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes,
-    perf_writer_heap_bytes, validate_matrix,
+    DistributionSummary, PAIRED_ESTIMATOR_SCHEMA_VERSION, PERF_ARTIFACT_SCHEMA_VERSION,
+    PERF_MAX_CV_PCT, PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES,
+    PairedClaimState, PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError,
+    PairedEstimatorReason, PairedEvidenceStatus, PairedExperimentResult, PerfCellResult,
+    PerfCellSpec, PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfMetricSemantics,
+    PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder,
+    PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode, estimate_paired_experiment,
+    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
+    seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,

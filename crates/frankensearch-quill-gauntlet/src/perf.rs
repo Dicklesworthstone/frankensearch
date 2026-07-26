@@ -4,13 +4,14 @@
 //! deterministic matrix, statistics, artifact schema, RSS probe, and human
 //! rendering so the evidence format is unit-tested without running a benchmark.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::GauntletError;
 
@@ -34,6 +35,8 @@ pub const PERF_WRITER_HEAP_BYTES: usize = 50_000_000;
 /// Tantivy's pinned minimum arena per writer thread. Multi-thread cells raise
 /// both engines' equal total budget rather than silently reducing thread count.
 pub const PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES: usize = 15_000_000;
+/// Version of the metric-specific paired estimator contract.
+pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
 
 /// Equal total heap budget for one thread-count cell.
 #[must_use]
@@ -451,6 +454,1004 @@ pub struct DistributionSummary {
     pub runs: usize,
 }
 
+/// How a raw measurement becomes the value compared between paired arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfMetricSemantics {
+    /// Work completed per elapsed second. Both arms must report equal work.
+    Throughput,
+    /// Elapsed nanoseconds. Smaller treatment/control ratios are faster.
+    Duration,
+    /// A positive directly observed value where larger is better.
+    GaugeHigherIsBetter,
+    /// A positive directly observed value where smaller is better.
+    GaugeLowerIsBetter,
+}
+
+impl PerfMetricSemantics {
+    /// Whether a larger treatment/control ratio is favorable.
+    #[must_use]
+    pub const fn higher_is_better(self) -> bool {
+        matches!(self, Self::Throughput | Self::GaugeHigherIsBetter)
+    }
+}
+
+/// Versioned identity for the exact operation inside one timed scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfOperationScope {
+    /// Stable operation identifier, such as `qg1.bulk_index_publish`.
+    pub operation_id: String,
+    /// Positive schema version for this exact timing boundary.
+    pub version: u32,
+    /// Metric-specific conversion applied to every raw record.
+    pub semantics: PerfMetricSemantics,
+    /// Human-readable unit for the derived absolute summaries.
+    pub unit: String,
+}
+
+impl PerfOperationScope {
+    /// Stable display identity used by diagnostics and artifact consumers.
+    #[must_use]
+    pub fn stable_id(&self) -> String {
+        format!("{}@{}", self.operation_id, self.version)
+    }
+
+    fn validate(&self) -> Result<(), PairedEstimatorError> {
+        if self.operation_id.trim().is_empty()
+            || self.operation_id.len() > 128
+            || self.unit.trim().is_empty()
+            || self.unit.len() > 32
+            || self.version == 0
+        {
+            return Err(PairedEstimatorError::InvalidScope {
+                reason: format!(
+                    "operation scope must have a bounded non-empty ID/unit and positive version: \
+                     {:?}",
+                    self
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable execution context shared by every record in one paired run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfSampleProvenance {
+    /// Unique identifier for this process-level measurement run.
+    pub run_id: String,
+    /// SHA-256 reported by the executing benchmark binary.
+    pub executable_sha256: String,
+    /// SHA-256 of the exact corpus/query manifest.
+    pub corpus_sha256: String,
+    /// Stable worker or machine identity.
+    pub worker_id: String,
+    /// Exact Cargo profile label.
+    pub build_profile: String,
+}
+
+impl PerfSampleProvenance {
+    fn validate(&self) -> Result<(), PairedEstimatorError> {
+        if self.run_id.trim().is_empty()
+            || self.worker_id.trim().is_empty()
+            || self.build_profile.trim().is_empty()
+            || !is_lower_hex_digest(&self.executable_sha256)
+            || !is_lower_hex_digest(&self.corpus_sha256)
+        {
+            return Err(PairedEstimatorError::InvalidProvenance {
+                reason: "paired samples require a run ID, worker, profile, and two lowercase \
+                         SHA-256 values"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn same_reproduction_context(&self, other: &Self) -> bool {
+        self.executable_sha256 == other.executable_sha256
+            && self.corpus_sha256 == other.corpus_sha256
+            && self.worker_id == other.worker_id
+            && self.build_profile == other.build_profile
+    }
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Logical arm carried by one raw sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfSampleArm {
+    /// Baseline or oracle arm.
+    Control,
+    /// Candidate or subject arm.
+    Treatment,
+}
+
+/// Execution order inside one paired block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfSampleOrder {
+    /// This sample executed first.
+    First,
+    /// This sample executed second.
+    Second,
+}
+
+/// Whether a record belongs to warmup or to the decision sample set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfSamplePhase {
+    /// Untimed-for-decision warmup record retained only for diagnostics.
+    Warmup,
+    /// Record admitted to the estimator.
+    Measurement,
+}
+
+/// One bounded raw record emitted by the timing harness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerfRawSample {
+    /// Stable pair identifier. Exactly one control and treatment must share it.
+    pub block_id: u64,
+    /// Globally unique sample identifier within the experiment.
+    pub sample_id: u64,
+    /// Baseline or candidate arm.
+    pub arm: PerfSampleArm,
+    /// First or second execution inside the block.
+    pub order: PerfSampleOrder,
+    /// Warmup or decision phase.
+    pub phase: PerfSamplePhase,
+    /// Exact versioned timing scope.
+    pub scope: PerfOperationScope,
+    /// Immutable process/corpus/worker provenance.
+    pub provenance: PerfSampleProvenance,
+    /// Monotonic timestamp relative to process start.
+    pub started_ns: u64,
+    /// Monotonic timestamp relative to process start.
+    pub ended_ns: u64,
+    /// Equal per-arm work denominator for throughput operations.
+    pub work_units: Option<u64>,
+    /// Equal per-arm byte denominator when applicable.
+    pub byte_count: Option<u64>,
+    /// Positive directly observed value for gauge operations.
+    pub observed_value: Option<f64>,
+}
+
+impl PerfRawSample {
+    fn validate_and_value(&self) -> Result<f64, PairedEstimatorError> {
+        self.scope.validate()?;
+        self.provenance.validate()?;
+        if self.phase != PerfSamplePhase::Measurement {
+            return Err(PairedEstimatorError::WarmupInDecisionSet {
+                sample_id: self.sample_id,
+            });
+        }
+        let elapsed_ns = self
+            .ended_ns
+            .checked_sub(self.started_ns)
+            .filter(|value| *value > 0)
+            .ok_or(PairedEstimatorError::InvalidTimestamp {
+                sample_id: self.sample_id,
+            })?;
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_ns = elapsed_ns as f64;
+        let value = match self.scope.semantics {
+            PerfMetricSemantics::Throughput => {
+                let work_units = self.work_units.filter(|value| *value > 0).ok_or_else(|| {
+                    PairedEstimatorError::InvalidValue {
+                        sample_id: self.sample_id,
+                        reason: "throughput samples require positive work_units".to_owned(),
+                    }
+                })?;
+                #[allow(clippy::cast_precision_loss)]
+                let work_units = work_units as f64;
+                work_units * 1_000_000_000.0 / elapsed_ns
+            }
+            PerfMetricSemantics::Duration => elapsed_ns,
+            PerfMetricSemantics::GaugeHigherIsBetter | PerfMetricSemantics::GaugeLowerIsBetter => {
+                self.observed_value
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| PairedEstimatorError::InvalidValue {
+                        sample_id: self.sample_id,
+                        reason: "gauge samples require a finite positive observed_value".to_owned(),
+                    })?
+            }
+        };
+        if !value.is_finite() || value <= 0.0 {
+            return Err(PairedEstimatorError::InvalidValue {
+                sample_id: self.sample_id,
+                reason: "derived sample value must be finite and positive".to_owned(),
+            });
+        }
+        Ok(value)
+    }
+}
+
+/// Predeclared validity thresholds for one paired estimator invocation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairedEstimatorConfig {
+    /// Seed used only for deterministic paired bootstrap resampling.
+    pub bootstrap_seed: u64,
+    /// Number of paired bootstrap resamples.
+    pub bootstrap_resamples: usize,
+    /// Minimum complete measurement blocks.
+    pub min_pairs: usize,
+    /// Largest permitted first-arm count imbalance.
+    pub max_order_imbalance: usize,
+    /// Maximum absolute A/A robust center on the log-ratio scale.
+    pub max_null_center_log: f64,
+    /// Maximum A/A confidence-bound distance from zero on the log scale.
+    pub max_null_ci_half_width_log: f64,
+    /// Maximum robust A/A dispersion on the paired log-ratio scale.
+    pub max_null_log_mad: f64,
+    /// Maximum difference between control-first and treatment-first A/A centers.
+    pub max_null_order_effect_log: f64,
+    /// Maximum first-half versus second-half A/A drift.
+    pub max_null_drift_log: f64,
+    /// Small log-scale dead band used only when comparing summary directions.
+    pub summary_direction_dead_band_log: f64,
+    /// Maximum effect delta admitted between stable process invocations.
+    pub max_reproduction_delta_log: f64,
+}
+
+impl PairedEstimatorConfig {
+    /// Validate that every threshold was fixed to a finite, usable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration error for undersampling or invalid bounds.
+    pub fn validate(&self) -> Result<(), PairedEstimatorError> {
+        let finite_non_negative = [
+            self.max_null_center_log,
+            self.max_null_ci_half_width_log,
+            self.max_null_log_mad,
+            self.max_null_order_effect_log,
+            self.max_null_drift_log,
+            self.summary_direction_dead_band_log,
+            self.max_reproduction_delta_log,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0);
+        if self.bootstrap_resamples < 100 || self.min_pairs < 4 || !finite_non_negative {
+            return Err(PairedEstimatorError::InvalidConfig {
+                reason: "paired estimation requires >=100 resamples, >=4 pairs, and finite \
+                         non-negative thresholds"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed fail-closed input and verification errors for paired estimation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PairedEstimatorError {
+    #[error("invalid paired estimator configuration: {reason}")]
+    InvalidConfig { reason: String },
+    #[error("invalid performance operation scope: {reason}")]
+    InvalidScope { reason: String },
+    #[error("invalid performance sample provenance: {reason}")]
+    InvalidProvenance { reason: String },
+    #[error("duplicate paired sample ID {sample_id}")]
+    DuplicateSampleId { sample_id: u64 },
+    #[error("warmup sample {sample_id} was passed to the decision estimator")]
+    WarmupInDecisionSet { sample_id: u64 },
+    #[error("sample {sample_id} has an invalid monotonic timestamp interval")]
+    InvalidTimestamp { sample_id: u64 },
+    #[error("sample {sample_id} has an invalid value: {reason}")]
+    InvalidValue { sample_id: u64, reason: String },
+    #[error(
+        "paired block {block_id} is incomplete: controls={control_count}, \
+         treatments={treatment_count}"
+    )]
+    IncompleteBlock {
+        block_id: u64,
+        control_count: usize,
+        treatment_count: usize,
+    },
+    #[error("paired block {block_id} repeats the {arm:?} arm")]
+    DuplicateArm { block_id: u64, arm: PerfSampleArm },
+    #[error("paired block {block_id} does not contain one first and one second sample")]
+    InvalidOrder { block_id: u64 },
+    #[error("paired block {block_id} contains overlapping or reversed executions")]
+    OverlappingSamples { block_id: u64 },
+    #[error("paired block {block_id} mixes operation scopes")]
+    ScopeMismatch { block_id: u64 },
+    #[error("paired block {block_id} mixes execution provenance")]
+    ProvenanceMismatch { block_id: u64 },
+    #[error("paired block {block_id} compares different work or byte denominators")]
+    WorkMismatch { block_id: u64 },
+    #[error("paired experiment has only {actual} complete blocks; require {required}")]
+    InsufficientPairs { actual: usize, required: usize },
+    #[error("A/B and A/A streams disagree on {field}")]
+    CrossExperimentMismatch { field: &'static str },
+    #[error("paired result no longer recomputes from its raw samples")]
+    InconsistentSummary,
+    #[error("paired reproduction context is incompatible: {field}")]
+    ReproductionMismatch { field: &'static str },
+    #[error("paired reproduction requires two distinct run IDs")]
+    ReusedRunId,
+    #[error("paired result has no decision-eligible effect")]
+    NoDecision,
+}
+
+/// Robust treatment/control estimate reconstructed from complete paired blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairedEffectEstimate {
+    /// Median paired log(treatment/control), the primary robust estimand.
+    pub median_log_ratio: f64,
+    /// Exponentiated primary estimand.
+    pub treatment_over_control: f64,
+    /// Lower 95% paired-bootstrap bound on the log scale.
+    pub ci95_low_log: f64,
+    /// Upper 95% paired-bootstrap bound on the log scale.
+    pub ci95_high_log: f64,
+    /// Exponentiated lower confidence bound.
+    pub ci95_low_ratio: f64,
+    /// Exponentiated upper confidence bound.
+    pub ci95_high_ratio: f64,
+    /// Median absolute deviation of paired log ratios.
+    pub log_mad: f64,
+    /// Arithmetic mean of paired log ratios, retained for algebraic checks.
+    pub mean_log_ratio: f64,
+    /// Ratio of marginal arm medians, diagnostic only.
+    pub ratio_of_arm_medians: f64,
+    /// Difference between mean paired logs and mean arm logs.
+    pub algebraic_reconciliation_error: f64,
+    /// Absolute value distribution for the control arm.
+    pub control: DistributionSummary,
+    /// Absolute value distribution for the treatment arm.
+    pub treatment: DistributionSummary,
+    /// Number of complete paired blocks.
+    pub pair_count: usize,
+    /// Blocks in which the control arm executed first.
+    pub control_first_blocks: usize,
+    /// Blocks in which the treatment arm executed first.
+    pub treatment_first_blocks: usize,
+    /// Difference between treatment-first and control-first log centers.
+    pub order_effect_log: Option<f64>,
+    /// Difference between second-half and first-half log centers.
+    pub drift_log: f64,
+}
+
+/// Whether the estimator produced admissible diagnostic evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairedEvidenceStatus {
+    /// Pairing, null, and summary checks all passed.
+    Valid,
+    /// A/A noise, drift, carryover, or order balance invalidated the run.
+    InvalidNull,
+    /// The A/B stream itself violated a predeclared design check.
+    InvalidExperiment,
+    /// Paired and marginal summaries point in opposite directions.
+    ContradictorySummaries,
+}
+
+/// Claim eligibility is deliberately separate from measured diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairedClaimState {
+    /// A downstream gate may apply its predeclared Allow/Block threshold.
+    EligibleForDecision,
+    /// Persist diagnostics, but emit no performance claim.
+    NoDecision,
+}
+
+/// Stable reason emitted by a paired estimator decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedEstimatorReason {
+    /// Machine-readable reason code.
+    pub code: String,
+    /// Bounded operator-facing explanation.
+    pub message: String,
+}
+
+/// Complete replayable paired estimator output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairedExperimentResult {
+    /// Estimator schema identifier.
+    pub schema_version: String,
+    /// Exact operation shared by A/B and A/A.
+    pub scope: PerfOperationScope,
+    /// Immutable execution context.
+    pub provenance: PerfSampleProvenance,
+    /// Predeclared estimator thresholds.
+    pub config: PairedEstimatorConfig,
+    /// Candidate-versus-control estimate.
+    pub effect: PairedEffectEstimate,
+    /// Same-operation A/A estimate.
+    pub null: PairedEffectEstimate,
+    /// Diagnostic validity.
+    pub status: PairedEvidenceStatus,
+    /// Whether a downstream decision is permitted.
+    pub claim_state: PairedClaimState,
+    /// Stable reasons explaining invalid or contradictory evidence.
+    pub reasons: Vec<PairedEstimatorReason>,
+    /// Bounded raw A/B records from which `effect` recomputes.
+    pub effect_samples: Vec<PerfRawSample>,
+    /// Bounded raw A/A records from which `null` recomputes.
+    pub null_samples: Vec<PerfRawSample>,
+}
+
+impl PairedExperimentResult {
+    /// Recompute every estimate and decision from the retained raw records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairedEstimatorError::InconsistentSummary`] on any mismatch.
+    pub fn verify_recomputed(&self) -> Result<(), PairedEstimatorError> {
+        let recomputed =
+            estimate_paired_experiment(&self.effect_samples, &self.null_samples, &self.config)?;
+        if recomputed == *self {
+            Ok(())
+        } else {
+            Err(PairedEstimatorError::InconsistentSummary)
+        }
+    }
+
+    /// Absolute log-effect delta against an independent process invocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects reused run IDs, different scopes/configs, incompatible
+    /// executable/corpus/worker/profile provenance, or a `NoDecision` input.
+    pub fn reproduction_delta_log(&self, other: &Self) -> Result<f64, PairedEstimatorError> {
+        if self.provenance.run_id == other.provenance.run_id {
+            return Err(PairedEstimatorError::ReusedRunId);
+        }
+        if self.scope != other.scope {
+            return Err(PairedEstimatorError::ReproductionMismatch {
+                field: "operation scope",
+            });
+        }
+        if self.config != other.config {
+            return Err(PairedEstimatorError::ReproductionMismatch {
+                field: "estimator configuration",
+            });
+        }
+        if !self.provenance.same_reproduction_context(&other.provenance) {
+            return Err(PairedEstimatorError::ReproductionMismatch {
+                field: "execution context",
+            });
+        }
+        if self.claim_state != PairedClaimState::EligibleForDecision
+            || other.claim_state != PairedClaimState::EligibleForDecision
+        {
+            return Err(PairedEstimatorError::NoDecision);
+        }
+        Ok((self.effect.median_log_ratio - other.effect.median_log_ratio).abs())
+    }
+
+    /// Whether an independent process replay meets the predeclared tolerance.
+    ///
+    /// # Errors
+    ///
+    /// Propagates incompatibility or `NoDecision` errors from
+    /// [`Self::reproduction_delta_log`].
+    pub fn reproduces_within(&self, other: &Self) -> Result<bool, PairedEstimatorError> {
+        Ok(self.reproduction_delta_log(other)? <= self.config.max_reproduction_delta_log)
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedPair {
+    control_value: f64,
+    treatment_value: f64,
+    log_ratio: f64,
+    control_first: bool,
+}
+
+type PairedStream = (
+    PerfOperationScope,
+    PerfSampleProvenance,
+    Vec<ValidatedPair>,
+    Vec<PerfRawSample>,
+);
+
+fn validate_paired_stream(
+    samples: &[PerfRawSample],
+    config: &PairedEstimatorConfig,
+) -> Result<PairedStream, PairedEstimatorError> {
+    config.validate()?;
+    let mut sample_ids = BTreeSet::new();
+    let mut blocks = BTreeMap::<u64, (Option<&PerfRawSample>, Option<&PerfRawSample>)>::new();
+    let mut stream_scope: Option<&PerfOperationScope> = None;
+    let mut stream_provenance: Option<&PerfSampleProvenance> = None;
+
+    for sample in samples {
+        let _ = sample.validate_and_value()?;
+        if !sample_ids.insert(sample.sample_id) {
+            return Err(PairedEstimatorError::DuplicateSampleId {
+                sample_id: sample.sample_id,
+            });
+        }
+        if let Some(scope) = stream_scope {
+            if scope != &sample.scope {
+                return Err(PairedEstimatorError::CrossExperimentMismatch {
+                    field: "operation scope within one stream",
+                });
+            }
+        } else {
+            stream_scope = Some(&sample.scope);
+        }
+        if let Some(provenance) = stream_provenance {
+            if provenance != &sample.provenance {
+                return Err(PairedEstimatorError::CrossExperimentMismatch {
+                    field: "provenance within one stream",
+                });
+            }
+        } else {
+            stream_provenance = Some(&sample.provenance);
+        }
+
+        let entry = blocks.entry(sample.block_id).or_default();
+        let slot = match sample.arm {
+            PerfSampleArm::Control => &mut entry.0,
+            PerfSampleArm::Treatment => &mut entry.1,
+        };
+        if slot.replace(sample).is_some() {
+            return Err(PairedEstimatorError::DuplicateArm {
+                block_id: sample.block_id,
+                arm: sample.arm,
+            });
+        }
+    }
+
+    let mut pairs = Vec::with_capacity(blocks.len());
+    for (block_id, (control, treatment)) in blocks {
+        let control_count = usize::from(control.is_some());
+        let treatment_count = usize::from(treatment.is_some());
+        let (Some(control), Some(treatment)) = (control, treatment) else {
+            return Err(PairedEstimatorError::IncompleteBlock {
+                block_id,
+                control_count,
+                treatment_count,
+            });
+        };
+        if control.scope != treatment.scope {
+            return Err(PairedEstimatorError::ScopeMismatch { block_id });
+        }
+        if control.provenance != treatment.provenance {
+            return Err(PairedEstimatorError::ProvenanceMismatch { block_id });
+        }
+        if control.work_units != treatment.work_units || control.byte_count != treatment.byte_count
+        {
+            return Err(PairedEstimatorError::WorkMismatch { block_id });
+        }
+        if control.order == treatment.order {
+            return Err(PairedEstimatorError::InvalidOrder { block_id });
+        }
+        let control_first = control.order == PerfSampleOrder::First;
+        let sequential = if control_first {
+            control.ended_ns <= treatment.started_ns
+        } else {
+            treatment.ended_ns <= control.started_ns
+        };
+        if !sequential {
+            return Err(PairedEstimatorError::OverlappingSamples { block_id });
+        }
+        let control_value = control.validate_and_value()?;
+        let treatment_value = treatment.validate_and_value()?;
+        let log_ratio = (treatment_value / control_value).ln();
+        if !log_ratio.is_finite() {
+            return Err(PairedEstimatorError::InvalidValue {
+                sample_id: treatment.sample_id,
+                reason: "paired log ratio must be finite".to_owned(),
+            });
+        }
+        pairs.push(ValidatedPair {
+            control_value,
+            treatment_value,
+            log_ratio,
+            control_first,
+        });
+    }
+
+    if pairs.len() < config.min_pairs {
+        return Err(PairedEstimatorError::InsufficientPairs {
+            actual: pairs.len(),
+            required: config.min_pairs,
+        });
+    }
+    let scope = stream_scope
+        .cloned()
+        .ok_or(PairedEstimatorError::InsufficientPairs {
+            actual: 0,
+            required: config.min_pairs,
+        })?;
+    let provenance = stream_provenance
+        .cloned()
+        .ok_or(PairedEstimatorError::InsufficientPairs {
+            actual: 0,
+            required: config.min_pairs,
+        })?;
+    let mut raw = samples.to_vec();
+    raw.sort_by_key(|sample| {
+        let order = match sample.order {
+            PerfSampleOrder::First => 0_u8,
+            PerfSampleOrder::Second => 1_u8,
+        };
+        (sample.block_id, order, sample.arm, sample.sample_id)
+    });
+    Ok((scope, provenance, pairs, raw))
+}
+
+fn summarize_pairs(
+    pairs: &[ValidatedPair],
+    config: &PairedEstimatorConfig,
+    seed_domain: u64,
+) -> Result<PairedEffectEstimate, PairedEstimatorError> {
+    let control_values = pairs
+        .iter()
+        .map(|pair| pair.control_value)
+        .collect::<Vec<_>>();
+    let treatment_values = pairs
+        .iter()
+        .map(|pair| pair.treatment_value)
+        .collect::<Vec<_>>();
+    let log_ratios = pairs.iter().map(|pair| pair.log_ratio).collect::<Vec<_>>();
+    let mut sorted_logs = log_ratios.clone();
+    sorted_logs.sort_unstable_by(f64::total_cmp);
+    let median_log_ratio = median_sorted(&sorted_logs);
+    let (ci95_low_log, ci95_high_log) = bootstrap_log_median_ci95(
+        &log_ratios,
+        config.bootstrap_seed ^ seed_domain,
+        config.bootstrap_resamples,
+    );
+    let mut log_deviations = log_ratios
+        .iter()
+        .map(|value| (value - median_log_ratio).abs())
+        .collect::<Vec<_>>();
+    log_deviations.sort_unstable_by(f64::total_cmp);
+    let control = DistributionSummary::from_samples(&control_values).map_err(|error| {
+        PairedEstimatorError::InvalidValue {
+            sample_id: 0,
+            reason: error.to_string(),
+        }
+    })?;
+    let treatment = DistributionSummary::from_samples(&treatment_values).map_err(|error| {
+        PairedEstimatorError::InvalidValue {
+            sample_id: 0,
+            reason: error.to_string(),
+        }
+    })?;
+    #[allow(clippy::cast_precision_loss)]
+    let pair_count = pairs.len() as f64;
+    let mean_log_ratio = log_ratios.iter().sum::<f64>() / pair_count;
+    let mean_control_log = control_values.iter().map(|value| value.ln()).sum::<f64>() / pair_count;
+    let mean_treatment_log =
+        treatment_values.iter().map(|value| value.ln()).sum::<f64>() / pair_count;
+    let control_first_logs = pairs
+        .iter()
+        .filter(|pair| pair.control_first)
+        .map(|pair| pair.log_ratio)
+        .collect::<Vec<_>>();
+    let treatment_first_logs = pairs
+        .iter()
+        .filter(|pair| !pair.control_first)
+        .map(|pair| pair.log_ratio)
+        .collect::<Vec<_>>();
+    let order_effect_log = median_of(&treatment_first_logs)
+        .zip(median_of(&control_first_logs))
+        .map(|(treatment_first, control_first)| treatment_first - control_first);
+    let midpoint = pairs.len() / 2;
+    let drift_log = median_of(
+        &pairs[midpoint..]
+            .iter()
+            .map(|pair| pair.log_ratio)
+            .collect::<Vec<_>>(),
+    )
+    .zip(median_of(
+        &pairs[..midpoint]
+            .iter()
+            .map(|pair| pair.log_ratio)
+            .collect::<Vec<_>>(),
+    ))
+    .map_or(0.0, |(second, first)| second - first);
+
+    Ok(PairedEffectEstimate {
+        median_log_ratio,
+        treatment_over_control: median_log_ratio.exp(),
+        ci95_low_log,
+        ci95_high_log,
+        ci95_low_ratio: ci95_low_log.exp(),
+        ci95_high_ratio: ci95_high_log.exp(),
+        log_mad: median_sorted(&log_deviations),
+        mean_log_ratio,
+        ratio_of_arm_medians: treatment.p50 / control.p50,
+        algebraic_reconciliation_error: mean_log_ratio - (mean_treatment_log - mean_control_log),
+        control,
+        treatment,
+        pair_count: pairs.len(),
+        control_first_blocks: control_first_logs.len(),
+        treatment_first_blocks: treatment_first_logs.len(),
+        order_effect_log,
+        drift_log,
+    })
+}
+
+fn median_of(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    Some(median_sorted(&sorted))
+}
+
+fn bootstrap_log_median_ci95(samples: &[f64], mut seed: u64, resamples: usize) -> (f64, f64) {
+    debug_assert!(!samples.is_empty());
+    let sample_count = u64::try_from(samples.len()).expect("sample count fits u64");
+    for sample in samples {
+        seed = splitmix64(seed ^ sample.to_bits());
+    }
+    let mut scratch = Vec::with_capacity(samples.len());
+    let mut medians = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        scratch.clear();
+        for _ in 0..samples.len() {
+            seed = splitmix64(seed);
+            let index = usize::try_from(seed % sample_count).expect("sample modulus fits usize");
+            scratch.push(samples[index]);
+        }
+        scratch.sort_unstable_by(f64::total_cmp);
+        medians.push(median_sorted(&scratch));
+    }
+    medians.sort_unstable_by(f64::total_cmp);
+    (percentile(&medians, 0.025), percentile(&medians, 0.975))
+}
+
+fn direction_conflicts(effect: &PairedEffectEstimate, dead_band: f64) -> bool {
+    let marginal_log_ratio = effect.ratio_of_arm_medians.ln();
+    effect.median_log_ratio.abs() > dead_band
+        && marginal_log_ratio.abs() > dead_band
+        && effect.median_log_ratio.is_sign_positive() != marginal_log_ratio.is_sign_positive()
+}
+
+fn push_reason(reasons: &mut Vec<PairedEstimatorReason>, code: &str, message: impl Into<String>) {
+    reasons.push(PairedEstimatorReason {
+        code: code.to_owned(),
+        message: message.into(),
+    });
+}
+
+/// Estimate one candidate/control stream beside its same-operation A/A null.
+///
+/// Both streams retain raw samples even when the null is invalid. Structural
+/// defects such as missing IDs or mixed scopes return an error; statistical
+/// invalidity returns a replayable [`PairedExperimentResult`] whose
+/// [`PairedClaimState`] is [`PairedClaimState::NoDecision`].
+///
+/// # Errors
+///
+/// Returns a typed fail-closed error for malformed pairs, mixed scopes or
+/// provenance, undersampling, and invalid raw values.
+pub fn estimate_paired_experiment(
+    effect_samples: &[PerfRawSample],
+    null_samples: &[PerfRawSample],
+    config: &PairedEstimatorConfig,
+) -> Result<PairedExperimentResult, PairedEstimatorError> {
+    let (scope, provenance, effect_pairs, effect_raw) =
+        validate_paired_stream(effect_samples, config)?;
+    let (null_scope, null_provenance, null_pairs, null_raw) =
+        validate_paired_stream(null_samples, config)?;
+    if scope != null_scope {
+        return Err(PairedEstimatorError::CrossExperimentMismatch {
+            field: "operation scope",
+        });
+    }
+    if provenance != null_provenance {
+        return Err(PairedEstimatorError::CrossExperimentMismatch {
+            field: "provenance",
+        });
+    }
+    let mut global_ids = BTreeSet::new();
+    for sample in effect_raw.iter().chain(&null_raw) {
+        if !global_ids.insert(sample.sample_id) {
+            return Err(PairedEstimatorError::DuplicateSampleId {
+                sample_id: sample.sample_id,
+            });
+        }
+    }
+
+    let effect = summarize_pairs(&effect_pairs, config, 0x4142_5f45_4646_4543)?;
+    let null = summarize_pairs(&null_pairs, config, 0x4141_5f4e_554c_4c00)?;
+    let mut null_invalid = false;
+    let mut experiment_invalid = false;
+    let mut contradictory = false;
+    let mut reasons = Vec::new();
+    let null_ci_half_width = null.ci95_low_log.abs().max(null.ci95_high_log.abs());
+    if !(null.ci95_low_log <= 0.0 && 0.0 <= null.ci95_high_log)
+        || null.median_log_ratio.abs() > config.max_null_center_log
+    {
+        null_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.null_center_invalid",
+            format!(
+                "A/A center {:.6} with CI [{:.6}, {:.6}] exceeds the predeclared null center",
+                null.median_log_ratio, null.ci95_low_log, null.ci95_high_log
+            ),
+        );
+    }
+    if null_ci_half_width > config.max_null_ci_half_width_log {
+        null_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.null_too_wide",
+            format!(
+                "A/A log-CI half width {null_ci_half_width:.6} exceeds {:.6}",
+                config.max_null_ci_half_width_log
+            ),
+        );
+    }
+    if null.log_mad > config.max_null_log_mad {
+        null_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.null_dispersion",
+            format!(
+                "A/A log-MAD {:.6} exceeds {:.6}",
+                null.log_mad, config.max_null_log_mad
+            ),
+        );
+    }
+    let null_order_imbalance = null
+        .control_first_blocks
+        .abs_diff(null.treatment_first_blocks);
+    if null_order_imbalance > config.max_order_imbalance {
+        null_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.null_order_imbalance",
+            format!(
+                "A/A first-arm imbalance {null_order_imbalance} exceeds {}",
+                config.max_order_imbalance
+            ),
+        );
+    }
+    match null.order_effect_log {
+        Some(effect) if effect.abs() <= config.max_null_order_effect_log => {}
+        Some(effect) => {
+            null_invalid = true;
+            push_reason(
+                &mut reasons,
+                "paired.null_order_effect",
+                format!(
+                    "A/A order effect {effect:.6} exceeds {:.6}",
+                    config.max_null_order_effect_log
+                ),
+            );
+        }
+        None => {
+            null_invalid = true;
+            push_reason(
+                &mut reasons,
+                "paired.null_order_unobserved",
+                "A/A stream did not execute both randomized orders",
+            );
+        }
+    }
+    if null.drift_log.abs() > config.max_null_drift_log {
+        null_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.null_drift",
+            format!(
+                "A/A first/second-half drift {:.6} exceeds {:.6}",
+                null.drift_log, config.max_null_drift_log
+            ),
+        );
+    }
+    let effect_order_imbalance = effect
+        .control_first_blocks
+        .abs_diff(effect.treatment_first_blocks);
+    if effect_order_imbalance > config.max_order_imbalance {
+        experiment_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.effect_order_imbalance",
+            format!(
+                "A/B first-arm imbalance {effect_order_imbalance} exceeds {}",
+                config.max_order_imbalance
+            ),
+        );
+    }
+    if direction_conflicts(&effect, config.summary_direction_dead_band_log) {
+        contradictory = true;
+        push_reason(
+            &mut reasons,
+            "paired.absolute_direction_conflict",
+            format!(
+                "paired ratio {:.6} and ratio-of-arm-medians {:.6} point in opposite directions",
+                effect.treatment_over_control, effect.ratio_of_arm_medians
+            ),
+        );
+    }
+    if effect.algebraic_reconciliation_error.abs() > 1.0e-12
+        || null.algebraic_reconciliation_error.abs() > 1.0e-12
+    {
+        experiment_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.algebraic_reconciliation_failed",
+            "mean paired log effect does not reconcile with the same raw arm values",
+        );
+    }
+
+    let status = if null_invalid {
+        PairedEvidenceStatus::InvalidNull
+    } else if experiment_invalid {
+        PairedEvidenceStatus::InvalidExperiment
+    } else if contradictory {
+        PairedEvidenceStatus::ContradictorySummaries
+    } else {
+        PairedEvidenceStatus::Valid
+    };
+    let claim_state = if status == PairedEvidenceStatus::Valid {
+        PairedClaimState::EligibleForDecision
+    } else {
+        PairedClaimState::NoDecision
+    };
+    Ok(PairedExperimentResult {
+        schema_version: PAIRED_ESTIMATOR_SCHEMA_VERSION.to_owned(),
+        scope,
+        provenance,
+        config: config.clone(),
+        effect,
+        null,
+        status,
+        claim_state,
+        reasons,
+        effect_samples: effect_raw,
+        null_samples: null_raw,
+    })
+}
+
+/// Produce a deterministic, balanced randomized first-arm schedule.
+///
+/// # Errors
+///
+/// Requires at least two blocks and a count representable by the deterministic
+/// shuffle.
+pub fn seeded_balanced_pair_order(
+    pair_count: usize,
+    mut seed: u64,
+) -> Result<Vec<PerfSampleArm>, PairedEstimatorError> {
+    if pair_count < 2 {
+        return Err(PairedEstimatorError::InvalidConfig {
+            reason: "paired order schedule requires at least two blocks".to_owned(),
+        });
+    }
+    let mut first_arms = (0..pair_count)
+        .map(|index| {
+            if index < pair_count / 2 {
+                PerfSampleArm::Control
+            } else {
+                PerfSampleArm::Treatment
+            }
+        })
+        .collect::<Vec<_>>();
+    for index in (1..pair_count).rev() {
+        seed = splitmix64(seed);
+        let modulus =
+            u64::try_from(index + 1).map_err(|_| PairedEstimatorError::InvalidConfig {
+                reason: "pair count does not fit deterministic shuffle modulus".to_owned(),
+            })?;
+        let swap_index =
+            usize::try_from(seed % modulus).map_err(|_| PairedEstimatorError::InvalidConfig {
+                reason: "shuffle index does not fit usize".to_owned(),
+            })?;
+        first_arms.swap(index, swap_index);
+    }
+    Ok(first_arms)
+}
+
 impl DistributionSummary {
     /// Summarize finite non-negative samples. The result records fewer than ten
     /// runs but cannot be gate-activated until [`Self::sampled_for_activation`]
@@ -473,7 +1474,7 @@ impl DistributionSummary {
         }
         let mut sorted = samples.to_vec();
         sorted.sort_unstable_by(f64::total_cmp);
-        let p50 = percentile(&sorted, 0.50);
+        let p50 = median_sorted(&sorted);
         let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
         let variance = sorted
             .iter()
@@ -501,7 +1502,7 @@ impl DistributionSummary {
             median_ci95_high,
             p95: percentile(&sorted, 0.95),
             p99: percentile(&sorted, 0.99),
-            mad: percentile(&deviations, 0.50),
+            mad: median_sorted(&deviations),
             cv_pct,
             runs: sorted.len(),
         })
@@ -539,7 +1540,7 @@ fn bootstrap_median_ci95(samples: &[f64]) -> (f64, f64) {
             resample.push(samples[index]);
         }
         resample.sort_unstable_by(f64::total_cmp);
-        medians.push(percentile(&resample, 0.50));
+        medians.push(median_sorted(&resample));
     }
     medians.sort_unstable_by(f64::total_cmp);
     (percentile(&medians, 0.025), percentile(&medians, 0.975))
@@ -558,6 +1559,16 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let index = scaled.round() as usize;
     sorted[index]
+}
+
+fn median_sorted(sorted: &[f64]) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    let midpoint = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        sorted[midpoint - 1] / 2.0 + sorted[midpoint] / 2.0
+    } else {
+        sorted[midpoint]
+    }
 }
 
 /// One engine or comparison row in a gate artifact.
@@ -757,6 +1768,498 @@ pub fn validate_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
 mod tests {
     use super::*;
 
+    fn estimator_config() -> PairedEstimatorConfig {
+        PairedEstimatorConfig {
+            bootstrap_seed: 0x5eed_1234_5678_9abc,
+            bootstrap_resamples: PERF_BOOTSTRAP_RESAMPLES,
+            min_pairs: PERF_MIN_RUNS,
+            max_order_imbalance: 0,
+            max_null_center_log: 1.05_f64.ln(),
+            max_null_ci_half_width_log: 1.10_f64.ln(),
+            max_null_log_mad: 1.05_f64.ln(),
+            max_null_order_effect_log: 1.05_f64.ln(),
+            max_null_drift_log: 1.05_f64.ln(),
+            summary_direction_dead_band_log: 1.000_001_f64.ln(),
+            max_reproduction_delta_log: 1.02_f64.ln(),
+        }
+    }
+
+    fn operation_scope(semantics: PerfMetricSemantics) -> PerfOperationScope {
+        PerfOperationScope {
+            operation_id: "qg.synthetic_operation".to_owned(),
+            version: 1,
+            semantics,
+            unit: match semantics {
+                PerfMetricSemantics::Throughput => "work/s",
+                PerfMetricSemantics::Duration => "ns",
+                PerfMetricSemantics::GaugeHigherIsBetter
+                | PerfMetricSemantics::GaugeLowerIsBetter => "units",
+            }
+            .to_owned(),
+        }
+    }
+
+    fn provenance(run_id: &str) -> PerfSampleProvenance {
+        PerfSampleProvenance {
+            run_id: run_id.to_owned(),
+            executable_sha256: "a".repeat(64),
+            corpus_sha256: "b".repeat(64),
+            worker_id: "synthetic-worker".to_owned(),
+            build_profile: "release-perf".to_owned(),
+        }
+    }
+
+    fn duration_stream(
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+        control_durations: &[u64],
+        treatment_durations: &[u64],
+        sample_id_base: u64,
+    ) -> Vec<PerfRawSample> {
+        assert_eq!(control_durations.len(), treatment_durations.len());
+        let first_arms =
+            seeded_balanced_pair_order(control_durations.len(), 0x00dd_5eed).expect("pair order");
+        let mut samples = Vec::with_capacity(control_durations.len() * 2);
+        for (index, ((control_duration, treatment_duration), first_arm)) in control_durations
+            .iter()
+            .zip(treatment_durations)
+            .zip(first_arms)
+            .enumerate()
+        {
+            let block_id = u64::try_from(index).expect("test block ID");
+            let base = block_id.saturating_mul(100_000_000);
+            let control_first = first_arm == PerfSampleArm::Control;
+            let (control_start, treatment_start) = if control_first {
+                (base, base + control_duration + 1_000)
+            } else {
+                (base + treatment_duration + 1_000, base)
+            };
+            let control_order = if control_first {
+                PerfSampleOrder::First
+            } else {
+                PerfSampleOrder::Second
+            };
+            let treatment_order = if control_first {
+                PerfSampleOrder::Second
+            } else {
+                PerfSampleOrder::First
+            };
+            let index = u64::try_from(index).expect("test sample index");
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id: sample_id_base + index * 2,
+                arm: PerfSampleArm::Control,
+                order: control_order,
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: control_start,
+                ended_ns: control_start + control_duration,
+                work_units: Some(1_000),
+                byte_count: Some(64_000),
+                observed_value: None,
+            });
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id: sample_id_base + index * 2 + 1,
+                arm: PerfSampleArm::Treatment,
+                order: treatment_order,
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: treatment_start,
+                ended_ns: treatment_start + treatment_duration,
+                work_units: Some(1_000),
+                byte_count: Some(64_000),
+                observed_value: None,
+            });
+        }
+        samples
+    }
+
+    fn gauge_stream(
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+        controls: &[f64],
+        treatments: &[f64],
+        sample_id_base: u64,
+    ) -> Vec<PerfRawSample> {
+        assert_eq!(controls.len(), treatments.len());
+        let first_arms =
+            seeded_balanced_pair_order(controls.len(), 0x00c0_ffee).expect("pair order");
+        let mut samples = Vec::with_capacity(controls.len() * 2);
+        for (index, ((control, treatment), first_arm)) in
+            controls.iter().zip(treatments).zip(first_arms).enumerate()
+        {
+            let block_id = u64::try_from(index).expect("test block ID");
+            let base = block_id.saturating_mul(1_000);
+            let control_first = first_arm == PerfSampleArm::Control;
+            let (control_start, treatment_start) = if control_first {
+                (base, base + 200)
+            } else {
+                (base + 200, base)
+            };
+            let index = u64::try_from(index).expect("test sample index");
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id: sample_id_base + index * 2,
+                arm: PerfSampleArm::Control,
+                order: if control_first {
+                    PerfSampleOrder::First
+                } else {
+                    PerfSampleOrder::Second
+                },
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: control_start,
+                ended_ns: control_start + 100,
+                work_units: None,
+                byte_count: None,
+                observed_value: Some(*control),
+            });
+            samples.push(PerfRawSample {
+                block_id,
+                sample_id: sample_id_base + index * 2 + 1,
+                arm: PerfSampleArm::Treatment,
+                order: if control_first {
+                    PerfSampleOrder::Second
+                } else {
+                    PerfSampleOrder::First
+                },
+                phase: PerfSamplePhase::Measurement,
+                scope: scope.clone(),
+                provenance: provenance.clone(),
+                started_ns: treatment_start,
+                ended_ns: treatment_start + 100,
+                work_units: None,
+                byte_count: None,
+                observed_value: Some(*treatment),
+            });
+        }
+        samples
+    }
+
+    fn stable_null(
+        scope: &PerfOperationScope,
+        provenance: &PerfSampleProvenance,
+    ) -> Vec<PerfRawSample> {
+        let durations = [
+            1_000_000, 1_200_000, 900_000, 1_500_000, 800_000, 1_100_000, 1_300_000, 950_000,
+            1_050_000, 1_400_000,
+        ];
+        duration_stream(scope, provenance, &durations, &durations, 10_000)
+    }
+
+    #[test]
+    fn paired_samples_reject_misaligned_blocks_and_duplicate_sample_ids() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("misaligned");
+        let durations = [1_000_000; PERF_MIN_RUNS];
+        let mut effect = duration_stream(&scope, &provenance, &durations, &durations, 0);
+        effect
+            .iter_mut()
+            .find(|sample| sample.arm == PerfSampleArm::Treatment && sample.block_id == 7)
+            .expect("target treatment sample")
+            .block_id = 77;
+        let error = estimate_paired_experiment(
+            &effect,
+            &stable_null(&scope, &provenance),
+            &estimator_config(),
+        )
+        .expect_err("misaligned block IDs must fail closed");
+        assert!(
+            matches!(error, PairedEstimatorError::IncompleteBlock { .. }),
+            "unexpected pairing error: {error}"
+        );
+
+        let mut duplicate_ids = duration_stream(&scope, &provenance, &durations, &durations, 0);
+        duplicate_ids[1].sample_id = duplicate_ids[0].sample_id;
+        assert!(matches!(
+            estimate_paired_experiment(
+                &duplicate_ids,
+                &stable_null(&scope, &provenance),
+                &estimator_config()
+            ),
+            Err(PairedEstimatorError::DuplicateSampleId { .. })
+        ));
+    }
+
+    #[test]
+    fn paired_log_estimator_recovers_known_effect_with_heteroskedastic_outlier() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("known-effect");
+        let controls = [
+            1_000_000, 9_000_000, 2_000_000, 20_000_000, 3_000_000, 30_000_000, 4_000_000,
+            40_000_000, 5_000_000, 50_000_000,
+        ];
+        let mut treatments = controls.map(|duration| duration / 2);
+        treatments[3] = controls[3] * 10;
+        let result = estimate_paired_experiment(
+            &duration_stream(&scope, &provenance, &controls, &treatments, 0),
+            &stable_null(&scope, &provenance),
+            &estimator_config(),
+        )
+        .expect("known paired effect");
+        assert_eq!(result.status, PairedEvidenceStatus::Valid);
+        assert_eq!(result.claim_state, PairedClaimState::EligibleForDecision);
+        assert!((result.effect.treatment_over_control - 2.0).abs() < 1.0e-12);
+        assert!(result.effect.ci95_low_ratio > 1.0);
+        assert!(result.effect.algebraic_reconciliation_error.abs() < 1.0e-12);
+        result.verify_recomputed().expect("raw samples recompute");
+    }
+
+    #[test]
+    fn noisy_order_dependent_null_is_retained_as_no_decision() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("invalid-null");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let treatments = [500_000; PERF_MIN_RUNS];
+        let effect = duration_stream(&scope, &provenance, &controls, &treatments, 0);
+        let mut null = stable_null(&scope, &provenance);
+        for sample in &mut null {
+            if sample.arm == PerfSampleArm::Treatment {
+                let duration = sample.ended_ns - sample.started_ns;
+                let biased = if sample.order == PerfSampleOrder::Second {
+                    duration / 4
+                } else {
+                    duration * 4
+                };
+                sample.ended_ns = sample.started_ns + biased;
+            }
+        }
+        for block_id in 0..u64::try_from(PERF_MIN_RUNS).expect("test block count") {
+            let first_end = null
+                .iter()
+                .find(|sample| {
+                    sample.block_id == block_id && sample.order == PerfSampleOrder::First
+                })
+                .expect("first sample")
+                .ended_ns;
+            let second = null
+                .iter_mut()
+                .find(|sample| {
+                    sample.block_id == block_id && sample.order == PerfSampleOrder::Second
+                })
+                .expect("second sample");
+            let duration = second.ended_ns - second.started_ns;
+            second.started_ns = first_end + 1_000;
+            second.ended_ns = second.started_ns + duration;
+        }
+        let result =
+            estimate_paired_experiment(&effect, &null, &estimator_config()).expect("diagnostic");
+        assert_eq!(result.status, PairedEvidenceStatus::InvalidNull);
+        assert_eq!(result.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paired.null_order_effect")
+        );
+        assert_eq!(result.effect_samples.len(), PERF_MIN_RUNS * 2);
+        assert_eq!(result.null_samples.len(), PERF_MIN_RUNS * 2);
+        result
+            .verify_recomputed()
+            .expect("invalid diagnostics still recompute");
+    }
+
+    #[test]
+    fn drifting_null_is_invalid_even_when_other_null_limits_are_wide() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("drifting-null");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let effect_treatments = [500_000; PERF_MIN_RUNS];
+        let mut null_treatments = controls;
+        null_treatments[PERF_MIN_RUNS / 2..].fill(1_200_000);
+        let effect = duration_stream(&scope, &provenance, &controls, &effect_treatments, 0);
+        let null = duration_stream(&scope, &provenance, &controls, &null_treatments, 10_000);
+        let mut config = estimator_config();
+        config.max_null_center_log = 1.5_f64.ln();
+        config.max_null_ci_half_width_log = 1.5_f64.ln();
+        config.max_null_log_mad = 1.5_f64.ln();
+        config.max_null_order_effect_log = 1.5_f64.ln();
+        let result = estimate_paired_experiment(&effect, &null, &config).expect("drift diagnostic");
+        assert_eq!(result.status, PairedEvidenceStatus::InvalidNull);
+        assert_eq!(result.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paired.null_drift")
+        );
+    }
+
+    #[test]
+    fn same_seed_bootstrap_and_json_round_trip_are_exact() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("deterministic");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let treatments = [625_000; PERF_MIN_RUNS];
+        let effect = duration_stream(&scope, &provenance, &controls, &treatments, 0);
+        let null = stable_null(&scope, &provenance);
+        let first = estimate_paired_experiment(&effect, &null, &estimator_config()).expect("first");
+        let second =
+            estimate_paired_experiment(&effect, &null, &estimator_config()).expect("second");
+        assert_eq!(first, second);
+        let encoded = serde_json::to_vec(&first).expect("encode paired result");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("decode paired schema");
+        let top_level_keys = value
+            .as_object()
+            .expect("paired result object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            top_level_keys,
+            BTreeSet::from([
+                "claim_state",
+                "config",
+                "effect",
+                "effect_samples",
+                "null",
+                "null_samples",
+                "provenance",
+                "reasons",
+                "schema_version",
+                "scope",
+                "status",
+            ])
+        );
+        let raw_sample_keys = value["effect_samples"][0]
+            .as_object()
+            .expect("raw paired sample")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            raw_sample_keys,
+            BTreeSet::from([
+                "arm",
+                "block_id",
+                "byte_count",
+                "ended_ns",
+                "observed_value",
+                "order",
+                "phase",
+                "provenance",
+                "sample_id",
+                "scope",
+                "started_ns",
+                "work_units",
+            ])
+        );
+        let decoded: PairedExperimentResult =
+            serde_json::from_slice(&encoded).expect("decode paired result");
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("re-encode paired result"),
+            encoded
+        );
+        decoded.verify_recomputed().expect("round-trip recomputes");
+    }
+
+    #[test]
+    fn scope_mismatch_and_warmup_leak_fail_closed() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("scope-mismatch");
+        let durations = [1_000_000; PERF_MIN_RUNS];
+        let effect = duration_stream(&scope, &provenance, &durations, &durations, 0);
+        let mut other_scope = scope.clone();
+        other_scope.version = 2;
+        let null = stable_null(&other_scope, &provenance);
+        assert!(matches!(
+            estimate_paired_experiment(&effect, &null, &estimator_config()),
+            Err(PairedEstimatorError::CrossExperimentMismatch {
+                field: "operation scope"
+            })
+        ));
+
+        let mut warmup = effect;
+        warmup[0].phase = PerfSamplePhase::Warmup;
+        assert!(matches!(
+            estimate_paired_experiment(
+                &warmup,
+                &stable_null(&scope, &provenance),
+                &estimator_config()
+            ),
+            Err(PairedEstimatorError::WarmupInDecisionSet { .. })
+        ));
+    }
+
+    #[test]
+    fn contradictory_paired_and_marginal_directions_yield_no_decision() {
+        let scope = operation_scope(PerfMetricSemantics::GaugeHigherIsBetter);
+        let provenance = provenance("contradictory");
+        let controls = [100.0, 1_000.0, 10_000.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let treatments = [
+            99.0, 999.0, 9_999.0, 100_000.0, 200_000.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+        ];
+        let effect = gauge_stream(&scope, &provenance, &controls, &treatments, 0);
+        let null = gauge_stream(&scope, &provenance, &controls, &controls, 10_000);
+        let result =
+            estimate_paired_experiment(&effect, &null, &estimator_config()).expect("diagnostic");
+        assert_eq!(result.status, PairedEvidenceStatus::ContradictorySummaries);
+        assert_eq!(result.claim_state, PairedClaimState::NoDecision);
+        assert!(result.effect.median_log_ratio.is_sign_negative());
+        assert!(result.effect.ratio_of_arm_medians > 1.0);
+    }
+
+    #[test]
+    fn independent_run_ids_reproduce_within_predeclared_tolerance() {
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let first_provenance = provenance("process-one");
+        let second_provenance = provenance("process-two");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let treatments = [500_000; PERF_MIN_RUNS];
+        let first = estimate_paired_experiment(
+            &duration_stream(&scope, &first_provenance, &controls, &treatments, 0),
+            &stable_null(&scope, &first_provenance),
+            &estimator_config(),
+        )
+        .expect("first process");
+        let second = estimate_paired_experiment(
+            &duration_stream(&scope, &second_provenance, &controls, &treatments, 0),
+            &stable_null(&scope, &second_provenance),
+            &estimator_config(),
+        )
+        .expect("second process");
+        assert!(first.reproduces_within(&second).expect("compatible replay"));
+        assert!(matches!(
+            first.reproduction_delta_log(&first),
+            Err(PairedEstimatorError::ReusedRunId)
+        ));
+    }
+
+    #[test]
+    fn seeded_order_is_deterministic_randomized_and_balanced() {
+        let first = seeded_balanced_pair_order(PERF_MIN_RUNS, 42).expect("first schedule");
+        let second = seeded_balanced_pair_order(PERF_MIN_RUNS, 42).expect("second schedule");
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            vec![
+                PerfSampleArm::Control,
+                PerfSampleArm::Treatment,
+                PerfSampleArm::Control,
+                PerfSampleArm::Treatment,
+                PerfSampleArm::Control,
+                PerfSampleArm::Treatment,
+                PerfSampleArm::Control,
+                PerfSampleArm::Treatment,
+                PerfSampleArm::Control,
+                PerfSampleArm::Treatment,
+            ],
+            "the seed must randomize more than fixed alternation"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|arm| **arm == PerfSampleArm::Control)
+                .count(),
+            PERF_MIN_RUNS / 2
+        );
+    }
+
     #[test]
     fn complete_matrix_covers_every_gate_and_required_cross_products() {
         let matrix = PerfMatrixSpec::complete();
@@ -775,6 +2278,28 @@ mod tests {
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg8).len(), 6);
         assert_eq!(matrix.for_gate(PerfGate::Qg10).len(), 1);
+    }
+
+    #[test]
+    fn normative_manifest_names_the_repaired_paired_estimator() {
+        let manifest: toml::Value = toml::from_str(include_str!(
+            "../../../docs/contracts/quill-perf-gates.toml"
+        ))
+        .expect("parse normative performance manifest");
+        let defaults = manifest
+            .get("defaults")
+            .and_then(toml::Value::as_table)
+            .expect("defaults table");
+        assert!(
+            defaults["stat_rule"]
+                .as_str()
+                .expect("statistical rule")
+                .contains(PAIRED_ESTIMATOR_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            defaults["decision_precedence"].as_str(),
+            Some("Fatal > Block > Quarantine > NoDecision/Provisional > Allow")
+        );
     }
 
     #[test]
@@ -807,6 +2332,9 @@ mod tests {
             high_cv.sampled_for_activation(),
             "CV is provenance and must not be an activation gate"
         );
+        let even =
+            DistributionSummary::from_samples(&[1.0, 2.0, 100.0, 200.0]).expect("even summary");
+        assert!((even.p50 - 51.0).abs() < f64::EPSILON);
         assert!(DistributionSummary::from_samples(&[]).is_err());
         assert!(DistributionSummary::from_samples(&[f64::NAN]).is_err());
         assert!(DistributionSummary::from_samples(&[-1.0]).is_err());

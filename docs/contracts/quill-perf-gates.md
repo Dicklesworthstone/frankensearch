@@ -49,15 +49,43 @@ directional regression; a median movement whose CIs do not decide it is
 provenance only. Promotion also
 requires a second artifact from the same git revision, machine fingerprint,
 corpus hash, and run window, with a distinct run ID and medians reproducing
-within 5%. Each fixture first calls the same factored, alternating-order paired
-routine as Tantivy/Tantivy, then as Tantivy/Quill. The statistic is the median
-of per-round ratios. A superiority claim is decidable only when its median lies
-outside the same-invocation A/A 95% median CI and its distance from 1.0 is at
-least 2x the A/A floor. QG-6 is an equivalence claim instead: its complete A/B
-median CI must fit inside [0.90, 1.10], while the 2x A/A floor must fit inside
-that equivalence margin. Oracle drift, an A/A CI that does not contain 1.0,
-fewer than 10 runs, incomplete cells, or an inactive gate all quarantine.
-`cv_pct` is reported but never gates a decision.
+within 5%.
+
+## Paired estimator contract
+
+`quill-paired-estimator-v1` replaces positional vectors and fixed alternation
+with complete, seeded, balanced-random paired blocks. Every decision sample
+carries a stable block/sample ID, arm and within-block order, measurement phase,
+monotonic start/end timestamps, versioned operation scope, matched work/byte
+denominators, and executable/corpus/worker/profile provenance. Warmup is
+kept outside the estimator input and is rejected if it leaks into the decision
+set. Missing, duplicate, overlapping, cross-scope, or cross-provenance pairs
+fail closed.
+
+The primary effect is the robust center of paired
+`log(treatment/control)` values with a deterministic seeded paired-bootstrap
+95% confidence interval. Each arm's absolute p50/p95/p99 and throughput remain
+first-class. The ratio of arm medians is persisted as a diagnostic only; it is
+not interchangeable with the median paired ratio. The estimator checks their
+directions and the exact mean-log identity so contradictory summaries are
+structurally visible.
+
+The A/A lane executes the identical operation twice under the same randomized
+block schedule. Before a live run, each metric/scale fixes its admissible null
+center, confidence-width, robust log-dispersion, order-balance, order-effect,
+drift, and reproduction tolerance. A null failure persists as
+`InvalidNull`/`NoDecision`, with bounded raw samples and deterministic reason
+codes, and cannot emit an `Allow` or `Block` claim. `cv_pct` remains provenance
+and never gates. Criterion results may coexist only under an explicitly
+different operation scope, or when they are derived from the exact same raw
+blocks; a separate Criterion measurement stream cannot be reconciled as if it
+were the paired evidence.
+
+The current v3 QG writer remains provisional until `bd-uh2f.1` integrates this
+estimator into atomic, verified evidence artifacts and the metric-specific
+throughput, hierarchical-latency, RSS, and cold-open estimands. Until then its
+legacy `paired_ab`/`paired_null` rows are diagnostics, every gate stays
+inactive, and no live performance claim is decision-grade.
 
 Every decision JSON names and SHA-256 hashes the manifest, baseline, candidate,
 and rerun. `Allow` may update the machine-class `latest.json` and write a dated

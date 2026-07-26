@@ -901,36 +901,36 @@ fn paired(
     arm_b: EngineArm,
     runs: usize,
 ) -> PairedSamples {
-    let mut samples_a = Vec::with_capacity(runs);
-    let mut samples_b = Vec::with_capacity(runs);
+    let mut reference_samples = Vec::with_capacity(runs);
+    let mut comparison_samples = Vec::with_capacity(runs);
     let mut ratios = Vec::with_capacity(runs);
     let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
     for round in 0..runs {
-        let (sample_a, sample_b) = if round % 2 == 0 {
+        let (measured_a, measured_b) = if round % 2 == 0 {
             (
                 black_box(measure_metric(context, spec, arm_a)),
                 black_box(measure_metric(context, spec, arm_b)),
             )
         } else {
-            let sample_b = black_box(measure_metric(context, spec, arm_b));
-            let sample_a = black_box(measure_metric(context, spec, arm_a));
-            (sample_a, sample_b)
+            let measured_b = black_box(measure_metric(context, spec, arm_b));
+            let measured_a = black_box(measure_metric(context, spec, arm_a));
+            (measured_a, measured_b)
         };
-        let round_ratio = black_box(ratio(sample_b, sample_a));
-        checksum ^= sample_a.to_bits().rotate_left(13);
+        let round_ratio = black_box(ratio(measured_b, measured_a));
+        checksum ^= measured_a.to_bits().rotate_left(13);
         checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-        checksum ^= sample_b.to_bits().rotate_left(31);
+        checksum ^= measured_b.to_bits().rotate_left(31);
         checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
         checksum ^= round_ratio.to_bits().rotate_left(47);
         checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-        samples_a.push(sample_a);
-        samples_b.push(sample_b);
+        reference_samples.push(measured_a);
+        comparison_samples.push(measured_b);
         ratios.push(round_ratio);
     }
     black_box(checksum);
     PairedSamples {
-        arm_a: samples_a,
-        arm_b: samples_b,
+        arm_a: reference_samples,
+        arm_b: comparison_samples,
         ratios_b_over_a: ratios,
         checksum,
     }
