@@ -1152,6 +1152,29 @@ pub struct ContractIndexingConfig {
     pub watch_mode: bool,
 }
 
+/// Contract defaults for the shadow-oracle fields.
+///
+/// These delegate to [`SearchConfig::default`] rather than repeating literals,
+/// so a v1 document that omits a shadow key and one that states the default
+/// explicitly cannot drift apart — the equality holds by construction, not by
+/// convention. `contract_shadow_defaults_match_search_config_defaults` pins it
+/// anyway so the intent survives a refactor that inlines these.
+fn default_shadow_mode() -> bool {
+    SearchConfig::default().shadow_mode
+}
+
+fn default_shadow_sample_rate_basis_points() -> u16 {
+    SearchConfig::default().shadow_sample_rate_basis_points
+}
+
+fn default_shadow_max_in_flight() -> usize {
+    SearchConfig::default().shadow_max_in_flight
+}
+
+fn default_shadow_score_epsilon() -> f32 {
+    SearchConfig::default().shadow_score_epsilon
+}
+
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractSearchConfig {
@@ -1165,9 +1188,19 @@ pub struct ContractSearchConfig {
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     pub explain: bool,
+    // The shadow-oracle keys arrived after v1 shipped. They default so that a
+    // legacy v1 document that predates them stays readable and means exactly
+    // what it meant before; they are always SERIALIZED, so the effective
+    // config still reports them. Omission is safe only because the defaults
+    // are explicit, schema-visible, and equal to `SearchConfig::default` —
+    // never widen this to a catch-all map or silent field dropping.
+    #[serde(default = "default_shadow_mode")]
     pub shadow_mode: bool,
+    #[serde(default = "default_shadow_sample_rate_basis_points")]
     pub shadow_sample_rate_basis_points: u16,
+    #[serde(default = "default_shadow_max_in_flight")]
     pub shadow_max_in_flight: usize,
+    #[serde(default = "default_shadow_score_epsilon")]
     pub shadow_score_epsilon: f32,
 }
 
@@ -1225,17 +1258,35 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 reindex_on_change: config.indexing.reindex_on_change,
                 watch_mode: config.indexing.watch_mode,
             },
-            search: ContractSearchConfig {
-                default_limit: config.search.default_limit,
-                quality_weight: config.search.quality_weight,
-                rrf_k: config.search.rrf_k,
-                quality_timeout_ms: config.search.quality_timeout_ms,
-                fast_only: config.search.fast_only,
-                explain: config.search.explain,
-                shadow_mode: config.search.shadow_mode,
-                shadow_sample_rate_basis_points: config.search.shadow_sample_rate_basis_points,
-                shadow_max_in_flight: config.search.shadow_max_in_flight,
-                shadow_score_epsilon: config.search.shadow_score_epsilon,
+            // Destructured, not field-accessed: adding a public `SearchConfig`
+            // field must fail THIS build until the contract, schema, fixtures
+            // and goldens are updated together. Field access would silently
+            // drop the new field out of the public contract instead.
+            search: {
+                let &SearchConfig {
+                    default_limit,
+                    quality_weight,
+                    rrf_k,
+                    quality_timeout_ms,
+                    fast_only,
+                    explain,
+                    shadow_mode,
+                    shadow_sample_rate_basis_points,
+                    shadow_max_in_flight,
+                    shadow_score_epsilon,
+                } = &config.search;
+                ContractSearchConfig {
+                    default_limit,
+                    quality_weight,
+                    rrf_k,
+                    quality_timeout_ms,
+                    fast_only,
+                    explain,
+                    shadow_mode,
+                    shadow_sample_rate_basis_points,
+                    shadow_max_in_flight,
+                    shadow_score_epsilon,
+                }
             },
             pressure: ContractPressureConfig {
                 profile: config.pressure.profile,
@@ -5272,6 +5323,133 @@ shadow_score_epsilon = 0.0002
                 .any(|warning| warning.reason_code == "override.rejected.locked_field")
         );
         assert!(effective.conflict_warnings.is_empty());
+    }
+
+    // ── Shadow-oracle contract fields (bd-95mp) ──
+
+    /// The contract defaults must equal `SearchConfig::default` field for
+    /// field. Backward-compatible omission of the shadow keys is only sound
+    /// because of this equality: it is what makes a legacy v1 document and an
+    /// explicit-default document mean the same thing.
+    #[test]
+    fn contract_shadow_defaults_match_search_config_defaults() {
+        use super::SearchConfig;
+
+        let search = SearchConfig::default();
+        assert_eq!(super::default_shadow_mode(), search.shadow_mode);
+        assert_eq!(
+            super::default_shadow_sample_rate_basis_points(),
+            search.shadow_sample_rate_basis_points
+        );
+        assert_eq!(
+            super::default_shadow_max_in_flight(),
+            search.shadow_max_in_flight
+        );
+        assert!(
+            (super::default_shadow_score_epsilon() - search.shadow_score_epsilon).abs()
+                < f32::EPSILON
+        );
+    }
+
+    /// A v1 document that omits the shadow keys and one that states the
+    /// defaults explicitly must deserialize to the identical value — the
+    /// backward-compatibility guarantee, asserted rather than assumed.
+    #[test]
+    fn omitted_and_explicit_default_shadow_keys_are_identical() {
+        use super::{ContractSearchConfig, SearchConfig};
+
+        let omitted = r#"{
+            "default_limit": 20, "quality_weight": 0.7, "rrf_k": 60,
+            "quality_timeout_ms": 500, "fast_only": false, "explain": false
+        }"#;
+        let explicit = r#"{
+            "default_limit": 20, "quality_weight": 0.7, "rrf_k": 60,
+            "quality_timeout_ms": 500, "fast_only": false, "explain": false,
+            "shadow_mode": false, "shadow_sample_rate_basis_points": 1000,
+            "shadow_max_in_flight": 2, "shadow_score_epsilon": 1.0e-5
+        }"#;
+
+        let from_omitted: ContractSearchConfig =
+            serde_json::from_str(omitted).expect("omitted shadow keys must deserialize");
+        let from_explicit: ContractSearchConfig =
+            serde_json::from_str(explicit).expect("explicit default shadow keys must deserialize");
+
+        assert_eq!(from_omitted, from_explicit);
+
+        let search = SearchConfig::default();
+        assert_eq!(from_omitted.shadow_mode, search.shadow_mode);
+        assert_eq!(
+            from_omitted.shadow_sample_rate_basis_points,
+            search.shadow_sample_rate_basis_points
+        );
+        assert_eq!(
+            from_omitted.shadow_max_in_flight,
+            search.shadow_max_in_flight
+        );
+    }
+
+    /// Explicit NON-default values must survive the round trip. Defaulting a
+    /// field is not evidence that it is wired up — without this, all four
+    /// fields could be ignored on the read path and every fixture would still
+    /// pass.
+    #[test]
+    fn explicit_non_default_shadow_keys_round_trip() {
+        use super::ContractSearchConfig;
+
+        let explicit = r#"{
+            "default_limit": 20, "quality_weight": 0.7, "rrf_k": 60,
+            "quality_timeout_ms": 500, "fast_only": false, "explain": false,
+            "shadow_mode": true, "shadow_sample_rate_basis_points": 2500,
+            "shadow_max_in_flight": 8, "shadow_score_epsilon": 0.0025
+        }"#;
+
+        let parsed: ContractSearchConfig =
+            serde_json::from_str(explicit).expect("explicit shadow keys must deserialize");
+        assert!(parsed.shadow_mode);
+        assert_eq!(parsed.shadow_sample_rate_basis_points, 2_500);
+        assert_eq!(parsed.shadow_max_in_flight, 8);
+        assert!((parsed.shadow_score_epsilon - 0.0025).abs() < f32::EPSILON);
+
+        let reparsed: ContractSearchConfig =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serialize contract"))
+                .expect("re-parse serialized contract");
+        assert_eq!(parsed, reparsed);
+    }
+
+    /// The shadow keys are supported, so they must round-trip through the real
+    /// loader into the effective snapshot rather than being reported as
+    /// unknown keys — the exact confusion that made the v1 fixtures wrong.
+    #[test]
+    fn shadow_keys_are_supported_not_unknown() {
+        let file = "\
+[search]\nshadow_mode = true\nshadow_sample_rate_basis_points = 2500\n\
+shadow_max_in_flight = 8\nshadow_score_epsilon = 0.0025\n";
+
+        let result = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load config");
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.reason_code == "config.unknown_key.warning"),
+            "supported shadow keys must not warn as unknown: {:?}",
+            result.warnings,
+        );
+
+        let effective = result.to_effective_snapshot_at("2026-02-14T03:30:00Z");
+        assert!(effective.values.search.shadow_mode);
+        assert_eq!(
+            effective.values.search.shadow_sample_rate_basis_points,
+            2_500
+        );
+        assert_eq!(effective.values.search.shadow_max_in_flight, 8);
     }
 
     // ── Unknown section warning ──

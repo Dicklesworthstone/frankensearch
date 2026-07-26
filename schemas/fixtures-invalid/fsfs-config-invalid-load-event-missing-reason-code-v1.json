@@ -64,9 +64,9 @@
     {
       "severity": "warn",
       "reason_code": "config.unknown_key.warning",
-      "field": "search.shadow_mode",
+      "field": "search.legacy_blend_mode",
       "source": "file",
-      "message": "Unknown key search.shadow_mode ignored"
+      "message": "Unknown key search.legacy_blend_mode ignored"
     }
   ],
   "reason_codes": [

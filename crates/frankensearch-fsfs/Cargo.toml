@@ -99,6 +99,10 @@ harness = false
 [[bench]]
 name = "code_sidecar_score"
 harness = false
+# Uses `frankensearch_core::bench_support`, so it must declare the feature that
+# provides it — otherwise `--all-targets` tries to build it with the feature off
+# and fails to resolve the import (same defect as bd-552b in quill).
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "fuse_merge_ab"

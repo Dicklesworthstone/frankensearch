@@ -193,6 +193,30 @@
             },
             "explain": {
               "type": "boolean"
+            },
+            "shadow_mode": {
+              "type": "boolean",
+              "default": false,
+              "description": "Opt in to bounded lexical shadow-oracle comparisons. Added after v1 shipped: omitting it is valid and means the default, so legacy v1 documents stay readable."
+            },
+            "shadow_sample_rate_basis_points": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000,
+              "default": 1000,
+              "description": "Deterministic shadow sample rate in basis points. Omitting it is valid and means the default."
+            },
+            "shadow_max_in_flight": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Maximum concurrently admitted shadow comparisons. Omitting it is valid and means the default."
+            },
+            "shadow_score_epsilon": {
+              "type": "number",
+              "minimum": 0,
+              "default": 1.0e-5,
+              "description": "Accepted absolute lexical score delta. Omitting it is valid and means the default."
             }
           }
         },

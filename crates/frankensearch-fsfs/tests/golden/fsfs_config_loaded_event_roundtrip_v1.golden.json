@@ -3,13 +3,42 @@
   "v": 1,
   "event": "config_loaded",
   "event_ts": "2026-02-14T03:30:10Z",
-  "source_precedence_applied": ["cli", "env", "file", "defaults"],
+  "source_precedence_applied": [
+    "cli",
+    "env",
+    "file",
+    "defaults"
+  ],
   "resolved_values": {
     "discovery": {
-      "roots": ["/home/test"],
-      "exclude_patterns": [".git", "node_modules", "target"],
+      "roots": [
+        "/home/test"
+      ],
+      "exclude_patterns": [
+        ".git",
+        "node_modules",
+        "target"
+      ],
       "text_selection_mode": "blocklist",
-      "binary_blocklist_extensions": [".exe", ".dll", ".so", ".o", ".class", ".jar", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wasm", ".pyc", ".pdb"],
+      "binary_blocklist_extensions": [
+        ".exe",
+        ".dll",
+        ".so",
+        ".o",
+        ".class",
+        ".jar",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".mp3",
+        ".mp4",
+        ".wasm",
+        ".pyc",
+        ".pdb"
+      ],
       "max_file_size_mb": 10,
       "follow_symlinks": false
     },
@@ -27,7 +56,11 @@
       "rrf_k": 60,
       "quality_timeout_ms": 500,
       "fast_only": true,
-      "explain": false
+      "explain": false,
+      "shadow_mode": true,
+      "shadow_sample_rate_basis_points": 2500,
+      "shadow_max_in_flight": 8,
+      "shadow_score_epsilon": 0.0025
     },
     "pressure": {
       "profile": "performance",
@@ -50,8 +83,13 @@
       "redact_paths_in_telemetry": true
     }
   },
-  "cli_flags_used": ["--fast-only"],
-  "env_keys_used": ["FSFS_SEARCH_FAST_ONLY", "FSFS_TUI_THEME"],
+  "cli_flags_used": [
+    "--fast-only"
+  ],
+  "env_keys_used": [
+    "FSFS_SEARCH_FAST_ONLY",
+    "FSFS_TUI_THEME"
+  ],
   "config_file_used": "/home/test/.config/fsfs/config.toml",
   "warnings": [
     {
@@ -64,9 +102,9 @@
     {
       "severity": "warn",
       "reason_code": "config.unknown_key.warning",
-      "field": "search.shadow_mode",
+      "field": "search.legacy_blend_mode",
       "source": "file",
-      "message": "Unknown key search.shadow_mode ignored"
+      "message": "Unknown key search.legacy_blend_mode ignored"
     }
   ],
   "reason_codes": [

@@ -27,7 +27,11 @@
       "rrf_k": 60,
       "quality_timeout_ms": 500,
       "fast_only": true,
-      "explain": false
+      "explain": false,
+      "shadow_mode": true,
+      "shadow_sample_rate_basis_points": 2500,
+      "shadow_max_in_flight": 8,
+      "shadow_score_epsilon": 0.0025
     },
     "pressure": {
       "profile": "performance",
@@ -64,9 +68,9 @@
     {
       "severity": "warn",
       "reason_code": "config.unknown_key.warning",
-      "field": "search.shadow_mode",
+      "field": "search.legacy_blend_mode",
       "source": "file",
-      "message": "Unknown key search.shadow_mode ignored"
+      "message": "Unknown key search.legacy_blend_mode ignored"
     }
   ],
   "reason_codes": [
