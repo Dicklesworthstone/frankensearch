@@ -245,3 +245,11 @@ inherits = "release"
 lto = "thin"
 debug = "line-tables-only"
 strip = false
+
+# Real-model E2E lanes run MiniLM/tokenizer inference inside `cargo test`; at
+# the default opt-level=0 a single corpus embedding takes minutes and the
+# resulting timings violate the "optimized inference" evidence criterion
+# (bd-tqhy). Dependencies get optimized; first-party test code stays at
+# opt-level 0 for debuggability.
+[profile.test.package."*"]
+opt-level = 2
