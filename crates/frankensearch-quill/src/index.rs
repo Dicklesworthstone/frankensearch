@@ -49,8 +49,9 @@ use crate::keeper::{
     plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
-    BooleanOperator, DefaultQueryParser, Occur, Query, QueryDiagnostic, QueryExplanation,
-    QueryParserConfigError, QueryValue, canonicalize_query, classify_query,
+    BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
+    QueryExplanation, QueryParserConfigError, QueryValue, canonicalize_query, classify_query,
+    validate_index_capabilities,
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
@@ -91,6 +92,10 @@ pub enum QuillIndexError {
     /// Parser/schema binding failed.
     #[error(transparent)]
     Parser(#[from] QueryParserConfigError),
+    /// A parsed or prebuilt operator requires an index capability the schema
+    /// does not provide.
+    #[error(transparent)]
+    QueryCapability(#[from] QueryCapabilityError),
     /// One document could not be accumulated atomically.
     #[error(transparent)]
     Accumulator(#[from] AccumulatorError),
@@ -3377,6 +3382,7 @@ impl QuillReader {
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
+        validate_query_lowering(&parsed.query, 1.0, self.schema)?;
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
         let rank_pruning = limit != 0
@@ -5301,11 +5307,6 @@ fn validate_query_lowering(
             slop,
             prefix,
         } => {
-            if *slop != 0 || *prefix {
-                return Err(QuillIndexError::UnsupportedQuery {
-                    detail: format!("phrase slop={slop} prefix={prefix}"),
-                });
-            }
             if terms.is_empty() {
                 return Err(ArgusError::InvalidPhrase {
                     reason: "an exact phrase requires positioned terms",
@@ -5313,6 +5314,10 @@ fn validate_query_lowering(
                 .into());
             }
             if terms.len() > 1 {
+                // Capability errors take precedence over operator refinements:
+                // slop and phrase-prefix queries also consume positions, so a
+                // positionless schema must receive the same typed failure.
+                validate_index_capabilities(query, schema)?;
                 if terms
                     .windows(2)
                     .any(|pair| pair[0].position > pair[1].position)
@@ -5329,19 +5334,11 @@ fn validate_query_lowering(
                     }
                     .into());
                 }
-                for field in fields {
-                    if !matches!(
-                        query_field_kind(schema, field.field_id)?,
-                        FieldKind::Text {
-                            positions: true,
-                            ..
-                        }
-                    ) {
-                        return Err(QuillIndexError::UnsupportedQuery {
-                            detail: format!("phrase names non-positioned field {}", field.field_id),
-                        });
-                    }
-                }
+            }
+            if *slop != 0 || *prefix {
+                return Err(QuillIndexError::UnsupportedQuery {
+                    detail: format!("phrase slop={slop} prefix={prefix}"),
+                });
             }
             for term in terms {
                 for field in fields {
@@ -7297,6 +7294,100 @@ mod tests {
         "\"shared left\"",
         "ord:[0 TO 39]",
     ];
+    #[cfg(feature = "bench-internals")]
+    const POSITIONLESS_QG_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+    #[cfg(feature = "bench-internals")]
+    const POSITIONLESS_QG_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "qg-positionless-typed-capability-test",
+        fields: &POSITIONLESS_QG_FIELDS,
+    };
+    #[cfg(feature = "bench-internals")]
+    const POSITIONED_QG_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+    #[cfg(feature = "bench-internals")]
+    const POSITIONED_QG_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "qg-positioned-capability-control",
+        fields: &POSITIONED_QG_FIELDS,
+    };
     const KNOWN_SECTION_KINDS: [SectionKind; 10] = [
         SectionKind::TERMDICT,
         SectionKind::POSTINGS,
@@ -12890,6 +12981,112 @@ mod tests {
                     }
                 ))
             ));
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_string_phrase_fails_with_typed_capability_before_execution() {
+        let index =
+            QuillIndex::in_memory_with_schema(POSITIONLESS_QG_SCHEMA, deterministic_config())
+                .expect("construct the QG positionless fixture");
+        let cx = Cx::for_testing();
+
+        let term_result = index
+            .search_paginated(&cx, "alpha", 10, 0, true)
+            .expect("position-independent queries remain servable");
+        assert!(term_result.hits.is_empty());
+        assert_eq!(term_result.total_count, Some(0));
+
+        let assert_positions_error = |error: &QuillIndexError| {
+            assert!(matches!(
+                error,
+                QuillIndexError::QueryCapability(QueryCapabilityError::PositionsRequired {
+                    schema: "qg-positionless-typed-capability-test",
+                    field,
+                    operator: QueryExplanation::Phrase,
+                    capability: crate::query::IndexCapability::Positions,
+                }) if field == "content"
+            ));
+        };
+        for query in ["\"alpha beta\"", "\"alpha beta\"~2"] {
+            let ranked = index
+                .search_paginated(&cx, query, 10, 0, true)
+                .expect_err("a position-dependent phrase must fail before query execution");
+            assert_positions_error(&ranked);
+            let docset = index
+                .collect_docids(&cx, query)
+                .expect_err("the scoreless path must preserve the capability error");
+            assert_positions_error(&docset);
+            let bench_ranked = index
+                .bench_search_sealed_forced(&cx, query, 10, false, None)
+                .expect_err("the QG ranked harness must reject before sealed collection");
+            assert_positions_error(&bench_ranked);
+            let bench_docset = index
+                .bench_collect_docids_forced(&cx, query, false)
+                .expect_err("the QG scoreless harness must reject before sealed collection");
+            assert_positions_error(&bench_docset);
+        }
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_queries_match_positioned_ids_order_and_scores() {
+        run_with_cx(|cx| async move {
+            let positioned =
+                QuillIndex::in_memory_with_schema(POSITIONED_QG_SCHEMA, deterministic_config())
+                    .expect("construct the positioned control");
+            let positionless =
+                QuillIndex::in_memory_with_schema(POSITIONLESS_QG_SCHEMA, deterministic_config())
+                    .expect("construct the positionless fixture");
+            let documents = fixture_documents();
+            positioned
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index positioned control documents");
+            positionless
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index positionless fixture documents");
+            positioned
+                .commit(&cx)
+                .await
+                .expect("publish positioned control");
+            positionless
+                .commit(&cx)
+                .await
+                .expect("publish positionless fixture");
+
+            for query in [
+                "rust",
+                "rust OR python",
+                "rust AND systems",
+                "title:guide",
+                "ord:[0 TO 1]",
+            ] {
+                let control = positioned
+                    .search_paginated(&cx, query, 10, 0, true)
+                    .unwrap_or_else(|error| {
+                        panic!("positioned control failed for {query:?}: {error}")
+                    });
+                let candidate = positionless
+                    .search_paginated(&cx, query, 10, 0, true)
+                    .unwrap_or_else(|error| {
+                        panic!("positionless fixture failed for {query:?}: {error}")
+                    });
+                assert_eq!(
+                    candidate, control,
+                    "positions must not affect ids, order, scores, or exact count for {query:?}"
+                );
+            }
+
+            let phrase = positioned
+                .search_paginated(&cx, "\"rust ownership\"", 10, 0, true)
+                .expect("positioned phrase behavior remains available");
+            assert!(
+                phrase.hits.iter().any(|hit| hit.document_id == "rust-1"),
+                "the positioned control must exercise a real phrase hit"
+            );
         });
     }
 

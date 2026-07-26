@@ -673,7 +673,7 @@ impl DefaultQueryParser {
     /// # Errors
     ///
     /// Returns a configuration error when either mandatory field is missing or
-    /// uses a non-default analyzer or does not store positions.
+    /// uses a non-default analyzer.
     pub fn new(schema: SchemaDescriptor) -> Result<Self, QueryParserConfigError> {
         schema
             .validate()
@@ -2655,7 +2655,7 @@ impl Grammar {
         match descriptor.kind {
             FieldKind::Text {
                 analyzer: AnalyzerKind::FrankensearchDefault,
-                positions,
+                ..
             } => {
                 let mut analyzer = FrankensearchTokenizer::default();
                 let mut terms = Vec::new();
@@ -2677,18 +2677,6 @@ impl Grammar {
                 };
                 if report.oversized_tokens != 0 {
                     return Some(Query::Empty);
-                }
-                if !positions && terms.len() > 1 {
-                    self.push_diagnostic(QueryDiagnostic {
-                        kind: QueryDiagnosticKind::UnsupportedField,
-                        message: format!(
-                            "field {} cannot execute a multi-term phrase without positions",
-                            descriptor.name
-                        ),
-                        byte_offset: Some(atom.byte_offset),
-                        fragment: None,
-                    });
-                    return None;
                 }
                 match terms.len() {
                     0 => None,
@@ -5916,7 +5904,20 @@ mod tests {
             );
         }
         assert!(typed_parser.parse("stored:[a TO b]").query.is_empty());
-        assert!(typed_parser.parse("summary:\"two words\"").query.is_empty());
+        let positionless_phrase = typed_parser.parse("summary:\"two words\"");
+        assert!(matches!(
+            positionless_phrase.query,
+            Query::Phrase { ref terms, .. } if terms.len() == 2
+        ));
+        assert!(matches!(
+            validate_index_capabilities(&positionless_phrase.query, TYPED_SCHEMA),
+            Err(QueryCapabilityError::PositionsRequired {
+                schema: "query-parser-typed-test",
+                ref field,
+                operator: QueryExplanation::Phrase,
+                capability: IndexCapability::Positions,
+            }) if field == "summary"
+        ));
         assert!(typed_parser.parse("signed:[* TO *]").query.is_empty());
 
         assert_eq!(
@@ -6169,12 +6170,8 @@ mod tests {
         }
     }
 
-    /// The capability gate rejects a phrase the *parser* cannot produce.
-    ///
-    /// Phrases reach lowering as ASTs too (`search_preparsed`-style entry
-    /// points construct `Query` directly), and that path has no parser
-    /// diagnostic in front of it, so the gate is what stands between a
-    /// positionless index and a phrase it cannot execute.
+    /// The capability gate rejects a phrase regardless of whether it came
+    /// from the string parser or an already-built AST.
     #[test]
     fn capability_gate_rejects_a_constructed_phrase_on_positionless_fields() {
         let phrase = Query::Phrase {
@@ -6218,35 +6215,28 @@ mod tests {
         assert!(validate_index_capabilities(&nested, POSITIONLESS_SCHEMA).is_err());
     }
 
-    /// PINS A KNOWN GAP, it does not bless it (`bd-vmpb`).
-    ///
-    /// On a positionless schema the parser drops a multi-term phrase branch at
-    /// `query.rs:2681` and the whole query lowers to `Empty`, so the search
-    /// returns **nothing** and the only trace is a diagnostic the caller has to
-    /// go looking for. Silently matching nothing is worse than erroring: the
-    /// bead requires a typed `PositionsRequired` naming field and operator.
-    ///
-    /// This test exists so the current behaviour cannot change unnoticed while
-    /// that half of `bd-vmpb` is outstanding. When the parser surfaces the
-    /// capability failure to callers, invert it.
     #[test]
-    fn positionless_schema_currently_drops_phrases_to_empty_with_only_a_diagnostic() {
+    fn positionless_parser_preserves_phrases_for_typed_capability_rejection() {
         let parser =
             DefaultQueryParser::new(POSITIONLESS_SCHEMA).expect("bind positionless parser");
         let parsed = parser.parse("\"alpha beta\"");
 
-        assert_eq!(
+        assert_ne!(
             parsed.query,
             Query::Empty,
-            "known gap: the phrase branch is dropped rather than reported"
+            "a capability mismatch must not silently erase the parsed branch"
         );
-        assert!(
-            parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind
-                == QueryDiagnosticKind::UnsupportedField
-                && diagnostic.message.contains("without positions")),
-            "the drop must at least be diagnosed: {:?}",
-            parsed.diagnostics
-        );
+        let error = validate_index_capabilities(&parsed.query, POSITIONLESS_SCHEMA)
+            .expect_err("the preserved phrase must fail at the typed capability boundary");
+        assert!(matches!(
+            error,
+            QueryCapabilityError::PositionsRequired {
+                schema: "query-parser-positionless-test",
+                ref field,
+                operator: QueryExplanation::Phrase,
+                capability: IndexCapability::Positions,
+            } if field == "content"
+        ));
     }
 
     #[test]
