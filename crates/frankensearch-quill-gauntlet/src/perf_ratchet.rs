@@ -750,6 +750,12 @@ fn compare_reproduction(
             "candidate and rerun must come from the same git revision",
         );
     }
+    if candidate.bench_elf_sha256 != rerun.bench_elf_sha256 {
+        state.quarantine(
+            "perf.ratchet.rerun_elf_mismatch",
+            "candidate and rerun must self-report the same benchmark ELF SHA-256",
+        );
+    }
     if candidate.run_window != rerun.run_window {
         state.quarantine(
             "perf.ratchet.rerun_window_mismatch",
@@ -1371,6 +1377,29 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.code == "perf.ratchet.reproduction_failed")
+        );
+    }
+
+    #[test]
+    fn rerun_from_a_different_elf_is_quarantined() {
+        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let candidate = qg2_artifact("new", 161.0, 100.0);
+        let mut rerun = candidate.clone();
+        rerun.run_id = "rerun".to_owned();
+        rerun.bench_elf_sha256 = "d".repeat(64);
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.rerun_elf_mismatch")
         );
     }
 
