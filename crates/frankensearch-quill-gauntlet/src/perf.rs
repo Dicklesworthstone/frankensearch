@@ -981,13 +981,19 @@ impl PairedExperimentResult {
 }
 
 #[derive(Debug)]
-pub(crate) struct ValidatedPair {
-    pub(crate) block_id: u64,
-    pub(crate) group_id: Option<u64>,
-    pub(crate) control_value: f64,
-    pub(crate) treatment_value: f64,
-    pub(crate) log_ratio: f64,
-    pub(crate) control_first: bool,
+pub struct ValidatedPair {
+    // Bridge: read by `perf_evidence::estimate_hierarchical_latency`, whose
+    // `lib.rs` module declaration lands with the in-flight V3 export tranche.
+    // These allows keep the committed base warning-free until that export
+    // exists and are removed by the bd-uh2f.1 bench-wiring commit.
+    #[allow(dead_code)]
+    pub block_id: u64,
+    #[allow(dead_code)]
+    pub group_id: Option<u64>,
+    pub control_value: f64,
+    pub treatment_value: f64,
+    pub log_ratio: f64,
+    pub control_first: bool,
 }
 
 type PairedStream = (
@@ -1008,7 +1014,7 @@ type PairedBlocks = (
 ///
 /// Enforces every per-sample and per-block law except the stream-level
 /// minimum pair count, which each caller owns.
-pub(crate) fn validate_paired_blocks(
+pub fn validate_paired_blocks(
     samples: &[PerfRawSample],
     config: &PairedEstimatorConfig,
 ) -> Result<PairedBlocks, PairedEstimatorError> {
@@ -1615,14 +1621,14 @@ fn bootstrap_median_ci95(samples: &[f64]) -> (f64, f64) {
     (percentile(&medians, 0.025), percentile(&medians, 0.975))
 }
 
-pub(crate) const fn splitmix64(mut value: u64) -> u64 {
+pub const fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
 
-pub(crate) fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+pub fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     let scaled = (sorted.len() - 1) as f64 * quantile;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1630,7 +1636,7 @@ pub(crate) fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     sorted[index]
 }
 
-pub(crate) fn median_sorted(sorted: &[f64]) -> f64 {
+pub fn median_sorted(sorted: &[f64]) -> f64 {
     debug_assert!(!sorted.is_empty());
     let midpoint = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
