@@ -14,6 +14,7 @@ mod comparator;
 mod engine;
 mod generator;
 mod perf;
+mod perf_evidence;
 mod perf_ratchet;
 mod runner;
 mod version_contract;
@@ -69,6 +70,17 @@ pub use perf::{
     PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode, estimate_paired_experiment,
     machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
+};
+pub use perf_evidence::{
+    AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
+    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EvidenceArtifactError,
+    EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
+    EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
+    EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION,
+    HierarchicalGroupSummary, HierarchicalLatencyEstimate, MachineIdentity,
+    PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence, PerfEvidenceArtifact,
+    estimate_hierarchical_latency, human_table_from_json, load_legacy_gate_artifact_v3,
+    required_estimand,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
