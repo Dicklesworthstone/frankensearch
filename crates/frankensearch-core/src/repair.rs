@@ -154,6 +154,16 @@ pub enum DegradedReason {
         /// Details of the activation failure.
         detail: String,
     },
+    /// The semantic lane returned zero signal for a state-scoped reason.
+    ///
+    /// Carries the typed classification so recovery planning can distinguish
+    /// benign emptiness (e.g. newly created) from availability failures
+    /// (no usable vectors, ANN anomaly). See
+    /// [`crate::config::ZeroSignalReason`].
+    SemanticZeroSignal {
+        /// Typed zero-signal classification.
+        reason: crate::config::ZeroSignalReason,
+    },
 }
 
 /// Current service state of the repair orchestrator.
@@ -661,12 +671,7 @@ mod tests {
         let mut embedders = BTreeMap::new();
         embedders.insert(
             "fast".into(),
-            EmbedderRevision {
-                model_name: "potion-128M".into(),
-                weights_hash: "abcdef1234567890".into(),
-                dimension: 256,
-                quantization: QuantizationFormat::F16,
-            },
+            EmbedderRevision::explicit_test_model("potion-128M", 256),
         );
         let mut manifest = GenerationManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -1162,6 +1167,9 @@ mod tests {
             DegradedReason::ActivationFailure {
                 detail: "hash mismatch".into(),
             },
+            DegradedReason::SemanticZeroSignal {
+                reason: crate::config::ZeroSignalReason::NoUsableVectors,
+            },
         ];
         for reason in &reasons {
             let json = serde_json::to_string(reason).expect("serialize");
@@ -1384,13 +1392,13 @@ mod tests {
         orch.report_corruption(corruption_event("a.fsvi", 1000));
         orch.report_corruption(corruption_event("b.fsvi", 1001));
 
-        if let ServiceState::Suspended { reason, .. } = orch.state() {
+        let state = orch.state();
+        assert!(matches!(&state, ServiceState::Suspended { .. }));
+        if let ServiceState::Suspended { reason, .. } = state {
             assert!(
                 reason.contains('2'),
                 "suspension reason should contain threshold: {reason}"
             );
-        } else {
-            panic!("expected Suspended state");
         }
     }
 

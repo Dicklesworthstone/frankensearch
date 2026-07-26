@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::{
+    EMBEDDING_INPUT_CONTRACT_SCHEMA_V1, EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
+    EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
+    EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingSpaceIdentityV1,
+    EmbeddingSpaceKindV1, GoldenVectorCertificateV1, QuantizationFormat,
+    VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
+};
 
 /// Environment variable for explicit model-download consent.
 pub const DOWNLOAD_CONSENT_ENV: &str = "FRANKENSEARCH_ALLOW_DOWNLOAD";
@@ -43,6 +50,1131 @@ pub enum ModelTier {
     Quality,
     /// Cross-encoder reranker, applied to top-K results.
     Reranker,
+}
+
+/// Schema for the frozen artifact-plus-execution manifest.
+pub const MODEL_ARTIFACT_MANIFEST_SCHEMA_V1: u16 = 1;
+
+const MAX_FROZEN_MANIFEST_FIELD_BYTES: usize = 4_096;
+
+/// Ordered synthetic corpus used by every registered embedding producer's
+/// bit-exact conformance certificate.
+///
+/// These bounded strings contain no user data. Ordering and bytes are part of
+/// the certificate contract.
+pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
+    "hello world",
+    "semantic search finds related ideas",
+    "identifier fsvi_v2",
+    "naive cafe Tokyo",
+];
+
+/// Pinned adapter-level token budget passed to `FastEmbed` 5.17.2.
+#[cfg(feature = "fastembed")]
+pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
+/// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
+pub(crate) const FASTEMBED_SEQUENCE_POLICY_V1: &str =
+    "max-length=512;longest-first;batch-longest-padding";
+/// Exact `FastEmbed` plus adapter-level output normalization pipeline.
+pub(crate) const FASTEMBED_OUTPUT_NORMALIZATION_V1: &str =
+    "fastembed-l2-eps-1e-12-then-l2-f32-zero-on-degenerate-v1";
+/// Exact native `Model2Vec` input preparation and empty/OOV behavior.
+pub(crate) const MODEL2VEC_PREPROCESSING_V1: &str =
+    "encode-special-tokens=false;discard-oov=true;empty-or-all-oov=zero-vector";
+/// Exact sequence behavior of the frozen Potion tokenizer.
+pub(crate) const MODEL2VEC_SEQUENCE_POLICY_V1: &str = "tokenizer-configured;no-padding";
+/// Exact native `Model2Vec` pooling rule.
+pub(crate) const MODEL2VEC_POOLING_V1: &str = "mean-in-vocabulary-token-rows-v1";
+/// Exact native `Model2Vec` output normalization rule.
+pub(crate) const MODEL2VEC_OUTPUT_NORMALIZATION_V1: &str = "l2-f32-zero-on-degenerate-v1";
+
+/// Semantic role of one artifact in a frozen model bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelArtifactRoleV1 {
+    /// Learned weights or static embedding table.
+    Weights,
+    /// Tokenizer implementation/configuration.
+    Tokenizer,
+    /// Standalone vocabulary.
+    Vocabulary,
+    /// Model architecture/configuration.
+    ModelConfig,
+    /// Special-token mapping.
+    SpecialTokens,
+    /// Tokenizer runtime configuration.
+    TokenizerConfig,
+    /// Projection/MRL matrix or descriptor.
+    Projection,
+}
+
+impl ModelArtifactRoleV1 {
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Weights => "weights",
+            Self::Tokenizer => "tokenizer",
+            Self::Vocabulary => "vocabulary",
+            Self::ModelConfig => "model_config",
+            Self::SpecialTokens => "special_tokens",
+            Self::TokenizerConfig => "tokenizer_config",
+            Self::Projection => "projection",
+        }
+    }
+}
+
+/// One role-tagged immutable artifact in a frozen model manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelArtifactFileV1 {
+    /// Semantic role. Roles are unique within a manifest.
+    pub role: ModelArtifactRoleV1,
+    /// Safe relative path inside the model directory.
+    pub relative_path: String,
+    /// Immutable upstream URL. Never emitted in structured runtime logs.
+    pub upstream_url: String,
+    /// Exact byte size.
+    pub size: u64,
+    /// Exact lowercase SHA-256.
+    pub sha256: String,
+}
+
+/// Execution semantics that turn verified artifacts into one mathematical space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelExecutionContractV1 {
+    /// Native/provider backend family.
+    pub backend: String,
+    /// Immutable implementation revision.
+    pub implementation_revision: String,
+    /// Inference or wire protocol revision.
+    pub protocol_revision: String,
+    /// Numeric execution profile.
+    pub numeric_profile: String,
+    /// Weights/container format.
+    pub weights_format: String,
+    /// Tokenizer implementation identity.
+    pub tokenizer_family: String,
+    /// Model-internal preprocessing.
+    pub model_preprocessing: String,
+    /// Sequence length, truncation, and padding.
+    pub sequence_policy: String,
+    /// Pooling rule.
+    pub pooling: String,
+    /// Output normalization.
+    pub output_normalization: String,
+    /// Query instruction.
+    pub query_instruction: String,
+    /// Document instruction.
+    pub document_instruction: String,
+    /// Outer content-selection/canonicalization contract.
+    pub input_contract: EmbeddingInputContractV1,
+    /// Pinned implementation conformance certificate.
+    pub golden_vectors: GoldenVectorCertificateV1,
+}
+
+/// Complete frozen model artifact manifest shared by local/native backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelArtifactManifestV1 {
+    /// Schema version; unknown versions fail closed.
+    pub schema_version: u16,
+    /// Stable artifact provider.
+    pub provider: String,
+    /// Semantic model identifier.
+    pub logical_model_id: String,
+    /// Immutable upstream model revision.
+    pub upstream_revision: String,
+    /// Immutable upstream repository identity.
+    pub upstream_repository: String,
+    /// Unique role-tagged artifacts.
+    pub artifacts: Vec<ModelArtifactFileV1>,
+    /// SPDX license identifier.
+    pub license_spdx: String,
+    /// Digest of the canonical pinned license metadata assertion.
+    pub license_metadata_sha256: String,
+    /// Output dimension.
+    pub dimension: u32,
+    /// Complete execution semantics.
+    pub execution: ModelExecutionContractV1,
+}
+
+/// Canonical bytes and digest proven to correspond to a validated manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenModelArtifactManifestV1 {
+    /// Validated structured manifest.
+    pub manifest: ModelArtifactManifestV1,
+    /// Domain-separated canonical bytes.
+    pub canonical_bytes: Vec<u8>,
+    /// SHA-256 of `canonical_bytes`.
+    pub fingerprint: String,
+}
+
+/// Proof that every file in a frozen manifest was verified in one directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedModelArtifactsV1 {
+    frozen: FrozenModelArtifactManifestV1,
+}
+
+impl VerifiedModelArtifactsV1 {
+    /// Validated frozen manifest.
+    #[must_use]
+    pub const fn frozen(&self) -> &FrozenModelArtifactManifestV1 {
+        &self.frozen
+    }
+
+    /// Derive the complete runtime identity from verified artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if any cross-contract fingerprint is inconsistent.
+    pub fn identity_bundle(
+        &self,
+        quantization: QuantizationFormat,
+        storage_format: &str,
+    ) -> SearchResult<EmbeddingIdentityBundleV1> {
+        self.frozen
+            .manifest
+            .identity_bundle(quantization, storage_format)
+    }
+}
+
+impl ModelArtifactManifestV1 {
+    /// Frozen native `Model2Vec` contract for the built-in potion fast tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the built-in pinned download manifest drifts
+    /// from the registered execution contract.
+    pub fn potion_128m_native() -> SearchResult<Self> {
+        let execution = ModelExecutionContractV1 {
+            backend: "model2vec-native".to_owned(),
+            implementation_revision: format!(
+                "frankensearch-embed-{}+model2vec-native-v1",
+                env!("CARGO_PKG_VERSION")
+            ),
+            protocol_revision: "tokenizers-0.23.1+safetensors-0.7.0-static-table-v1".to_owned(),
+            numeric_profile: "f32-row-gather-mean-l2-v1".to_owned(),
+            weights_format: "safetensors-f32-matrix-v1".to_owned(),
+            tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
+            model_preprocessing: MODEL2VEC_PREPROCESSING_V1.to_owned(),
+            sequence_policy: MODEL2VEC_SEQUENCE_POLICY_V1.to_owned(),
+            pooling: MODEL2VEC_POOLING_V1.to_owned(),
+            output_normalization: MODEL2VEC_OUTPUT_NORMALIZATION_V1.to_owned(),
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+            input_contract: default_plain_text_input_contract(),
+            golden_vectors: GoldenVectorCertificateV1 {
+                corpus_sha256: conformance_corpus_fingerprint()?,
+                vectors_sha256: "f7dabe71dbb62abf9271f9568d799accb558b982521d3a48337c6a760d7e6c74"
+                    .to_owned(),
+                vector_count: 4,
+                dimension: 256,
+            },
+        };
+        Self::from_download_manifest(
+            &ModelManifest::potion_128m(),
+            "minishlab-huggingface",
+            execution,
+        )
+    }
+
+    /// Frozen FastEmbed/ONNX contract for the built-in `MiniLM` quality tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the built-in pinned download manifest drifts
+    /// from the registered execution contract.
+    pub fn minilm_fastembed() -> SearchResult<Self> {
+        let execution = ModelExecutionContractV1 {
+            backend: "fastembed-onnx".to_owned(),
+            implementation_revision: format!(
+                "frankensearch-embed-{}+fastembed-5.17.2",
+                env!("CARGO_PKG_VERSION")
+            ),
+            protocol_revision: "fastembed-5.17.2+ort-2.0.0-rc.12-user-defined-onnx-v1".to_owned(),
+            numeric_profile: "onnxruntime-2.0.0-rc.12-cpu-f32-host-default-intra-threads-v1"
+                .to_owned(),
+            weights_format: "onnx-opset-pinned-v1".to_owned(),
+            tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
+            model_preprocessing: "bert-tokenizer-special-tokens=true;empty-input=zero-vector"
+                .to_owned(),
+            sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+            pooling: "attention-mask-mean-pool-v1".to_owned(),
+            output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+            input_contract: default_plain_text_input_contract(),
+            golden_vectors: GoldenVectorCertificateV1 {
+                corpus_sha256: conformance_corpus_fingerprint()?,
+                vectors_sha256: "11620592994a30c5df2ec108983c8a5ce304760f78666c42f56db285a7f3d948"
+                    .to_owned(),
+                vector_count: 4,
+                dimension: 384,
+            },
+        };
+        Self::from_download_manifest(
+            &ModelManifest::minilm_v2(),
+            "sentence-transformers-huggingface",
+            execution,
+        )
+    }
+
+    /// Frozen pure-Rust frankentorch/safetensors contract for `MiniLM`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the immutable upstream artifact metadata or
+    /// native execution contract is incomplete.
+    pub fn minilm_native_frankentorch() -> SearchResult<Self> {
+        let mut download_manifest = ModelManifest::minilm_v2();
+        let weights = download_manifest
+            .files
+            .iter_mut()
+            .find(|file| file.name == "onnx/model.onnx")
+            .ok_or_else(|| {
+                invalid_manifest_field(
+                    "artifacts[].role",
+                    "weights",
+                    "MiniLM download manifest is missing its registered weights artifact",
+                )
+            })?;
+        "model.safetensors".clone_into(&mut weights.name);
+        weights.url = Some(
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/model.safetensors"
+                .to_owned(),
+        );
+        "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+            .clone_into(&mut weights.sha256);
+        weights.size = 90_868_376;
+        download_manifest.download_size_bytes =
+            download_manifest.files.iter().map(|file| file.size).sum();
+        let execution = ModelExecutionContractV1 {
+            backend: "frankentorch-native-minilm".to_owned(),
+            implementation_revision:
+                "frankensearch-rerank-native-embedder-v1+frankentorch-c305306b251753099620ad5fe02e78c07c167cf6"
+                    .to_owned(),
+            protocol_revision:
+                "tokenizers-0.23.1+frankentorch-bert-encoder-v1".to_owned(),
+            numeric_profile: "f32-weights-int8-linear-f32-accumulate-v2".to_owned(),
+            weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
+            tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
+            model_preprocessing: "bert-special-tokens=true;token-type-ids=zero".to_owned(),
+            sequence_policy: "max-length=512;longest-first;no-padding".to_owned(),
+            pooling: "mean-all-returned-tokens-including-specials-no-padding-v1".to_owned(),
+            output_normalization: "l2-f32-if-norm-gt-zero-else-unchanged-v1".to_owned(),
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+            input_contract: default_plain_text_input_contract(),
+            golden_vectors: GoldenVectorCertificateV1 {
+                corpus_sha256: conformance_corpus_fingerprint()?,
+                vectors_sha256: "bed15455ed5910d6ebcf39b28a22e321d83a904f99c53e79724995b662e67c26"
+                    .to_owned(),
+                vector_count: 4,
+                dimension: 384,
+            },
+        };
+        Self::from_download_manifest(
+            &download_manifest,
+            "sentence-transformers-huggingface",
+            execution,
+        )
+    }
+
+    /// Frozen `FastEmbed` contract for Snowflake Arctic Embed S.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the pinned manifest or contract is incomplete.
+    pub fn snowflake_fastembed() -> SearchResult<Self> {
+        let execution = fastembed_execution_contract(
+            384,
+            "snowflake-arctic-embed-s",
+            "fb999e00707c8f3709844de704529c29c1f87b540311c05ee211aa93d0dad3a6",
+        )?;
+        Self::from_download_manifest(
+            &ModelManifest::snowflake_arctic_s(),
+            "snowflake-huggingface",
+            execution,
+        )
+    }
+
+    /// Frozen `FastEmbed` contract for Nomic Embed Text v1.5.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the pinned manifest or contract is incomplete.
+    pub fn nomic_fastembed() -> SearchResult<Self> {
+        let execution = fastembed_execution_contract(
+            768,
+            "nomic-embed-text-v1.5",
+            "dbb7e33fdb5ccb4864faf9ff425b35a83a2d9dcd4f8d736033d7f819e0c1e851",
+        )?;
+        Self::from_download_manifest(
+            &ModelManifest::nomic_embed(),
+            "nomic-ai-huggingface",
+            execution,
+        )
+    }
+
+    /// Convert the existing pinned download manifest plus explicit execution
+    /// semantics into the frozen identity contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` for unknown/duplicate roles or incomplete metadata.
+    pub fn from_download_manifest(
+        manifest: &ModelManifest,
+        provider: &str,
+        execution: ModelExecutionContractV1,
+    ) -> SearchResult<Self> {
+        manifest.validate()?;
+        if !manifest.is_production_ready() {
+            return Err(invalid_manifest_field(
+                "production_ready",
+                &manifest.id,
+                "frozen manifests require pinned revision, size, and SHA-256 for every artifact",
+            ));
+        }
+        let dimension = manifest.dimension.ok_or_else(|| {
+            invalid_manifest_field(
+                "dimension",
+                &manifest.id,
+                "embedding manifests require a fixed output dimension",
+            )
+        })?;
+        let artifacts = manifest
+            .files
+            .iter()
+            .map(|file| {
+                Ok(ModelArtifactFileV1 {
+                    role: artifact_role_for_path(&file.name)?,
+                    relative_path: file.name.clone(),
+                    upstream_url: manifest.download_url(file),
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                })
+            })
+            .collect::<SearchResult<Vec<_>>>()?;
+        let license_metadata_sha256 = license_metadata_fingerprint(
+            &manifest.license,
+            provider,
+            &manifest.repo,
+            &manifest.revision,
+        );
+        let frozen = Self {
+            schema_version: MODEL_ARTIFACT_MANIFEST_SCHEMA_V1,
+            provider: provider.to_owned(),
+            logical_model_id: manifest.id.clone(),
+            upstream_revision: manifest.revision.clone(),
+            upstream_repository: manifest.repo.clone(),
+            artifacts,
+            license_spdx: manifest.license.clone(),
+            license_metadata_sha256,
+            dimension,
+            execution,
+        };
+        frozen.validate()?;
+        Ok(frozen)
+    }
+
+    /// Validate schema, role uniqueness, hashes, sizes, license, and execution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` for any incomplete or ambiguous contract.
+    pub fn validate(&self) -> SearchResult<()> {
+        if self.schema_version != MODEL_ARTIFACT_MANIFEST_SCHEMA_V1 {
+            return Err(invalid_manifest_field(
+                "artifact_manifest.schema_version",
+                &self.schema_version.to_string(),
+                "unsupported frozen artifact manifest schema",
+            ));
+        }
+        for (field, value) in [
+            ("provider", self.provider.as_str()),
+            ("logical_model_id", self.logical_model_id.as_str()),
+            ("upstream_repository", self.upstream_repository.as_str()),
+            ("license_spdx", self.license_spdx.as_str()),
+            ("execution.backend", self.execution.backend.as_str()),
+            (
+                "execution.implementation_revision",
+                self.execution.implementation_revision.as_str(),
+            ),
+            (
+                "execution.protocol_revision",
+                self.execution.protocol_revision.as_str(),
+            ),
+            (
+                "execution.numeric_profile",
+                self.execution.numeric_profile.as_str(),
+            ),
+            (
+                "execution.weights_format",
+                self.execution.weights_format.as_str(),
+            ),
+            (
+                "execution.tokenizer_family",
+                self.execution.tokenizer_family.as_str(),
+            ),
+            (
+                "execution.model_preprocessing",
+                self.execution.model_preprocessing.as_str(),
+            ),
+            (
+                "execution.sequence_policy",
+                self.execution.sequence_policy.as_str(),
+            ),
+            ("execution.pooling", self.execution.pooling.as_str()),
+            (
+                "execution.output_normalization",
+                self.execution.output_normalization.as_str(),
+            ),
+        ] {
+            validate_frozen_manifest_text(field, value, false)?;
+        }
+        for (field, value) in [
+            (
+                "execution.query_instruction",
+                self.execution.query_instruction.as_str(),
+            ),
+            (
+                "execution.document_instruction",
+                self.execution.document_instruction.as_str(),
+            ),
+        ] {
+            validate_frozen_manifest_text(field, value, true)?;
+        }
+        if !matches!(self.upstream_revision.len(), 40 | 64)
+            || !self
+                .upstream_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_manifest_field(
+                "upstream_revision",
+                &self.upstream_revision,
+                "must be a complete lowercase 40- or 64-character immutable commit digest",
+            ));
+        }
+        if self.dimension == 0 {
+            return Err(invalid_manifest_field(
+                "dimension",
+                "0",
+                "must be greater than zero",
+            ));
+        }
+        validate_frozen_sha256("license_metadata_sha256", &self.license_metadata_sha256)?;
+        let expected_license_metadata = license_metadata_fingerprint(
+            &self.license_spdx,
+            &self.provider,
+            &self.upstream_repository,
+            &self.upstream_revision,
+        );
+        if self.license_metadata_sha256 != expected_license_metadata {
+            return Err(invalid_manifest_field(
+                "license_metadata_sha256",
+                &self.license_metadata_sha256,
+                "must bind the canonical SPDX, provider, repository, and immutable revision assertion",
+            ));
+        }
+        self.execution.input_contract.validate()?;
+        self.execution.golden_vectors.validate().map_err(|error| {
+            invalid_manifest_field(
+                "execution.golden_vectors",
+                &self.logical_model_id,
+                &error.to_string(),
+            )
+        })?;
+        if self.execution.golden_vectors.dimension != self.dimension {
+            return Err(invalid_manifest_field(
+                "execution.golden_vectors.dimension",
+                &self.execution.golden_vectors.dimension.to_string(),
+                "must equal manifest dimension",
+            ));
+        }
+
+        let mut roles = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        for artifact in &self.artifacts {
+            validate_frozen_manifest_text(
+                "artifacts[].relative_path",
+                &artifact.relative_path,
+                false,
+            )?;
+            validate_model_file_name(&artifact.relative_path)?;
+            validate_frozen_sha256("artifacts[].sha256", &artifact.sha256)?;
+            if artifact.size == 0 {
+                return Err(invalid_manifest_field(
+                    "artifacts[].size",
+                    "0",
+                    "must be greater than zero",
+                ));
+            }
+            validate_frozen_manifest_text(
+                "artifacts[].upstream_url",
+                &artifact.upstream_url,
+                false,
+            )?;
+            if !artifact.upstream_url.starts_with("https://")
+                || artifact
+                    .upstream_url
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace())
+                || artifact.upstream_url.contains('@')
+                || artifact.upstream_url.contains('?')
+                || artifact.upstream_url.contains('#')
+            {
+                return Err(invalid_manifest_field(
+                    "artifacts[].upstream_url",
+                    "redacted",
+                    "must be credential-free HTTPS without userinfo, query, or fragment",
+                ));
+            }
+            if !roles.insert(artifact.role) {
+                return Err(invalid_manifest_field(
+                    "artifacts[].role",
+                    artifact.role.tag(),
+                    "duplicate semantic artifact role",
+                ));
+            }
+            if !paths.insert(artifact.relative_path.as_str()) {
+                return Err(invalid_manifest_field(
+                    "artifacts[].relative_path",
+                    &artifact.relative_path,
+                    "duplicate artifact path",
+                ));
+            }
+        }
+        if !roles.contains(&ModelArtifactRoleV1::Weights)
+            || !roles.contains(&ModelArtifactRoleV1::Tokenizer)
+        {
+            return Err(invalid_manifest_field(
+                "artifacts",
+                &self.logical_model_id,
+                "embedding manifests require unique weights and tokenizer roles",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Domain-separated canonical bytes. Artifact order is canonicalized by the
+    /// frozen serialized role tag rather than enum declaration order.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_frozen_bytes(&mut bytes, b"frankensearch.model-artifact-manifest.v1");
+        bytes.extend_from_slice(&self.schema_version.to_be_bytes());
+        for value in [
+            &self.provider,
+            &self.logical_model_id,
+            &self.upstream_revision,
+            &self.upstream_repository,
+            &self.license_spdx,
+            &self.license_metadata_sha256,
+        ] {
+            append_frozen_bytes(&mut bytes, value.as_bytes());
+        }
+        bytes.extend_from_slice(&self.dimension.to_be_bytes());
+        let mut artifacts = self.artifacts.iter().collect::<Vec<_>>();
+        artifacts.sort_by_key(|artifact| artifact.role.tag());
+        append_frozen_len(&mut bytes, artifacts.len());
+        for artifact in artifacts {
+            append_frozen_bytes(&mut bytes, artifact.role.tag().as_bytes());
+            append_frozen_bytes(&mut bytes, artifact.relative_path.as_bytes());
+            append_frozen_bytes(&mut bytes, artifact.upstream_url.as_bytes());
+            bytes.extend_from_slice(&artifact.size.to_be_bytes());
+            append_frozen_bytes(&mut bytes, artifact.sha256.as_bytes());
+        }
+        for value in [
+            &self.execution.backend,
+            &self.execution.implementation_revision,
+            &self.execution.protocol_revision,
+            &self.execution.numeric_profile,
+            &self.execution.weights_format,
+            &self.execution.tokenizer_family,
+            &self.execution.model_preprocessing,
+            &self.execution.sequence_policy,
+            &self.execution.query_instruction,
+            &self.execution.document_instruction,
+            &self.execution.pooling,
+            &self.execution.output_normalization,
+        ] {
+            append_frozen_bytes(&mut bytes, value.as_bytes());
+        }
+        append_frozen_bytes(&mut bytes, &self.execution.input_contract.canonical_bytes());
+        append_frozen_bytes(
+            &mut bytes,
+            self.execution.golden_vectors.corpus_sha256.as_bytes(),
+        );
+        append_frozen_bytes(
+            &mut bytes,
+            self.execution.golden_vectors.vectors_sha256.as_bytes(),
+        );
+        bytes.extend_from_slice(&self.execution.golden_vectors.vector_count.to_be_bytes());
+        bytes.extend_from_slice(&self.execution.golden_vectors.dimension.to_be_bytes());
+        bytes
+    }
+
+    /// Fingerprint only the fields that define the mathematical embedding
+    /// space, excluding producer/backend and distribution metadata.
+    ///
+    /// This deliberately omits provider, repository URL, license, backend,
+    /// implementation/protocol revision, numeric execution profile, and golden
+    /// certificate. Those remain covered by the full frozen manifest and the
+    /// separately bound producer attestation. Consequently, two conformant
+    /// implementations over the same artifacts and model semantics may share a
+    /// space identity without pretending to be the same producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the complete manifest is invalid.
+    pub fn space_contract_fingerprint(&self) -> SearchResult<String> {
+        self.validate()?;
+        Ok(sha256_hex_bytes(&self.space_contract_canonical_bytes()))
+    }
+
+    fn space_contract_canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_frozen_bytes(
+            &mut bytes,
+            b"frankensearch.model-artifact-space-contract.v1",
+        );
+        bytes.extend_from_slice(&self.schema_version.to_be_bytes());
+        append_frozen_bytes(&mut bytes, self.logical_model_id.as_bytes());
+        append_frozen_bytes(&mut bytes, self.upstream_revision.as_bytes());
+        bytes.extend_from_slice(&self.dimension.to_be_bytes());
+
+        let mut artifacts = self.artifacts.iter().collect::<Vec<_>>();
+        artifacts.sort_by_key(|artifact| artifact.role.tag());
+        append_frozen_len(&mut bytes, artifacts.len());
+        for artifact in artifacts {
+            append_frozen_bytes(&mut bytes, artifact.role.tag().as_bytes());
+            bytes.extend_from_slice(&artifact.size.to_be_bytes());
+            append_frozen_bytes(&mut bytes, artifact.sha256.as_bytes());
+        }
+
+        for value in [
+            &self.execution.weights_format,
+            &self.execution.tokenizer_family,
+            &self.execution.model_preprocessing,
+            &self.execution.sequence_policy,
+            &self.execution.query_instruction,
+            &self.execution.document_instruction,
+            &self.execution.pooling,
+            &self.execution.output_normalization,
+        ] {
+            append_frozen_bytes(&mut bytes, value.as_bytes());
+        }
+        append_frozen_bytes(&mut bytes, &self.execution.input_contract.canonical_bytes());
+        bytes
+    }
+
+    /// Validate and freeze exact canonical bytes plus their fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the manifest is incomplete.
+    pub fn freeze(&self) -> SearchResult<FrozenModelArtifactManifestV1> {
+        self.validate()?;
+        let canonical_bytes = self.canonical_bytes();
+        Ok(FrozenModelArtifactManifestV1 {
+            manifest: self.clone(),
+            fingerprint: sha256_hex_bytes(&canonical_bytes),
+            canonical_bytes,
+        })
+    }
+
+    /// Verify all registered files and reject partial layouts or unregistered
+    /// files that collide with a registered semantic artifact role. Unrelated
+    /// cache metadata such as notices may coexist with the artifact set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed search error on missing, unexpected, size-drifted, or
+    /// hash-drifted artifacts.
+    pub fn verify_dir(&self, model_dir: &Path) -> SearchResult<VerifiedModelArtifactsV1> {
+        let frozen = self.freeze()?;
+        let mut failures = Vec::new();
+        for artifact in &self.artifacts {
+            let path = resolve_model_file_path(model_dir, &artifact.relative_path)?;
+            match verify_file_sha256(&path, &artifact.sha256, artifact.size) {
+                Ok(()) => {}
+                Err(SearchError::ModelNotFound { .. }) => {
+                    failures.push((artifact, "missing"));
+                }
+                Err(SearchError::HashMismatch { .. }) => {
+                    failures.push((artifact, "sha256-or-size-mismatch"));
+                }
+                Err(SearchError::ModelLoadFailed { .. } | SearchError::Io(_)) => {
+                    failures.push((artifact, "unreadable-or-not-regular-file"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !failures.is_empty() {
+            let mut detail = String::new();
+            for (artifact, reason) in &failures {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                let _ = write!(
+                    detail,
+                    "{}:{}:{reason}:fetch={}",
+                    artifact.role.tag(),
+                    artifact.relative_path,
+                    artifact.upstream_url
+                );
+            }
+            // ubs:ignore — reason is a public diagnostic tag, not a secret.
+            if failures.iter().all(|(_, reason)| *reason == "missing") {
+                return Err(SearchError::ModelNotFound {
+                    name: format!(
+                        "{} (incomplete frozen artifact set: {detail})",
+                        self.logical_model_id
+                    ),
+                });
+            }
+            return Err(SearchError::ModelLoadFailed {
+                path: PathBuf::from("<redacted-model-dir>"),
+                source: format!("frozen artifact set rejected: {detail}").into(),
+            });
+        }
+        verify_no_extra_artifacts(model_dir, &self.artifacts)?;
+        Ok(VerifiedModelArtifactsV1 { frozen })
+    }
+
+    /// Derive the identity declared by this frozen manifest without claiming
+    /// that a local artifact directory has already been verified.
+    ///
+    /// This is intended for lazy embedders that must expose their immutable
+    /// expected identity before first use. They still must verify the artifact
+    /// directory and compare the loaded identity byte-for-byte before returning
+    /// any vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if the manifest or cross-contract bindings are
+    /// incomplete.
+    pub fn declared_identity_bundle(
+        &self,
+        quantization: QuantizationFormat,
+        storage_format: &str,
+    ) -> SearchResult<EmbeddingIdentityBundleV1> {
+        self.identity_bundle(quantization, storage_format)
+    }
+
+    fn identity_bundle(
+        &self,
+        quantization: QuantizationFormat,
+        storage_format: &str,
+    ) -> SearchResult<EmbeddingIdentityBundleV1> {
+        let space_contract_fingerprint = self.space_contract_fingerprint()?;
+        let provenance_manifest_fingerprint = self.freeze()?.fingerprint;
+        let input = self.execution.input_contract.clone();
+        let tokenizer_fingerprint = role_fingerprint(self, ModelArtifactRoleV1::Tokenizer)?;
+        let vocabulary_fingerprint = role_fingerprint_optional(
+            self,
+            ModelArtifactRoleV1::Vocabulary,
+            &tokenizer_fingerprint,
+        );
+        let model_config_fingerprint = role_fingerprint_optional(
+            self,
+            ModelArtifactRoleV1::ModelConfig,
+            &space_contract_fingerprint,
+        );
+        let space = EmbeddingSpaceIdentityV1 {
+            schema_version: EMBEDDING_SPACE_IDENTITY_SCHEMA_V1,
+            logical_model_id: self.logical_model_id.clone(),
+            immutable_revision: self.upstream_revision.clone(),
+            kind: EmbeddingSpaceKindV1::Semantic,
+            artifact_manifest_fingerprint: space_contract_fingerprint,
+            artifacts: self
+                .artifacts
+                .iter()
+                .map(|artifact| EmbeddingArtifactIdentityV1 {
+                    role: artifact.role.tag().to_owned(),
+                    sha256: artifact.sha256.clone(),
+                    size: artifact.size,
+                })
+                .collect(),
+            tokenizer_fingerprint,
+            vocabulary_fingerprint,
+            model_config_fingerprint,
+            model_preprocessing: self.execution.model_preprocessing.clone(),
+            sequence_policy: self.execution.sequence_policy.clone(),
+            query_instruction: self.execution.query_instruction.clone(),
+            document_instruction: self.execution.document_instruction.clone(),
+            pooling: self.execution.pooling.clone(),
+            output_normalization: self.execution.output_normalization.clone(),
+            dimension: self.dimension,
+            input_contract_fingerprint: input.fingerprint(),
+            hash_control: None,
+            projection: None,
+        };
+        let producer = EmbeddingProducerAttestationV1 {
+            schema_version: EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
+            backend: self.execution.backend.clone(),
+            implementation_revision: self.execution.implementation_revision.clone(),
+            protocol_revision: self.execution.protocol_revision.clone(),
+            numeric_profile: self.execution.numeric_profile.clone(),
+            provenance_manifest_fingerprint,
+            space_fingerprint: space.fingerprint(),
+            golden_vectors: self.execution.golden_vectors.clone(),
+        };
+        let bundle = EmbeddingIdentityBundleV1 {
+            space,
+            producer,
+            input,
+            storage: VectorStorageIdentityV1 {
+                schema_version: VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
+                format: storage_format.to_owned(),
+                quantization,
+                endianness: storage_endianness(storage_format).to_owned(),
+                vector_normalization: self.execution.output_normalization.clone(),
+                dimension: self.dimension,
+            },
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+}
+
+impl FrozenModelArtifactManifestV1 {
+    /// Recompute canonical bytes and fingerprint, rejecting any disagreement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` if structured fields, bytes, or digest disagree.
+    pub fn validate(&self) -> SearchResult<()> {
+        self.manifest.validate()?;
+        validate_frozen_sha256("fingerprint", &self.fingerprint)?;
+        let canonical = self.manifest.canonical_bytes();
+        if canonical != self.canonical_bytes {
+            return Err(invalid_manifest_field(
+                "canonical_bytes",
+                &self.manifest.logical_model_id,
+                "stored canonical bytes disagree with structured manifest",
+            ));
+        }
+        let fingerprint = sha256_hex_bytes(&canonical);
+        if fingerprint != self.fingerprint {
+            return Err(invalid_manifest_field(
+                "fingerprint",
+                &self.fingerprint,
+                "stored fingerprint disagrees with canonical bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_plain_text_input_contract() -> EmbeddingInputContractV1 {
+    EmbeddingInputContractV1 {
+        schema_version: EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+        canonicalization: "caller-utf8-as-is-v1".to_owned(),
+        content_selection: "single-caller-supplied-text-v1".to_owned(),
+        chunking: "none-at-embedder-boundary-v1".to_owned(),
+        query_instruction: String::new(),
+        document_instruction: String::new(),
+        doc_id_semantics: "vector-independent-of-document-id-v1".to_owned(),
+    }
+}
+
+fn storage_endianness(storage_format: &str) -> &'static str {
+    if storage_format.starts_with("in-memory-") {
+        "native-f32-values"
+    } else {
+        "little-endian"
+    }
+}
+
+fn fastembed_execution_contract(
+    dimension: u32,
+    model_id: &str,
+    vectors_sha256: &str,
+) -> SearchResult<ModelExecutionContractV1> {
+    Ok(ModelExecutionContractV1 {
+        backend: "fastembed-onnx".to_owned(),
+        implementation_revision: format!(
+            "frankensearch-embed-{}+fastembed-5.17.2:{model_id}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        protocol_revision: "fastembed-5.17.2+ort-2.0.0-rc.12-user-defined-onnx-v1".to_owned(),
+        numeric_profile: "onnxruntime-2.0.0-rc.12-cpu-f32-host-default-intra-threads-v1".to_owned(),
+        weights_format: "onnx-opset-pinned-v1".to_owned(),
+        tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
+        model_preprocessing: "model-tokenizer-special-tokens=true;empty-input=zero-vector"
+            .to_owned(),
+        sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+        pooling: "attention-mask-mean-pool-v1".to_owned(),
+        output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
+        query_instruction: String::new(),
+        document_instruction: String::new(),
+        input_contract: default_plain_text_input_contract(),
+        golden_vectors: GoldenVectorCertificateV1 {
+            corpus_sha256: conformance_corpus_fingerprint()?,
+            vectors_sha256: vectors_sha256.to_owned(),
+            vector_count: 4,
+            dimension,
+        },
+    })
+}
+
+fn conformance_corpus_fingerprint() -> SearchResult<String> {
+    GoldenVectorCertificateV1::corpus_fingerprint(&MODEL_CONFORMANCE_TEXTS_V1)
+}
+
+fn artifact_role_for_path(path: &str) -> SearchResult<ModelArtifactRoleV1> {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    match file_name {
+        "model.safetensors" | "model_f32.safetensors" | "model.onnx" => {
+            Ok(ModelArtifactRoleV1::Weights)
+        }
+        "tokenizer.json" => Ok(ModelArtifactRoleV1::Tokenizer),
+        "vocab.json" | "vocab.txt" => Ok(ModelArtifactRoleV1::Vocabulary),
+        "config.json" => Ok(ModelArtifactRoleV1::ModelConfig),
+        "special_tokens_map.json" => Ok(ModelArtifactRoleV1::SpecialTokens),
+        "tokenizer_config.json" => Ok(ModelArtifactRoleV1::TokenizerConfig),
+        "projection.safetensors" | "projection.bin" => Ok(ModelArtifactRoleV1::Projection),
+        _ => Err(invalid_manifest_field(
+            "artifacts[].role",
+            path,
+            "artifact path has no registered semantic role",
+        )),
+    }
+}
+
+fn validate_frozen_sha256(field: &str, value: &str) -> SearchResult<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(invalid_manifest_field(
+        field,
+        "redacted-invalid-sha256",
+        "must be lowercase 64-character SHA-256",
+    ))
+}
+
+fn validate_frozen_manifest_text(field: &str, value: &str, allow_empty: bool) -> SearchResult<()> {
+    if value.len() > MAX_FROZEN_MANIFEST_FIELD_BYTES {
+        return Err(invalid_manifest_field(
+            field,
+            "redacted-oversized",
+            "field exceeds the bounded frozen-manifest size",
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(invalid_manifest_field(
+            field,
+            "redacted-control-character",
+            "field must not contain control characters",
+        ));
+    }
+    if !allow_empty && value.trim().is_empty() {
+        return Err(invalid_manifest_field(field, value, "must not be empty"));
+    }
+    Ok(())
+}
+
+fn append_frozen_len(bytes: &mut Vec<u8>, value: usize) {
+    let value = u64::try_from(value).unwrap_or(u64::MAX);
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn append_frozen_bytes(bytes: &mut Vec<u8>, value: &[u8]) {
+    append_frozen_len(bytes, value.len());
+    bytes.extend_from_slice(value);
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    to_hex_lowercase(&digest)
+}
+
+fn license_metadata_fingerprint(
+    license_spdx: &str,
+    provider: &str,
+    repository: &str,
+    revision: &str,
+) -> String {
+    let mut bytes = Vec::new();
+    append_frozen_bytes(&mut bytes, b"frankensearch.model-license-metadata.v1");
+    for value in [license_spdx, provider, repository, revision] {
+        append_frozen_bytes(&mut bytes, value.as_bytes());
+    }
+    sha256_hex_bytes(&bytes)
+}
+
+fn role_fingerprint(
+    manifest: &ModelArtifactManifestV1,
+    role: ModelArtifactRoleV1,
+) -> SearchResult<String> {
+    manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == role)
+        .map(|artifact| artifact.sha256.clone())
+        .ok_or_else(|| {
+            invalid_manifest_field("artifacts[].role", role.tag(), "required role is absent")
+        })
+}
+
+fn role_fingerprint_optional(
+    manifest: &ModelArtifactManifestV1,
+    role: ModelArtifactRoleV1,
+    fallback: &str,
+) -> String {
+    manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == role)
+        .map_or_else(|| fallback.to_owned(), |artifact| artifact.sha256.clone())
+}
+
+fn verify_no_extra_artifacts(
+    model_dir: &Path,
+    expected: &[ModelArtifactFileV1],
+) -> SearchResult<()> {
+    let expected_paths = expected
+        .iter()
+        .map(|artifact| artifact.relative_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut pending = vec![model_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(SearchError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(SearchError::Io)?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(SearchError::Io)?;
+            let relative = path.strip_prefix(model_dir).map_err(|_| {
+                invalid_manifest_field(
+                    "model_dir",
+                    "redacted",
+                    "artifact escaped the verified model directory",
+                )
+            })?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative == ".verified" || expected_paths.contains(relative.as_str()) {
+                continue;
+            }
+            if let Ok(role) = artifact_role_for_path(&relative) {
+                return Err(invalid_manifest_field(
+                    "artifacts[].role",
+                    role.tag(),
+                    "unregistered file collides with an expected semantic role",
+                ));
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 const HASH_BUFFER_SIZE: usize = 8 * 1024;
@@ -254,7 +1386,7 @@ impl ModelManifest {
                     ),
                 },
             ],
-            license: "Apache-2.0".to_owned(),
+            license: "MIT".to_owned(),
             dimension: Some(256),
             tier: Some(ModelTier::Fast),
             download_size_bytes: 530_977_691,
@@ -371,7 +1503,8 @@ impl ModelManifest {
 
     /// Snowflake Arctic Embed S manifest.
     ///
-    /// Dimension: 384. Small, fast model with MiniLM-compatible dimension.
+    /// Dimension: 384. Small, fast model with the same width as `MiniLM` but a
+    /// distinct mathematical vector space.
     /// Verified checksums from `HuggingFace`.
     #[must_use]
     pub fn snowflake_arctic_s() -> Self {
@@ -620,10 +1753,11 @@ impl ModelManifest {
     /// Returns `SearchError::InvalidConfig` if JSON parsing or validation fails.
     pub fn from_json_str(raw: &str) -> SearchResult<Self> {
         let manifest =
-            serde_json::from_str::<Self>(raw).map_err(|source| SearchError::InvalidConfig {
+            serde_json::from_str::<Self>(raw).map_err(|_source| SearchError::InvalidConfig {
                 field: "manifest_json".to_owned(),
-                value: truncate_for_error(raw),
-                reason: format!("failed to parse manifest JSON: {source}"),
+                value: "redacted-manifest-json".to_owned(),
+                reason: "failed to parse manifest JSON; input was malformed or unsupported"
+                    .to_owned(),
             })?;
         manifest.validate()?;
         Ok(manifest)
@@ -648,16 +1782,14 @@ impl ModelManifest {
         !self.files.is_empty() && self.files.iter().all(ModelFile::has_verified_checksum)
     }
 
-    /// Returns true when revision appears pinned (not empty and not floating aliases).
+    /// Returns true only for a complete lowercase commit digest.
     #[must_use]
     pub fn has_pinned_revision(&self) -> bool {
         let revision = self.revision.trim();
-        !(revision.is_empty()
-            || revision.eq_ignore_ascii_case("main")
-            || revision.eq_ignore_ascii_case("master")
-            || revision.eq_ignore_ascii_case("latest")
-            || revision.eq_ignore_ascii_case("head")
-            || revision == PLACEHOLDER_PINNED_REVISION)
+        matches!(revision.len(), 40 | 64)
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
     /// Returns true when this manifest is ready for production-grade verification.
@@ -693,42 +1825,64 @@ impl ModelManifest {
     ///
     /// Returns `SearchError::InvalidConfig` for malformed fields.
     pub fn validate(&self) -> SearchResult<()> {
-        if self.id.trim().is_empty() {
-            return Err(invalid_manifest_field("id", &self.id, "must not be empty"));
+        for (field, value) in [
+            ("id", self.id.as_str()),
+            ("repo", self.repo.as_str()),
+            ("revision", self.revision.as_str()),
+            ("license", self.license.as_str()),
+        ] {
+            validate_frozen_manifest_text(field, value, false)?;
         }
-        if self.repo.trim().is_empty() {
-            return Err(invalid_manifest_field(
-                "repo",
-                &self.repo,
-                "must not be empty",
-            ));
+        for (field, value) in [
+            ("repo", self.repo.as_str()),
+            ("revision", self.revision.as_str()),
+        ] {
+            if value.bytes().any(|byte| byte.is_ascii_whitespace())
+                || value.contains('@')
+                || value.contains('?')
+                || value.contains('#')
+            {
+                return Err(invalid_manifest_field(
+                    field,
+                    "redacted",
+                    "download coordinates must not contain whitespace, userinfo, query, or fragment",
+                ));
+            }
         }
-        if self.revision.trim().is_empty() {
-            return Err(invalid_manifest_field(
-                "revision",
-                &self.revision,
-                "must not be empty",
-            ));
-        }
-        if self.license.trim().is_empty() {
-            return Err(invalid_manifest_field(
-                "license",
-                &self.license,
-                "must not be empty",
-            ));
+        validate_frozen_manifest_text("version", &self.version, true)?;
+        for (field, value) in [
+            ("display_name", self.display_name.as_deref()),
+            ("description", self.description.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_frozen_manifest_text(field, value, true)?;
+            }
         }
 
         for file in &self.files {
             validate_model_file_name(&file.name)?;
             if file.uses_placeholder_checksum() {
-                continue;
-            }
-            if !is_valid_sha256_hex(&file.sha256) {
+            } else if !is_valid_sha256_hex(&file.sha256) {
                 return Err(invalid_manifest_field(
                     "files[].sha256",
-                    &file.sha256,
+                    "redacted-invalid-sha256",
                     "must be lowercase 64-char SHA256 hex or placeholder",
                 ));
+            }
+            if let Some(url) = &file.url {
+                validate_frozen_manifest_text("files[].url", url, false)?;
+                if !url.starts_with("https://")
+                    || url.bytes().any(|byte| byte.is_ascii_whitespace())
+                    || url.contains('@')
+                    || url.contains('?')
+                    || url.contains('#')
+                {
+                    return Err(invalid_manifest_field(
+                        "files[].url",
+                        "redacted",
+                        "must be credential-free HTTPS without userinfo, query, or fragment",
+                    ));
+                }
             }
         }
 
@@ -890,10 +2044,11 @@ impl ModelManifestCatalog {
     ///
     /// Returns `SearchError::InvalidConfig` if parsing fails.
     pub fn from_json_str(raw: &str) -> SearchResult<Self> {
-        serde_json::from_str::<Self>(raw).map_err(|source| SearchError::InvalidConfig {
+        serde_json::from_str::<Self>(raw).map_err(|_source| SearchError::InvalidConfig {
             field: "manifest_catalog_json".to_owned(),
-            value: truncate_for_error(raw),
-            reason: format!("failed to parse manifest catalog JSON: {source}"),
+            value: "redacted-manifest-catalog-json".to_owned(),
+            reason: "failed to parse manifest catalog JSON; input was malformed or unsupported"
+                .to_owned(),
         })
     }
 
@@ -1277,24 +2432,28 @@ pub fn verify_file_sha256(
     if !is_valid_sha256_hex(expected_sha256) {
         return Err(SearchError::InvalidConfig {
             field: "sha256".to_owned(),
-            value: expected_sha256.to_owned(),
+            value: "redacted-invalid-sha256".to_owned(),
             reason: "expected lowercase 64-char SHA256 hex".to_owned(),
         });
     }
-    if !path.exists() {
-        return Err(SearchError::ModelNotFound {
-            name: format!("missing model file: {}", path.display()),
-        });
-    }
-
-    let metadata = fs::metadata(path).map_err(|source| SearchError::ModelLoadFailed {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })?;
-    if !metadata.is_file() {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SearchError::ModelNotFound {
+                name: format!("missing model file: {}", path.display()),
+            });
+        }
+        Err(source) => {
+            return Err(SearchError::ModelLoadFailed {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
         return Err(SearchError::ModelLoadFailed {
             path: path.to_path_buf(),
-            source: "expected a regular file".into(),
+            source: "expected a regular file, not a symlink or special node".into(),
         });
     }
 
@@ -1328,6 +2487,7 @@ pub fn verify_file_sha256(
 
     let actual_sha256 = to_hex_lowercase(&hasher.finalize());
     let expected_lower = expected_sha256.to_ascii_lowercase();
+    // ubs:ignore — artifact sizes and SHA-256 digests are public integrity metadata.
     if bytes_read != expected_size || actual_sha256 != expected_lower {
         return Err(SearchError::HashMismatch {
             path: path.to_path_buf(),
@@ -1358,8 +2518,8 @@ pub struct FileVerificationState {
 }
 
 fn capture_file_verification_state(path: &Path) -> Option<FileVerificationState> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
         return None;
     }
     let modified = metadata
@@ -1381,6 +2541,20 @@ fn resolve_model_file_path(model_dir: &Path, file_name: &str) -> SearchResult<Pa
 }
 
 fn validate_model_file_name(file_name: &str) -> SearchResult<()> {
+    if file_name.len() > MAX_FROZEN_MANIFEST_FIELD_BYTES {
+        return Err(invalid_manifest_field(
+            "files[].name",
+            "redacted-oversized",
+            "must fit the bounded manifest field size",
+        ));
+    }
+    if file_name.chars().any(char::is_control) {
+        return Err(invalid_manifest_field(
+            "files[].name",
+            "redacted-control-character",
+            "must not contain control characters",
+        ));
+    }
     if file_name.trim().is_empty() {
         return Err(invalid_manifest_field(
             "files[].name",
@@ -1393,21 +2567,65 @@ fn validate_model_file_name(file_name: &str) -> SearchResult<()> {
             std::path::Component::ParentDir => {
                 return Err(invalid_manifest_field(
                     "files[].name",
-                    file_name,
+                    "redacted-path-traversal",
                     "must not contain '..' path traversal",
                 ));
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(invalid_manifest_field(
                     "files[].name",
-                    file_name,
+                    "redacted-absolute-path",
                     "must be a relative path without root",
                 ));
             }
             _ => {}
         }
     }
+    if file_name.contains('\\')
+        || file_name
+            .bytes()
+            .any(|byte| matches!(byte, b':' | b'<' | b'>' | b'"' | b'|' | b'?' | b'*'))
+        || file_name.split('/').any(|component| {
+            component.is_empty()
+                || component == "."
+                || component.trim() != component
+                || component.ends_with('.')
+                || is_windows_reserved_path_component(component)
+        })
+    {
+        return Err(invalid_manifest_field(
+            "files[].name",
+            "redacted-nonportable-path",
+            "must use a canonical portable relative path",
+        ));
+    }
     Ok(())
+}
+
+fn is_windows_reserved_path_component(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _suffix)| stem);
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    ) || upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|suffix| matches!(suffix.as_bytes(), &[b'1'..=b'9']))
 }
 
 /// Cached verification result stored as a small JSON file alongside model files.
@@ -1596,7 +2814,7 @@ fn manifest_registry_lock_error(action: &str) -> SearchError {
 fn invalid_manifest_field(field: &str, value: &str, reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: field.to_owned(),
-        value: value.to_owned(),
+        value: truncate_for_error(value),
         reason: reason.to_owned(),
     }
 }
@@ -1666,11 +2884,547 @@ mod tests {
         file.flush().unwrap();
     }
 
+    fn sample_artifact_manifest() -> ModelArtifactManifestV1 {
+        let input_contract = default_plain_text_input_contract();
+        ModelArtifactManifestV1 {
+            schema_version: MODEL_ARTIFACT_MANIFEST_SCHEMA_V1,
+            provider: "fixture-provider".to_owned(),
+            logical_model_id: "fixture-semantic-model".to_owned(),
+            upstream_revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            upstream_repository: "fixture/model".to_owned(),
+            artifacts: vec![
+                ModelArtifactFileV1 {
+                    role: ModelArtifactRoleV1::Weights,
+                    relative_path: "model.safetensors".to_owned(),
+                    upstream_url: "https://models.example.invalid/immutable/model.safetensors"
+                        .to_owned(),
+                    size: 7,
+                    sha256: to_hex_lowercase(&Sha256::digest(b"weights")),
+                },
+                ModelArtifactFileV1 {
+                    role: ModelArtifactRoleV1::Tokenizer,
+                    relative_path: "tokenizer.json".to_owned(),
+                    upstream_url: "https://models.example.invalid/immutable/tokenizer.json"
+                        .to_owned(),
+                    size: 9,
+                    sha256: to_hex_lowercase(&Sha256::digest(b"tokenizer")),
+                },
+            ],
+            license_spdx: "Apache-2.0".to_owned(),
+            license_metadata_sha256: license_metadata_fingerprint(
+                "Apache-2.0",
+                "fixture-provider",
+                "fixture/model",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+            dimension: 3,
+            execution: ModelExecutionContractV1 {
+                backend: "fixture-native".to_owned(),
+                implementation_revision: "fixture-implementation-v1".to_owned(),
+                protocol_revision: "fixture-protocol-v1".to_owned(),
+                numeric_profile: "f32-fixture-v1".to_owned(),
+                weights_format: "safetensors-f32-v1".to_owned(),
+                tokenizer_family: "fixture-tokenizer-v1".to_owned(),
+                model_preprocessing: "fixture-preprocessing-v1".to_owned(),
+                sequence_policy: "max-length=8;truncate-right;no-padding".to_owned(),
+                pooling: "mean-v1".to_owned(),
+                output_normalization: "l2-f32-v1".to_owned(),
+                query_instruction: "query: ".to_owned(),
+                document_instruction: "document: ".to_owned(),
+                input_contract,
+                golden_vectors: GoldenVectorCertificateV1 {
+                    corpus_sha256: "1".repeat(64),
+                    vectors_sha256: "2".repeat(64),
+                    vector_count: 2,
+                    dimension: 3,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn frozen_artifact_manifest_is_role_order_canonical_and_exact() {
+        let left = sample_artifact_manifest();
+        left.validate().unwrap();
+        let left_frozen = left.freeze().unwrap();
+        left_frozen.validate().unwrap();
+
+        let mut right = left;
+        right.artifacts.reverse();
+        right.validate().unwrap();
+        let right_frozen = right.freeze().unwrap();
+        assert_eq!(left_frozen.canonical_bytes, right_frozen.canonical_bytes);
+        assert_eq!(left_frozen.fingerprint, right_frozen.fingerprint);
+    }
+
+    #[test]
+    fn compatible_producers_share_only_the_space_contract() {
+        let left = sample_artifact_manifest();
+        let left_manifest_fingerprint = left.freeze().unwrap().fingerprint;
+        let left_identity = left
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+
+        let mut right = left.clone();
+        right.execution.backend = "fixture-alternate-backend".to_owned();
+        right.execution.implementation_revision = "fixture-implementation-v2".to_owned();
+        right.execution.protocol_revision = "fixture-protocol-v2".to_owned();
+        right.execution.numeric_profile = "f32-fixture-alternate-kernel-v1".to_owned();
+        let right_manifest_fingerprint = right.freeze().unwrap().fingerprint;
+        let right_identity = right
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+
+        assert_ne!(left_manifest_fingerprint, right_manifest_fingerprint);
+        assert_eq!(
+            left_identity.producer.provenance_manifest_fingerprint,
+            left_manifest_fingerprint
+        );
+        assert_eq!(
+            right_identity.producer.provenance_manifest_fingerprint,
+            right_manifest_fingerprint
+        );
+        assert_eq!(
+            left_identity.space.fingerprint(),
+            right_identity.space.fingerprint()
+        );
+        assert!(left_identity.is_conformance_compatible_with(&right_identity));
+        assert_ne!(
+            left_identity.producer.fingerprint(),
+            right_identity.producer.fingerprint()
+        );
+        assert_ne!(left_identity.fingerprint(), right_identity.fingerprint());
+
+        let mut redistributed = left.clone();
+        redistributed.provider = "fixture-mirror-provider".to_owned();
+        redistributed.upstream_repository = "fixture/model-mirror".to_owned();
+        redistributed.license_spdx = "MIT".to_owned();
+        redistributed.license_metadata_sha256 = license_metadata_fingerprint(
+            &redistributed.license_spdx,
+            &redistributed.provider,
+            &redistributed.upstream_repository,
+            &redistributed.upstream_revision,
+        );
+        for artifact in &mut redistributed.artifacts {
+            artifact.upstream_url = format!(
+                "https://mirror.example.invalid/immutable/{}",
+                artifact.relative_path
+            );
+        }
+        let redistributed_identity = redistributed
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        assert_eq!(
+            left_identity.space.fingerprint(),
+            redistributed_identity.space.fingerprint()
+        );
+        assert_ne!(
+            left_identity.producer.fingerprint(),
+            redistributed_identity.producer.fingerprint()
+        );
+        assert!(
+            left_identity.is_conformance_compatible_with(&redistributed_identity),
+            "distribution metadata may differ when space and explicit conformance stay exact"
+        );
+
+        let mut nonconformant = right.clone();
+        nonconformant.execution.golden_vectors.vectors_sha256 = "8".repeat(64);
+        let nonconformant_identity = nonconformant
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        assert_eq!(
+            left_identity.space.fingerprint(),
+            nonconformant_identity.space.fingerprint()
+        );
+        assert!(!left_identity.is_conformance_compatible_with(&nonconformant_identity));
+
+        let mut changed_semantics = right;
+        changed_semantics.execution.pooling.push_str("-drift");
+        assert_ne!(
+            left_identity.space.fingerprint(),
+            changed_semantics
+                .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap()
+                .space
+                .fingerprint()
+        );
+    }
+
+    #[test]
+    fn every_artifact_manifest_field_participates_in_the_fingerprint() {
+        let base = sample_artifact_manifest();
+        let base_fingerprint = sha256_hex_bytes(&base.canonical_bytes());
+        macro_rules! changed {
+            ($label:literal, $mutate:expr) => {{
+                let mut candidate = base.clone();
+                $mutate(&mut candidate);
+                assert_ne!(
+                    base_fingerprint,
+                    sha256_hex_bytes(&candidate.canonical_bytes()),
+                    $label
+                );
+            }};
+        }
+
+        changed!("schema", |m: &mut ModelArtifactManifestV1| m
+            .schema_version +=
+            1);
+        changed!("provider", |m: &mut ModelArtifactManifestV1| m
+            .provider
+            .push('x'));
+        changed!("model", |m: &mut ModelArtifactManifestV1| m
+            .logical_model_id
+            .push('x'));
+        changed!("revision", |m: &mut ModelArtifactManifestV1| m
+            .upstream_revision
+            .push('x'));
+        changed!("repository", |m: &mut ModelArtifactManifestV1| m
+            .upstream_repository
+            .push('x'));
+        changed!("role", |m: &mut ModelArtifactManifestV1| m.artifacts[0]
+            .role =
+            ModelArtifactRoleV1::Projection);
+        changed!("path", |m: &mut ModelArtifactManifestV1| m.artifacts[0]
+            .relative_path
+            .push('x'));
+        changed!("url", |m: &mut ModelArtifactManifestV1| m.artifacts[0]
+            .upstream_url
+            .push('x'));
+        changed!("size", |m: &mut ModelArtifactManifestV1| m.artifacts[0]
+            .size += 1);
+        changed!("artifact digest", |m: &mut ModelArtifactManifestV1| m
+            .artifacts[0]
+            .sha256 =
+            "3".repeat(64));
+        changed!("license", |m: &mut ModelArtifactManifestV1| m
+            .license_spdx
+            .push('x'));
+        changed!("license digest", |m: &mut ModelArtifactManifestV1| m
+            .license_metadata_sha256 =
+            "4".repeat(64));
+        changed!("dimension", |m: &mut ModelArtifactManifestV1| m
+            .dimension +=
+            1);
+        changed!("backend", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .backend
+            .push('x'));
+        changed!("implementation", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .implementation_revision
+            .push('x'));
+        changed!("protocol", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .protocol_revision
+            .push('x'));
+        changed!("numeric", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .numeric_profile
+            .push('x'));
+        changed!("weights format", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .weights_format
+            .push('x'));
+        changed!("tokenizer family", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .tokenizer_family
+            .push('x'));
+        changed!("preprocessing", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .model_preprocessing
+            .push('x'));
+        changed!("sequence", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .sequence_policy
+            .push('x'));
+        changed!("pooling", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .pooling
+            .push('x'));
+        changed!("normalization", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .output_normalization
+            .push('x'));
+        changed!("query instruction", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .query_instruction
+            .push('x'));
+        changed!("document instruction", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .document_instruction
+            .push('x'));
+        changed!("input contract", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .input_contract
+            .canonicalization
+            .push('x'));
+        changed!("golden corpus", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .golden_vectors
+            .corpus_sha256 =
+            "5".repeat(64));
+        changed!("golden vectors", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .golden_vectors
+            .vectors_sha256 =
+            "6".repeat(64));
+        changed!("golden count", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .golden_vectors
+            .vector_count +=
+            1);
+        changed!("golden dimension", |m: &mut ModelArtifactManifestV1| m
+            .execution
+            .golden_vectors
+            .dimension +=
+            1);
+    }
+
+    #[test]
+    fn frozen_manifest_rejects_schema_roles_bytes_and_digest_disagreement() {
+        let manifest = sample_artifact_manifest();
+        let frozen = manifest.freeze().unwrap();
+
+        let mut unknown_schema = manifest.clone();
+        unknown_schema.schema_version += 1;
+        assert!(unknown_schema.validate().is_err());
+
+        let mut floating_revision = manifest.clone();
+        floating_revision.upstream_revision = "main".to_owned();
+        assert!(floating_revision.validate().is_err());
+
+        let mut duplicate_role = manifest.clone();
+        duplicate_role.artifacts[1].role = ModelArtifactRoleV1::Weights;
+        assert!(duplicate_role.validate().is_err());
+
+        let mut stale_license_assertion = manifest.clone();
+        stale_license_assertion.license_spdx = "MIT".to_owned();
+        assert!(stale_license_assertion.validate().is_err());
+
+        let mut oversized_instruction = manifest.clone();
+        oversized_instruction.execution.query_instruction =
+            "x".repeat(MAX_FROZEN_MANIFEST_FIELD_BYTES + 1);
+        assert!(oversized_instruction.validate().is_err());
+
+        let mut missing_role = manifest;
+        missing_role
+            .artifacts
+            .retain(|artifact| artifact.role != ModelArtifactRoleV1::Tokenizer);
+        assert!(missing_role.validate().is_err());
+
+        let mut bad_bytes = frozen.clone();
+        bad_bytes.canonical_bytes.push(0);
+        assert!(bad_bytes.validate().is_err());
+
+        let mut bad_digest = frozen.clone();
+        bad_digest.fingerprint = "0".repeat(64);
+        assert!(bad_digest.validate().is_err());
+
+        let mut injected_digest = frozen;
+        injected_digest.fingerprint = "digest\nforged-log-line".to_owned();
+        let error = injected_digest.validate().unwrap_err();
+        assert!(error.to_string().contains("redacted-invalid-sha256"));
+        assert!(!error.to_string().contains("forged-log-line"));
+
+        let mut unknown_field = serde_json::to_value(sample_artifact_manifest()).unwrap();
+        unknown_field["execution"]["future_unregistered_field"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ModelArtifactManifestV1>(unknown_field).is_err(),
+            "versioned manifests must reject unknown fields instead of silently dropping them"
+        );
+
+        let mut credentialed_url = sample_artifact_manifest();
+        credentialed_url.artifacts[0].upstream_url =
+            "https://models.example.invalid/model.safetensors?token=secret".to_owned();
+        let error = credentialed_url.freeze().unwrap_err();
+        assert!(error.to_string().contains("credential-free HTTPS"));
+        assert!(!error.to_string().contains("secret"));
+
+        let mut log_injection = sample_artifact_manifest();
+        log_injection.logical_model_id = "fixture\nforged-log-line".to_owned();
+        let error = log_injection.freeze().unwrap_err();
+        assert!(error.to_string().contains("control characters"));
+        assert!(!error.to_string().contains("forged-log-line"));
+
+        let mut digest_injection = sample_artifact_manifest();
+        digest_injection.artifacts[0].sha256 = "digest\nforged-log-line".to_owned();
+        let error = digest_injection.freeze().unwrap_err();
+        assert!(error.to_string().contains("redacted-invalid-sha256"));
+        assert!(!error.to_string().contains("forged-log-line"));
+    }
+
+    #[test]
+    fn streaming_artifact_verification_rejects_size_hash_missing_and_role_collision() {
+        let manifest = sample_artifact_manifest();
+        let exact = tempfile::tempdir().unwrap();
+        write_temp_file(&exact.path().join("model.safetensors"), b"weights");
+        write_temp_file(&exact.path().join("tokenizer.json"), b"tokenizer");
+        write_temp_file(&exact.path().join("NOTICE"), b"fixture notice");
+        let verified = manifest.verify_dir(exact.path()).unwrap();
+        verified
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        let wrong_size = tempfile::tempdir().unwrap();
+        write_temp_file(&wrong_size.path().join("model.safetensors"), b"weight");
+        write_temp_file(&wrong_size.path().join("tokenizer.json"), b"tokenizer");
+        assert!(manifest.verify_dir(wrong_size.path()).is_err());
+
+        let wrong_hash = tempfile::tempdir().unwrap();
+        write_temp_file(&wrong_hash.path().join("model.safetensors"), b"WeightS");
+        write_temp_file(&wrong_hash.path().join("tokenizer.json"), b"tokenizer");
+        assert!(manifest.verify_dir(wrong_hash.path()).is_err());
+
+        let missing = tempfile::tempdir().unwrap();
+        write_temp_file(&missing.path().join("model.safetensors"), b"weights");
+        assert!(manifest.verify_dir(missing.path()).is_err());
+
+        let all_missing = tempfile::tempdir().unwrap();
+        let error = manifest.verify_dir(all_missing.path()).unwrap_err();
+        assert!(matches!(&error, SearchError::ModelNotFound { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("model.safetensors:missing"));
+        assert!(diagnostic.contains("tokenizer.json:missing"));
+        assert!(diagnostic.contains("https://models.example.invalid/immutable/model.safetensors"));
+        assert!(diagnostic.contains("https://models.example.invalid/immutable/tokenizer.json"));
+        assert!(
+            !diagnostic.contains(&all_missing.path().display().to_string()),
+            "artifact diagnostics must not expose the raw model-directory path"
+        );
+
+        let mixed_failure = tempfile::tempdir().unwrap();
+        write_temp_file(&mixed_failure.path().join("model.safetensors"), b"WeightS");
+        let error = manifest.verify_dir(mixed_failure.path()).unwrap_err();
+        assert!(matches!(&error, SearchError::ModelLoadFailed { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("model.safetensors:sha256-or-size-mismatch"));
+        assert!(diagnostic.contains("tokenizer.json:missing"));
+        assert!(diagnostic.contains("<redacted-model-dir>"));
+        assert!(
+            !diagnostic.contains(&mixed_failure.path().display().to_string()),
+            "mixed artifact diagnostics must not expose the raw model-directory path"
+        );
+
+        let collision = tempfile::tempdir().unwrap();
+        write_temp_file(&collision.path().join("model.safetensors"), b"weights");
+        write_temp_file(&collision.path().join("tokenizer.json"), b"tokenizer");
+        fs::create_dir_all(collision.path().join("unregistered")).unwrap();
+        write_temp_file(
+            &collision.path().join("unregistered/model.safetensors"),
+            b"collision",
+        );
+        assert!(manifest.verify_dir(collision.path()).is_err());
+
+        let unexpected_role = tempfile::tempdir().unwrap();
+        write_temp_file(
+            &unexpected_role.path().join("model.safetensors"),
+            b"weights",
+        );
+        write_temp_file(&unexpected_role.path().join("tokenizer.json"), b"tokenizer");
+        write_temp_file(&unexpected_role.path().join("config.json"), b"{}");
+        assert!(manifest.verify_dir(unexpected_role.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_verification_rejects_symlinked_extra_role_collision() {
+        let manifest = sample_artifact_manifest();
+        let collision = tempfile::tempdir().unwrap();
+        write_temp_file(&collision.path().join("model.safetensors"), b"weights");
+        write_temp_file(&collision.path().join("tokenizer.json"), b"tokenizer");
+        fs::create_dir_all(collision.path().join("unregistered")).unwrap();
+        let target = collision.path().join("unrelated.bin");
+        write_temp_file(&target, b"unrelated");
+        std::os::unix::fs::symlink(&target, collision.path().join("unregistered/model.onnx"))
+            .unwrap();
+
+        let error = manifest.verify_dir(collision.path()).unwrap_err();
+        assert!(error.to_string().contains("semantic role"));
+    }
+
+    #[test]
+    fn every_registered_local_backend_has_a_frozen_manifest() {
+        for manifest in [
+            ModelArtifactManifestV1::potion_128m_native().unwrap(),
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        ] {
+            let frozen = manifest.freeze().unwrap();
+            frozen.validate().unwrap();
+            assert_eq!(
+                frozen.manifest.dimension,
+                frozen.manifest.execution.golden_vectors.dimension
+            );
+            assert_eq!(
+                frozen.manifest.execution.golden_vectors.corpus_sha256,
+                GoldenVectorCertificateV1::corpus_fingerprint(&MODEL_CONFORMANCE_TEXTS_V1).unwrap()
+            );
+            let identity = frozen
+                .manifest
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_eq!(identity.storage.endianness, "native-f32-values");
+        }
+    }
+
+    #[test]
+    fn persisted_storage_identity_remains_little_endian() {
+        let identity = ModelArtifactManifestV1::potion_128m_native()
+            .unwrap()
+            .declared_identity_bundle(QuantizationFormat::F16, "fsvi-v2")
+            .unwrap();
+        assert_eq!(identity.storage.endianness, "little-endian");
+    }
+
+    #[test]
+    fn registered_manifest_fingerprints_are_exact_fixtures() {
+        let observed = [
+            ModelArtifactManifestV1::potion_128m_native().unwrap(),
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        ]
+        .map(|manifest| {
+            let frozen = manifest.freeze().unwrap();
+            (frozen.manifest.execution.backend, frozen.fingerprint)
+        });
+        let expected = [
+            (
+                "model2vec-native".to_owned(),
+                "38469302ca53aa9e82e1a1f1e4d6576e5d6aff492f441de273eafcf6e437216e".to_owned(),
+            ),
+            (
+                "fastembed-onnx".to_owned(),
+                "7bee34ce869e288067c20775f80b72fce87d95f4d28eebf25529ae227b7cdd8b".to_owned(),
+            ),
+            (
+                "frankentorch-native-minilm".to_owned(),
+                "726d6dde1d25946d1c7287a26f92518c158ee6d009b8a76f52748275f063e72c".to_owned(),
+            ),
+            (
+                "fastembed-onnx".to_owned(),
+                "773b04ae1120f4787d650b866ff67c54f91132201be4cf845061d58d484d5a1e".to_owned(),
+            ),
+            (
+                "fastembed-onnx".to_owned(),
+                "a8272beabe876d07d68e82f9ba50c26bc55958220f3b4cc9701db299ffebb04f".to_owned(),
+            ),
+        ];
+        assert_eq!(observed, expected);
+    }
+
     #[test]
     fn invalid_manifest_json_returns_clear_error() {
-        let err = ModelManifest::from_json_str("{not-valid-json]").unwrap_err();
+        let err = ModelManifest::from_json_str("{\"credential\":\"secret-token\",not-valid-json}")
+            .unwrap_err();
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
         assert!(err.to_string().contains("manifest JSON"));
+        assert!(!err.to_string().contains("secret-token"));
     }
 
     #[test]
@@ -1701,7 +3455,35 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_manifest_field_surfaces_field_name() {
+    fn downloadable_manifest_rejects_log_control_characters_redacted() {
+        let mut manifest = ModelManifest::potion_128m();
+        manifest.id = "model\nforged-log-line".to_owned();
+        let error = manifest.validate().unwrap_err();
+        assert!(error.to_string().contains("control characters"));
+        assert!(!error.to_string().contains("forged-log-line"));
+
+        let mut manifest = ModelManifest::potion_128m();
+        manifest.files[0].name = "tokenizer.json\nforged-log-line".to_owned();
+        let error = manifest.validate().unwrap_err();
+        assert!(error.to_string().contains("control characters"));
+        assert!(!error.to_string().contains("forged-log-line"));
+
+        let mut manifest = ModelManifest::potion_128m();
+        manifest.files[0].sha256 = "digest\nforged-log-line".to_owned();
+        let error = manifest.validate().unwrap_err();
+        assert!(error.to_string().contains("redacted-invalid-sha256"));
+        assert!(!error.to_string().contains("forged-log-line"));
+
+        let mut manifest = ModelManifest::potion_128m();
+        manifest.files[0].url =
+            Some("https://models.example.invalid/tokenizer.json?token=secret".to_owned());
+        let error = manifest.validate().unwrap_err();
+        assert!(error.to_string().contains("credential-free HTTPS"));
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn missing_required_manifest_field_is_rejected_with_redacted_input() {
         let err = ModelManifest::from_json_str(
             r#"{
                 "id":"test-model",
@@ -1712,8 +3494,17 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, SearchError::InvalidConfig { .. }));
-        assert!(err.to_string().contains("license"));
+        assert!(matches!(
+            err,
+            SearchError::InvalidConfig {
+                ref field,
+                ref value,
+                ..
+            // ubs:ignore — this is a public fixed redaction sentinel, not a secret.
+            } if field == "manifest_json" && value == "redacted-manifest-json"
+        ));
+        assert!(err.to_string().contains("malformed or unsupported"));
+        assert!(!err.to_string().contains("acme/test-model"));
     }
 
     #[test]
@@ -1744,12 +3535,33 @@ mod tests {
             verify_file_sha256(&missing_path, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, 1).unwrap_err();
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
 
-        let err = verify_file_sha256(&missing_path, "NOT-A-HASH", 1).unwrap_err();
+        let err = verify_file_sha256(&missing_path, "digest\nforged-log-line", 1).unwrap_err();
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
+        assert!(err.to_string().contains("redacted-invalid-sha256"));
+        assert!(!err.to_string().contains("forged-log-line"));
 
         let valid_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = verify_file_sha256(&missing_path, valid_hash, 1).unwrap_err();
         assert!(matches!(err, SearchError::ModelNotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_file_sha256_rejects_symlinked_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.bin");
+        let link = temp.path().join("model.bin");
+        write_temp_file(&target, b"model-bytes");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let expected_hash = to_hex_lowercase(&Sha256::digest(b"model-bytes"));
+        let error = verify_file_sha256(&link, &expected_hash, 11).unwrap_err();
+        assert!(matches!(&error, SearchError::ModelLoadFailed { .. }));
+        assert!(error.to_string().contains("symlink"));
+        assert!(
+            capture_file_verification_state(&link).is_none(),
+            "verification cache metadata must not follow symlinks"
+        );
     }
 
     #[test]
@@ -1920,6 +3732,33 @@ mod tests {
             SearchError::InvalidConfig { ref field, .. } if field == "files[].name"
         ));
         assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn model_file_names_reject_noncanonical_portable_encodings() {
+        for name in [
+            "./model.safetensors",
+            "C:/model.safetensors",
+            "model.safetensors:alternate-stream",
+            "onnx//model.onnx",
+            "onnx\\model.onnx",
+            "tokenizer.json/",
+            "onnx/model?.onnx",
+            "weights*/model.onnx",
+            "NUL",
+            "com1.bin",
+            "COM¹.txt",
+            "LPT9.config",
+            "clock$",
+            "CONOUT$/model.bin",
+            "model.onnx.",
+            " model.onnx",
+            "model.onnx ",
+        ] {
+            let error = validate_model_file_name(name).unwrap_err();
+            assert!(error.to_string().contains("canonical portable"));
+            assert!(!error.to_string().contains(name));
+        }
     }
 
     #[test]
@@ -2116,12 +3955,12 @@ mod tests {
     }
 
     #[test]
-    fn has_pinned_revision_rejects_floating_aliases() {
+    fn has_pinned_revision_rejects_every_non_digest_alias() {
         for alias in &[
             "main",
-            "master",
             "latest",
             "HEAD",
+            "legacy-default-branch",
             PLACEHOLDER_PINNED_REVISION,
         ] {
             let m = ModelManifest {
@@ -2310,11 +4149,13 @@ mod tests {
 
     #[test]
     fn detect_update_state_different_revision_returns_update() {
+        let latest_revision = "a".repeat(40);
+        let installed_revision = "b".repeat(40);
         let m = ModelManifest {
-            revision: "new_rev".to_owned(),
+            revision: latest_revision,
             ..ModelManifest::potion_128m()
         };
-        let state = m.detect_update_state("old_rev").unwrap();
+        let state = m.detect_update_state(&installed_revision).unwrap();
         assert!(matches!(state, ModelState::UpdateAvailable { .. }));
     }
 
@@ -2614,6 +4455,7 @@ mod tests {
         let m = ModelManifest::potion_128m();
         assert_eq!(m.dimension, Some(256));
         assert_eq!(m.tier, Some(ModelTier::Fast));
+        assert_eq!(m.license, "MIT");
         assert!(m.display_name.is_some());
         assert!(m.display_name.as_deref().unwrap().contains("fast"));
     }

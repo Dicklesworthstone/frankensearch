@@ -9,6 +9,27 @@
 use std::fmt;
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+
+/// Immutable space/producer fingerprints carried by one remote response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEmbeddingAttestationV1 {
+    /// Mathematical embedding-space fingerprint.
+    pub space_fingerprint: String,
+    /// Concrete producer/backend fingerprint.
+    pub producer_fingerprint: String,
+}
+
+impl RemoteEmbeddingAttestationV1 {
+    /// Build the exact fingerprints expected for a validated identity bundle.
+    #[must_use]
+    pub fn from_identity(identity: &EmbeddingIdentityBundleV1) -> Self {
+        Self {
+            space_fingerprint: identity.space.fingerprint(),
+            producer_fingerprint: identity.producer.fingerprint(),
+        }
+    }
+}
 
 // ─── ApiProvider trait ──────────────────────────────────────────────────────
 
@@ -24,8 +45,18 @@ pub trait ApiProvider: Send + Sync + fmt::Debug {
     /// Model ID sent to the API (e.g. `"text-embedding-3-small"`).
     fn api_model_id(&self) -> &str;
 
-    /// Stable embedder ID stored in FSVI index headers.
+    /// Stable operational identifier for registry selection and diagnostics.
+    ///
+    /// This display-level ID never establishes vector-space compatibility.
     fn embedder_id(&self) -> &str;
+
+    /// Canonical producer backend value required by an explicit immutable
+    /// identity epoch.
+    fn identity_backend(&self) -> &'static str;
+
+    /// Canonical wire-protocol revision required by an explicit immutable
+    /// identity epoch.
+    fn identity_protocol_revision(&self) -> &'static str;
 
     /// Output embedding dimensionality.
     fn dimension(&self) -> usize;
@@ -64,18 +95,48 @@ pub trait ApiProvider: Send + Sync + fmt::Debug {
     /// Returns [`SearchError::EmbeddingFailed`] when the response is malformed
     /// or reports a provider error.
     fn deserialize_response(&self, body: &[u8]) -> SearchResult<Vec<Vec<f32>>>;
+
+    /// Extract a per-response immutable space/producer attestation.
+    ///
+    /// Providers whose wire protocol does not carry this contract return
+    /// `None`. [`ApiEmbedder`](crate::ApiEmbedder) rejects such responses
+    /// because a caller-supplied epoch cannot authenticate the responding
+    /// service.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbeddingFailed` when an attestation field is present but
+    /// malformed.
+    fn response_attestation(
+        &self,
+        _body: &[u8],
+    ) -> SearchResult<Option<RemoteEmbeddingAttestationV1>> {
+        Ok(None)
+    }
 }
 
 // ─── OpenAI ─────────────────────────────────────────────────────────────────
 
 /// `OpenAI` embeddings API provider (`text-embedding-3-small`, `text-embedding-3-large`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     api_key: String,
     model: String,
     dimension: usize,
     endpoint: String,
     embedder_id: String,
+}
+
+impl fmt::Debug for OpenAiProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiProvider")
+            .field("model", &self.model)
+            .field("dimension", &self.dimension)
+            .field("endpoint", &"<redacted>")
+            .field("api_key", &"<redacted>")
+            .field("embedder_id", &self.embedder_id)
+            .finish()
+    }
 }
 
 impl OpenAiProvider {
@@ -140,6 +201,14 @@ impl ApiProvider for OpenAiProvider {
 
     fn embedder_id(&self) -> &str {
         &self.embedder_id
+    }
+
+    fn identity_backend(&self) -> &'static str {
+        "remote-api-openai"
+    }
+
+    fn identity_protocol_revision(&self) -> &'static str {
+        "openai-embeddings-json-v1"
     }
 
     fn dimension(&self) -> usize {
@@ -244,12 +313,23 @@ impl ApiProvider for OpenAiProvider {
 // ─── Gemini ─────────────────────────────────────────────────────────────────
 
 /// Google Gemini embeddings API provider (`text-embedding-004`, `embedding-001`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiProvider {
     api_key: String,
     model: String,
     dimension: usize,
     embedder_id: String,
+}
+
+impl fmt::Debug for GeminiProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeminiProvider")
+            .field("model", &self.model)
+            .field("dimension", &self.dimension)
+            .field("api_key", &"<redacted>")
+            .field("embedder_id", &self.embedder_id)
+            .finish()
+    }
 }
 
 impl GeminiProvider {
@@ -287,6 +367,14 @@ impl ApiProvider for GeminiProvider {
 
     fn embedder_id(&self) -> &str {
         &self.embedder_id
+    }
+
+    fn identity_backend(&self) -> &'static str {
+        "remote-api-gemini"
+    }
+
+    fn identity_protocol_revision(&self) -> &'static str {
+        "gemini-batch-embed-content-json-v1"
     }
 
     fn dimension(&self) -> usize {
@@ -486,5 +574,22 @@ mod tests {
     fn openai_embedder_id_includes_dimension() {
         let p = OpenAiProvider::text_embedding_3_small("k", Some(512));
         assert_eq!(p.embedder_id(), "openai-text-embedding-3-small-512d");
+    }
+
+    #[test]
+    fn provider_debug_redacts_credentials_and_endpoint() {
+        let openai = OpenAiProvider::custom(
+            "openai-secret",
+            "model",
+            8,
+            "https://user:password@example.invalid/private",
+        );
+        let openai_debug = format!("{openai:?}");
+        assert!(!openai_debug.contains("openai-secret"));
+        assert!(!openai_debug.contains("password"));
+        assert!(!openai_debug.contains("example.invalid"));
+
+        let gemini = GeminiProvider::text_embedding_004("gemini-secret");
+        assert!(!format!("{gemini:?}").contains("gemini-secret"));
     }
 }

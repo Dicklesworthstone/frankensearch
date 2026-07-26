@@ -288,12 +288,7 @@ mod tests {
         let mut embedders = BTreeMap::new();
         embedders.insert(
             "fast".into(),
-            EmbedderRevision {
-                model_name: "potion-128M".into(),
-                weights_hash: "abcdef1234567890".into(),
-                dimension: 256,
-                quantization: QuantizationFormat::F16,
-            },
+            EmbedderRevision::explicit_test_model("potion-128M", 256),
         );
         let mut manifest = GenerationManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -395,7 +390,7 @@ mod tests {
 
         // Seq 150 is between the two generations.
         let result = history.resolve_detailed(150);
-        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
+        assert!(matches!(&result, TimeTravelResult::NotFound { .. }));
         if let TimeTravelResult::NotFound {
             requested_seq,
             closest_range,
@@ -640,7 +635,7 @@ mod tests {
 
         // One below low → not found.
         let result = history.resolve_detailed(9);
-        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
+        assert!(matches!(&result, TimeTravelResult::NotFound { .. }));
 
         // One above high → not found.
         let result = history.resolve_detailed(21);
@@ -741,18 +736,16 @@ mod tests {
 
         // Seq 120 is 20 away from gen-near (high=100) and 380 from gen-far (low=500).
         let result = history.resolve_detailed(120);
+        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
         if let TimeTravelResult::NotFound { closest_range, .. } = result {
             assert_eq!(closest_range, Some((1, 100)));
-        } else {
-            panic!("expected NotFound");
         }
 
         // Seq 400 is 300 away from gen-near and 100 from gen-far.
         let result = history.resolve_detailed(400);
+        assert!(matches!(result, TimeTravelResult::NotFound { .. }));
         if let TimeTravelResult::NotFound { closest_range, .. } = result {
             assert_eq!(closest_range, Some((500, 600)));
-        } else {
-            panic!("expected NotFound");
         }
     }
 

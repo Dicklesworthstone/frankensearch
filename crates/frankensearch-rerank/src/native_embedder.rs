@@ -17,16 +17,21 @@ use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::traits::{ModelCategory, SyncEmbed};
+use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
 use crate::native::{
-    DEFAULT_MAX_LENGTH, Model, SAFETENSORS_FALLBACK, SAFETENSORS_PRIMARY, TOKENIZER_JSON,
-    build_model, parse_weights,
+    DEFAULT_MAX_LENGTH, Model, SAFETENSORS_FALLBACK, TOKENIZER_JSON, build_model, parse_weights,
 };
 
 const MODEL_NAME: &str = "all-minilm-l6-v2";
 const EMBEDDER_ID: &str = "minilm-384-native";
 const DIM: usize = 384;
+const IDENTITY_DIMENSION: u32 = 384;
+const IDENTITY_SEQUENCE_POLICY: &str = "max-length=512;longest-first;no-padding";
+const IDENTITY_POOLING: &str = "mean-all-returned-tokens-including-specials-no-padding-v1";
+const IDENTITY_OUTPUT_NORMALIZATION: &str = "l2-f32-if-norm-gt-zero-else-unchanged-v1";
 /// Token budget per batched forward (mirrors the reranker's chunking) so each
 /// forward's attention intermediates stay memory-bounded.
 const MAX_BATCH_TOKENS: usize = 2048;
@@ -41,6 +46,7 @@ pub struct NativeEmbedder {
     max_length: usize,
     name: String,
     id: String,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl std::fmt::Debug for NativeEmbedder {
@@ -54,15 +60,51 @@ impl std::fmt::Debug for NativeEmbedder {
 
 impl NativeEmbedder {
     /// Load from a model directory containing `tokenizer.json` and a safetensors weight
-    /// file (`model_f32.safetensors` preferred, else `model.safetensors`) — the standard
-    /// `sentence-transformers/all-MiniLM-L6-v2` layout (bare `embeddings.*`/`encoder.*`
-    /// keys are normalized to the shared `bert.`-prefixed scheme during parse).
+    /// file (`model.safetensors`) — the standard immutable
+    /// `sentence-transformers/all-MiniLM-L6-v2` layout (bare
+    /// `embeddings.*`/`encoder.*` keys are normalized to the shared
+    /// `bert.`-prefixed scheme during parse).
     ///
     /// # Errors
     /// [`SearchError::ModelNotFound`] when required files are missing;
     /// [`SearchError::ModelLoadFailed`] when the tokenizer or weights fail to load.
     pub fn load(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
         let dir = model_dir.as_ref();
+        let verified = ModelArtifactManifestV1::minilm_native_frankentorch()?.verify_dir(dir)?;
+        let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        if identity.space.dimension != IDENTITY_DIMENSION {
+            return Err(SearchError::ModelLoadFailed {
+                path: dir.to_path_buf(),
+                source: format!(
+                    "registered dimension {} disagrees with native backend dimension {DIM}",
+                    identity.space.dimension
+                )
+                .into(),
+            });
+        }
+        for (field, actual, expected) in [
+            (
+                "sequence policy",
+                identity.space.sequence_policy.as_str(),
+                IDENTITY_SEQUENCE_POLICY,
+            ),
+            ("pooling", identity.space.pooling.as_str(), IDENTITY_POOLING),
+            (
+                "output normalization",
+                identity.space.output_normalization.as_str(),
+                IDENTITY_OUTPUT_NORMALIZATION,
+            ),
+        ] {
+            if actual != expected {
+                return Err(SearchError::ModelLoadFailed {
+                    path: dir.to_path_buf(),
+                    source: format!(
+                        "registered {field} disagrees with the native backend contract"
+                    )
+                    .into(),
+                });
+            }
+        }
 
         let tok_path = dir.join(TOKENIZER_JSON);
         if !tok_path.is_file() {
@@ -95,18 +137,11 @@ impl NativeEmbedder {
         // padding is needed for either the single or the batched path.
         tokenizer.with_padding(None);
 
-        let weights_path = {
-            let primary = dir.join(SAFETENSORS_PRIMARY);
-            if primary.is_file() {
-                primary
-            } else {
-                dir.join(SAFETENSORS_FALLBACK)
-            }
-        };
+        let weights_path = dir.join(SAFETENSORS_FALLBACK);
         if !weights_path.is_file() {
             return Err(SearchError::ModelNotFound {
                 name: format!(
-                    "{MODEL_NAME} (missing {SAFETENSORS_PRIMARY} or {SAFETENSORS_FALLBACK} in {})",
+                    "{MODEL_NAME} (missing verified {SAFETENSORS_FALLBACK} in {})",
                     dir.display()
                 ),
             });
@@ -119,7 +154,8 @@ impl NativeEmbedder {
             model = MODEL_NAME,
             dimension = DIM,
             max_length = DEFAULT_MAX_LENGTH,
-            model_dir = %dir.display(),
+            manifest = %verified.frozen().fingerprint,
+            identity = %identity.fingerprint(),
             "native frankentorch MiniLM embedder loaded (int8 linear, mean-pool + L2)"
         );
 
@@ -129,6 +165,7 @@ impl NativeEmbedder {
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
             id: EMBEDDER_ID.to_owned(),
+            identity,
         })
     }
 
@@ -161,7 +198,21 @@ impl SyncEmbed for NativeEmbedder {
         let mut model = self.lock_model()?;
         let mut out = model.embed_forward(&[ids])?;
         drop(model);
-        Ok(out.pop().unwrap_or_else(|| vec![0.0; DIM]))
+        let vector = out.pop().ok_or_else(|| SearchError::EmbeddingFailed {
+            model: MODEL_NAME.to_owned(),
+            source: "native backend returned no embedding".into(),
+        })?;
+        if vector.len() != DIM {
+            return Err(SearchError::EmbeddingFailed {
+                model: MODEL_NAME.to_owned(),
+                source: format!(
+                    "native backend returned dimension {}, expected {DIM}",
+                    vector.len()
+                )
+                .into(),
+            });
+        }
+        Ok(vector)
     }
 
     fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
@@ -192,11 +243,23 @@ impl SyncEmbed for NativeEmbedder {
             start = end;
         }
         drop(model);
+        if out.len() != texts.len() || out.iter().any(|vector| vector.len() != DIM) {
+            return Err(SearchError::EmbeddingFailed {
+                model: MODEL_NAME.to_owned(),
+                source:
+                    "native backend returned a batch shape inconsistent with its attested identity"
+                        .into(),
+            });
+        }
         Ok(out)
     }
 
     fn dimension(&self) -> usize {
         DIM
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
     }
 
     fn id(&self) -> &str {
@@ -223,6 +286,21 @@ mod tests {
     // Compile-level proof that NativeEmbedder satisfies the embedder contract.
     const fn assert_sync_embed<T: SyncEmbed>() {}
     const _: () = assert_sync_embed::<NativeEmbedder>();
+
+    #[test]
+    fn registered_identity_matches_native_backend_contract() {
+        let identity = ModelArtifactManifestV1::minilm_native_frankentorch()
+            .expect("registered native MiniLM manifest")
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive native MiniLM identity");
+        assert_eq!(identity.space.dimension, IDENTITY_DIMENSION);
+        assert_eq!(identity.space.sequence_policy, IDENTITY_SEQUENCE_POLICY);
+        assert_eq!(identity.space.pooling, IDENTITY_POOLING);
+        assert_eq!(
+            identity.space.output_normalization,
+            IDENTITY_OUTPUT_NORMALIZATION
+        );
+    }
 
     /// Smoke test against a real `all-MiniLM-L6-v2` directory. Ignored by default
     /// (no model fixture in CI); run with `MINILM_FIXTURE_DIR=<dir> cargo test -p
@@ -251,6 +329,36 @@ mod tests {
         assert!(
             cos > 0.999,
             "single vs batch embedding mismatch (cos {cos})"
+        );
+    }
+
+    /// Bit-exact producer conformance proof for the frozen native MiniLM
+    /// certificate. This is intentionally fixture-gated because CI does not
+    /// provision the 90 MiB model bundle in ordinary unit-test lanes.
+    #[test]
+    #[ignore = "requires a verified all-MiniLM-L6-v2 model dir via MINILM_FIXTURE_DIR"]
+    fn conformance_certificate_matches_fixture() {
+        let dir = std::env::var("MINILM_FIXTURE_DIR")
+            .expect("set MINILM_FIXTURE_DIR to an all-MiniLM-L6-v2 model directory");
+        let manifest = ModelArtifactManifestV1::minilm_native_frankentorch()
+            .expect("registered native MiniLM manifest");
+        let expected_identity = manifest
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive registered native MiniLM identity");
+        let embedder = NativeEmbedder::load(&dir).expect("load native MiniLM embedder");
+        assert_eq!(embedder.identity().unwrap(), &expected_identity);
+        let texts = &frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let vectors = embedder
+            .embed_batch_sync(texts)
+            .expect("embed bounded conformance corpus");
+        let observed = frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+            texts, &vectors,
+        )
+        .expect("compute exact conformance certificate");
+        let expected = manifest.execution.golden_vectors;
+        assert_eq!(
+            observed, expected,
+            "native MiniLM output bits drifted from the registered producer certificate"
         );
     }
 }

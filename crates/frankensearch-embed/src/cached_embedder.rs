@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
+use frankensearch_core::SearchResult;
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{Embedder, ModelCategory, ModelTier, SearchFuture};
 
 /// Default maximum number of cached query embeddings.
@@ -378,6 +380,10 @@ impl Embedder for CachedEmbedder {
         })
     }
 
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.inner.identity()
+    }
+
     fn dimension(&self) -> usize {
         self.inner.dimension()
     }
@@ -421,6 +427,7 @@ mod tests {
     struct CountingEmbedder {
         dim: usize,
         calls: AtomicUsize,
+        identity: EmbeddingIdentityBundleV1,
     }
 
     impl CountingEmbedder {
@@ -428,6 +435,10 @@ mod tests {
             Self {
                 dim,
                 calls: AtomicUsize::new(0),
+                identity: EmbeddingIdentityBundleV1::explicit_test_model(
+                    "counting-test",
+                    u32::try_from(dim).unwrap_or(u32::MAX),
+                ),
             }
         }
 
@@ -446,6 +457,10 @@ mod tests {
             }
             let normalized = l2_normalize(&vec);
             Box::pin(async move { Ok(normalized) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
         }
 
         fn dimension(&self) -> usize {
@@ -476,6 +491,7 @@ mod tests {
         dim: usize,
         embed_calls: AtomicUsize,
         batch_calls: AtomicUsize,
+        identity: EmbeddingIdentityBundleV1,
     }
 
     impl BatchCountingEmbedder {
@@ -508,6 +524,10 @@ mod tests {
             Box::pin(async move { Ok(out) })
         }
 
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
         fn dimension(&self) -> usize {
             self.dim
         }
@@ -532,6 +552,7 @@ mod tests {
                 dim: 64,
                 embed_calls: AtomicUsize::new(0),
                 batch_calls: AtomicUsize::new(0),
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("batch-counting-test", 64),
             });
             let cached = CachedEmbedder::new(inner.clone(), 128);
             let texts = ["a", "bb", "ccc", "dddd", "eeeee"];
@@ -559,6 +580,12 @@ mod tests {
         let inner = Arc::new(CountingEmbedder::new(64));
         let cached = CachedEmbedder::new(inner.clone(), capacity);
         (cached, inner)
+    }
+
+    #[test]
+    fn cache_wrapper_forwards_complete_identity_exactly() {
+        let (cached, inner) = make_cached(16);
+        assert_eq!(cached.identity().unwrap(), inner.identity().unwrap());
     }
 
     #[test]

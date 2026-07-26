@@ -15,6 +15,14 @@
 //! | `JLProjection`  | JL-guaranteed  | ~0.10ms  | Better distance preservation   |
 
 use asupersync::Cx;
+use frankensearch_core::SearchResult;
+use frankensearch_core::generation::{
+    EMBEDDING_INPUT_CONTRACT_SCHEMA_V1, EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
+    EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingIdentityBundleV1, EmbeddingInputContractV1,
+    EmbeddingProducerAttestationV1, EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    GoldenVectorCertificateV1, HashControlProfileV1, QuantizationFormat,
+    VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
+};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize_in_place};
 use rayon::prelude::*;
 
@@ -24,15 +32,23 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a prime (64-bit).
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
-/// Minimum token length (tokens shorter than this are filtered out).
+/// Minimum UTF-8 byte length (tokens shorter than this are filtered out).
 const MIN_TOKEN_LEN: usize = 2;
 
-/// Default embedding dimension (matches `MiniLM` for index compatibility).
+/// Default embedding dimension (the same width as `MiniLM`, but a distinct
+/// non-semantic vector space).
 const DEFAULT_DIMENSION: usize = 384;
 
 /// Batch size where parallel dispatch amortizes Rayon scheduling for FNV-384.
 /// Smaller batches stay serial to preserve the latency of the default size (64).
 const PARALLEL_BATCH_MIN: usize = 256;
+
+const HASH_CONFORMANCE_TEXTS_V1: [&str; 4] = [
+    "",
+    "Frankensearch identity",
+    "Case CASE case",
+    "unicode café 東京",
+];
 
 /// Hash algorithm selection for the [`HashEmbedder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +70,120 @@ pub enum HashAlgorithm {
     },
 }
 
+fn hash_identity(dimension: usize, algorithm: HashAlgorithm) -> EmbeddingIdentityBundleV1 {
+    let maximum = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
+    assert!(
+        dimension <= maximum,
+        "dimension must fit the u32 identity schema"
+    );
+    let dimension_u32 = u32::try_from(dimension).unwrap_or(u32::MAX);
+    let (logical_model_id, algorithm_name, algorithm_revision, seed, feature_rules, signing_rules) =
+        match algorithm {
+            HashAlgorithm::FnvModular => (
+                "fnv1a-hash-control",
+                "fnv1a-modular-signed-bucket",
+                "v1",
+                0,
+                "for each token hash=fnv1a64(UTF-8 bytes); bucket=hash modulo dimension; add one contribution",
+                "FNV hash bit 63 set => +1f32; clear => -1f32",
+            ),
+            HashAlgorithm::JLProjection { seed } => (
+                "jl-hash-control",
+                "fnv1a-xorshift64-jl-projection",
+                "v1",
+                seed,
+                "for each token state=(seed xor fnv1a64(UTF-8 bytes)) or 1; per output dimension advance xorshift64 by left-13,right-7,left-17; add one contribution",
+                "advanced xorshift64 state bit 0 clear => +1f32; set => -1f32",
+            ),
+        };
+    let profile = HashControlProfileV1 {
+        algorithm: algorithm_name.to_owned(),
+        algorithm_revision: algorithm_revision.to_owned(),
+        seed,
+        feature_rules: feature_rules.to_owned(),
+        tokenization_rules:
+            "split unicode alphanumeric runs; preserve case; drop tokens shorter than 2 UTF-8 bytes"
+                .to_owned(),
+        signing_rules: signing_rules.to_owned(),
+        normalization_rules: "l2-f32-zero-on-degenerate-v1".to_owned(),
+    };
+    let profile_fingerprint = profile.fingerprint();
+    let input = EmbeddingInputContractV1 {
+        schema_version: EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+        canonicalization: "caller-utf8-as-is-v1".to_owned(),
+        content_selection: "single-caller-supplied-text-v1".to_owned(),
+        chunking: "none-at-embedder-boundary-v1".to_owned(),
+        query_instruction: String::new(),
+        document_instruction: String::new(),
+        doc_id_semantics: "vector-independent-of-document-id-v1".to_owned(),
+    };
+    let space = EmbeddingSpaceIdentityV1 {
+        schema_version: EMBEDDING_SPACE_IDENTITY_SCHEMA_V1,
+        logical_model_id: logical_model_id.to_owned(),
+        immutable_revision: format!("{algorithm_revision}:dimension={dimension_u32}"),
+        kind: EmbeddingSpaceKindV1::HashControl,
+        artifact_manifest_fingerprint: profile_fingerprint.clone(),
+        artifacts: Vec::new(),
+        tokenizer_fingerprint: profile_fingerprint.clone(),
+        vocabulary_fingerprint: profile_fingerprint.clone(),
+        model_config_fingerprint: profile_fingerprint.clone(),
+        model_preprocessing: "none".to_owned(),
+        sequence_policy: "unbounded-caller-string".to_owned(),
+        query_instruction: String::new(),
+        document_instruction: String::new(),
+        pooling: feature_rules.to_owned(),
+        output_normalization: "l2-f32-zero-on-degenerate-v1".to_owned(),
+        dimension: dimension_u32,
+        input_contract_fingerprint: input.fingerprint(),
+        hash_control: Some(profile),
+        projection: None,
+    };
+    let golden_vectors = hash_golden_certificate(dimension, algorithm);
+    let producer = EmbeddingProducerAttestationV1 {
+        schema_version: EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1,
+        backend: "frankensearch-hash-native".to_owned(),
+        implementation_revision: env!("CARGO_PKG_VERSION").to_owned(),
+        protocol_revision: "in-process-hash-v1".to_owned(),
+        numeric_profile: "deterministic-f32-bit-exact-v1".to_owned(),
+        provenance_manifest_fingerprint: profile_fingerprint,
+        space_fingerprint: space.fingerprint(),
+        golden_vectors,
+    };
+    let identity = EmbeddingIdentityBundleV1 {
+        space,
+        producer,
+        input,
+        storage: VectorStorageIdentityV1 {
+            schema_version: VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
+            format: "in-memory-f32-v1".to_owned(),
+            quantization: QuantizationFormat::F32,
+            endianness: "native-f32-values".to_owned(),
+            vector_normalization: "l2-f32-zero-on-degenerate-v1".to_owned(),
+            dimension: dimension_u32,
+        },
+    };
+    debug_assert!(identity.validate().is_ok());
+    identity
+}
+
+fn hash_golden_certificate(
+    dimension: usize,
+    algorithm: HashAlgorithm,
+) -> GoldenVectorCertificateV1 {
+    let placeholder = EmbeddingIdentityBundleV1::explicit_test_model("hash-golden-probe", 1);
+    let probe = HashEmbedder {
+        dimension,
+        algorithm,
+        identity: placeholder,
+    };
+    let vectors = HASH_CONFORMANCE_TEXTS_V1
+        .iter()
+        .map(|text| probe.embed_sync(text))
+        .collect::<Vec<_>>();
+    GoldenVectorCertificateV1::from_exact_f32(&HASH_CONFORMANCE_TEXTS_V1, &vectors)
+        .expect("static hash conformance corpus and vectors must be valid")
+}
+
 /// Model-free hash-based embedder.
 ///
 /// Produces deterministic embeddings using FNV-1a hashing. Not semantic —
@@ -72,6 +202,7 @@ pub enum HashAlgorithm {
 pub struct HashEmbedder {
     dimension: usize,
     algorithm: HashAlgorithm,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl HashEmbedder {
@@ -79,13 +210,15 @@ impl HashEmbedder {
     ///
     /// # Panics
     ///
-    /// Panics if `dimension` is zero.
+    /// Panics if `dimension` is zero or exceeds the identity schema's u32 limit.
     #[must_use]
     pub fn new(dimension: usize, algorithm: HashAlgorithm) -> Self {
         assert!(dimension > 0, "dimension must be > 0");
+        let identity = hash_identity(dimension, algorithm);
         Self {
             dimension,
             algorithm,
+            identity,
         }
     }
 
@@ -95,7 +228,7 @@ impl HashEmbedder {
         Self::new(DEFAULT_DIMENSION, HashAlgorithm::FnvModular)
     }
 
-    /// Default FNV-modular embedder with 256 dimensions (fast-tier compatibility).
+    /// Default FNV-modular embedder with 256 dimensions.
     #[must_use]
     pub fn default_256() -> Self {
         Self::new(256, HashAlgorithm::FnvModular)
@@ -129,11 +262,13 @@ impl HashEmbedder {
     /// FNV-1a modular projection: each token maps to one dimension.
     fn embed_fnv_modular<'a>(&self, tokens: impl Iterator<Item = &'a str>) -> Vec<f32> {
         let mut embedding = vec![0.0_f32; self.dimension];
+        let dimension = u64::try_from(self.dimension)
+            .expect("hash-embedder dimension must fit the u64 modulus");
 
         for token in tokens {
             let hash = fnv1a_hash(token.as_bytes());
-            #[allow(clippy::cast_possible_truncation)] // modular arithmetic; truncation is fine
-            let index = (hash as usize) % self.dimension;
+            let index = usize::try_from(hash % dimension)
+                .expect("modular bucket must fit the configured usize dimension");
             let sign = if (hash >> 63) == 1 { 1.0 } else { -1.0 };
             embedding[index] += sign;
         }
@@ -173,8 +308,8 @@ impl HashEmbedder {
         for token in tokens {
             let hash = fnv1a_hash(token.as_bytes());
             // xorshift64 has a fixed point at zero — if seed ^ hash == 0,
-            // the state stays zero forever, making all signs +1.0. `| 1`
-            // preserves that exact behaviour while keeping the state live.
+            // the state would stay zero forever. The v1 profile's explicit
+            // `| 1` seed-mixing rule keeps every chain live.
             states[filled] = (seed ^ hash) | 1;
             filled += 1;
             if filled == JL_LANES {
@@ -398,12 +533,17 @@ impl Embedder for HashEmbedder {
         Box::pin(async move { Ok(self.embed_batch_sync(texts)) })
     }
 
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn dimension(&self) -> usize {
         self.dimension
     }
 
     fn id(&self) -> &str {
-        // The id encodes algorithm + dimension for index compatibility
+        // The ID is operational metadata; the complete hash-control identity
+        // establishes compatibility.
         match (self.algorithm, self.dimension) {
             (HashAlgorithm::FnvModular, 384) => "fnv1a-384",
             (HashAlgorithm::FnvModular, 256) => "fnv1a-256",
@@ -805,6 +945,12 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_length_filter_is_exactly_utf8_bytes() {
+        let tokens: Vec<&str> = tokenize("a é Δ 京").collect();
+        assert_eq!(tokens, vec!["é", "Δ", "京"]);
+    }
+
+    #[test]
     fn tokenize_splits_on_punctuation() {
         let tokens: Vec<&str> = tokenize("hello-world.test").collect();
         assert_eq!(tokens, vec!["hello", "world", "test"]);
@@ -848,6 +994,24 @@ mod tests {
     #[test]
     fn embedder_trait_not_semantic() {
         assert!(!HashEmbedder::default_384().is_semantic());
+    }
+
+    #[test]
+    fn hash_control_identity_binds_the_actual_golden_vectors() {
+        for embedder in [
+            HashEmbedder::default_256(),
+            HashEmbedder::jl_384(0x9e37_79b9_7f4a_7c15),
+        ] {
+            let vectors = embedder.embed_batch_sync(&HASH_CONFORMANCE_TEXTS_V1);
+            embedder
+                .identity()
+                .unwrap()
+                .producer
+                .golden_vectors
+                .verify_exact_f32(&HASH_CONFORMANCE_TEXTS_V1, &vectors)
+                .unwrap();
+            assert!(!embedder.is_semantic());
+        }
     }
 
     #[test]

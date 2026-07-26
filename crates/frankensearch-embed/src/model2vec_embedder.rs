@@ -1,8 +1,8 @@
 //! `Model2Vec` static token embedding for the fast tier.
 //!
-//! Wraps potion-multilingual-128M (and compatible `Model2Vec` models) which are
-//! static token embedding models: they look up pre-computed per-token embeddings
-//! and mean-pool them. No transformer inference, no GPU needed.
+//! Wraps the exact manifest-registered potion-multilingual-128M artifact set.
+//! It looks up pre-computed per-token embeddings and mean-pools them. No
+//! transformer inference, no GPU needed.
 //!
 //! Performance: ~0.57ms per embedding (223x faster than `MiniLM-L6-v2`).
 //!
@@ -21,8 +21,13 @@ use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tracing::instrument;
 
+use crate::model_manifest::{
+    MODEL2VEC_OUTPUT_NORMALIZATION_V1, MODEL2VEC_POOLING_V1, MODEL2VEC_PREPROCESSING_V1,
+    MODEL2VEC_SEQUENCE_POLICY_V1, ModelArtifactManifestV1,
+};
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Required files for a `Model2Vec` model.
@@ -70,6 +75,8 @@ pub struct Model2VecEmbedder {
     name: String,
     /// Directory the model was loaded from.
     model_dir: PathBuf,
+    /// Complete identity derived from the verified frozen manifest.
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl fmt::Debug for Model2VecEmbedder {
@@ -78,7 +85,8 @@ impl fmt::Debug for Model2VecEmbedder {
             .field("name", &self.name)
             .field("dimensions", &self.dimensions)
             .field("vocab_size", &self.vocab_size)
-            .field("model_dir", &self.model_dir)
+            .field("model_dir", &"<redacted>")
+            .field("identity", &self.identity.fingerprint())
             .finish_non_exhaustive()
     }
 }
@@ -91,12 +99,16 @@ impl Model2VecEmbedder {
     ///
     /// Returns `SearchError::ModelNotFound` if required files are missing.
     /// Returns `SearchError::ModelLoadFailed` if files exist but cannot be parsed.
-    #[instrument(skip_all, fields(model_dir = %model_dir.as_ref().display()))]
+    #[instrument(skip_all, fields(model = DEFAULT_MODEL_NAME))]
     pub fn load(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
         Self::load_with_name(model_dir, DEFAULT_MODEL_NAME)
     }
 
-    /// Load a `Model2Vec` model with a custom name.
+    /// Load the registered potion model with a custom display identifier.
+    ///
+    /// The supplied name does not select or attest compatibility; production
+    /// model bytes and runtime identity still come exclusively from the frozen
+    /// potion manifest.
     ///
     /// # Errors
     ///
@@ -104,7 +116,24 @@ impl Model2VecEmbedder {
     /// Returns `SearchError::ModelLoadFailed` if files exist but cannot be parsed.
     pub fn load_with_name(model_dir: impl AsRef<Path>, name: &str) -> SearchResult<Self> {
         let model_dir = model_dir.as_ref();
+        #[cfg(test)]
+        {
+            Self::load_explicit_test_model(model_dir, name)
+        }
+        #[cfg(not(test))]
+        {
+            let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir(model_dir)?;
+            let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+            validate_registered_execution_contract(&identity)?;
+            Self::load_preverified(model_dir, name, identity)
+        }
+    }
 
+    fn load_preverified(
+        model_dir: &Path,
+        name: &str,
+        mut identity: EmbeddingIdentityBundleV1,
+    ) -> SearchResult<Self> {
         // Validate required files exist
         for filename in &REQUIRED_FILES {
             let path = model_dir.join(filename);
@@ -173,6 +202,30 @@ impl Model2VecEmbedder {
 
         let vocab_size = shape[0];
         let dimensions = shape[1];
+        let parsed_dimension =
+            u32::try_from(dimensions).map_err(|_| SearchError::InvalidConfig {
+                field: "model2vec.dimension".to_owned(),
+                value: dimensions.to_string(),
+                reason: "parsed tensor dimension exceeds the identity schema".to_owned(),
+            })?;
+
+        if identity.producer.backend == "explicit-test-backend" {
+            identity.space.dimension = parsed_dimension;
+            identity.storage.dimension = parsed_dimension;
+            identity.producer.golden_vectors.dimension = parsed_dimension;
+            identity.producer.space_fingerprint = identity.space.fingerprint();
+        }
+        if identity.space.dimension != parsed_dimension {
+            return Err(SearchError::ModelLoadFailed {
+                path: safetensors_path.clone(),
+                source: format!(
+                    "parsed embedding dimension {parsed_dimension} disagrees with attested dimension {}",
+                    identity.space.dimension
+                )
+                .into(),
+            });
+        }
+        identity.validate()?;
 
         // Parse the raw f32 data into the embedding matrix
         let embeddings = parse_f32_matrix(tensor.data(), vocab_size, dimensions).map_err(|e| {
@@ -183,10 +236,11 @@ impl Model2VecEmbedder {
         })?;
 
         tracing::info!(
-            name,
+            model = DEFAULT_MODEL_NAME,
             vocab_size,
             dimensions,
-            tensor_name = tensor_name.as_str(),
+            manifest = %identity.producer.provenance_manifest_fingerprint,
+            identity = %identity.fingerprint(),
             "Model2Vec model loaded"
         );
 
@@ -197,7 +251,17 @@ impl Model2VecEmbedder {
             vocab_size,
             name: name.to_owned(),
             model_dir: model_dir.to_owned(),
+            identity,
         })
+    }
+
+    #[cfg(test)]
+    fn load_explicit_test_model(model_dir: &Path, name: &str) -> SearchResult<Self> {
+        Self::load_preverified(
+            model_dir,
+            name,
+            EmbeddingIdentityBundleV1::explicit_test_model(name, 1),
+        )
     }
 
     /// Synchronous embedding (no async overhead for ~0.57ms operation).
@@ -298,6 +362,42 @@ fn normalize_in_place(vec: &mut [f32]) {
     }
 }
 
+fn validate_registered_execution_contract(
+    identity: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
+    for (field, actual, expected) in [
+        (
+            "model preprocessing",
+            identity.space.model_preprocessing.as_str(),
+            MODEL2VEC_PREPROCESSING_V1,
+        ),
+        (
+            "sequence policy",
+            identity.space.sequence_policy.as_str(),
+            MODEL2VEC_SEQUENCE_POLICY_V1,
+        ),
+        (
+            "pooling",
+            identity.space.pooling.as_str(),
+            MODEL2VEC_POOLING_V1,
+        ),
+        (
+            "output normalization",
+            identity.space.output_normalization.as_str(),
+            MODEL2VEC_OUTPUT_NORMALIZATION_V1,
+        ),
+    ] {
+        if actual != expected {
+            return Err(SearchError::InvalidConfig {
+                field: "model2vec.execution_contract".to_owned(),
+                value: identity.space.logical_model_id.clone(),
+                reason: format!("registered {field} disagrees with the native Model2Vec backend"),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Embedder for Model2VecEmbedder {
     fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         // Model2Vec is pure computation (~0.57ms) — no cancellation check needed
@@ -310,6 +410,10 @@ impl Embedder for Model2VecEmbedder {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move { self.embed_batch_sync(texts) })
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
     }
 
     fn dimension(&self) -> usize {
@@ -330,11 +434,6 @@ impl Embedder for Model2VecEmbedder {
 
     fn category(&self) -> ModelCategory {
         ModelCategory::StaticEmbedder
-    }
-
-    fn supports_mrl(&self) -> bool {
-        // Model2Vec models support Matryoshka truncation
-        true
     }
 }
 
@@ -571,6 +670,32 @@ mod tests {
     }
 
     #[test]
+    fn load_preverified_rejects_tensor_dimension_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_model(dir.path(), 12, 8);
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("dimension-drift", 7);
+        identity.producer.backend = "attested-fixture-backend".to_owned();
+        identity.validate().unwrap();
+
+        let error = Model2VecEmbedder::load_preverified(dir.path(), "dimension-drift", identity)
+            .expect_err("parsed tensor width must agree with the attested identity");
+        assert!(matches!(error, SearchError::ModelLoadFailed { .. }));
+    }
+
+    #[test]
+    fn registered_identity_matches_native_execution_contract() {
+        let identity = ModelArtifactManifestV1::potion_128m_native()
+            .unwrap()
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        validate_registered_execution_contract(&identity).unwrap();
+
+        let mut drifted = identity;
+        drifted.space.model_preprocessing.push_str("-drift");
+        assert!(validate_registered_execution_contract(&drifted).is_err());
+    }
+
+    #[test]
     fn embed_batch_sync_matches_serial_across_parallel_boundary() {
         let dir = tempfile::tempdir().unwrap();
         create_test_model(dir.path(), 12, 8);
@@ -739,12 +864,12 @@ mod tests {
     }
 
     #[test]
-    fn trait_supports_mrl() {
+    fn trait_does_not_infer_mrl_from_model2vec_backend() {
         let dir = tempfile::tempdir().unwrap();
         create_test_model(dir.path(), 12, 8);
 
         let embedder = Model2VecEmbedder::load(dir.path()).unwrap();
-        assert!(embedder.supports_mrl());
+        assert!(!embedder.supports_mrl());
     }
 
     #[test]
@@ -763,6 +888,42 @@ mod tests {
     fn embedder_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Model2VecEmbedder>();
+    }
+
+    /// Bit-exact producer conformance proof for the frozen potion manifest.
+    #[test]
+    #[ignore = "requires a verified potion model dir via POTION_FIXTURE_DIR"]
+    fn conformance_certificate_matches_fixture() {
+        let dir = std::env::var("POTION_FIXTURE_DIR")
+            .expect("set POTION_FIXTURE_DIR to a potion-multilingual-128M directory");
+        let manifest = crate::model_manifest::ModelArtifactManifestV1::potion_128m_native()
+            .expect("registered potion manifest");
+        let verified = manifest
+            .verify_dir(Path::new(&dir))
+            .expect("verify frozen potion artifacts");
+        let expected_identity = verified
+            .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive verified potion identity");
+        let embedder = Model2VecEmbedder::load_preverified(
+            Path::new(&dir),
+            DEFAULT_MODEL_NAME,
+            expected_identity.clone(),
+        )
+        .expect("load verified potion embedder");
+        assert_eq!(embedder.identity().unwrap(), &expected_identity);
+        let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let vectors = embedder
+            .embed_batch_sync(texts)
+            .expect("embed bounded conformance corpus");
+        let observed = frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+            texts, &vectors,
+        )
+        .expect("compute exact conformance certificate");
+        let expected = manifest.execution.golden_vectors;
+        assert_eq!(
+            observed, expected,
+            "Model2Vec output bits drifted from the registered producer certificate"
+        );
     }
 
     // ── Debug impl ─────────────────────────────────────────────────────

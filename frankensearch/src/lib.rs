@@ -304,7 +304,7 @@ pub use frankensearch_index::{
 };
 
 #[cfg(feature = "ann")]
-pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex};
+pub use frankensearch_index::{AnnFallbackReason, AnnSearchStats, HnswConfig, HnswIndex};
 
 // ─── Fusion and search orchestration (always available) ─────────────────────
 

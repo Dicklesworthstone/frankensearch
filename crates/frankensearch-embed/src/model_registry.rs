@@ -18,7 +18,6 @@ pub const BAKEOFF_CUTOFF_DATE: &str = "2025-11-01";
 const NO_HUGGINGFACE_ID: &str = "builtin";
 
 const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
-const MODEL_ONNX_LEGACY: &str = "model.onnx";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const MODEL_SAFETENSORS: &str = "model.safetensors";
 const CONFIG_JSON: &str = "config.json";
@@ -342,11 +341,10 @@ pub(crate) fn ensure_model_storage_layout_checked() -> SearchResult<PathBuf> {
 pub(crate) fn ensure_model_storage_layout() -> PathBuf {
     match ensure_model_storage_layout_checked() {
         Ok(root) => root,
-        Err(error) => {
+        Err(_error) => {
             let root = model_storage_root();
             warn!(
-                root = %root.display(),
-                error = %error,
+                reason = "model-storage-layout-unavailable",
                 "failed to ensure model storage layout; continuing with unresolved root"
             );
             root
@@ -460,10 +458,7 @@ fn has_reranker_files(dir: &Path) -> bool {
 }
 
 fn has_onnx_file(dir: &Path) -> bool {
-    if dir.join(MODEL_ONNX_SUBDIR).is_file() {
-        return true;
-    }
-    dir.join(MODEL_ONNX_LEGACY).is_file()
+    dir.join(MODEL_ONNX_SUBDIR).is_file()
 }
 
 #[cfg(test)]
@@ -635,13 +630,13 @@ mod tests {
     }
 
     #[test]
-    fn availability_detects_legacy_model_onnx_layout() {
+    fn availability_rejects_unregistered_legacy_model_onnx_layout() {
         let temp = tempfile::tempdir().unwrap();
         touch_model_files(
             temp.path(),
             "all-MiniLM-L6-v2",
             &[
-                MODEL_ONNX_LEGACY,
+                "model.onnx",
                 TOKENIZER_JSON,
                 CONFIG_JSON,
                 SPECIAL_TOKENS_JSON,
@@ -651,7 +646,7 @@ mod tests {
 
         let registry = EmbedderRegistry::new(temp.path());
         assert!(
-            registry
+            !registry
                 .available()
                 .iter()
                 .map(|entry| entry.id)
@@ -1062,7 +1057,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(!has_any_file(
             temp.path(),
-            &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY]
+            &[MODEL_ONNX_SUBDIR, "model.onnx"]
         ));
     }
 
@@ -1099,7 +1094,7 @@ mod tests {
     fn has_embedder_files_reference(id: &str, dir: &Path) -> bool {
         match id {
             "minilm-384" => {
-                has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
+                has_any_file(dir, &[MODEL_ONNX_SUBDIR])
                     && has_all_files(
                         dir,
                         &[
@@ -1111,8 +1106,7 @@ mod tests {
                     )
             }
             "snowflake-arctic-s-384" | "nomic-embed-768" => {
-                has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
-                    && has_all_files(dir, &[TOKENIZER_JSON])
+                has_any_file(dir, &[MODEL_ONNX_SUBDIR]) && has_all_files(dir, &[TOKENIZER_JSON])
             }
             "potion-multilingual-128m-256" | "potion-retrieval-32m-512" => {
                 has_all_files(dir, &[TOKENIZER_JSON, MODEL_SAFETENSORS])
@@ -1122,15 +1116,14 @@ mod tests {
     }
 
     fn has_reranker_files_reference(dir: &Path) -> bool {
-        has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
-            && has_all_files(dir, &[TOKENIZER_JSON])
+        has_any_file(dir, &[MODEL_ONNX_SUBDIR]) && has_all_files(dir, &[TOKENIZER_JSON])
     }
 
     #[test]
     fn file_presence_checks_match_reference_logic() {
         let files = [
             MODEL_ONNX_SUBDIR,
-            MODEL_ONNX_LEGACY,
+            "model.onnx",
             TOKENIZER_JSON,
             CONFIG_JSON,
             SPECIAL_TOKENS_JSON,

@@ -9,7 +9,7 @@
 //! - Nomic Embed Text v1.5 (bake-off candidate, 768 dimensions)
 //!
 //! Required files:
-//! - `onnx/model.onnx` (preferred, current layout) OR `model.onnx` (legacy layout)
+//! - `onnx/model.onnx` at the exact registered manifest path
 //! - `tokenizer.json`
 //! - `config.json`
 //! - `special_tokens_map.json`
@@ -26,8 +26,13 @@ use fastembed::{
 };
 use tracing::instrument;
 
+use crate::model_manifest::{
+    FASTEMBED_MAX_LENGTH_V1, FASTEMBED_OUTPUT_NORMALIZATION_V1, FASTEMBED_SEQUENCE_POLICY_V1,
+    ModelArtifactManifestV1,
+};
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Default quality-tier model directory name.
@@ -39,7 +44,11 @@ pub const DEFAULT_HF_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 /// Expected `MiniLM` output dimension.
 pub const DEFAULT_DIMENSION: usize = 384;
 
-/// Configuration for loading an ONNX embedder with custom parameters.
+/// Configuration for selecting a frozen, manifest-registered ONNX embedder.
+///
+/// `model_id`, `dimension`, and `pooling` must agree with the registered
+/// execution contract. `embedder_id` remains a caller-facing display/registry
+/// identifier and never establishes vector-space compatibility.
 #[derive(Debug, Clone)]
 pub struct OnnxEmbedderConfig {
     /// Unique embedder ID (e.g., `"minilm-384"`).
@@ -66,18 +75,19 @@ impl Default for OnnxEmbedderConfig {
 impl OnnxEmbedderConfig {
     /// Return a config for a known embedder name, or `None` for unknown names.
     ///
-    /// Recognised names: `"minilm"`, `"snowflake-arctic-s"`, `"nomic-embed"`.
+    /// Recognised names include the short registry aliases and complete frozen
+    /// logical model IDs for `MiniLM`, Snowflake, and Nomic.
     #[must_use]
     pub fn for_name(embedder_name: &str) -> Option<Self> {
         match embedder_name {
-            "minilm" => Some(Self::default()),
-            "snowflake-arctic-s" => Some(Self {
+            "minilm" | DEFAULT_MODEL_NAME | "all-minilm-l6-v2" => Some(Self::default()),
+            "snowflake-arctic-s" | "snowflake-arctic-embed-s" => Some(Self {
                 embedder_id: "snowflake-arctic-s-384".to_string(),
                 model_id: "snowflake-arctic-embed-s".to_string(),
                 dimension: 384,
                 pooling: Pooling::Mean,
             }),
-            "nomic-embed" => Some(Self {
+            "nomic-embed" | "nomic-embed-text-v1.5" => Some(Self {
                 embedder_id: "nomic-embed-768".to_string(),
                 model_id: "nomic-embed-text-v1.5".to_string(),
                 dimension: 768,
@@ -88,8 +98,56 @@ impl OnnxEmbedderConfig {
     }
 }
 
+fn frozen_manifest_for_config(
+    config: &OnnxEmbedderConfig,
+) -> SearchResult<ModelArtifactManifestV1> {
+    let manifest = match config.model_id.as_str() {
+        DEFAULT_MODEL_NAME | "all-minilm-l6-v2" => ModelArtifactManifestV1::minilm_fastembed(),
+        "snowflake-arctic-embed-s" => ModelArtifactManifestV1::snowflake_fastembed(),
+        "nomic-embed-text-v1.5" => ModelArtifactManifestV1::nomic_fastembed(),
+        _model_id => Err(SearchError::InvalidConfig {
+            field: "fastembed.model_id".to_owned(),
+            value: "unregistered".to_owned(),
+            reason: "model has no registered frozen artifact/execution manifest".to_owned(),
+        }),
+    }?;
+    let manifest_dimension =
+        usize::try_from(manifest.dimension).map_err(|_| SearchError::InvalidConfig {
+            field: "fastembed.manifest.dimension".to_owned(),
+            value: manifest.dimension.to_string(),
+            reason: "registered dimension does not fit usize".to_owned(),
+        })?;
+    if config.dimension != manifest_dimension {
+        return Err(SearchError::InvalidConfig {
+            field: "fastembed.dimension".to_owned(),
+            value: config.dimension.to_string(),
+            reason: format!(
+                "configuration disagrees with frozen manifest dimension {manifest_dimension}"
+            ),
+        });
+    }
+    if config.pooling != Pooling::Mean {
+        return Err(SearchError::InvalidConfig {
+            field: "fastembed.pooling".to_owned(),
+            value: format!("{:?}", config.pooling),
+            reason: "configuration disagrees with frozen mean-pooling execution contract"
+                .to_owned(),
+        });
+    }
+    if manifest.execution.sequence_policy != FASTEMBED_SEQUENCE_POLICY_V1
+        || manifest.execution.output_normalization != FASTEMBED_OUTPUT_NORMALIZATION_V1
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "fastembed.execution_contract".to_owned(),
+            value: manifest.logical_model_id.clone(),
+            reason: "registered tokenizer or normalization semantics disagree with the pinned FastEmbed adapter"
+                .to_owned(),
+        });
+    }
+    Ok(manifest)
+}
+
 const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
-const MODEL_ONNX_LEGACY: &str = "model.onnx";
 
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const CONFIG_JSON: &str = "config.json";
@@ -113,6 +171,7 @@ pub struct FastEmbedEmbedder {
     name: String,
     dimension: usize,
     model_dir: PathBuf,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl fmt::Debug for FastEmbedEmbedder {
@@ -120,7 +179,8 @@ impl fmt::Debug for FastEmbedEmbedder {
         f.debug_struct("FastEmbedEmbedder")
             .field("name", &self.name)
             .field("dimension", &self.dimension)
-            .field("model_dir", &self.model_dir)
+            .field("model_dir", &"<redacted>")
+            .field("identity", &self.identity.fingerprint())
             .finish_non_exhaustive()
     }
 }
@@ -134,39 +194,41 @@ impl FastEmbedEmbedder {
     ///
     /// # Errors
     ///
+    /// Returns `SearchError::InvalidConfig` when model, dimension, or pooling
+    /// disagrees with the frozen execution contract.
     /// Returns `SearchError::ModelNotFound` when required files are missing.
     /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
-    #[instrument(skip_all, fields(model_dir = %model_dir.as_ref().display()))]
+    #[instrument(skip_all, fields(model = DEFAULT_MODEL_NAME))]
     pub fn load(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
         Self::load_with_name(model_dir, DEFAULT_MODEL_NAME)
     }
 
-    /// Load a `FastEmbed` model with a custom model directory name.
-    ///
-    /// Uses the default `MiniLM` configuration (384 dimensions, mean pooling).
+    /// Load a registered `FastEmbed` model by its manifest model identifier.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::ModelNotFound` when required files are missing.
+    /// Returns `SearchError::InvalidConfig` for an unregistered model name and
+    /// `SearchError::ModelNotFound` when registered files are missing.
     /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
     pub fn load_with_name(model_dir: impl AsRef<Path>, name: &str) -> SearchResult<Self> {
-        Self::load_with_config(
-            model_dir,
-            OnnxEmbedderConfig {
-                embedder_id: name.to_owned(),
-                model_id: name.to_owned(),
-                ..OnnxEmbedderConfig::default()
-            },
-        )
+        let mut config = OnnxEmbedderConfig::for_name(name).unwrap_or_else(|| OnnxEmbedderConfig {
+            embedder_id: name.to_owned(),
+            model_id: name.to_owned(),
+            ..OnnxEmbedderConfig::default()
+        });
+        name.clone_into(&mut config.embedder_id);
+        Self::load_with_config(model_dir, config)
     }
 
-    /// Load an ONNX embedder with custom configuration.
+    /// Load an ONNX embedder with an explicit registered configuration.
     ///
-    /// This is the most flexible constructor, allowing callers to specify
-    /// dimension, pooling strategy, and identifiers for any supported model.
+    /// Dimension and pooling are checked against the frozen manifest before any
+    /// model bytes are accepted.
     ///
     /// # Errors
     ///
+    /// Returns `SearchError::InvalidConfig` when model, dimension, or pooling
+    /// disagrees with the frozen execution contract.
     /// Returns `SearchError::ModelNotFound` when required files are missing.
     /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
     pub fn load_with_config(
@@ -175,10 +237,13 @@ impl FastEmbedEmbedder {
     ) -> SearchResult<Self> {
         let name = &config.model_id;
         let expected_dim = config.dimension;
+        let frozen_manifest = frozen_manifest_for_config(&config)?;
         let model_dir = resolve_model_dir(model_dir.as_ref(), name)?;
+        let verified = frozen_manifest.verify_dir(&model_dir)?;
+        let identity = verified.identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
         let model_file =
             select_model_file(&model_dir).ok_or_else(|| SearchError::ModelNotFound {
-                name: format!("{name} (missing {MODEL_ONNX_SUBDIR} or {MODEL_ONNX_LEGACY})"),
+                name: format!("{name} (missing registered artifact {MODEL_ONNX_SUBDIR})"),
             })?;
 
         for filename in &REQUIRED_NON_MODEL_FILES {
@@ -206,7 +271,7 @@ impl FastEmbedEmbedder {
         let mut user_model = UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files);
         user_model.pooling = Some(config.pooling);
 
-        let init_options = InitOptionsUserDefined::new();
+        let init_options = InitOptionsUserDefined::new().with_max_length(FASTEMBED_MAX_LENGTH_V1);
         let mut text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_dir.clone(),
@@ -234,7 +299,8 @@ impl FastEmbedEmbedder {
         tracing::info!(
             model = %name,
             dimension = expected_dim,
-            model_dir = %model_dir.display(),
+            manifest = %identity.producer.provenance_manifest_fingerprint,
+            identity = %identity.fingerprint(),
             "FastEmbed model loaded"
         );
 
@@ -243,6 +309,7 @@ impl FastEmbedEmbedder {
             name: config.embedder_id,
             dimension: expected_dim,
             model_dir,
+            identity,
         })
     }
 
@@ -392,6 +459,10 @@ impl Embedder for FastEmbedEmbedder {
         })
     }
 
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn dimension(&self) -> usize {
         self.dimension
     }
@@ -508,17 +579,8 @@ fn resolve_model_dir(base_dir: &Path, model_name: &str) -> SearchResult<PathBuf>
 }
 
 fn select_model_file(model_dir: &Path) -> Option<PathBuf> {
-    let modern = model_dir.join(MODEL_ONNX_SUBDIR);
-    if modern.is_file() {
-        return Some(modern);
-    }
-
-    let legacy = model_dir.join(MODEL_ONNX_LEGACY);
-    if legacy.is_file() {
-        return Some(legacy);
-    }
-
-    None
+    let registered = model_dir.join(MODEL_ONNX_SUBDIR);
+    registered.is_file().then_some(registered)
 }
 
 fn has_required_files(dir: &Path) -> bool {
@@ -554,10 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn has_required_files_accepts_legacy_layout() {
+    fn has_required_files_rejects_unregistered_legacy_onnx_path() {
         let temp = tempfile::tempdir().unwrap();
         create_stub_model_layout(temp.path(), false);
-        assert!(has_required_files(temp.path()));
+        assert!(!has_required_files(temp.path()));
     }
 
     #[test]
@@ -597,7 +659,7 @@ mod tests {
     #[test]
     fn map_lock_error_poisoned_to_embedding_failed() {
         let err = map_lock_error("all-MiniLM-L6-v2", "fastembed.embed", LockError::Poisoned);
-        assert!(matches!(err, SearchError::EmbeddingFailed { .. }));
+        assert!(matches!(&err, SearchError::EmbeddingFailed { .. }));
     }
 
     #[test]
@@ -607,15 +669,13 @@ mod tests {
             "fastembed.embed",
             LockError::PolledAfterCompletion,
         );
-        match err {
-            SearchError::EmbeddingFailed { source, .. } => {
-                assert!(
-                    source
-                        .to_string()
-                        .contains("future polled after completion")
-                );
-            }
-            other => panic!("expected EmbeddingFailed variant, got {other:?}"),
+        assert!(matches!(err, SearchError::EmbeddingFailed { .. }));
+        if let SearchError::EmbeddingFailed { source, .. } = err {
+            assert!(
+                source
+                    .to_string()
+                    .contains("future polled after completion")
+            );
         }
     }
 
@@ -662,12 +722,11 @@ mod tests {
     }
 
     #[test]
-    fn select_model_file_falls_back_to_legacy() {
+    fn select_model_file_rejects_unregistered_legacy_path() {
         let temp = tempfile::tempdir().unwrap();
-        // Only legacy model.onnx, no onnx/ subdir
+        // Only unregistered legacy model.onnx, no frozen onnx/ path.
         std::fs::write(temp.path().join("model.onnx"), b"legacy").unwrap();
-        let selected = select_model_file(temp.path()).unwrap();
-        assert!(selected.ends_with(MODEL_ONNX_LEGACY));
+        assert!(select_model_file(temp.path()).is_none());
     }
 
     #[test]
@@ -687,22 +746,18 @@ mod tests {
     #[test]
     fn map_lock_error_preserves_phase_string() {
         let err = map_lock_error("test-model", "test.phase", LockError::Cancelled);
-        match err {
-            SearchError::Cancelled { phase, .. } => {
-                assert_eq!(phase, "test.phase");
-            }
-            _ => panic!("expected Cancelled variant"),
+        assert!(matches!(&err, SearchError::Cancelled { .. }));
+        if let SearchError::Cancelled { phase, .. } = err {
+            assert_eq!(phase, "test.phase");
         }
     }
 
     #[test]
     fn map_lock_error_preserves_model_string() {
         let err = map_lock_error("custom-model", "embed", LockError::Poisoned);
-        match err {
-            SearchError::EmbeddingFailed { model, .. } => {
-                assert_eq!(model, "custom-model");
-            }
-            _ => panic!("expected EmbeddingFailed variant"),
+        assert!(matches!(&err, SearchError::EmbeddingFailed { .. }));
+        if let SearchError::EmbeddingFailed { model, .. } = err {
+            assert_eq!(model, "custom-model");
         }
     }
 
@@ -710,11 +765,9 @@ mod tests {
     fn resolve_model_dir_error_message_includes_paths() {
         let temp = tempfile::tempdir().unwrap();
         let err = resolve_model_dir(temp.path(), "my-model").unwrap_err();
-        match err {
-            SearchError::ModelNotFound { name } => {
-                assert!(name.contains("my-model"), "error should include model name");
-            }
-            _ => panic!("expected ModelNotFound variant"),
+        assert!(matches!(&err, SearchError::ModelNotFound { .. }));
+        if let SearchError::ModelNotFound { name } = err {
+            assert!(name.contains("my-model"), "error should include model name");
         }
     }
 
@@ -730,19 +783,126 @@ mod tests {
         let minilm = OnnxEmbedderConfig::for_name("minilm").unwrap();
         assert_eq!(minilm.embedder_id, "minilm-384");
         assert_eq!(minilm.dimension, 384);
+        assert_eq!(
+            OnnxEmbedderConfig::for_name("all-minilm-l6-v2")
+                .unwrap()
+                .dimension,
+            384
+        );
 
         let snowflake = OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap();
         assert_eq!(snowflake.embedder_id, "snowflake-arctic-s-384");
         assert_eq!(snowflake.dimension, 384);
+        assert_eq!(
+            OnnxEmbedderConfig::for_name("snowflake-arctic-embed-s")
+                .unwrap()
+                .dimension,
+            384
+        );
 
         let nomic = OnnxEmbedderConfig::for_name("nomic-embed").unwrap();
         assert_eq!(nomic.embedder_id, "nomic-embed-768");
         assert_eq!(nomic.dimension, 768);
+        assert_eq!(
+            OnnxEmbedderConfig::for_name("nomic-embed-text-v1.5")
+                .unwrap()
+                .dimension,
+            768
+        );
     }
 
     #[test]
     fn onnx_config_for_name_unknown_returns_none() {
         assert!(OnnxEmbedderConfig::for_name("unknown-model").is_none());
         assert!(OnnxEmbedderConfig::for_name("").is_none());
+    }
+
+    #[test]
+    fn frozen_manifest_rejects_pooling_and_dimension_drift() {
+        let pooling_drift = OnnxEmbedderConfig {
+            pooling: Pooling::Cls,
+            ..OnnxEmbedderConfig::default()
+        };
+        assert!(matches!(
+            frozen_manifest_for_config(&pooling_drift),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+
+        let mut dimension_drift = OnnxEmbedderConfig::default();
+        dimension_drift.dimension += 1;
+        assert!(matches!(
+            frozen_manifest_for_config(&dimension_drift),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+
+        let unregistered = OnnxEmbedderConfig {
+            model_id: "unregistered-model".to_owned(),
+            ..OnnxEmbedderConfig::default()
+        };
+        assert!(matches!(
+            frozen_manifest_for_config(&unregistered),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+    }
+
+    fn assert_conformance_fixture(
+        environment_variable: &str,
+        config: OnnxEmbedderConfig,
+        manifest: &ModelArtifactManifestV1,
+    ) {
+        let dir = std::env::var(environment_variable)
+            .expect("conformance fixture environment variable must name the verified model dir");
+        let expected_identity = manifest
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .expect("derive registered FastEmbed identity");
+        let embedder =
+            FastEmbedEmbedder::load_with_config(&dir, config).expect("load verified ONNX model");
+        assert_eq!(embedder.identity().unwrap(), &expected_identity);
+        let texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread conformance runtime");
+        let cx = Cx::for_testing();
+        let vectors = runtime
+            .block_on(embedder.embed_batch(&cx, texts))
+            .expect("embed bounded conformance corpus");
+        let observed = frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+            texts, &vectors,
+        )
+        .expect("compute exact conformance certificate");
+        assert_eq!(
+            observed, manifest.execution.golden_vectors,
+            "FastEmbed output bits drifted from the registered producer certificate"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires verified MiniLM ONNX assets via FASTEMBED_MINILM_FIXTURE_DIR"]
+    fn minilm_conformance_certificate_matches_fixture() {
+        assert_conformance_fixture(
+            "FASTEMBED_MINILM_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("minilm").unwrap(),
+            &ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires verified Snowflake ONNX assets via FASTEMBED_SNOWFLAKE_FIXTURE_DIR"]
+    fn snowflake_conformance_certificate_matches_fixture() {
+        assert_conformance_fixture(
+            "FASTEMBED_SNOWFLAKE_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("snowflake-arctic-s").unwrap(),
+            &ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires verified Nomic ONNX assets via FASTEMBED_NOMIC_FIXTURE_DIR"]
+    fn nomic_conformance_certificate_matches_fixture() {
+        assert_conformance_fixture(
+            "FASTEMBED_NOMIC_FIXTURE_DIR",
+            OnnxEmbedderConfig::for_name("nomic-embed").unwrap(),
+            &ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        );
     }
 }

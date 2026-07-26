@@ -33,12 +33,20 @@ use asupersync::sync::OnceCell;
 // `warn` is needed unconditionally: `report_readiness` escalates a hash-only
 // stack in every build, including the default `hash`-only one that compiles
 // none of the model backends.
-#[cfg(any(feature = "model2vec", feature = "fastembed", feature = "api"))]
+#[cfg(any(feature = "model2vec", feature = "fastembed"))]
 use tracing::{debug, info, warn};
-#[cfg(not(any(feature = "model2vec", feature = "fastembed", feature = "api")))]
+#[cfg(not(any(feature = "model2vec", feature = "fastembed")))]
 use tracing::{info, warn};
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+#[cfg(feature = "api")]
+use frankensearch_core::generation::FrozenEmbeddingIdentityBundleV1;
+#[cfg(all(
+    feature = "download",
+    any(feature = "model2vec", feature = "fastembed")
+))]
+use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::traits::{Embedder, SearchFuture};
 #[cfg(all(
     feature = "download",
@@ -62,6 +70,11 @@ use crate::hash_embedder::HashEmbedder;
     any(feature = "model2vec", feature = "fastembed")
 ))]
 use crate::model_download::{DownloadProgress, ModelDownloader};
+#[cfg(all(
+    feature = "download",
+    any(feature = "model2vec", feature = "fastembed")
+))]
+use crate::model_manifest::ModelArtifactManifestV1;
 #[cfg(any(feature = "model2vec", feature = "fastembed"))]
 use crate::model_manifest::ModelManifest;
 #[cfg(all(
@@ -247,14 +260,26 @@ pub struct EmbedderStack {
 
 impl fmt::Debug for EmbedderStack {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fast_identity = self.fast.identity().map_or_else(
+            |_| "unverifiable".to_owned(),
+            EmbeddingIdentityBundleV1::fingerprint,
+        );
+        let quality_identity = self.quality.as_ref().map(|embedder| {
+            embedder.identity().map_or_else(
+                |_| "unverifiable".to_owned(),
+                EmbeddingIdentityBundleV1::fingerprint,
+            )
+        });
         f.debug_struct("EmbedderStack")
             .field("availability", &self.availability)
-            .field("fast_id", &self.fast.id())
+            .field("fast_category", &self.fast.category())
             .field("fast_dim", &self.fast.dimension())
+            .field("fast_identity", &fast_identity)
             .field(
-                "quality_id",
-                &self.quality.as_ref().map(|embedder| embedder.id()),
+                "quality_category",
+                &self.quality.as_ref().map(|embedder| embedder.category()),
             )
+            .field("quality_identity", &quality_identity)
             .finish()
     }
 }
@@ -360,20 +385,32 @@ impl EmbedderStack {
     /// caller receives an ordinary-looking `Ok` holding lexical-only results.
     /// Announcing that at `info!` is precisely how "semantic search never
     /// works" reaches users as silence, so it is escalated to `warn!` and
-    /// carries the full actionable diagnosis from
-    /// [`degradation_message`](Self::degradation_message) — which until now had
-    /// no production caller at all.
+    /// carries a bounded reason code. The richer
+    /// [`degradation_message`](Self::degradation_message) remains available to
+    /// an explicit user-facing diagnostics surface because it includes the
+    /// configured model-cache path and must not enter structured logs.
     ///
     /// [`TwoTierSearcher`]: https://docs.rs/frankensearch/latest/frankensearch/struct.TwoTierSearcher.html
     fn report_readiness(&self) {
-        let quality = self.quality.as_ref().map(|embedder| embedder.id());
+        let fast_identity = self.fast.identity().map_or_else(
+            |_| "unverifiable".to_owned(),
+            EmbeddingIdentityBundleV1::fingerprint,
+        );
+        let quality_identity = self.quality.as_ref().map(|embedder| {
+            embedder.identity().map_or_else(
+                |_| "unverifiable".to_owned(),
+                EmbeddingIdentityBundleV1::fingerprint,
+            )
+        });
+        let quality_category = self.quality.as_ref().map(|embedder| embedder.category());
         if matches!(self.availability, TwoTierAvailability::HashOnly) {
-            let detail = self.degradation_message().unwrap_or_default();
             warn!(
                 availability = ?self.availability,
-                fast = self.fast.id(),
-                quality,
-                detail = %detail,
+                fast_category = ?self.fast.category(),
+                fast_identity = %fast_identity,
+                quality_category = ?quality_category,
+                quality_identity = ?quality_identity,
+                reason = "no-semantic-model",
                 "SEMANTIC SEARCH UNAVAILABLE: no embedding model was found, so \
                  retrieval fell back to non-semantic hash vectors. Vector search \
                  will not return meaningful results until a model is installed."
@@ -382,8 +419,10 @@ impl EmbedderStack {
         }
         info!(
             availability = ?self.availability,
-            fast = self.fast.id(),
-            quality,
+            fast_category = ?self.fast.category(),
+            fast_identity = %fast_identity,
+            quality_category = ?quality_category,
+            quality_identity = ?quality_identity,
             "embedder stack ready"
         );
     }
@@ -616,13 +655,14 @@ pub struct DimReduceEmbedder {
     target_dim: usize,
     id: String,
     model_name: String,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 impl fmt::Debug for DimReduceEmbedder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DimReduceEmbedder")
-            .field("inner", &self.inner.id())
             .field("target_dim", &self.target_dim)
+            .field("identity", &self.identity.fingerprint())
             .finish_non_exhaustive()
     }
 }
@@ -658,10 +698,22 @@ impl DimReduceEmbedder {
                 reason: "embedder does not support MRL truncation".to_owned(),
             });
         }
+        let target_dimension =
+            u32::try_from(target_dim).map_err(|_| SearchError::InvalidConfig {
+                field: "target_dim".to_owned(),
+                value: target_dim.to_string(),
+                reason: "target dimension does not fit the identity schema".to_owned(),
+            })?;
+        let identity = inner.identity()?.derive_projection(
+            target_dimension,
+            "prefix-truncate-first-n-dimensions-v1",
+            "l2-f32-zero-on-degenerate-v1",
+        )?;
 
         Ok(Self {
             id: format!("{}-mrl-{target_dim}", inner.id()),
             model_name: format!("{} (MRL {target_dim})", inner.model_name()),
+            identity,
             inner,
             target_dim,
         })
@@ -692,6 +744,10 @@ impl Embedder for DimReduceEmbedder {
 
     fn dimension(&self) -> usize {
         self.target_dim
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
     }
 
     fn id(&self) -> &str {
@@ -848,10 +904,17 @@ fn maybe_lazy_fast_embedder(
         tier = "fast",
         "model not found locally; deferring download to first embed call"
     );
-    Some(Arc::new(LazyModel2VecEmbedder::new(
-        model_root.map(Path::to_path_buf),
-        policy,
-    )))
+    match LazyModel2VecEmbedder::new(model_root.map(Path::to_path_buf), policy) {
+        Ok(embedder) => Some(Arc::new(embedder)),
+        Err(_error) => {
+            warn!(
+                model = POTION_MODEL_NAME,
+                reason = "registered-identity-invalid",
+                "registered lazy fast-tier identity is invalid"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(all(
@@ -890,10 +953,17 @@ fn maybe_lazy_quality_embedder(
         tier = "quality",
         "model not found locally; deferring download to first embed call"
     );
-    Some(Arc::new(LazyFastEmbedEmbedder::new(
-        model_root.map(Path::to_path_buf),
-        policy,
-    )))
+    match LazyFastEmbedEmbedder::new(model_root.map(Path::to_path_buf), policy) {
+        Ok(embedder) => Some(Arc::new(embedder)),
+        Err(_error) => {
+            warn!(
+                model = MINILM_MODEL_NAME,
+                reason = "registered-identity-invalid",
+                "registered lazy quality-tier identity is invalid"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(all(
@@ -948,7 +1018,6 @@ async fn download_and_install_manifest(
 
     info!(
         model = %manifest.id,
-        destination = %destination_dir.display(),
         bytes = manifest.total_size_bytes(),
         "starting automatic model download"
     );
@@ -971,7 +1040,7 @@ async fn download_and_install_manifest(
             warn!(
                 model = %manifest.id,
                 duration_ms = start.elapsed().as_millis(),
-                error = %error,
+                reason = "transport_or_verification_failed",
                 "automatic model download failed"
             );
             return Err(error);
@@ -980,14 +1049,10 @@ async fn download_and_install_manifest(
 
     match manifest.promote_verified_installation(&staged, destination_dir) {
         Ok(backup) => {
-            let backup_path = backup
-                .as_ref()
-                .map_or_else(|| "none".to_owned(), |path| path.display().to_string());
             reporter.finish_ok(start.elapsed(), manifest.total_size_bytes());
             info!(
                 model = %manifest.id,
-                destination = %destination_dir.display(),
-                backup = %backup_path,
+                backup_created = backup.is_some(),
                 duration_ms = start.elapsed().as_millis(),
                 bytes = manifest.total_size_bytes(),
                 "automatic model download completed"
@@ -998,9 +1063,8 @@ async fn download_and_install_manifest(
             reporter.finish_failed(start.elapsed(), &error);
             warn!(
                 model = %manifest.id,
-                destination = %destination_dir.display(),
                 duration_ms = start.elapsed().as_millis(),
-                error = %error,
+                reason = "verified_promotion_failed",
                 "automatic model promotion failed"
             );
             Err(error)
@@ -1013,16 +1077,20 @@ struct LazyModel2VecEmbedder {
     model_root: Option<PathBuf>,
     policy: DownloadPolicy,
     inner: OnceCell<Arc<dyn Embedder>>,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 #[cfg(all(feature = "download", feature = "model2vec"))]
 impl LazyModel2VecEmbedder {
-    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
-        Self {
+    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> SearchResult<Self> {
+        let identity = ModelArtifactManifestV1::potion_128m_native()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        Ok(Self {
             model_root,
             policy,
             inner: OnceCell::new(),
-        }
+            identity,
+        })
     }
 
     async fn ensure_loaded(&self, cx: &Cx) -> SearchResult<Arc<dyn Embedder>> {
@@ -1035,6 +1103,16 @@ impl LazyModel2VecEmbedder {
 
     async fn initialize(&self, cx: &Cx) -> SearchResult<Arc<dyn Embedder>> {
         if let Some(existing) = detect_fast_embedder(self.model_root.as_deref()) {
+            let loaded_identity = existing.identity()?;
+            // ubs:ignore — fingerprints are public compatibility IDs, not secrets.
+            if loaded_identity.fingerprint() != self.identity.fingerprint() {
+                return Err(SearchError::InvalidConfig {
+                    field: "lazy_model2vec.identity".to_owned(),
+                    value: loaded_identity.fingerprint(),
+                    reason: "detected loaded identity disagrees with the registered lazy identity"
+                        .to_owned(),
+                });
+            }
             return Ok(existing);
         }
         if !self.policy.can_download() {
@@ -1047,8 +1125,18 @@ impl LazyModel2VecEmbedder {
         let manifest = ModelManifest::potion_128m();
         let destination = install_destination_dir(self.model_root.as_deref(), POTION_MODEL_NAME)?;
         download_and_install_manifest(cx, &manifest, &destination, self.policy).await?;
-        Model2VecEmbedder::load_with_name(&destination, POTION_MODEL_NAME)
-            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+        let embedder = Model2VecEmbedder::load_with_name(&destination, POTION_MODEL_NAME)?;
+        let loaded_identity = embedder.identity()?;
+        // ubs:ignore — fingerprints are public compatibility IDs, not secrets.
+        if loaded_identity.fingerprint() != self.identity.fingerprint() {
+            return Err(SearchError::InvalidConfig {
+                field: "lazy_model2vec.identity".to_owned(),
+                value: loaded_identity.fingerprint(),
+                reason: "verified loaded identity disagrees with the registered lazy identity"
+                    .to_owned(),
+            });
+        }
+        Ok(Arc::new(embedder))
     }
 }
 
@@ -1076,6 +1164,10 @@ impl Embedder for LazyModel2VecEmbedder {
         POTION_DIMENSION
     }
 
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+
     fn id(&self) -> &str {
         POTION_MODEL_NAME
     }
@@ -1099,10 +1191,6 @@ impl Embedder for LazyModel2VecEmbedder {
     fn tier(&self) -> ModelTier {
         ModelTier::Fast
     }
-
-    fn supports_mrl(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(all(feature = "download", feature = "fastembed"))]
@@ -1110,16 +1198,20 @@ struct LazyFastEmbedEmbedder {
     model_root: Option<PathBuf>,
     policy: DownloadPolicy,
     inner: OnceCell<Arc<dyn Embedder>>,
+    identity: EmbeddingIdentityBundleV1,
 }
 
 #[cfg(all(feature = "download", feature = "fastembed"))]
 impl LazyFastEmbedEmbedder {
-    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> Self {
-        Self {
+    fn new(model_root: Option<PathBuf>, policy: DownloadPolicy) -> SearchResult<Self> {
+        let identity = ModelArtifactManifestV1::minilm_fastembed()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        Ok(Self {
             model_root,
             policy,
             inner: OnceCell::new(),
-        }
+            identity,
+        })
     }
 
     async fn ensure_loaded(&self, cx: &Cx) -> SearchResult<Arc<dyn Embedder>> {
@@ -1132,6 +1224,16 @@ impl LazyFastEmbedEmbedder {
 
     async fn initialize(&self, cx: &Cx) -> SearchResult<Arc<dyn Embedder>> {
         if let Some(existing) = detect_quality_embedder(self.model_root.as_deref()) {
+            let loaded_identity = existing.identity()?;
+            // ubs:ignore — fingerprints are public compatibility IDs, not secrets.
+            if loaded_identity.fingerprint() != self.identity.fingerprint() {
+                return Err(SearchError::InvalidConfig {
+                    field: "lazy_fastembed.identity".to_owned(),
+                    value: loaded_identity.fingerprint(),
+                    reason: "detected loaded identity disagrees with the registered lazy identity"
+                        .to_owned(),
+                });
+            }
             return Ok(existing);
         }
         if !self.policy.can_download() {
@@ -1144,8 +1246,18 @@ impl LazyFastEmbedEmbedder {
         let manifest = ModelManifest::minilm_v2();
         let destination = install_destination_dir(self.model_root.as_deref(), MINILM_MODEL_NAME)?;
         download_and_install_manifest(cx, &manifest, &destination, self.policy).await?;
-        FastEmbedEmbedder::load_with_name(&destination, MINILM_MODEL_NAME)
-            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+        let embedder = FastEmbedEmbedder::load_with_name(&destination, MINILM_MODEL_NAME)?;
+        let loaded_identity = embedder.identity()?;
+        // ubs:ignore — fingerprints are public compatibility IDs, not secrets.
+        if loaded_identity.fingerprint() != self.identity.fingerprint() {
+            return Err(SearchError::InvalidConfig {
+                field: "lazy_fastembed.identity".to_owned(),
+                value: loaded_identity.fingerprint(),
+                reason: "verified loaded identity disagrees with the registered lazy identity"
+                    .to_owned(),
+            });
+        }
+        Ok(Arc::new(embedder))
     }
 }
 
@@ -1171,6 +1283,10 @@ impl Embedder for LazyFastEmbedEmbedder {
 
     fn dimension(&self) -> usize {
         MINILM_DIMENSION
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
     }
 
     fn id(&self) -> &str {
@@ -1249,20 +1365,18 @@ impl DownloadProgressReporter {
         }
     }
 
-    fn finish_failed(&self, elapsed: std::time::Duration, error: &SearchError) {
+    fn finish_failed(&self, elapsed: std::time::Duration, _error: &SearchError) {
         if self.stderr_is_tty {
             eprintln!(
-                "\rDownload failed for {} after {:.1}s: {}",
+                "\rDownload failed for {} after {:.1}s",
                 self.model_id,
                 elapsed.as_secs_f64(),
-                error
             );
         } else {
             eprintln!(
-                "Download failed for {} after {:.1}s: {}",
+                "Download failed for {} after {:.1}s",
                 self.model_id,
                 elapsed.as_secs_f64(),
-                error
             );
         }
     }
@@ -1421,10 +1535,7 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
         find_model2vec_model_dir(POTION_MODEL_NAME, POTION_HF_ID)
     };
     let candidates = candidate_directories(model_root, POTION_MODEL_NAME, discovered.as_deref());
-    let checked_paths: Vec<String> = candidates
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
+    let checked_candidates = candidates.len();
 
     for candidate in candidates {
         let missing = missing_manifest_files(&manifest, &candidate);
@@ -1433,18 +1544,16 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
                 debug!(
                     model = POTION_MODEL_NAME,
                     tier = "fast",
-                    path = %candidate.display(),
                     missing = ?missing,
                     "model directory exists but is incomplete, skipping candidate"
                 );
             }
             continue;
         }
-        if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
+        if let Err(_error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
             warn!(
                 model = POTION_MODEL_NAME,
-                path = %candidate.display(),
-                error = %error,
+                reason = "manifest_verification_failed",
                 "model2vec manifest verification failed, skipping candidate"
             );
             continue;
@@ -1455,18 +1564,20 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
                 info!(
                     model = POTION_MODEL_NAME,
                     tier = "fast",
-                    path = %candidate.display(),
                     dimension = embedder.dimension(),
+                    identity = embedder.identity().map_or_else(
+                        |_| "unverifiable".to_owned(),
+                        EmbeddingIdentityBundleV1::fingerprint
+                    ),
                     "embedder detected"
                 );
                 return Some(Arc::new(embedder));
             }
-            Err(error) => {
+            Err(_error) => {
                 warn!(
                     model = POTION_MODEL_NAME,
                     tier = "fast",
-                    path = %candidate.display(),
-                    error = %error,
+                    reason = "backend_load_failed",
                     "embedder unavailable"
                 );
             }
@@ -1476,7 +1587,7 @@ fn detect_fast_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder>> 
     info!(
         model = POTION_MODEL_NAME,
         tier = "fast",
-        checked_paths = ?checked_paths,
+        checked_candidates,
         "embedder unavailable"
     );
     None
@@ -1498,10 +1609,7 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
         find_fastembed_model_dir(MINILM_MODEL_NAME, MINILM_HF_ID)
     };
     let candidates = candidate_directories(model_root, MINILM_MODEL_NAME, discovered.as_deref());
-    let checked_paths: Vec<String> = candidates
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
+    let checked_candidates = candidates.len();
 
     for candidate in candidates {
         let missing = missing_manifest_files(&manifest, &candidate);
@@ -1510,18 +1618,16 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
                 debug!(
                     model = MINILM_MODEL_NAME,
                     tier = "quality",
-                    path = %candidate.display(),
                     missing = ?missing,
                     "model directory exists but is incomplete, skipping candidate"
                 );
             }
             continue;
         }
-        if let Err(error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
+        if let Err(_error) = crate::model_manifest::verify_dir_cached(&manifest, &candidate) {
             warn!(
                 model = MINILM_MODEL_NAME,
-                path = %candidate.display(),
-                error = %error,
+                reason = "manifest_verification_failed",
                 "quality manifest verification failed, skipping candidate"
             );
             continue;
@@ -1532,18 +1638,20 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
                 info!(
                     model = MINILM_MODEL_NAME,
                     tier = "quality",
-                    path = %candidate.display(),
                     dimension = embedder.dimension(),
+                    identity = embedder.identity().map_or_else(
+                        |_| "unverifiable".to_owned(),
+                        EmbeddingIdentityBundleV1::fingerprint
+                    ),
                     "embedder detected"
                 );
                 return Some(Arc::new(embedder));
             }
-            Err(error) => {
+            Err(_error) => {
                 warn!(
                     model = MINILM_MODEL_NAME,
                     tier = "quality",
-                    path = %candidate.display(),
-                    error = %error,
+                    reason = "backend_load_failed",
                     "embedder unavailable"
                 );
             }
@@ -1553,7 +1661,7 @@ fn detect_quality_embedder(model_root: Option<&Path>) -> Option<Arc<dyn Embedder
     info!(
         model = MINILM_MODEL_NAME,
         tier = "quality",
-        checked_paths = ?checked_paths,
+        checked_candidates,
         "embedder unavailable"
     );
     None
@@ -1579,7 +1687,10 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 ///
 /// Checks for `OPENAI_API_KEY` or `GEMINI_API_KEY`, with optional
 /// `FRANKENSEARCH_API_PROVIDER`, `FRANKENSEARCH_API_MODEL`, and
-/// `FRANKENSEARCH_API_DIMENSION` overrides.
+/// `FRANKENSEARCH_API_DIMENSION` overrides. Remote use additionally requires a
+/// frozen `FrozenEmbeddingIdentityBundleV1` (structured identity, canonical
+/// bytes, and digest) in `FRANKENSEARCH_API_IDENTITY_JSON`; a mutable provider
+/// model name is never treated as compatibility evidence.
 ///
 /// Returns a cached `ApiEmbedder` for the quality tier.
 #[cfg(feature = "api")]
@@ -1592,6 +1703,36 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
     let explicit_dim: Option<usize> = std::env::var("FRANKENSEARCH_API_DIMENSION")
         .ok()
         .and_then(|s| s.parse().ok());
+    let Ok(identity_json) = std::env::var("FRANKENSEARCH_API_IDENTITY_JSON") else {
+        if std::env::var_os("OPENAI_API_KEY").is_some()
+            || std::env::var_os("GEMINI_API_KEY").is_some()
+        {
+            warn!(
+                field = "FRANKENSEARCH_API_IDENTITY_JSON",
+                "remote embedder ignored because no immutable space epoch was supplied"
+            );
+        }
+        return None;
+    };
+    let identity: FrozenEmbeddingIdentityBundleV1 = match serde_json::from_str(&identity_json) {
+        Ok(identity) => identity,
+        Err(_error) => {
+            warn!(
+                field = "FRANKENSEARCH_API_IDENTITY_JSON",
+                reason = "malformed-json",
+                "remote embedder ignored because its immutable space epoch is malformed"
+            );
+            return None;
+        }
+    };
+    if let Err(_error) = identity.validate() {
+        warn!(
+            field = "FRANKENSEARCH_API_IDENTITY_JSON",
+            reason = "identity-validation-failed",
+            "remote embedder ignored because its immutable space epoch is invalid"
+        );
+        return None;
+    }
 
     let provider: Box<dyn crate::api_provider::ApiProvider> = match explicit_provider.as_deref() {
         Some("gemini") => {
@@ -1630,21 +1771,33 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
                 return None;
             }
         }
-        Some(other) => {
-            warn!(provider = other, "unknown FRANKENSEARCH_API_PROVIDER value");
+        Some(_other) => {
+            warn!(
+                field = "FRANKENSEARCH_API_PROVIDER",
+                reason = "unknown-provider",
+                "unknown remote embedding provider"
+            );
             return None;
         }
     };
 
     info!(
         provider = provider.provider_name(),
-        model = provider.api_model_id(),
         dimension = provider.dimension(),
+        identity = identity.fingerprint.as_str(),
         "detected API embedder from environment"
     );
 
-    let embedder = ApiEmbedder::with_defaults(provider);
-    Some(Arc::new(embedder.cached_default()))
+    match ApiEmbedder::with_defaults(provider, Some(identity)) {
+        Ok(embedder) => Some(Arc::new(embedder.cached_default())),
+        Err(_error) => {
+            warn!(
+                reason = "provider-identity-disagreement",
+                "remote embedder ignored because its provider and immutable epoch disagree"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(not(feature = "api"))]
@@ -1658,16 +1811,15 @@ fn materialize_bundled_default_models(model_root: Option<&Path>) {
         Ok(summary) => {
             if summary.models_written > 0 {
                 info!(
-                    model_root = %summary.model_root.display(),
                     models_written = summary.models_written,
                     bytes_written = summary.bytes_written,
                     "materialized bundled default semantic models"
                 );
             }
         }
-        Err(error) => {
+        Err(_error) => {
             warn!(
-                error = %error,
+                reason = "bundled-model-materialization-failed",
                 "failed to materialize bundled default semantic models; continuing with normal detection"
             );
         }
@@ -1717,11 +1869,7 @@ fn candidate_directories(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(
-        feature = "model2vec",
-        feature = "hash",
-        not(feature = "bundled-default-models")
-    ))]
+    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
     use std::fs;
 
     #[cfg(all(feature = "download", feature = "model2vec"))]
@@ -1729,6 +1877,63 @@ mod tests {
 
     use super::*;
     use frankensearch_core::traits::ModelCategory;
+
+    struct MrlFixtureEmbedder {
+        identity: EmbeddingIdentityBundleV1,
+    }
+
+    impl MrlFixtureEmbedder {
+        fn semantic_nomic() -> Self {
+            let identity = crate::model_manifest::ModelArtifactManifestV1::nomic_fastembed()
+                .expect("registered Nomic manifest")
+                .declared_identity_bundle(
+                    frankensearch_core::generation::QuantizationFormat::F32,
+                    "in-memory-f32-v1",
+                )
+                .expect("derive semantic MRL fixture identity");
+            Self { identity }
+        }
+    }
+
+    impl Embedder for MrlFixtureEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                Err(SearchError::EmbeddingFailed {
+                    model: "mrl-structural-fixture".to_owned(),
+                    source: "identity-only test fixture does not run inference".into(),
+                })
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            usize::try_from(self.identity.space.dimension)
+                .expect("fixture dimension must fit usize")
+        }
+
+        fn id(&self) -> &'static str {
+            "mrl-structural-fixture"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "MRL structural fixture"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
+        }
+
+        fn supports_mrl(&self) -> bool {
+            true
+        }
+    }
 
     #[cfg(all(feature = "hash", not(feature = "bundled-default-models")))]
     #[test]
@@ -1860,7 +2065,8 @@ mod tests {
                 false,
                 false,
             ),
-        );
+        )
+        .unwrap();
 
         run_test_with_cx(|cx| async move {
             let err = lazy
@@ -1905,11 +2111,7 @@ mod tests {
         assert_eq!(progress_percent_x100(&progress), 3_750);
     }
 
-    #[cfg(all(
-        feature = "model2vec",
-        feature = "hash",
-        not(feature = "bundled-default-models")
-    ))]
+    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
     fn create_test_model2vec_layout(dir: &Path, vocab_size: usize, dimensions: usize) {
         let tokenizer_json = serde_json::json!({
             "version": "1.0",
@@ -1942,11 +2144,7 @@ mod tests {
         create_test_safetensors(dir, vocab_size, dimensions);
     }
 
-    #[cfg(all(
-        feature = "model2vec",
-        feature = "hash",
-        not(feature = "bundled-default-models")
-    ))]
+    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
     fn create_test_vocab(vocab_size: usize) -> serde_json::Value {
         let mut vocab = serde_json::Map::new();
         vocab.insert("[UNK]".to_owned(), serde_json::Value::from(0));
@@ -2008,6 +2206,25 @@ mod tests {
         assert!(!inner.supports_mrl());
         let err = DimReduceEmbedder::new(inner, 64).expect_err("should reject non-MRL embedder");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn dim_reduce_derives_structural_identity() {
+        let inner: Arc<dyn Embedder> = Arc::new(MrlFixtureEmbedder::semantic_nomic());
+        assert!(inner.is_semantic());
+        assert!(inner.supports_mrl());
+        let parent = inner.identity().unwrap().clone();
+        let reduced = DimReduceEmbedder::new(inner, 4).unwrap();
+        let child = reduced.identity().unwrap();
+        child.validate().unwrap();
+        let projection = child.space.projection.as_ref().unwrap();
+        assert_eq!(
+            projection.parent_space_fingerprint,
+            parent.space.fingerprint()
+        );
+        assert_eq!(projection.source_dimension, 768);
+        assert_eq!(projection.output_dimension, 4);
+        assert_eq!(child.storage.dimension, 4);
     }
 
     #[cfg(feature = "hash")]
@@ -2612,11 +2829,7 @@ mod tests {
 
     // ─── bd-1il3 tests end ───
 
-    #[cfg(all(
-        feature = "model2vec",
-        feature = "hash",
-        not(feature = "bundled-default-models")
-    ))]
+    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
     fn create_test_safetensors(dir: &Path, vocab_size: usize, dimensions: usize) {
         use std::collections::HashMap;
 

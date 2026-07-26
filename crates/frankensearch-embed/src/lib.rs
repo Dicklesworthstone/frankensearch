@@ -81,10 +81,13 @@ pub use model_cache::{
     model_file_path, resolve_cache_root,
 };
 pub use model_manifest::{
-    ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, MANIFEST_SCHEMA_VERSION, ModelFile,
+    ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, FrozenModelArtifactManifestV1,
+    MANIFEST_SCHEMA_VERSION, MODEL_ARTIFACT_MANIFEST_SCHEMA_V1, ModelArtifactFileV1,
+    ModelArtifactManifestV1, ModelArtifactRoleV1, ModelExecutionContractV1, ModelFile,
     ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
-    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker, is_verification_cached,
-    resolve_download_consent, verify_dir_cached, verify_file_sha256, write_verification_marker,
+    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker, VerifiedModelArtifactsV1,
+    is_verification_cached, resolve_download_consent, verify_dir_cached, verify_file_sha256,
+    write_verification_marker,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,
@@ -127,4 +130,62 @@ pub mod api_embedder;
 #[cfg(feature = "api")]
 pub use api_embedder::ApiEmbedder;
 #[cfg(feature = "api")]
-pub use api_provider::{ApiProvider, GeminiProvider, OpenAiProvider};
+pub use api_provider::{ApiProvider, GeminiProvider, OpenAiProvider, RemoteEmbeddingAttestationV1};
+
+#[cfg(test)]
+mod build_policy_tests {
+    const BUILD_SCRIPT: &str = include_str!("../build.rs");
+    const AUTO_DETECT_SOURCE: &str = include_str!("auto_detect.rs");
+    const FASTEMBED_SOURCE: &str = include_str!("fastembed_embedder.rs");
+    const MODEL_DOWNLOAD_SOURCE: &str = include_str!("model_download.rs");
+    const MODEL_REGISTRY_SOURCE: &str = include_str!("model_registry.rs");
+    const MODEL2VEC_SOURCE: &str = include_str!("model2vec_embedder.rs");
+
+    #[test]
+    fn build_script_is_strictly_network_free_and_non_destructive() {
+        for forbidden in [
+            "Command::new",
+            "TcpStream",
+            "curl",
+            "http://",
+            "https://",
+            "remove_file",
+            "remove_dir",
+        ] {
+            assert!(
+                !BUILD_SCRIPT.contains(forbidden),
+                "build.rs contains forbidden network/destructive token {forbidden}"
+            );
+        }
+        assert!(BUILD_SCRIPT.contains("FRANKENSEARCH_BUNDLED_MODELS_SOURCE_DIR"));
+        assert!(BUILD_SCRIPT.contains("build.rs is network-free"));
+    }
+
+    #[test]
+    fn model_identity_logs_do_not_emit_raw_paths() {
+        for source in [
+            AUTO_DETECT_SOURCE,
+            FASTEMBED_SOURCE,
+            MODEL2VEC_SOURCE,
+            MODEL_DOWNLOAD_SOURCE,
+            MODEL_REGISTRY_SOURCE,
+        ] {
+            for forbidden in [
+                "path = %",
+                "model_dir = %",
+                "destination = %",
+                "checked_paths =",
+                "url = %",
+                "error = %",
+                "reason = %error",
+                "detail = %detail",
+                "provider = other",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "model logging source contains raw-path field {forbidden}"
+                );
+            }
+        }
+    }
+}

@@ -202,21 +202,28 @@ fn evaluate_embedder_revision_match(
 ) -> InvariantCheck {
     let mut failures = Vec::new();
     for (tier, expected) in &manifest.embedders {
+        let safe_tier = if tier.len() <= 128 && !tier.chars().any(char::is_control) {
+            tier.as_str()
+        } else {
+            "<redacted-tier>"
+        };
         let Some(actual) = verifier.runtime_embedder(tier) else {
-            failures.push(format!("runtime embedder missing for tier '{tier}'"));
+            failures.push(format!("runtime embedder missing for tier '{safe_tier}'"));
             continue;
         };
-        if actual != *expected {
+        if expected.validate().is_err() || actual.validate().is_err() {
             failures.push(format!(
-                "tier '{tier}' mismatch: expected model={} hash={} dim={} quant={:?}, got model={} hash={} dim={} quant={:?}",
-                expected.model_name,
-                expected.weights_hash,
-                expected.dimension,
-                expected.quantization,
-                actual.model_name,
-                actual.weights_hash,
-                actual.dimension,
-                actual.quantization,
+                "tier '{safe_tier}' mismatch: expected or runtime identity failed canonical validation"
+            ));
+        } else if actual.fingerprint != expected.fingerprint {
+            failures.push(format!(
+                "tier '{safe_tier}' mismatch: expected model={} identity={} dim={}, got model={} identity={} dim={}",
+                expected.identity.space.logical_model_id,
+                expected.fingerprint,
+                expected.identity.space.dimension,
+                actual.identity.space.logical_model_id,
+                actual.fingerprint,
+                actual.identity.space.dimension,
             ));
         }
     }
@@ -533,12 +540,11 @@ mod tests {
     use crate::generation::*;
 
     fn sample_embedder() -> EmbedderRevision {
-        EmbedderRevision {
-            model_name: "potion-128M".into(),
-            weights_hash: "abcdef1234567890".into(),
-            dimension: 256,
-            quantization: QuantizationFormat::F16,
-        }
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("potion-128M", 256);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".to_owned();
+        identity.freeze().unwrap()
     }
 
     /// Test verifier that always passes.
@@ -1080,12 +1086,7 @@ mod tests {
         let mut verifier = AlwaysPassVerifier::new("/data");
         verifier.runtime_embedders.insert(
             "fast".into(),
-            EmbedderRevision {
-                model_name: "different-model".into(),
-                weights_hash: "abcdef1234567890".into(),
-                dimension: 256,
-                quantization: QuantizationFormat::F16,
-            },
+            EmbedderRevision::explicit_test_model("different-model", 256),
         );
         let checks = check_invariants(&manifest, &verifier, None);
         assert_eq!(checks.len(), 1);
@@ -1106,6 +1107,53 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(checks[0].passed);
         assert!(checks[0].reason.contains("match manifest"));
+    }
+
+    #[test]
+    fn embedder_revision_with_tampered_canonical_digest_fails() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "emb_rev".into(),
+            description: "Embedder revision match".into(),
+            kind: InvariantKind::EmbedderRevisionMatch,
+        }];
+        let mut verifier = AlwaysPassVerifier::new("/data");
+        let mut tampered = manifest.embedders["fast"].clone();
+        tampered.fingerprint = "0".repeat(64);
+        verifier.runtime_embedders.insert("fast".into(), tampered);
+
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("mismatch"));
+    }
+
+    #[test]
+    fn malformed_embedder_identity_diagnostics_are_bounded_and_redacted() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "emb_rev".into(),
+            description: "Embedder revision match".into(),
+            kind: InvariantKind::EmbedderRevisionMatch,
+        }];
+        let expected = manifest.embedders.remove("fast").unwrap();
+        manifest
+            .embedders
+            .insert("fast\nforged-log-line".to_owned(), expected.clone());
+        let mut verifier = AlwaysPassVerifier::new("/data");
+        let mut malformed = expected;
+        malformed.identity.space.logical_model_id = "model\nforged-model-line".to_owned();
+        verifier
+            .runtime_embedders
+            .insert("fast\nforged-log-line".to_owned(), malformed);
+
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed);
+        assert!(checks[0].reason.contains("<redacted-tier>"));
+        assert!(checks[0].reason.contains("failed canonical validation"));
+        assert!(!checks[0].reason.contains("forged-log-line"));
+        assert!(!checks[0].reason.contains("forged-model-line"));
     }
 
     #[test]

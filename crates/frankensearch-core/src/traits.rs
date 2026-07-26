@@ -16,12 +16,99 @@ use asupersync::Cx;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{SearchError, SearchResult};
+use crate::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
 use crate::types::{
     EmbeddingMetrics, IndexMetrics, IndexableDocument, ScoredResult, SearchMetrics,
 };
 
 /// Boxed future carrying a `SearchResult<T>`.
 pub type SearchFuture<'a, T> = Pin<Box<dyn Future<Output = SearchResult<T>> + Send + 'a>>;
+
+fn bounded_embedder_diagnostic_id(id: &str) -> String {
+    if !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        id.to_owned()
+    } else {
+        "<redacted-embedder-id>".to_owned()
+    }
+}
+
+/// Vector output bound to the complete space, producer, input, and storage contracts.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityBoundEmbedding {
+    /// Raw f32 vector values.
+    pub values: Vec<f32>,
+    /// Complete validated identity bundle used to produce the vector.
+    pub identity: EmbeddingIdentityBundleV1,
+}
+
+impl fmt::Debug for IdentityBoundEmbedding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityBoundEmbedding")
+            .field("dimension", &self.values.len())
+            .field("identity", &self.identity.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl IdentityBoundEmbedding {
+    /// Validate the identity bundle and exact vector dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when the identity is malformed or the vector
+    /// length does not match its declared mathematical space.
+    pub fn validate(&self) -> SearchResult<()> {
+        self.identity.validate()?;
+        let declared_dimension = usize::try_from(self.identity.space.dimension).map_err(|_| {
+            SearchError::InvalidConfig {
+                field: "identity_bound_embedding.dimension".to_owned(),
+                value: self.identity.space.dimension.to_string(),
+                reason: "dimension does not fit usize".to_owned(),
+            }
+        })?;
+        if self.values.len() != declared_dimension {
+            return Err(SearchError::InvalidConfig {
+                field: "identity_bound_embedding.values".to_owned(),
+                value: self.values.len().to_string(),
+                reason: format!("expected {declared_dimension} vector elements"),
+            });
+        }
+        if self.identity.storage.quantization != QuantizationFormat::F32 {
+            return Err(SearchError::InvalidConfig {
+                field: "identity_bound_embedding.storage.quantization".to_owned(),
+                value: format!("{:?}", self.identity.storage.quantization),
+                reason: "an in-process Vec<f32> output must carry an f32 storage identity"
+                    .to_owned(),
+            });
+        }
+        if !self.identity.storage.format.starts_with("in-memory-") {
+            return Err(SearchError::InvalidConfig {
+                field: "identity_bound_embedding.storage.format".to_owned(),
+                value: self.identity.storage.format.clone(),
+                reason: "an in-process Vec<f32> output must carry an in-memory storage format"
+                    .to_owned(),
+            });
+        }
+        if !matches!(
+            self.identity.storage.endianness.as_str(),
+            "native-f32-values" | "native-test-only"
+        ) {
+            return Err(SearchError::InvalidConfig {
+                field: "identity_bound_embedding.storage.endianness".to_owned(),
+                value: self.identity.storage.endianness.clone(),
+                reason: "an in-process Vec<f32> output must carry a native-value contract"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
 
 // ─── Model Category ─────────────────────────────────────────────────────────
 
@@ -121,13 +208,19 @@ pub struct ModelInfo {
 ///
 /// # Contract
 ///
-/// - `embed()` and `embed_batch()` are cancel-aware and return boxed futures.
+/// - `embed()` and `embed_batch()` are raw inference primitives; any caller
+///   persisting, comparing, caching, or transporting vectors must use
+///   `embed_bound()` or `embed_batch_bound()` so space and producer identity
+///   travel with the values.
 /// - `dimension()` must be constant for the lifetime of the embedder.
-/// - `id()` must be stable across process restarts (it's stored in FSVI headers).
+/// - `id()` must be stable across process restarts for diagnostics and registry
+///   selection, but never establishes vector-space compatibility.
 pub trait Embedder: Send + Sync {
     /// Embed a single text string into a vector of f32 floats.
     ///
     /// The returned vector has exactly `self.dimension()` elements.
+    /// This raw primitive carries no compatibility proof; use
+    /// [`Self::embed_bound`] outside an implementation-local inference path.
     ///
     /// # Errors
     ///
@@ -139,6 +232,8 @@ pub trait Embedder: Send + Sync {
     /// Default implementation calls `embed` in a loop. Neural models should
     /// override this to exploit batch inference (ONNX has high fixed overhead
     /// but low marginal cost per additional input).
+    /// This raw primitive carries no compatibility proof; use
+    /// [`Self::embed_batch_bound`] when values leave the embedder boundary.
     ///
     /// # Errors
     ///
@@ -157,13 +252,70 @@ pub trait Embedder: Send + Sync {
         })
     }
 
+    /// Embed one input and bind the output to the complete verified identity.
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        Box::pin(async move {
+            let bound = IdentityBoundEmbedding {
+                values: self.embed(cx, text).await?,
+                identity: self.identity()?.clone(),
+            };
+            bound.validate()?;
+            Ok(bound)
+        })
+    }
+
+    /// Embed a batch and bind every output to the same verified identity.
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+        Box::pin(async move {
+            let identity = self.identity()?.clone();
+            self.embed_batch(cx, texts)
+                .await?
+                .into_iter()
+                .map(|values| {
+                    let bound = IdentityBoundEmbedding {
+                        values,
+                        identity: identity.clone(),
+                    };
+                    bound.validate()?;
+                    Ok(bound)
+                })
+                .collect()
+        })
+    }
+
+    /// Complete immutable identity of this embedder and its output/storage contract.
+    ///
+    /// Legacy/custom implementations that have not supplied a complete identity
+    /// fail closed here; raw model names and dimensions never synthesize
+    /// compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when the implementation is not identity-aware.
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Err(SearchError::InvalidConfig {
+            field: "embedder.identity".to_owned(),
+            value: bounded_embedder_diagnostic_id(self.id()),
+            reason: "embedder did not supply a complete immutable identity bundle".to_owned(),
+        })
+    }
+
     /// The dimensionality of embedding vectors produced by this model.
     fn dimension(&self) -> usize;
 
     /// A unique, stable identifier for this embedder.
     ///
     /// Examples: `"fnv-hash-384"`, `"potion-multilingual-128M"`, `"all-MiniLM-L6-v2"`.
-    /// Stored in FSVI index headers for embedder-revision matching.
+    /// This is operational metadata only. Persistence and compatibility checks
+    /// must use the complete immutable identity bundle.
     fn id(&self) -> &str;
 
     /// Human-readable model name.
@@ -247,6 +399,10 @@ pub trait Embedder: Send + Sync {
 pub trait SyncEmbed: Send + Sync {
     /// Synchronously embed a single text into a vector.
     ///
+    /// This raw primitive carries no compatibility proof; callers that persist,
+    /// compare, cache, or transport the vector must use
+    /// [`Self::embed_bound_sync`].
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError`] when embedding fails (for example model load,
@@ -256,6 +412,8 @@ pub trait SyncEmbed: Send + Sync {
     /// Synchronously embed a batch of texts.
     ///
     /// Default implementation calls [`embed_sync`](Self::embed_sync) for each text.
+    /// Use [`Self::embed_batch_bound_sync`] when vectors leave an
+    /// implementation-local inference path.
     ///
     /// # Errors
     ///
@@ -265,10 +423,61 @@ pub trait SyncEmbed: Send + Sync {
         texts.iter().map(|t| self.embed_sync(t)).collect()
     }
 
+    /// Synchronously embed one input and bind it to the complete identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the embedding error or fails closed when identity/dimension
+    /// validation fails.
+    fn embed_bound_sync(&self, text: &str) -> SearchResult<IdentityBoundEmbedding> {
+        let bound = IdentityBoundEmbedding {
+            values: self.embed_sync(text)?,
+            identity: self.identity()?.clone(),
+        };
+        bound.validate()?;
+        Ok(bound)
+    }
+
+    /// Synchronously embed a batch and bind every output to one identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first embedding or identity validation error.
+    fn embed_batch_bound_sync(&self, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+        let identity = self.identity()?.clone();
+        self.embed_batch_sync(texts)?
+            .into_iter()
+            .map(|values| {
+                let bound = IdentityBoundEmbedding {
+                    values,
+                    identity: identity.clone(),
+                };
+                bound.validate()?;
+                Ok(bound)
+            })
+            .collect()
+    }
+
+    /// Complete immutable identity of this embedder and its output/storage contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when the implementation is not identity-aware.
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Err(SearchError::InvalidConfig {
+            field: "sync_embedder.identity".to_owned(),
+            value: bounded_embedder_diagnostic_id(self.id()),
+            reason: "embedder did not supply a complete immutable identity bundle".to_owned(),
+        })
+    }
+
     /// The output dimensionality of embedding vectors.
     fn dimension(&self) -> usize;
 
-    /// Unique, stable identifier for this embedder (stored in index headers).
+    /// Unique, stable operational identifier for this embedder.
+    ///
+    /// It never substitutes for the immutable identity bundle in persistence or
+    /// compatibility checks.
     fn id(&self) -> &str;
 
     /// Human-readable model name.
@@ -316,6 +525,10 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move { self.0.embed_batch_sync(texts) })
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.0.identity()
     }
 
     fn dimension(&self) -> usize {
@@ -736,6 +949,37 @@ mod tests {
 
     use super::*;
 
+    struct BoundSyncEmbedder {
+        identity: EmbeddingIdentityBundleV1,
+        output_dimension: usize,
+    }
+
+    impl SyncEmbed for BoundSyncEmbedder {
+        fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            Ok(vec![1.0; self.output_dimension])
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.output_dimension
+        }
+
+        fn id(&self) -> &'static str {
+            "bound-sync-fixture"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
     struct UnsortedSyncReranker;
 
     impl SyncRerank for UnsortedSyncReranker {
@@ -772,6 +1016,30 @@ mod tests {
 
         fn model_name(&self) -> &'static str {
             "Unsorted Sync Reranker"
+        }
+    }
+
+    struct UnboundSyncEmbedder;
+
+    impl SyncEmbed for UnboundSyncEmbedder {
+        fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            Ok(vec![0.0])
+        }
+
+        fn dimension(&self) -> usize {
+            1
+        }
+
+        fn id(&self) -> &'static str {
+            "legacy\nforged-log-line"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
         }
     }
 
@@ -871,6 +1139,100 @@ mod tests {
     #[test]
     fn embedder_trait_is_object_safe() {
         fn _takes_dyn_embedder(_: &dyn Embedder) {}
+    }
+
+    #[test]
+    fn sync_bound_outputs_carry_identity_and_fail_on_shape_drift() {
+        let embedder = BoundSyncEmbedder {
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("bound-sync-fixture", 3),
+            output_dimension: 3,
+        };
+        let bound = embedder.embed_bound_sync("text").unwrap();
+        assert_eq!(bound.values, vec![1.0; 3]);
+        assert_eq!(bound.identity, embedder.identity);
+        assert_eq!(
+            embedder.embed_batch_bound_sync(&["a", "b"]).unwrap().len(),
+            2
+        );
+
+        let drifted = BoundSyncEmbedder {
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("bound-sync-fixture", 2),
+            output_dimension: 3,
+        };
+        assert!(drifted.embed_bound_sync("text").is_err());
+    }
+
+    #[test]
+    fn missing_identity_diagnostic_redacts_untrusted_embedder_id() {
+        let error = UnboundSyncEmbedder.identity().unwrap_err();
+        assert!(error.to_string().contains("<redacted-embedder-id>"));
+        assert!(!error.to_string().contains("forged-log-line"));
+    }
+
+    #[test]
+    fn identity_bound_debug_redacts_vector_values() {
+        let bound = IdentityBoundEmbedding {
+            values: vec![12_345.5, -9_876.25],
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("debug-redaction", 2),
+        };
+        let debug = format!("{bound:?}");
+        assert!(debug.contains("dimension"));
+        assert!(debug.contains(&bound.identity.fingerprint()));
+        assert!(!debug.contains("12345"));
+        assert!(!debug.contains("9876"));
+    }
+
+    #[test]
+    fn identity_bound_output_rejects_non_memory_f32_storage_claims() {
+        let mut identity =
+            EmbeddingIdentityBundleV1::explicit_test_model("bound-storage-fixture", 2);
+        identity.storage.quantization = QuantizationFormat::F16;
+        let bound = IdentityBoundEmbedding {
+            values: vec![1.0, 2.0],
+            identity,
+        };
+        assert!(bound.validate().is_err());
+
+        let mut identity =
+            EmbeddingIdentityBundleV1::explicit_test_model("bound-storage-fixture", 2);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.endianness = "little-endian".to_owned();
+        let bound = IdentityBoundEmbedding {
+            values: vec![1.0, 2.0],
+            identity,
+        };
+        assert!(bound.validate().is_err());
+
+        let mut identity =
+            EmbeddingIdentityBundleV1::explicit_test_model("bound-storage-fixture", 2);
+        identity.storage.endianness = "little-endian".to_owned();
+        let bound = IdentityBoundEmbedding {
+            values: vec![1.0, 2.0],
+            identity,
+        };
+        assert!(bound.validate().is_err());
+    }
+
+    #[test]
+    fn async_bound_outputs_carry_forwarded_identity() {
+        run_test_with_cx(|cx| async move {
+            let identity = EmbeddingIdentityBundleV1::explicit_test_model("bound-async-fixture", 3);
+            let adapter = SyncEmbedderAdapter(BoundSyncEmbedder {
+                identity: identity.clone(),
+                output_dimension: 3,
+            });
+            let bound = adapter.embed_bound(&cx, "text").await.unwrap();
+            assert_eq!(bound.values, vec![1.0; 3]);
+            assert_eq!(bound.identity, identity);
+            assert_eq!(
+                adapter
+                    .embed_batch_bound(&cx, &["a", "b"])
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        });
     }
 
     #[test]

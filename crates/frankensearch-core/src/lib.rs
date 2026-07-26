@@ -61,7 +61,10 @@ pub use commit_replay::{
     CommitEntry, CommitOutcome, CommitReplayEngine, DocumentOp, ReplayConsumer, ReplayPolicy,
     ReplayWatermark, SkipReason,
 };
-pub use config::{FusionStrategy, TwoTierConfig, TwoTierMetrics};
+pub use config::{
+    FusionStrategy, TwoTierConfig, TwoTierMetrics, ZERO_SIGNAL_SCHEMA_VERSION, ZeroSignalReason,
+    ZeroSignalState,
+};
 pub use contract_sanity::{
     AdapterContractResult, CompatibilityStatus, ContractSanityChecker, ContractSanityReport,
     ContractViolationDiagnostic, MAX_SCHEMA_VERSION_LAG, ViolationSeverity, classify_version,
@@ -102,10 +105,15 @@ pub use fingerprint::{
     DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint, SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,
 };
 pub use generation::{
-    ActivationInvariant, CommitRange, EmbedderRevision, EmbedderTierTag, GenerationManifest,
-    InvariantKind, LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, RepairDescriptor,
-    ValidationFinding, ValidationResult, VectorArtifact, compute_manifest_hash, require_valid,
-    validate_manifest,
+    ActivationInvariant, CommitRange, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+    EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbedderRevision,
+    EmbedderTierTag, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
+    EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingProjectionV1,
+    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1, FrozenEmbeddingIdentityBundleV1,
+    GenerationManifest, GoldenVectorCertificateV1, HashControlProfileV1, InvariantKind,
+    LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, RepairDescriptor,
+    VECTOR_STORAGE_IDENTITY_SCHEMA_V1, ValidationFinding, ValidationResult, VectorArtifact,
+    VectorStorageIdentityV1, compute_manifest_hash, require_valid, validate_manifest,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
@@ -144,8 +152,8 @@ pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, Ti
 pub use asupersync::Cx;
 pub use query_class::QueryClass;
 pub use traits::{
-    Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
-    NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
+    Embedder, IdentityBoundEmbedding, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo,
+    ModelTier, NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
     SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
     cosine_similarity, l2_normalize, truncate_embedding,
 };

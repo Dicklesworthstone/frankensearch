@@ -10,10 +10,18 @@ repository.workspace = true
 default = []
 fastembed-reranker = ["dep:fastembed"]
 # Pure-Rust frankentorch cross-encoder reranker backend (no ONNX/ort).
-native = ["dep:ft-api", "dep:ft-autograd", "dep:ft-core", "dep:wide", "dep:rayon"]
+native = [
+    "dep:frankensearch-embed",
+    "dep:ft-api",
+    "dep:ft-autograd",
+    "dep:ft-core",
+    "dep:wide",
+    "dep:rayon",
+]
 
 [dependencies]
 frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true, default-features = false, optional = true }
 asupersync = { workspace = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }

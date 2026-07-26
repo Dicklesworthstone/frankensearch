@@ -249,7 +249,6 @@ impl ModelDownloader {
             info!(
                 file = %file.name,
                 size = file.size,
-                url = %url,
                 "downloading model file"
             );
 
@@ -265,7 +264,11 @@ impl ModelDownloader {
                 )
                 .await
             {
-                lifecycle.fail_verification(format!("download failed for '{}': {err}", file.name));
+                lifecycle.fail_verification(format!(
+                    "download failed for '{}': {}",
+                    file.name,
+                    bounded_download_failure_reason(&err)
+                ));
                 return Err(err);
             }
 
@@ -291,7 +294,7 @@ impl ModelDownloader {
                 Ok(staging_dir)
             }
             Err(e) => {
-                lifecycle.fail_verification(e.to_string());
+                lifecycle.fail_verification(bounded_download_failure_reason(&e));
                 Err(e)
             }
         }
@@ -331,7 +334,7 @@ impl ModelDownloader {
                     warn!(
                         file = %file.name,
                         attempt,
-                        error = %e,
+                        reason = bounded_download_failure_reason(&e),
                         "download attempt failed"
                     );
                     last_error = Some(e);
@@ -444,6 +447,7 @@ impl ModelDownloader {
             }
         }
 
+        // ubs:ignore — artifact byte counts are public integrity metadata.
         if file.size > 0 && bytes_downloaded != file.size {
             return Err(SearchError::HashMismatch {
                 path: dest.to_path_buf(),
@@ -455,6 +459,7 @@ impl ModelDownloader {
         // Verify SHA-256 only when the manifest provides a concrete checksum.
         if file.has_verified_checksum() {
             let actual_hash = sha256_digest_hex(hasher.finalize().as_slice());
+            // ubs:ignore — pinned artifact digests are public integrity metadata.
             if actual_hash != file.sha256 {
                 return Err(SearchError::HashMismatch {
                     path: dest.to_path_buf(),
@@ -557,6 +562,19 @@ fn sha256_digest_hex(data: &[u8]) -> String {
     out
 }
 
+fn bounded_download_failure_reason(error: &SearchError) -> &'static str {
+    match error {
+        SearchError::HashMismatch { .. } => "artifact-integrity-mismatch",
+        SearchError::ModelNotFound { .. } => "registered-artifact-missing",
+        SearchError::ModelLoadFailed { .. } | SearchError::Io(_) => {
+            "transport-or-filesystem-failure"
+        }
+        SearchError::Cancelled { .. } => "operation-cancelled",
+        SearchError::InvalidConfig { .. } => "invalid-download-contract",
+        _ => "model-download-failed",
+    }
+}
+
 /// Compute lowercase hex SHA-256 of a byte slice.
 #[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
@@ -583,7 +601,10 @@ impl Drop for TempFileGuard {
         if self.armed
             && let Err(e) = std::fs::remove_file(&self.path)
         {
-            tracing::warn!(path = %self.path.display(), error = %e, "failed to clean up temp file");
+            tracing::warn!(
+                error_kind = ?e.kind(),
+                "failed to clean up model download temp file"
+            );
         }
     }
 }
