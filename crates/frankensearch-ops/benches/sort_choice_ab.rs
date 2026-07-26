@@ -188,12 +188,17 @@ fn main() {
         a.sort_by(|&x, &y| cmp(&rows[x], &rows[y]));
         let mut b = base.clone();
         b.sort_unstable_by(|&x, &y| cmp(&rows[x], &rows[y]));
-        assert_eq!(a, b, "stable and unstable must agree on a strict total order (n={n})");
+        assert_eq!(
+            a, b,
+            "stable and unstable must agree on a strict total order (n={n})"
+        );
         eprintln!("[parity] n={n} order_identical=true");
 
         let stable_us = median_us(&rows, &base, Arm::Stable);
         let unstable_us = median_us(&rows, &base, Arm::Unstable);
-        eprintln!("[profile] n={n} stable_median_us={stable_us:.4} unstable_median_us={unstable_us:.4}");
+        eprintln!(
+            "[profile] n={n} stable_median_us={stable_us:.4} unstable_median_us={unstable_us:.4}"
+        );
 
         let null = paired_ratio(&rows, &base, Arm::Stable, Arm::Stable);
         let lever = paired_ratio(&rows, &base, Arm::Stable, Arm::Unstable);
@@ -217,6 +222,10 @@ fn main() {
     }
     eprintln!(
         "[gate-summary] decision={} all_shapes_clear_null_floor={all_gates_pass}",
-        if all_gates_pass { "unstable-faster" } else { "MIXED-or-floor" }
+        if all_gates_pass {
+            "unstable-faster"
+        } else {
+            "MIXED-or-floor"
+        }
     );
 }

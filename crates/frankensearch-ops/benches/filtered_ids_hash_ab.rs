@@ -207,6 +207,10 @@ fn main() {
     }
     eprintln!(
         "[gate-summary] decision={} all_shapes_clear_null_floor={all_gates_pass}",
-        if all_gates_pass { "ahash-faster" } else { "MIXED-or-floor" }
+        if all_gates_pass {
+            "ahash-faster"
+        } else {
+            "MIXED-or-floor"
+        }
     );
 }

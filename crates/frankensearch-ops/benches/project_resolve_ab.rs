@@ -94,7 +94,9 @@ fn ratio_distribution(mut samples: Vec<f64>) -> RatioDistribution {
 
 fn run_arm(corpus: &Corpus, arm: Arm) -> usize {
     match arm {
-        Arm::Legacy => bench_count_project_linear(&corpus.events, &corpus.instances, FILTER_PROJECT),
+        Arm::Legacy => {
+            bench_count_project_linear(&corpus.events, &corpus.instances, FILTER_PROJECT)
+        }
         Arm::Fused => bench_count_project_mapped(&corpus.events, &corpus.instances, FILTER_PROJECT),
     }
 }

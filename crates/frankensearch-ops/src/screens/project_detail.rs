@@ -131,13 +131,9 @@ impl ProjectDetailScreen {
     /// Shared by `project_instances` (collect) and the count-only clamp path.
     fn project_instances_iter(&self) -> impl Iterator<Item = &crate::state::InstanceInfo> + '_ {
         let project = self.selected_project();
-        self.state
-            .fleet()
-            .instances
-            .iter()
-            .filter(move |instance| {
-                project.is_some_and(|project| instance.project.eq_ignore_ascii_case(project))
-            })
+        self.state.fleet().instances.iter().filter(move |instance| {
+            project.is_some_and(|project| instance.project.eq_ignore_ascii_case(project))
+        })
     }
 
     /// Count of the selected project's instances without collecting a Vec — used by
@@ -503,7 +499,9 @@ impl ProjectDetailScreen {
 
         // Unstable is byte-identical: one card per instance with `instance.id`
         // (`.1`) as the final tiebreak = strict total order.
-        cards.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        cards.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
 
         let mut lines = vec![Line::from("Top anomaly cards:")];
         if cards.is_empty() {

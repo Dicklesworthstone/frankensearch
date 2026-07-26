@@ -165,7 +165,9 @@ fn main() {
 
         let siphash_us = median_us(&corpus, Arm::SipHash);
         let ahash_us = median_us(&corpus, Arm::AHash);
-        eprintln!("[profile] n={n} siphash_median_us={siphash_us:.4} ahash_median_us={ahash_us:.4}");
+        eprintln!(
+            "[profile] n={n} siphash_median_us={siphash_us:.4} ahash_median_us={ahash_us:.4}"
+        );
 
         let null = paired_ratio(&corpus, Arm::SipHash, Arm::SipHash);
         let lever = paired_ratio(&corpus, Arm::SipHash, Arm::AHash);
@@ -189,6 +191,10 @@ fn main() {
     }
     eprintln!(
         "[gate-summary] decision={} all_shapes_clear_null_floor={all_gates_pass}",
-        if all_gates_pass { "aHash-faster" } else { "MIXED-or-floor" }
+        if all_gates_pass {
+            "aHash-faster"
+        } else {
+            "MIXED-or-floor"
+        }
     );
 }
