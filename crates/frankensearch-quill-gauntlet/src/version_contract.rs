@@ -315,8 +315,16 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
                 .with_title("Common gamma")
                 .with_metadata("batch", "c"),
         ],
+        vec![
+            IndexableDocument::new("merge-d1", "shared delta exact phrase")
+                .with_title("Delta segment")
+                .with_metadata("batch", "d"),
+            IndexableDocument::new("merge-d2", "common delta anchor")
+                .with_title("Common delta")
+                .with_metadata("batch", "d"),
+        ],
     ];
-    for documents in &batches {
+    for (batch_index, documents) in batches.iter().enumerate() {
         index
             .index_documents(cx, documents)
             .await
@@ -325,6 +333,45 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             .commit(cx)
             .await
             .map_err(|error| q1_merge_error("commit source batch", error))?;
+        if batch_index == 1 {
+            let first_stage_source_ids = index
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| segment.manifest().segment_id)
+                .collect::<Vec<_>>();
+            if first_stage_source_ids.len() != 2 {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "Q1 E3.5 expected two first-stage source segments, got {}",
+                        first_stage_source_ids.len()
+                    ),
+                });
+            }
+            let first_stage_output_segment_id = [
+                0xe34f_0000_0000_0001,
+                0xe34f_0000_0000_0002,
+                0xe34f_0000_0000_0003,
+                0xe34f_0000_0000_0004,
+            ]
+            .into_iter()
+            .find(|candidate| !first_stage_source_ids.contains(candidate))
+            .ok_or_else(|| GauntletError::InvalidContract {
+                reason: "Q1 E3.5 could not choose a first-stage fixture segment id".to_owned(),
+            })?;
+            // The explicit first-stage merge retires the active ingest lease.
+            // Appending the remaining batches from the successor lease then
+            // creates a real burned-tail gap inside the final merge hull.
+            index
+                .concat_merge(
+                    cx,
+                    &first_stage_source_ids,
+                    first_stage_output_segment_id,
+                    1_700_000_034,
+                )
+                .await
+                .map_err(|error| q1_merge_error("publish first-stage concat merge", error))?;
+        }
     }
 
     let source_ids = index
@@ -354,12 +401,24 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
     let before_field_stats = before_manifest.field_stats.clone();
     let before_at_seal_doc_count = index.snapshot().at_seal_doc_count();
     let before_live_doc_count = index.snapshot().doc_count();
-    let first_docid_hi = index.snapshot().segments()[0].manifest().docid_hi;
+    let first_hole = index
+        .snapshot()
+        .segments()
+        .windows(2)
+        .find_map(|pair| {
+            let left_hi = pair[0].manifest().docid_hi;
+            let right_lo = pair[1].manifest().docid_lo;
+            (left_hi < right_lo).then_some(left_hi)
+        })
+        .ok_or_else(|| GauntletError::InvalidContract {
+            reason: "Q1 E3.5 did not construct an interior burned lease tail".to_owned(),
+        })?;
     let merged_docid_lo = index.snapshot().segments()[0].manifest().docid_lo;
     let merged_docid_hi = index.snapshot().segments()[2].manifest().docid_hi;
 
-    const DOCUMENT_IDS: [&str; 6] = [
-        "merge-a1", "merge-a2", "merge-b1", "merge-b2", "merge-c1", "merge-c2",
+    const DOCUMENT_IDS: [&str; 8] = [
+        "merge-a1", "merge-a2", "merge-b1", "merge-b2", "merge-c1", "merge-c2", "merge-d1",
+        "merge-d2",
     ];
     let mut identity_rows = Vec::with_capacity(DOCUMENT_IDS.len());
     for document_id in DOCUMENT_IDS {
@@ -518,7 +577,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             });
         }
     }
-    let first_hole = u32::try_from(first_docid_hi).map_err(|_| GauntletError::InvalidContract {
+    let first_hole = u32::try_from(first_hole).map_err(|_| GauntletError::InvalidContract {
         reason: "Q1 E3.5 source hole does not fit the public docid domain".to_owned(),
     })?;
     if index
