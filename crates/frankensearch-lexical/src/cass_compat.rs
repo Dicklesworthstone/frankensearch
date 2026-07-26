@@ -753,6 +753,55 @@ pub struct CassFields {
     pub conversation_id: Option<Field>,
 }
 
+/// Canonical CASS document identity: `"{source_id}#{msg_idx}"`.
+///
+/// The CASS schema deliberately has no dedicated id field — a document is a
+/// message inside a source, so identity is the pair. The synthetic conformance
+/// corpus repeats `source_id` on purpose (several messages share one session),
+/// which is exactly why `source_id` alone cannot serve as the key and `msg_idx`
+/// supplies per-message uniqueness.
+///
+/// This exact rendering is part of the CASS profile contract
+/// (`document_identity=source_id#msg_idx` in the schema contract preimage) and
+/// must match on both the subject and the oracle side. It is not an adapter
+/// convenience: the gauntlet comparator keys every divergence signature on this
+/// string, so changing the format invalidates the register.
+///
+/// Missing stored fields degrade to an empty `source_id` and `msg_idx` 0 rather
+/// than erroring, so a malformed document surfaces as a *comparable* identity
+/// mismatch in the differential report instead of aborting the campaign.
+#[cfg(feature = "tantivy-oracle")]
+#[must_use]
+pub fn cass_document_identity(document: &tantivy::TantivyDocument, fields: &CassFields) -> String {
+    use tantivy::schema::Value as _;
+
+    let source_id = document
+        .get_first(fields.source_id)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let msg_idx = document
+        .get_first(fields.msg_idx)
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    cass_document_identity_parts(source_id, msg_idx)
+}
+
+/// Render the canonical CASS document identity from its two components.
+///
+/// This is the single source of truth for the `"{source_id}#{msg_idx}"`
+/// rendering named by the CASS profile contract. It lives in this crate rather
+/// than in the gauntlet because the dependency runs gauntlet → lexical: the
+/// corpus generator and both engine adapters must agree byte-for-byte, and the
+/// only way to guarantee that is for all of them to call one function.
+///
+/// Prefer [`cass_document_identity`] when you already hold a stored document;
+/// use this form when you are constructing the corpus and hold the parts.
+#[cfg(feature = "tantivy-oracle")]
+#[must_use]
+pub fn cass_document_identity_parts(source_id: &str, msg_idx: u64) -> String {
+    format!("{source_id}#{msg_idx}")
+}
+
 /// Merge status for cass-compatible Tantivy segment optimization.
 #[derive(Debug, Clone)]
 pub struct CassMergeStatus {
@@ -1012,6 +1061,114 @@ impl CassTantivyIndex {
     /// Returns [`SearchError::SubsystemError`] when Tantivy reader construction fails.
     pub fn reader(&self) -> SearchResult<IndexReader> {
         self.index.reader().map_err(tantivy_err)
+    }
+
+    /// Observe the CASS-compatible parser/search path for Quill conformance.
+    ///
+    /// The CASS-profile analogue of [`crate::TantivyIndex::oracle_observe_query`].
+    /// Like that producer it retains the full Tantivy `DocAddress`, the exact
+    /// total count, raw score **bits**, and an expanded cutoff tie group, because
+    /// the gauntlet comparator classifies `TieOrder` from native ordering and
+    /// cannot do so once that evidence is canonicalized away.
+    ///
+    /// Two deliberate differences from the default-profile producer, both
+    /// required by the CASS activation contract:
+    ///
+    /// * **No empty-query short circuit.** The default profile returns an empty
+    ///   observation for a blank query. Under CASS an empty query carrying
+    ///   structured filters is a legitimate filter-only browse that matches
+    ///   documents, so short-circuiting would report zero hits where the engine
+    ///   returns a full filtered page.
+    /// * **Snippets are always `None`.** The activation profile is snippet-free
+    ///   (`snippets=disabled` in the schema contract preimage); preview and
+    ///   highlight parity belong to a separate lane, and `SnippetWindow` is not
+    ///   an active allowance for this profile.
+    ///
+    /// Document identity is the profile contract's `"{source_id}#{msg_idx}"`
+    /// rendering (see [`cass_document_identity`]). It is pinned by the contract
+    /// preimage rather than chosen here, because changing the rendering silently
+    /// changes every mismatch signature already recorded in the divergence
+    /// register.
+    ///
+    /// Cancellation is the caller's responsibility: this is a synchronous
+    /// Tantivy path, so the gauntlet adapter checks its `Cx` before calling
+    /// rather than threading a context through the oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if reader/searcher construction, query execution,
+    /// or stored-document loading fails.
+    #[cfg(feature = "tantivy-oracle")]
+    pub fn cass_oracle_observe_query(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+        limit: usize,
+        tie_expansion_limit: usize,
+    ) -> SearchResult<crate::OracleQueryObservation> {
+        let searcher = self.reader()?.searcher();
+        let fields = self.fields();
+        let query = cass_build_tantivy_query(raw_query, filters, &fields);
+
+        // Fetch past `limit` so the cutoff tie group can be observed whole; a
+        // truncated group is reported through `cutoff_tie_complete` instead of
+        // being silently accepted as complete.
+        let fetch_limit = if limit == 0 {
+            0
+        } else {
+            limit.saturating_add(tie_expansion_limit)
+        };
+        let search_result = crate::execute_query_with_offset(&searcher, &*query, fetch_limit, 0)?;
+
+        let mut materialized = Vec::with_capacity(search_result.hits.len());
+        for hit in search_result.hits {
+            let document = crate::load_doc(&searcher, hit.doc_address)?;
+            materialized.push(crate::OracleRankedHit {
+                doc_id: cass_document_identity(&document, &fields),
+                score_bits: hit.bm25_score.to_bits(),
+                rank: hit.rank,
+                segment_ord: hit.doc_address.segment_ord,
+                segment_doc_id: hit.doc_address.doc_id,
+                snippet: None,
+            });
+        }
+
+        let top_len = limit.min(materialized.len());
+        let cutoff_bits = top_len
+            .checked_sub(1)
+            .and_then(|index| materialized.get(index))
+            .map(|hit| hit.score_bits);
+        let cutoff_tie_group = cutoff_bits.map_or_else(Vec::new, |cutoff| {
+            materialized
+                .iter()
+                .filter(|hit| {
+                    f32::from_bits(hit.score_bits)
+                        .total_cmp(&f32::from_bits(cutoff))
+                        .is_eq()
+                })
+                .cloned()
+                .collect()
+        });
+        // The group is complete when either every match was fetched or the last
+        // fetched hit scored strictly below the cutoff — otherwise the expansion
+        // budget ended inside the tie and the comparator must not assume more.
+        let cutoff_tie_complete = cutoff_bits.is_none_or(|cutoff| {
+            search_result.total_count <= fetch_limit
+                || materialized.last().is_none_or(|last| {
+                    !f32::from_bits(last.score_bits)
+                        .total_cmp(&f32::from_bits(cutoff))
+                        .is_eq()
+                })
+        });
+        materialized.truncate(top_len);
+
+        Ok(crate::OracleQueryObservation {
+            hits: materialized,
+            cutoff_tie_group,
+            cutoff_tie_complete,
+            total_count: search_result.total_count,
+            doc_count: usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX),
+        })
     }
 
     /// Delete all indexed documents.
@@ -2705,6 +2862,113 @@ mod cass_query_tests {
             .expect("index CASS result documents");
         index.commit().expect("commit CASS result documents");
         (directory, index)
+    }
+
+    /// The CASS oracle observation producer must expose exactly the evidence the
+    /// gauntlet comparator consumes, under the CASS profile contract
+    /// (`document_identity=source_id#msg_idx`, `snippets=disabled`).
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn cass_oracle_observation_carries_contract_identity_and_full_tie_evidence() {
+        let (_directory, index) = cass_result_fixture();
+        let filters = CassQueryFilters::default();
+
+        // CASS bare terms are PREFIX-matched (the schema carries dedicated
+        // `*_prefix` fields), so `alpha` retrieves `alpha active`,
+        // `alpha deprecated` AND `alphabeta retained` — but not `xalpha
+        // archived`, which only contains the term as an infix. That asymmetry
+        // is the load-bearing part of this expectation: a subject adapter that
+        // treats CASS terms as exact would pass a naive 2-hit assertion and
+        // still be wrong.
+        let observation = index
+            .cass_oracle_observe_query("alpha", &filters, 10, 8)
+            .expect("observe CASS term query");
+        assert_eq!(
+            observation
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["local-a#0", "local-b#1", "local-d#5"]
+                .into_iter()
+                .collect(),
+            "identity must be the contract's source_id#msg_idx rendering, \
+             over the prefix-expanded match set",
+        );
+        assert_eq!(observation.total_count, 3);
+        assert_eq!(observation.doc_count, 6, "live document count");
+        assert!(
+            observation.hits.iter().all(|hit| hit.snippet.is_none()),
+            "the CASS activation profile is snippet-free",
+        );
+        assert!(
+            observation
+                .hits
+                .iter()
+                .enumerate()
+                .all(|(index, hit)| hit.rank == index),
+            "ranks must be the native fetched order",
+        );
+
+        // An empty CASS query is a filter-only browse, NOT the default
+        // profile's empty short-circuit: it must still match every document.
+        let browse = index
+            .cass_oracle_observe_query("", &filters, 10, 8)
+            .expect("observe CASS filter-only browse");
+        assert_eq!(
+            browse.hits.len(),
+            6,
+            "empty CASS query must browse, not short-circuit: {:?}",
+            browse
+                .hits
+                .iter()
+                .map(|hit| &hit.doc_id)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(browse.total_count, 6);
+
+        // Structured filters narrow the browse through the same producer.
+        let filtered = index
+            .cass_oracle_observe_query(
+                "",
+                &CassQueryFilters {
+                    source_filter: CassSourceFilter::SourceId("local-a".to_owned()),
+                    ..CassQueryFilters::default()
+                },
+                10,
+                8,
+            )
+            .expect("observe CASS structured filter");
+        assert_eq!(
+            filtered
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-a#0"],
+        );
+
+        // Truncating to k must not discard the cutoff tie evidence: the group is
+        // computed over the expanded fetch, then `hits` is cut to k.
+        let truncated = index
+            .cass_oracle_observe_query("alpha", &filters, 1, 8)
+            .expect("observe CASS truncated query");
+        assert_eq!(truncated.hits.len(), 1, "hits truncate to the requested k");
+        assert_eq!(
+            truncated.total_count, 3,
+            "total_count stays independent of k",
+        );
+        assert!(
+            truncated.cutoff_tie_complete,
+            "the whole match set was fetched, so the tie group is complete",
+        );
+        assert!(
+            truncated
+                .cutoff_tie_group
+                .iter()
+                .all(|hit| hit.score_bits == truncated.hits[0].score_bits),
+            "the tie group holds exactly the cutoff-score rows",
+        );
     }
 
     #[test]
