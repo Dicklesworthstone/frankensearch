@@ -16,6 +16,15 @@ ratchet = ".bench-history/<gate>.latest.json committed; pass-over-pass within th
 machines = ["apple-silicon >= M2 Pro class (P/E asymmetric)", "x86 Zen3+ >=16C (RCH fleet for trend lines; documented noise budget; attribution runs LOCAL only per bd-e41k)"]
 rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (per-OS abstraction mandatory — e8.4 notes)"
 
+[evidence]
+# Decision-grade artifact layer above the paired estimator (bd-uh2f / bd-uh2f.1).
+schema = "quill-perf-evidence-v1"
+artifact = "<gate>.evidence.json sealed with an embedded SHA-256 over its own canonical JSON; <gate>.evidence.md derived from the persisted JSON string; atomic tmp+fsync+rename+dirsync writes; load verifies seal, recomputes every estimator from retained raw samples, and rejects truncated or stale-schema files; legacy v3 loads only via the explicit read-only path"
+estimands = "metric-specific, enforced by gate: QG-1/2/3/4/5/8 flat paired log ratio; QG-6 hierarchical two-stage per-query resampling (queries first, then blocks; 4 pinned queries per class); QG-7 process RSS; QG-9 cold open requiring verified cache-state proof (currently NoDecision: in-process reopen does not drop the OS page cache); QG-10 dependency facts outside timing A/A (diagnostic)"
+policy = "reconciliation dead band ln(1.005); absolute-vs-paired tolerance ln(1.25); >=2 hierarchical groups with >=2 pairs each; 1 warmup round outside every decision set; raw-sample cap 20000 per cell"
+provenance = "executing ELF SHA-256; git revision + dirty-state hash; Cargo.lock SHA-256; rustc/target/profile/features; machine fingerprint + governor + load averages; peak RSS with method (unsupported reported as absent, never zero); corpus/query-set hashes + generator seed/revision"
+ratchet_seam = "invalid runs persist as InvalidNull/NoDecision and are never ratchet-admissible; downstream validators consult ratchet_admissible() and record Allow/Block/Quarantine via apply_gate_decision (bd-quill-e8-perf-doctrine-x4e4.15.1)"
+
 [corpus.tiny]
 source = "fsfs benchmark_baseline_matrix golden profile 'tiny'"
 [corpus.small]

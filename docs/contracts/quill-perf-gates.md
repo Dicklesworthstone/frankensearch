@@ -81,11 +81,41 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The current v3 QG writer remains provisional until `bd-uh2f.1` integrates this
-estimator into atomic, verified evidence artifacts and the metric-specific
-throughput, hierarchical-latency, RSS, and cold-open estimands. Until then its
-legacy `paired_ab`/`paired_null` rows are diagnostics, every gate stays
-inactive, and no live performance claim is decision-grade.
+The v3 QG writer's legacy `paired_ab`/`paired_null` rows are diagnostics only.
+Decision-grade output is the `quill-perf-evidence-v1` artifact (`bd-uh2f` /
+`bd-uh2f.1`), which the harness now emits beside every v3 artifact from the
+exact same raw paired blocks.
+
+## Evidence artifacts (`quill-perf-evidence-v1`)
+
+One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
+gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
+carries: both engines' absolute distributions from the same paired blocks, the
+paired log-ratio effect with a seeded bootstrap CI, the same-invocation A/A
+result, bounded raw samples that every summary recomputes from on load, and a
+same-scope absolute-versus-paired reconciliation. Run provenance records the
+executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
+rustc/target/profile/features, machine identity with governor and load, peak
+RSS with its method (`unsupported` is reported honestly, never a zero), and
+corpus/query-set hashes with generator coordinates.
+
+Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
+two-stage hierarchical per-query resampling (QG-6, four query groups per
+class), process RSS (QG-7), cold open requiring verified cache-state proof
+(QG-9 currently persists `NoDecision` because the harness reopens in-process
+without dropping the OS page cache), and dependency facts outside timing A/A
+(QG-10, diagnostic).
+
+Decision statuses fold deterministically with severity precedence
+`Fatal > Block > Quarantine > NoClaim > Allow`. Invalid runs persist durably
+as `InvalidNull` or `NoDecision` and are never ratchet-admissible;
+`ratchet_admissible()` is the single predicate downstream validators
+(`bd-quill-e8-perf-doctrine-x4e4.15.1`) must consult before applying
+`Allow`/`Block`/`Quarantine` via `apply_gate_decision`. Persistence is atomic
+(temp file, `fsync`, rename, directory sync); loading verifies the hash seal,
+re-runs every estimator from the retained raw samples, and rejects truncated
+files and stale schema versions. Legacy v3 artifacts load only through the
+explicit read-only `load_legacy_gate_artifact_v3`.
 
 Every decision JSON names and SHA-256 hashes the manifest, baseline, candidate,
 and rerun. `Allow` may update the machine-class `latest.json` and write a dated

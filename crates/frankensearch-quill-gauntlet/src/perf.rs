@@ -619,6 +619,11 @@ pub struct PerfRawSample {
     pub byte_count: Option<u64>,
     /// Positive directly observed value for gauge operations.
     pub observed_value: Option<f64>,
+    /// First-stage resampling unit for hierarchical estimands, such as the
+    /// identity of one query inside a per-query latency cell. Flat estimands
+    /// leave this unset; hierarchical estimation requires it on every sample.
+    #[serde(default)]
+    pub group_id: Option<u64>,
 }
 
 impl PerfRawSample {
@@ -699,6 +704,31 @@ pub struct PairedEstimatorConfig {
 }
 
 impl PairedEstimatorConfig {
+    /// Predeclared gate thresholds for harness-emitted QG evidence.
+    ///
+    /// These bounds are the bd-tqi3 estimator-repair defaults: at least
+    /// [`PERF_MIN_RUNS`] complete pairs, [`PERF_BOOTSTRAP_RESAMPLES`]
+    /// deterministic resamples, a 5% A/A center/dispersion budget, and a 10%
+    /// A/A confidence half-width budget, all on the log-ratio scale. The
+    /// order-imbalance allowance is one block because
+    /// [`seeded_balanced_pair_order`] balances first arms to within one.
+    #[must_use]
+    pub fn predeclared(bootstrap_seed: u64) -> Self {
+        Self {
+            bootstrap_seed,
+            bootstrap_resamples: PERF_BOOTSTRAP_RESAMPLES,
+            min_pairs: PERF_MIN_RUNS,
+            max_order_imbalance: 1,
+            max_null_center_log: 1.05_f64.ln(),
+            max_null_ci_half_width_log: 1.10_f64.ln(),
+            max_null_log_mad: 1.05_f64.ln(),
+            max_null_order_effect_log: 1.05_f64.ln(),
+            max_null_drift_log: 1.05_f64.ln(),
+            summary_direction_dead_band_log: 1.000_001_f64.ln(),
+            max_reproduction_delta_log: 1.02_f64.ln(),
+        }
+    }
+
     /// Validate that every threshold was fixed to a finite, usable value.
     ///
     /// # Errors
@@ -763,10 +793,22 @@ pub enum PairedEstimatorError {
     ScopeMismatch { block_id: u64 },
     #[error("paired block {block_id} mixes execution provenance")]
     ProvenanceMismatch { block_id: u64 },
+    #[error("sample {sample_id} requires a hierarchical group ID")]
+    MissingGroupId { sample_id: u64 },
+    #[error("paired block {block_id} mixes hierarchical group IDs")]
+    GroupMismatch { block_id: u64 },
     #[error("paired block {block_id} compares different work or byte denominators")]
     WorkMismatch { block_id: u64 },
     #[error("paired experiment has only {actual} complete blocks; require {required}")]
     InsufficientPairs { actual: usize, required: usize },
+    #[error("hierarchical experiment has only {actual} groups; require {required}")]
+    InsufficientGroups { actual: usize, required: usize },
+    #[error("hierarchical group {group_id} has only {actual} complete blocks; require {required}")]
+    InsufficientGroupPairs {
+        group_id: u64,
+        actual: usize,
+        required: usize,
+    },
     #[error("A/B and A/A streams disagree on {field}")]
     CrossExperimentMismatch { field: &'static str },
     #[error("paired result no longer recomputes from its raw samples")]
@@ -939,11 +981,13 @@ impl PairedExperimentResult {
 }
 
 #[derive(Debug)]
-struct ValidatedPair {
-    control_value: f64,
-    treatment_value: f64,
-    log_ratio: f64,
-    control_first: bool,
+pub(crate) struct ValidatedPair {
+    pub(crate) block_id: u64,
+    pub(crate) group_id: Option<u64>,
+    pub(crate) control_value: f64,
+    pub(crate) treatment_value: f64,
+    pub(crate) log_ratio: f64,
+    pub(crate) control_first: bool,
 }
 
 type PairedStream = (
@@ -953,10 +997,21 @@ type PairedStream = (
     Vec<PerfRawSample>,
 );
 
-fn validate_paired_stream(
+type PairedBlocks = (
+    Option<PerfOperationScope>,
+    Option<PerfSampleProvenance>,
+    Vec<ValidatedPair>,
+    Vec<PerfRawSample>,
+);
+
+/// Structural validation shared by the flat and hierarchical estimators.
+///
+/// Enforces every per-sample and per-block law except the stream-level
+/// minimum pair count, which each caller owns.
+pub(crate) fn validate_paired_blocks(
     samples: &[PerfRawSample],
     config: &PairedEstimatorConfig,
-) -> Result<PairedStream, PairedEstimatorError> {
+) -> Result<PairedBlocks, PairedEstimatorError> {
     config.validate()?;
     let mut sample_ids = BTreeSet::new();
     let mut blocks = BTreeMap::<u64, (Option<&PerfRawSample>, Option<&PerfRawSample>)>::new();
@@ -1023,6 +1078,9 @@ fn validate_paired_stream(
         {
             return Err(PairedEstimatorError::WorkMismatch { block_id });
         }
+        if control.group_id != treatment.group_id {
+            return Err(PairedEstimatorError::GroupMismatch { block_id });
+        }
         if control.order == treatment.order {
             return Err(PairedEstimatorError::InvalidOrder { block_id });
         }
@@ -1045,6 +1103,8 @@ fn validate_paired_stream(
             });
         }
         pairs.push(ValidatedPair {
+            block_id,
+            group_id: control.group_id,
             control_value,
             treatment_value,
             log_ratio,
@@ -1052,24 +1112,6 @@ fn validate_paired_stream(
         });
     }
 
-    if pairs.len() < config.min_pairs {
-        return Err(PairedEstimatorError::InsufficientPairs {
-            actual: pairs.len(),
-            required: config.min_pairs,
-        });
-    }
-    let scope = stream_scope
-        .cloned()
-        .ok_or(PairedEstimatorError::InsufficientPairs {
-            actual: 0,
-            required: config.min_pairs,
-        })?;
-    let provenance = stream_provenance
-        .cloned()
-        .ok_or(PairedEstimatorError::InsufficientPairs {
-            actual: 0,
-            required: config.min_pairs,
-        })?;
     let mut raw = samples.to_vec();
     raw.sort_by_key(|sample| {
         let order = match sample.order {
@@ -1078,6 +1120,33 @@ fn validate_paired_stream(
         };
         (sample.block_id, order, sample.arm, sample.sample_id)
     });
+    Ok((
+        stream_scope.cloned(),
+        stream_provenance.cloned(),
+        pairs,
+        raw,
+    ))
+}
+
+fn validate_paired_stream(
+    samples: &[PerfRawSample],
+    config: &PairedEstimatorConfig,
+) -> Result<PairedStream, PairedEstimatorError> {
+    let (scope, provenance, pairs, raw) = validate_paired_blocks(samples, config)?;
+    if pairs.len() < config.min_pairs {
+        return Err(PairedEstimatorError::InsufficientPairs {
+            actual: pairs.len(),
+            required: config.min_pairs,
+        });
+    }
+    let scope = scope.ok_or(PairedEstimatorError::InsufficientPairs {
+        actual: 0,
+        required: config.min_pairs,
+    })?;
+    let provenance = provenance.ok_or(PairedEstimatorError::InsufficientPairs {
+        actual: 0,
+        required: config.min_pairs,
+    })?;
     Ok((scope, provenance, pairs, raw))
 }
 
@@ -1546,14 +1615,14 @@ fn bootstrap_median_ci95(samples: &[f64]) -> (f64, f64) {
     (percentile(&medians, 0.025), percentile(&medians, 0.975))
 }
 
-const fn splitmix64(mut value: u64) -> u64 {
+pub(crate) const fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
 
-fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     let scaled = (sorted.len() - 1) as f64 * quantile;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1561,7 +1630,7 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     sorted[index]
 }
 
-fn median_sorted(sorted: &[f64]) -> f64 {
+pub(crate) fn median_sorted(sorted: &[f64]) -> f64 {
     debug_assert!(!sorted.is_empty());
     let midpoint = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
@@ -1858,6 +1927,7 @@ mod tests {
                 work_units: Some(1_000),
                 byte_count: Some(64_000),
                 observed_value: None,
+                group_id: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -1872,6 +1942,7 @@ mod tests {
                 work_units: Some(1_000),
                 byte_count: Some(64_000),
                 observed_value: None,
+                group_id: None,
             });
         }
         samples
@@ -1917,6 +1988,7 @@ mod tests {
                 work_units: None,
                 byte_count: None,
                 observed_value: Some(*control),
+                group_id: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -1935,6 +2007,7 @@ mod tests {
                 work_units: None,
                 byte_count: None,
                 observed_value: Some(*treatment),
+                group_id: None,
             });
         }
         samples
@@ -2139,6 +2212,7 @@ mod tests {
                 "block_id",
                 "byte_count",
                 "ended_ns",
+                "group_id",
                 "observed_value",
                 "order",
                 "phase",
