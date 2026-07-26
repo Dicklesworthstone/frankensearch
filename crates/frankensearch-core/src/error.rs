@@ -6,8 +6,9 @@ use std::path::PathBuf;
 /// The `TwoTierSearcher` catches transient errors and degrades gracefully: fast embedding
 /// failures can still yield lexical-only initial results when lexical retrieval is available,
 /// `RerankFailed` skips reranking, and `SearchTimeout` yields initial results.
-/// Only `IndexNotFound`, `IndexCandidatesNotFound`, and `InvalidConfig`
-/// prevent search from starting.
+/// Index/configuration failures and unverifiable embedding-space identity can prevent a
+/// semantic search from starting. Callers must only degrade when the selected public API
+/// explicitly preserves a verified lexical result path.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     // === Embedding errors ===
@@ -186,6 +187,23 @@ pub enum SearchError {
         actual: String,
     },
 
+    /// A producer cannot prove the canonical identity of its embedding space.
+    #[error(
+        "Embedding space identity is unverifiable. Refuse semantic comparison; require a producer-authenticated immutable identity, or use a verified local embedder or lexical fallback."
+    )]
+    UnverifiableRemoteSpace {
+        /// Component or remote producer that supplied the identity claim.
+        ///
+        /// This field is intentionally omitted from [`Display`](std::fmt::Display). Public
+        /// serializers must validate and bound it before exposure.
+        producer: String,
+        /// Why the supplied identity cannot be verified.
+        ///
+        /// This field is intentionally omitted from [`Display`](std::fmt::Display). It may be
+        /// retained for bounded, redacted structured diagnostics.
+        reason: String,
+    },
+
     // === Cancellation ===
     /// Operation was cancelled via the asupersync structured concurrency protocol.
     #[error("Operation cancelled during {phase}: {reason}")]
@@ -268,6 +286,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/tmp/vector.fast.idx"));
         assert!(msg.contains("/tmp/vector.idx"));
+
+        let err = SearchError::UnverifiableRemoteSpace {
+            producer: "https://user:secret@embedding.example/v1".to_owned(),
+            reason: "response contained private query text".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("secret"));
+        assert!(!msg.contains("private query text"));
+        assert!(msg.contains("Refuse semantic comparison"));
+        assert!(msg.contains("producer-authenticated immutable identity"));
 
         let err = SearchError::DimensionMismatch {
             expected: 256,
