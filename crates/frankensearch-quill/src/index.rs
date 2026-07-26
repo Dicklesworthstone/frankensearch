@@ -535,10 +535,20 @@ impl QuillSearchSnapshot {
         &self,
         global_docid: u32,
     ) -> Result<Option<Arc<serde_json::Value>>, QuillIndexError> {
-        self.materialize_stored_value(METADATA_FIELD, global_docid)?
-            .map(|metadata| serde_json::from_slice(&metadata).map(Arc::new))
-            .transpose()
-            .map_err(QuillIndexError::from)
+        let Some(stored) = self.materialize_stored_value(METADATA_FIELD, global_docid)? else {
+            return Ok(None);
+        };
+        let metadata: serde_json::Value = serde_json::from_slice(&stored)?;
+        // Ingest always writes a canonical metadata object, so a document indexed
+        // without metadata stores `{}`. Tantivy omits the field entirely in that
+        // case, and an empty object carries no information anyway — materialize
+        // both as `None` so the public envelope never hands out an
+        // information-free `Some({})` (with its per-hit `Arc`) and so
+        // `metadata.is_some()` means the same thing on both engines.
+        if metadata.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(metadata)))
     }
 
     fn materialize_stored_value(
@@ -12517,6 +12527,84 @@ mod tests {
                 1,
                 "rejected ingests must not change doc_count",
             );
+        });
+    }
+
+    /// A document indexed without metadata must materialize as absent, not as
+    /// an empty JSON object. Ingest always writes a canonical metadata object,
+    /// so the empty map round-trips as `{}` unless the materialization
+    /// boundary folds it away — while the Tantivy oracle omits the field
+    /// entirely. `IndexableDocument::new` starts with an empty map, so leaving
+    /// `Some({})` in place flips `metadata.is_some()` on the majority of
+    /// documents at the default-engine flip (fusion winner re-attachment,
+    /// fsfs JSON output) and allocates a per-hit `Arc` carrying no
+    /// information (bd-quill-e4-argus-3ycz.10).
+    #[test]
+    fn e410_empty_metadata_materializes_as_absent_not_empty_object() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("metadata index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("doc-bare", "alpha bare document"),
+                        IndexableDocument::new("doc-meta", "alpha annotated document")
+                            .with_metadata("lang", "rust"),
+                    ],
+                )
+                .await
+                .expect("ingest mixed-metadata batch");
+            index.commit(&cx).await.expect("seal mixed-metadata batch");
+            let annotated = serde_json::json!({ "lang": "rust" });
+
+            let hydrated = index
+                .search_results(&cx, "alpha", 10)
+                .expect("search the hydrated envelope");
+            assert_eq!(hydrated.len(), 2, "both documents match the shared term");
+            for result in &hydrated {
+                match result.doc_id.as_str() {
+                    "doc-bare" => assert!(
+                        result.metadata.is_none(),
+                        "empty stored metadata must materialize as absent, got {:?}",
+                        result.metadata,
+                    ),
+                    "doc-meta" => assert_eq!(
+                        result.metadata.as_deref(),
+                        Some(&annotated),
+                        "present metadata must survive the same boundary",
+                    ),
+                    other => panic!("unexpected document id {other}"),
+                }
+            }
+
+            // The deferred-fusion lane re-attaches winners' metadata through
+            // the same boundary, so hydration must agree hit for hit.
+            let mut candidates = LexicalSearch::search_fusion_candidates(&index, &cx, "alpha", 10)
+                .await
+                .expect("deferred fusion candidates");
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.metadata.is_none()),
+                "deferred candidates carry no metadata before hydration",
+            );
+            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut candidates)
+                .await
+                .expect("hydrate fusion winners");
+            for candidate in &candidates {
+                match candidate.doc_id.as_str() {
+                    "doc-bare" => assert!(
+                        candidate.metadata.is_none(),
+                        "hydration must not resurrect an empty metadata object",
+                    ),
+                    "doc-meta" => assert_eq!(
+                        candidate.metadata.as_deref(),
+                        Some(&annotated),
+                        "hydration must restore the annotated metadata verbatim",
+                    ),
+                    other => panic!("unexpected document id {other}"),
+                }
+            }
         });
     }
 
