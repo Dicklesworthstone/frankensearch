@@ -34,7 +34,7 @@
 //!
 //! **Use `--release`.** These lanes run a real transformer over the whole book
 //! three times (semantic corpus, hash-control corpus, hybrid corpus) — roughly
-//! 1,000 MiniLM forwards. In an unoptimized build the int8 GEMM is slow enough
+//! 1,000 `MiniLM` forwards. In an unoptimized build the int8 GEMM is slow enough
 //! to push the run past half an hour, which is how a lane like this ends up
 //! disabled instead of maintained. Optimized, it is minutes.
 //!
@@ -54,7 +54,7 @@ use std::path::PathBuf;
 /// `asupersync::test_utils::run_test_with_cx` installs a TRACE-level subscriber
 /// and ignores `RUST_LOG`. `tracing`'s global default is first-wins and applies
 /// process-wide, so once any test in this binary calls it, every later test
-/// inherits TRACE — including the ones that tokenize. The HuggingFace tokenizer
+/// inherits TRACE — including the ones that tokenize. The `HuggingFace` tokenizer
 /// inside `NativeEmbedder` logs *five lines per character*: one measured run
 /// produced 1,976,875 lines and burned over ten CPU-hours across 66 threads
 /// without finishing, while the same tests in a process that never reaches
@@ -106,7 +106,7 @@ const SEMANTIC_QUERIES: &str =
 
 /// Target passage size in bytes. Chosen so a passage is a few paragraphs of
 /// narrative — large enough to carry a scene's meaning into a sentence
-/// embedding, small enough that a typical passage fits MiniLM's 512-token
+/// embedding, small enough that a typical passage fits `MiniLM`'s 512-token
 /// window.
 ///
 /// This is a floor, not a cap: paragraphs are never split, so a single long
@@ -169,7 +169,11 @@ pub fn chunk_book(raw: &str) -> Vec<Passage> {
                 .and_then(|n| n.trim().parse().ok())
                 .unwrap_or_else(|| panic!("unparseable chapter heading: {block}"));
             let _roman = parts.next();
-            title = parts.next().unwrap_or_default().trim().to_owned();
+            parts
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .clone_into(&mut title);
             seq = 0;
             continue;
         }
@@ -258,13 +262,41 @@ fn model_dir_candidates() -> Vec<PathBuf> {
 /// exercised rather than quietly stepped over.
 #[cfg(feature = "native")]
 fn resolve_model_dir(lane: &str) -> Option<PathBuf> {
+    // Ask the frozen manifest what the loader will actually demand rather than
+    // keeping a second list here. `NativeEmbedder::load` verifies every declared
+    // artifact by size and SHA-256, so any list maintained separately from the
+    // manifest is a list that can drift out of date — and did: this guard used
+    // to check only `tokenizer.json` plus a weights file, which let a directory
+    // missing `config.json`, `special_tokens_map.json` and `tokenizer_config.json`
+    // pass as "model present". The lane then died inside `NativeEmbedder::load`
+    // naming one missing file at a time instead of skipping with a full list.
+    let manifest =
+        frankensearch_embed::model_manifest::ModelArtifactManifestV1::minilm_native_frankentorch()
+            .expect("registered native MiniLM manifest");
+    let required: Vec<&str> = manifest
+        .artifacts
+        .iter()
+        .map(|a| a.relative_path.as_str())
+        .collect();
+
     let candidates = model_dir_candidates();
+    // Remember the closest near-miss so the diagnostic names what a
+    // half-provisioned directory is actually missing.
+    let mut closest: Option<(&PathBuf, Vec<&str>)> = None;
     for dir in &candidates {
-        let has_tokenizer = dir.join("tokenizer.json").is_file();
-        let has_weights =
-            dir.join("model_f32.safetensors").is_file() || dir.join("model.safetensors").is_file();
-        if has_tokenizer && has_weights {
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|rel| !dir.join(rel).is_file())
+            .collect();
+        if missing.is_empty() {
             return Some(dir.clone());
+        }
+        if closest
+            .as_ref()
+            .is_none_or(|(_, seen)| missing.len() < seen.len())
+        {
+            closest = Some((dir, missing));
         }
     }
 
@@ -273,18 +305,38 @@ fn resolve_model_dir(lane: &str) -> Option<PathBuf> {
         .map(|p| format!("  - {}", p.display()))
         .collect::<Vec<_>>()
         .join("\n");
+    let detail = match &closest {
+        Some((dir, missing)) => {
+            let lines = missing
+                .iter()
+                .map(|rel| {
+                    let url = manifest
+                        .artifacts
+                        .iter()
+                        .find(|a| a.relative_path == *rel)
+                        .map_or("<no pinned url>", |a| a.upstream_url.as_str());
+                    format!("  - {rel}\n      {url}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Closest directory {} is missing {} of {} pinned artifacts:\n{lines}\n",
+                dir.display(),
+                missing.len(),
+                required.len()
+            )
+        }
+        None => String::new(),
+    };
     let message = format!(
-        "SKIPPING {lane}: no all-MiniLM-L6-v2 model found.\n\
+        "SKIPPING {lane}: no complete all-MiniLM-L6-v2 model found.\n\
          Searched:\n{searched}\n\
-         Each directory needs `tokenizer.json` plus `model_f32.safetensors` or \
-         `model.safetensors`.\n\
-         Install with:\n  \
-         mkdir -p ~/.cache/frankensearch/models/all-MiniLM-L6-v2 && cd $_ && \\\n    \
-         curl -sSLO https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/\
-         c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer.json && \\\n    \
-         curl -sSLO https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/\
-         c9745ed1d9f207416be6d2e6f8de32d1f16199bf/model.safetensors\n\
-         Set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 to make this a hard failure."
+         {detail}\
+         Every artifact the frozen manifest declares must be present; \
+         `NativeEmbedder::load` verifies each by size and SHA-256 at revision \
+         {revision}.\n\
+         Set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 to make this a hard failure.",
+        revision = manifest.upstream_revision
     );
 
     assert!(

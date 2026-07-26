@@ -178,7 +178,7 @@
     },
     {
       "name": "assault_repelled",
-      "query": "the defenders inside the wooden walls fight off a rush of attackers and count their dead",
+      "query": "the defenders inside the wooden walls fight off a rush of assailants and count their dead",
       "expect_chapters": [
         21
       ],
