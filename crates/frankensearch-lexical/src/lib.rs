@@ -253,6 +253,59 @@ pub struct OracleQueryObservation {
     pub doc_count: usize,
 }
 
+/// Dev-only exact counted page used by the Quill replacement witness.
+///
+/// This is deliberately separate from [`OracleQueryObservation`]: the latter
+/// owns cutoff-tie expansion for rank-parity campaigns, while this DTO proves
+/// the incumbent's real offset-pagination contract. Shipping callers should
+/// not depend on this evidence-only surface.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OraclePageObservation {
+    /// Ordered page returned by Tantivy's real offset collector.
+    pub hits: Vec<OraclePageHit>,
+    /// Exact number of matches, independent of `limit` and `offset`.
+    pub total_count: usize,
+    /// Exact live-document count.
+    pub doc_count: usize,
+}
+
+/// One ordered hit from [`OraclePageObservation`].
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OraclePageHit {
+    /// Stable external document identifier.
+    pub doc_id: String,
+    /// Exact BM25 score representation.
+    pub score_bits: u32,
+    /// Zero-based rank inside this returned page.
+    pub page_rank: usize,
+    /// Zero-based rank in the complete result stream.
+    pub absolute_rank: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COUNTED_COLLECTOR_INVOCATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static TOP_K_COLLECTOR_INVOCATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_collector_invocations() {
+    COUNTED_COLLECTOR_INVOCATIONS.set(0);
+    TOP_K_COLLECTOR_INVOCATIONS.set(0);
+}
+
+#[cfg(test)]
+fn collector_invocations() -> (u64, u64) {
+    (
+        COUNTED_COLLECTOR_INVOCATIONS.get(),
+        TOP_K_COLLECTOR_INVOCATIONS.get(),
+    )
+}
+
 /// Execute a pre-built Tantivy query with offset pagination.
 ///
 /// This helper centralizes error mapping and result-shape normalization so
@@ -269,6 +322,9 @@ pub fn execute_query_with_offset(
     limit: usize,
     offset: usize,
 ) -> SearchResult<LexicalSearchResult> {
+    #[cfg(test)]
+    COUNTED_COLLECTOR_INVOCATIONS.set(COUNTED_COLLECTOR_INVOCATIONS.get().saturating_add(1));
+
     if limit == 0 {
         let total_count =
             searcher
@@ -331,6 +387,9 @@ pub fn execute_top_k(
         return Ok(Vec::new());
     }
 
+    #[cfg(test)]
+    TOP_K_COLLECTOR_INVOCATIONS.set(TOP_K_COLLECTOR_INVOCATIONS.get().saturating_add(1));
+
     let top_docs = searcher
         .search(
             query,
@@ -366,53 +425,6 @@ pub fn load_doc(searcher: &Searcher, doc_address: DocAddress) -> SearchResult<Ta
             subsystem: "tantivy",
             source: Box::new(e),
         })
-}
-
-fn is_counted_query_syntax(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'"' | b'\''
-            | b'('
-            | b')'
-            | b':'
-            | b'+'
-            | b'-'
-            | b'!'
-            | b'^'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'*'
-            | b'?'
-            | b'~'
-            | b'\\'
-            | b'/'
-    )
-}
-
-fn use_count_free_top_k(query: &str) -> bool {
-    let mut term_count = 0usize;
-    let mut in_term = false;
-
-    for byte in query.bytes() {
-        if byte.is_ascii_whitespace() {
-            in_term = false;
-            continue;
-        }
-        if is_counted_query_syntax(byte) {
-            return false;
-        }
-        if !in_term {
-            term_count += 1;
-            if term_count > 2 {
-                return false;
-            }
-            in_term = true;
-        }
-    }
-
-    term_count > 0
 }
 
 /// Try to build a snippet generator for a query/content field pair.
@@ -1460,6 +1472,70 @@ impl TantivyIndex {
         })
     }
 
+    /// Observe Tantivy's real exact-count offset-pagination path.
+    ///
+    /// This method exists only for the replacement conformance harness. It
+    /// intentionally uses the same private lenient parser, reader snapshot,
+    /// stored-ID materialization, and [`execute_query_with_offset`] collector
+    /// as the incumbent engine. The exact count is returned by Tantivy's
+    /// [`Count`] collector and is never inferred from the page length.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed search failure when query execution, rank arithmetic,
+    /// or stored-document materialization fails.
+    #[cfg(feature = "tantivy-oracle")]
+    #[instrument(skip_all, fields(query = %query, limit = limit, offset = offset))]
+    pub fn oracle_observe_page(
+        &self,
+        _cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> SearchResult<OraclePageObservation> {
+        let query = Self::truncate_query(query);
+        if query.trim().is_empty() {
+            return Ok(OraclePageObservation {
+                hits: Vec::new(),
+                total_count: 0,
+                doc_count: self.doc_count.load(Ordering::Relaxed),
+            });
+        }
+
+        let parsed = self.parse_query_lenient(query);
+        let searcher = self.reader.searcher();
+        let search_result = execute_query_with_offset(&searcher, &*parsed, limit, offset)?;
+        let mut hits = Vec::with_capacity(search_result.hits.len());
+        for hit in search_result.hits {
+            let doc = load_doc(&searcher, hit.doc_address)?;
+            let doc_id = doc
+                .get_first(self.fields.id)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let absolute_rank =
+                offset
+                    .checked_add(hit.rank)
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "tantivy.oracle_page_rank".to_owned(),
+                        value: format!("{offset}+{}", hit.rank),
+                        reason: "absolute result rank must fit usize".to_owned(),
+                    })?;
+            hits.push(OraclePageHit {
+                doc_id,
+                score_bits: hit.bm25_score.to_bits(),
+                page_rank: hit.rank,
+                absolute_rank,
+            });
+        }
+
+        Ok(OraclePageObservation {
+            hits,
+            total_count: search_result.total_count,
+            doc_count: self.doc_count.load(Ordering::Relaxed),
+        })
+    }
+
     /// Search and return only `(doc_id, score, rank)` rows.
     ///
     /// This avoids metadata JSON decoding and is intended for latency-critical
@@ -1482,11 +1558,7 @@ impl TantivyIndex {
 
         let parsed = self.parse_query_lenient(query);
         let searcher = self.reader.searcher();
-        let hits = if use_count_free_top_k(query) {
-            execute_top_k(&searcher, &*parsed, limit, 0)?
-        } else {
-            execute_query_with_offset(&searcher, &*parsed, limit, 0)?.hits
-        };
+        let hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
         self.collect_id_hits(&searcher, hits)
     }
 
@@ -1639,11 +1711,7 @@ impl TantivyIndex {
 
         let parsed = self.parse_query_lenient(query);
         let searcher = self.reader.searcher();
-        let hits = if use_count_free_top_k(query) {
-            execute_top_k(&searcher, &*parsed, limit, 0)?
-        } else {
-            execute_query_with_offset(&searcher, &*parsed, limit, 0)?.hits
-        };
+        let hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
         let mut results = Vec::with_capacity(hits.len());
         for hit in hits {
             results.push(LexicalIdHit {
@@ -2136,6 +2204,227 @@ mod tests {
         ]
     }
 
+    fn shared_full120_docs() -> Vec<IndexableDocument> {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/corpus.json"))
+                .expect("parse committed Full120 corpus");
+        let documents = fixture["documents"]
+            .as_array()
+            .expect("fixture documents array");
+        assert_eq!(documents.len(), 120, "Full120 fixture count drifted");
+        documents
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document)| {
+                let mut metadata = document["metadata"]
+                    .as_object()
+                    .expect("fixture metadata")
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            value
+                                .as_str()
+                                .map_or_else(|| value.to_string(), str::to_owned),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>();
+                metadata.insert(
+                    "created_at".to_owned(),
+                    document["created_at"]
+                        .as_str()
+                        .expect("fixture created_at")
+                        .to_owned(),
+                );
+                metadata.insert(
+                    "doc_type".to_owned(),
+                    document["doc_type"]
+                        .as_str()
+                        .expect("fixture doc_type")
+                        .to_owned(),
+                );
+                metadata.insert("created_at_ms".to_owned(), ordinal.to_string());
+                IndexableDocument {
+                    id: document["doc_id"]
+                        .as_str()
+                        .expect("fixture doc_id")
+                        .to_owned(),
+                    content: document["content"]
+                        .as_str()
+                        .expect("fixture content")
+                        .to_owned(),
+                    title: Some(
+                        document["title"]
+                            .as_str()
+                            .expect("fixture title")
+                            .to_owned(),
+                    ),
+                    metadata,
+                }
+            })
+            .collect()
+    }
+
+    fn optional_score_bits(score: Option<f32>) -> Option<u32> {
+        score.map(f32::to_bits)
+    }
+
+    fn assert_scored_result_contract(
+        actual: &ScoredResult,
+        expected: &ScoredResult,
+        context: &str,
+    ) {
+        assert_eq!(actual.doc_id, expected.doc_id, "doc_id: {context}");
+        assert_eq!(
+            actual.score.to_bits(),
+            expected.score.to_bits(),
+            "score: {context}"
+        );
+        assert_eq!(actual.source, expected.source, "source: {context}");
+        assert_eq!(actual.index, expected.index, "index: {context}");
+        assert_eq!(
+            optional_score_bits(actual.fast_score),
+            optional_score_bits(expected.fast_score),
+            "fast score: {context}"
+        );
+        assert_eq!(
+            optional_score_bits(actual.quality_score),
+            optional_score_bits(expected.quality_score),
+            "quality score: {context}"
+        );
+        assert_eq!(
+            optional_score_bits(actual.lexical_score),
+            optional_score_bits(expected.lexical_score),
+            "lexical score: {context}"
+        );
+        assert_eq!(
+            optional_score_bits(actual.rerank_score),
+            optional_score_bits(expected.rerank_score),
+            "rerank score: {context}"
+        );
+        assert_eq!(
+            serde_json::to_value(&actual.explanation).expect("serialize actual explanation"),
+            serde_json::to_value(&expected.explanation).expect("serialize expected explanation"),
+            "explanation: {context}"
+        );
+        assert_eq!(
+            actual.metadata.as_deref(),
+            expected.metadata.as_deref(),
+            "metadata: {context}"
+        );
+    }
+
+    async fn assert_live_lexical_contract(
+        idx: &TantivyIndex,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        expected_total_count: usize,
+    ) {
+        let context = format!("query={query:?}, limit={limit}");
+        let full = idx.search(cx, query, limit).await.expect("full search");
+        let id_hits = idx
+            .search_doc_ids(cx, query, limit)
+            .expect("ord-table ID search");
+        let docstore_hits = idx
+            .search_doc_ids_via_docstore(cx, query, limit)
+            .expect("docstore ID search");
+        let mut candidates = idx
+            .search_fusion_candidates(cx, query, limit)
+            .await
+            .expect("fusion candidate search");
+
+        assert_eq!(
+            id_hits, docstore_hits,
+            "ordinal table must independently resolve the same IDs as stored documents: {context}"
+        );
+        assert_eq!(full.len(), id_hits.len(), "full/id length: {context}");
+        assert_eq!(
+            full.len(),
+            candidates.len(),
+            "full/candidate length: {context}"
+        );
+        assert_eq!(
+            full.len(),
+            limit.min(expected_total_count),
+            "result count: {context}"
+        );
+
+        for (rank, ((expected, id_hit), candidate)) in
+            full.iter().zip(&id_hits).zip(&candidates).enumerate()
+        {
+            let row_context = format!("{context}, rank={rank}");
+            assert_eq!(id_hit.rank, rank, "ID rank: {row_context}");
+            assert_eq!(id_hit.doc_id, expected.doc_id, "ID doc_id: {row_context}");
+            assert_eq!(
+                id_hit.bm25_score.to_bits(),
+                expected.score.to_bits(),
+                "ID score: {row_context}"
+            );
+            assert_eq!(
+                candidate.doc_id, expected.doc_id,
+                "candidate doc_id: {row_context}"
+            );
+            assert_eq!(
+                candidate.score.to_bits(),
+                expected.score.to_bits(),
+                "candidate score: {row_context}"
+            );
+            assert_eq!(
+                optional_score_bits(candidate.lexical_score),
+                optional_score_bits(expected.lexical_score),
+                "candidate lexical score: {row_context}"
+            );
+            assert_eq!(candidate.source, expected.source, "source: {row_context}");
+            assert_eq!(candidate.index, expected.index, "index: {row_context}");
+            assert_eq!(
+                optional_score_bits(candidate.fast_score),
+                optional_score_bits(expected.fast_score),
+                "fast score: {row_context}"
+            );
+            assert_eq!(
+                optional_score_bits(candidate.quality_score),
+                optional_score_bits(expected.quality_score),
+                "quality score: {row_context}"
+            );
+            assert_eq!(
+                optional_score_bits(candidate.rerank_score),
+                optional_score_bits(expected.rerank_score),
+                "rerank score: {row_context}"
+            );
+            assert_eq!(
+                serde_json::to_value(&candidate.explanation)
+                    .expect("serialize candidate explanation"),
+                serde_json::to_value(&expected.explanation)
+                    .expect("serialize expected explanation"),
+                "explanation: {row_context}"
+            );
+            assert!(
+                candidate.metadata.is_none(),
+                "candidate metadata must be deferred: {row_context}"
+            );
+        }
+
+        idx.hydrate_fusion_metadata(cx, &mut candidates)
+            .await
+            .expect("hydrate fusion metadata");
+        for (rank, (candidate, expected)) in candidates.iter().zip(&full).enumerate() {
+            assert_scored_result_contract(
+                candidate,
+                expected,
+                &format!("{context}, hydrated rank={rank}"),
+            );
+        }
+
+        let parsed = idx.parse_query_lenient(query);
+        let counted = execute_query_with_offset(&idx.reader.searcher(), &*parsed, limit, 0)
+            .expect("exact counted search");
+        assert_eq!(
+            counted.total_count, expected_total_count,
+            "Count must remain exact and independent of k: {context}"
+        );
+    }
+
     // ─── Schema tests ───────────────────────────────────────────────────
 
     #[test]
@@ -2502,6 +2791,74 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn oracle_counted_pages_keep_exact_totals_and_absolute_ranks() {
+        let idx = TantivyIndex::in_memory_single_threaded_oracle().expect("create oracle");
+        run_with_cx(|cx| async move {
+            let docs = (0..9)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("doc-{ordinal:02}"),
+                        format!("shared counted-page term document {ordinal}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let count_only = idx
+                .oracle_observe_page(&cx, "counted-page", 0, 0)
+                .expect("count-only page");
+            let first = idx
+                .oracle_observe_page(&cx, "counted-page", 3, 0)
+                .expect("first page");
+            let second = idx
+                .oracle_observe_page(&cx, "counted-page", 3, 3)
+                .expect("second page");
+            let prefix = idx
+                .oracle_observe_page(&cx, "counted-page", 6, 0)
+                .expect("combined prefix");
+            let past_end = idx
+                .oracle_observe_page(&cx, "counted-page", 3, 100)
+                .expect("past-end page");
+
+            for page in [&count_only, &first, &second, &prefix, &past_end] {
+                assert_eq!(page.total_count, 9, "exact Count must ignore k and offset");
+                assert_eq!(page.doc_count, 9, "snapshot document count must be stable");
+            }
+            assert!(
+                count_only.hits.is_empty(),
+                "limit zero must retain Count only"
+            );
+            assert!(past_end.hits.is_empty(), "past-end offset must be empty");
+            assert_eq!(first.hits.len(), 3);
+            assert_eq!(second.hits.len(), 3);
+            assert_eq!(prefix.hits.len(), 6);
+
+            for (page_rank, hit) in first.hits.iter().enumerate() {
+                assert_eq!(hit.page_rank, page_rank);
+                assert_eq!(hit.absolute_rank, page_rank);
+            }
+            for (page_rank, hit) in second.hits.iter().enumerate() {
+                assert_eq!(hit.page_rank, page_rank);
+                assert_eq!(hit.absolute_rank, page_rank + 3);
+            }
+            let combined = first
+                .hits
+                .iter()
+                .chain(&second.hits)
+                .map(|hit| (&hit.doc_id, hit.score_bits))
+                .collect::<Vec<_>>();
+            let prefix = prefix
+                .hits
+                .iter()
+                .map(|hit| (&hit.doc_id, hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(combined, prefix, "offset pages must compose exactly");
+        });
+    }
+
     #[test]
     fn tantivy_indexing_enforces_max_token_len_boundary() {
         let idx = TantivyIndex::in_memory().expect("create");
@@ -2808,44 +3165,121 @@ mod tests {
     }
 
     #[test]
-    fn search_doc_ids_matches_counted_baseline() {
+    fn every_live_tantivy_search_surface_has_one_total_order_under_score_ties() {
         let idx = TantivyIndex::in_memory().expect("create");
         run_with_cx(|cx| async move {
-            let docs = sample_docs();
-            idx.index_documents(&cx, &docs).await.expect("index");
-            idx.commit(&cx).await.expect("commit");
+            idx.writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
 
-            for query in ["Rust", "Rust search", "\"Rust programming\""] {
-                let optimized = idx
-                    .search_doc_ids(&cx, query, 10)
-                    .expect("optimized search");
-                let counted = idx
-                    .search_doc_ids_counted(&cx, query, 10)
-                    .expect("counted search");
-                assert_eq!(optimized, counted, "query {query:?}");
+            const DOC_COUNT: usize = 120;
+            const SEGMENT_SIZE: usize = 30;
+            for segment_start in (0..DOC_COUNT).step_by(SEGMENT_SIZE) {
+                let docs = (segment_start..segment_start + SEGMENT_SIZE)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("tie-{ordinal:03}"),
+                            "alpha beta gamma delta shared exact score",
+                        )
+                        .with_title("alpha beta heading")
+                        .with_metadata("ordinal", ordinal.to_string())
+                    })
+                    .collect::<Vec<_>>();
+                idx.index_documents(&cx, &docs)
+                    .await
+                    .expect("index tie segment");
+                idx.commit(&cx).await.expect("commit tie segment");
             }
+
+            let query_shapes = [
+                "alpha",
+                "alpha beta",
+                "alpha beta gamma",
+                "\"alpha beta\"",
+                "alpha AND beta",
+                "title:alpha",
+            ];
+            for query in query_shapes {
+                for limit in [0, 1, DOC_COUNT - 1, DOC_COUNT, DOC_COUNT + 1] {
+                    assert_live_lexical_contract(&idx, &cx, query, limit, DOC_COUNT).await;
+                }
+            }
+            assert_live_lexical_contract(&idx, &cx, "", 20, 0).await;
+            assert_live_lexical_contract(&idx, &cx, "term-not-present", 20, 0).await;
         });
     }
 
     #[test]
-    fn count_free_doc_ids_only_accepts_one_or_two_plain_terms() {
-        assert!(use_count_free_top_k("Rust"));
-        assert!(use_count_free_top_k("rust_2026"));
-        assert!(use_count_free_top_k("Rust search"));
-        assert!(use_count_free_top_k("  Rust\tsearch\n"));
+    fn harvested_natural_language_query_keeps_count_off_the_public_candidate_path() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let documents = shared_full120_docs();
+            for batch in documents.chunks(5) {
+                idx.index_documents(&cx, batch)
+                    .await
+                    .expect("index Full120 campaign batch");
+            }
+            idx.commit(&cx).await.expect("commit Full120");
 
-        for query in [
-            "",
-            "Rust search relevance",
-            "\"Rust programming\"",
-            "title:Rust",
-            "Rust*",
-            "+Rust",
-            "doc-000001",
-            "path/to/doc",
-        ] {
-            assert!(!use_count_free_top_k(query), "query {query:?}");
-        }
+            const QUERY: &str = "how to sear a steak properly";
+            const LIMIT: usize = 20;
+            let full = idx.search(&cx, QUERY, LIMIT).await.expect("full search");
+            reset_collector_invocations();
+            let ids = idx
+                .search_doc_ids(&cx, QUERY, LIMIT)
+                .expect("count-free ID search");
+            let candidates = idx
+                .search_fusion_candidates(&cx, QUERY, LIMIT)
+                .await
+                .expect("fusion candidates");
+            assert_eq!(
+                collector_invocations(),
+                (0, 2),
+                "both public candidate surfaces must construct TopDocs-only and never Count"
+            );
+            let counted = idx
+                .search_doc_ids_counted(&cx, QUERY, LIMIT)
+                .expect("counted benchmark control");
+            assert_eq!(
+                collector_invocations(),
+                (1, 2),
+                "only the explicit benchmark control may construct (TopDocs, Count)"
+            );
+
+            assert_eq!(full.len(), LIMIT);
+            assert_eq!(ids.len(), full.len());
+            assert_eq!(candidates.len(), full.len());
+            assert_eq!(counted.len(), LIMIT);
+            for (rank, ((expected, id_hit), candidate)) in
+                full.iter().zip(&ids).zip(&candidates).enumerate()
+            {
+                let context = format!("harvested-14 rank={rank}");
+                assert_eq!(id_hit.rank, rank, "{context}");
+                assert_eq!(id_hit.doc_id, expected.doc_id, "{context}");
+                assert_eq!(
+                    id_hit.bm25_score.to_bits(),
+                    expected.score.to_bits(),
+                    "{context}"
+                );
+                assert_eq!(candidate.doc_id, expected.doc_id, "{context}");
+                assert_eq!(
+                    candidate.score.to_bits(),
+                    expected.score.to_bits(),
+                    "{context}"
+                );
+            }
+
+            let parsed = idx.parse_query_lenient(QUERY);
+            let counted_page =
+                execute_query_with_offset(&idx.reader.searcher(), &*parsed, LIMIT, 0)
+                    .expect("exact counted API");
+            assert_eq!(
+                counted_page.total_count, 110,
+                "the pinned Full120 harvested-14 exact count drifted"
+            );
+        });
     }
 
     #[test]
