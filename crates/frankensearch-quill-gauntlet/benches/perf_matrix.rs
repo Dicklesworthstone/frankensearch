@@ -1185,6 +1185,14 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         };
         let (json, table) = artifact.write_to(&output_dir).expect("write QG artifacts");
         eprintln!("{}", artifact.human_table());
+        eprintln!("[quill-perf-json-begin] gate={gate}");
+        eprintln!(
+            "{}",
+            artifact
+                .to_json_pretty()
+                .expect("serialize QG artifact for remote retrieval")
+        );
+        eprintln!("[quill-perf-json-end] gate={gate}");
         eprintln!(
             "[quill-perf] gate={gate} json={} table={}",
             display_path(&json),
