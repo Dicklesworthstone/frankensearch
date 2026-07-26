@@ -1021,6 +1021,7 @@ fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
 enum ProvenanceProgram {
     Git,
     Rustc,
+    Rustup,
 }
 
 impl ProvenanceProgram {
@@ -1028,6 +1029,7 @@ impl ProvenanceProgram {
         match self {
             Self::Git => std::process::Command::new("git"),
             Self::Rustc => std::process::Command::new("rustc"),
+            Self::Rustup => std::process::Command::new("rustup"),
         }
     }
 }
@@ -1091,7 +1093,7 @@ fn collect_dated_toolchain_channel() -> Result<String, GauntletError> {
         ));
     }
     let active = run_capture(
-        "rustup",
+        ProvenanceProgram::Rustup,
         &["show", "active-toolchain"],
         "rustup active toolchain",
     )?;
