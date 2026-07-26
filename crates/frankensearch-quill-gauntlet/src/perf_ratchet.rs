@@ -10,19 +10,19 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
 use crate::{
-    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS, PerfCellResult, PerfGate,
-    PerfGateArtifact, PerfMatrixSpec,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PerfCellResult, PerfGate, PerfGateArtifact,
+    PerfMatrixSpec,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
-pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v1";
+pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v2";
 /// Maximum directional pass-over-pass regression admitted for a cell.
 pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 /// Maximum disagreement admitted between same-revision candidate reruns.
 pub const PERF_MAX_REPRODUCTION_DELTA_PCT: f64 = 5.0;
-/// Robust-z threshold used to distinguish a regression from an inconclusive
-/// movement inside a wide MAD noise band.
+/// Robust-z value retained as diagnostic provenance beside CI-gated decisions.
 pub const PERF_REGRESSION_ROBUST_Z: f64 = 3.0;
 
 const MAD_SCALE: f64 = 1.4826;
@@ -226,6 +226,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         "candidate",
         &mut state,
     );
+    validate_paired_evidence(gate, &candidate_cells, "candidate", &mut state);
 
     if request.mode == PerfRatchetMode::Promotion {
         validate_complete_gate(gate, &candidate_cells, request.gate_activated, &mut state);
@@ -271,6 +272,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
                 "rerun",
                 &mut state,
             );
+            validate_paired_evidence(gate, &rerun_cells, "rerun", &mut state);
             compare_reproduction(
                 request.candidate,
                 rerun,
@@ -354,6 +356,17 @@ fn validate_artifact<'a>(
             format!("{role} must record non-empty run_window and run_id values"),
         );
     }
+    let explicit_bootstrap = artifact.cells.is_empty()
+        && artifact.machine_fingerprint == "unmeasured"
+        && artifact.bench_elf_sha256 == "unmeasured";
+    if !explicit_bootstrap && !is_lower_hex_sha256(&artifact.bench_elf_sha256) {
+        state.fatal(
+            "perf.ratchet.invalid_bench_elf_sha256",
+            format!(
+                "{role} must carry the 64-character lowercase SHA-256 self-reported by its benchmark ELF"
+            ),
+        );
+    }
 
     let mut cells = BTreeMap::new();
     for cell in &artifact.cells {
@@ -367,23 +380,133 @@ fn validate_artifact<'a>(
                 ),
             );
         }
-        if cell.distribution.runs < PERF_MIN_RUNS || cell.distribution.cv_pct >= PERF_MAX_CV_PCT {
+        if cell.distribution.runs < PERF_MIN_RUNS {
             state.quarantine(
-                "perf.ratchet.noisy_cell",
+                "perf.ratchet.insufficient_samples",
                 format!(
-                    "{role} {}/{}/{} has runs={} cv_pct={:.3}; require runs>={} and cv_pct<{}",
+                    "{role} {}/{}/{} has runs={}; require runs>={}",
+                    cell.fixture, cell.metric, cell.engine, cell.distribution.runs, PERF_MIN_RUNS,
+                ),
+            );
+        }
+        let distribution = &cell.distribution;
+        if !distribution.median_ci95_low.is_finite()
+            || !distribution.median_ci95_high.is_finite()
+            || distribution.median_ci95_low > distribution.p50
+            || distribution.p50 > distribution.median_ci95_high
+        {
+            state.fatal(
+                "perf.ratchet.invalid_median_ci",
+                format!(
+                    "{role} {}/{}/{} has invalid median CI [{:.6}, {:.6}] around {:.6}",
                     cell.fixture,
                     cell.metric,
                     cell.engine,
-                    cell.distribution.runs,
-                    cell.distribution.cv_pct,
-                    PERF_MIN_RUNS,
-                    PERF_MAX_CV_PCT,
+                    distribution.median_ci95_low,
+                    distribution.median_ci95_high,
+                    distribution.p50,
                 ),
             );
         }
     }
     cells
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_paired_evidence(
+    gate: PerfGate,
+    cells: &BTreeMap<CellKey, &PerfCellResult>,
+    role: &str,
+    state: &mut DecisionState,
+) {
+    let paired = cells
+        .iter()
+        .filter(|(key, _)| key.engine == "paired_ab")
+        .map(|(key, cell)| (key.clone(), *cell))
+        .collect::<Vec<_>>();
+    for (key, claim) in paired {
+        let Some(metric_stem) = key.metric.strip_suffix("_quill_over_tantivy") else {
+            state.fatal(
+                "perf.ratchet.invalid_paired_metric",
+                format!(
+                    "{role} paired A/B row {}/{}/{} has no canonical metric suffix",
+                    key.fixture, key.metric, key.engine
+                ),
+            );
+            continue;
+        };
+        let null_key = CellKey {
+            fixture: key.fixture.clone(),
+            metric: format!("{metric_stem}_tantivy_over_tantivy"),
+            engine: "paired_null".to_owned(),
+            unit: "ratio".to_owned(),
+        };
+        let Some(null) = cells.get(&null_key).copied() else {
+            state.quarantine(
+                "perf.ratchet.missing_null_control",
+                format!(
+                    "{role} paired claim {}/{} has no same-invocation A/A null row",
+                    key.fixture, key.metric
+                ),
+            );
+            continue;
+        };
+        if !validate_null_control(null, role, state) {
+            continue;
+        }
+
+        let null_floor = (null.distribution.median_ci95_low - 1.0)
+            .abs()
+            .max((null.distribution.median_ci95_high - 1.0).abs());
+        if gate == PerfGate::Qg6 {
+            let equivalence_half_width = 0.10;
+            let floor_fits = PERF_NULL_MARGIN_MULTIPLIER * null_floor <= equivalence_half_width;
+            let claim_fits = claim.distribution.median_ci95_low >= 1.0 - equivalence_half_width
+                && claim.distribution.median_ci95_high <= 1.0 + equivalence_half_width;
+            if !floor_fits || !claim_fits {
+                state.quarantine(
+                    "perf.ratchet.inconclusive_equivalence",
+                    format!(
+                        "{role} {}/{} cannot establish ±10% equivalence: A/B median CI \
+                         [{:.6}, {:.6}], A/A median CI [{:.6}, {:.6}], required null margin {:.1}x",
+                        key.fixture,
+                        key.metric,
+                        claim.distribution.median_ci95_low,
+                        claim.distribution.median_ci95_high,
+                        null.distribution.median_ci95_low,
+                        null.distribution.median_ci95_high,
+                        PERF_NULL_MARGIN_MULTIPLIER,
+                    ),
+                );
+            }
+            continue;
+        }
+
+        let effect = (claim.distribution.p50 - 1.0).abs();
+        let outside_null = claim.distribution.p50 < null.distribution.median_ci95_low
+            || claim.distribution.p50 > null.distribution.median_ci95_high;
+        if !outside_null || effect < PERF_NULL_MARGIN_MULTIPLIER * null_floor {
+            state.quarantine(
+                "perf.ratchet.inconclusive_paired_claim",
+                format!(
+                    "{role} {}/{} median {:.6} does not clear A/A median CI \
+                     [{:.6}, {:.6}] with the required {:.1}x margin",
+                    key.fixture,
+                    key.metric,
+                    claim.distribution.p50,
+                    null.distribution.median_ci95_low,
+                    null.distribution.median_ci95_high,
+                    PERF_NULL_MARGIN_MULTIPLIER,
+                ),
+            );
+        }
+    }
 }
 
 fn expected_gate_keys(gate: PerfGate) -> BTreeSet<CellKey> {
@@ -496,6 +619,7 @@ fn compare_baseline(
 ) {
     let explicit_bootstrap = baseline.cells.is_empty()
         && baseline.machine_fingerprint == "unmeasured"
+        && baseline.bench_elf_sha256 == "unmeasured"
         && baseline.git_rev == "unmeasured"
         && baseline.run_window == "unmeasured"
         && baseline.run_id == "unmeasured";
@@ -520,6 +644,7 @@ fn compare_baseline(
         );
         return;
     }
+    validate_paired_evidence(baseline.gate, baseline_cells, "baseline", state);
     if baseline.machine_fingerprint != candidate.machine_fingerprint {
         state.quarantine(
             "perf.ratchet.machine_mismatch",
@@ -550,7 +675,7 @@ fn compare_baseline(
             continue;
         };
         if key.engine == "paired_null" {
-            validate_null_control(current, state);
+            let _ = validate_null_control(current, "candidate", state);
             continue;
         }
 
@@ -575,6 +700,7 @@ fn compare_baseline(
         if matches!(key.engine.as_str(), "tantivy" | "quill_tokenizer_null") {
             if relative_delta_pct(previous.distribution.p50, current.distribution.p50)
                 > PERF_MAX_REGRESSION_PCT
+                && confidence_intervals_show_shift(previous, current)
             {
                 state.quarantine(
                     "perf.ratchet.oracle_drift",
@@ -589,10 +715,22 @@ fn compare_baseline(
 
         if threshold_exceeded {
             let message = format!(
-                "{}/{}/{} regressed {:.3}% (robust_z={robust_z:.3})",
-                key.fixture, key.metric, key.engine, regression_pct
+                "{}/{}/{} regressed {:.3}% (baseline median CI [{:.6}, {:.6}], \
+                 candidate median CI [{:.6}, {:.6}], robust_z provenance={robust_z:.3})",
+                key.fixture,
+                key.metric,
+                key.engine,
+                regression_pct,
+                previous.distribution.median_ci95_low,
+                previous.distribution.median_ci95_high,
+                current.distribution.median_ci95_low,
+                current.distribution.median_ci95_high,
             );
-            if robust_z >= PERF_REGRESSION_ROBUST_Z {
+            if confidence_interval_confirms_regression(
+                previous,
+                current,
+                higher_is_better(&key.metric),
+            ) {
                 state.block("perf.ratchet.regression_detected", message);
             } else {
                 state.quarantine("perf.ratchet.inconclusive_regression", message);
@@ -668,18 +806,48 @@ fn compare_reproduction(
     }
 }
 
-fn validate_null_control(cell: &PerfCellResult, state: &mut DecisionState) {
-    let tolerance = (MAD_SCALE * PERF_REGRESSION_ROBUST_Z * cell.distribution.mad)
-        .max(PERF_MAX_REGRESSION_PCT / 100.0);
-    if (cell.distribution.p50 - 1.0).abs() > tolerance {
+fn validate_null_control(cell: &PerfCellResult, role: &str, state: &mut DecisionState) -> bool {
+    let contains_identity =
+        cell.distribution.median_ci95_low <= 1.0 && 1.0 <= cell.distribution.median_ci95_high;
+    if !contains_identity {
         state.quarantine(
             "perf.ratchet.invalid_null_control",
             format!(
-                "{}/{}/{} median {:.6} does not bracket 1.0 within tolerance {:.6}",
-                cell.fixture, cell.metric, cell.engine, cell.distribution.p50, tolerance
+                "{role} {}/{}/{} A/A median CI [{:.6}, {:.6}] does not contain 1.0 \
+                 (cv_pct={:.3} is provenance only)",
+                cell.fixture,
+                cell.metric,
+                cell.engine,
+                cell.distribution.median_ci95_low,
+                cell.distribution.median_ci95_high,
+                cell.distribution.cv_pct,
             ),
         );
     }
+    contains_identity
+}
+
+fn confidence_interval_confirms_regression(
+    baseline: &PerfCellResult,
+    candidate: &PerfCellResult,
+    higher_is_better: bool,
+) -> bool {
+    let threshold = PERF_MAX_REGRESSION_PCT / 100.0;
+    if higher_is_better {
+        candidate.distribution.median_ci95_high
+            < baseline.distribution.median_ci95_low * (1.0 - threshold)
+    } else {
+        candidate.distribution.median_ci95_low
+            > baseline.distribution.median_ci95_high * (1.0 + threshold)
+    }
+}
+
+fn confidence_intervals_show_shift(baseline: &PerfCellResult, candidate: &PerfCellResult) -> bool {
+    let threshold = PERF_MAX_REGRESSION_PCT / 100.0;
+    candidate.distribution.median_ci95_low
+        > baseline.distribution.median_ci95_high * (1.0 + threshold)
+        || candidate.distribution.median_ci95_high
+            < baseline.distribution.median_ci95_low * (1.0 - threshold)
 }
 
 fn higher_is_better(metric: &str) -> bool {
@@ -1040,6 +1208,8 @@ mod tests {
         DistributionSummary {
             value,
             p50: value,
+            median_ci95_low: value,
+            median_ci95_high: value,
             p95: value,
             p99: value,
             mad: value.abs() * 0.002,
@@ -1053,6 +1223,7 @@ mod tests {
         PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg2,
+            bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             git_rev: revision.to_owned(),
             run_window: "test-window".to_owned(),
@@ -1149,10 +1320,10 @@ mod tests {
     }
 
     #[test]
-    fn noisy_candidate_is_quarantined_never_kept() {
+    fn high_cv_is_provenance_and_does_not_quarantine_a_decidable_claim() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let mut candidate = qg2_artifact("new", 161.0, 100.0);
-        candidate.cells[0].distribution.cv_pct = PERF_MAX_CV_PCT;
+        candidate.cells[0].distribution.cv_pct = 47.0;
         let mut rerun = candidate.clone();
         rerun.run_id = "rerun".to_owned();
         let result = evaluate(
@@ -1162,13 +1333,11 @@ mod tests {
             true,
             PerfRatchetMode::Promotion,
         );
-        assert_eq!(result.decision, PerfGateDecision::Quarantine);
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason.code == "perf.ratchet.noisy_cell")
-        );
+        assert_eq!(result.decision, PerfGateDecision::Allow);
+        assert!(result.reasons.iter().all(|reason| {
+            reason.code != "perf.ratchet.insufficient_samples"
+                && reason.code != "perf.ratchet.inconclusive_paired_claim"
+        }));
     }
 
     #[test]
@@ -1229,10 +1398,11 @@ mod tests {
     }
 
     #[test]
-    fn noisy_apparent_regression_is_quarantined_not_blocked() {
+    fn ci_overlapping_apparent_regression_is_quarantined_not_blocked() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let mut candidate = qg2_artifact("new", 100.0, 100.0);
-        candidate.cells[0].distribution.cv_pct = PERF_MAX_CV_PCT;
+        candidate.cells[0].distribution.median_ci95_low = 90.0;
+        candidate.cells[0].distribution.median_ci95_high = 170.0;
         let mut rerun = candidate.clone();
         rerun.run_id = "rerun".to_owned();
         let result = evaluate(
@@ -1249,6 +1419,7 @@ mod tests {
     fn activated_bootstrap_can_establish_first_measured_baseline() {
         let mut baseline = qg2_artifact("unmeasured", 0.0, 1.0);
         baseline.machine_fingerprint = "unmeasured".to_owned();
+        baseline.bench_elf_sha256 = "unmeasured".to_owned();
         baseline.run_window = "unmeasured".to_owned();
         baseline.run_id = "unmeasured".to_owned();
         baseline.cells.clear();
@@ -1276,6 +1447,9 @@ mod tests {
     fn bootstrap_cannot_satisfy_pr_regression_alarm() {
         let mut baseline = qg2_artifact("unmeasured", 0.0, 1.0);
         baseline.machine_fingerprint = "unmeasured".to_owned();
+        baseline.bench_elf_sha256 = "unmeasured".to_owned();
+        baseline.run_window = "unmeasured".to_owned();
+        baseline.run_id = "unmeasured".to_owned();
         baseline.cells.clear();
         baseline.laws_attested = false;
         let candidate = qg2_artifact("new", 161.0, 100.0);

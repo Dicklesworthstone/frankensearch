@@ -16,8 +16,8 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
-use frankensearch_core::bench_support::paired_median_ratio;
+use criterion::Criterion;
+use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_index::{Quantization, VectorIndex};
 
 const N: usize = 100_000;
@@ -148,12 +148,21 @@ fn bench(c: &mut Criterion) {
     let null = paired_median_ratio(31, 3, mk_f16(), mk_f16());
     let lever = paired_median_ratio(31, 3, mk_f16(), mk_i8());
     eprintln!(
-        "[null]  fast_scan: median {:.4} p5 {:.4} p95 {:.4}",
-        null.median, null.p5, null.p95
+        "[null]  fast_scan: median {:.4} median_ci95 [{:.4}, {:.4}] \
+         p5 {:.4} p95 {:.4} admissible={}",
+        null.median,
+        null.median_ci95_low,
+        null.median_ci95_high,
+        null.p5,
+        null.p95,
+        null.is_admissible_null(),
     );
     eprintln!(
-        "[lever] fast_scan int8/f16 median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        "[lever] fast_scan int8/f16 median {:.4} median_ci95 [{:.4}, {:.4}] \
+         p5 {:.4} p95 {:.4} -> {}",
         lever.median,
+        lever.median_ci95_low,
+        lever.median_ci95_high,
         lever.p5,
         lever.p95,
         if lever.decidable_against(&null) {
@@ -175,8 +184,15 @@ fn bench(c: &mut Criterion) {
         g.finish();
     }
 
-    let _ = std::fs::remove_file(&path);
+    eprintln!(
+        "[artifact] retained index={} (repository policy forbids benchmark teardown deletion)",
+        path.display()
+    );
 }
 
-criterion_group!(benches, bench);
-criterion_main!(benches);
+fn main() {
+    let _identity = print_bench_elf_sha256().expect("hash executing top-k benchmark");
+    let mut criterion = Criterion::default().configure_from_args();
+    bench(&mut criterion);
+    criterion.final_summary();
+}

@@ -15,10 +15,19 @@ use serde::{Deserialize, Serialize};
 use crate::GauntletError;
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v2";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v3";
 /// Minimum independent samples required by the standing statistical law.
 pub const PERF_MIN_RUNS: usize = 10;
-/// Maximum coefficient of variation admitted by an activated gate.
+/// Deterministic bootstrap resamples used for the 95% confidence interval on
+/// each sample median.
+pub const PERF_BOOTSTRAP_RESAMPLES: usize = 2_000;
+/// Required margin between a claimed paired effect and its same-invocation
+/// A/A null floor.
+pub const PERF_NULL_MARGIN_MULTIPLIER: f64 = 2.0;
+/// Legacy display reference retained for artifact consumers.
+///
+/// `cv_pct` is provenance only. Neither the harness nor the ratchet uses this
+/// value as an admission threshold.
 pub const PERF_MAX_CV_PCT: f64 = 5.0;
 /// Oracle writer heap pinned for all same-binary comparisons (50 MiB).
 pub const PERF_WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -431,16 +440,20 @@ impl PerfMatrixSpec {
 pub struct DistributionSummary {
     pub value: f64,
     pub p50: f64,
+    pub median_ci95_low: f64,
+    pub median_ci95_high: f64,
     pub p95: f64,
     pub p99: f64,
     pub mad: f64,
+    /// Provenance only. Activation decisions are based on the median CI and
+    /// paired A/A null floor, never on this coefficient of variation.
     pub cv_pct: f64,
     pub runs: usize,
 }
 
 impl DistributionSummary {
     /// Summarize finite non-negative samples. The result records fewer than ten
-    /// runs but cannot be gate-activated until [`Self::stable_for_activation`]
+    /// runs but cannot be gate-activated until [`Self::sampled_for_activation`]
     /// is true.
     ///
     /// # Errors
@@ -480,9 +493,12 @@ impl DistributionSummary {
             .map(|sample| (sample - p50).abs())
             .collect::<Vec<_>>();
         deviations.sort_unstable_by(f64::total_cmp);
+        let (median_ci95_low, median_ci95_high) = bootstrap_median_ci95(samples);
         Ok(Self {
             value: p50,
             p50,
+            median_ci95_low,
+            median_ci95_high,
             p95: percentile(&sorted, 0.95),
             p99: percentile(&sorted, 0.99),
             mad: percentile(&deviations, 0.50),
@@ -491,11 +507,49 @@ impl DistributionSummary {
         })
     }
 
-    /// Whether this distribution can participate in an activated gate.
+    /// Whether this distribution has the minimum independent sample count.
+    ///
+    /// This deliberately ignores `cv_pct`: the ratchet decides paired claims
+    /// from the bootstrap median CI and the same-invocation A/A null floor.
     #[must_use]
-    pub fn stable_for_activation(&self) -> bool {
-        self.runs >= PERF_MIN_RUNS && self.cv_pct < PERF_MAX_CV_PCT
+    pub fn sampled_for_activation(&self) -> bool {
+        self.runs >= PERF_MIN_RUNS
+            && self.median_ci95_low.is_finite()
+            && self.median_ci95_high.is_finite()
+            && self.median_ci95_low <= self.p50
+            && self.p50 <= self.median_ci95_high
     }
+}
+
+fn bootstrap_median_ci95(samples: &[f64]) -> (f64, f64) {
+    debug_assert!(!samples.is_empty());
+    let sample_count = u64::try_from(samples.len()).expect("sample count fits u64");
+    let mut seed = 0x6a09_e667_f3bc_c909_u64 ^ sample_count;
+    for sample in samples {
+        seed = splitmix64(seed ^ sample.to_bits());
+    }
+
+    let mut resample = Vec::with_capacity(samples.len());
+    let mut medians = Vec::with_capacity(PERF_BOOTSTRAP_RESAMPLES);
+    for _ in 0..PERF_BOOTSTRAP_RESAMPLES {
+        resample.clear();
+        for _ in 0..samples.len() {
+            seed = splitmix64(seed);
+            let index = usize::try_from(seed % sample_count).expect("sample modulus fits usize");
+            resample.push(samples[index]);
+        }
+        resample.sort_unstable_by(f64::total_cmp);
+        medians.push(percentile(&resample, 0.50));
+    }
+    medians.sort_unstable_by(f64::total_cmp);
+    (percentile(&medians, 0.025), percentile(&medians, 0.975))
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
@@ -522,6 +576,8 @@ pub struct PerfCellResult {
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
+    /// SHA-256 emitted by the benchmark process for its own executing ELF.
+    pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
     pub git_rev: String,
     /// Shared identifier for the bounded candidate/rerun measurement window.
@@ -548,28 +604,30 @@ impl PerfGateArtifact {
     #[must_use]
     pub fn human_table(&self) -> String {
         let mut table = String::from(
-            "fixture | engine | metric | p50 | p95 | p99 | cv_pct | runs | activation\n",
+            "fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission\n",
         );
-        table.push_str("--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---\n");
+        table.push_str("--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---\n");
         for cell in &self.cells {
-            let activation = if cell.distribution.stable_for_activation() {
-                "stable"
+            let admission = if cell.distribution.sampled_for_activation() {
+                "sampled"
             } else {
-                "noise"
+                "under-sampled"
             };
             let _ = writeln!(
                 table,
-                "{} | {} | {} ({}) | {:.6} | {:.6} | {:.6} | {:.3} | {} | {}",
+                "{} | {} | {} ({}) | {:.6} | [{:.6}, {:.6}] | {:.6} | {:.6} | {:.3} | {} | {}",
                 cell.fixture,
                 cell.engine,
                 cell.metric,
                 cell.unit,
                 cell.distribution.p50,
+                cell.distribution.median_ci95_low,
+                cell.distribution.median_ci95_high,
                 cell.distribution.p95,
                 cell.distribution.p99,
                 cell.distribution.cv_pct,
                 cell.distribution.runs,
-                activation,
+                admission,
             );
         }
         table
@@ -720,14 +778,35 @@ mod tests {
     }
 
     #[test]
-    fn distribution_reports_percentiles_mad_cv_and_stability() {
+    fn distribution_reports_median_ci_and_cv_provenance() {
         let samples = [10.0, 10.1, 9.9, 10.0, 10.2, 9.8, 10.0, 10.1, 9.9, 10.0];
         let summary = DistributionSummary::from_samples(&samples).expect("summary");
         assert!((summary.p50 - 10.0).abs() < f64::EPSILON);
+        assert!(summary.median_ci95_low <= summary.p50);
+        assert!(summary.p50 <= summary.median_ci95_high);
         assert_eq!(summary.runs, PERF_MIN_RUNS);
         assert!(summary.mad <= 0.1);
         assert!(summary.cv_pct < 2.0);
-        assert!(summary.stable_for_activation());
+        assert!(summary.sampled_for_activation());
+        let repeated =
+            DistributionSummary::from_samples(&samples).expect("deterministic repeated summary");
+        assert_eq!(
+            summary.median_ci95_low.to_bits(),
+            repeated.median_ci95_low.to_bits()
+        );
+        assert_eq!(
+            summary.median_ci95_high.to_bits(),
+            repeated.median_ci95_high.to_bits()
+        );
+        let high_cv = DistributionSummary::from_samples(&[
+            1.0, 100.0, 1.0, 100.0, 1.0, 100.0, 1.0, 100.0, 1.0, 100.0,
+        ])
+        .expect("high-CV provenance");
+        assert!(high_cv.cv_pct > 5.0);
+        assert!(
+            high_cv.sampled_for_activation(),
+            "CV is provenance and must not be an activation gate"
+        );
         assert!(DistributionSummary::from_samples(&[]).is_err());
         assert!(DistributionSummary::from_samples(&[f64::NAN]).is_err());
         assert!(DistributionSummary::from_samples(&[-1.0]).is_err());
@@ -740,6 +819,7 @@ mod tests {
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg1,
+            bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             git_rev: "0123456789abcdef".to_owned(),
             run_window: "test-window".to_owned(),
@@ -760,6 +840,7 @@ mod tests {
         for key in [
             "schema_version",
             "gate",
+            "bench_elf_sha256",
             "machine_fingerprint",
             "git_rev",
             "run_window",
@@ -773,8 +854,9 @@ mod tests {
         }
         let table = artifact.human_table();
         assert!(table.contains("cv_pct"));
+        assert!(table.contains("median_ci95"));
         assert!(table.contains("bulk/tiny/1/positions_on"));
-        assert!(table.contains("stable"));
+        assert!(table.contains("sampled"));
     }
 
     #[test]

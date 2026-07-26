@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion};
+use frankensearch_core::bench_support::{paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_fsfs::code_structure_sidecar::CodeStructureSidecar;
 use frankensearch_fsfs::query_execution::{FusedCandidate, RankingPriorSignals};
 
@@ -105,6 +106,41 @@ fn bench_sidecar_candidate_score(c: &mut Criterion) {
         let candidate = sidecar.prior_signals_for_candidates(query, &candidates);
         assert_eq!(legacy, candidate);
 
+        let run_legacy = || {
+            black_box(legacy_prior_signals(
+                black_box(&sidecar),
+                black_box(query),
+                black_box(&candidates),
+            ));
+        };
+        let run_candidate = || {
+            black_box(
+                sidecar.prior_signals_for_candidates(black_box(query), black_box(&candidates)),
+            );
+        };
+        let null = paired_median_ratio(41, 3, run_legacy, run_legacy);
+        let lever = paired_median_ratio(41, 3, run_legacy, run_candidate);
+        eprintln!(
+            "[sidecar-paired] candidates={n} null_median={:.6} \
+             null_median_ci95=[{:.6},{:.6}] lever_median={:.6} \
+             lever_median_ci95=[{:.6},{:.6}] decision={}",
+            null.median,
+            null.median_ci95_low,
+            null.median_ci95_high,
+            lever.median,
+            lever.median_ci95_low,
+            lever.median_ci95_high,
+            if lever.decidable_against(&null) {
+                if lever.median < 1.0 {
+                    "DECIDABLE_WIN"
+                } else {
+                    "DECIDABLE_REGRESSION"
+                }
+            } else {
+                "INSIDE_NULL_FLOOR"
+            },
+        );
+
         group.bench_with_input(
             BenchmarkId::new("legacy_score_query_loop", n),
             &n,
@@ -129,5 +165,9 @@ fn bench_sidecar_candidate_score(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sidecar_candidate_score);
-criterion_main!(benches);
+fn main() {
+    let _identity = print_bench_elf_sha256().expect("hash executing sidecar benchmark");
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_sidecar_candidate_score(&mut criterion);
+    criterion.final_summary();
+}

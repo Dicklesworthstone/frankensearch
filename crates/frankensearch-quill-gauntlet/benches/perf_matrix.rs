@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
+use frankensearch_core::bench_support::print_bench_elf_sha256;
 use frankensearch_core::{IndexableDocument, LexicalSearch};
 use frankensearch_lexical::TantivyIndex;
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
@@ -872,6 +873,55 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
     numerator / denominator.max(f64::MIN_POSITIVE)
 }
 
+struct PairedSamples {
+    arm_a: Vec<f64>,
+    arm_b: Vec<f64>,
+    ratios_b_over_a: Vec<f64>,
+    checksum: u64,
+}
+
+fn paired(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm_a: EngineArm,
+    arm_b: EngineArm,
+    runs: usize,
+) -> PairedSamples {
+    let mut samples_a = Vec::with_capacity(runs);
+    let mut samples_b = Vec::with_capacity(runs);
+    let mut ratios = Vec::with_capacity(runs);
+    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+    for round in 0..runs {
+        let (sample_a, sample_b) = if round % 2 == 0 {
+            (
+                black_box(measure_metric(context, spec, arm_a)),
+                black_box(measure_metric(context, spec, arm_b)),
+            )
+        } else {
+            let sample_b = black_box(measure_metric(context, spec, arm_b));
+            let sample_a = black_box(measure_metric(context, spec, arm_a));
+            (sample_a, sample_b)
+        };
+        let round_ratio = black_box(ratio(sample_b, sample_a));
+        checksum ^= sample_a.to_bits().rotate_left(13);
+        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+        checksum ^= sample_b.to_bits().rotate_left(31);
+        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+        checksum ^= round_ratio.to_bits().rotate_left(47);
+        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+        samples_a.push(sample_a);
+        samples_b.push(sample_b);
+        ratios.push(round_ratio);
+    }
+    black_box(checksum);
+    PairedSamples {
+        arm_a: samples_a,
+        arm_b: samples_b,
+        ratios_b_over_a: ratios,
+        checksum,
+    }
+}
+
 fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec<PerfCellResult> {
     if spec.gate == PerfGate::Qg10 {
         let samples = (0..runs)
@@ -886,28 +936,33 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
         }];
     }
 
-    let mut quill = Vec::with_capacity(runs);
-    let mut oracle = Vec::with_capacity(runs);
-    let mut paired = Vec::with_capacity(runs);
-    let mut null = Vec::with_capacity(runs);
-    for round in 0..runs {
-        let (oracle_value, quill_value) = if round % 2 == 0 {
-            (
-                measure_metric(context, spec, EngineArm::Tantivy),
-                measure_metric(context, spec, EngineArm::Quill),
-            )
-        } else {
-            let quill_value = measure_metric(context, spec, EngineArm::Quill);
-            let oracle_value = measure_metric(context, spec, EngineArm::Tantivy);
-            (oracle_value, quill_value)
-        };
-        let null_a = measure_metric(context, spec, EngineArm::Tantivy);
-        let null_b = measure_metric(context, spec, EngineArm::Tantivy);
-        oracle.push(oracle_value);
-        quill.push(quill_value);
-        paired.push(ratio(quill_value, oracle_value));
-        null.push(ratio(null_b, null_a));
-    }
+    // Contract order is deliberate: establish this invocation's A/A floor
+    // through the exact paired routine, then measure the Quill/Tantivy claim.
+    let null = paired(context, spec, EngineArm::Tantivy, EngineArm::Tantivy, runs);
+    let real = paired(context, spec, EngineArm::Tantivy, EngineArm::Quill, runs);
+    let quill_distribution =
+        DistributionSummary::from_samples(&real.arm_b).expect("Quill distribution");
+    let oracle_distribution =
+        DistributionSummary::from_samples(&real.arm_a).expect("oracle distribution");
+    let paired_distribution =
+        DistributionSummary::from_samples(&real.ratios_b_over_a).expect("paired distribution");
+    let null_distribution =
+        DistributionSummary::from_samples(&null.ratios_b_over_a).expect("null distribution");
+    eprintln!(
+        "[quill-perf-paired] fixture={} null_median={:.6} null_ci95=[{:.6},{:.6}] \
+         null_cv_pct={:.3} ab_median={:.6} ab_ci95=[{:.6},{:.6}] ab_cv_pct={:.3} \
+         checksum={:016x}",
+        spec.fixture,
+        null_distribution.p50,
+        null_distribution.median_ci95_low,
+        null_distribution.median_ci95_high,
+        null_distribution.cv_pct,
+        paired_distribution.p50,
+        paired_distribution.median_ci95_low,
+        paired_distribution.median_ci95_high,
+        paired_distribution.cv_pct,
+        null.checksum ^ real.checksum.rotate_left(29),
+    );
 
     let absolute_engine = if spec.metric == "tokenize_docs_per_second" {
         "quill_tokenizer"
@@ -920,7 +975,7 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
             metric: spec.metric.clone(),
             engine: absolute_engine.to_owned(),
             unit: unit(spec).to_owned(),
-            distribution: DistributionSummary::from_samples(&quill).expect("Quill distribution"),
+            distribution: quill_distribution,
         },
         PerfCellResult {
             fixture: spec.fixture.clone(),
@@ -931,21 +986,21 @@ fn collect_cell(context: &BenchContext, spec: &PerfCellSpec, runs: usize) -> Vec
                 EngineArm::Tantivy.label().to_owned()
             },
             unit: unit(spec).to_owned(),
-            distribution: DistributionSummary::from_samples(&oracle).expect("oracle distribution"),
+            distribution: oracle_distribution,
         },
         PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: format!("{}_quill_over_tantivy", spec.metric),
             engine: "paired_ab".to_owned(),
             unit: "ratio".to_owned(),
-            distribution: DistributionSummary::from_samples(&paired).expect("paired distribution"),
+            distribution: paired_distribution,
         },
         PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: format!("{}_tantivy_over_tantivy", spec.metric),
             engine: "paired_null".to_owned(),
             unit: "ratio".to_owned(),
-            distribution: DistributionSummary::from_samples(&null).expect("null distribution"),
+            distribution: null_distribution,
         },
     ]
 }
@@ -1076,7 +1131,7 @@ fn output_dir() -> PathBuf {
         .unwrap_or_else(|| scratch_path("artifacts"))
 }
 
-fn bench_matrix(c: &mut Criterion) {
+fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let scale = MatrixScale::from_env();
     let context = BenchContext::new(scale);
     let matrix = PerfMatrixSpec::complete();
@@ -1118,6 +1173,7 @@ fn bench_matrix(c: &mut Criterion) {
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate,
+            bench_elf_sha256: bench_elf_sha256.to_owned(),
             machine_fingerprint: machine_fingerprint(),
             git_rev: revision.clone(),
             run_window: run_window.clone(),
@@ -1248,7 +1304,8 @@ fn main() {
     if run_child_mode() {
         return;
     }
+    let identity = print_bench_elf_sha256().expect("hash executing QG benchmark");
     let mut criterion = Criterion::default().configure_from_args();
-    bench_matrix(&mut criterion);
+    bench_matrix(&mut criterion, &identity.sha256);
     criterion.final_summary();
 }

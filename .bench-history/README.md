@@ -12,3 +12,9 @@ placeholders, not performance evidence. They contain no cells, have
 gate is activated, a full, stable candidate/rerun from distinct passes in one
 measurement window may establish the first real machine-class baseline. No QG
 number may be cited as kept before that first `Allow`.
+
+Artifact schema v3 records the SHA-256 self-reported by the executing benchmark
+ELF and a deterministic bootstrap 95% confidence interval on every median.
+Each paired claim carries an A/A null from the same invocation. The ratchet
+uses those median intervals and the required 2x null-floor margin; `cv_pct`
+remains provenance and never decides admission.

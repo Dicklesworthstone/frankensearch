@@ -6,9 +6,9 @@
 
 [defaults]
 oracle = "tantivy 0.26.1 via frankensearch-lexical (feature tantivy-oracle)"
-oracle_config = "identical analyzer semantics; identical heap budget; commits inside timed windows for BOTH engines; symmetric setup/teardown outside timed windows; same-binary paired A/B (bench-internals convention)"
+oracle_config = "identical analyzer semantics; identical heap budget; commits inside timed windows for BOTH engines; symmetric setup/teardown outside timed windows; same-binary paired(arm_a, arm_b) with alternating per-round order; paired(Tantivy,Tantivy) A/A immediately before paired(Tantivy,Quill) A/B"
 build_profile = "release-perf equivalent: opt-level=3, lto=thin, codegen-units=1, force-frame-pointers=yes"
-stat_rule = ">=10 runs; median + MAD; cv_pct < 5 else the cell is NOISE (quarantine, never keep); bootstrap CI on ratios (metrics_eval::bootstrap_compare, 2000 resamples, seeded)"
+stat_rule = "executing bench ELF self-reports SHA-256 as line 1; >=10 runs; median + MAD + cv_pct provenance; deterministic seeded bootstrap 95% CI on every median (2000 resamples); A/A CI must contain 1.0; superiority claim median must lie outside its same-invocation A/A CI and clear the A/A floor by 2x; QG-6 equivalence requires the full A/B CI inside [0.90,1.10] and the 2x A/A floor inside that margin; NEVER gate on cv_pct"
 ratchet = ".bench-history/<gate>.latest.json committed; pass-over-pass within thresholds; regressions replay via seeded harness"
 machines = ["apple-silicon >= M2 Pro class (P/E asymmetric)", "x86 Zen3+ >=16C (RCH fleet for trend lines; documented noise budget; attribution runs LOCAL only per bd-e41k)"]
 rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (per-OS abstraction mandatory — e8.4 notes)"

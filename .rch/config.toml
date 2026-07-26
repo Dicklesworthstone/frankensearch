@@ -27,3 +27,23 @@
 # frankensearch nightly Rust builds are heavy — use high confidence to avoid
 # intercepting non-compilation commands.
 confidence_threshold = 0.85
+
+# Forward only the benchmark selectors/provenance needed by the Quill harness.
+# Keeping `cargo` as the direct remote command is deliberate: wrapping it in
+# `env` causes rch 1.0.52 to lose dirty overlays for nested path dependencies.
+[environment]
+allowlist = [
+  "QUILL_PERF_SCALE",
+  "QUILL_PERF_GATE",
+  "QUILL_PERF_FIXTURE",
+  "QUILL_PERF_RUNS",
+  "QUILL_PERF_GIT_REV",
+  "QUILL_PERF_RUN_WINDOW",
+  "QUILL_PERF_RUN_ID",
+  "QUILL_PERF_OUTPUT_DIR",
+  "QUILL_PERF_SCRATCH_DIR",
+  "QUILL_E17_SCALE",
+  "QUILL_E17_PROFILE",
+  "QUILL_E17_THREADS",
+  "QUILL_E17_ROUNDS",
+]

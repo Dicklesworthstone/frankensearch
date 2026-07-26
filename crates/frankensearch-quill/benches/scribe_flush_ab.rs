@@ -36,7 +36,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use frankensearch_core::DocId;
-use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
+use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio, print_bench_elf_sha256};
 use frankensearch_quill::contract::fieldnorm_to_id;
 use frankensearch_quill::delta::{
     DeltaFieldNorm, DeltaSegment, DeltaSnapshot, DeltaStoredValue, DeltaTermPosting,
@@ -364,8 +364,16 @@ fn flush_radix(
 
 fn print_ratio(kind: &str, profile: Profile, threads: usize, ratio: PairedRatio) {
     eprintln!(
-        "[{kind}] {}/{}t: new/old median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
-        profile.name, threads, ratio.median, ratio.p5, ratio.p95, ratio.rounds
+        "[{kind}] {}/{}t: new/old median {:.4} median_ci95 [{:.4}, {:.4}] \
+         p5 {:.4} p95 {:.4} ({} rounds)",
+        profile.name,
+        threads,
+        ratio.median,
+        ratio.median_ci95_low,
+        ratio.median_ci95_high,
+        ratio.p5,
+        ratio.p95,
+        ratio.rounds
     );
 }
 
@@ -438,6 +446,7 @@ fn run_cell(
 }
 
 fn main() {
+    let _identity = print_bench_elf_sha256().expect("hash executing Scribe benchmark");
     let scale = Scale::from_env();
     let profiles = selected_profiles(scale);
     assert!(
