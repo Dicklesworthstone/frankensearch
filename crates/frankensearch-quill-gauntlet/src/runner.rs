@@ -3046,7 +3046,7 @@ fn lower_tantivy_cass_filters(
 #[cfg(feature = "tantivy-oracle")]
 impl DifferentialCampaignEngine for crate::engine::CassQuillSubject {
     fn descriptor(&self) -> EngineDescriptor {
-        crate::engine::CassQuillSubject::descriptor(self)
+        Self::descriptor(self)
     }
 
     fn semantic_contract(&self) -> SemanticContract {
@@ -3089,9 +3089,7 @@ impl DifferentialCampaignEngine for crate::engine::CassQuillSubject {
                     "Quill CASS commit received a different semantic contract",
                 ));
             }
-            let actual_count =
-                u64::try_from(crate::engine::CassQuillSubject::commit_corpus(self, cx)?)
-                    .unwrap_or(u64::MAX);
+            let actual_count = u64::try_from(Self::commit_corpus(self, cx)?).unwrap_or(u64::MAX);
             if actual_count != manifest.document_count {
                 return Err(campaign_error(
                     "Quill CASS committed document count differs from the corpus manifest",
@@ -3134,14 +3132,14 @@ impl DifferentialCampaignEngine for crate::engine::CassQuillSubject {
     }
 
     fn abort_corpus(&mut self) {
-        crate::engine::CassQuillSubject::abort(self);
+        Self::abort(self);
     }
 }
 
 #[cfg(feature = "tantivy-oracle")]
 impl DifferentialCampaignEngine for crate::engine::CassTantivyOracle {
     fn descriptor(&self) -> EngineDescriptor {
-        crate::engine::CassTantivyOracle::descriptor(self)
+        Self::descriptor(self)
     }
 
     fn semantic_contract(&self) -> SemanticContract {
@@ -3184,9 +3182,7 @@ impl DifferentialCampaignEngine for crate::engine::CassTantivyOracle {
                     "Tantivy CASS commit received a different semantic contract",
                 ));
             }
-            let actual_count =
-                u64::try_from(crate::engine::CassTantivyOracle::commit_corpus(self, cx)?)
-                    .unwrap_or(u64::MAX);
+            let actual_count = u64::try_from(Self::commit_corpus(self, cx)?).unwrap_or(u64::MAX);
             if actual_count != manifest.document_count {
                 return Err(campaign_error(
                     "Tantivy CASS committed document count differs from the corpus manifest",
@@ -3219,7 +3215,7 @@ impl DifferentialCampaignEngine for crate::engine::CassTantivyOracle {
     }
 
     fn abort_corpus(&mut self) {
-        crate::engine::CassTantivyOracle::abort(self);
+        Self::abort(self);
     }
 }
 
