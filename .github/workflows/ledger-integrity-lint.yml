@@ -1,0 +1,44 @@
+name: Ledger Integrity Lint
+
+# Refuses a NEW rejected-lever row that cannot distinguish the lever from the
+# harness. See scripts/check_ledger_null_control.sh for the contract, and
+# docs/LEDGER_RESURRECTION.md for the audit that motivated it (205 of 220 void
+# rows in this ledger are VOID-NONULL).
+#
+# Ledger integrity DECAYS: across the fleet, repos that audited once and
+# institutionalized the check sit near 1.7% void, while repos that audited and
+# stopped sit at 25-91%. This job is the difference.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  ledger-integrity-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Need history so the PR base is available to diff against.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate newly added REJECT rows
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # Fall back to the previous commit when no usable base is supplied
+          # (e.g. a first push), so the job checks something rather than
+          # silently passing.
+          if [[ -z "${BASE_REF}" || "${BASE_REF}" == "0000000000000000000000000000000000000000" ]]; then
+            BASE_REF="HEAD~1"
+          fi
+          echo "Gating ledger rows added since ${BASE_REF}"
+          scripts/check_ledger_null_control.sh --since "${BASE_REF}"
+
+      - name: Report historical backlog (never fails)
+        if: always()
+        run: scripts/check_ledger_null_control.sh --all
