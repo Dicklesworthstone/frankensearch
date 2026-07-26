@@ -42,13 +42,22 @@ Installer goals:
 
 ## Cargo Install (Developer Path)
 
-`fsfs` currently builds from this workspace and uses the pinned nightly toolchain (`rust-toolchain.toml`):
+`fsfs` currently builds from this workspace and uses the pinned nightly toolchain
+(`rust-toolchain.toml`). Its default feature set embeds two pinned semantic
+models; provision and verify those build inputs before invoking Cargo:
 
 ```bash
+scripts/rch-ensure-deps.sh --models-only
 cargo +nightly install --path crates/frankensearch-fsfs
 fsfs version
 fsfs status --no-watch-mode --format json
 ```
+
+The provisioning command validates every artifact's byte length and SHA-256.
+It writes to `FRANKENSEARCH_BUNDLED_MODELS_SOURCE_DIR`,
+`FRANKENSEARCH_MODEL_DIR`, or
+`~/.local/share/frankensearch/models` (in that precedence order). The Cargo
+build itself remains network-free.
 
 ## Quick Start (60 Seconds)
 

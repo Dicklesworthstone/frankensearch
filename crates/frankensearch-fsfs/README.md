@@ -8,6 +8,21 @@ Standalone `fsfs` CLI and runtime for two-tier hybrid local search.
 
 The crate is split into a library (`src/lib.rs`) for reusable runtime, configuration, and adapter logic, and a binary (`src/main.rs`) for the `fsfs` CLI entrypoint.
 
+## Build Prerequisite
+
+The default `embedded-models` feature packages exact, pinned Potion and MiniLM
+artifacts. From the workspace root, provision their verified source files
+before a default-feature build:
+
+```bash
+scripts/rch-ensure-deps.sh --models-only
+```
+
+Use `scripts/rch-ensure-deps.sh --all-workers --models-only` to prepare every
+RCH worker without coupling model admission to sibling-dependency maintenance.
+Both provisioning modes enforce the manifest byte lengths and SHA-256 digests;
+Cargo's build script performs no network access.
+
 ## Key Types
 
 ### CLI and Configuration
