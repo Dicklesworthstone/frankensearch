@@ -710,6 +710,39 @@ impl StorageBackedJobRunner {
                 }
             };
 
+            // Reject unusable embeddings before any sink sees them: an
+            // all-zero or non-finite vector can never match a query, and a
+            // persisted one becomes a permanently dead record that drags the
+            // index toward the NoUsableVectors zero-signal state (bd-tqhc).
+            let norm_sq: f32 = embedding.iter().map(|value| value * value).sum();
+            if embedding.iter().any(|value| !value.is_finite())
+                || norm_sq == 0.0
+                || !norm_sq.is_finite()
+            {
+                let error = SearchError::InvalidConfig {
+                    field: "embedding".to_owned(),
+                    value: "<unusable vector>".to_owned(),
+                    reason: "embedding must be finite with non-zero norm; refusing to persist \
+                             an unsearchable record"
+                        .to_owned(),
+                };
+                if self.handle_job_failure(job, &error) {
+                    result.terminal_failures += 1;
+                }
+                result.jobs_failed += 1;
+                tracing::warn!(
+                    target: "frankensearch.storage.pipeline",
+                    stage = "validate",
+                    worker_id,
+                    correlation_id = %correlation_id,
+                    doc_id = %job.doc_id,
+                    embedder_id = %job.embedder_id,
+                    "embedder produced an unusable (zero-norm or non-finite) vector; \
+                     job failed without persisting"
+                );
+                continue;
+            }
+
             let write_result = self
                 .vector_sink
                 .persist(&job.doc_id, &job.embedder_id, &embedding);
@@ -1609,6 +1642,42 @@ mod tests {
                 .count_by_status("fast-tier")
                 .expect("status counts should succeed");
             assert_eq!(counts.failed, 1);
+        });
+    }
+
+    #[test]
+    fn process_batch_zero_norm_embedding_fails_job_without_persisting() {
+        // bd-tqhc: an embedder that yields an all-zero vector must fail the
+        // job at the validate stage; nothing may reach the vector sink.
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 4, None, 0.0));
+            let runner = make_runner(
+                JobQueueConfig {
+                    max_retries: 0,
+                    ..JobQueueConfig::default()
+                },
+                PipelineConfig::default(),
+                fast,
+                None,
+                Arc::clone(&sink),
+            );
+
+            let _ = runner
+                .ingest(IngestRequest::new("doc-zero", "some perfectly normal text"))
+                .expect("ingest should succeed");
+            let processed = runner
+                .process_batch(&cx, "worker-zero")
+                .await
+                .expect("process_batch should succeed");
+
+            assert_eq!(processed.jobs_claimed, 1);
+            assert_eq!(processed.jobs_completed, 0);
+            assert_eq!(processed.jobs_failed, 1);
+            assert!(
+                sink.entries().is_empty(),
+                "an unusable vector must never reach the sink"
+            );
         });
     }
 
