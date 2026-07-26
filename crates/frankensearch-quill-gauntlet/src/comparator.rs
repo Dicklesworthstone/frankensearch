@@ -82,6 +82,18 @@ pub enum AstLoweringKind {
     /// An oversized (>65,530-byte) query token lowered to `MatchNone` under
     /// Quill's symmetric admission rule (register DIV-004).
     OversizedQueryToken,
+    /// A match- or score-affecting parser/canonicalization shape differs from
+    /// the reviewed logical query contract.
+    QueryCanonicalization,
+    /// Quill deliberately refuses to reproduce behavior proven incorrect in
+    /// the pinned oracle.
+    OracleBug,
+    /// A bounded wildcard expansion selected a different admissible subset.
+    GlobExpansionLimit,
+    /// Snapshot statistics differ at a reviewed lifecycle boundary.
+    StatsSemantics,
+    /// Analyzer behavior differs on one reviewed Unicode edge case.
+    UnicodeEdge,
 }
 
 /// One recorded AST/diagnostic lowering difference between subject and oracle
@@ -197,15 +209,29 @@ pub enum DivergenceClass {
     ScoreEpsilon,
     RankMismatch,
     SnippetMismatch,
+    SnippetWindow,
     CountMismatch,
     DocumentCountMismatch,
+    GlobExpansionLimit,
+    QueryCanonicalization,
+    OracleBug,
+    StatsSemantics,
+    UnicodeEdge,
     OversizedQueryToken,
 }
 
 impl DivergenceClass {
     const fn is_failure(self) -> bool {
         match self {
-            Self::TieOrder | Self::ScoreEpsilon | Self::OversizedQueryToken => false,
+            Self::TieOrder
+            | Self::ScoreEpsilon
+            | Self::SnippetWindow
+            | Self::GlobExpansionLimit
+            | Self::QueryCanonicalization
+            | Self::OracleBug
+            | Self::StatsSemantics
+            | Self::UnicodeEdge
+            | Self::OversizedQueryToken => false,
             Self::RankMismatch
             | Self::SnippetMismatch
             | Self::CountMismatch
@@ -803,6 +829,11 @@ fn classify_ast_differences(
     for (index, difference) in subject.ast_differences.iter().enumerate() {
         let class = match difference.kind {
             AstLoweringKind::OversizedQueryToken => DivergenceClass::OversizedQueryToken,
+            AstLoweringKind::QueryCanonicalization => DivergenceClass::QueryCanonicalization,
+            AstLoweringKind::OracleBug => DivergenceClass::OracleBug,
+            AstLoweringKind::GlobExpansionLimit => DivergenceClass::GlobExpansionLimit,
+            AstLoweringKind::StatsSemantics => DivergenceClass::StatsSemantics,
+            AstLoweringKind::UnicodeEdge => DivergenceClass::UnicodeEdge,
         };
         divergences.push(Divergence {
             class,
@@ -1110,6 +1141,41 @@ mod tests {
         // The classified pointer resolves in the serialized artifact.
         let projection = serde_json::json!({ "comparison": &report });
         assert!(projection.pointer(&report.divergences[0].pointer).is_some());
+    }
+
+    #[test]
+    fn reviewed_ast_difference_taxonomy_is_closed_and_classified() {
+        let reviewed = [
+            (
+                AstLoweringKind::QueryCanonicalization,
+                DivergenceClass::QueryCanonicalization,
+            ),
+            (AstLoweringKind::OracleBug, DivergenceClass::OracleBug),
+            (
+                AstLoweringKind::GlobExpansionLimit,
+                DivergenceClass::GlobExpansionLimit,
+            ),
+            (
+                AstLoweringKind::StatsSemantics,
+                DivergenceClass::StatsSemantics,
+            ),
+            (AstLoweringKind::UnicodeEdge, DivergenceClass::UnicodeEdge),
+        ];
+        for (kind, expected_class) in reviewed {
+            let mut subject = observation(vec![quill_hit("a", 5.0, 1)]);
+            subject.ast_differences.push(AstDifference {
+                kind,
+                oracle: "reviewed oracle shape".to_owned(),
+                subject: "reviewed subject shape".to_owned(),
+            });
+            let oracle = observation(vec![tantivy_hit("a", 5.0, 1)]);
+            let report = compare_observations(subject, oracle, ComparatorConfig::default())
+                .expect("reviewed AST comparison");
+            assert_eq!(report.status, ComparisonStatus::Classified);
+            assert_eq!(report.rank_class, RankClass::RankExact);
+            assert_eq!(report.divergences.len(), 1);
+            assert_eq!(report.divergences[0].class, expected_class);
+        }
     }
 
     #[test]

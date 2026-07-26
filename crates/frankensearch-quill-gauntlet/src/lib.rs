@@ -42,14 +42,14 @@ pub use generator::{
     CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
     FULL_SHARED_DOCUMENT_COUNT, GENERATOR_ID, GENERATOR_SCHEMA_VERSION, GeneratedDocument,
     GeneratedQueryCase, GeneratedQueryFilters, GeneratedQueryKind, GeneratedQuerySuite,
-    GlobPatternClass, HarvestedContractQuery, MAX_CORPUS_DOCUMENT_COUNT, MAX_DOCUMENT_BYTES,
-    MAX_DOCUMENT_ID_BYTES, MAX_QUERY_CASES, MAX_QUERY_ID_BYTES, MAX_QUERY_SUITE_TEXT_BYTES,
-    MAX_QUERY_TEXT_BYTES, Pathology, QUERY_MANIFEST_SCHEMA_VERSION, QueryGeneratorSpec,
-    QueryManifest, QuerySuiteSource, QuerySyntax, RangeClass, RepositoryEntry,
+    GeneratedSourceFilter, GlobPatternClass, HarvestedContractQuery, MAX_CORPUS_DOCUMENT_COUNT,
+    MAX_DOCUMENT_BYTES, MAX_DOCUMENT_ID_BYTES, MAX_QUERY_CASES, MAX_QUERY_ID_BYTES,
+    MAX_QUERY_SUITE_TEXT_BYTES, MAX_QUERY_TEXT_BYTES, Pathology, QUERY_MANIFEST_SCHEMA_VERSION,
+    QueryGeneratorSpec, QueryManifest, QuerySuiteSource, QuerySyntax, RangeClass, RepositoryEntry,
     RepositoryFileDigest, RepositorySkipReason, RepositorySnapshot, SharedCorpusView,
     SharedEdgeCase, SharedFixtureSuite, SharedRelevanceQuery, SkippedRepositoryEntry,
-    SourceFileDigest, SyntheticCorpus, SyntheticCorpusIter, SyntheticCorpusSpec, UnicodeLane,
-    XLARGE_DOCUMENT_COUNT, ZipfExponent,
+    SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
+    SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent, cass_document_identity,
 };
 pub use perf::{
     DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,
@@ -65,8 +65,9 @@ pub use perf_ratchet::{
     evaluate_perf_ratchet,
 };
 pub use runner::{
-    CAMPAIGN_REPORT_SCHEMA_VERSION, CampaignCaseResult, CampaignConfig, CampaignDisposition,
-    CampaignFuture, CampaignReport, CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH,
+    CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
+    CampaignCaseResult, CampaignConfig, CampaignDisposition, CampaignFuture, CampaignProvenance,
+    CampaignReport, CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH,
     DEFAULT_ANALYZER_CONTRACT_PREIMAGE, DEFAULT_SCHEMA_CONTRACT_HASH,
     DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL, DifferentialCampaignEngine,
     DifferentialCampaignRunner, DivergenceRegisterDecision, DivergenceRegisterEntry,

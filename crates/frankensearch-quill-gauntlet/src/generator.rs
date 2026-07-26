@@ -24,8 +24,9 @@ use crate::{DifferentialCase, GauntletError};
 
 /// Schema version for generator specifications and manifests.
 pub const GENERATOR_SCHEMA_VERSION: u32 = 1;
-/// Schema version for query manifests with explicit suite provenance.
-pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// Schema version for query manifests with explicit suite provenance and the
+/// complete CASS Boolean/glob/range/structured-filter profile.
+pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = 3;
 /// Stable identity of this generator implementation.
 pub const GENERATOR_ID: &str = "frankensearch-quill-gauntlet/generator-v1";
 /// Maximum accepted document size, in UTF-8 bytes.
@@ -54,6 +55,8 @@ const DEFAULT_VOCABULARY_SIZE: u32 = 4_096;
 const MAX_FREQUENCY_REPETITIONS: usize = 65_536;
 const MAX_GENERATED_QUERY_LIMIT: u64 = 100_000;
 const MAX_QUERY_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_STRUCTURED_FILTER_VALUES: usize = 64;
+const MAX_STRUCTURED_FILTER_VALUE_BYTES: usize = 4 * 1024;
 const MAX_DOCUMENT_AUXILIARY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CANONICAL_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_REPOSITORY_ID_BYTES: usize = 1_024;
@@ -209,6 +212,16 @@ pub struct CassDocumentFields {
     pub origin_kind: String,
     /// Message position in the source.
     pub message_index: u64,
+}
+
+/// Render the canonical cross-engine identity for one stored CASS message.
+///
+/// Both adapters derive this value after reopening from the stored
+/// `source_id` and `msg_idx` fields. The exact separator/rendering is pinned by
+/// `CASS_SCHEMA_CONTRACT_PREIMAGE`.
+#[must_use]
+pub fn cass_document_identity(source_id: &str, message_index: u64) -> String {
+    format!("{source_id}#{message_index}")
 }
 
 /// Engine-neutral generated document with canonical metadata ordering.
@@ -1323,6 +1336,24 @@ pub enum RangeClass {
     To,
 }
 
+/// Required structured-filter families in the CASS campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredFilterClass {
+    /// Exact agent-name set.
+    Agent,
+    /// Exact workspace-name set.
+    Workspace,
+    /// Local-origin restriction.
+    Local,
+    /// Remote-origin restriction.
+    Remote,
+    /// Exact durable source identifier.
+    SourceId,
+    /// Multiple structured predicates combined as required clauses.
+    Combined,
+}
+
 /// Semantic/syntactic purpose of a generated query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1345,6 +1376,11 @@ pub enum GeneratedQueryKind {
         /// Exact bound shape.
         range_class: RangeClass,
     },
+    /// One or more structured CASS predicates.
+    StructuredFilter {
+        /// Exact structured-filter family.
+        filter_class: StructuredFilterClass,
+    },
     /// Explicit pagination probe.
     Paginated,
     /// Explicit count/no-count probe.
@@ -1356,13 +1392,89 @@ pub enum GeneratedQueryKind {
     },
 }
 
-/// CASS structured range filters kept separate from raw query syntax.
+/// Engine-neutral source restriction lowered by both CASS adapters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GeneratedSourceFilter {
+    /// Do not restrict the durable source identity.
+    #[default]
+    All,
+    /// Match documents indexed from the local machine.
+    Local,
+    /// Match documents indexed through SSH.
+    Remote,
+    /// Match one exact durable source identifier.
+    SourceId {
+        /// Stable source identifier.
+        source_id: String,
+    },
+}
+
+/// CASS structured filters kept separate from raw query syntax.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedQueryFilters {
+    /// Exact agent names, combined with OR and required by the root query.
+    #[serde(default)]
+    pub agents: Vec<String>,
+    /// Exact workspace names, combined with OR and required by the root query.
+    #[serde(default)]
+    pub workspaces: Vec<String>,
     /// Inclusive creation-time lower bound.
     pub created_from_ms: Option<i64>,
     /// Inclusive creation-time upper bound.
     pub created_to_ms: Option<i64>,
+    /// Durable source restriction.
+    #[serde(default)]
+    pub source_filter: GeneratedSourceFilter,
+}
+
+impl GeneratedQueryFilters {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+            && self.workspaces.is_empty()
+            && self.created_from_ms.is_none()
+            && self.created_to_ms.is_none()
+            && self.source_filter == GeneratedSourceFilter::All
+    }
+
+    fn text_bytes(&self) -> Option<usize> {
+        self.agents
+            .iter()
+            .chain(&self.workspaces)
+            .try_fold(0_usize, |bytes, value| bytes.checked_add(value.len()))
+            .and_then(|bytes| match &self.source_filter {
+                GeneratedSourceFilter::SourceId { source_id } => bytes.checked_add(source_id.len()),
+                GeneratedSourceFilter::All
+                | GeneratedSourceFilter::Local
+                | GeneratedSourceFilter::Remote => Some(bytes),
+            })
+    }
+
+    fn validate(&self) -> bool {
+        let bounded_unique_values = |values: &[String]| {
+            values.len() <= MAX_STRUCTURED_FILTER_VALUES
+                && values
+                    .iter()
+                    .all(|value| is_canonical_text(value, MAX_STRUCTURED_FILTER_VALUE_BYTES))
+                && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+        };
+        let range_is_ordered = self
+            .created_from_ms
+            .zip(self.created_to_ms)
+            .is_none_or(|(from, to)| from <= to);
+        let source_is_bounded = match &self.source_filter {
+            GeneratedSourceFilter::SourceId { source_id } => {
+                is_canonical_text(source_id, MAX_STRUCTURED_FILTER_VALUE_BYTES)
+            }
+            GeneratedSourceFilter::All
+            | GeneratedSourceFilter::Local
+            | GeneratedSourceFilter::Remote => true,
+        };
+        bounded_unique_values(&self.agents)
+            && bounded_unique_values(&self.workspaces)
+            && range_is_ordered
+            && source_is_bounded
+    }
 }
 
 /// Rich engine-neutral query case; E6.2 adapters lower this without data loss.
@@ -1707,6 +1819,7 @@ fn contract_query_case(
         filters: GeneratedQueryFilters {
             created_from_ms: query.filters.get("created_from").copied(),
             created_to_ms: query.filters.get("created_to").copied(),
+            ..GeneratedQueryFilters::default()
         },
         expected_divergence: None,
         source,
@@ -1846,6 +1959,24 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
             "auth OR token cache".to_owned(),
         ),
         base(
+            "boolean-cass-and",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::Boolean,
+            "auth AND token".to_owned(),
+        ),
+        base(
+            "boolean-cass-or",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::Boolean,
+            "auth OR token".to_owned(),
+        ),
+        base(
+            "boolean-cass-not",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::Boolean,
+            "auth NOT stale".to_owned(),
+        ),
+        base(
             "glob-exact",
             QuerySyntax::Cass,
             GeneratedQueryKind::Glob {
@@ -1890,6 +2021,7 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
         filters: GeneratedQueryFilters {
             created_from_ms: Some(1_700_000_000_000),
             created_to_ms: Some(1_700_000_000_999),
+            ..GeneratedQueryFilters::default()
         },
         ..base(
             "range-inclusive",
@@ -1904,6 +2036,7 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
         filters: GeneratedQueryFilters {
             created_from_ms: Some(1_700_000_000_000),
             created_to_ms: None,
+            ..GeneratedQueryFilters::default()
         },
         ..base(
             "range-from",
@@ -1918,6 +2051,7 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
         filters: GeneratedQueryFilters {
             created_from_ms: None,
             created_to_ms: Some(1_700_000_000_999),
+            ..GeneratedQueryFilters::default()
         },
         ..base(
             "range-to",
@@ -1926,6 +2060,97 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
                 range_class: RangeClass::To,
             },
             "cache".to_owned(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            agents: vec!["agent-0".to_owned(), "agent-3".to_owned()],
+            ..GeneratedQueryFilters::default()
+        },
+        ..base(
+            "filter-agent",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Agent,
+            },
+            String::new(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            workspaces: vec!["workspace-1".to_owned(), "workspace-4".to_owned()],
+            ..GeneratedQueryFilters::default()
+        },
+        ..base(
+            "filter-workspace",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Workspace,
+            },
+            String::new(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            source_filter: GeneratedSourceFilter::Local,
+            ..GeneratedQueryFilters::default()
+        },
+        ..base(
+            "filter-local",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Local,
+            },
+            String::new(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            source_filter: GeneratedSourceFilter::Remote,
+            ..GeneratedQueryFilters::default()
+        },
+        ..base(
+            "filter-remote",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Remote,
+            },
+            String::new(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            source_filter: GeneratedSourceFilter::SourceId {
+                source_id: "source-2".to_owned(),
+            },
+            ..GeneratedQueryFilters::default()
+        },
+        ..base(
+            "filter-source-id",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::SourceId,
+            },
+            String::new(),
+        )
+    });
+    cases.push(GeneratedQueryCase {
+        filters: GeneratedQueryFilters {
+            agents: vec!["agent-0".to_owned(), "agent-1".to_owned()],
+            workspaces: vec!["workspace-0".to_owned()],
+            created_from_ms: Some(1_700_000_000_000),
+            created_to_ms: Some(1_700_000_000_128),
+            source_filter: GeneratedSourceFilter::SourceId {
+                source_id: "source-0".to_owned(),
+            },
+        },
+        ..base(
+            "filter-combined",
+            QuerySyntax::Cass,
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Combined,
+            },
+            String::new(),
         )
     });
     cases.push(GeneratedQueryCase {
@@ -2067,6 +2292,11 @@ fn validate_query_inputs(
                     _ => 0,
                 })
             })
+            .and_then(|bytes| {
+                case.filters
+                    .text_bytes()
+                    .and_then(|filter_bytes| bytes.checked_add(filter_bytes))
+            })
             .ok_or_else(|| generator_error("query case text byte count overflow"))?;
         aggregate_text_bytes = aggregate_text_bytes
             .checked_add(case_text_bytes)
@@ -2083,6 +2313,12 @@ fn validate_query_inputs(
                 GeneratedQueryKind::Harvested { semantic_class }
                     if !is_canonical_query_id(semantic_class)
             )
+            || !case.filters.validate()
+            || (case.syntax == QuerySyntax::Default && !case.filters.is_empty())
+            || matches!(
+                &case.query_kind,
+                GeneratedQueryKind::StructuredFilter { .. }
+            ) && (case.syntax != QuerySyntax::Cass || case.filters.is_empty())
             || !ids.insert(case.id.as_str())
             || case.limit > MAX_GENERATED_QUERY_LIMIT
             || case.offset > MAX_GENERATED_QUERY_LIMIT
@@ -2836,6 +3072,31 @@ mod tests {
             ranges,
             BTreeSet::from([RangeClass::Inclusive, RangeClass::From, RangeClass::To])
         );
+        let structured_filters = suite
+            .cases
+            .iter()
+            .filter_map(|case| match &case.query_kind {
+                GeneratedQueryKind::StructuredFilter { filter_class } => Some(*filter_class),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            structured_filters,
+            BTreeSet::from([
+                StructuredFilterClass::Agent,
+                StructuredFilterClass::Workspace,
+                StructuredFilterClass::Local,
+                StructuredFilterClass::Remote,
+                StructuredFilterClass::SourceId,
+                StructuredFilterClass::Combined,
+            ])
+        );
+        for boolean_id in ["boolean-cass-and", "boolean-cass-or", "boolean-cass-not"] {
+            assert!(
+                suite.cases.iter().any(|case| case.id == boolean_id),
+                "CASS matrix dropped {boolean_id}"
+            );
+        }
         assert!(suite.cases.iter().any(|case| case.offset != 0));
         assert!(suite.cases.iter().any(|case| case.count_requested));
         assert!(suite.cases.iter().any(|case| !case.count_requested));
@@ -2932,6 +3193,47 @@ mod tests {
                 suite.manifest.spec.clone(),
                 &corpus_hash,
                 vec![invalid_divergence_id],
+            )
+            .is_err()
+        );
+        let mut duplicate_filter = suite
+            .cases
+            .iter()
+            .find(|case| case.id == "filter-agent")
+            .expect("agent filter")
+            .clone();
+        duplicate_filter.filters.agents = vec!["agent-0".to_owned(), "agent-0".to_owned()];
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![duplicate_filter],
+            )
+            .is_err()
+        );
+        let mut inverted_range = suite
+            .cases
+            .iter()
+            .find(|case| case.id == "range-inclusive")
+            .expect("range filter")
+            .clone();
+        inverted_range.filters.created_from_ms = Some(2);
+        inverted_range.filters.created_to_ms = Some(1);
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![inverted_range],
+            )
+            .is_err()
+        );
+        let mut default_with_filter = suite.cases[0].clone();
+        default_with_filter.filters.agents = vec!["agent-0".to_owned()];
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![default_with_filter],
             )
             .is_err()
         );

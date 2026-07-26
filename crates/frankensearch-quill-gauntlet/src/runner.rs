@@ -27,13 +27,15 @@ use crate::engine::{
     EnginePairIdentity, HarnessRun, MAX_SNIPPET_CHARS,
 };
 use crate::generator::{
-    CorpusManifest, GENERATOR_ID, GeneratedDocument, GeneratedQueryCase, GeneratedQueryKind,
-    GeneratedQuerySuite, GlobPatternClass, MAX_DOCUMENT_BYTES, MAX_QUERY_CASES, MAX_QUERY_ID_BYTES,
-    QuerySuiteSource, QuerySyntax, RangeClass, SyntheticCorpus, is_canonical_query_id,
+    CorpusManifest, CorpusSourceManifest, GENERATOR_ID, GeneratedDocument, GeneratedQueryCase,
+    GeneratedQueryKind, GeneratedQuerySuite, GlobPatternClass, MAX_DOCUMENT_BYTES, MAX_QUERY_CASES,
+    MAX_QUERY_ID_BYTES, QUERY_MANIFEST_SCHEMA_VERSION, QueryManifest, QuerySuiteSource,
+    QuerySyntax, RangeClass, StructuredFilterClass, SyntheticCorpus, is_canonical_query_id,
 };
+use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 2;
 /// Canonical preimage for the default shipping lexical analyzer protocol.
 pub const DEFAULT_ANALYZER_CONTRACT_PREIMAGE: &str =
     "v1;tokenizer=frankensearch_default;split=unicode_alphanumeric;lowercase=unicode_to_lowercase";
@@ -44,6 +46,10 @@ pub const DEFAULT_ANALYZER_CONTRACT_HASH: &str =
 pub const DEFAULT_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default_fields(content,title);title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=tantivy-html-configured";
 /// Scalar G1a subset: identical lexical semantics with snippet evidence disabled.
 pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default-fields-term-multiterm-exact-phrase-boolean;title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
+/// Canonical preimage for the CASS hyphen/prefix analyzer protocol.
+pub const CASS_ANALYZER_CONTRACT_PREIMAGE: &str = "v1;tokenizer=cass_hyphen_normalize;split=unicode_alphanumeric_with_interior_hyphens;lowercase=unicode_to_lowercase;prefix_tokenizer=cass_prefix_normalize;edge_ngrams=2..8;cjk=bigrams";
+/// Canonical CASS field, parser, filtering, ranking, and pagination protocol.
+pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent,workspace,workspace_original,source_path,msg_idx,created_at,title,content,title_prefix,content_prefix,preview,source_id,origin_kind,origin_host,conversation_id;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;negation=all-plus-must-not;wildcards=exact-prefix-suffix-substring-complex;filters=agents,workspaces,created_at-inclusive,local,remote,source_id;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Default schema/query/ranking protocol implemented by the shipping Tantivy adapter.
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
     "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
@@ -82,6 +88,15 @@ impl SemanticContract {
         Self {
             analyzer_contract_hash: sha256_text(DEFAULT_ANALYZER_CONTRACT_PREIMAGE),
             schema_contract_hash: sha256_text(SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE),
+        }
+    }
+
+    /// Native Quill versus Tantivy CASS query/schema profile.
+    #[must_use]
+    pub fn cass() -> Self {
+        Self {
+            analyzer_contract_hash: sha256_text(CASS_ANALYZER_CONTRACT_PREIMAGE),
+            schema_contract_hash: sha256_text(CASS_SCHEMA_CONTRACT_PREIMAGE),
         }
     }
 
@@ -256,6 +271,8 @@ pub enum CampaignSelection {
     All,
     /// Execute the bounded default-parser classes owned by the scalar G1a gate.
     DefaultSyntax,
+    /// Execute the complete native CASS Boolean/glob/filter/range profile.
+    CassSyntax,
     /// Execute the named cases, retaining their original manifest order.
     CaseIds { ids: Vec<String> },
 }
@@ -281,8 +298,20 @@ impl CampaignSelection {
                                 | GeneratedQueryKind::Counted
                                 | GeneratedQueryKind::Harvested { .. }
                         )
-                        && case.filters.created_from_ms.is_none()
-                        && case.filters.created_to_ms.is_none()
+                        && case.filters.is_empty()
+                })
+                .collect(),
+            Self::CassSyntax => cases
+                .iter()
+                .filter(|case| {
+                    case.syntax == QuerySyntax::Cass
+                        && matches!(
+                            &case.query_kind,
+                            GeneratedQueryKind::Boolean
+                                | GeneratedQueryKind::Glob { .. }
+                                | GeneratedQueryKind::Range { .. }
+                                | GeneratedQueryKind::StructuredFilter { .. }
+                        )
                 })
                 .collect(),
             Self::CaseIds { ids } => {
@@ -343,7 +372,16 @@ pub enum DivergenceRegisterDecision {
 
 impl DivergenceRegisterEntry {
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
-        let invalid_class = !matches!(self.class, DivergenceClass::OversizedQueryToken);
+        let invalid_class = !matches!(
+            self.class,
+            DivergenceClass::SnippetWindow
+                | DivergenceClass::GlobExpansionLimit
+                | DivergenceClass::QueryCanonicalization
+                | DivergenceClass::OracleBug
+                | DivergenceClass::StatsSemantics
+                | DivergenceClass::UnicodeEdge
+                | DivergenceClass::OversizedQueryToken
+        );
         let invalid_signatures = self.mismatch_signatures.is_empty()
             || self.mismatch_signatures.len() > 64
             || self
@@ -492,6 +530,13 @@ fn validate_registry_bounds(entries: &[DivergenceRegisterEntry]) -> Result<(), G
 pub struct CampaignConfig {
     pub selection: CampaignSelection,
     pub comparator_config: ComparatorConfig,
+    /// Require complete, environment-matched production provenance.
+    ///
+    /// Deterministic unit/regression fixtures may leave this disabled. Every
+    /// live PR or nightly campaign enables it and therefore fails before
+    /// either engine starts ingesting when provenance is missing or stale.
+    #[serde(default)]
+    pub require_provenance: bool,
     /// Maximum documents sent to each engine per identical indexing batch.
     pub index_batch_size: u64,
     /// Preferred canonical-JSON byte ceiling for an indexing batch.
@@ -510,6 +555,7 @@ impl Default for CampaignConfig {
         Self {
             selection: CampaignSelection::All,
             comparator_config: ComparatorConfig::default(),
+            require_provenance: false,
             index_batch_size: 4_096,
             index_batch_max_bytes: 16 * 1024 * 1024,
             tie_expansion_limit: 256,
@@ -703,7 +749,17 @@ pub struct CampaignProvenance {
     pub unicode_version: String,
     /// Locked `unicode-normalization` crate version from `Cargo.lock`.
     pub unicode_normalization_version: String,
-    /// Canonical hash of the campaign query profile (selection + profile).
+    /// Unicode data-table version compiled into `unicode-normalization`.
+    pub unicode_normalization_table_version: String,
+    /// Query generator implementation identity.
+    pub query_generator_id: String,
+    /// Query-manifest schema implemented by the generator.
+    pub query_generator_schema_version: u32,
+    /// Independent query-generator seed.
+    pub query_seed: u64,
+    /// Content-addressed identity of the exact query-suite source.
+    pub query_source_identity_sha256: String,
+    /// Canonical hash of generator, source, selection, and semantic profile.
     pub query_profile_sha256: String,
     /// Synthetic corpus seed when the corpus is generator-produced.
     pub corpus_seed: Option<u64>,
@@ -712,11 +768,11 @@ pub struct CampaignProvenance {
 impl CampaignProvenance {
     /// Collect the full immutable provenance for one campaign execution.
     ///
-    /// Git state is read from the invoking checkout unless overridden by the
-    /// `GAUNTLET_SUBJECT_REVISION` / `GAUNTLET_SUBJECT_DIRTY` and matching
-    /// oracle environment variables (the CI path supplies them explicitly so
-    /// runners never guess). Toolchain facts come from the executing `rustc`
-    /// and the workspace `Cargo.lock`.
+    /// Subject Git state is read from the invoking checkout unless explicitly
+    /// overridden. Oracle state defaults to the committed oracle version
+    /// contract and may likewise be overridden by a complete revision/dirty
+    /// pair. The CI path supplies both pairs explicitly. Toolchain facts come
+    /// from the executing `rustc` and workspace `Cargo.lock`.
     ///
     /// # Errors
     ///
@@ -724,20 +780,18 @@ impl CampaignProvenance {
     /// cannot be collected; a campaign must fail closed, never guess.
     pub fn collect(
         corpus_seed: Option<u64>,
+        query_manifest: &QueryManifest,
         selection: &CampaignSelection,
+        semantic_contract: &SemanticContract,
     ) -> Result<Self, GauntletError> {
         let (subject_git_revision, subject_source_dirty) =
             collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
-        let (oracle_git_revision, oracle_source_dirty) =
-            collect_git_state("GAUNTLET_ORACLE_REVISION", "GAUNTLET_ORACLE_DIRTY")?;
+        let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
         let cargo_lock_sha256 = hash_workspace_lockfile()?;
         let rustc_version_verbose = collect_rustc_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
-        let profile_bytes =
-            serde_json::to_vec(selection).map_err(|error| GauntletError::InvalidCampaign {
-                reason: format!("query profile serialization failed: {error}"),
-            })?;
-        let query_profile_sha256 = sha256_hex(&profile_bytes);
+        let query_profile_sha256 =
+            query_profile_sha256(query_manifest, selection, semantic_contract)?;
         Ok(Self {
             subject_git_revision,
             subject_source_dirty,
@@ -752,19 +806,163 @@ impl CampaignProvenance {
                 char::UNICODE_VERSION.2
             ),
             unicode_normalization_version,
+            unicode_normalization_table_version: unicode_normalization_table_version(),
+            query_generator_id: query_manifest.generator_id.clone(),
+            query_generator_schema_version: query_manifest.schema_version,
+            query_seed: query_manifest.spec.seed,
+            query_source_identity_sha256: query_manifest.source_identity_sha256.clone(),
             query_profile_sha256,
             corpus_seed,
         })
     }
+
+    fn validate_for_campaign(
+        &self,
+        engines: &EnginePairIdentity,
+        semantic_contract: &SemanticContract,
+        config: &CampaignConfig,
+        corpus_manifest: &CorpusManifest,
+        query_manifest: &QueryManifest,
+    ) -> Result<(), GauntletError> {
+        let expected_corpus_seed = match &corpus_manifest.source {
+            CorpusSourceManifest::Synthetic { spec } => Some(spec.seed),
+            CorpusSourceManifest::SharedFixtures { .. }
+            | CorpusSourceManifest::Repository { .. } => None,
+        };
+        let expected_unicode_version = format!(
+            "{}.{}.{}",
+            char::UNICODE_VERSION.0,
+            char::UNICODE_VERSION.1,
+            char::UNICODE_VERSION.2
+        );
+        let expected_query_profile =
+            query_profile_sha256(query_manifest, &config.selection, semantic_contract)?;
+        let rustc_is_complete = self.rustc_version_verbose.len() <= 16 * 1024
+            && !self.rustc_version_verbose.contains('\0')
+            && ["commit-hash:", "commit-date:", "host:", "release:"]
+                .iter()
+                .all(|label| {
+                    self.rustc_version_verbose
+                        .lines()
+                        .any(|line| line.starts_with(label))
+                });
+
+        if !is_git_revision(&self.subject_git_revision)
+            || !is_git_revision(&self.oracle_git_revision)
+            || self.subject_git_revision != engines.subject.source_revision
+            || self.subject_source_dirty != engines.subject.source_dirty
+            || self.oracle_git_revision != engines.oracle.source_revision
+            || self.oracle_source_dirty != engines.oracle.source_dirty
+            || !is_lower_sha256(&self.cargo_lock_sha256)
+            || self.cargo_lock_sha256 != hash_workspace_lockfile()?
+            || !rustc_is_complete
+            || self.rustc_version_verbose != collect_rustc_verbose()?
+            || self.unicode_version != expected_unicode_version
+            || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
+            || self.unicode_normalization_table_version != unicode_normalization_table_version()
+            || self.query_generator_id != GENERATOR_ID
+            || self.query_generator_id != query_manifest.generator_id
+            || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
+            || self.query_generator_schema_version != query_manifest.schema_version
+            || self.query_seed != query_manifest.spec.seed
+            || !is_lower_sha256(&self.query_source_identity_sha256)
+            || self.query_source_identity_sha256 != query_manifest.source_identity_sha256
+            || !is_lower_sha256(&self.query_profile_sha256)
+            || self.query_profile_sha256 != expected_query_profile
+            || self.corpus_seed != expected_corpus_seed
+        {
+            return Err(campaign_error(
+                "campaign provenance is missing, malformed, or does not match the exact engines, toolchain, Unicode tables, corpus, and query profile",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct QueryProfilePreimage<'a> {
+    schema_version: u32,
+    generator_id: &'a str,
+    generator_schema_version: u32,
+    query_seed: u64,
+    query_source: QuerySuiteSource,
+    query_source_identity_sha256: &'a str,
+    selection: &'a CampaignSelection,
+    semantic_contract: &'a SemanticContract,
+}
+
+fn query_profile_sha256(
+    query_manifest: &QueryManifest,
+    selection: &CampaignSelection,
+    semantic_contract: &SemanticContract,
+) -> Result<String, GauntletError> {
+    let profile = QueryProfilePreimage {
+        schema_version: 1,
+        generator_id: &query_manifest.generator_id,
+        generator_schema_version: query_manifest.schema_version,
+        query_seed: query_manifest.spec.seed,
+        query_source: query_manifest.source,
+        query_source_identity_sha256: &query_manifest.source_identity_sha256,
+        selection,
+        semantic_contract,
+    };
+    let bytes = serde_json::to_vec(&profile).map_err(|error| GauntletError::InvalidCampaign {
+        reason: format!("query profile serialization failed: {error}"),
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn unicode_normalization_table_version() -> String {
+    format!(
+        "{}.{}.{}",
+        unicode_normalization::UNICODE_VERSION.0,
+        unicode_normalization::UNICODE_VERSION.1,
+        unicode_normalization::UNICODE_VERSION.2
+    )
 }
 
 fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, bool), GauntletError> {
-    if let (Ok(revision), Ok(dirty)) = (std::env::var(revision_env), std::env::var(dirty_env)) {
-        return Ok((revision, dirty == "1" || dirty.eq_ignore_ascii_case("true")));
+    match (std::env::var(revision_env), std::env::var(dirty_env)) {
+        (Ok(revision), Ok(dirty)) => {
+            return Ok((revision, parse_dirty_state(&dirty, dirty_env)?));
+        }
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {}
+        _ => {
+            return Err(campaign_error(format!(
+                "provenance overrides {revision_env} and {dirty_env} must be supplied together as valid UTF-8"
+            )));
+        }
     }
     let revision = run_capture("git", &["rev-parse", "HEAD"], revision_env)?;
     let porcelain = run_capture("git", &["status", "--porcelain"], dirty_env)?;
     Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
+}
+
+fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
+    const REVISION_ENV: &str = "GAUNTLET_ORACLE_REVISION";
+    const DIRTY_ENV: &str = "GAUNTLET_ORACLE_DIRTY";
+    match (std::env::var(REVISION_ENV), std::env::var(DIRTY_ENV)) {
+        (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            let contract = oracle_version_contract()?;
+            Ok((contract.lexical_git_revision, false))
+        }
+        _ => Err(campaign_error(format!(
+            "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
+        ))),
+    }
+}
+
+fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
+    match value {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        _ if value.eq_ignore_ascii_case("true") => Ok(true),
+        _ if value.eq_ignore_ascii_case("false") => Ok(false),
+        _ => Err(campaign_error(format!(
+            "provenance dirty-state override {label} must be true, false, 1, or 0"
+        ))),
+    }
 }
 
 fn run_capture(program: &str, args: &[&str], label: &str) -> Result<String, GauntletError> {
@@ -871,7 +1069,6 @@ impl CampaignReport {
                 "campaign report engine and semantic identities are inconsistent",
             ));
         }
-
         self.corpus_manifest.validate_contract()?;
         if self.corpus_manifest.manifest_hash()? != self.corpus_manifest_hash {
             return Err(campaign_error(
@@ -885,6 +1082,21 @@ impl CampaignReport {
             return Err(campaign_error(
                 "campaign report query suite is not bound to its manifest and corpus",
             ));
+        }
+        match (&self.provenance, self.config.require_provenance) {
+            (Some(provenance), _) => provenance.validate_for_campaign(
+                &self.engines,
+                &self.semantic_contract,
+                &self.config,
+                &self.corpus_manifest,
+                &self.query_suite.manifest,
+            )?,
+            (None, true) => {
+                return Err(campaign_error(
+                    "production campaign report is missing required provenance",
+                ));
+            }
+            (None, false) => {}
         }
 
         let selected = self.config.selection.select(&self.query_suite.cases)?;
@@ -1388,6 +1600,21 @@ impl DifferentialCampaignRunner {
         }
         engines.bind_semantic_contract(self.semantic_contract.clone())?;
         engines.validate_gauntlet_contract()?;
+        match (&self.provenance, self.config.require_provenance) {
+            (Some(provenance), _) => provenance.validate_for_campaign(
+                &engines,
+                &self.semantic_contract,
+                &self.config,
+                corpus_manifest,
+                &query_suite.manifest,
+            )?,
+            (None, true) => {
+                return Err(campaign_error(
+                    "production campaign is missing required provenance",
+                ));
+            }
+            (None, false) => {}
+        }
 
         let divergence_registry_hash = self.registry.registry_hash()?;
         let reservation = CampaignRunReservation {
@@ -1823,8 +2050,14 @@ fn is_auto_class(class: DivergenceClass) -> bool {
         DivergenceClass::TieOrder | DivergenceClass::ScoreEpsilon => true,
         DivergenceClass::RankMismatch
         | DivergenceClass::SnippetMismatch
+        | DivergenceClass::SnippetWindow
         | DivergenceClass::CountMismatch
         | DivergenceClass::DocumentCountMismatch
+        | DivergenceClass::GlobExpansionLimit
+        | DivergenceClass::QueryCanonicalization
+        | DivergenceClass::OracleBug
+        | DivergenceClass::StatsSemantics
+        | DivergenceClass::UnicodeEdge
         | DivergenceClass::OversizedQueryToken => false,
     }
 }
@@ -1855,6 +2088,17 @@ fn query_class(query: &GeneratedQueryCase) -> String {
                 RangeClass::Inclusive => "inclusive",
                 RangeClass::From => "from",
                 RangeClass::To => "to",
+            }
+        ),
+        GeneratedQueryKind::StructuredFilter { filter_class } => format!(
+            "filter_{}",
+            match filter_class {
+                StructuredFilterClass::Agent => "agent",
+                StructuredFilterClass::Workspace => "workspace",
+                StructuredFilterClass::Local => "local",
+                StructuredFilterClass::Remote => "remote",
+                StructuredFilterClass::SourceId => "source_id",
+                StructuredFilterClass::Combined => "combined",
             }
         ),
         GeneratedQueryKind::Paginated => "paginated".to_owned(),
@@ -2096,7 +2340,7 @@ fn mismatch_cause_shape(divergence: &Divergence) -> String {
             rank_value(&divergence.oracle),
             rank_value(&divergence.subject)
         ),
-        DivergenceClass::SnippetMismatch => format!(
+        DivergenceClass::SnippetMismatch | DivergenceClass::SnippetWindow => format!(
             "snippet:{}:{}",
             presence(&divergence.oracle),
             presence(&divergence.subject)
@@ -2107,7 +2351,12 @@ fn mismatch_cause_shape(divergence: &Divergence) -> String {
             count(&divergence.subject)
         ),
         DivergenceClass::DocumentCountMismatch => "document_count:value:value".to_owned(),
-        DivergenceClass::OversizedQueryToken => format!(
+        DivergenceClass::GlobExpansionLimit
+        | DivergenceClass::QueryCanonicalization
+        | DivergenceClass::OracleBug
+        | DivergenceClass::StatsSemantics
+        | DivergenceClass::UnicodeEdge
+        | DivergenceClass::OversizedQueryToken => format!(
             "ast:{}:{}",
             normalized_diagnostic_shape(&divergence.oracle),
             normalized_diagnostic_shape(&divergence.subject)
@@ -2146,6 +2395,12 @@ const fn divergence_class_tag(class: DivergenceClass) -> u8 {
         DivergenceClass::CountMismatch => 4,
         DivergenceClass::DocumentCountMismatch => 5,
         DivergenceClass::OversizedQueryToken => 6,
+        DivergenceClass::SnippetWindow => 7,
+        DivergenceClass::GlobExpansionLimit => 8,
+        DivergenceClass::QueryCanonicalization => 9,
+        DivergenceClass::OracleBug => 10,
+        DivergenceClass::StatsSemantics => 11,
+        DivergenceClass::UnicodeEdge => 12,
     }
 }
 
@@ -2258,6 +2513,13 @@ fn is_review_date(value: &str) -> bool {
 
 fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_git_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -3328,9 +3590,24 @@ fn auto_triage(target: DivergenceClass, report: &ComparisonReport) -> TriageVerd
                 evidence.push("snippet windows disagree on identical hits".to_owned());
                 (SuspectedLayer::ParserLowering, TriageConfidence::Low)
             }
+            DivergenceClass::SnippetWindow => {
+                evidence.push("reviewed snippet-window selection differs".to_owned());
+                (SuspectedLayer::ParserLowering, TriageConfidence::High)
+            }
             DivergenceClass::CountMismatch | DivergenceClass::DocumentCountMismatch => {
                 evidence.push("count evidence disagrees with the oracle".to_owned());
                 (SuspectedLayer::Indexing, TriageConfidence::Medium)
+            }
+            DivergenceClass::GlobExpansionLimit
+            | DivergenceClass::QueryCanonicalization
+            | DivergenceClass::OracleBug
+            | DivergenceClass::UnicodeEdge => {
+                evidence.push("reviewed query-lowering divergence present".to_owned());
+                (SuspectedLayer::ParserLowering, TriageConfidence::High)
+            }
+            DivergenceClass::StatsSemantics => {
+                evidence.push("reviewed snapshot-statistics divergence present".to_owned());
+                (SuspectedLayer::FieldNormArithmetic, TriageConfidence::High)
             }
             DivergenceClass::OversizedQueryToken => unreachable!("covered above"),
         }
@@ -4133,6 +4410,109 @@ mod tests {
         SemanticContract::shipping_default()
     }
 
+    #[test]
+    fn cass_selection_is_complete_profile_specific_and_manifest_ordered() {
+        let fixture = make_fixture();
+        let selected = CampaignSelection::CassSyntax
+            .select(&fixture.query_suite.cases)
+            .expect("CASS selection");
+        assert!(
+            selected.iter().all(|case| case.syntax == QuerySyntax::Cass),
+            "the CASS campaign must not admit default-parser cases"
+        );
+        let selected_ids = selected
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "boolean-cass-and",
+            "boolean-cass-or",
+            "boolean-cass-not",
+            "glob-exact",
+            "glob-prefix",
+            "glob-suffix",
+            "glob-substring",
+            "glob-complex",
+            "range-inclusive",
+            "range-from",
+            "range-to",
+            "filter-agent",
+            "filter-workspace",
+            "filter-local",
+            "filter-remote",
+            "filter-source-id",
+            "filter-combined",
+        ] {
+            assert!(
+                selected_ids.contains(&required),
+                "the CASS campaign dropped required case {required}"
+            );
+        }
+        let manifest_positions = selected_ids
+            .iter()
+            .map(|id| {
+                fixture
+                    .query_suite
+                    .cases
+                    .iter()
+                    .position(|case| case.id == *id)
+                    .expect("selected case is in manifest")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            manifest_positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "CASS selection must retain manifest order"
+        );
+    }
+
+    #[test]
+    fn cass_semantic_contract_is_canonical_and_profile_distinct() {
+        let contract = SemanticContract::cass();
+        contract.validate().expect("canonical CASS hashes");
+        assert_eq!(
+            contract.analyzer_contract_hash,
+            sha256_text(CASS_ANALYZER_CONTRACT_PREIMAGE)
+        );
+        assert_eq!(
+            contract.schema_contract_hash,
+            sha256_text(CASS_SCHEMA_CONTRACT_PREIMAGE)
+        );
+        assert_ne!(contract, SemanticContract::scalar_g1a());
+        assert_ne!(contract, SemanticContract::shipping_default());
+    }
+
+    #[test]
+    fn divergence_register_accepts_only_reviewed_semantic_taxonomy() {
+        let entry = |class| DivergenceRegisterEntry {
+            id: "DIV-999".to_owned(),
+            class,
+            fixture_id: "reviewed-fixture".to_owned(),
+            mismatch_signatures: vec!["0".repeat(64)],
+            decision: DivergenceRegisterDecision::Accept,
+            root_cause: "reviewed root cause".to_owned(),
+            consumer_impact: "reviewed consumer impact".to_owned(),
+            reviewer: "second-agent".to_owned(),
+            reviewed_at: "2026-07-26".to_owned(),
+        };
+        for class in [
+            DivergenceClass::SnippetWindow,
+            DivergenceClass::GlobExpansionLimit,
+            DivergenceClass::QueryCanonicalization,
+            DivergenceClass::OracleBug,
+            DivergenceClass::StatsSemantics,
+            DivergenceClass::UnicodeEdge,
+            DivergenceClass::OversizedQueryToken,
+        ] {
+            entry(class)
+                .validate()
+                .unwrap_or_else(|error| panic!("{class:?} must be registerable: {error}"));
+        }
+        assert!(
+            entry(DivergenceClass::RankMismatch).validate().is_err(),
+            "generic result mismatch must never become a register wildcard"
+        );
+    }
+
     fn runner(
         root: &std::path::Path,
         selection: CampaignSelection,
@@ -4365,6 +4745,137 @@ mod tests {
             assert_eq!(first.index_calls.load(Ordering::Relaxed), 0);
             assert_eq!(second.index_calls.load(Ordering::Relaxed), 0);
         });
+    }
+
+    #[test]
+    fn production_campaign_missing_provenance_fails_before_ingest() {
+        let fixture = make_fixture();
+        let mut subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            semantic_contract(),
+            CampaignConfig {
+                selection: CampaignSelection::All,
+                require_provenance: true,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("production campaign policy");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = campaign
+                .run(
+                    &cx,
+                    "missing-production-provenance",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect_err("production provenance is mandatory");
+            assert!(
+                error.to_string().contains("missing required provenance"),
+                "unexpected fail-closed reason: {error}"
+            );
+            assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(oracle.index_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn provenance_matches_every_engine_toolchain_and_query_pin() {
+        let fixture = make_fixture();
+        let semantic_contract = semantic_contract();
+        let config = CampaignConfig {
+            selection: CampaignSelection::All,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let subject_revision = "1".repeat(40);
+        let subject = EngineDescriptor {
+            source_revision: subject_revision.clone(),
+            ..subject_descriptor()
+        };
+        let oracle = oracle_descriptor();
+        let mut engines =
+            EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle.clone())
+                .expect("engine identity");
+        engines
+            .bind_semantic_contract(semantic_contract.clone())
+            .expect("semantic contract");
+        let mut provenance = CampaignProvenance {
+            subject_git_revision: subject_revision,
+            subject_source_dirty: false,
+            oracle_git_revision: oracle.source_revision,
+            oracle_source_dirty: oracle.source_dirty,
+            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
+            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
+            unicode_version: format!(
+                "{}.{}.{}",
+                char::UNICODE_VERSION.0,
+                char::UNICODE_VERSION.1,
+                char::UNICODE_VERSION.2
+            ),
+            unicode_normalization_version: locked_crate_version("unicode-normalization")
+                .expect("locked normalization version"),
+            unicode_normalization_table_version: unicode_normalization_table_version(),
+            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
+            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
+            query_seed: fixture.query_suite.manifest.spec.seed,
+            query_source_identity_sha256: fixture
+                .query_suite
+                .manifest
+                .source_identity_sha256
+                .clone(),
+            query_profile_sha256: query_profile_sha256(
+                &fixture.query_suite.manifest,
+                &config.selection,
+                &semantic_contract,
+            )
+            .expect("query profile hash"),
+            corpus_seed: Some(0x6200),
+        };
+        provenance
+            .validate_for_campaign(
+                &engines,
+                &semantic_contract,
+                &config,
+                &fixture.corpus_manifest,
+                &fixture.query_suite.manifest,
+            )
+            .expect("all exact provenance pins validate");
+
+        provenance.query_seed ^= 1;
+        assert!(
+            provenance
+                .validate_for_campaign(
+                    &engines,
+                    &semantic_contract,
+                    &config,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite.manifest,
+                )
+                .is_err(),
+            "a query-generator seed mismatch must fail closed"
+        );
+        provenance.query_seed ^= 1;
+        provenance.unicode_normalization_table_version = "0.0.0".to_owned();
+        assert!(
+            provenance
+                .validate_for_campaign(
+                    &engines,
+                    &semantic_contract,
+                    &config,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite.manifest,
+                )
+                .is_err(),
+            "a Unicode table mismatch must fail closed"
+        );
     }
 
     #[test]
@@ -6461,7 +6972,9 @@ mod tests {
     // ==== Live oracle campaign activation (bd-quill-e6-gauntlet-scale-rm3q.9) ====
 
     #[cfg(feature = "tantivy-oracle")]
-    fn live_campaign_engines() -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+    fn live_campaign_engines(
+        provenance: &CampaignProvenance,
+    ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
             .lexical_git_revision;
@@ -6469,11 +6982,17 @@ mod tests {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let subject =
-            crate::engine::QuillSubject::in_memory(config, "e6.9-live-activation-subject", false)
-                .expect("fresh scalar Quill subject");
-        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
-            .expect("fresh scalar G1a Tantivy oracle");
+        let subject = crate::engine::QuillSubject::in_memory(
+            config,
+            &provenance.subject_git_revision,
+            provenance.subject_source_dirty,
+        )
+        .expect("fresh scalar Quill subject");
+        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
+            &lexical_revision,
+            provenance.oracle_source_dirty,
+        )
+        .expect("fresh scalar G1a Tantivy oracle");
         (subject, oracle)
     }
 
@@ -6484,15 +7003,22 @@ mod tests {
         run_id: &str,
     ) -> Result<CampaignReport, GauntletError> {
         let fixture = make_scalar_g1a_regression_fixture();
-        let (mut subject, mut oracle) = live_campaign_engines();
         let selection = CampaignSelection::DefaultSyntax;
-        let provenance =
-            CampaignProvenance::collect(Some(0x6201), &selection).expect("collect provenance");
+        let semantic_contract = SemanticContract::scalar_g1a();
+        let provenance = CampaignProvenance::collect(
+            None,
+            &fixture.query_suite.manifest,
+            &selection,
+            &semantic_contract,
+        )
+        .expect("collect provenance");
+        let (mut subject, mut oracle) = live_campaign_engines(&provenance);
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
-            SemanticContract::scalar_g1a(),
+            semantic_contract,
             CampaignConfig {
                 selection,
+                require_provenance: true,
                 index_batch_size: 5,
                 snippet_max_chars: None,
                 ..CampaignConfig::default()
@@ -6545,7 +7071,19 @@ mod tests {
                 )
             );
             assert!(!provenance.unicode_normalization_version.is_empty());
+            assert_eq!(
+                provenance.unicode_normalization_table_version,
+                unicode_normalization_table_version()
+            );
+            assert_eq!(provenance.query_generator_id, GENERATOR_ID);
+            assert_eq!(
+                provenance.query_generator_schema_version,
+                QUERY_MANIFEST_SCHEMA_VERSION
+            );
+            assert_eq!(provenance.query_seed, 0x6201);
+            assert!(is_lower_sha256(&provenance.query_source_identity_sha256));
             assert!(!provenance.query_profile_sha256.is_empty());
+            assert_eq!(provenance.corpus_seed, None);
 
             // CI-grade acceptance: ONLY a verified reload counts as evidence.
             let reloaded = ArtifactStore::new(temp.path())
@@ -6644,15 +7182,22 @@ mod tests {
             &SharedFixtureSuite::load().expect("shared fixtures"),
         )
         .expect("query suite");
-        let (mut subject, mut oracle) = live_campaign_engines();
         let selection = CampaignSelection::DefaultSyntax;
-        let provenance =
-            CampaignProvenance::collect(Some(spec.seed), &selection).expect("collect provenance");
+        let semantic_contract = SemanticContract::scalar_g1a();
+        let provenance = CampaignProvenance::collect(
+            Some(spec.seed),
+            &query_suite.manifest,
+            &selection,
+            &semantic_contract,
+        )
+        .expect("collect provenance");
+        let (mut subject, mut oracle) = live_campaign_engines(&provenance);
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(temp.path()),
-            SemanticContract::scalar_g1a(),
+            semantic_contract,
             CampaignConfig {
                 selection,
+                require_provenance: true,
                 index_batch_size: 64,
                 snippet_max_chars: None,
                 ..CampaignConfig::default()
