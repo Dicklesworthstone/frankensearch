@@ -104,14 +104,11 @@ memmap2 = "0.9"
 same-file = "1.0.6"
 
 # Embedder dependencies (feature-gated per crate)
-# Default features pull in native-tls (openssl-sys), which breaks
-# cross-compilation to musl/aarch64-linux/intel-darwin in downstream
-# release pipelines. Force rustls TLS via explicit features.
-fastembed = { version = "5.11.0", default-features = false, features = [
+# Default features pull in native-tls and network stacks that transitively
+# depend on forbidden Tokio ecosystem crates. Keep only ORT's rustls-backed
+# binary acquisition path; model provisioning is owned by frankensearch.
+fastembed = { version = "=5.17.2", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
-    "hf-hub-rustls-tls",
-    "online",
-    "image-models",
 ] }
 safetensors = "0.7.0"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
