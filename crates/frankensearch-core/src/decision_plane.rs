@@ -449,6 +449,28 @@ impl ReasonCode {
     /// Boost map entry decayed below threshold and was removed.
     pub const FEEDBACK_BOOST_DECAYED: &str = "feedback.boost.decayed";
 
+    // ── Semantic Zero-Signal ─────────────────────────────────────────
+    /// Empty result because the caller requested `k == 0`.
+    pub const ZERO_SIGNAL_CALLER_REQUESTED_ZERO_K: &str = "zerosignal.request.zero_k";
+    /// Empty result because the caller's filter excluded every candidate.
+    pub const ZERO_SIGNAL_FILTER_ELIMINATED_ALL: &str = "zerosignal.request.filter_eliminated_all";
+    /// The query vector contains NaN or infinite components.
+    pub const ZERO_SIGNAL_NON_FINITE_QUERY: &str = "zerosignal.request.non_finite_query";
+    /// The query vector's norm is (near-)zero; similarity ranking is undefined.
+    pub const ZERO_SIGNAL_ZERO_NORM_QUERY: &str = "zerosignal.request.zero_norm_query";
+    /// The index was created but has never held any record.
+    pub const ZERO_SIGNAL_NEWLY_CREATED_EMPTY: &str = "zerosignal.state.newly_created_empty";
+    /// Every main-index record is tombstoned and no WAL entry remains.
+    pub const ZERO_SIGNAL_ALL_TOMBSTONED: &str = "zerosignal.state.all_tombstoned";
+    /// Only WAL-resident entries exist and none produced a usable hit.
+    pub const ZERO_SIGNAL_WAL_ONLY_NO_LIVE_RECORDS: &str =
+        "zerosignal.state.wal_only_no_live_records";
+    /// Live records exist but no stored vector is usable. Availability failure.
+    pub const ZERO_SIGNAL_NO_USABLE_VECTORS: &str = "zerosignal.availability.no_usable_vectors";
+    /// ANN returned no candidates despite usable live vectors. Availability anomaly.
+    pub const ZERO_SIGNAL_ANN_EMPTY_DESPITE_USABLE: &str =
+        "zerosignal.availability.ann_empty_despite_usable_vectors";
+
     /// Create a new reason code from a string.
     ///
     /// The caller is responsible for ensuring the code matches the

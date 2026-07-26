@@ -208,6 +208,16 @@ fn registered_reason_codes() -> HashSet<&'static str> {
         // Feedback
         ReasonCode::FEEDBACK_BOOST_UPDATED,
         ReasonCode::FEEDBACK_BOOST_DECAYED,
+        // Semantic Zero-Signal
+        ReasonCode::ZERO_SIGNAL_CALLER_REQUESTED_ZERO_K,
+        ReasonCode::ZERO_SIGNAL_FILTER_ELIMINATED_ALL,
+        ReasonCode::ZERO_SIGNAL_NON_FINITE_QUERY,
+        ReasonCode::ZERO_SIGNAL_ZERO_NORM_QUERY,
+        ReasonCode::ZERO_SIGNAL_NEWLY_CREATED_EMPTY,
+        ReasonCode::ZERO_SIGNAL_ALL_TOMBSTONED,
+        ReasonCode::ZERO_SIGNAL_WAL_ONLY_NO_LIVE_RECORDS,
+        ReasonCode::ZERO_SIGNAL_NO_USABLE_VECTORS,
+        ReasonCode::ZERO_SIGNAL_ANN_EMPTY_DESPITE_USABLE,
     ])
 }
 

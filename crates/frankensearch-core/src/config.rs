@@ -3,10 +3,12 @@
 //! [`TwoTierConfig`] contains all tuning knobs for the search pipeline.
 //! [`TwoTierMetrics`] provides diagnostics from a search execution.
 
+use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::decision_plane::ReasonCode;
 use crate::query_class::QueryClass;
 use crate::traits::MetricsExporter;
 use crate::types::RankChanges;
@@ -501,6 +503,209 @@ pub struct TwoTierMetrics {
     pub fast_embedder_id: Option<String>,
     /// Embedder used for quality tier.
     pub quality_embedder_id: Option<String>,
+    /// Typed classification when the semantic lane produced zero results.
+    ///
+    /// `None` means the semantic lane returned at least one hit (or was not
+    /// consulted). Compatibility with older serialized payloads is preserved
+    /// via `serde(default)`.
+    #[serde(default)]
+    pub zero_signal: Option<ZeroSignalReason>,
+}
+
+/// Schema version for zero-signal classification payloads.
+pub const ZERO_SIGNAL_SCHEMA_VERSION: &str = "frankensearch.zero_signal.v1";
+
+/// Why a semantic search lane produced zero results.
+///
+/// Distinct no-signal states must never collapse into an undifferentiated
+/// `Ok(empty)`: callers need to distinguish a legitimately empty answer
+/// (benign request/state outcome) from an unusable semantic lane
+/// (availability failure). Exact (brute-force) and ANN paths classify
+/// equivalent states identically.
+///
+/// Classification precedence, first match wins:
+/// 1. request-scoped pre-scan: [`CallerRequestedZeroK`], then
+///    [`NonFiniteQuery`], then [`ZeroNormQuery`]
+/// 2. state-scoped pre-scan (from [`ZeroSignalState`]):
+///    [`NewlyCreatedEmpty`], [`AllTombstoned`], [`NoUsableVectors`]
+/// 3. post-scan: [`FilterEliminatedAll`] when a filter rejected every
+///    candidate, [`WalOnlyNoLiveRecords`] when only WAL entries existed and
+///    none survived, [`AnnReturnedEmptyDespiteUsableVectors`] when the ANN
+///    graph came back empty although usable live vectors exist.
+///
+/// [`CallerRequestedZeroK`]: ZeroSignalReason::CallerRequestedZeroK
+/// [`NonFiniteQuery`]: ZeroSignalReason::NonFiniteQuery
+/// [`ZeroNormQuery`]: ZeroSignalReason::ZeroNormQuery
+/// [`NewlyCreatedEmpty`]: ZeroSignalReason::NewlyCreatedEmpty
+/// [`AllTombstoned`]: ZeroSignalReason::AllTombstoned
+/// [`NoUsableVectors`]: ZeroSignalReason::NoUsableVectors
+/// [`FilterEliminatedAll`]: ZeroSignalReason::FilterEliminatedAll
+/// [`WalOnlyNoLiveRecords`]: ZeroSignalReason::WalOnlyNoLiveRecords
+/// [`AnnReturnedEmptyDespiteUsableVectors`]: ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroSignalReason {
+    /// The caller asked for `k == 0` results. Expected outcome, never warned.
+    CallerRequestedZeroK,
+    /// A caller-supplied filter excluded every candidate. Expected outcome.
+    FilterEliminatedAll,
+    /// The query vector contains NaN or infinite components.
+    NonFiniteQuery,
+    /// The query vector's norm is (near-)zero, so every similarity score is
+    /// zero and ranking would be arbitrary tie-breaking.
+    ZeroNormQuery,
+    /// The index was created but has never contained any record (no main
+    /// records, no WAL entries).
+    NewlyCreatedEmpty,
+    /// Every main-index record is tombstoned and no WAL entry remains.
+    AllTombstoned,
+    /// The main index holds no live records; only WAL-resident entries
+    /// existed and none of them produced a usable hit.
+    WalOnlyNoLiveRecords,
+    /// Live records exist but none of their stored vectors is usable (all
+    /// zero-norm, non-finite, or otherwise corrupt). Availability failure.
+    NoUsableVectors,
+    /// The ANN graph returned no candidates although usable live vectors
+    /// exist; exact search would have found hits. Availability anomaly.
+    AnnReturnedEmptyDespiteUsableVectors,
+}
+
+impl ZeroSignalReason {
+    /// Stable machine-readable code, registered in
+    /// [`crate::decision_plane::ReasonCode`] and the observability-lint
+    /// registry (OBS-003).
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::CallerRequestedZeroK => ReasonCode::ZERO_SIGNAL_CALLER_REQUESTED_ZERO_K,
+            Self::FilterEliminatedAll => ReasonCode::ZERO_SIGNAL_FILTER_ELIMINATED_ALL,
+            Self::NonFiniteQuery => ReasonCode::ZERO_SIGNAL_NON_FINITE_QUERY,
+            Self::ZeroNormQuery => ReasonCode::ZERO_SIGNAL_ZERO_NORM_QUERY,
+            Self::NewlyCreatedEmpty => ReasonCode::ZERO_SIGNAL_NEWLY_CREATED_EMPTY,
+            Self::AllTombstoned => ReasonCode::ZERO_SIGNAL_ALL_TOMBSTONED,
+            Self::WalOnlyNoLiveRecords => ReasonCode::ZERO_SIGNAL_WAL_ONLY_NO_LIVE_RECORDS,
+            Self::NoUsableVectors => ReasonCode::ZERO_SIGNAL_NO_USABLE_VECTORS,
+            Self::AnnReturnedEmptyDespiteUsableVectors => {
+                ReasonCode::ZERO_SIGNAL_ANN_EMPTY_DESPITE_USABLE
+            }
+        }
+    }
+
+    /// Availability failures mean the semantic lane is unusable and warrant
+    /// operator attention; every other reason is an expected outcome of the
+    /// request or index state and must not warn.
+    #[must_use]
+    pub const fn is_availability_failure(self) -> bool {
+        matches!(
+            self,
+            Self::NoUsableVectors | Self::AnnReturnedEmptyDespiteUsableVectors
+        )
+    }
+
+    /// True when the reason depends only on the request (k, filter, query
+    /// vector) rather than on index state. Request-scoped events are logged
+    /// at debug level, never per-query warnings.
+    #[must_use]
+    pub const fn is_request_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::CallerRequestedZeroK
+                | Self::FilterEliminatedAll
+                | Self::NonFiniteQuery
+                | Self::ZeroNormQuery
+        )
+    }
+
+    /// Short human-readable summary.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::CallerRequestedZeroK => "caller requested zero results (k = 0)",
+            Self::FilterEliminatedAll => "search filter excluded every candidate",
+            Self::NonFiniteQuery => "query vector contains non-finite values",
+            Self::ZeroNormQuery => "query vector has zero norm",
+            Self::NewlyCreatedEmpty => "index is newly created and empty",
+            Self::AllTombstoned => "all index records are tombstoned",
+            Self::WalOnlyNoLiveRecords => "only WAL entries exist and none produced a hit",
+            Self::NoUsableVectors => "live records exist but no stored vector is usable",
+            Self::AnnReturnedEmptyDespiteUsableVectors => {
+                "ANN returned no candidates despite usable live vectors"
+            }
+        }
+    }
+}
+
+impl fmt::Display for ZeroSignalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.summary())
+    }
+}
+
+/// Point-in-time census of a vector index generation, used to classify
+/// zero-signal outcomes without per-query scans.
+///
+/// Computed once at open/reload time (the usable-vector pass is O(n·dim))
+/// and invalidated by mutations (append, soft-delete, vacuum, compaction).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZeroSignalState {
+    /// Physical records in the main index, including tombstoned ones.
+    pub record_count: usize,
+    /// Records not tombstoned.
+    pub live_count: usize,
+    /// Tombstoned records.
+    pub tombstone_count: usize,
+    /// WAL-resident entries not yet compacted into the main index.
+    pub wal_count: usize,
+    /// Live records whose stored vector is usable (finite, non-zero norm).
+    pub usable_vector_count: usize,
+}
+
+impl ZeroSignalState {
+    /// Classify the state-scoped reason an empty result would have, if the
+    /// index state alone explains it. Request-scoped conditions (k, filter,
+    /// query vector) take precedence and are classified by the caller.
+    #[must_use]
+    pub const fn state_reason(&self) -> Option<ZeroSignalReason> {
+        if self.record_count == 0 && self.wal_count == 0 {
+            return Some(ZeroSignalReason::NewlyCreatedEmpty);
+        }
+        if self.live_count == 0 && self.wal_count == 0 {
+            return Some(ZeroSignalReason::AllTombstoned);
+        }
+        if self.live_count > 0 && self.usable_vector_count == 0 {
+            return Some(ZeroSignalReason::NoUsableVectors);
+        }
+        None
+    }
+
+    /// True when queries can only be served from WAL-resident entries.
+    #[must_use]
+    pub const fn is_wal_only(&self) -> bool {
+        self.live_count == 0 && self.wal_count > 0
+    }
+
+    /// Classify why a well-formed search (k > 0, finite non-zero query)
+    /// over this state returned nothing, following the precedence
+    /// documented on [`ZeroSignalReason`].
+    ///
+    /// The fallback for "usable candidates existed, no filter, still empty"
+    /// is [`ZeroSignalReason::NoUsableVectors`]: an exact scan cannot
+    /// legitimately come back empty in that state, so it is reported as an
+    /// availability failure. ANN callers refine that case to
+    /// [`ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors`].
+    #[must_use]
+    pub const fn empty_result_reason(&self, had_filter: bool) -> ZeroSignalReason {
+        if let Some(reason) = self.state_reason() {
+            return reason;
+        }
+        if had_filter {
+            return ZeroSignalReason::FilterEliminatedAll;
+        }
+        if self.is_wal_only() {
+            return ZeroSignalReason::WalOnlyNoLiveRecords;
+        }
+        ZeroSignalReason::NoUsableVectors
+    }
 }
 
 #[cfg(test)]
@@ -768,5 +973,160 @@ mod tests {
         assert!(!config.fast_only);
         config.fast_only = "1" == "1";
         assert!(config.fast_only);
+    }
+
+    const ALL_ZERO_SIGNAL_REASONS: [ZeroSignalReason; 9] = [
+        ZeroSignalReason::CallerRequestedZeroK,
+        ZeroSignalReason::FilterEliminatedAll,
+        ZeroSignalReason::NonFiniteQuery,
+        ZeroSignalReason::ZeroNormQuery,
+        ZeroSignalReason::NewlyCreatedEmpty,
+        ZeroSignalReason::AllTombstoned,
+        ZeroSignalReason::WalOnlyNoLiveRecords,
+        ZeroSignalReason::NoUsableVectors,
+        ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
+    ];
+
+    #[test]
+    fn zero_signal_reason_serde_roundtrip_snake_case() {
+        for reason in ALL_ZERO_SIGNAL_REASONS {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, json.to_ascii_lowercase(), "snake_case: {json}");
+            let decoded: ZeroSignalReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, reason);
+        }
+        assert_eq!(
+            serde_json::to_string(&ZeroSignalReason::NewlyCreatedEmpty).unwrap(),
+            "\"newly_created_empty\""
+        );
+    }
+
+    #[test]
+    fn zero_signal_reason_codes_are_registered_and_valid() {
+        for reason in ALL_ZERO_SIGNAL_REASONS {
+            let code = ReasonCode::new(reason.reason_code());
+            assert!(code.is_valid(), "invalid reason code: {}", code.as_str());
+        }
+        // Codes are unique.
+        let codes: std::collections::HashSet<&str> = ALL_ZERO_SIGNAL_REASONS
+            .iter()
+            .map(|r| r.reason_code())
+            .collect();
+        assert_eq!(codes.len(), ALL_ZERO_SIGNAL_REASONS.len());
+    }
+
+    #[test]
+    fn zero_signal_availability_partition() {
+        for reason in ALL_ZERO_SIGNAL_REASONS {
+            let is_failure = matches!(
+                reason,
+                ZeroSignalReason::NoUsableVectors
+                    | ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
+            );
+            assert_eq!(reason.is_availability_failure(), is_failure);
+            // A reason is never both an availability failure and request-scoped.
+            assert!(!(reason.is_availability_failure() && reason.is_request_scoped()));
+        }
+    }
+
+    #[test]
+    fn zero_signal_state_classification_table() {
+        // (record, live, tombstone, wal, usable) -> expected state reason
+        let cases: [(ZeroSignalState, Option<ZeroSignalReason>); 6] = [
+            (
+                ZeroSignalState::default(),
+                Some(ZeroSignalReason::NewlyCreatedEmpty),
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 5,
+                    live_count: 0,
+                    tombstone_count: 5,
+                    wal_count: 0,
+                    usable_vector_count: 0,
+                },
+                Some(ZeroSignalReason::AllTombstoned),
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 5,
+                    live_count: 3,
+                    tombstone_count: 2,
+                    wal_count: 0,
+                    usable_vector_count: 0,
+                },
+                Some(ZeroSignalReason::NoUsableVectors),
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 0,
+                    live_count: 0,
+                    tombstone_count: 0,
+                    wal_count: 4,
+                    usable_vector_count: 0,
+                },
+                // WAL-only is not a pre-scan verdict: WAL entries may serve
+                // the query, so classification happens post-scan.
+                None,
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 5,
+                    live_count: 0,
+                    tombstone_count: 5,
+                    wal_count: 2,
+                    usable_vector_count: 0,
+                },
+                None,
+            ),
+            (
+                ZeroSignalState {
+                    record_count: 5,
+                    live_count: 5,
+                    tombstone_count: 0,
+                    wal_count: 0,
+                    usable_vector_count: 5,
+                },
+                None,
+            ),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(state.state_reason(), expected, "state: {state:?}");
+        }
+        assert!(
+            ZeroSignalState {
+                record_count: 0,
+                live_count: 0,
+                tombstone_count: 0,
+                wal_count: 4,
+                usable_vector_count: 0,
+            }
+            .is_wal_only()
+        );
+    }
+
+    #[test]
+    fn two_tier_metrics_zero_signal_serde_default_compat() {
+        // Old payloads without the field must still deserialize.
+        let legacy = serde_json::json!({
+            "fast_embed_ms": 0.0, "vector_search_ms": 0.0, "lexical_search_ms": 0.0,
+            "rrf_fusion_ms": 0.0, "phase1_total_ms": 0.0, "phase1_vectors_searched": 0,
+            "quality_embed_ms": 0.0, "quality_search_ms": 0.0, "blend_ms": 0.0,
+            "rerank_ms": 0.0, "phase2_total_ms": 0.0, "phase2_vectors_searched": 0,
+            "kendall_tau": null, "rank_changes": RankChanges::default(),
+            "skip_reason": null, "query_class": null, "lexical_candidates": 0,
+            "semantic_candidates": 0, "incomplete_embeddings": 0,
+            "fast_embedder_id": null, "quality_embedder_id": null
+        });
+        let decoded: TwoTierMetrics = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.zero_signal, None);
+
+        let metrics = TwoTierMetrics {
+            zero_signal: Some(ZeroSignalReason::AllTombstoned),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let decoded: TwoTierMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.zero_signal, Some(ZeroSignalReason::AllTombstoned));
     }
 }
