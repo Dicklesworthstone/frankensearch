@@ -2100,6 +2100,108 @@ mod tests {
         fields: &E55_FIELDS,
     };
 
+    #[cfg(feature = "perf-harness")]
+    const QG_POSITIONLESS_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+
+    #[cfg(feature = "perf-harness")]
+    const QG_POSITIONLESS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "frankensearch-default-no-positions-v1",
+        fields: &QG_POSITIONLESS_FIELDS,
+    };
+
+    #[cfg(feature = "perf-harness")]
+    fn qg_position_mode_subject(positions: bool) -> QuillSubject {
+        let config = e55_config();
+        let schema = if positions {
+            frankensearch_quill::DEFAULT_SCHEMA
+        } else {
+            QG_POSITIONLESS_SCHEMA
+        };
+        let descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_revision: "qg-position-mode-smoke".to_owned(),
+            source_dirty: false,
+            config_hash: format!(
+                "{}-positions_{}",
+                quill_config_hash(&config),
+                if positions { "on" } else { "off" }
+            ),
+        };
+        descriptor
+            .validate()
+            .expect("QG position-mode subject descriptor");
+        QuillSubject {
+            index: Some(
+                QuillIndex::in_memory_with_schema(schema, config.clone())
+                    .expect("QG position-mode Quill index"),
+            ),
+            config,
+            descriptor,
+            state: QuillCampaignState::Fresh,
+        }
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn qg_position_mode_oracle(positions: bool) -> TantivyOracle {
+        let revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let index = frankensearch_lexical::TantivyIndex::in_memory_with_benchmark_config(
+            50_000_000, 1, positions,
+        )
+        .expect("QG position-mode Tantivy index");
+        TantivyOracle::from_index_with_campaign_freshness(
+            index,
+            &revision,
+            false,
+            true,
+            crate::runner::SemanticContract::scalar_g1a(),
+        )
+        .expect("QG position-mode Tantivy oracle")
+    }
+
     struct CountingEngine {
         descriptor: EngineDescriptor,
         observe_calls: Arc<AtomicUsize>,
@@ -4319,6 +4421,130 @@ mod tests {
                 "encode length={length}"
             );
         }
+    }
+
+    /// QG position-free cells are a schema mode, not a different query
+    /// language. Before release measurement, both engines must construct the
+    /// mode and preserve the registered exact law for operators that never
+    /// consume a position list. Quill's separate capability tests cover the
+    /// typed `PositionsRequired` failure for phrases.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn qg_position_modes_are_cross_engine_exact_for_position_independent_queries() {
+        use frankensearch_core::IndexableDocument;
+
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("boolean-or", "alpha OR gamma"),
+            ("fielded-term", "title:alpha"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut quill_mode_evidence = Vec::new();
+            let mut tantivy_mode_evidence = Vec::new();
+
+            for positions in [true, false] {
+                let mode = if positions {
+                    "positions_on"
+                } else {
+                    "positions_off"
+                };
+                let mut subject = qg_position_mode_subject(positions);
+                let mut oracle = qg_position_mode_oracle(positions);
+
+                subject
+                    .claim_fresh_campaign()
+                    .unwrap_or_else(|error| panic!("{mode}: claim Quill campaign: {error}"));
+                subject
+                    .index_mut()
+                    .unwrap_or_else(|error| panic!("{mode}: open Quill campaign: {error}"))
+                    .index_documents(&cx, &documents)
+                    .await
+                    .unwrap_or_else(|error| panic!("{mode}: index Quill fixture: {error}"));
+                subject
+                    .index_mut()
+                    .unwrap_or_else(|error| panic!("{mode}: open Quill campaign: {error}"))
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{mode}: commit Quill fixture: {error}"));
+                subject
+                    .mark_committed()
+                    .unwrap_or_else(|error| panic!("{mode}: publish Quill campaign: {error}"));
+
+                oracle
+                    .claim_fresh_campaign()
+                    .unwrap_or_else(|error| panic!("{mode}: claim Tantivy campaign: {error}"));
+                oracle
+                    .index_documents(&cx, &documents)
+                    .await
+                    .unwrap_or_else(|error| panic!("{mode}: index Tantivy fixture: {error}"));
+                oracle
+                    .mark_committed()
+                    .unwrap_or_else(|error| panic!("{mode}: publish Tantivy campaign: {error}"));
+
+                let harness = DifferentialHarness::default();
+                let mut quill_queries = Vec::new();
+                let mut tantivy_queries = Vec::new();
+                for (query_id, query) in queries {
+                    let mut case =
+                        DifferentialCase::new(format!("qg-{mode}-{query_id}"), query, 16);
+                    case.snippet_max_chars = None;
+                    case.tie_expansion_limit = 64;
+                    let run = harness
+                        .run(&cx, &subject, &oracle, &case)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("{mode}/{query_id}: cross-engine observation failed: {error}")
+                        });
+                    assert_eq!(
+                        run.comparison.status,
+                        ComparisonStatus::Exact,
+                        "{mode}/{query_id}: {:?}",
+                        run.comparison.divergences,
+                    );
+                    assert_eq!(
+                        run.comparison.rank_class,
+                        RankClass::RankExact,
+                        "{mode}/{query_id}: {:?}",
+                        run.comparison.divergences,
+                    );
+
+                    let summarize = |observation: &EngineObservation| {
+                        (
+                            query_id.to_owned(),
+                            observation
+                                .hits
+                                .iter()
+                                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                                .collect::<Vec<_>>(),
+                            observation.match_count.clone(),
+                        )
+                    };
+                    quill_queries.push(summarize(&run.comparison.subject));
+                    tantivy_queries.push(summarize(&run.comparison.oracle));
+                }
+                quill_mode_evidence.push(quill_queries);
+                tantivy_mode_evidence.push(tantivy_queries);
+            }
+
+            assert_eq!(
+                quill_mode_evidence[0], quill_mode_evidence[1],
+                "Quill position-independent IDs, order, score bits, or counts changed with positions",
+            );
+            assert_eq!(
+                tantivy_mode_evidence[0], tantivy_mode_evidence[1],
+                "Tantivy position-independent IDs, order, score bits, or counts changed with positions",
+            );
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]

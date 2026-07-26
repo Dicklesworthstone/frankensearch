@@ -4249,7 +4249,7 @@ fn build_term_rows(
                         doc_ord: current_doc,
                     }
                 })?,
-                if stores_positions { frequency } else { 1 },
+                frequency,
             ));
             current_doc = row.doc_ord;
             frequency = 0;
@@ -4283,7 +4283,7 @@ fn build_term_rows(
                 doc_ord: current_doc,
             }
         })?,
-        if stores_positions { frequency } else { 1 },
+        frequency,
     ));
     Ok((postings, positions))
 }
@@ -7161,16 +7161,7 @@ mod tests {
             let decoded = posting_list.decode_all().expect("posting list decodes");
             let expected_postings = expected_runs
                 .iter()
-                .map(|(doc_id, frequency, _)| {
-                    Posting::new(
-                        *doc_id,
-                        if field.positions().is_some() {
-                            *frequency
-                        } else {
-                            1
-                        },
-                    )
-                })
+                .map(|(doc_id, frequency, _)| Posting::new(*doc_id, *frequency))
                 .collect::<Vec<_>>();
             assert_eq!(
                 decoded,
@@ -7261,8 +7252,8 @@ mod tests {
         .expect("Basic postings reopen");
         assert_eq!(
             basic_postings.decode_all().expect("Basic postings decode"),
-            [Posting::new(65_538, 1)],
-            "positionless text records document presence, not duplicate term frequency"
+            [Posting::new(65_538, 2)],
+            "positionless text preserves term frequency without storing position lists"
         );
         let positionless = accumulator.field(2).expect("positionless field");
         assert_eq!(
