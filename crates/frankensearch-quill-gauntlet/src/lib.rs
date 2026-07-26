@@ -28,8 +28,16 @@ pub use artifact::{
 };
 pub use comparator::{
     AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
-    CountState, Divergence, DivergenceClass, EngineObservation, NativeTieKey, RankClass, RankedHit,
-    SCORE_EPSILON, ScoreEpsilonReason, compare_observations,
+    CountState, Divergence, DivergenceClass, EngineObservation, LEXICAL_OBSERVATION_SCHEMA_VERSION,
+    LexicalBackendIdentity, LexicalComparisonReport, LexicalComparisonStatus, LexicalCountState,
+    LexicalEmptyShape, LexicalEquivalenceLaw, LexicalErrorClass, LexicalErrorObservation,
+    LexicalFieldMismatch, LexicalHighlightSpan, LexicalHitObservation, LexicalHitSupplement,
+    LexicalMismatchClass, LexicalObservation, LexicalObservationContext, LexicalObservationOutcome,
+    LexicalObservationSupplement, LexicalObserved, MAX_LEXICAL_DOC_ID_BYTES,
+    MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT, MAX_LEXICAL_OBSERVATION_HITS,
+    MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES, NativeTieKey, RankClass, RankedHit, SCORE_EPSILON,
+    ScoreEpsilonReason, SensitiveValueObservation, compare_lexical_observations,
+    compare_observations, observe_lexical_outcome,
 };
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,

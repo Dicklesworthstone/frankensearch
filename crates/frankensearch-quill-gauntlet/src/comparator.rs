@@ -1,10 +1,1184 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use frankensearch_core::{QueryClass, ScoreSource, ScoredResult, SearchError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::info;
 
 use crate::GauntletError;
 
 pub const SCORE_EPSILON: f32 = 0.0001;
+/// Stable schema identifier for the complete public lexical result envelope.
+pub const LEXICAL_OBSERVATION_SCHEMA_VERSION: &str = "lexical-observation-v1";
+/// Maximum number of hits admitted into one lexical observation artifact.
+pub const MAX_LEXICAL_OBSERVATION_HITS: usize = 100_000;
+/// Maximum UTF-8 byte length of a consumer-visible document identifier.
+pub const MAX_LEXICAL_DOC_ID_BYTES: usize = 1_024;
+/// Maximum canonical byte length represented by one redacted payload digest.
+pub const MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
+/// Maximum number of ordered highlight spans represented for one hit.
+pub const MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT: usize = 4_096;
+
+/// Backend identity retained as provenance but not treated as an equivalence field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalBackendIdentity {
+    /// Stable engine name, such as `quill` or `tantivy`.
+    pub engine: String,
+    /// Exact engine source or package revision.
+    pub revision: String,
+    /// Stable public index/source identity for this invocation.
+    pub index_identity: String,
+}
+
+impl LexicalBackendIdentity {
+    fn validate(&self) -> Result<(), GauntletError> {
+        if [
+            self.engine.as_str(),
+            self.revision.as_str(),
+            self.index_identity.as_str(),
+        ]
+        .into_iter()
+        .any(|value| value.trim().is_empty() || value.len() > 256)
+        {
+            return Err(GauntletError::InvalidObservation {
+                reason: "lexical backend identity fields must be bounded and non-empty".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Query, corpus, seed, and backend provenance for one lexical observation.
+///
+/// Query text is never persisted. Raw and normalized inputs are represented by
+/// exact byte lengths and SHA-256 digests, while the classification that alters
+/// retrieval policy remains explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalObservationContext {
+    /// Observation schema identifier.
+    pub schema_version: String,
+    /// Engine and revision that emitted this observation.
+    pub backend: LexicalBackendIdentity,
+    /// SHA-256 of the exact indexed corpus.
+    pub corpus_sha256: String,
+    /// SHA-256 of the raw query bytes.
+    pub query_sha256: String,
+    /// Raw query byte length.
+    pub query_bytes: usize,
+    /// SHA-256 of the normalized query bytes.
+    pub normalized_query_sha256: String,
+    /// Normalized query byte length.
+    pub normalized_query_bytes: usize,
+    /// Query class used by adaptive retrieval.
+    pub query_class: QueryClass,
+    /// Deterministic case/generator seed.
+    pub seed: u64,
+    /// Requested top-k limit.
+    pub limit: usize,
+}
+
+impl LexicalObservationContext {
+    /// Build a CI-safe context without retaining plaintext query material.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed corpus hashes and unbounded backend identity fields.
+    pub fn new(
+        backend: LexicalBackendIdentity,
+        corpus_sha256: String,
+        raw_query: &str,
+        normalized_query: &str,
+        query_class: QueryClass,
+        seed: u64,
+        limit: usize,
+    ) -> Result<Self, GauntletError> {
+        let context = Self {
+            schema_version: LEXICAL_OBSERVATION_SCHEMA_VERSION.to_owned(),
+            backend,
+            corpus_sha256,
+            query_sha256: sha256_hex(raw_query.as_bytes()),
+            query_bytes: raw_query.len(),
+            normalized_query_sha256: sha256_hex(normalized_query.as_bytes()),
+            normalized_query_bytes: normalized_query.len(),
+            query_class,
+            seed,
+            limit,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    fn validate(&self) -> Result<(), GauntletError> {
+        self.backend.validate()?;
+        if self.schema_version != LEXICAL_OBSERVATION_SCHEMA_VERSION
+            || !is_lower_sha256(&self.corpus_sha256)
+            || !is_lower_sha256(&self.query_sha256)
+            || !is_lower_sha256(&self.normalized_query_sha256)
+        {
+            return Err(GauntletError::InvalidObservation {
+                reason: "lexical context schema or SHA-256 provenance is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Explicit observation state for public values that a boundary may not expose.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum LexicalObserved<T> {
+    /// The selected public boundary does not expose this value.
+    #[default]
+    NotExposed,
+    /// The boundary exposes the field and reported absence.
+    Absent,
+    /// The boundary exposed this exact value.
+    Value(T),
+}
+
+/// CI-safe representation of metadata, snippets, explanations, and errors.
+///
+/// Payload bytes never enter the artifact. Presence, emptiness, byte length,
+/// and a stable digest remain independently observable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SensitiveValueObservation {
+    /// The selected public boundary does not expose this field.
+    #[default]
+    NotExposed,
+    /// The field was exposed and absent.
+    Absent,
+    /// The field was present but logically empty.
+    PresentEmpty {
+        /// SHA-256 of the canonical payload bytes.
+        sha256: String,
+        /// Canonical payload byte length.
+        byte_len: usize,
+    },
+    /// The field was present and non-empty.
+    Present {
+        /// SHA-256 of the canonical payload bytes.
+        sha256: String,
+        /// Canonical payload byte length.
+        byte_len: usize,
+    },
+}
+
+impl SensitiveValueObservation {
+    /// Hash a snippet or other UTF-8 payload without retaining plaintext.
+    #[must_use]
+    pub fn from_text(value: &str) -> Self {
+        Self::from_bytes(value.as_bytes(), value.is_empty())
+    }
+
+    fn from_serializable<T: Serialize>(
+        value: &T,
+        logically_empty: bool,
+    ) -> Result<Self, GauntletError> {
+        let bytes = canonical_json_bytes(value)?;
+        if bytes.len() > MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES {
+            return Err(GauntletError::InvalidObservation {
+                reason: "lexical sensitive payload exceeds the observation byte limit".to_owned(),
+            });
+        }
+        Ok(Self::from_bytes(&bytes, logically_empty))
+    }
+
+    fn from_bytes(bytes: &[u8], logically_empty: bool) -> Self {
+        let sha256 = sha256_hex(bytes);
+        let byte_len = bytes.len();
+        if logically_empty {
+            Self::PresentEmpty { sha256, byte_len }
+        } else {
+            Self::Present { sha256, byte_len }
+        }
+    }
+
+    fn validate(&self) -> bool {
+        match self {
+            Self::NotExposed | Self::Absent => true,
+            Self::PresentEmpty { sha256, byte_len } | Self::Present { sha256, byte_len } => {
+                *byte_len <= MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES && is_lower_sha256(sha256)
+            }
+        }
+    }
+}
+
+/// Half-open highlight span in UTF-8 byte offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalHighlightSpan {
+    /// Inclusive byte offset.
+    pub start: usize,
+    /// Exclusive byte offset.
+    pub end: usize,
+}
+
+/// Optional fields supplied by a richer backend boundary for one hit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LexicalHitSupplement {
+    /// Snippet presence and digest.
+    pub snippet: SensitiveValueObservation,
+    /// Ordered highlight spans, or an explicit unexposed/absent marker.
+    pub highlight_spans: LexicalObserved<Vec<LexicalHighlightSpan>>,
+}
+
+/// Exact count semantics for a lexical result page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalCountState {
+    /// The selected boundary has no total-count contract.
+    #[default]
+    NotExposed,
+    /// The caller explicitly did not request a count.
+    NotRequested,
+    /// Exact total number of matches.
+    Value(u64),
+}
+
+/// Rich values supplied beside the common `ScoredResult` envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LexicalObservationSupplement {
+    /// Exact count semantics for this page.
+    pub total_count: LexicalCountState,
+    /// Optional per-hit snippet/highlight observations keyed by document ID.
+    pub hits: BTreeMap<String, LexicalHitSupplement>,
+}
+
+/// Exhaustive public observation of one lexical hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalHitObservation {
+    /// Zero-based native result rank.
+    pub rank: usize,
+    /// Stable external document identifier.
+    pub doc_id: String,
+    /// Public normalized/final score bits.
+    pub normalized_score_bits: u32,
+    /// Raw lexical score bits, when the public result exposes them.
+    pub raw_lexical_score_bits: Option<u32>,
+    /// Public source identity.
+    pub source: ScoreSource,
+    /// Public index/source ordinal, when present.
+    pub index: Option<u32>,
+    /// Fast semantic component bits.
+    pub fast_score_bits: Option<u32>,
+    /// Quality semantic component bits.
+    pub quality_score_bits: Option<u32>,
+    /// Reranker component bits.
+    pub rerank_score_bits: Option<u32>,
+    /// Metadata presence/emptiness/content digest.
+    pub metadata: SensitiveValueObservation,
+    /// Explanation presence/emptiness/content digest.
+    pub explanation: SensitiveValueObservation,
+    /// Snippet presence/emptiness/content digest.
+    pub snippet: SensitiveValueObservation,
+    /// Ordered highlight spans.
+    pub highlight_spans: LexicalObserved<Vec<LexicalHighlightSpan>>,
+}
+
+/// Explicit shape of a successful result vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalEmptyShape {
+    /// Successful search returned zero hits.
+    Empty,
+    /// Successful search returned at least one hit.
+    NonEmpty,
+}
+
+/// Stable error class independent of backend error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalErrorClass {
+    /// Embedding/model availability or inference.
+    Embedding,
+    /// Index availability, corruption, version, or dimensions.
+    Index,
+    /// Query parsing.
+    Query,
+    /// Time budget exhaustion.
+    Timeout,
+    /// Federated quorum failure.
+    Federated,
+    /// Reranking availability or inference.
+    Rerank,
+    /// File or device I/O.
+    Io,
+    /// Invalid configuration.
+    Configuration,
+    /// Artifact hash verification.
+    Integrity,
+    /// Structured cancellation.
+    Cancellation,
+    /// Bounded queue capacity.
+    Capacity,
+    /// Optional backend subsystem.
+    Subsystem,
+    /// Requested feature was not compiled.
+    FeatureDisabled,
+}
+
+/// Typed, redacted error observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalErrorObservation {
+    /// Stable broad error class.
+    pub class: LexicalErrorClass,
+    /// Stable variant-level code.
+    pub code: String,
+    /// Hash and length of the complete display diagnostic.
+    pub detail: SensitiveValueObservation,
+}
+
+/// Successful or failed public lexical outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LexicalObservationOutcome {
+    /// Successful ordered result page.
+    Success {
+        /// Results in native consumer-visible order.
+        hits: Vec<LexicalHitObservation>,
+        /// Returned vector length, retained independently for schema checks.
+        returned_count: usize,
+        /// Exact empty/non-empty result shape.
+        empty_shape: LexicalEmptyShape,
+        /// Total-count request/value semantics.
+        total_count: LexicalCountState,
+    },
+    /// Typed failure without unrestricted diagnostic text.
+    Error(LexicalErrorObservation),
+}
+
+/// Complete backend-neutral observation at the public lexical result boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalObservation {
+    /// Query/corpus/backend provenance.
+    pub context: LexicalObservationContext,
+    /// Successful result envelope or typed error.
+    pub outcome: LexicalObservationOutcome,
+}
+
+/// Registered equivalence laws applied by the lexical comparator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalEquivalenceLaw {
+    /// Result arrays retain native order and rank exactly.
+    NativeOrderExact,
+    /// Floating-point scores compare by exact IEEE-754 bits.
+    ScoreBitsExact,
+    /// `NotExposed`, `Absent`, empty, and populated remain distinct.
+    PresenceExact,
+    /// Sensitive payload contents compare by canonical SHA-256 and length.
+    SensitivePayloadDigest,
+    /// Count request/value and empty-success shapes compare exactly.
+    CountAndEmptyShapeExact,
+    /// Error class and stable variant code compare exactly.
+    TypedErrorExact,
+}
+
+const LEXICAL_EQUIVALENCE_LAWS: [LexicalEquivalenceLaw; 6] = [
+    LexicalEquivalenceLaw::NativeOrderExact,
+    LexicalEquivalenceLaw::ScoreBitsExact,
+    LexicalEquivalenceLaw::PresenceExact,
+    LexicalEquivalenceLaw::SensitivePayloadDigest,
+    LexicalEquivalenceLaw::CountAndEmptyShapeExact,
+    LexicalEquivalenceLaw::TypedErrorExact,
+];
+
+/// Stable mismatch taxonomy for result-contract diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalMismatchClass {
+    /// Corpus/query/seed/limit provenance differs.
+    Context,
+    /// Success/error or result arity differs.
+    Outcome,
+    /// Rank, document identity, or array order differs.
+    Ordering,
+    /// Raw, normalized, or component score bits differ.
+    Score,
+    /// Public score source or index identity differs.
+    SourceIdentity,
+    /// Snippet presence or digest differs.
+    Snippet,
+    /// Ordered highlight spans differ.
+    Highlight,
+    /// Metadata presence or digest differs.
+    Metadata,
+    /// Explanation presence or digest differs.
+    Explanation,
+    /// Count or empty-result shape differs.
+    Count,
+    /// Typed error class, code, or redacted digest differs.
+    Error,
+}
+
+/// One bounded, field-addressable lexical contract mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalFieldMismatch {
+    /// Stable mismatch class.
+    pub class: LexicalMismatchClass,
+    /// JSON pointer into the subject observation.
+    pub path: String,
+    /// Bounded safe oracle diagnostic.
+    pub oracle: String,
+    /// Bounded safe subject diagnostic.
+    pub subject: String,
+}
+
+/// Overall lexical comparison status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalComparisonStatus {
+    /// Every registered equivalence law passed.
+    Equivalent,
+    /// At least one consumer-visible field differed.
+    Mismatch,
+}
+
+/// Pure, replayable result-contract comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalComparisonReport {
+    /// Overall comparison status.
+    pub status: LexicalComparisonStatus,
+    /// Fixed equivalence laws applied to this comparison.
+    pub applied_laws: Vec<LexicalEquivalenceLaw>,
+    /// Ordered, field-level mismatches.
+    pub mismatches: Vec<LexicalFieldMismatch>,
+    /// First differing field for compact logs and triage.
+    pub first_mismatch: Option<LexicalFieldMismatch>,
+    /// Subject evidence.
+    pub subject: LexicalObservation,
+    /// Oracle evidence.
+    pub oracle: LexicalObservation,
+}
+
+/// Convert the public lexical result/error envelope into a complete observation.
+///
+/// `ScoredResult` is deliberately destructured without `..`: adding a public
+/// result field breaks this adapter at compile time until the new field is
+/// deliberately observed or documented.
+///
+/// # Errors
+///
+/// Rejects invalid provenance, non-finite scores, unknown supplement document
+/// IDs, malformed highlight spans, and supplements attached to an error.
+pub fn observe_lexical_outcome(
+    context: LexicalObservationContext,
+    outcome: Result<Vec<ScoredResult>, SearchError>,
+    supplement: &LexicalObservationSupplement,
+) -> Result<LexicalObservation, GauntletError> {
+    context.validate()?;
+    let outcome = match outcome {
+        Ok(results) => {
+            let mut observed_ids = BTreeSet::new();
+            let mut hits = Vec::with_capacity(results.len());
+            for (rank, result) in results.into_iter().enumerate() {
+                let ScoredResult {
+                    doc_id,
+                    score,
+                    source,
+                    index,
+                    fast_score,
+                    quality_score,
+                    lexical_score,
+                    rerank_score,
+                    explanation,
+                    metadata,
+                } = result;
+                let doc_id = doc_id.to_string();
+                observed_ids.insert(doc_id.clone());
+                let hit_supplement = supplement.hits.get(&doc_id).cloned().unwrap_or_default();
+                let metadata = match metadata {
+                    None => SensitiveValueObservation::Absent,
+                    Some(value) => {
+                        let logically_empty =
+                            value.as_object().is_some_and(serde_json::Map::is_empty);
+                        SensitiveValueObservation::from_serializable(
+                            value.as_ref(),
+                            logically_empty,
+                        )?
+                    }
+                };
+                let explanation = match explanation {
+                    None => SensitiveValueObservation::Absent,
+                    Some(value) => {
+                        SensitiveValueObservation::from_serializable(value.as_ref(), false)?
+                    }
+                };
+                hits.push(LexicalHitObservation {
+                    rank,
+                    doc_id,
+                    normalized_score_bits: score.to_bits(),
+                    raw_lexical_score_bits: lexical_score.map(f32::to_bits),
+                    source,
+                    index,
+                    fast_score_bits: fast_score.map(f32::to_bits),
+                    quality_score_bits: quality_score.map(f32::to_bits),
+                    rerank_score_bits: rerank_score.map(f32::to_bits),
+                    metadata,
+                    explanation,
+                    snippet: hit_supplement.snippet,
+                    highlight_spans: hit_supplement.highlight_spans,
+                });
+            }
+            if let Some(doc_id) = supplement
+                .hits
+                .keys()
+                .find(|doc_id| !observed_ids.contains(doc_id.as_str()))
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "lexical supplement names document {} outside the result page",
+                        safe_text_diagnostic(doc_id)
+                    ),
+                });
+            }
+            let returned_count = hits.len();
+            let empty_shape = if hits.is_empty() {
+                LexicalEmptyShape::Empty
+            } else {
+                LexicalEmptyShape::NonEmpty
+            };
+            LexicalObservationOutcome::Success {
+                hits,
+                returned_count,
+                empty_shape,
+                total_count: supplement.total_count,
+            }
+        }
+        Err(error) => {
+            if supplement != &LexicalObservationSupplement::default() {
+                return Err(GauntletError::InvalidObservation {
+                    reason: "a failed lexical result cannot carry successful-hit supplements"
+                        .to_owned(),
+                });
+            }
+            LexicalObservationOutcome::Error(observe_search_error(&error))
+        }
+    };
+    let observation = LexicalObservation { context, outcome };
+    validate_lexical_observation(&observation)?;
+    Ok(observation)
+}
+
+/// Compare complete lexical result envelopes under the fixed registered laws.
+///
+/// Backend names and revisions are provenance: Quill and Tantivy are expected
+/// to differ there. Corpus/query identity, ordered public results, score bits,
+/// presence states, sensitive digests, count shape, and typed errors are exact.
+///
+/// # Errors
+///
+/// Rejects malformed observations before comparison.
+pub fn compare_lexical_observations(
+    subject: LexicalObservation,
+    oracle: LexicalObservation,
+) -> Result<LexicalComparisonReport, GauntletError> {
+    validate_lexical_observation(&subject)?;
+    validate_lexical_observation(&oracle)?;
+    let mut mismatches = Vec::new();
+
+    compare_safe_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/corpus_sha256",
+        &oracle.context.corpus_sha256,
+        &subject.context.corpus_sha256,
+    );
+    compare_safe_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/query_sha256",
+        &oracle.context.query_sha256,
+        &subject.context.query_sha256,
+    );
+    compare_debug_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/query_bytes",
+        &oracle.context.query_bytes,
+        &subject.context.query_bytes,
+    );
+    compare_safe_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/normalized_query_sha256",
+        &oracle.context.normalized_query_sha256,
+        &subject.context.normalized_query_sha256,
+    );
+    compare_debug_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/normalized_query_bytes",
+        &oracle.context.normalized_query_bytes,
+        &subject.context.normalized_query_bytes,
+    );
+    compare_debug_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/query_class",
+        &oracle.context.query_class,
+        &subject.context.query_class,
+    );
+    compare_debug_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/seed",
+        &oracle.context.seed,
+        &subject.context.seed,
+    );
+    compare_debug_field(
+        &mut mismatches,
+        LexicalMismatchClass::Context,
+        "/context/limit",
+        &oracle.context.limit,
+        &subject.context.limit,
+    );
+    compare_lexical_outcomes(&subject.outcome, &oracle.outcome, &mut mismatches);
+
+    let status = if mismatches.is_empty() {
+        LexicalComparisonStatus::Equivalent
+    } else {
+        LexicalComparisonStatus::Mismatch
+    };
+    let first_mismatch = mismatches.first().cloned();
+    if let Some(first) = &first_mismatch {
+        info!(
+            subject_engine = %subject.context.backend.engine,
+            subject_revision = %subject.context.backend.revision,
+            oracle_engine = %oracle.context.backend.engine,
+            oracle_revision = %oracle.context.backend.revision,
+            corpus_sha256 = %subject.context.corpus_sha256,
+            query_sha256 = %subject.context.query_sha256,
+            seed = subject.context.seed,
+            field_path = %first.path,
+            mismatch_class = ?first.class,
+            "lexical result contract mismatch"
+        );
+    }
+    Ok(LexicalComparisonReport {
+        status,
+        applied_laws: LEXICAL_EQUIVALENCE_LAWS.to_vec(),
+        mismatches,
+        first_mismatch,
+        subject,
+        oracle,
+    })
+}
+
+fn compare_lexical_outcomes(
+    subject: &LexicalObservationOutcome,
+    oracle: &LexicalObservationOutcome,
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+) {
+    match (subject, oracle) {
+        (
+            LexicalObservationOutcome::Success {
+                hits: subject_hits,
+                returned_count: subject_returned,
+                empty_shape: subject_empty,
+                total_count: subject_total,
+            },
+            LexicalObservationOutcome::Success {
+                hits: oracle_hits,
+                returned_count: oracle_returned,
+                empty_shape: oracle_empty,
+                total_count: oracle_total,
+            },
+        ) => {
+            compare_debug_field(
+                mismatches,
+                LexicalMismatchClass::Outcome,
+                "/outcome/returned_count",
+                oracle_returned,
+                subject_returned,
+            );
+            compare_debug_field(
+                mismatches,
+                LexicalMismatchClass::Count,
+                "/outcome/empty_shape",
+                oracle_empty,
+                subject_empty,
+            );
+            compare_debug_field(
+                mismatches,
+                LexicalMismatchClass::Count,
+                "/outcome/total_count",
+                oracle_total,
+                subject_total,
+            );
+            compare_debug_field(
+                mismatches,
+                LexicalMismatchClass::Outcome,
+                "/outcome/hits/length",
+                &oracle_hits.len(),
+                &subject_hits.len(),
+            );
+            for (index, (subject_hit, oracle_hit)) in
+                subject_hits.iter().zip(oracle_hits).enumerate()
+            {
+                compare_lexical_hits(index, subject_hit, oracle_hit, mismatches);
+            }
+        }
+        (
+            LexicalObservationOutcome::Error(subject_error),
+            LexicalObservationOutcome::Error(oracle_error),
+        ) => compare_lexical_errors(subject_error, oracle_error, mismatches),
+        (subject_outcome, oracle_outcome) => push_mismatch(
+            mismatches,
+            LexicalMismatchClass::Outcome,
+            "/outcome/kind",
+            outcome_kind(oracle_outcome),
+            outcome_kind(subject_outcome),
+        ),
+    }
+}
+
+fn compare_lexical_hits(
+    index: usize,
+    subject: &LexicalHitObservation,
+    oracle: &LexicalHitObservation,
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+) {
+    let path = |field: &str| format!("/outcome/hits/{index}/{field}");
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Ordering,
+        &path("rank"),
+        &oracle.rank,
+        &subject.rank,
+    );
+    if !oracle.doc_id.eq(&subject.doc_id) {
+        push_mismatch(
+            mismatches,
+            LexicalMismatchClass::Ordering,
+            path("doc_id"),
+            &safe_text_diagnostic(&oracle.doc_id),
+            &safe_text_diagnostic(&subject.doc_id),
+        );
+    }
+    compare_score_bits(
+        mismatches,
+        &path("normalized_score_bits"),
+        oracle.normalized_score_bits,
+        subject.normalized_score_bits,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Score,
+        &path("raw_lexical_score_bits"),
+        &oracle.raw_lexical_score_bits.map(hex_bits),
+        &subject.raw_lexical_score_bits.map(hex_bits),
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::SourceIdentity,
+        &path("source"),
+        &oracle.source,
+        &subject.source,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::SourceIdentity,
+        &path("index"),
+        &oracle.index,
+        &subject.index,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Score,
+        &path("fast_score_bits"),
+        &oracle.fast_score_bits.map(hex_bits),
+        &subject.fast_score_bits.map(hex_bits),
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Score,
+        &path("quality_score_bits"),
+        &oracle.quality_score_bits.map(hex_bits),
+        &subject.quality_score_bits.map(hex_bits),
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Score,
+        &path("rerank_score_bits"),
+        &oracle.rerank_score_bits.map(hex_bits),
+        &subject.rerank_score_bits.map(hex_bits),
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Metadata,
+        &path("metadata"),
+        &oracle.metadata,
+        &subject.metadata,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Explanation,
+        &path("explanation"),
+        &oracle.explanation,
+        &subject.explanation,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Snippet,
+        &path("snippet"),
+        &oracle.snippet,
+        &subject.snippet,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Highlight,
+        &path("highlight_spans"),
+        &oracle.highlight_spans,
+        &subject.highlight_spans,
+    );
+}
+
+fn compare_lexical_errors(
+    subject: &LexicalErrorObservation,
+    oracle: &LexicalErrorObservation,
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+) {
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Error,
+        "/outcome/error/class",
+        &oracle.class,
+        &subject.class,
+    );
+    compare_safe_field(
+        mismatches,
+        LexicalMismatchClass::Error,
+        "/outcome/error/code",
+        &oracle.code,
+        &subject.code,
+    );
+    compare_debug_field(
+        mismatches,
+        LexicalMismatchClass::Error,
+        "/outcome/error/detail",
+        &oracle.detail,
+        &subject.detail,
+    );
+}
+
+fn compare_score_bits(
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+    path: &str,
+    oracle: u32,
+    subject: u32,
+) {
+    if !oracle.eq(&subject) {
+        push_mismatch(
+            mismatches,
+            LexicalMismatchClass::Score,
+            path.to_owned(),
+            &hex_bits(oracle),
+            &hex_bits(subject),
+        );
+    }
+}
+
+fn compare_safe_field<T: AsRef<str> + PartialEq>(
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+    class: LexicalMismatchClass,
+    path: &str,
+    oracle: &T,
+    subject: &T,
+) {
+    if !oracle.eq(subject) {
+        push_mismatch(
+            mismatches,
+            class,
+            path.to_owned(),
+            oracle.as_ref(),
+            subject.as_ref(),
+        );
+    }
+}
+
+fn compare_debug_field<T: std::fmt::Debug + PartialEq>(
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+    class: LexicalMismatchClass,
+    path: &str,
+    oracle: &T,
+    subject: &T,
+) {
+    if !oracle.eq(subject) {
+        push_mismatch(
+            mismatches,
+            class,
+            path.to_owned(),
+            &format!("{oracle:?}"),
+            &format!("{subject:?}"),
+        );
+    }
+}
+
+fn push_mismatch(
+    mismatches: &mut Vec<LexicalFieldMismatch>,
+    class: LexicalMismatchClass,
+    path: impl Into<String>,
+    oracle: &str,
+    subject: &str,
+) {
+    mismatches.push(LexicalFieldMismatch {
+        class,
+        path: path.into(),
+        oracle: bounded_diagnostic(oracle),
+        subject: bounded_diagnostic(subject),
+    });
+}
+
+fn validate_lexical_observation(observation: &LexicalObservation) -> Result<(), GauntletError> {
+    observation.context.validate()?;
+    match &observation.outcome {
+        LexicalObservationOutcome::Success {
+            hits,
+            returned_count,
+            empty_shape,
+            total_count,
+        } => {
+            if *returned_count != hits.len()
+                || hits.len() > MAX_LEXICAL_OBSERVATION_HITS
+                || hits.len() > observation.context.limit
+                || (*empty_shape == LexicalEmptyShape::Empty) != hits.is_empty()
+                || matches!(total_count, LexicalCountState::Value(total) if *total < u64::try_from(hits.len()).unwrap_or(u64::MAX))
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: "lexical returned-count, empty-shape, or total-count evidence is inconsistent"
+                        .to_owned(),
+                });
+            }
+            let mut doc_ids = BTreeSet::new();
+            for (expected_rank, hit) in hits.iter().enumerate() {
+                if hit.rank != expected_rank
+                    || hit.doc_id.is_empty()
+                    || hit.doc_id.len() > MAX_LEXICAL_DOC_ID_BYTES
+                    || !doc_ids.insert(hit.doc_id.as_str())
+                    || !float_bits_are_finite(hit.normalized_score_bits)
+                    || !optional_float_bits_are_finite(hit.raw_lexical_score_bits)
+                    || !optional_float_bits_are_finite(hit.fast_score_bits)
+                    || !optional_float_bits_are_finite(hit.quality_score_bits)
+                    || !optional_float_bits_are_finite(hit.rerank_score_bits)
+                    || !hit.metadata.validate()
+                    || !hit.explanation.validate()
+                    || !hit.snippet.validate()
+                    || !valid_highlight_state(&hit.highlight_spans)
+                {
+                    return Err(GauntletError::InvalidObservation {
+                        reason: format!(
+                            "lexical hit {} violates rank, identity, score, payload, or highlight invariants",
+                            safe_text_diagnostic(&hit.doc_id)
+                        ),
+                    });
+                }
+            }
+        }
+        LexicalObservationOutcome::Error(error) => {
+            if error.code.is_empty() || error.code.len() > 128 || !error.detail.validate() {
+                return Err(GauntletError::InvalidObservation {
+                    reason: "lexical error code or redacted detail is invalid".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_highlight_state(spans: &LexicalObserved<Vec<LexicalHighlightSpan>>) -> bool {
+    let LexicalObserved::Value(spans) = spans else {
+        return true;
+    };
+    if spans.len() > MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT {
+        return false;
+    }
+    let mut previous_end = 0;
+    for span in spans {
+        if span.start >= span.end || span.start < previous_end {
+            return false;
+        }
+        previous_end = span.end;
+    }
+    true
+}
+
+fn observe_search_error(error: &SearchError) -> LexicalErrorObservation {
+    let detail = SensitiveValueObservation::from_text(&error.to_string());
+    let (class, code) = match error {
+        SearchError::EmbedderUnavailable {
+            model: _,
+            reason: _,
+        } => (
+            LexicalErrorClass::Embedding,
+            "embedder_unavailable".to_owned(),
+        ),
+        SearchError::EmbeddingFailed {
+            model: _,
+            source: _,
+        } => (LexicalErrorClass::Embedding, "embedding_failed".to_owned()),
+        SearchError::ModelNotFound { name: _ } => {
+            (LexicalErrorClass::Embedding, "model_not_found".to_owned())
+        }
+        SearchError::ModelLoadFailed { path: _, source: _ } => {
+            (LexicalErrorClass::Embedding, "model_load_failed".to_owned())
+        }
+        SearchError::IndexCorrupted { path: _, detail: _ } => {
+            (LexicalErrorClass::Index, "index_corrupted".to_owned())
+        }
+        SearchError::IndexVersionMismatch {
+            expected: _,
+            found: _,
+        } => (
+            LexicalErrorClass::Index,
+            "index_version_mismatch".to_owned(),
+        ),
+        SearchError::DimensionMismatch {
+            expected: _,
+            found: _,
+        } => (LexicalErrorClass::Index, "dimension_mismatch".to_owned()),
+        SearchError::IndexNotFound { path: _ } => {
+            (LexicalErrorClass::Index, "index_not_found".to_owned())
+        }
+        SearchError::IndexCandidatesNotFound { paths: _ } => (
+            LexicalErrorClass::Index,
+            "index_candidates_not_found".to_owned(),
+        ),
+        SearchError::QueryParseError {
+            query: _,
+            detail: _,
+        } => (LexicalErrorClass::Query, "query_parse_error".to_owned()),
+        SearchError::SearchTimeout {
+            elapsed_ms: _,
+            budget_ms: _,
+        } => (LexicalErrorClass::Timeout, "search_timeout".to_owned()),
+        SearchError::FederatedInsufficientResponses {
+            required: _,
+            received: _,
+        } => (
+            LexicalErrorClass::Federated,
+            "federated_insufficient_responses".to_owned(),
+        ),
+        SearchError::RerankerUnavailable { model: _ } => {
+            (LexicalErrorClass::Rerank, "reranker_unavailable".to_owned())
+        }
+        SearchError::RerankFailed {
+            model: _,
+            source: _,
+        } => (LexicalErrorClass::Rerank, "rerank_failed".to_owned()),
+        SearchError::Io(_) => (LexicalErrorClass::Io, "io".to_owned()),
+        SearchError::InvalidConfig {
+            field: _,
+            value: _,
+            reason: _,
+        } => (
+            LexicalErrorClass::Configuration,
+            "invalid_config".to_owned(),
+        ),
+        SearchError::HashMismatch {
+            path: _,
+            expected: _,
+            actual: _,
+        } => (LexicalErrorClass::Integrity, "hash_mismatch".to_owned()),
+        SearchError::Cancelled {
+            phase: _,
+            reason: _,
+        } => (LexicalErrorClass::Cancellation, "cancelled".to_owned()),
+        SearchError::QueueFull {
+            pending: _,
+            capacity: _,
+        } => (LexicalErrorClass::Capacity, "queue_full".to_owned()),
+        SearchError::SubsystemError {
+            subsystem,
+            source: _,
+        } => (
+            LexicalErrorClass::Subsystem,
+            format!("subsystem.{subsystem}"),
+        ),
+        SearchError::DurabilityDisabled => (
+            LexicalErrorClass::FeatureDisabled,
+            "durability_disabled".to_owned(),
+        ),
+    };
+    LexicalErrorObservation {
+        class,
+        code,
+        detail,
+    }
+}
+
+fn outcome_kind(outcome: &LexicalObservationOutcome) -> &'static str {
+    match outcome {
+        LexicalObservationOutcome::Success { .. } => "success",
+        LexicalObservationOutcome::Error(_) => "error",
+    }
+}
+
+fn optional_float_bits_are_finite(bits: Option<u32>) -> bool {
+    bits.is_none_or(float_bits_are_finite)
+}
+
+fn float_bits_are_finite(bits: u32) -> bool {
+    f32::from_bits(bits).is_finite()
+}
+
+fn hex_bits(bits: u32) -> String {
+    format!("0x{bits:08x}")
+}
+
+fn safe_text_diagnostic(value: &str) -> String {
+    let digest = sha256_hex(value.as_bytes());
+    format!("sha256:{} bytes={}", &digest[..16], value.len())
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 192;
+    if value.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return value.to_owned();
+    }
+    let mut bounded = value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let value = canonicalize_json_value(serde_json::to_value(value)?);
+    serde_json::to_vec(&value)
+}
+
+fn canonicalize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values.into_iter().collect::<BTreeMap<_, _>>();
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in sorted {
+                canonical.insert(key, canonicalize_json_value(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Native secondary ordering evidence retained for every ranked hit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -902,6 +2076,7 @@ fn escape_json_pointer_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn quill_hit(doc_id: &str, score: f32, native_doc_id: u32) -> RankedHit {
         RankedHit {
@@ -936,6 +2111,131 @@ mod tests {
             snippets: BTreeMap::new(),
             ast_differences: Vec::new(),
         }
+    }
+
+    fn lexical_context(engine: &str) -> LexicalObservationContext {
+        LexicalObservationContext::new(
+            LexicalBackendIdentity {
+                engine: engine.to_owned(),
+                revision: format!("{engine}-test-revision"),
+                index_identity: "in-memory".to_owned(),
+            },
+            "a".repeat(64),
+            " Rust  search ",
+            "rust search",
+            QueryClass::ShortKeyword,
+            42,
+            10,
+        )
+        .expect("valid lexical observation context")
+    }
+
+    fn lexical_result(doc_id: &str, score: f32) -> ScoredResult {
+        use frankensearch_core::{ExplanationPhase, HitExplanation};
+
+        ScoredResult {
+            doc_id: doc_id.into(),
+            score,
+            source: ScoreSource::Lexical,
+            index: Some(7),
+            fast_score: Some(0.25),
+            quality_score: Some(0.5),
+            lexical_score: Some(score),
+            rerank_score: Some(0.75),
+            explanation: Some(Box::new(HitExplanation {
+                final_score: f64::from(score),
+                components: Vec::new(),
+                phase: ExplanationPhase::Refined,
+                rank_movement: None,
+            })),
+            metadata: Some(Arc::new(serde_json::json!({
+                "language": "rust",
+                "nested": {"stable": true}
+            }))),
+        }
+    }
+
+    fn lexical_supplement(doc_id: &str) -> LexicalObservationSupplement {
+        LexicalObservationSupplement {
+            total_count: LexicalCountState::Value(1),
+            hits: BTreeMap::from([(
+                doc_id.to_owned(),
+                LexicalHitSupplement {
+                    snippet: SensitiveValueObservation::from_text("safe snippet"),
+                    highlight_spans: LexicalObserved::Value(vec![LexicalHighlightSpan {
+                        start: 0,
+                        end: 4,
+                    }]),
+                },
+            )]),
+        }
+    }
+
+    fn complete_lexical_observation(engine: &str) -> LexicalObservation {
+        observe_lexical_outcome(
+            lexical_context(engine),
+            Ok(vec![lexical_result("doc-1", 3.5)]),
+            &lexical_supplement("doc-1"),
+        )
+        .expect("complete lexical observation")
+    }
+
+    fn lexical_success_mut(
+        observation: &mut LexicalObservation,
+    ) -> Option<(
+        &mut Vec<LexicalHitObservation>,
+        &mut usize,
+        &mut LexicalEmptyShape,
+        &mut LexicalCountState,
+    )> {
+        match &mut observation.outcome {
+            LexicalObservationOutcome::Success {
+                hits,
+                returned_count,
+                empty_shape,
+                total_count,
+            } => Some((hits, returned_count, empty_shape, total_count)),
+            LexicalObservationOutcome::Error(_) => None,
+        }
+    }
+
+    fn lexical_hit_mut(observation: &mut LexicalObservation) -> &mut LexicalHitObservation {
+        lexical_success_mut(observation)
+            .expect("test fixture must be a successful lexical observation")
+            .0
+            .first_mut()
+            .expect("test fixture must contain one lexical hit")
+    }
+
+    fn lexical_error_mut(
+        observation: &mut LexicalObservation,
+    ) -> Option<&mut LexicalErrorObservation> {
+        match &mut observation.outcome {
+            LexicalObservationOutcome::Success { .. } => None,
+            LexicalObservationOutcome::Error(error) => Some(error),
+        }
+    }
+
+    fn assert_single_lexical_mismatch(
+        mutate: impl FnOnce(&mut LexicalObservation),
+        expected_class: LexicalMismatchClass,
+        expected_path: &str,
+    ) {
+        let oracle = complete_lexical_observation("tantivy");
+        let mut subject = complete_lexical_observation("quill");
+        mutate(&mut subject);
+        let report = compare_lexical_observations(subject, oracle)
+            .expect("mutated observation remains structurally valid");
+        assert_eq!(report.status, LexicalComparisonStatus::Mismatch);
+        assert_eq!(
+            report
+                .mismatches
+                .iter()
+                .map(|mismatch| (mismatch.class, mismatch.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(expected_class, expected_path)]
+        );
+        assert_eq!(report.first_mismatch, report.mismatches.first().cloned());
     }
 
     #[test]
@@ -1375,5 +2675,673 @@ mod tests {
         let error = compare_observations(oracle.clone(), oracle, ComparatorConfig::default())
             .expect_err("inconsistent offset evidence is rejected");
         assert!(matches!(error, GauntletError::InvalidObservation { .. }));
+    }
+
+    #[test]
+    fn lexical_observation_backend_identity_is_provenance_not_equivalence() {
+        let subject = complete_lexical_observation("quill");
+        let oracle = complete_lexical_observation("tantivy");
+
+        let report =
+            compare_lexical_observations(subject, oracle).expect("complete lexical comparison");
+
+        assert_eq!(report.status, LexicalComparisonStatus::Equivalent);
+        assert!(report.mismatches.is_empty());
+        assert_eq!(
+            report.applied_laws,
+            vec![
+                LexicalEquivalenceLaw::NativeOrderExact,
+                LexicalEquivalenceLaw::ScoreBitsExact,
+                LexicalEquivalenceLaw::PresenceExact,
+                LexicalEquivalenceLaw::SensitivePayloadDigest,
+                LexicalEquivalenceLaw::CountAndEmptyShapeExact,
+                LexicalEquivalenceLaw::TypedErrorExact,
+            ]
+        );
+        assert_eq!(report.subject.context.backend.engine, "quill");
+        assert_eq!(report.oracle.context.backend.engine, "tantivy");
+    }
+
+    #[test]
+    fn lexical_observation_context_field_mutations_are_detected() {
+        assert_single_lexical_mismatch(
+            |observation| observation.context.corpus_sha256 = "b".repeat(64),
+            LexicalMismatchClass::Context,
+            "/context/corpus_sha256",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.query_sha256 = "b".repeat(64),
+            LexicalMismatchClass::Context,
+            "/context/query_sha256",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.query_bytes += 1,
+            LexicalMismatchClass::Context,
+            "/context/query_bytes",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.normalized_query_sha256 = "c".repeat(64),
+            LexicalMismatchClass::Context,
+            "/context/normalized_query_sha256",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.normalized_query_bytes += 1,
+            LexicalMismatchClass::Context,
+            "/context/normalized_query_bytes",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.query_class = QueryClass::NaturalLanguage,
+            LexicalMismatchClass::Context,
+            "/context/query_class",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.seed += 1,
+            LexicalMismatchClass::Context,
+            "/context/seed",
+        );
+        assert_single_lexical_mismatch(
+            |observation| observation.context.limit += 1,
+            LexicalMismatchClass::Context,
+            "/context/limit",
+        );
+    }
+
+    #[test]
+    fn lexical_observation_hit_field_mutations_are_detected() {
+        assert_single_lexical_mismatch(
+            |observation| lexical_hit_mut(observation).doc_id = "doc-2".to_owned(),
+            LexicalMismatchClass::Ordering,
+            "/outcome/hits/0/doc_id",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                let hit = lexical_hit_mut(observation);
+                hit.normalized_score_bits = f32::from_bits(hit.normalized_score_bits + 1).to_bits();
+            },
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/normalized_score_bits",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).raw_lexical_score_bits = Some(4.0_f32.to_bits());
+            },
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/raw_lexical_score_bits",
+        );
+        assert_single_lexical_mismatch(
+            |observation| lexical_hit_mut(observation).source = ScoreSource::Hybrid,
+            LexicalMismatchClass::SourceIdentity,
+            "/outcome/hits/0/source",
+        );
+        assert_single_lexical_mismatch(
+            |observation| lexical_hit_mut(observation).index = Some(8),
+            LexicalMismatchClass::SourceIdentity,
+            "/outcome/hits/0/index",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).fast_score_bits = Some(0.26_f32.to_bits());
+            },
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/fast_score_bits",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).quality_score_bits = Some(0.51_f32.to_bits());
+            },
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/quality_score_bits",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).rerank_score_bits = Some(0.76_f32.to_bits());
+            },
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/rerank_score_bits",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).metadata = SensitiveValueObservation::Absent;
+            },
+            LexicalMismatchClass::Metadata,
+            "/outcome/hits/0/metadata",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).explanation = SensitiveValueObservation::Absent;
+            },
+            LexicalMismatchClass::Explanation,
+            "/outcome/hits/0/explanation",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).snippet = SensitiveValueObservation::Absent;
+            },
+            LexicalMismatchClass::Snippet,
+            "/outcome/hits/0/snippet",
+        );
+        assert_single_lexical_mismatch(
+            |observation| {
+                lexical_hit_mut(observation).highlight_spans =
+                    LexicalObserved::Value(vec![LexicalHighlightSpan { start: 1, end: 4 }]);
+            },
+            LexicalMismatchClass::Highlight,
+            "/outcome/hits/0/highlight_spans",
+        );
+    }
+
+    #[test]
+    fn lexical_observation_count_and_shape_contracts_fail_closed() {
+        let oracle = complete_lexical_observation("tantivy");
+        let mut subject = complete_lexical_observation("quill");
+        let (_, _, _, total_count) =
+            lexical_success_mut(&mut subject).expect("test fixture must be a success");
+        *total_count = LexicalCountState::Value(2);
+        let report = compare_lexical_observations(subject, oracle).expect("valid count comparison");
+        assert_eq!(
+            report
+                .mismatches
+                .iter()
+                .map(|mismatch| mismatch.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/outcome/total_count"]
+        );
+
+        for mutate in [
+            |observation: &mut LexicalObservation| {
+                let (_, returned_count, _, _) =
+                    lexical_success_mut(observation).expect("test fixture must be a success");
+                *returned_count = 2;
+            },
+            |observation: &mut LexicalObservation| {
+                let (_, _, empty_shape, _) =
+                    lexical_success_mut(observation).expect("test fixture must be a success");
+                *empty_shape = LexicalEmptyShape::Empty;
+            },
+            |observation: &mut LexicalObservation| {
+                let (_, _, _, total_count) =
+                    lexical_success_mut(observation).expect("test fixture must be a success");
+                *total_count = LexicalCountState::Value(0);
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).rank = 1;
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).normalized_score_bits = f32::NAN.to_bits();
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).highlight_spans =
+                    LexicalObserved::Value(vec![LexicalHighlightSpan { start: 4, end: 4 }]);
+            },
+            |observation: &mut LexicalObservation| {
+                observation.context.limit = 0;
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).doc_id = "d".repeat(MAX_LEXICAL_DOC_ID_BYTES + 1);
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).metadata = SensitiveValueObservation::Present {
+                    sha256: "d".repeat(64),
+                    byte_len: MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES + 1,
+                };
+            },
+            |observation: &mut LexicalObservation| {
+                lexical_hit_mut(observation).highlight_spans = LexicalObserved::Value(
+                    (0..=MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT)
+                        .map(|index| LexicalHighlightSpan {
+                            start: index * 2,
+                            end: index * 2 + 1,
+                        })
+                        .collect(),
+                );
+            },
+        ] {
+            let mut malformed = complete_lexical_observation("quill");
+            mutate(&mut malformed);
+            let error =
+                compare_lexical_observations(malformed, complete_lexical_observation("tantivy"))
+                    .expect_err("malformed public observation must fail closed");
+            assert!(matches!(error, GauntletError::InvalidObservation { .. }));
+        }
+
+        let mut invalid_schema = complete_lexical_observation("quill");
+        invalid_schema.context.schema_version = "unknown".to_owned();
+        assert!(matches!(
+            compare_lexical_observations(invalid_schema, complete_lexical_observation("tantivy")),
+            Err(GauntletError::InvalidObservation { .. })
+        ));
+    }
+
+    #[test]
+    fn lexical_observation_rejects_unknown_supplements_and_duplicate_hits() {
+        let unknown = LexicalObservationSupplement {
+            total_count: LexicalCountState::NotExposed,
+            hits: BTreeMap::from([("not-returned".to_owned(), LexicalHitSupplement::default())]),
+        };
+        assert!(matches!(
+            observe_lexical_outcome(
+                lexical_context("quill"),
+                Ok(vec![lexical_result("doc-1", 3.5)]),
+                &unknown,
+            ),
+            Err(GauntletError::InvalidObservation { .. })
+        ));
+        assert!(matches!(
+            observe_lexical_outcome(
+                lexical_context("quill"),
+                Ok(vec![
+                    lexical_result("duplicate", 3.5),
+                    lexical_result("duplicate", 3.0),
+                ]),
+                &LexicalObservationSupplement::default(),
+            ),
+            Err(GauntletError::InvalidObservation { .. })
+        ));
+        assert!(matches!(
+            observe_lexical_outcome(
+                lexical_context("quill"),
+                Err(SearchError::QueryParseError {
+                    query: "secret".to_owned(),
+                    detail: "secret detail".to_owned(),
+                }),
+                &lexical_supplement("doc-1"),
+            ),
+            Err(GauntletError::InvalidObservation { .. })
+        ));
+    }
+
+    #[test]
+    fn lexical_observation_canonicalizes_metadata_key_order() {
+        let metadata = |reverse: bool| {
+            let mut object = serde_json::Map::new();
+            if reverse {
+                object.insert("zeta".to_owned(), serde_json::json!(2));
+                object.insert("alpha".to_owned(), serde_json::json!(1));
+            } else {
+                object.insert("alpha".to_owned(), serde_json::json!(1));
+                object.insert("zeta".to_owned(), serde_json::json!(2));
+            }
+            Arc::new(serde_json::Value::Object(object))
+        };
+        let result = |engine: &str, reverse| {
+            let mut hit = lexical_result("doc-1", 3.5);
+            hit.metadata = Some(metadata(reverse));
+            observe_lexical_outcome(
+                lexical_context(engine),
+                Ok(vec![hit]),
+                &LexicalObservationSupplement::default(),
+            )
+            .expect("metadata observation")
+        };
+
+        let report = compare_lexical_observations(result("quill", true), result("tantivy", false))
+            .expect("canonical metadata comparison");
+
+        assert_eq!(report.status, LexicalComparisonStatus::Equivalent);
+    }
+
+    #[test]
+    fn lexical_observation_detects_tie_reordering_without_score_rounding() {
+        let observe = |engine: &str, ids: [&str; 2]| {
+            observe_lexical_outcome(
+                lexical_context(engine),
+                Ok(ids
+                    .into_iter()
+                    .map(|doc_id| lexical_result(doc_id, 3.5))
+                    .collect()),
+                &LexicalObservationSupplement {
+                    total_count: LexicalCountState::Value(2),
+                    hits: BTreeMap::new(),
+                },
+            )
+            .expect("ordered tie observation")
+        };
+        let reordered = compare_lexical_observations(
+            observe("quill", ["doc-b", "doc-a"]),
+            observe("tantivy", ["doc-a", "doc-b"]),
+        )
+        .expect("tie ordering comparison");
+        assert_eq!(reordered.status, LexicalComparisonStatus::Mismatch);
+        assert_eq!(
+            reordered
+                .mismatches
+                .iter()
+                .map(|mismatch| mismatch.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/outcome/hits/0/doc_id", "/outcome/hits/1/doc_id"]
+        );
+
+        assert_single_lexical_mismatch(
+            |observation| lexical_hit_mut(observation).normalized_score_bits += 1,
+            LexicalMismatchClass::Score,
+            "/outcome/hits/0/normalized_score_bits",
+        );
+    }
+
+    #[test]
+    fn lexical_observation_preserves_empty_and_typed_error_shapes() {
+        let empty = observe_lexical_outcome(
+            lexical_context("quill"),
+            Ok(Vec::new()),
+            &LexicalObservationSupplement {
+                total_count: LexicalCountState::Value(0),
+                hits: BTreeMap::new(),
+            },
+        )
+        .expect("empty success observation");
+        assert!(matches!(
+            empty.outcome,
+            LexicalObservationOutcome::Success {
+                ref hits,
+                returned_count: 0,
+                empty_shape: LexicalEmptyShape::Empty,
+                total_count: LexicalCountState::Value(0),
+            } if hits.is_empty()
+        ));
+
+        let error_observation = |engine: &str| {
+            observe_lexical_outcome(
+                lexical_context(engine),
+                Err(SearchError::QueryParseError {
+                    query: "raw secret query".to_owned(),
+                    detail: "secret parser detail".to_owned(),
+                }),
+                &LexicalObservationSupplement::default(),
+            )
+            .expect("typed error observation")
+        };
+        let equivalent =
+            compare_lexical_observations(error_observation("quill"), error_observation("tantivy"))
+                .expect("typed error comparison");
+        assert_eq!(equivalent.status, LexicalComparisonStatus::Equivalent);
+
+        let mutate_error = |mutate: fn(&mut LexicalErrorObservation), path: &str| {
+            let oracle = error_observation("tantivy");
+            let mut subject = error_observation("quill");
+            let error = lexical_error_mut(&mut subject).expect("test fixture must be an error");
+            mutate(error);
+            let report =
+                compare_lexical_observations(subject, oracle).expect("valid error comparison");
+            assert_eq!(
+                report
+                    .mismatches
+                    .iter()
+                    .map(|mismatch| mismatch.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec![path]
+            );
+        };
+        mutate_error(
+            |error| error.class = LexicalErrorClass::Timeout,
+            "/outcome/error/class",
+        );
+        mutate_error(
+            |error| error.code = "query_parse_changed".to_owned(),
+            "/outcome/error/code",
+        );
+        mutate_error(
+            |error| error.detail = SensitiveValueObservation::from_text("changed"),
+            "/outcome/error/detail",
+        );
+
+        let outcome_mismatch = compare_lexical_observations(empty, error_observation("tantivy"))
+            .expect("success/error comparison");
+        assert_eq!(
+            outcome_mismatch
+                .first_mismatch
+                .as_ref()
+                .map(|mismatch| mismatch.path.as_str()),
+            Some("/outcome/kind")
+        );
+    }
+
+    #[test]
+    fn lexical_observation_artifacts_redact_sensitive_values() {
+        const QUERY_CANARY: &str = "sensitive-query-canary-9f3a";
+        const NORMALIZED_CANARY: &str = "sensitive-normalized-canary-2e7b";
+        const METADATA_CANARY: &str = "sensitive-metadata-canary-36c1";
+        const SNIPPET_CANARY: &str = "sensitive-snippet-canary-73d4";
+
+        let context = |engine: &str| {
+            LexicalObservationContext::new(
+                LexicalBackendIdentity {
+                    engine: engine.to_owned(),
+                    revision: "redaction-test".to_owned(),
+                    index_identity: "in-memory".to_owned(),
+                },
+                "d".repeat(64),
+                QUERY_CANARY,
+                NORMALIZED_CANARY,
+                QueryClass::Identifier,
+                91,
+                1,
+            )
+            .expect("redaction context")
+        };
+        let observation = |engine: &str, snippet: &str| {
+            let mut hit = lexical_result("public-doc-id", 1.0);
+            hit.metadata = Some(Arc::new(serde_json::json!({
+                "private": METADATA_CANARY
+            })));
+            observe_lexical_outcome(
+                context(engine),
+                Ok(vec![hit]),
+                &LexicalObservationSupplement {
+                    total_count: LexicalCountState::NotRequested,
+                    hits: BTreeMap::from([(
+                        "public-doc-id".to_owned(),
+                        LexicalHitSupplement {
+                            snippet: SensitiveValueObservation::from_text(snippet),
+                            highlight_spans: LexicalObserved::Absent,
+                        },
+                    )]),
+                },
+            )
+            .expect("redacted observation")
+        };
+        let subject = observation("quill", SNIPPET_CANARY);
+        let oracle = observation("tantivy", "different-private-snippet");
+        let report =
+            compare_lexical_observations(subject, oracle).expect("redacted mismatch comparison");
+        let artifact = serde_json::to_string(&report).expect("serialize redacted report");
+
+        for canary in [
+            QUERY_CANARY,
+            NORMALIZED_CANARY,
+            METADATA_CANARY,
+            SNIPPET_CANARY,
+            "different-private-snippet",
+        ] {
+            assert!(
+                !artifact.contains(canary),
+                "sensitive canary escaped into artifact"
+            );
+        }
+        assert!(artifact.contains(&sha256_hex(QUERY_CANARY.as_bytes())));
+        assert!(artifact.contains(&sha256_hex(SNIPPET_CANARY.as_bytes())));
+        assert!(report.mismatches.iter().all(|mismatch| {
+            mismatch.oracle.chars().count() <= 193 && mismatch.subject.chars().count() <= 193
+        }));
+
+        let error = observe_lexical_outcome(
+            context("quill"),
+            Err(SearchError::QueryParseError {
+                query: QUERY_CANARY.to_owned(),
+                detail: METADATA_CANARY.to_owned(),
+            }),
+            &LexicalObservationSupplement::default(),
+        )
+        .expect("redacted error observation");
+        let error_artifact = serde_json::to_string(&error).expect("serialize redacted error");
+        assert!(!error_artifact.contains(QUERY_CANARY));
+        assert!(!error_artifact.contains(METADATA_CANARY));
+    }
+
+    #[test]
+    fn lexical_observation_shared_comparator_distinguishes_absent_from_empty_metadata() {
+        let context = |engine: &str| {
+            LexicalObservationContext::new(
+                LexicalBackendIdentity {
+                    engine: engine.to_owned(),
+                    revision: "test-revision".to_owned(),
+                    index_identity: "in-memory".to_owned(),
+                },
+                "a".repeat(64),
+                "rust",
+                "rust",
+                QueryClass::ShortKeyword,
+                42,
+                10,
+            )
+            .expect("valid lexical observation context")
+        };
+        let scored = |metadata| ScoredResult {
+            doc_id: "doc-1".into(),
+            score: 3.5,
+            source: ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(3.5),
+            rerank_score: None,
+            explanation: None,
+            metadata,
+        };
+        let subject = observe_lexical_outcome(
+            context("quill"),
+            Ok(vec![scored(None)]),
+            &LexicalObservationSupplement::default(),
+        )
+        .expect("subject observation");
+        let oracle = observe_lexical_outcome(
+            context("tantivy"),
+            Ok(vec![scored(Some(Arc::new(serde_json::json!({}))))]),
+            &LexicalObservationSupplement::default(),
+        )
+        .expect("oracle observation");
+
+        let report =
+            compare_lexical_observations(subject, oracle).expect("shared lexical comparison");
+
+        assert_eq!(report.status, LexicalComparisonStatus::Mismatch);
+        assert_eq!(
+            report
+                .first_mismatch
+                .as_ref()
+                .map(|item| item.path.as_str()),
+            Some("/outcome/hits/0/metadata")
+        );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn lexical_observation_real_quill_tantivy_public_boundary_is_exact() {
+        use frankensearch_core::{IndexableDocument, LexicalSearch};
+        use frankensearch_lexical::TantivyIndex;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let documents = vec![
+                IndexableDocument::new("doc-none", "rust rust systems programming"),
+                IndexableDocument::new("doc-metadata", "rust search")
+                    .with_metadata("language", "rust")
+                    .with_metadata("stable", "true"),
+                IndexableDocument::new("doc-other", "unrelated database material"),
+            ];
+            let corpus_sha256 =
+                sha256_hex(&canonical_json_bytes(&documents).expect("canonical corpus"));
+            let quill = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("create Quill subject");
+            let tantivy =
+                TantivyIndex::in_memory_single_threaded_oracle().expect("create Tantivy oracle");
+
+            LexicalSearch::index_documents(&quill, &cx, &documents)
+                .await
+                .expect("index Quill corpus");
+            LexicalSearch::index_documents(&tantivy, &cx, &documents)
+                .await
+                .expect("index Tantivy corpus");
+            LexicalSearch::commit(&quill, &cx)
+                .await
+                .expect("commit Quill corpus");
+            LexicalSearch::commit(&tantivy, &cx)
+                .await
+                .expect("commit Tantivy corpus");
+
+            let query = "rust";
+            let quill_results = LexicalSearch::search(&quill, &cx, query, 10)
+                .await
+                .expect("search Quill");
+            let tantivy_results = LexicalSearch::search(&tantivy, &cx, query, 10)
+                .await
+                .expect("search Tantivy");
+            for results in [&quill_results, &tantivy_results] {
+                assert_eq!(results.len(), 2);
+                assert!(
+                    results
+                        .iter()
+                        .find(|result| result.doc_id.as_str() == "doc-none")
+                        .is_some_and(|result| result.metadata.is_none()),
+                    "empty metadata must remain absent at the public boundary"
+                );
+                assert!(
+                    results
+                        .iter()
+                        .find(|result| result.doc_id.as_str() == "doc-metadata")
+                        .is_some_and(|result| result.metadata.is_some()),
+                    "populated metadata must remain observable"
+                );
+            }
+
+            let context = |engine: &str, revision: &str| {
+                LexicalObservationContext::new(
+                    LexicalBackendIdentity {
+                        engine: engine.to_owned(),
+                        revision: revision.to_owned(),
+                        index_identity: "in-memory".to_owned(),
+                    },
+                    corpus_sha256.clone(),
+                    query,
+                    query,
+                    QueryClass::classify(query),
+                    0x51_7e_a2,
+                    10,
+                )
+                .expect("real backend observation context")
+            };
+            let quill_count = u64::try_from(quill_results.len()).expect("small Quill result count");
+            let tantivy_count =
+                u64::try_from(tantivy_results.len()).expect("small Tantivy result count");
+            let subject = observe_lexical_outcome(
+                context("quill", env!("CARGO_PKG_VERSION")),
+                Ok(quill_results),
+                &LexicalObservationSupplement {
+                    total_count: LexicalCountState::Value(quill_count),
+                    hits: BTreeMap::new(),
+                },
+            )
+            .expect("observe real Quill result envelope");
+            let oracle = observe_lexical_outcome(
+                context("tantivy", env!("CARGO_PKG_VERSION")),
+                Ok(tantivy_results),
+                &LexicalObservationSupplement {
+                    total_count: LexicalCountState::Value(tantivy_count),
+                    hits: BTreeMap::new(),
+                },
+            )
+            .expect("observe real Tantivy result envelope");
+
+            let report = compare_lexical_observations(subject, oracle)
+                .expect("compare real public lexical envelopes");
+            assert_eq!(
+                report.status,
+                LexicalComparisonStatus::Equivalent,
+                "real backend mismatch: {:?}",
+                report.first_mismatch
+            );
+        });
     }
 }
