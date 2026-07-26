@@ -273,6 +273,9 @@ pub struct DeltaTermPosting<'a> {
     /// Exact term bytes without the field prefix.
     pub term: &'a [u8],
     /// Occurrence count in the document.
+    ///
+    /// Positionless fields retain this count only in their fieldnorm
+    /// statistics; their Basic posting frequency is canonicalized to one.
     pub frequency: u32,
     /// Positions for a position-indexed Text field.
     pub positions: Option<&'a [u32]>,
@@ -1338,6 +1341,11 @@ impl DeltaSegment {
             let field_index = self
                 .field_index(posting.field_ord)
                 .expect("validated indexed-string field has a fieldnorm column");
+            let frequency = if self.fields[field_index].positions {
+                posting.frequency
+            } else {
+                1
+            };
             let fieldnorm_id = fieldnorms[field_index].fieldnorm_id;
             let (term_index, term_bytes) = if *planned_term == NEW_TERM_SENTINEL {
                 self.terms.intern_accounted(posting.field_ord, posting.term)
@@ -1369,18 +1377,15 @@ impl DeltaSegment {
                 &mut chain.postings,
                 PostingRecord {
                     global_docid,
-                    frequency: posting.frequency,
+                    frequency,
                     position_start,
                     has_positions: posting.positions.is_some(),
                 },
             ));
             chain.last_docid = Some(global_docid);
-            chain.max_frequency_code =
-                chain
-                    .max_frequency_code
-                    .max(crate::contract::block_max_frequency_to_code(
-                        posting.frequency,
-                    ));
+            chain.max_frequency_code = chain
+                .max_frequency_code
+                .max(crate::contract::block_max_frequency_to_code(frequency));
             chain.min_fieldnorm_id = chain.min_fieldnorm_id.min(fieldnorm_id);
         }
 
@@ -2989,10 +2994,16 @@ mod tests {
         {
             let keyword = delta.find_term(0, b"same").expect("keyword term");
             let positioned = delta.find_term(1, b"same").expect("positioned term");
+            let plain = delta.find_term(2, b"plain").expect("positionless term");
             let keyword_posting = keyword.postings().next().expect("keyword posting");
             let positioned_posting = positioned.postings().next().expect("positioned posting");
+            let plain_posting = plain.postings().next().expect("positionless posting");
             assert!(!keyword_posting.has_positions());
             assert!(keyword.positions(keyword_posting).is_none());
+            assert_eq!(
+                plain_posting.frequency, 1,
+                "positionless fields retain Basic document-presence postings"
+            );
             assert_eq!(
                 positioned
                     .positions(positioned_posting)

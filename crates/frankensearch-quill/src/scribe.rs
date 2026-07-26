@@ -4249,7 +4249,7 @@ fn build_term_rows(
                         doc_ord: current_doc,
                     }
                 })?,
-                frequency,
+                if stores_positions { frequency } else { 1 },
             ));
             current_doc = row.doc_ord;
             frequency = 0;
@@ -4283,7 +4283,7 @@ fn build_term_rows(
                 doc_ord: current_doc,
             }
         })?,
-        frequency,
+        if stores_positions { frequency } else { 1 },
     ));
     Ok((postings, positions))
 }
@@ -7161,7 +7161,16 @@ mod tests {
             let decoded = posting_list.decode_all().expect("posting list decodes");
             let expected_postings = expected_runs
                 .iter()
-                .map(|(doc_id, frequency, _)| Posting::new(*doc_id, *frequency))
+                .map(|(doc_id, frequency, _)| {
+                    Posting::new(
+                        *doc_id,
+                        if field.positions().is_some() {
+                            *frequency
+                        } else {
+                            1
+                        },
+                    )
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
                 decoded,
@@ -7235,6 +7244,31 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("second alpha positions"),
             [1]
+        );
+
+        let basic_alpha = dictionary
+            .lookup(2, b"alpha")
+            .expect("positionless alpha lookup")
+            .expect("positionless alpha exists");
+        let basic_start =
+            usize::try_from(basic_alpha.metadata.postings.offset).expect("Basic posting offset");
+        let basic_end = basic_start
+            + usize::try_from(basic_alpha.metadata.postings.len).expect("Basic posting length");
+        let basic_postings = PostingList::parse(
+            &postings_bytes[basic_start..basic_end],
+            basic_alpha.metadata.doc_freq,
+        )
+        .expect("Basic postings reopen");
+        assert_eq!(
+            basic_postings.decode_all().expect("Basic postings decode"),
+            [Posting::new(65_538, 1)],
+            "positionless text records document presence, not duplicate term frequency"
+        );
+        let positionless = accumulator.field(2).expect("positionless field");
+        assert_eq!(
+            positionless.document_lengths(),
+            &[2, 1],
+            "Basic postings still retain complete token counts for fieldnorms"
         );
 
         let id_map = IdMapSection::parse(

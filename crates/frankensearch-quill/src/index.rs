@@ -1319,7 +1319,7 @@ struct PendingDeltaSeal {
 struct QuillReader {
     config: QuillConfig,
     schema: SchemaDescriptor,
-    parser: DefaultQueryParser,
+    parser: Option<DefaultQueryParser>,
     published_snapshot: Arc<SnapshotPublisher>,
 }
 
@@ -1379,6 +1379,18 @@ pub struct QuillIndex {
 pub struct QuillSearchIndex {
     reader: QuillReader,
     directory: PathBuf,
+}
+
+/// Read-only in-memory handle for conformance schemas with their own parser.
+///
+/// This type intentionally exposes only typed-query execution. It neither
+/// constructs Scribe writer shards nor offers string-query or mutation APIs,
+/// so a schema whose analyzer and query-language contracts differ from the
+/// shipping defaults cannot accidentally enter those paths.
+#[cfg(feature = "bench-internals")]
+#[derive(Clone)]
+pub struct PreparsedQuillIndex {
+    reader: QuillReader,
 }
 
 /// Scalar Quill writer state guarded by [`QuillIndex::writer`].
@@ -1671,7 +1683,7 @@ impl QuillWriterState {
         schema: SchemaDescriptor,
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
-        let parser = DefaultQueryParser::new(schema)?;
+        let parser = Some(DefaultQueryParser::new(schema)?);
         let manifest = &backend.snapshot().loaded_manifest().manifest;
         let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
         let detected_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
@@ -3061,6 +3073,12 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    fn default_parser(&self) -> Result<&DefaultQueryParser, QuillIndexError> {
+        self.parser.as_ref().ok_or_else(|| {
+            invalid_state("string query APIs are unavailable for this preparsed-only index")
+        })
+    }
+
     /// Parse and exhaustively execute one query over the published composite
     /// Keeper-plus-Delta snapshot.
     ///
@@ -3134,7 +3152,7 @@ impl QuillReader {
             );
             let _parse_timer = crate::tracing_conventions::StageTimer::new(&parse_span);
             let _parse_entered = parse_span.enter();
-            let mut parsed = self.parser.parse_lenient(query);
+            let mut parsed = self.default_parser()?.parse_lenient(query);
             let report = canonicalize_query(&mut parsed.query);
             parse_span.record(
                 "diagnostic_count",
@@ -3259,7 +3277,7 @@ impl QuillReader {
             );
             let _parse_timer = crate::tracing_conventions::StageTimer::new(&parse_span);
             let _parse_entered = parse_span.enter();
-            let mut parsed = self.parser.parse_lenient(query);
+            let mut parsed = self.default_parser()?.parse_lenient(query);
             let _canonicalization = canonicalize_query(&mut parsed.query);
             parse_span.record(
                 "diagnostic_count",
@@ -3357,7 +3375,7 @@ impl QuillReader {
         fan_out: bool,
         rank_pruning: Option<bool>,
     ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
-        let mut parsed = self.parser.parse_lenient(query);
+        let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
@@ -3729,7 +3747,7 @@ impl QuillReader {
         query: &str,
         fan_out: bool,
     ) -> Result<Vec<u32>, QuillIndexError> {
-        let mut parsed = self.parser.parse_lenient(query);
+        let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         validate_query_lowering(&parsed.query, 1.0, self.schema)?;
         let published = self.published_snapshot.load();
@@ -3860,7 +3878,7 @@ impl QuillReader {
         }
         let snapshot = self.published_snapshot.load();
         let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot.as_ref())?;
-        let mut parsed = self.parser.parse_lenient(query);
+        let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
         let terms = compiled_snippet_terms(
             &parsed.query,
@@ -3918,6 +3936,55 @@ impl QuillReader {
     }
 }
 
+#[cfg(feature = "bench-internals")]
+impl PreparsedQuillIndex {
+    /// Bind an owned Keeper snapshot for typed query execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration or snapshot-validation failures.
+    pub fn from_in_memory_snapshot(
+        snapshot: KeeperSnapshot,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        let schema = snapshot.schema();
+        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
+        Ok(Self {
+            reader: QuillReader {
+                config,
+                schema,
+                parser: None,
+                published_snapshot,
+            },
+        })
+    }
+
+    /// Execute one already-built query tree against the pinned snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed lowering, collection, cancellation, or allocation
+    /// failures.
+    pub fn search_preparsed_paginated(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.reader
+            .search_preparsed_paginated(cx, query, limit, offset, exact_count)
+    }
+
+    /// Number of live documents in the pinned snapshot.
+    #[must_use]
+    pub fn doc_count(&self) -> u64 {
+        self.reader.published_snapshot.load().live_doc_count()
+    }
+}
+
 impl QuillSearchIndex {
     /// Open the latest published shipping-schema snapshot without acquiring the
     /// durable writer lease.
@@ -3942,7 +4009,7 @@ impl QuillSearchIndex {
         let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
         Ok(Self {
             reader: QuillReader {
-                parser: DefaultQueryParser::new(DEFAULT_SCHEMA)?,
+                parser: Some(DefaultQueryParser::new(DEFAULT_SCHEMA)?),
                 config,
                 schema: DEFAULT_SCHEMA,
                 published_snapshot,
@@ -6099,6 +6166,9 @@ fn materialize_live_numeric_range<'a>(
         .range_entries(lower, upper)
         .map_err(ArgusError::from)?;
     let value_count = field.len();
+    let covers_every_document = value_count
+        == usize::try_from(segment_num_docs).unwrap_or(usize::MAX)
+        && entries.len() == value_count;
     let mut docids = Vec::new();
     docids
         .try_reserve_exact(entries.len())
@@ -6119,6 +6189,7 @@ fn materialize_live_numeric_range<'a>(
         docids,
         value_count,
         segment_num_docs,
+        covers_every_document,
         score,
     )
     .map_err(QuillIndexError::from)
@@ -8288,7 +8359,11 @@ mod tests {
         exact_count: bool,
         fan_out: bool,
     ) -> CollectedTopDocs {
-        let mut parsed = index.reader.parser.parse_lenient(query_text);
+        let mut parsed = index
+            .reader
+            .default_parser()
+            .expect("fan-out fixture has a default parser")
+            .parse_lenient(query_text);
         let _ = canonicalize_query(&mut parsed.query);
         let snapshot = index.search_snapshot();
         let rank_pruning =
@@ -8376,7 +8451,11 @@ mod tests {
 
     /// Run the sealed-segment unscored id-set stage on one explicit path.
     fn collect_docid_set(index: &QuillIndex, cx: &Cx, query_text: &str, fan_out: bool) -> Vec<u32> {
-        let mut parsed = index.reader.parser.parse_lenient(query_text);
+        let mut parsed = index
+            .reader
+            .default_parser()
+            .expect("fan-out fixture has a default parser")
+            .parse_lenient(query_text);
         let _ = canonicalize_query(&mut parsed.query);
         let snapshot = index.search_snapshot();
         let mut collector = DocSetCollector::new();

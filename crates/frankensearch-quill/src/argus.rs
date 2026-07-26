@@ -2346,6 +2346,7 @@ impl<'a> ReferenceScorer<'a> {
         docids: Vec<u32>,
         value_count: usize,
         segment_num_docs: u32,
+        covers_every_document: bool,
         boost: f32,
     ) -> Result<Self, ArgusError> {
         if !boost.is_finite() {
@@ -2371,8 +2372,8 @@ impl<'a> ReferenceScorer<'a> {
         Ok(Self {
             node: ScorerNode::NumericRange(NumericRangeScorer::new_materialized(
                 docids,
-                value_count,
                 segment_num_docs,
+                covers_every_document,
                 boost,
             )),
         })
@@ -2438,6 +2439,9 @@ impl<'a> ReferenceScorer<'a> {
         matches!(
             &self.node,
             ScorerNode::All(scorer) if scorer.is_raw_unit_score()
+        ) || matches!(
+            &self.node,
+            ScorerNode::NumericRange(scorer) if scorer.is_raw_unit_all()
         )
     }
 
@@ -2657,10 +2661,11 @@ impl<'a> ReferenceScorer<'a> {
             }
         }
 
-        // Tantivy removes only direct, unboosted AllScorers before composing a
-        // complex Boolean tree. Keep one removed scorer per occurrence as the
-        // global-domain restoration token; duplicate unit contributions are
-        // deliberately collapsed, while boosted All scorers remain untouched.
+        // Tantivy removes direct, unboosted AllScorers before composing a
+        // complex Boolean tree. A full-cardinality numeric range lowers to
+        // that same raw AllScorer, while a boosted one is wrapped and remains
+        // score-bearing. Keep one removed scorer per occurrence as the global
+        // domain restoration token; duplicate unit contributions collapse.
         let must_all = remove_raw_unit_all_scorers(&mut must);
         let should_all = remove_raw_unit_all_scorers(&mut should);
         if remove_raw_unit_all_scorers(&mut excluded).is_some() {
@@ -3205,43 +3210,43 @@ struct NumericRangeScorer {
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    covers_every_document: bool,
     score: f32,
 }
 
 impl NumericRangeScorer {
     fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32, score: f32) -> Self {
+        let covers_every_document = value_count
+            == usize::try_from(segment_num_docs).unwrap_or(usize::MAX)
+            && u32::try_from(docids.len()).unwrap_or(u32::MAX) == segment_num_docs;
         Self::from_docids(
             NumericRangeDocIds::Encoded(docids),
-            value_count,
             segment_num_docs,
+            covers_every_document,
             score,
         )
     }
 
     fn new_materialized(
         docids: Vec<u32>,
-        value_count: usize,
         segment_num_docs: u32,
+        covers_every_document: bool,
         score: f32,
     ) -> Self {
         Self::from_docids(
             NumericRangeDocIds::Materialized(docids),
-            value_count,
             segment_num_docs,
+            covers_every_document,
             score,
         )
     }
 
     fn from_docids(
         docids: NumericRangeDocIds,
-        value_count: usize,
         segment_num_docs: u32,
+        covers_every_document: bool,
         score: f32,
     ) -> Self {
-        let match_count = u32::try_from(docids.len()).unwrap_or(u32::MAX);
-        let full_cardinality =
-            value_count == usize::try_from(segment_num_docs).unwrap_or(usize::MAX);
-        let covers_every_document = full_cardinality && match_count == segment_num_docs;
         let (cost, size_hint) = if covers_every_document {
             (u64::from(segment_num_docs), segment_num_docs)
         } else {
@@ -3253,6 +3258,7 @@ impl NumericRangeScorer {
             cost,
             size_hint,
             segment_num_docs,
+            covers_every_document,
             score,
         }
     }
@@ -3267,6 +3273,10 @@ impl NumericRangeScorer {
 
     const fn size_hint(&self) -> u32 {
         self.size_hint
+    }
+
+    fn is_raw_unit_all(&self) -> bool {
+        self.covers_every_document && self.score.to_bits() == 1.0_f32.to_bits()
     }
 
     fn next(&mut self) -> Option<u32> {
@@ -8226,6 +8236,42 @@ mod tests {
             )
         };
         let all = || ReferenceScorer::numeric_range(field, Bound::Unbounded, Bound::Unbounded, 3);
+
+        let mut required_full_range = ReferenceScorer::boolean(vec![
+            ScorerClause::must(all()?),
+            ScorerClause::must(left()?),
+        ])?;
+        let mut required_full_range_hits = required_full_range.top_k(3, &AllLiveDocs)?;
+        required_full_range_hits.sort_unstable_by_key(|hit| hit.global_docid);
+        assert_eq!(
+            required_full_range_hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            vec![(0, 1.0_f32.to_bits()), (1, 1.0_f32.to_bits())],
+            "Tantivy removes a full-cardinality unit range after it lowers to raw AllScorer"
+        );
+
+        let mut required_boosted_full_range = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::numeric_range_with_boost(
+                field,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                3,
+                2.5,
+            )?),
+            ScorerClause::must(left()?),
+        ])?;
+        let mut required_boosted_hits = required_boosted_full_range.top_k(3, &AllLiveDocs)?;
+        required_boosted_hits.sort_unstable_by_key(|hit| hit.global_docid);
+        assert_eq!(
+            required_boosted_hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3.5_f32.to_bits()), (1, 3.5_f32.to_bits())],
+            "a boosted full-cardinality range remains score-bearing"
+        );
 
         let mut should = ReferenceScorer::boolean(vec![
             ScorerClause::should(left()?),

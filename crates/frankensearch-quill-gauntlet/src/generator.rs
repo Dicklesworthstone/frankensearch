@@ -23,12 +23,12 @@ use crate::DifferentialCaseMetadata;
 use crate::{DifferentialCase, GauntletError};
 
 /// Schema version for generator specifications and manifests.
-pub const GENERATOR_SCHEMA_VERSION: u32 = 1;
+pub const GENERATOR_SCHEMA_VERSION: u32 = 2;
 /// Schema version for query manifests with explicit suite provenance and the
 /// complete CASS Boolean/glob/range/structured-filter profile.
 pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = 3;
 /// Stable identity of this generator implementation.
-pub const GENERATOR_ID: &str = "frankensearch-quill-gauntlet/generator-v1";
+pub const GENERATOR_ID: &str = "frankensearch-quill-gauntlet/generator-v2";
 /// Maximum accepted document size, in UTF-8 bytes.
 pub const MAX_DOCUMENT_BYTES: u32 = 2 * 1024 * 1024;
 /// Maximum UTF-8 bytes in an external document ID carried into observations.
@@ -212,16 +212,6 @@ pub struct CassDocumentFields {
     pub origin_kind: String,
     /// Message position in the source.
     pub message_index: u64,
-}
-
-/// Render the canonical cross-engine identity for one stored CASS message.
-///
-/// Both adapters derive this value after reopening from the stored
-/// `source_id` and `msg_idx` fields. The exact separator/rendering is pinned by
-/// `CASS_SCHEMA_CONTRACT_PREIMAGE`.
-#[must_use]
-pub fn cass_document_identity(source_id: &str, message_index: u64) -> String {
-    format!("{source_id}#{message_index}")
 }
 
 /// Engine-neutral generated document with canonical metadata ordering.
@@ -409,11 +399,18 @@ impl SyntheticCorpus {
                 Some(Pathology::NearLimitCode),
                 UnicodeLane::Ascii,
             ),
-            _ => (
-                self.generate_regular_content(&mut rng, regular_unicode_lane),
-                None,
-                regular_unicode_lane,
-            ),
+            _ => {
+                let regular = self.generate_regular_content(&mut rng, regular_unicode_lane);
+                let content = match cass_profile_anchor(index) {
+                    Some(anchor) => format!("{anchor} {regular}"),
+                    None => regular,
+                };
+                (
+                    truncate_utf8(content, usize_from_u32(self.spec.max_document_bytes)),
+                    None,
+                    regular_unicode_lane,
+                )
+            }
         };
         let mut metadata = BTreeMap::new();
         metadata.insert("generator_id".to_owned(), GENERATOR_ID.to_owned());
@@ -439,7 +436,11 @@ impl SyntheticCorpus {
                 workspace: format!("workspace-{}", index % 5),
                 source_id: format!("source-{}", index % 11),
                 source_path: format!("src/generated/{index:08}.rs"),
-                origin_kind: "synthetic".to_owned(),
+                origin_kind: if index.is_multiple_of(2) {
+                    "local".to_owned()
+                } else {
+                    "ssh".to_owned()
+                },
                 message_index: index,
             }),
             metadata,
@@ -2014,7 +2015,7 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
             GeneratedQueryKind::Glob {
                 pattern_class: GlobPatternClass::Complex,
             },
-            "con*fi?g*".to_owned(),
+            "con*fig*".to_owned(),
         ),
     ];
     cases.push(GeneratedQueryCase {
@@ -2457,6 +2458,18 @@ fn sampled_document_length(rng: &mut DeterministicRng, cap: usize) -> usize {
     available_minimum + usize::try_from(rng.bounded(span)).unwrap_or(usize::MAX)
 }
 
+fn cass_profile_anchor(index: u64) -> Option<&'static str> {
+    match index {
+        10 => Some("auth token cache config"),
+        11 => Some("auth stale configured"),
+        12 => Some("token cache configuration"),
+        13 => Some("auth cache reconfig"),
+        14 => Some("token configurable"),
+        15 => Some("unrelated baseline"),
+        _ => None,
+    }
+}
+
 fn maximum_frequency_content(cap: usize) -> String {
     let repeat = "freq ";
     let tail = "tail";
@@ -2659,7 +2672,7 @@ mod tests {
 
     use super::*;
 
-    const GENERATOR_GOLDEN_JSON: &str = include_str!("../fixtures/generator-v1.json");
+    const GENERATOR_GOLDEN_JSON: &str = include_str!("../fixtures/generator-v2.json");
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct GeneratorGolden {
@@ -2883,6 +2896,89 @@ mod tests {
         assert!(documents[7].content.contains('𪛟'));
         assert!(documents[8].content.contains("café"));
         assert!(documents[9].content.ends_with("// needle tail"));
+    }
+
+    #[test]
+    fn synthetic_cass_profile_anchors_and_sources_keep_campaign_non_vacuous() {
+        let corpus = SyntheticCorpus::new(SyntheticCorpusSpec {
+            seed: 23,
+            document_count: 16,
+            vocabulary_size: 128,
+            zipf_exponent: ZipfExponent::S11,
+            max_document_bytes: 512,
+        })
+        .expect("valid CASS corpus");
+        let documents = corpus.iter().collect::<Vec<_>>();
+        for (index, expected) in [
+            (10, "auth token cache config"),
+            (11, "auth stale configured"),
+            (12, "token cache configuration"),
+            (13, "auth cache reconfig"),
+            (14, "token configurable"),
+            (15, "unrelated baseline"),
+        ] {
+            assert!(
+                documents[index].content.starts_with(expected),
+                "document {index} dropped CASS anchor {expected}"
+            );
+        }
+        assert!(cass_profile_anchor(9).is_none());
+        assert!(cass_profile_anchor(16).is_none());
+        assert!(cass_profile_anchor(u64::MAX).is_none());
+        let origin_kinds = documents
+            .iter()
+            .map(|document| {
+                document
+                    .cass
+                    .as_ref()
+                    .expect("synthetic document has CASS fields")
+                    .origin_kind
+                    .as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(origin_kinds, BTreeSet::from(["local", "ssh"]));
+        assert!(documents.iter().any(|document| {
+            document
+                .cass
+                .as_ref()
+                .is_some_and(|cass| cass.source_id == "source-2")
+        }));
+        assert!(documents.iter().any(|document| {
+            document.cass.as_ref().is_some_and(|cass| {
+                (cass.agent == "agent-0" || cass.agent == "agent-1")
+                    && cass.workspace == "workspace-0"
+                    && cass.source_id == "source-0"
+            })
+        }));
+
+        let corpus_manifest = corpus.manifest().expect("CASS corpus manifest");
+        let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
+        let query_suite = GeneratedQuerySuite::generate(
+            QueryGeneratorSpec {
+                seed: 24,
+                default_limit: 20,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            &SharedFixtureSuite::load().expect("shared fixtures"),
+        )
+        .expect("CASS query suite");
+        let case = |id: &str| {
+            query_suite
+                .cases
+                .iter()
+                .find(|case| case.id == id)
+                .unwrap_or_else(|| panic!("missing generated CASS case {id}"))
+        };
+        assert_eq!(case("glob-complex").query, "con*fig*");
+        assert_eq!(
+            case("filter-local").filters.source_filter,
+            GeneratedSourceFilter::Local
+        );
+        assert_eq!(
+            case("filter-remote").filters.source_filter,
+            GeneratedSourceFilter::Remote
+        );
     }
 
     #[test]
@@ -3542,16 +3638,16 @@ mod tests {
             actual,
             (
                 [XLARGE_DOCUMENT_COUNT; 3],
-                [3_978_050_198; 3],
+                [3_978_050_328; 3],
                 [
-                    "4003abd3f8d3de470ad8d70401c95e2ee0199388e7388dc8169fac1a7e596ef8".to_owned(),
-                    "c07b02b1541c25a29a68b00ccd6cd64e09636f593fe5700ce10df9e5cb842d5a".to_owned(),
-                    "ffdf5a9b502c5e6847c4ddf33969c87012fc4277e6aa4bbabe601ad257a077e4".to_owned(),
+                    "80f670f33cca9cf086fb0c735889f6be03bf0ef31250bbcd8e5466708c2ad8cd".to_owned(),
+                    "ec301008e69ec8407c5880da68795d82cbb0993029f313875dd1e54e1343ebd0".to_owned(),
+                    "c6b1cb940bb25b23cf202ce43b248dcd9121a6278ead8d2d6c23bfa1cedfea7d".to_owned(),
                 ],
                 [
-                    "66a49dd8191d383b1d016f17fb55c8392803d648bc427dcfcc03eb299f722a8b".to_owned(),
-                    "8524cd498b8d480b0a2c45f2fa5f56a56a8e97bc72a9aaf082aec3f984a928d2".to_owned(),
-                    "55cf61b93b78b94b787875def3618354c2fab28baab5bbfece73b412811228d1".to_owned(),
+                    "bc8c37a9f914ad9f60ad6cf57512b6cabd54a124410a106e406fa20c5f2dbb7b".to_owned(),
+                    "9fbd168d0e924c2a2f6d3e8aff3b714d37fb1a7cd8628c03e4478816ef62f1a0".to_owned(),
+                    "67202aea2fb0b30b6e1350b2340218a9a741f391e3d35746e44cff1447a13ed8".to_owned(),
                 ],
             )
         );

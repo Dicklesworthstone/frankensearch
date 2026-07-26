@@ -26,6 +26,8 @@ use crate::engine::{
     ComparisonMode, DifferentialCase, DifferentialCaseMetadata, EngineDescriptor,
     EnginePairIdentity, HarnessRun, MAX_SNIPPET_CHARS,
 };
+#[cfg(feature = "tantivy-oracle")]
+use crate::generator::GeneratedSourceFilter;
 use crate::generator::{
     CorpusManifest, CorpusSourceManifest, GENERATOR_ID, GeneratedDocument, GeneratedQueryCase,
     GeneratedQueryKind, GeneratedQuerySuite, GlobPatternClass, MAX_DOCUMENT_BYTES, MAX_QUERY_CASES,
@@ -35,7 +37,7 @@ use crate::generator::{
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 3;
 /// Canonical preimage for the default shipping lexical analyzer protocol.
 pub const DEFAULT_ANALYZER_CONTRACT_PREIMAGE: &str =
     "v1;tokenizer=frankensearch_default;split=unicode_alphanumeric;lowercase=unicode_to_lowercase";
@@ -47,9 +49,9 @@ pub const DEFAULT_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;id=text:string+stored;con
 /// Scalar G1a subset: identical lexical semantics with snippet evidence disabled.
 pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default-fields-term-multiterm-exact-phrase-boolean;title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Canonical preimage for the CASS hyphen/prefix analyzer protocol.
-pub const CASS_ANALYZER_CONTRACT_PREIMAGE: &str = "v1;tokenizer=cass_hyphen_normalize;split=unicode_alphanumeric_with_interior_hyphens;lowercase=unicode_to_lowercase;prefix_tokenizer=cass_prefix_normalize;edge_ngrams=2..8;cjk=bigrams";
+pub const CASS_ANALYZER_CONTRACT_PREIMAGE: &str = "v2;tokenizer=cass_hyphen_normalize;token_runs=ascii_alphanumeric_with_interior_hyphens_or_pinned_cjk;hyphen_tokens=compound_and_parts_same_position;cjk_tokens=overlapping_bigrams_or_singleton;normalize=ascii_lowercase;max_token_bytes=inclusive-256;prefix_tokenizer=cass_prefix_normalize_without_hyphen_decomposition;prefix_source_split=unicode_alphanumeric;prefix_edge_ngrams=2..20-unicode-scalars;prefix_cjk=overlapping-bigrams";
 /// Canonical CASS field, parser, filtering, ranking, and pagination protocol.
-pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent,workspace,workspace_original,source_path,msg_idx,created_at,title,content,title_prefix,content_prefix,preview,source_id,origin_kind,origin_host,conversation_id;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;negation=all-plus-must-not;wildcards=exact-prefix-suffix-substring-complex;filters=agents,workspaces,created_at-inclusive,local,remote,source_id;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
+pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v4;profile=cass;schema=frankensearch-cass-semantic-v1;fields=agent:keyword+stored,workspace:keyword+stored,workspace_original:stored,source_path:stored,msg_idx:u64+indexed+stored,created_at:i64+indexed+fast+stored,title:text+positions+stored,content:text+positions,title_prefix:text+basic,content_prefix:text+basic,preview:stored,source_id:keyword+stored,origin_kind:keyword+stored,origin_host:keyword+stored,conversation_id:i64+stored;derived_title_prefix=edge_ngrams(full_title);derived_content_prefix=edge_ngrams(utf8_boundary_prefix_bytes<=4096);derived_preview=first_400_unicode_scalars_plus_ellipsis_if_truncated;document_identity=source_id#msg_idx;query_parser=cass-or-binds-tighter-than-and;blank_query=match_all;bare_terms=exact_raw_or_bounded_edge-prefix;phrases=title_or_content_positions;cjk_phrases=compound-bigram-and;negation=all-plus-must-not;wildcards=exact-prefix-on-four-search-fields,suffix-substring-complex-regex-on-title-content;filters=agents-or,workspaces-or,created_at-inclusive,local=origin_kind:local,remote=origin_kind:ssh,source_id;bm25=tantivy-0.26.1-default-no-field-boosts;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Default schema/query/ranking protocol implemented by the shipping Tantivy adapter.
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
     "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
@@ -745,6 +747,9 @@ pub struct CampaignProvenance {
     pub cargo_lock_sha256: String,
     /// Full `rustc -Vv` output (release, commit, date, host).
     pub rustc_version_verbose: String,
+    /// Exact dated channel from `rust-toolchain.toml`, cross-checked against
+    /// `rustup`'s active toolchain.
+    pub rust_toolchain_channel: String,
     /// `std::char::UNICODE_VERSION` of the executing toolchain.
     pub unicode_version: String,
     /// Locked `unicode-normalization` crate version from `Cargo.lock`.
@@ -761,8 +766,25 @@ pub struct CampaignProvenance {
     pub query_source_identity_sha256: String,
     /// Canonical hash of generator, source, selection, and semantic profile.
     pub query_profile_sha256: String,
-    /// Synthetic corpus seed when the corpus is generator-produced.
+    /// Analyzer protocol selected by the campaign.
+    pub analyzer_contract_hash: String,
+    /// Schema/query/ranking protocol selected by the campaign.
+    pub schema_contract_hash: String,
+    /// Canonical corpus-manifest hash.
+    pub corpus_manifest_hash: String,
+    /// Canonical query-manifest hash.
+    pub query_manifest_hash: String,
+    /// Synthetic corpus seed when generator-produced; explicit `null` for
+    /// non-synthetic corpora. The field itself is always required.
+    #[serde(deserialize_with = "deserialize_required_optional_u64")]
     pub corpus_seed: Option<u64>,
+}
+
+fn deserialize_required_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
 }
 
 impl CampaignProvenance {
@@ -779,11 +801,25 @@ impl CampaignProvenance {
     /// Returns [`GauntletError::InvalidCampaign`] when any required fact
     /// cannot be collected; a campaign must fail closed, never guess.
     pub fn collect(
-        corpus_seed: Option<u64>,
+        corpus_manifest: &CorpusManifest,
         query_manifest: &QueryManifest,
         selection: &CampaignSelection,
         semantic_contract: &SemanticContract,
     ) -> Result<Self, GauntletError> {
+        corpus_manifest.validate_contract()?;
+        semantic_contract.validate()?;
+        let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
+        if query_manifest.corpus_manifest_hash != corpus_manifest_hash {
+            return Err(campaign_error(
+                "provenance query manifest is not bound to the supplied corpus manifest",
+            ));
+        }
+        let query_manifest_hash = query_manifest.manifest_hash()?;
+        let corpus_seed = match &corpus_manifest.source {
+            CorpusSourceManifest::Synthetic { spec } => Some(spec.seed),
+            CorpusSourceManifest::SharedFixtures { .. }
+            | CorpusSourceManifest::Repository { .. } => None,
+        };
         let (subject_git_revision, subject_source_dirty) =
             collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
         let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
@@ -799,6 +835,7 @@ impl CampaignProvenance {
             oracle_source_dirty,
             cargo_lock_sha256,
             rustc_version_verbose,
+            rust_toolchain_channel: collect_dated_toolchain_channel()?,
             unicode_version: format!(
                 "{}.{}.{}",
                 char::UNICODE_VERSION.0,
@@ -812,6 +849,10 @@ impl CampaignProvenance {
             query_seed: query_manifest.spec.seed,
             query_source_identity_sha256: query_manifest.source_identity_sha256.clone(),
             query_profile_sha256,
+            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
+            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
+            corpus_manifest_hash,
+            query_manifest_hash,
             corpus_seed,
         })
     }
@@ -837,6 +878,8 @@ impl CampaignProvenance {
         );
         let expected_query_profile =
             query_profile_sha256(query_manifest, &config.selection, semantic_contract)?;
+        let expected_corpus_manifest_hash = corpus_manifest.manifest_hash()?;
+        let expected_query_manifest_hash = query_manifest.manifest_hash()?;
         let rustc_is_complete = self.rustc_version_verbose.len() <= 16 * 1024
             && !self.rustc_version_verbose.contains('\0')
             && ["commit-hash:", "commit-date:", "host:", "release:"]
@@ -857,6 +900,7 @@ impl CampaignProvenance {
             || self.cargo_lock_sha256 != hash_workspace_lockfile()?
             || !rustc_is_complete
             || self.rustc_version_verbose != collect_rustc_verbose()?
+            || self.rust_toolchain_channel != collect_dated_toolchain_channel()?
             || self.unicode_version != expected_unicode_version
             || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
             || self.unicode_normalization_table_version != unicode_normalization_table_version()
@@ -869,6 +913,10 @@ impl CampaignProvenance {
             || self.query_source_identity_sha256 != query_manifest.source_identity_sha256
             || !is_lower_sha256(&self.query_profile_sha256)
             || self.query_profile_sha256 != expected_query_profile
+            || self.analyzer_contract_hash != semantic_contract.analyzer_contract_hash
+            || self.schema_contract_hash != semantic_contract.schema_contract_hash
+            || self.corpus_manifest_hash != expected_corpus_manifest_hash
+            || self.query_manifest_hash != expected_query_manifest_hash
             || self.corpus_seed != expected_corpus_seed
         {
             return Err(campaign_error(
@@ -933,8 +981,12 @@ fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, boo
             )));
         }
     }
-    let revision = run_capture("git", &["rev-parse", "HEAD"], revision_env)?;
-    let porcelain = run_capture("git", &["status", "--porcelain"], dirty_env)?;
+    let revision = run_capture(ProvenanceProgram::Git, &["rev-parse", "HEAD"], revision_env)?;
+    let porcelain = run_capture(
+        ProvenanceProgram::Git,
+        &["status", "--porcelain"],
+        dirty_env,
+    )?;
     Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
 }
 
@@ -965,13 +1017,34 @@ fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
     }
 }
 
-fn run_capture(program: &str, args: &[&str], label: &str) -> Result<String, GauntletError> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| GauntletError::InvalidCampaign {
-            reason: format!("provenance collection failed to spawn {label}: {error}"),
-        })?;
+#[derive(Clone, Copy)]
+enum ProvenanceProgram {
+    Git,
+    Rustc,
+}
+
+impl ProvenanceProgram {
+    fn command(self) -> std::process::Command {
+        match self {
+            Self::Git => std::process::Command::new("git"),
+            Self::Rustc => std::process::Command::new("rustc"),
+        }
+    }
+}
+
+fn run_capture(
+    program: ProvenanceProgram,
+    args: &[&str],
+    label: &str,
+) -> Result<String, GauntletError> {
+    let output =
+        program
+            .command()
+            .args(args)
+            .output()
+            .map_err(|error| GauntletError::InvalidCampaign {
+                reason: format!("provenance collection failed to spawn {label}: {error}"),
+            })?;
     if !output.status.success() {
         return Err(GauntletError::InvalidCampaign {
             reason: format!("provenance collection command {label} failed: {output:?}"),
@@ -983,13 +1056,59 @@ fn run_capture(program: &str, args: &[&str], label: &str) -> Result<String, Gaun
 }
 
 fn collect_rustc_verbose() -> Result<String, GauntletError> {
-    run_capture("rustc", &["-Vv"], "rustc -Vv")
+    run_capture(ProvenanceProgram::Rustc, &["-Vv"], "rustc -Vv")
 }
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+}
+
+fn collect_dated_toolchain_channel() -> Result<String, GauntletError> {
+    let path = workspace_root().join("rust-toolchain.toml");
+    let contents =
+        std::fs::read_to_string(&path).map_err(|error| GauntletError::InvalidCampaign {
+            reason: format!("cannot read {}: {error}", path.display()),
+        })?;
+    let parsed: toml::Value =
+        toml::from_str(&contents).map_err(|error| GauntletError::InvalidCampaign {
+            reason: format!("cannot parse {}: {error}", path.display()),
+        })?;
+    let channel = parsed
+        .get("toolchain")
+        .and_then(|toolchain| toolchain.get("channel"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| campaign_error("rust-toolchain.toml does not declare a channel"))?;
+    let Some(date) = channel.strip_prefix("nightly-") else {
+        return Err(campaign_error(
+            "production campaigns require a committed dated nightly toolchain",
+        ));
+    };
+    if !is_review_date(date) {
+        return Err(campaign_error(
+            "production campaign nightly channel has a malformed date",
+        ));
+    }
+    let active = run_capture(
+        "rustup",
+        &["show", "active-toolchain"],
+        "rustup active toolchain",
+    )?;
+    let active_channel = active
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| campaign_error("rustup did not report an active toolchain"))?;
+    if active_channel != channel
+        && !active_channel
+            .strip_prefix(channel)
+            .is_some_and(|target| target.starts_with('-') && target.len() > 1)
+    {
+        return Err(campaign_error(format!(
+            "active Rust toolchain {active_channel:?} does not match committed channel {channel:?}"
+        )));
+    }
+    Ok(channel.to_owned())
 }
 
 fn hash_workspace_lockfile() -> Result<String, GauntletError> {
@@ -2880,6 +2999,228 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
     }
 }
 
+#[cfg(feature = "tantivy-oracle")]
+fn lower_quill_cass_filters(
+    filters: &crate::generator::GeneratedQueryFilters,
+) -> frankensearch_quill::CassQueryFilters {
+    let source_filter = match &filters.source_filter {
+        GeneratedSourceFilter::All => frankensearch_quill::CassSourceFilter::All,
+        GeneratedSourceFilter::Local => frankensearch_quill::CassSourceFilter::Local,
+        GeneratedSourceFilter::Remote => frankensearch_quill::CassSourceFilter::Remote,
+        GeneratedSourceFilter::SourceId { source_id } => {
+            frankensearch_quill::CassSourceFilter::SourceId(source_id.clone())
+        }
+    };
+    frankensearch_quill::CassQueryFilters {
+        agents: filters.agents.clone(),
+        workspaces: filters.workspaces.clone(),
+        created_from: filters.created_from_ms,
+        created_to: filters.created_to_ms,
+        source_filter,
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn lower_tantivy_cass_filters(
+    filters: &crate::generator::GeneratedQueryFilters,
+) -> frankensearch_lexical::CassQueryFilters {
+    let source_filter = match &filters.source_filter {
+        GeneratedSourceFilter::All => frankensearch_lexical::CassSourceFilter::All,
+        GeneratedSourceFilter::Local => frankensearch_lexical::CassSourceFilter::Local,
+        GeneratedSourceFilter::Remote => frankensearch_lexical::CassSourceFilter::Remote,
+        GeneratedSourceFilter::SourceId { source_id } => {
+            frankensearch_lexical::CassSourceFilter::SourceId(source_id.clone())
+        }
+    };
+    frankensearch_lexical::CassQueryFilters {
+        agents: filters.agents.clone(),
+        workspaces: filters.workspaces.clone(),
+        created_from: filters.created_from_ms,
+        created_to: filters.created_to_ms,
+        source_filter,
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+impl DifferentialCampaignEngine for crate::engine::CassQuillSubject {
+    fn descriptor(&self) -> EngineDescriptor {
+        crate::engine::CassQuillSubject::descriptor(self)
+    }
+
+    fn semantic_contract(&self) -> SemanticContract {
+        SemanticContract::cass()
+    }
+
+    fn begin_corpus<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _manifest: &'a CorpusManifest,
+        semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move {
+            if semantic_contract != &SemanticContract::cass() {
+                return Err(campaign_error(
+                    "Quill CASS subject requires the CASS semantic contract",
+                ));
+            }
+            self.claim_fresh_campaign()
+        })
+    }
+
+    fn index_batch<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        documents: &'a [GeneratedDocument],
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move { self.index_generated_batch(cx, documents) })
+    }
+
+    fn commit_corpus<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        manifest: &'a CorpusManifest,
+        semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, EngineIndexReceipt> {
+        Box::pin(async move {
+            if semantic_contract != &SemanticContract::cass() {
+                return Err(campaign_error(
+                    "Quill CASS commit received a different semantic contract",
+                ));
+            }
+            let actual_count =
+                u64::try_from(crate::engine::CassQuillSubject::commit_corpus(self, cx)?)
+                    .unwrap_or(u64::MAX);
+            if actual_count != manifest.document_count {
+                return Err(campaign_error(
+                    "Quill CASS committed document count differs from the corpus manifest",
+                ));
+            }
+            Ok(EngineIndexReceipt {
+                corpus_manifest_hash: manifest.manifest_hash()?,
+                document_count: actual_count,
+                total_content_bytes: manifest.total_content_bytes,
+                semantic_contract: semantic_contract.clone(),
+            })
+        })
+    }
+
+    fn observe_generated<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        query: &'a GeneratedQueryCase,
+        evidence_case: &'a DifferentialCase,
+    ) -> CampaignFuture<'a, EngineObservation> {
+        let query_span = tracing::info_span!(
+            target: "frankensearch.quill",
+            "frankensearch::quill::gauntlet::cass_query",
+            query_id = %query.id,
+            query_seed = evidence_case.metadata.generator_seed.unwrap_or_default(),
+            corpus_hash = %evidence_case.metadata.corpus_hash.as_deref().unwrap_or("missing"),
+        );
+        Box::pin(
+            async move {
+                if query.syntax != QuerySyntax::Cass {
+                    return Err(GauntletError::InvalidCase {
+                        reason: "the CASS Quill adapter rejects default query syntax".to_owned(),
+                    });
+                }
+                let filters = lower_quill_cass_filters(&query.filters);
+                self.observe_cass(cx, evidence_case, &filters)
+            }
+            .instrument(query_span),
+        )
+    }
+
+    fn abort_corpus(&mut self) {
+        crate::engine::CassQuillSubject::abort(self);
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+impl DifferentialCampaignEngine for crate::engine::CassTantivyOracle {
+    fn descriptor(&self) -> EngineDescriptor {
+        crate::engine::CassTantivyOracle::descriptor(self)
+    }
+
+    fn semantic_contract(&self) -> SemanticContract {
+        SemanticContract::cass()
+    }
+
+    fn begin_corpus<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _manifest: &'a CorpusManifest,
+        semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move {
+            if semantic_contract != &SemanticContract::cass() {
+                return Err(campaign_error(
+                    "Tantivy CASS oracle requires the CASS semantic contract",
+                ));
+            }
+            self.claim_fresh_campaign()
+        })
+    }
+
+    fn index_batch<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        documents: &'a [GeneratedDocument],
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move { self.index_generated_batch(cx, documents) })
+    }
+
+    fn commit_corpus<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        manifest: &'a CorpusManifest,
+        semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, EngineIndexReceipt> {
+        Box::pin(async move {
+            if semantic_contract != &SemanticContract::cass() {
+                return Err(campaign_error(
+                    "Tantivy CASS commit received a different semantic contract",
+                ));
+            }
+            let actual_count =
+                u64::try_from(crate::engine::CassTantivyOracle::commit_corpus(self, cx)?)
+                    .unwrap_or(u64::MAX);
+            if actual_count != manifest.document_count {
+                return Err(campaign_error(
+                    "Tantivy CASS committed document count differs from the corpus manifest",
+                ));
+            }
+            Ok(EngineIndexReceipt {
+                corpus_manifest_hash: manifest.manifest_hash()?,
+                document_count: actual_count,
+                total_content_bytes: manifest.total_content_bytes,
+                semantic_contract: semantic_contract.clone(),
+            })
+        })
+    }
+
+    fn observe_generated<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        query: &'a GeneratedQueryCase,
+        evidence_case: &'a DifferentialCase,
+    ) -> CampaignFuture<'a, EngineObservation> {
+        Box::pin(async move {
+            if query.syntax != QuerySyntax::Cass {
+                return Err(GauntletError::InvalidCase {
+                    reason: "the CASS Tantivy adapter rejects default query syntax".to_owned(),
+                });
+            }
+            let filters = lower_tantivy_cass_filters(&query.filters);
+            self.observe_cass(cx, evidence_case, &filters)
+        })
+    }
+
+    fn abort_corpus(&mut self) {
+        crate::engine::CassTantivyOracle::abort(self);
+    }
+}
+
 // ============================================================================
 // Divergence shrinker + explanation-driven auto-triage
 // (bd-quill-duel-shrinker-2j21)
@@ -4379,6 +4720,37 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    fn make_cass_activation_fixture() -> Fixture {
+        let corpus = SyntheticCorpus::new(SyntheticCorpusSpec {
+            seed: 0x6200,
+            document_count: 24,
+            vocabulary_size: 128,
+            zipf_exponent: ZipfExponent::S11,
+            max_document_bytes: 512,
+        })
+        .expect("CASS activation corpus");
+        let documents = corpus.iter().collect::<Vec<_>>();
+        let corpus_manifest = corpus.manifest().expect("CASS corpus manifest");
+        let corpus_hash = corpus_manifest.manifest_hash().expect("CASS corpus hash");
+        let query_suite = GeneratedQuerySuite::generate(
+            QueryGeneratorSpec {
+                seed: 0x6201,
+                default_limit: 20,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            &SharedFixtureSuite::load().expect("shared fixtures"),
+        )
+        .expect("CASS query suite");
+        Fixture {
+            documents,
+            corpus_manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn make_scalar_g1a_regression_fixture() -> Fixture {
         let shared = SharedFixtureSuite::load().expect("shared fixtures");
         let documents = shared
@@ -4425,6 +4797,7 @@ mod tests {
             .map(|case| case.id.as_str())
             .collect::<Vec<_>>();
         for required in [
+            "boolean-cass",
             "boolean-cass-and",
             "boolean-cass-or",
             "boolean-cass-not",
@@ -4448,6 +4821,14 @@ mod tests {
                 "the CASS campaign dropped required case {required}"
             );
         }
+        assert_eq!(
+            selected
+                .iter()
+                .find(|case| case.id == "boolean-cass")
+                .expect("CASS precedence case")
+                .query,
+            "auth OR token cache"
+        );
         let manifest_positions = selected_ids
             .iter()
             .map(|id| {
@@ -4807,13 +5188,15 @@ mod tests {
         engines
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
-        let mut provenance = CampaignProvenance {
+        let provenance = CampaignProvenance {
             subject_git_revision: subject_revision,
             subject_source_dirty: false,
             oracle_git_revision: oracle.source_revision,
             oracle_source_dirty: oracle.source_dirty,
             cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
             rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
+            rust_toolchain_channel: collect_dated_toolchain_channel()
+                .expect("dated nightly provenance"),
             unicode_version: format!(
                 "{}.{}.{}",
                 char::UNICODE_VERSION.0,
@@ -4837,6 +5220,17 @@ mod tests {
                 &semantic_contract,
             )
             .expect("query profile hash"),
+            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
+            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
+            corpus_manifest_hash: fixture
+                .corpus_manifest
+                .manifest_hash()
+                .expect("corpus manifest hash"),
+            query_manifest_hash: fixture
+                .query_suite
+                .manifest
+                .manifest_hash()
+                .expect("query manifest hash"),
             corpus_seed: Some(0x6200),
         };
         provenance
@@ -4849,33 +5243,120 @@ mod tests {
             )
             .expect("all exact provenance pins validate");
 
-        provenance.query_seed ^= 1;
-        assert!(
-            provenance
-                .validate_for_campaign(
-                    &engines,
-                    &semantic_contract,
-                    &config,
-                    &fixture.corpus_manifest,
-                    &fixture.query_suite.manifest,
-                )
-                .is_err(),
-            "a query-generator seed mismatch must fail closed"
-        );
-        provenance.query_seed ^= 1;
-        provenance.unicode_normalization_table_version = "0.0.0".to_owned();
-        assert!(
-            provenance
-                .validate_for_campaign(
-                    &engines,
-                    &semantic_contract,
-                    &config,
-                    &fixture.corpus_manifest,
-                    &fixture.query_suite.manifest,
-                )
-                .is_err(),
-            "a Unicode table mismatch must fail closed"
-        );
+        let serialized = serde_json::to_value(&provenance).expect("serialize provenance");
+        for field in [
+            "subject_git_revision",
+            "subject_source_dirty",
+            "oracle_git_revision",
+            "oracle_source_dirty",
+            "cargo_lock_sha256",
+            "rustc_version_verbose",
+            "rust_toolchain_channel",
+            "unicode_version",
+            "unicode_normalization_version",
+            "unicode_normalization_table_version",
+            "query_generator_id",
+            "query_generator_schema_version",
+            "query_seed",
+            "query_source_identity_sha256",
+            "query_profile_sha256",
+            "analyzer_contract_hash",
+            "schema_contract_hash",
+            "corpus_manifest_hash",
+            "query_manifest_hash",
+            "corpus_seed",
+        ] {
+            let mut missing = serialized.clone();
+            missing
+                .as_object_mut()
+                .expect("provenance object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<CampaignProvenance>(missing).is_err(),
+                "missing provenance field {field} must fail closed"
+            );
+        }
+
+        type CorruptProvenance = fn(&mut CampaignProvenance);
+        let corruptions: [(&str, CorruptProvenance); 20] = [
+            ("subject_git_revision", |value| {
+                value.subject_git_revision = "2".repeat(40);
+            }),
+            ("subject_source_dirty", |value| {
+                value.subject_source_dirty = !value.subject_source_dirty;
+            }),
+            ("oracle_git_revision", |value| {
+                value.oracle_git_revision = "3".repeat(40);
+            }),
+            ("oracle_source_dirty", |value| {
+                value.oracle_source_dirty = !value.oracle_source_dirty;
+            }),
+            ("cargo_lock_sha256", |value| {
+                value.cargo_lock_sha256 = "0".repeat(64);
+            }),
+            ("rustc_version_verbose", |value| {
+                value.rustc_version_verbose.push_str("mismatch");
+            }),
+            ("rust_toolchain_channel", |value| {
+                value.rust_toolchain_channel = "nightly-1970-01-01".to_owned();
+            }),
+            ("unicode_version", |value| {
+                value.unicode_version = "0.0.0".to_owned();
+            }),
+            ("unicode_normalization_version", |value| {
+                value.unicode_normalization_version = "0.0.0".to_owned();
+            }),
+            ("unicode_normalization_table_version", |value| {
+                value.unicode_normalization_table_version = "0.0.0".to_owned();
+            }),
+            ("query_generator_id", |value| {
+                value.query_generator_id = "wrong-generator".to_owned();
+            }),
+            ("query_generator_schema_version", |value| {
+                value.query_generator_schema_version =
+                    value.query_generator_schema_version.saturating_add(1);
+            }),
+            ("query_seed", |value| {
+                value.query_seed ^= 1;
+            }),
+            ("query_source_identity_sha256", |value| {
+                value.query_source_identity_sha256 = "0".repeat(64);
+            }),
+            ("query_profile_sha256", |value| {
+                value.query_profile_sha256 = "0".repeat(64);
+            }),
+            ("analyzer_contract_hash", |value| {
+                value.analyzer_contract_hash = "0".repeat(64);
+            }),
+            ("schema_contract_hash", |value| {
+                value.schema_contract_hash = "0".repeat(64);
+            }),
+            ("corpus_manifest_hash", |value| {
+                value.corpus_manifest_hash = "0".repeat(64);
+            }),
+            ("query_manifest_hash", |value| {
+                value.query_manifest_hash = "0".repeat(64);
+            }),
+            ("corpus_seed", |value| {
+                value.corpus_seed = None;
+            }),
+        ];
+        for (field, corrupt) in corruptions {
+            let mut mismatched = provenance.clone();
+            corrupt(&mut mismatched);
+            assert!(
+                mismatched
+                    .validate_for_campaign(
+                        &engines,
+                        &semantic_contract,
+                        &config,
+                        &fixture.corpus_manifest,
+                        &fixture.query_suite.manifest,
+                    )
+                    .is_err(),
+                "mismatched provenance field {field} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -6997,16 +7478,55 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    fn live_cass_campaign_engines(
+        provenance: &CampaignProvenance,
+    ) -> (
+        crate::engine::CassQuillSubject,
+        crate::engine::CassTantivyOracle,
+    ) {
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            glob_expansion_limit: 4_096,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let subject = crate::engine::CassQuillSubject::in_memory(
+            config,
+            &provenance.subject_git_revision,
+            provenance.subject_source_dirty,
+        )
+        .expect("fresh CASS Quill subject");
+        let oracle = crate::engine::CassTantivyOracle::in_memory(
+            &lexical_revision,
+            provenance.oracle_source_dirty,
+        )
+        .expect("fresh CASS Tantivy oracle");
+        (subject, oracle)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     async fn run_live_default_profile_campaign(
         cx: &Cx,
         root: &std::path::Path,
         run_id: &str,
     ) -> Result<CampaignReport, GauntletError> {
         let fixture = make_scalar_g1a_regression_fixture();
+        run_live_default_profile_fixture(cx, root, run_id, &fixture).await
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_live_default_profile_fixture(
+        cx: &Cx,
+        root: &std::path::Path,
+        run_id: &str,
+        fixture: &Fixture,
+    ) -> Result<CampaignReport, GauntletError> {
         let selection = CampaignSelection::DefaultSyntax;
         let semantic_contract = SemanticContract::scalar_g1a();
         let provenance = CampaignProvenance::collect(
-            None,
+            &fixture.corpus_manifest,
             &fixture.query_suite.manifest,
             &selection,
             &semantic_contract,
@@ -7041,14 +7561,117 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    async fn run_live_cass_profile_fixture(
+        cx: &Cx,
+        root: &std::path::Path,
+        run_id: &str,
+        fixture: &Fixture,
+    ) -> Result<CampaignReport, GauntletError> {
+        let selection = CampaignSelection::CassSyntax;
+        let semantic_contract = SemanticContract::cass();
+        let provenance = CampaignProvenance::collect(
+            &fixture.corpus_manifest,
+            &fixture.query_suite.manifest,
+            &selection,
+            &semantic_contract,
+        )
+        .expect("collect CASS provenance");
+        let (mut subject, mut oracle) = live_cass_campaign_engines(&provenance);
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(root),
+            semantic_contract,
+            CampaignConfig {
+                selection,
+                require_provenance: true,
+                index_batch_size: 5,
+                snippet_max_chars: None,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("live CASS campaign runner")
+        .with_provenance(provenance);
+        campaign
+            .run(
+                cx,
+                run_id,
+                &mut subject,
+                &mut oracle,
+                &fixture.documents,
+                &fixture.corpus_manifest,
+                &fixture.query_suite,
+            )
+            .await
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn load_campaign_case_object(
+        root: &std::path::Path,
+        result: &CampaignCaseResult,
+    ) -> ArtifactObject {
+        let object_hash = result
+            .artifact_hash
+            .as_deref()
+            .expect("successful campaign case has an immutable object");
+        serde_json::from_slice(
+            &std::fs::read(root.join("objects").join(format!("{object_hash}.json")))
+                .expect("read immutable campaign object"),
+        )
+        .expect("decode immutable campaign object")
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn live_pr_artifact_root(fallback: &std::path::Path, profile: &str) -> std::path::PathBuf {
+        let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| fallback.to_path_buf())
+            .join(profile);
+        std::fs::create_dir_all(&root).expect("create PR campaign artifact root");
+        root
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_cass_campaign_is_nonvacuous(root: &std::path::Path, report: &CampaignReport) {
+        let selected = report.selected_queries().expect("selected CASS cases");
+        assert_eq!(selected.len(), report.cases.len());
+        for (query, result) in selected.into_iter().zip(&report.cases) {
+            let object = load_campaign_case_object(root, result);
+            assert!(
+                object.comparison.subject.snippets.is_empty()
+                    && object.comparison.oracle.snippets.is_empty(),
+                "{}: CASS activation must remain snippet-free",
+                query.id
+            );
+            if matches!(
+                &query.query_kind,
+                GeneratedQueryKind::Boolean
+                    | GeneratedQueryKind::Glob { .. }
+                    | GeneratedQueryKind::Range { .. }
+                    | GeneratedQueryKind::StructuredFilter { .. }
+            ) {
+                for (engine, count) in [
+                    ("subject", &object.comparison.subject.match_count),
+                    ("oracle", &object.comparison.oracle.match_count),
+                ] {
+                    assert!(
+                        matches!(count, crate::comparator::CountState::Value(value) if *value > 0),
+                        "{}: {engine} coverage probe must match at least one document, got {count:?}",
+                        query.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let root = live_pr_artifact_root(temp.path(), "default");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let report =
-                run_live_default_profile_campaign(&cx, temp.path(), "e6.9-default-pr-lane")
-                    .await
-                    .expect("live default-profile campaign must complete and pass");
+            let report = run_live_default_profile_campaign(&cx, &root, "e6.9-default-pr-lane")
+                .await
+                .expect("live default-profile campaign must complete and pass");
             assert!(
                 report.passed,
                 "default profile is green: {:?}",
@@ -7061,6 +7684,7 @@ mod tests {
             assert!(!provenance.subject_git_revision.is_empty());
             assert!(!provenance.cargo_lock_sha256.is_empty());
             assert!(provenance.rustc_version_verbose.contains("release:"));
+            assert!(provenance.rust_toolchain_channel.starts_with("nightly-"));
             assert_eq!(
                 provenance.unicode_version,
                 format!(
@@ -7083,14 +7707,56 @@ mod tests {
             assert_eq!(provenance.query_seed, 0x6201);
             assert!(is_lower_sha256(&provenance.query_source_identity_sha256));
             assert!(!provenance.query_profile_sha256.is_empty());
+            assert_eq!(
+                provenance.analyzer_contract_hash,
+                report.semantic_contract.analyzer_contract_hash
+            );
+            assert_eq!(
+                provenance.schema_contract_hash,
+                report.semantic_contract.schema_contract_hash
+            );
+            assert_eq!(provenance.corpus_manifest_hash, report.corpus_manifest_hash);
+            assert_eq!(provenance.query_manifest_hash, report.query_manifest_hash);
             assert_eq!(provenance.corpus_seed, None);
 
             // CI-grade acceptance: ONLY a verified reload counts as evidence.
-            let reloaded = ArtifactStore::new(temp.path())
+            let reloaded = ArtifactStore::new(&root)
                 .load_verified_campaign("e6.9-default-pr-lane")
                 .expect("verified reload accepts the completed campaign");
             assert_eq!(reloaded, report);
             assert_eq!(reloaded.provenance, report.provenance);
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn live_cass_profile_campaign_covers_contract_and_reloads_verified() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = live_pr_artifact_root(temp.path(), "cass");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_cass_activation_fixture();
+            let report = run_live_cass_profile_fixture(&cx, &root, "e6.9-cass-pr-lane", &fixture)
+                .await
+                .expect("live CASS campaign must complete");
+            assert!(
+                report.passed,
+                "CASS profile is green: {:?}",
+                report.mismatches
+            );
+            assert_eq!(report.semantic_contract, SemanticContract::cass());
+            assert_eq!(
+                report.engines.subject.implementation,
+                "frankensearch-quill/cass-index"
+            );
+            assert_eq!(
+                report.engines.oracle.config_hash,
+                crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH
+            );
+            assert_cass_campaign_is_nonvacuous(&root, &report);
+            let reloaded = ArtifactStore::new(&root)
+                .load_verified_campaign("e6.9-cass-pr-lane")
+                .expect("verified reload accepts the CASS campaign");
+            assert_eq!(reloaded, report);
         });
     }
 
@@ -7126,103 +7792,257 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
-    fn documents_content_hash(documents: &[GeneratedDocument]) -> String {
-        let mut hasher = Sha256::new();
-        for document in documents {
-            let bytes = serde_json::to_vec(document).expect("document json");
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(&bytes);
-        }
-        let digest = hasher.finalize();
-        let mut output = String::with_capacity(64);
-        for byte in digest {
-            use std::fmt::Write as _;
-            let _ = write!(output, "{byte:02x}");
-        }
-        output
-    }
+    const NIGHTLY_REPOSITORY_PATHS: &[&str] = &[
+        "README.md",
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        ".github/workflows/ci.yml",
+        "tests/fixtures/corpus.json",
+        "tests/fixtures/edge_cases.json",
+        "tests/fixtures/queries.json",
+        "tests/fixtures/quill_language_contract.json",
+        "crates/frankensearch-lexical/Cargo.toml",
+        "crates/frankensearch-lexical/src/cass_compat.rs",
+        "crates/frankensearch-lexical/src/lib.rs",
+        "crates/frankensearch-lexical/src/quill_contract.rs",
+        "crates/frankensearch-quill/Cargo.toml",
+        "crates/frankensearch-quill/src/argus.rs",
+        "crates/frankensearch-quill/src/config.rs",
+        "crates/frankensearch-quill/src/contract.rs",
+        "crates/frankensearch-quill/src/delta.rs",
+        "crates/frankensearch-quill/src/error.rs",
+        "crates/frankensearch-quill/src/grimoire.rs",
+        "crates/frankensearch-quill/src/index.rs",
+        "crates/frankensearch-quill/src/keeper.rs",
+        "crates/frankensearch-quill/src/lib.rs",
+        "crates/frankensearch-quill/src/query.rs",
+        "crates/frankensearch-quill/src/quiver.rs",
+        "crates/frankensearch-quill/src/schema.rs",
+        "crates/frankensearch-quill/src/scribe.rs",
+        "crates/frankensearch-quill/src/segment.rs",
+        "crates/frankensearch-quill/src/snippet.rs",
+        "crates/frankensearch-quill/src/stats.rs",
+        "crates/frankensearch-quill/src/tracing_conventions.rs",
+        "crates/frankensearch-quill-gauntlet/Cargo.toml",
+        "crates/frankensearch-quill-gauntlet/fixtures/generator-v2.json",
+        "crates/frankensearch-quill-gauntlet/src/artifact.rs",
+        "crates/frankensearch-quill-gauntlet/src/comparator.rs",
+        "crates/frankensearch-quill-gauntlet/src/engine.rs",
+        "crates/frankensearch-quill-gauntlet/src/generator.rs",
+        "crates/frankensearch-quill-gauntlet/src/lib.rs",
+        "crates/frankensearch-quill-gauntlet/src/runner.rs",
+        "crates/frankensearch-quill-gauntlet/src/version_contract.rs",
+    ];
 
     #[cfg(feature = "tantivy-oracle")]
-    #[test]
-    #[ignore = "nightly full lane: pinned generated + repository-scale corpora"]
-    fn live_default_profile_campaign_nightly_full_lane() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        // Generated lane: pinned synthetic corpus, deterministic replay.
-        let spec = SyntheticCorpusSpec {
-            seed: 0xE609,
-            document_count: 2_000,
-            vocabulary_size: 2_048,
-            zipf_exponent: ZipfExponent::S11,
-            max_document_bytes: 2_048,
-        };
-        let documents: Vec<_> = SyntheticCorpus::new(spec.clone())
-            .expect("synthetic spec")
-            .iter()
-            .collect();
-        let corpus_manifest = CorpusManifest {
-            schema_version: 1,
-            generator_id: GENERATOR_ID.to_owned(),
-            source: crate::generator::CorpusSourceManifest::Synthetic { spec: spec.clone() },
-            document_count: u64::try_from(documents.len()).expect("doc count"),
-            total_content_bytes: documents
-                .iter()
-                .map(|document| u64::try_from(document.content.len()).unwrap_or(u64::MAX))
-                .sum(),
-            content_sha256: documents_content_hash(&documents),
-            skipped_repository_entries: Vec::new(),
-        };
+    fn nightly_query_suite(corpus_manifest: &CorpusManifest, seed: u64) -> GeneratedQuerySuite {
         let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
-        let query_suite = GeneratedQuerySuite::generate(
+        GeneratedQuerySuite::generate(
             QueryGeneratorSpec {
-                seed: 0x9602,
+                seed,
                 default_limit: 20,
                 include_shared_relevance_queries: true,
             },
             &corpus_hash,
             &SharedFixtureSuite::load().expect("shared fixtures"),
         )
-        .expect("query suite");
-        let selection = CampaignSelection::DefaultSyntax;
-        let semantic_contract = SemanticContract::scalar_g1a();
-        let provenance = CampaignProvenance::collect(
-            Some(spec.seed),
-            &query_suite.manifest,
-            &selection,
-            &semantic_contract,
+        .expect("nightly query suite")
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn nightly_generated_fixture() -> Fixture {
+        let corpus = SyntheticCorpus::new(SyntheticCorpusSpec {
+            seed: 0xE609,
+            document_count: 2_000,
+            vocabulary_size: 2_048,
+            zipf_exponent: ZipfExponent::S11,
+            max_document_bytes: 2_048,
+        })
+        .expect("synthetic spec");
+        let documents = corpus.iter().collect::<Vec<_>>();
+        let corpus_manifest = corpus.manifest().expect("synthetic corpus manifest");
+        let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
+        let query_suite = nightly_query_suite(&corpus_manifest, 0x9602);
+        Fixture {
+            documents,
+            corpus_manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn nightly_repository_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_tracked_paths(
+            &workspace_root(),
+            "frankensearch-e6-nightly",
+            NIGHTLY_REPOSITORY_PATHS
+                .iter()
+                .copied()
+                .map(std::path::PathBuf::from),
         )
-        .expect("collect provenance");
-        let (mut subject, mut oracle) = live_campaign_engines(&provenance);
-        let campaign = DifferentialCampaignRunner::new(
-            ArtifactStore::new(temp.path()),
-            semantic_contract,
-            CampaignConfig {
-                selection,
-                require_provenance: true,
-                index_batch_size: 64,
-                snippet_max_chars: None,
-                ..CampaignConfig::default()
-            },
-            DivergenceRegistry::default(),
-        )
-        .expect("nightly campaign runner")
-        .with_provenance(provenance);
+        .expect("content-addressed repository snapshot");
+        assert!(
+            snapshot.manifest.skipped_repository_entries.is_empty(),
+            "pinned nightly repository paths must all be readable UTF-8 files: {:?}",
+            snapshot.manifest.skipped_repository_entries
+        );
+        assert_eq!(
+            snapshot.documents.len(),
+            NIGHTLY_REPOSITORY_PATHS.len(),
+            "nightly repository snapshot must include every pinned path"
+        );
+        let corpus_hash = snapshot.manifest.manifest_hash().expect("corpus hash");
+        let query_suite = nightly_query_suite(&snapshot.manifest, 0x9603);
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn required_nightly_artifact_root() -> std::path::PathBuf {
+        let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("nightly lane requires GAUNTLET_ARTIFACT_ROOT");
+        assert!(
+            root.is_relative()
+                && root.starts_with("target/coverage")
+                && !root
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir),
+            "nightly artifacts must use a relative target/coverage path so RCH returns them"
+        );
+        std::fs::create_dir_all(&root).expect("create nightly campaign artifact root");
+        root
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_and_reload_default_nightly_campaign(
+        cx: &Cx,
+        root: &std::path::Path,
+        run_id: &str,
+        fixture: &Fixture,
+    ) -> CampaignReport {
+        std::fs::create_dir_all(root).expect("create default nightly campaign root");
+        let report = run_live_default_profile_fixture(cx, root, run_id, fixture)
+            .await
+            .expect("nightly full lane completes");
+        assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
+        let reloaded = ArtifactStore::new(root)
+            .load_verified_campaign(run_id)
+            .expect("verified reload accepts the nightly campaign");
+        assert_eq!(reloaded, report);
+        reloaded
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_and_reload_cass_nightly_campaign(
+        cx: &Cx,
+        root: &std::path::Path,
+        run_id: &str,
+        fixture: &Fixture,
+    ) -> CampaignReport {
+        std::fs::create_dir_all(root).expect("create CASS nightly campaign root");
+        let report = run_live_cass_profile_fixture(cx, root, run_id, fixture)
+            .await
+            .expect("CASS nightly full lane completes");
+        assert!(
+            report.passed,
+            "CASS nightly lane green: {:?}",
+            report.mismatches
+        );
+        let reloaded = ArtifactStore::new(root)
+            .load_verified_campaign(run_id)
+            .expect("verified reload accepts the CASS nightly campaign");
+        assert_eq!(reloaded, report);
+        reloaded
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_same_seed_campaign_replay(first: &CampaignReport, replay: &CampaignReport) {
+        assert_eq!(
+            first.corpus_manifest_hash, replay.corpus_manifest_hash,
+            "same-seed corpus manifest"
+        );
+        assert_eq!(
+            first.query_manifest_hash, replay.query_manifest_hash,
+            "same-seed query manifest"
+        );
+        assert_eq!(
+            first
+                .mismatches
+                .iter()
+                .map(|mismatch| mismatch.signature.as_str())
+                .collect::<Vec<_>>(),
+            replay
+                .mismatches
+                .iter()
+                .map(|mismatch| mismatch.signature.as_str())
+                .collect::<Vec<_>>(),
+            "same-seed mismatch signatures"
+        );
+        assert_eq!(
+            first.report_hash().expect("first report hash"),
+            replay.report_hash().expect("replay report hash"),
+            "same-seed report hash"
+        );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    #[ignore = "nightly full lane: both profiles over pinned generated + repository corpora"]
+    fn live_both_profiles_campaign_nightly_full_lane() {
+        let artifact_root = required_nightly_artifact_root();
+        let generated = nightly_generated_fixture();
+        let repository = nightly_repository_fixture();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let report = campaign
-                .run(
-                    &cx,
-                    "e6.9-default-nightly-full",
-                    &mut subject,
-                    &mut oracle,
-                    &documents,
-                    &corpus_manifest,
-                    &query_suite,
-                )
-                .await
-                .expect("nightly full lane completes");
-            assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
-            ArtifactStore::new(temp.path())
-                .load_verified_campaign("e6.9-default-nightly-full")
-                .expect("verified reload accepts the nightly campaign");
+            for (label, fixture) in [("generated", &generated), ("repository", &repository)] {
+                for profile in ["default", "cass"] {
+                    let run_id = format!("e6.9-{profile}-nightly-{label}");
+                    let first_root = artifact_root.join(profile).join("first");
+                    let replay_root = artifact_root.join(profile).join("replay");
+                    let (first, replay) = if profile == "default" {
+                        (
+                            run_and_reload_default_nightly_campaign(
+                                &cx,
+                                &first_root,
+                                &run_id,
+                                fixture,
+                            )
+                            .await,
+                            run_and_reload_default_nightly_campaign(
+                                &cx,
+                                &replay_root,
+                                &run_id,
+                                fixture,
+                            )
+                            .await,
+                        )
+                    } else {
+                        (
+                            run_and_reload_cass_nightly_campaign(
+                                &cx,
+                                &first_root,
+                                &run_id,
+                                fixture,
+                            )
+                            .await,
+                            run_and_reload_cass_nightly_campaign(
+                                &cx,
+                                &replay_root,
+                                &run_id,
+                                fixture,
+                            )
+                            .await,
+                        )
+                    };
+                    assert_same_seed_campaign_replay(&first, &replay);
+                }
+            }
         });
     }
 }

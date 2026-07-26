@@ -31,13 +31,13 @@ pub use comparator::{
     CountState, Divergence, DivergenceClass, EngineObservation, NativeTieKey, RankClass, RankedHit,
     SCORE_EPSILON, ScoreEpsilonReason, compare_observations,
 };
-#[cfg(feature = "tantivy-oracle")]
-pub use engine::TantivyOracle;
 pub use engine::{
-    ComparisonMode, DifferentialCase, DifferentialCaseMetadata, DifferentialHarness,
-    EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine, GauntletFuture, HarnessRun,
-    MAX_SNIPPET_CHARS, QuillSubject,
+    CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
+    DifferentialHarness, EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine,
+    GauntletFuture, HarnessRun, MAX_SNIPPET_CHARS, QuillSubject,
 };
+#[cfg(feature = "tantivy-oracle")]
+pub use engine::{CassQuillSubject, CassTantivyOracle, TantivyOracle};
 pub use generator::{
     CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
     FULL_SHARED_DOCUMENT_COUNT, GENERATOR_ID, GENERATOR_SCHEMA_VERSION, GeneratedDocument,
@@ -49,7 +49,7 @@ pub use generator::{
     RepositoryFileDigest, RepositorySkipReason, RepositorySnapshot, SharedCorpusView,
     SharedEdgeCase, SharedFixtureSuite, SharedRelevanceQuery, SkippedRepositoryEntry,
     SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
-    SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent, cass_document_identity,
+    SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use perf::{
     DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,

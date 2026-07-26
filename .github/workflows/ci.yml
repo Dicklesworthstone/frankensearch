@@ -34,8 +34,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -134,19 +135,19 @@ jobs:
         env:
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: ${{ github.sha }}
+          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
           GAUNTLET_ORACLE_DIRTY: "false"
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
 
-      - name: Quill oracle campaign nightly full lane (bd-quill-e6.9)
-        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
-        timeout-minutes: 45
-        env:
-          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
-          GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: ${{ github.sha }}
-          GAUNTLET_ORACLE_DIRTY: "false"
-        run: cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_default_profile_campaign_nightly_full_lane -- --ignored --exact --nocapture
+      - name: Upload Quill oracle PR campaign artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quill-gauntlet-pr-${{ github.run_id }}
+          path: target/coverage/quill-gauntlet-pr/**
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Nightly Quill E5.5 seeded mixed-state conformance
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
@@ -468,6 +469,53 @@ jobs:
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  quill-oracle-nightly-rch:
+    name: Quill oracle nightly (strict RCH)
+    if: github.event_name == 'schedule'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+    timeout-minutes: 90
+    env:
+      RCH_WORKER: ${{ vars.RCH_QUILL_ORACLE_WORKER || 'hz1' }}
+      RCH_REMOTE_DEPS_DIR: ${{ vars.RCH_REMOTE_DEPS_DIR || '/data/tmp/rch/frankensearch' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Bootstrap the pinned RCH worker dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rch
+          scripts/rch-ensure-deps.sh --worker "${RCH_WORKER}"
+
+      - name: Run both Quill oracle profiles and replay corpora remotely
+        timeout-minutes: 75
+        env:
+          RCH_TEST_TIMEOUT_SEC: "4200"
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
+          GAUNTLET_ORACLE_DIRTY: "false"
+          GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-nightly
+        run: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_both_profiles_campaign_nightly_full_lane -- --ignored --exact --nocapture
+
+      - name: Upload complete verified Quill oracle campaigns
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quill-gauntlet-nightly-${{ github.run_id }}
+          path: target/coverage/quill-gauntlet-nightly/**
+          if-no-files-found: error
+          retention-days: 30
+
   feature-matrix:
     name: Feature smoke (${{ matrix.lane }})
     runs-on: ubuntu-latest
@@ -491,7 +539,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
 
       - name: Prepare path dependencies
         shell: bash
@@ -550,7 +600,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
 
       - name: Prepare path dependencies
         shell: bash
@@ -742,8 +794,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -912,8 +965,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
       - name: Prepare path dependencies
@@ -1055,8 +1109,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
       - name: Prepare path dependencies

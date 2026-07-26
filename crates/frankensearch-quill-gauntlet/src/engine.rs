@@ -4,6 +4,17 @@ use std::future::Future;
 use std::pin::Pin;
 
 use asupersync::Cx;
+#[cfg(feature = "tantivy-oracle")]
+use frankensearch_quill::scribe::{
+    CassAnalyzer, ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushMode,
+    FlushSegmentInput, IndexedFieldValue, IndexedNumericValue, StoredFieldValue,
+    flush_accumulator_with_mode,
+};
+#[cfg(feature = "tantivy-oracle")]
+use frankensearch_quill::{
+    CASS_SEMANTIC_SCHEMA, CURRENT_ENGINE_VERSION, EncodedSegment, KeeperSnapshot,
+    ManifestFieldStats, ManifestSegment, TombstoneSet,
+};
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchResult};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
@@ -13,6 +24,8 @@ use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey, RankedHit,
     compare_observations,
 };
+#[cfg(feature = "tantivy-oracle")]
+use crate::generator::GeneratedDocument;
 use crate::generator::MAX_DOCUMENT_ID_BYTES;
 #[cfg(feature = "tantivy-oracle")]
 use crate::runner::SemanticContract;
@@ -30,6 +43,7 @@ const MAX_OBSERVATION_AGGREGATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum snippet budget accepted at every harness and campaign boundary.
 pub const MAX_SNIPPET_CHARS: u64 = 1_000_000;
 pub const TANTIVY_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
+pub const CASS_TANTIVY_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,10 +181,17 @@ impl EnginePairIdentity {
         }
         if self.comparison_mode == ComparisonMode::CrossEngine {
             let oracle_version = oracle_version_contract()?;
+            let expected_config_hash = if self.semantic_contract.as_ref()
+                == Some(&crate::runner::SemanticContract::cass())
+            {
+                CASS_TANTIVY_ORACLE_CONFIG_HASH
+            } else {
+                TANTIVY_ORACLE_CONFIG_HASH
+            };
             if self.oracle.implementation != "frankensearch-lexical/tantivy-index"
                 || self.oracle.crate_version != oracle_version.lexical_package_version
                 || self.oracle.source_revision != oracle_version.lexical_git_revision
-                || self.oracle.config_hash != TANTIVY_ORACLE_CONFIG_HASH
+                || self.oracle.config_hash != expected_config_hash
                 || self.oracle.source_dirty
             {
                 return Err(GauntletError::InvalidContract {
@@ -939,6 +960,426 @@ fn quill_config_hash(config: &QuillConfig) -> String {
     format!("{:016x}", xxh3_64(canonical.as_bytes()))
 }
 
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug)]
+struct CassFlushIdentity {
+    doc_ord: u32,
+    document_id: String,
+    content_hash: u64,
+}
+
+/// Fresh one-shot Quill subject bound to the durable CASS semantic schema.
+#[cfg(feature = "tantivy-oracle")]
+pub struct CassQuillSubject {
+    config: QuillConfig,
+    descriptor: EngineDescriptor,
+    parser: frankensearch_quill::CassQueryParser,
+    index: Option<frankensearch_quill::index::PreparsedQuillIndex>,
+    accumulator: Option<ColumnarAccumulator<CassAnalyzer>>,
+    flush_identities: Vec<CassFlushIdentity>,
+    encoded_segments: Vec<EncodedSegment>,
+    manifest_segments: Vec<ManifestSegment>,
+    field_stats: BTreeMap<u16, (u64, u32)>,
+    current_lease_base: u64,
+    document_count: u64,
+    state: QuillCampaignState,
+}
+
+#[cfg(feature = "tantivy-oracle")]
+impl CassQuillSubject {
+    /// Construct a fresh CASS subject without publishing any index state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed schema, analyzer, parser, configuration, or descriptor
+    /// failure before a campaign can claim the adapter.
+    pub fn in_memory(
+        config: QuillConfig,
+        source_revision: impl Into<String>,
+        source_dirty: bool,
+    ) -> Result<Self, GauntletError> {
+        let parser =
+            frankensearch_quill::CassQueryParser::new(CASS_SEMANTIC_SCHEMA).map_err(|error| {
+                GauntletError::InvalidContract {
+                    reason: format!("cannot bind the Quill CASS parser: {error}"),
+                }
+            })?;
+        let descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/cass-index".to_owned(),
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_revision: source_revision.into(),
+            source_dirty,
+            config_hash: format!("cass-semantic-v1:{}", quill_config_hash(&config)),
+        };
+        descriptor.validate()?;
+        let accumulator =
+            ColumnarAccumulator::with_analyzer(CASS_SEMANTIC_SCHEMA, CassAnalyzer::default())
+                .map_err(frankensearch_quill::QuillIndexError::from)?;
+        Ok(Self {
+            config,
+            descriptor,
+            parser,
+            index: None,
+            accumulator: Some(accumulator),
+            flush_identities: Vec::new(),
+            encoded_segments: Vec::new(),
+            manifest_segments: Vec::new(),
+            field_stats: BTreeMap::new(),
+            current_lease_base: 0,
+            document_count: 0,
+            state: QuillCampaignState::Fresh,
+        })
+    }
+
+    pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Fresh
+            || self.index.is_some()
+            || self.document_count != 0
+            || !self.encoded_segments.is_empty()
+        {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill CASS subject may execute only one fresh campaign".to_owned(),
+            });
+        }
+        self.state = QuillCampaignState::Ingesting;
+        Ok(())
+    }
+
+    fn require_ingesting(&self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Ingesting {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill CASS indexing and commit require an active ingest session"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_committed(&self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Committed {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill CASS observation requires a committed one-shot snapshot".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn index(&self) -> Result<&frankensearch_quill::index::PreparsedQuillIndex, GauntletError> {
+        self.index
+            .as_ref()
+            .ok_or_else(|| GauntletError::SubjectUnavailable {
+                reason: "Quill CASS campaign subject has no committed snapshot".to_owned(),
+            })
+    }
+
+    fn finish_segment(&mut self) -> Result<(), GauntletError> {
+        let accumulator =
+            self.accumulator
+                .take()
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: "Quill CASS accumulator is unavailable".to_owned(),
+                })?;
+        if accumulator.document_count() == 0 {
+            self.accumulator = Some(accumulator);
+            return Ok(());
+        }
+        let documents = self
+            .flush_identities
+            .iter()
+            .map(|identity| {
+                FlushDocumentInput::new(
+                    identity.doc_ord,
+                    &identity.document_id,
+                    identity.content_hash,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seal_seq = u64::try_from(self.manifest_segments.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: "Quill CASS seal sequence exhausted".to_owned(),
+            })?;
+        let segment_id = 0xca55_0000_0000_0000_u64
+            .checked_add(seal_seq)
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: "Quill CASS segment identity exhausted".to_owned(),
+            })?;
+        let encoded = flush_accumulator_with_mode(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id,
+                lease_docid_base: self.current_lease_base,
+                created_unix_s: 0,
+                engine_version: CURRENT_ENGINE_VERSION,
+                documents: &documents,
+            },
+            FlushMode::Scalar,
+        )
+        .map_err(frankensearch_quill::QuillIndexError::from)?;
+        let segment_document_count = u32::try_from(accumulator.document_count()).map_err(|_| {
+            GauntletError::InvalidCampaign {
+                reason: "Quill CASS segment document count does not fit u32".to_owned(),
+            }
+        })?;
+        for field in accumulator.fields() {
+            let entry = self.field_stats.entry(field.field_ord()).or_insert((0, 0));
+            entry.0 = entry.0.checked_add(field.total_tokens()).ok_or_else(|| {
+                GauntletError::InvalidCampaign {
+                    reason: "Quill CASS field token count overflow".to_owned(),
+                }
+            })?;
+            entry.1 = entry.1.checked_add(segment_document_count).ok_or_else(|| {
+                GauntletError::InvalidCampaign {
+                    reason: "Quill CASS field document count overflow".to_owned(),
+                }
+            })?;
+        }
+        let header = encoded.header();
+        self.manifest_segments.push(ManifestSegment {
+            segment_id: header.segment_id,
+            seal_seq,
+            file_len: encoded.file_len(),
+            file_xxh3: encoded.file_xxh3(),
+            docid_lo: header.docid_lo,
+            docid_hi: header.docid_hi,
+            doc_count: header.doc_count,
+            tombstones: TombstoneSet::new(),
+        });
+        self.encoded_segments.push(encoded);
+        self.flush_identities.clear();
+        self.accumulator = Some(
+            ColumnarAccumulator::with_analyzer(CASS_SEMANTIC_SCHEMA, CassAnalyzer::default())
+                .map_err(frankensearch_quill::QuillIndexError::from)?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn index_generated_batch(
+        &mut self,
+        cx: &Cx,
+        documents: &[GeneratedDocument],
+    ) -> Result<(), GauntletError> {
+        self.require_ingesting()?;
+        for document in documents {
+            require_active_cx(cx, "Quill CASS indexing")?;
+            let local_doc_ord = u32::try_from(self.document_count % u64::from(DOC_ORDS_PER_LEASE))
+                .map_err(|_| GauntletError::InvalidCampaign {
+                    reason: "Quill CASS local document ordinal does not fit u32".to_owned(),
+                })?;
+            if local_doc_ord == 0 && self.document_count > 0 {
+                self.finish_segment()?;
+                self.current_lease_base = self.document_count;
+            }
+            let cass = document
+                .cass
+                .as_ref()
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: format!(
+                        "CASS campaign document {:?} has no typed CASS fields",
+                        document.id
+                    ),
+                })?;
+            let document_id = frankensearch_lexical::cass_compat::cass_document_identity_parts(
+                &cass.source_id,
+                cass.message_index,
+            );
+            if document_id.is_empty() || document_id.len() > MAX_DOCUMENT_ID_BYTES {
+                return Err(GauntletError::InvalidCampaign {
+                    reason: "CASS contract identity is empty or exceeds the document-ID bound"
+                        .to_owned(),
+                });
+            }
+            let title_prefix = document
+                .title
+                .as_deref()
+                .map(frankensearch_quill::scribe::cass_generate_edge_ngrams);
+            let content_prefix = frankensearch_quill::scribe::cass_generate_edge_ngrams(
+                cass_content_prefix_source(&document.content),
+            );
+            let preview = frankensearch_quill::scribe::cass_build_preview(&document.content, 400);
+            let mut indexed = vec![
+                IndexedFieldValue::new(0, &cass.agent),
+                IndexedFieldValue::new(1, &cass.workspace),
+                IndexedFieldValue::new(7, &document.content),
+                IndexedFieldValue::new(9, &content_prefix),
+                IndexedFieldValue::new(11, &cass.source_id),
+                IndexedFieldValue::new(12, &cass.origin_kind),
+            ];
+            if let Some(title) = document.title.as_deref() {
+                indexed.push(IndexedFieldValue::new(6, title));
+            }
+            if let Some(prefix) = title_prefix.as_deref() {
+                indexed.push(IndexedFieldValue::new(8, prefix));
+            }
+            let numeric = [
+                IndexedNumericValue::u64(4, cass.message_index),
+                IndexedNumericValue::i64(5, document.created_at_ms),
+            ];
+            let stored = [
+                StoredFieldValue::new(3, cass.source_path.as_bytes()),
+                StoredFieldValue::new(10, preview.as_bytes()),
+            ];
+            self.accumulator
+                .as_mut()
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: "Quill CASS accumulator is unavailable".to_owned(),
+                })?
+                .add_document_with_values(local_doc_ord, &indexed, &numeric, &stored)
+                .map_err(frankensearch_quill::QuillIndexError::from)?;
+            let canonical = serde_json::to_vec(document)?;
+            self.flush_identities.push(CassFlushIdentity {
+                doc_ord: local_doc_ord,
+                document_id,
+                content_hash: xxh3_64(&canonical),
+            });
+            self.document_count = self.document_count.checked_add(1).ok_or_else(|| {
+                GauntletError::InvalidCampaign {
+                    reason: "Quill CASS document count overflow".to_owned(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_corpus(&mut self, cx: &Cx) -> Result<usize, GauntletError> {
+        self.require_ingesting()?;
+        require_active_cx(cx, "Quill CASS commit")?;
+        self.finish_segment()?;
+        let genesis = KeeperSnapshot::in_memory(CASS_SEMANTIC_SCHEMA)
+            .map_err(frankensearch_quill::QuillIndexError::from)?;
+        let snapshot = if self.manifest_segments.is_empty() {
+            genesis
+        } else {
+            let mut manifest = genesis
+                .next_manifest()
+                .map_err(frankensearch_quill::QuillIndexError::from)?;
+            manifest.segments = std::mem::take(&mut self.manifest_segments);
+            manifest.docid_high_watermark = self
+                .current_lease_base
+                .checked_add(u64::from(DOC_ORDS_PER_LEASE))
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: "Quill CASS document-ID watermark overflow".to_owned(),
+                })?;
+            manifest.field_stats = self
+                .field_stats
+                .iter()
+                .map(
+                    |(&field_ord, &(total_tokens, doc_count))| ManifestFieldStats {
+                        field_ord,
+                        total_tokens,
+                        doc_count,
+                    },
+                )
+                .collect();
+            genesis
+                .publish_owned_segments(&manifest, std::mem::take(&mut self.encoded_segments))
+                .map_err(frankensearch_quill::QuillIndexError::from)?
+        };
+        self.index = Some(
+            frankensearch_quill::index::PreparsedQuillIndex::from_in_memory_snapshot(
+                snapshot,
+                self.config.clone(),
+            )?,
+        );
+        self.accumulator = None;
+        self.state = QuillCampaignState::Committed;
+        usize::try_from(self.document_count).map_err(|_| GauntletError::InvalidCampaign {
+            reason: "Quill CASS document count does not fit usize".to_owned(),
+        })
+    }
+
+    pub(crate) fn observe_cass(
+        &self,
+        cx: &Cx,
+        case: &DifferentialCase,
+        filters: &frankensearch_quill::CassQueryFilters,
+    ) -> Result<EngineObservation, GauntletError> {
+        self.require_committed()?;
+        case.validate_shape()?;
+        if case.snippet_max_chars.is_some() {
+            return Err(GauntletError::InvalidCase {
+                reason: "the CASS Quill adapter requires snippets to be disabled".to_owned(),
+            });
+        }
+        let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
+            reason: "limit does not fit usize".to_owned(),
+        })?;
+        let offset = usize::try_from(case.offset).map_err(|_| GauntletError::InvalidCase {
+            reason: "offset does not fit usize".to_owned(),
+        })?;
+        let tie_expansion =
+            usize::try_from(case.tie_expansion_limit).map_err(|_| GauntletError::InvalidCase {
+                reason: "tie expansion limit does not fit usize".to_owned(),
+            })?;
+        let page_end = offset
+            .checked_add(limit)
+            .ok_or_else(|| GauntletError::InvalidCase {
+                reason: "offset plus limit does not fit usize".to_owned(),
+            })?;
+        let fetch_limit =
+            page_end
+                .checked_add(tie_expansion)
+                .ok_or_else(|| GauntletError::InvalidCase {
+                    reason: "expanded Quill CASS observation window does not fit usize".to_owned(),
+                })?;
+        let parsed = self.parser.parse(&case.query, filters);
+        let mut observed = self.index()?.search_preparsed_paginated(
+            cx,
+            &parsed.query,
+            limit,
+            offset,
+            case.count_requested,
+        )?;
+        let mut evidence =
+            self.index()?
+                .search_preparsed_paginated(cx, &parsed.query, fetch_limit, 0, true)?;
+        observed.diagnostics.clone_from(&parsed.diagnostics);
+        evidence.diagnostics = parsed.diagnostics;
+        quill_observation_from_results(&observed, &evidence, limit, offset, case.count_requested)
+    }
+
+    pub(crate) fn descriptor(&self) -> EngineDescriptor {
+        self.descriptor.clone()
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state = QuillCampaignState::Aborted;
+        self.index = None;
+        self.accumulator = None;
+        self.flush_identities.clear();
+        self.encoded_segments.clear();
+        self.manifest_segments.clear();
+        self.field_stats.clear();
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_content_prefix_source(content: &str) -> &str {
+    const MAX_BYTES: usize = 4 * 1024;
+    if content.len() <= MAX_BYTES {
+        return content;
+    }
+    let mut boundary = MAX_BYTES;
+    while !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &content[..boundary]
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn require_active_cx(cx: &Cx, phase: &str) -> Result<(), GauntletError> {
+    if cx.is_cancel_requested() {
+        return Err(frankensearch_core::SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: "gauntlet campaign context requested cancellation".to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Tantivy oracle adapter over the shipping lexical implementation.
 #[cfg(feature = "tantivy-oracle")]
 pub struct TantivyOracle {
@@ -1262,6 +1703,294 @@ impl GauntletEngine for TantivyOracle {
                 ast_differences: Vec::new(),
             })
         })
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn oracle_observation_from_results(
+    observation: frankensearch_lexical::OracleQueryObservation,
+    case: &DifferentialCase,
+) -> Result<EngineObservation, GauntletError> {
+    let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
+        reason: "limit does not fit usize".to_owned(),
+    })?;
+    let offset = usize::try_from(case.offset).map_err(|_| GauntletError::InvalidCase {
+        reason: "offset does not fit usize".to_owned(),
+    })?;
+    let (offset_tie_group, offset_tie_complete) = if offset > 0
+        && offset < observation.hits.len()
+        && observation
+            .hits
+            .get(offset - 1)
+            .zip(observation.hits.get(offset))
+            .is_some_and(|(previous, first)| {
+                f32::from_bits(previous.score_bits)
+                    .total_cmp(&f32::from_bits(first.score_bits))
+                    .is_eq()
+            }) {
+        let leading_bits = observation.hits[offset].score_bits;
+        let same_leading_score = |score_bits| {
+            f32::from_bits(score_bits)
+                .total_cmp(&f32::from_bits(leading_bits))
+                .is_eq()
+        };
+        let cutoff_is_leading = observation
+            .cutoff_tie_group
+            .first()
+            .is_some_and(|hit| same_leading_score(hit.score_bits));
+        if cutoff_is_leading {
+            (
+                observation.cutoff_tie_group.clone(),
+                observation.cutoff_tie_complete,
+            )
+        } else {
+            let group = observation
+                .hits
+                .iter()
+                .filter(|hit| same_leading_score(hit.score_bits))
+                .cloned()
+                .collect::<Vec<_>>();
+            let complete = observation
+                .hits
+                .iter()
+                .skip(offset + 1)
+                .any(|hit| !same_leading_score(hit.score_bits))
+                || observation.total_count <= observation.hits.len();
+            (group, complete)
+        }
+    } else {
+        (Vec::new(), false)
+    };
+    let mut snippets = BTreeMap::new();
+    let hits = observation
+        .hits
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|hit| {
+            if case.snippet_max_chars.is_some()
+                && let Some(snippet) = hit.snippet
+            {
+                snippets.insert(hit.doc_id.clone(), snippet);
+            }
+            RankedHit {
+                doc_id: hit.doc_id,
+                score_bits: hit.score_bits,
+                native_tie_key: NativeTieKey::TantivyDocAddress {
+                    segment_ord: hit.segment_ord,
+                    doc_id: hit.segment_doc_id,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let cutoff_tie_group = if hits.is_empty() {
+        Vec::new()
+    } else {
+        observation
+            .cutoff_tie_group
+            .into_iter()
+            .map(|hit| RankedHit {
+                doc_id: hit.doc_id,
+                score_bits: hit.score_bits,
+                native_tie_key: NativeTieKey::TantivyDocAddress {
+                    segment_ord: hit.segment_ord,
+                    doc_id: hit.segment_doc_id,
+                },
+            })
+            .collect()
+    };
+    let offset_tie_group = offset_tie_group
+        .into_iter()
+        .map(|hit| RankedHit {
+            doc_id: hit.doc_id,
+            score_bits: hit.score_bits,
+            native_tie_key: NativeTieKey::TantivyDocAddress {
+                segment_ord: hit.segment_ord,
+                doc_id: hit.segment_doc_id,
+            },
+        })
+        .collect();
+    Ok(EngineObservation {
+        hits,
+        cutoff_tie_group,
+        cutoff_tie_complete: observation.cutoff_tie_complete,
+        offset_tie_group,
+        offset_tie_complete,
+        snippets,
+        match_count: if case.count_requested {
+            CountState::Value(u64::try_from(observation.total_count).unwrap_or(u64::MAX))
+        } else {
+            CountState::NotRequested
+        },
+        doc_count: u64::try_from(observation.doc_count).unwrap_or(u64::MAX),
+        ast_differences: Vec::new(),
+    })
+}
+
+/// Fresh one-shot Tantivy oracle bound to the shipping CASS compatibility path.
+#[cfg(feature = "tantivy-oracle")]
+pub struct CassTantivyOracle {
+    index: frankensearch_lexical::CassTantivyIndex,
+    descriptor: EngineDescriptor,
+    document_count: usize,
+    state: TantivyCampaignState,
+}
+
+#[cfg(feature = "tantivy-oracle")]
+impl CassTantivyOracle {
+    /// Construct a fresh RAM-backed CASS oracle with one deterministic writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a version-contract or Tantivy setup failure before the campaign
+    /// can claim the adapter.
+    pub fn in_memory(
+        observed_lexical_revision: &str,
+        source_dirty: bool,
+    ) -> Result<Self, GauntletError> {
+        let contract = oracle_version_contract()?;
+        contract.validate_source_state(observed_lexical_revision, source_dirty)?;
+        let descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: contract.lexical_package_version,
+            source_revision: contract.lexical_git_revision,
+            source_dirty,
+            config_hash: CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        descriptor.validate()?;
+        Ok(Self {
+            index: frankensearch_lexical::CassTantivyIndex::in_memory_single_threaded_oracle()?,
+            descriptor,
+            document_count: 0,
+            state: TantivyCampaignState::Fresh,
+        })
+    }
+
+    pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
+        if self.state != TantivyCampaignState::Fresh || self.document_count != 0 {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy CASS oracle may execute only one fresh campaign".to_owned(),
+            });
+        }
+        self.state = TantivyCampaignState::Ingesting;
+        Ok(())
+    }
+
+    fn require_ingesting(&self) -> Result<(), GauntletError> {
+        if self.state != TantivyCampaignState::Ingesting {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy CASS indexing and commit require an active ingest session"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_committed(&self) -> Result<(), GauntletError> {
+        if self.state != TantivyCampaignState::Committed {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy CASS observation requires a committed one-shot index".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn index_generated_batch(
+        &mut self,
+        cx: &Cx,
+        documents: &[GeneratedDocument],
+    ) -> Result<(), GauntletError> {
+        self.require_ingesting()?;
+        require_active_cx(cx, "Tantivy CASS indexing")?;
+        let mut lowered = Vec::with_capacity(documents.len());
+        for document in documents {
+            let cass = document
+                .cass
+                .as_ref()
+                .ok_or_else(|| GauntletError::InvalidCampaign {
+                    reason: format!(
+                        "CASS campaign document {:?} has no typed CASS fields",
+                        document.id
+                    ),
+                })?;
+            lowered.push(frankensearch_lexical::CassDocument {
+                agent: cass.agent.clone(),
+                workspace: Some(cass.workspace.clone()),
+                workspace_original: None,
+                source_path: cass.source_path.clone(),
+                msg_idx: cass.message_index,
+                created_at: Some(document.created_at_ms),
+                title: document.title.clone(),
+                content: document.content.clone(),
+                source_id: cass.source_id.clone(),
+                origin_kind: cass.origin_kind.clone(),
+                origin_host: None,
+                conversation_id: None,
+            });
+        }
+        self.index.add_cass_documents(&lowered)?;
+        self.document_count = self
+            .document_count
+            .checked_add(lowered.len())
+            .ok_or_else(|| GauntletError::InvalidCampaign {
+                reason: "Tantivy CASS document count overflow".to_owned(),
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_corpus(&mut self, cx: &Cx) -> Result<usize, GauntletError> {
+        self.require_ingesting()?;
+        require_active_cx(cx, "Tantivy CASS commit")?;
+        self.index.commit()?;
+        self.state = TantivyCampaignState::Committed;
+        Ok(self.document_count)
+    }
+
+    pub(crate) fn observe_cass(
+        &self,
+        cx: &Cx,
+        case: &DifferentialCase,
+        filters: &frankensearch_lexical::CassQueryFilters,
+    ) -> Result<EngineObservation, GauntletError> {
+        self.require_committed()?;
+        require_active_cx(cx, "Tantivy CASS search")?;
+        case.validate_shape()?;
+        if case.snippet_max_chars.is_some() {
+            return Err(GauntletError::InvalidCase {
+                reason: "the CASS Tantivy adapter requires snippets to be disabled".to_owned(),
+            });
+        }
+        let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
+            reason: "limit does not fit usize".to_owned(),
+        })?;
+        let offset = usize::try_from(case.offset).map_err(|_| GauntletError::InvalidCase {
+            reason: "offset does not fit usize".to_owned(),
+        })?;
+        let fetch_limit = offset
+            .checked_add(limit)
+            .ok_or_else(|| GauntletError::InvalidCase {
+                reason: "offset plus limit does not fit usize".to_owned(),
+            })?;
+        let tie_expansion_limit =
+            usize::try_from(case.tie_expansion_limit).map_err(|_| GauntletError::InvalidCase {
+                reason: "tie expansion limit does not fit usize".to_owned(),
+            })?;
+        let observation = self.index.cass_oracle_observe_query(
+            &case.query,
+            filters,
+            fetch_limit,
+            tie_expansion_limit,
+        )?;
+        oracle_observation_from_results(observation, case)
+    }
+
+    pub(crate) fn descriptor(&self) -> EngineDescriptor {
+        self.descriptor.clone()
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state = TantivyCampaignState::Aborted;
     }
 }
 
@@ -3227,6 +3956,43 @@ mod tests {
             EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle),
             Err(GauntletError::InvalidContract { .. })
         ));
+    }
+
+    #[test]
+    fn cass_identity_requires_the_cass_oracle_config_hash() {
+        let version = oracle_version_contract().expect("oracle version contract");
+        let subject = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/cass-index".to_owned(),
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_revision: "subject-revision".to_owned(),
+            source_dirty: false,
+            config_hash: "cass-subject-config".to_owned(),
+        };
+        let oracle = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: version.lexical_package_version,
+            source_revision: version.lexical_git_revision,
+            source_dirty: false,
+            config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        let mut pair =
+            EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle.clone())
+                .expect("well-shaped cross-engine identity");
+        pair.bind_semantic_contract(crate::runner::SemanticContract::cass())
+            .expect("CASS semantic contract");
+        assert!(matches!(
+            pair.validate_gauntlet_contract(),
+            Err(GauntletError::InvalidContract { .. })
+        ));
+
+        pair.oracle = EngineDescriptor {
+            config_hash: CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+            ..oracle
+        };
+        pair.validate_gauntlet_contract()
+            .expect("CASS oracle identity clears only with the CASS config hash");
     }
 
     #[test]

@@ -13,6 +13,7 @@ default = []
 tantivy-oracle = [
     "dep:frankensearch-lexical",
     "frankensearch-lexical/tantivy-oracle",
+    "frankensearch-quill/bench-internals",
 ]
 perf-harness = [
     "tantivy-oracle",

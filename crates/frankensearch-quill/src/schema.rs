@@ -39,11 +39,16 @@ impl Analyzer {
 pub enum FieldKind {
     /// Exact-match text with no tokenization.
     Keyword,
-    /// Analyzed text; `positions` controls phrase-query support.
+    /// Analyzed text.
+    ///
+    /// `positions = true` records frequencies and positions, matching
+    /// Tantivy's `WithFreqsAndPositions`. `positions = false` records Basic
+    /// document-presence postings while still retaining the complete analyzed
+    /// token count for fieldnorms and average-field-length statistics.
     Text {
         /// Compile-time analyzer pipeline.
         analyzer: Analyzer,
-        /// Whether token positions are persisted.
+        /// Whether term frequencies and token positions are persisted.
         positions: bool,
     },
     /// Opaque stored bytes with no index entries.

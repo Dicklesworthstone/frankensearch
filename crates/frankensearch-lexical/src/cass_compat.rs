@@ -953,6 +953,34 @@ pub struct CassTantivyIndex {
 }
 
 impl CassTantivyIndex {
+    /// Create a fresh in-memory CASS oracle with one deterministic writer.
+    ///
+    /// This constructor is restricted to differential campaigns whose native
+    /// `DocAddress` evidence must be reproducible across same-seed replays.
+    /// Shipping callers retain the host-scaled writer configuration exposed by
+    /// [`Self::open_or_create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if schema extraction or writer construction
+    /// fails.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub fn in_memory_single_threaded_oracle() -> SearchResult<Self> {
+        let mut index = Index::create_in_ram(cass_build_schema());
+        cass_ensure_tokenizer(&mut index);
+        let fields = cass_fields_from_schema(&index.schema())?;
+        let writer_config = cass_writer_config_for_parallelism(1);
+        let writer = index
+            .writer_with_num_threads(writer_config.num_threads, writer_config.heap_size_bytes)
+            .map_err(tantivy_err)?;
+        Ok(Self {
+            index,
+            writer,
+            fields,
+        })
+    }
+
     /// Open existing index or create/rebuild as needed.
     ///
     /// # Errors
