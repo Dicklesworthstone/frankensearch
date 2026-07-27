@@ -44,6 +44,7 @@ path = "src/bin/quill_perf_ratchet.rs"
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["bench-internals"] }
+jsonschema = { version = "0.46", default-features = false }
 rayon = { workspace = true }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }

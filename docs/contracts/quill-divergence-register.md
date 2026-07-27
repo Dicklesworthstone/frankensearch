@@ -1,7 +1,12 @@
 # Quill Divergence Register
 
-**Status:** Living ledger (append-only entries; `decision` fields may be updated with a dated edit).
-**Owning bead:** `bd-quill-e0-contracts-j53p.4`. **Design of record:** plan §15.6. **Oracle:** tantivy `0.26.1` + `frankensearch-lexical` (pinned by the gauntlet's version contract).
+**Status:** Living ledger. Machine history is append-only; corrections and
+disposition changes append superseding events rather than rewriting prior
+evidence.
+**Owning beads:** `bd-quill-e0-contracts-j53p.4` (language policy) and
+`bd-quill-e6-gauntlet-scale-rm3q.8` (campaign population and terminal census).
+**Design of record:** plan §15.6. **Oracle:** tantivy `0.26.1` +
+`frankensearch-lexical` (pinned by the gauntlet's version contract).
 
 ## Doctrine
 
@@ -12,7 +17,63 @@ Every **intentional or discovered-and-accepted** behavioral divergence between Q
 
 The gauntlet's comparator auto-classifies against §2's classes; anything it cannot classify fails the run and lands in triage (bd-quill-duel-shrinker's factor-diff bucketing feeds this).
 
-## 1. Entry schema
+## 1. Machine contract and review workflow
+
+The v1 machine contract is
+[`schemas/quill-divergence-register-v1.schema.json`](../../schemas/quill-divergence-register-v1.schema.json).
+Its synthetic schema-conformance fixture is
+[`crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v1.json`](../../crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v1.json).
+That fixture proves the format; it is **not** a production campaign register
+and must never be cited as live mismatch evidence.
+
+`DivergenceRegisterLedger` is the typed implementation. One immutable event
+stream retains:
+
+- exact first-seen gauntlet object address plus SHA-256 integrity digest, and
+  engine, corpus, query, and generator revisions;
+- minimized fixture identity, replay test, mismatch signatures, root cause,
+  expected/observed behavior, consumer impact, and hashed redacted diagnostics;
+- reviewed `accepted`, `fixed`, or `blocking` dispositions;
+- predicted-class declarations followed by reviewed `observed` or `retired`
+  revisions.
+
+Every event has a contiguous sequence number, author, UTC timestamp, and an
+optional `supersedes` link to the currently active event of the same kind and
+logical ID. `validate_append_only_successor` compares complete event prefixes,
+so deletion, reordering, or editing of historical evidence fails even when the
+resulting JSON remains internally valid. Corrected observation evidence also
+requires a later disposition event, preventing an old review from silently
+blessing new evidence.
+
+The campaign workflow is:
+
+1. Append an observation as soon as a mismatch is emitted. Raw rank, snippet,
+   and count failures may be recorded, but cannot be accepted as equivalence
+   classes.
+2. Append exactly one active disposition. A fix names its commit and regression
+   test. An accept names an equivalence law, rationale, and reviewer independent
+   of the observation author. An unresolved mismatch names an owning bead and
+   remains an explicit blocker.
+3. Append prediction revisions when a seeded class is forced or formally
+   retired. A declaration is permitted during an active campaign, but prevents
+   a terminal census.
+4. Run the mismatch census over the sorted unique signatures emitted by the
+   required campaigns. Missing signatures, a reappearance after `fixed`, active
+   blockers, and unresolved predictions all make `flip_ready = false`;
+   `require_terminal_census` fails closed on the same state.
+5. Run source-sensitive canaries before commit. Diagnostics carry only a
+   lowercase SHA-256 digest and a canonical `<redacted:...>` marker. The
+   generated review table is derived from validated active events and never
+   renders observed/query payloads.
+
+The older `DivergenceRegistry` remains the narrow per-fixture runtime allowlist
+embedded in existing campaign artifacts. It can classify only already accepted
+semantic mismatches. It is not the append-only review ledger and cannot satisfy
+the E6 terminal census by itself.
+
+The following Markdown shape is the human projection retained for current
+entries. The machine ledger carries the additional hashes, revisions, event
+links, and disposition-specific proof described above.
 
 ```
 ### DIV-<NNN>: <short title>
@@ -24,6 +85,10 @@ The gauntlet's comparator auto-classifies against §2's classes; anything it can
 - Decision: accept | fix (bead: <id>) | pending
 - Reviewer: <second agent name + date for accepts>
 ```
+
+The E6.8 bead remains open until the production ledger is populated from every
+required campaign and two consecutive independent nightly receipts (different
+fixed seeds and worker receipts) report no new or unclassified divergence.
 
 ## 2. Divergence classes (taxonomy)
 
