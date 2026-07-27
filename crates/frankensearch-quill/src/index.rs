@@ -5641,22 +5641,19 @@ const fn bound_topology_kind(bound: &Bound<QueryValue>) -> u8 {
 /// Gate for deferred grouped `MaxScore` over nested pure-term unions
 /// (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
 ///
-/// **Currently `false`: the shape machinery below is complete and rank-safe,
-/// but the runtime candidate path it feeds does not actually prune yet.**
+/// **Currently `false`: the grouped runtime is rank-safe and demonstrably
+/// prunes, but it did not earn activation in the paired release A/B.**
 ///
-/// `argus::tests::grouped_max_score_matches_exhaustive_and_prunes` — the test
-/// landed in `1b5a1018` specifically to prove grouped `MaxScore` prunes — fails
-/// on `main` with `max_score_windows: 0`. Its bit-parity assertions pass, so
-/// results are correct; the *pruning* claim is what is false. The test was
-/// written against a tree that did not yet contain the deterministic
-/// query-fuel metering from `ae5baa0d`, which arrived afterwards through merge
-/// `afb7800d`; both sides merged cleanly as text and nothing re-ran the test.
+/// `argus::tests::grouped_max_score_matches_exhaustive_and_prunes` and the
+/// drained-essential-group regression both pass. The immutable 100k,
+/// same-binary, 41-round campaign recorded pruned/exhaustive medians of 1.0138
+/// for two groups, 1.0023 for three, and 1.0151 for four, all inside their A/A
+/// median-CI floors; eight groups was a decision-valid 1.0261 regression.
 ///
-/// Flipping this to `true` would therefore open BLOCKMAX for every nested
-/// union's terms — i.e. pay the metadata cost on the *most common* query shape
-/// — while the root still scores exhaustively. That is pure cost for no
-/// measured benefit, so the gate stays closed until the pruning regression is
-/// fixed and the A/B in `benches/grouped_maxscore_ab.rs` shows a decidable win.
+/// Flipping this to `true` would open BLOCKMAX for every nested union's terms
+/// — i.e. pay the metadata cost on the most common query shape — without a
+/// measured query-time win. Full provenance and the retry predicate live in
+/// `docs/NEGATIVE_EVIDENCE.md`.
 ///
 /// With this `false`, nested unions fail the rank-pruning gate exactly as they
 /// did before this change: the shape classification below is inert, no BLOCKMAX
@@ -5664,8 +5661,10 @@ const fn bound_topology_kind(bound: &Bound<QueryValue>) -> u8 {
 /// POSTINGS-only exhaustive path. Direct-term `MaxScore`/BMW is unaffected
 /// either way.
 ///
-/// **To activate:** fix the pruning regression, then flip this to `true` — no
-/// other edit is required.
+/// **To activate:** first produce a materially different traversal and a
+/// same-binary win for at least the two- and four-group 100k cells, then run
+/// the full 1M and parity matrix. The gate flip itself remains the only
+/// production edit required.
 const GROUPED_MAX_SCORE_ENABLED: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12125,16 +12124,16 @@ mod tests {
         );
 
         // Nested multi-field unions stay POSTINGS-only while
-        // `GROUPED_MAX_SCORE_ENABLED` is false. Admitting them would open
-        // BLOCKMAX for their terms, and the runtime candidate path does not yet
-        // prune (see that constant's docs), so this is the shipping behaviour
-        // until the pruning regression is fixed.
+        // `GROUPED_MAX_SCORE_ENABLED` is false. The runtime candidate is
+        // rank-safe and prunes, but its release A/B failed the performance
+        // gate (see that constant's docs), so shipping does not pay to open
+        // BLOCKMAX for these terms.
         // When `GROUPED_MAX_SCORE_ENABLED` flips to `true`, this assertion is
         // the one to invert — the shape assertions below stay as they are.
         let nested_two = parser.parse("alpha OR beta");
         assert!(
             !query_has_prunable_root_union(&nested_two.query, 1.0),
-            "nested field unions must not open BLOCKMAX while grouped MaxScore is dormant"
+            "nested field unions must not open BLOCKMAX while grouped MaxScore is gated off"
         );
 
         let nested_nine = parser

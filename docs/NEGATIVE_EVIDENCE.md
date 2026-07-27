@@ -16290,3 +16290,75 @@ their own same-invocation A/A null p5–p95 band on at least the `grouped2` and
 cells. Per the fleet harness contract, decide on the median-CI — **never** on
 `cv`, which is unreachable below ~12% on this hardware and does not track
 decidability.
+
+### 2026-07-27 — REJECT: deferred grouped `MaxScore` is a 2–4-group wash and an 8-group regression (`bd-quill-e8-perf-doctrine-x4e4.5.1`, CyanPine)
+
+The prerequisite correctness blocker above is fixed on current `main`.
+Strict-remote `ovh-a` proof `b42e6b25f97a2018` passed both grouped-`MaxScore`
+library tests, including the drained-essential-group regression and the
+instrumented assertion that at least one window is pruned. The production
+query gate nevertheless remained closed while the performance candidate was
+measured through the bench-only forced A/B override.
+
+The inherited benchmark was not initially capable of producing the required
+evidence. Its two nominal full shapes were both 100,000 documents, normal tier
+promotion silently changed eight explicit commits into two physical leaves,
+the 65,536-document lease boundary invalidated its assumption that every batch
+becomes exactly one leaf, and `run_test_with_cx` emitted tens of millions of
+trace lines. Benchmark-only commit `974a6453` fixes those defects: it restores
+the 1,000,000-document shape, suppresses avoidable lifecycle seals and tier
+promotion, asserts the exact live-document count, reports mandatory physical
+lease splits, and uses a quiet current-thread runtime. No shipping search code
+or gate changed.
+
+The decision run used one immutable release binary on idle RCH worker `hz2`:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=hz2 \
+RCH_TEST_TIMEOUT_SEC=1800 env -u CARGO_TARGET_DIR \
+rch exec --no-self-healing --base 974a6453 --clean-overlay --no-overlay -- \
+  env RAYON_NUM_THREADS=1 QUILL_E851_SCALE=full \
+  QUILL_E851_ROUNDS=41 QUILL_E851_LIMITS=10 \
+  cargo bench -p frankensearch-quill --features bench-internals \
+    --profile release --bench grouped_maxscore_ab
+```
+
+RCH source/command hash was `6429ada56a1028ba`; the running binary
+self-reported SHA-256
+`eba16df24daac902ede8bf8a92be78460918b504b100ba07027ef0231ee6360d`.
+The 100,000-document fixture built in 1,358.7 ms and contained nine physical
+leaves. Every cell asserted exact `(global_docid, f32 score bits)` page parity
+before timing. Ratios are pruned/exhaustive, so values above one are slower.
+The bracketed values are raw per-round p5–p95 provenance; `decidable` is the
+canonical helper's separate two-times-A/A-median-CI decision.
+
+| 100k query, k=10 | exhaustive/exhaustive A/A median [p5, p95] | pruned/exhaustive median [p5, p95] | median-CI verdict | separate absolute exhaustive → pruned |
+|---|---:|---:|---|---:|
+| grouped2 | 0.9960 [0.9377, 1.0762] | **1.0138 [0.9650, 1.0877]** | inside null floor | 164,006.2 → 163,964.8 us |
+| grouped3_skewed | 0.9923 [0.9139, 1.0946] | **1.0023 [0.9693, 1.1033]** | inside null floor | 243,345.4 → 249,879.8 us |
+| grouped4 | 1.0040 [0.9487, 1.0471] | **1.0151 [0.9676, 1.0659]** | inside null floor | 339,763.8 → 333,043.9 us |
+| grouped8 | 1.0020 [0.9525, 1.0396] | **1.0261 [0.9875, 1.0500]** | **decidable regression** | 672,474.3 → 644,120.4 us |
+| direct2 negative control | 0.9967 [0.9114, 1.0862] | **1.0408 [0.9588, 1.1402]** | **decidable regression** | 82,991.2 → 88,765.5 us |
+
+The separately sampled absolute timings are provenance only and occasionally
+reverse the paired median under this worker's noise; they do not override the
+predeclared paired median-CI gate. Most importantly, the common grouped2 and
+grouped4 shapes both fail the previous row's explicit retry predicate: neither
+median clears its own same-invocation null floor in the winning direction.
+
+The corrected 1,000,000-document fixture also completed setup successfully in
+56,051.8 ms with exactly 1,000,000 live documents across 19 physical leaves.
+Its timing tranche was not started: the campaign was a sequential 100k-then-1M
+gate, and every required 100k grouped shape had already failed KEEP admission.
+The operator then stopped the remote process with exit 130. This is a complete
+100k REJECT, not a 1M performance claim.
+
+**Decision: REJECT activation and retain
+`GROUPED_MAX_SCORE_ENABLED = false`.** Deferred group scoring removes the
+catastrophic 19–26% overhead of E4.4's eager nested topology, but it still
+cannot establish a query-time win over exhaustive scoring. Do not spend a 1M
+campaign on this unchanged traversal. Retry only after a fresh profile
+identifies a materially different way to avoid opening/scoring non-essential
+groups; first require grouped2 and grouped4 to clear an admissible same-binary
+100k A/A median-CI in the winning direction, then run the full 1M and
+randomized/mixed/tombstone/offset parity matrix.

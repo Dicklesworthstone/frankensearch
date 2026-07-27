@@ -7110,3 +7110,21 @@ byte-for-byte; only this evidence ships. Do not retry a separate dictionary
 preflight. A future attempt must fuse eligibility accounting into the single
 term-lowering traversal while deferring BLOCKMAX validation, then beat both
 this same-binary cold null and warm regression with exact parity intact.
+
+## 2026-07-27 — REJECT: deferred grouped `MaxScore` stays gated off (`bd-quill-e8-perf-doctrine-x4e4.5.1`, CyanPine)
+
+The dormant grouped candidate is now correctness-capable, and benchmark repair
+`974a6453` provides honest 100k/1M fixture construction plus compact,
+self-identifying receipts. It does **not** earn activation. One exact
+same-binary 41-round run on RCH worker `hz2` measured the common 100k
+multi-field shapes at pruned/exhaustive medians of 1.0138 (grouped2), 1.0023
+(grouped3), and 1.0151 (grouped4), all inside their A/A median-CI floors.
+Grouped8 was a decision-valid 1.0261 regression. Every completed cell asserted
+exact global-docid and score-bit parity before timing.
+
+The 1M fixture built successfully but was not timed after the sequential 100k
+KEEP gate failed. Shipping therefore retains
+`GROUPED_MAX_SCORE_ENABLED = false`; direct-term MaxScore/BMW remains the only
+retained E4.4 pruning path. Full command, binary SHA-256, p5–p95 provenance,
+absolute timings, invalid-harness attempts, and the concrete retry predicate
+are recorded in `docs/NEGATIVE_EVIDENCE.md`.

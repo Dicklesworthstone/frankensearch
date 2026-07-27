@@ -300,20 +300,32 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limits: &[usize], index: &Qu
                         .expect("pruned absolute"),
                 );
             });
-            // `decidable` is the only verdict. The p5/p95 pair is printed for
-            // provenance so a reader can see the spread behind the decision.
+            let verdict = if !lever.decidable_against(&null) {
+                "inside_null_floor"
+            } else if lever.median < 1.0 {
+                "win"
+            } else {
+                "regression"
+            };
+            // The median-CI verdict is authoritative. Raw p5/p95 is printed
+            // separately as provenance and never decides the result.
             eprintln!(
                 "[cell] shape={} query={query_name} k={limit} \
-                 null={:.4} [{:.4}, {:.4}] lever(pruned/exhaustive)={:.4} [{:.4}, {:.4}] \
-                 decidable={} exhaustive_us={exhaustive_us:.1} pruned_us={pruned_us:.1}",
+                 null={:.4} ci95=[{:.4}, {:.4}] p5_p95=[{:.4}, {:.4}] \
+                 lever(pruned/exhaustive)={:.4} ci95=[{:.4}, {:.4}] \
+                 p5_p95=[{:.4}, {:.4}] verdict={verdict} \
+                 exhaustive_us={exhaustive_us:.1} pruned_us={pruned_us:.1}",
                 shape.name,
                 null.median,
+                null.median_ci95_low,
+                null.median_ci95_high,
                 null.p5,
                 null.p95,
                 lever.median,
+                lever.median_ci95_low,
+                lever.median_ci95_high,
                 lever.p5,
                 lever.p95,
-                lever.decidable_against(&null),
             );
         }
     }
