@@ -28,7 +28,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
-use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
+use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
@@ -623,6 +623,40 @@ impl TwoTierSearcher {
                 demoted
             }
             None => hits,
+        }
+    }
+
+    /// Classify an empty fast-tier result produced by the explicit
+    /// `search_params` lane (bd-tqhc).
+    ///
+    /// Runs the classified fast lane purely for its state census — hit
+    /// production stays with the params lane that already answered, and the
+    /// two lanes scan the same records, so an empty params result implies an
+    /// empty (classified) default result. Classification is diagnostic and
+    /// must never fail the search: errors degrade to an unclassified lane at
+    /// debug level rather than a fabricated reason.
+    ///
+    /// Known narrow gap: if the classified lane were to find hits where the
+    /// params lane found none, this returns `None` and the empty result
+    /// carries no reason. That needs the two lanes to disagree about
+    /// *emptiness* specifically — the params lane is the exact scan and the
+    /// classified lane's int8 two-pass is a candidate superset of it, so an
+    /// empty exact result implies an empty int8 result and the disagreement
+    /// cannot occur in that direction. Closing it properly wants a public
+    /// census on `TwoTierIndex` (as `InMemoryVectorIndex` already exposes,
+    /// which is how the sync searcher avoids both this gap and the second
+    /// scan); that lives in `two_tier.rs` and is deferred rather than
+    /// entangled with the in-flight ANN tranche.
+    fn classify_fast_empty(&self, query_vec: &[f32], k: usize) -> Option<ZeroSignalReason> {
+        match self.index.search_fast_classified(query_vec, k) {
+            Ok(classified) => classified.zero_signal,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "fast-tier zero-signal classification failed; lane left unclassified"
+                );
+                None
+            }
         }
     }
 
@@ -1454,13 +1488,36 @@ impl TwoTierSearcher {
                     ));
                 }
 
-                // Vector search.
+                // Vector search, through the classified fast lane so an empty
+                // semantic result carries its typed `ZeroSignalReason`
+                // (bd-tqhc). The default path classifies inline (and drives
+                // the index's once-per-transition availability logging); an
+                // explicit `search_params` override keeps its exact scan
+                // configuration and classifies lazily, only when the result
+                // comes back empty.
                 let search_start = Instant::now();
-                let mut fast_hits = self.index.search_fast_with_params(
-                    &query_vec,
-                    semantic_budget,
-                    self.search_params,
-                )?;
+                let (mut fast_hits, index_zero_signal) = match self.search_params {
+                    None => {
+                        let classified = self
+                            .index
+                            .search_fast_classified(&query_vec, semantic_budget)?;
+                        (classified.hits, classified.zero_signal)
+                    }
+                    Some(params) => {
+                        let hits = self.index.search_fast_with_params(
+                            &query_vec,
+                            semantic_budget,
+                            Some(params),
+                        )?;
+                        let zero_signal = if hits.is_empty() {
+                            self.classify_fast_empty(&query_vec, semantic_budget)
+                        } else {
+                            None
+                        };
+                        (hits, zero_signal)
+                    }
+                };
+                let prefilter_empty = fast_hits.is_empty();
                 self.apply_score_calibration_to_hits(&mut fast_hits);
                 let fast_hits = if let Some(exclusions) = normalized_exclusions {
                     filter_vector_hits_by_negations(fast_hits, exclusions, text_fn, "semantic")
@@ -1476,6 +1533,22 @@ impl TwoTierSearcher {
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
                 metrics.phase1_vectors_searched = self.index.doc_count();
+                metrics.zero_signal = if fast_hits.is_empty() {
+                    if prefilter_empty {
+                        // The index itself produced nothing; carry its typed
+                        // classification (None only if diagnostic
+                        // classification failed, which degrades to an
+                        // unclassified lane rather than a fabricated reason).
+                        index_zero_signal
+                    } else {
+                        // The index produced candidates; caller-supplied
+                        // negation exclusions or pool corrections removed
+                        // every one of them downstream of the scan.
+                        Some(ZeroSignalReason::FilterEliminatedAll)
+                    }
+                } else {
+                    None
+                };
 
                 let graph_candidates: Option<Vec<ScoredResult>> = if self
                     .config
@@ -4014,6 +4087,188 @@ mod tests {
                 .unwrap();
 
             assert!(phases.is_empty());
+        });
+    }
+
+    #[test]
+    fn search_with_hits_leaves_zero_signal_unset() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            let metrics = searcher
+                .search(&cx, "test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+
+            assert!(metrics.semantic_candidates > 0);
+            assert_eq!(metrics.zero_signal, None);
+        });
+    }
+
+    #[test]
+    fn index_classified_zero_signal_propagates_to_metrics() {
+        // A zero-vector query embedding makes the index's classified fast
+        // lane return an empty result with a typed reason; the searcher must
+        // carry that classification into `TwoTierMetrics.zero_signal` instead
+        // of collapsing it into a bare empty answer. (Index-state reasons
+        // such as AllTombstoned travel the identical `index_zero_signal`
+        // path and are covered by the index-crate classified tests.)
+        struct ZeroEmbedder {
+            dimension: usize,
+        }
+
+        impl Embedder for ZeroEmbedder {
+            fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                let dim = self.dimension;
+                Box::pin(async move { Ok(vec![0.0; dim]) })
+            }
+
+            fn dimension(&self) -> usize {
+                self.dimension
+            }
+
+            fn id(&self) -> &str {
+                "zero-embedder"
+            }
+
+            fn model_name(&self) -> &str {
+                "zero-embedder"
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder = Arc::new(ZeroEmbedder { dimension: 4 });
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            let metrics = searcher
+                .search(&cx, "test", 5, |_| None, |_| {})
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(
+                metrics.zero_signal,
+                Some(ZeroSignalReason::ZeroNormQuery),
+                "an empty semantic lane must say why, not just return nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn hybrid_search_keeps_lexical_results_when_semantic_lane_has_zero_signal() {
+        // Explicit hybrid policy (bd-tqhc): a semantic lane with zero signal
+        // must not fail or empty a hybrid search — lexical results still
+        // flow, and the typed reason still lands in the metrics so callers
+        // can tell "lexical-only because the semantic lane had nothing"
+        // apart from a genuinely empty corpus.
+        struct ZeroQueryEmbedder;
+
+        impl Embedder for ZeroQueryEmbedder {
+            fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async move { Ok(vec![0.0; 4]) })
+            }
+
+            fn dimension(&self) -> usize {
+                4
+            }
+
+            fn id(&self) -> &str {
+                "zero-embedder"
+            }
+
+            fn model_name(&self) -> &str {
+                "zero-embedder"
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder: Arc<dyn Embedder> = Arc::new(ZeroQueryEmbedder);
+            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
+                .with_lexical(lexical);
+
+            let mut initial_results = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "test",
+                    5,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                !initial_results.is_empty(),
+                "hybrid search must keep lexical results when the semantic lane is empty"
+            );
+            assert!(
+                initial_results
+                    .iter()
+                    .all(|result| result.doc_id.starts_with("lex-doc-")),
+                "every surviving hit is lexical-sourced"
+            );
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(
+                metrics.zero_signal,
+                Some(ZeroSignalReason::ZeroNormQuery),
+                "the hybrid path must still carry the semantic lane's typed reason"
+            );
+        });
+    }
+
+    #[test]
+    fn negation_excluding_every_candidate_classifies_as_filter() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let embedder = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+
+            // Every document's text contains the negated term, so the index
+            // produces candidates and the negation filter then removes all
+            // of them: the searcher-side post-scan classification must say
+            // "filter", not inherit an index-state reason.
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "test -banned",
+                    5,
+                    |_| Some("banned text".to_owned()),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(
+                metrics.zero_signal,
+                Some(ZeroSignalReason::FilterEliminatedAll)
+            );
         });
     }
 

@@ -841,15 +841,18 @@ mod tests {
     #[test]
     fn comb_mnz_boosts_multi_index_documents() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // The low-relevance decoys point away from the query direction but
+            // keep a nonzero norm: the index writer rejects zero-norm
+            // embeddings outright (bd-tqhc), since they can never match.
             let index_a = build_searcher(&[
                 ("a-only", &[1.0, 0.0]),
                 ("shared", &[0.9, 0.0]),
-                ("a-low", &[0.0, 0.0]),
+                ("a-low", &[0.05, 1.0]),
             ]);
             let index_b = build_searcher(&[
                 ("b-only", &[1.0, 0.0]),
                 ("shared", &[0.9, 0.0]),
-                ("b-low", &[0.0, 0.0]),
+                ("b-low", &[0.05, 1.0]),
             ]);
 
             let federated = FederatedSearcher::new()
