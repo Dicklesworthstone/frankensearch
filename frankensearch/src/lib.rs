@@ -267,7 +267,13 @@ pub use frankensearch_core::traits::{
     NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
     SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
-pub use frankensearch_core::{DaemonClient, DaemonError, DaemonRetryConfig};
+pub use frankensearch_core::{
+    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
+    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
+    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
+    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256,
+    daemon_endpoint_fingerprint, daemon_executable_fingerprint, daemon_ordered_request_sha256,
+};
 
 // Reranker support types
 pub use frankensearch_core::traits::{RerankDocument, RerankScore};
@@ -309,9 +315,11 @@ pub use frankensearch_index::{AnnFallbackReason, AnnSearchStats, HnswConfig, Hns
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
 pub use frankensearch_fusion::{
-    DaemonFallbackEmbedder, DaemonFallbackReranker, FederatedConfig, FederatedFusion, FederatedHit,
-    FederatedSearcher, NoopDaemonClient, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
-    SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
+    AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
+    DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedFusion, FederatedHit,
+    FederatedSearcher, NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch,
+    SyncSearchIterator, SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count,
+    rrf_fuse,
 };
 
 #[cfg(feature = "graph")]
