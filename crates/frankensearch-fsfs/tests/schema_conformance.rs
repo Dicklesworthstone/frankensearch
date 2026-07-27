@@ -1018,7 +1018,7 @@ fn test_degradation_advice_fixture_conformance() -> serde_json::Result<()> {
         .map(|advice| advice.reason_code.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(fixture.len(), 7);
+    assert_eq!(fixture.len(), 8);
     assert_eq!(
         reasons,
         vec![
@@ -1029,6 +1029,7 @@ fn test_degradation_advice_fixture_conformance() -> serde_json::Result<()> {
             "degrade.advice.timeout",
             "degrade.advice.index_corrupt",
             "degrade.advice.cache_miss",
+            "degrade.advice.semantic_zero_signal",
         ]
     );
     assert!(

@@ -125,7 +125,7 @@ pub use config::{
 pub use degradation_advisor::{
     AdviceOutputSurface, DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationAdvice,
     DegradationAdviceInput, DegradationAdviceSeverity, DegradationFailureKind,
-    DegradationNextAction, advice_for_search_error, classify_search_error,
+    DegradationNextAction, advice_for_search_error, advice_for_zero_signal, classify_search_error,
     synthetic_degradation_advice_fixture,
 };
 pub use evidence::{
