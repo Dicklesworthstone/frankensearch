@@ -33,10 +33,19 @@
 //!
 //! # Safety
 //!
-//! The workspace forbids `unsafe`, so the class of defect that the previous
-//! engine's reload path carried — a misaligned pointer cast whose element
-//! count came from a file header rather than the bytes actually read — is
-//! not merely fixed here but unrepresentable.
+//! This module contains no `unsafe`, and needs none: the graph stores ids
+//! and distances, never reinterpreted bytes. So the class of defect the
+//! previous engine's reload path carried — a misaligned pointer cast whose
+//! element count came from a file header rather than the bytes actually
+//! read — cannot occur here.
+//!
+//! That is a property of this module, not a blanket guarantee. The
+//! workspace lints `unsafe_code` at `deny` rather than `forbid`
+//! specifically so crates can opt in, and this crate does exactly that for
+//! memory-mapping (`mapped_file.rs` and the `MmapMut` path in `lib.rs`).
+//! Any future persistence layer for this graph inherits that risk the
+//! moment it maps a file, so it should parse into owned values rather than
+//! casting mapped bytes.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -229,7 +238,7 @@ impl std::error::Error for GraphDefect {}
 pub const MAX_LEVEL: usize = 16;
 
 /// Tuning parameters for graph construction and search.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswParams {
     /// Neighbours kept per point per layer above layer 0.
     pub m: usize,
@@ -423,11 +432,19 @@ impl LevelSampler {
         // Map to (0, 1] and take the geometric level.
         let unit = ((z >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0);
         let level = (-unit.ln() * self.level_scale).floor();
-        if level.is_finite() && level > 0.0 {
-            (level as usize).min(MAX_LEVEL - 1)
-        } else {
-            0
+        if !level.is_finite() || level <= 0.0 {
+            return 0;
         }
+        // Walk up to the sampled level rather than casting the float.
+        // `MAX_LEVEL` is small, so this is at most a handful of comparisons,
+        // and it makes the ceiling structural: there is no `as usize` whose
+        // out-of-range behaviour would silently saturate a corrupt or
+        // extreme value into a plausible-looking level.
+        let mut chosen = 0usize;
+        while chosen + 1 < MAX_LEVEL && (chosen + 1) as f64 <= level {
+            chosen += 1;
+        }
+        chosen
     }
 }
 
@@ -580,10 +597,21 @@ impl NativeHnsw {
 
     /// Insert row `id`, which must be the next unindexed row.
     ///
+    /// **Not atomic.** The point is appended before any linking, and linking
+    /// reads vectors through `store`, so a store that fails partway leaves
+    /// the graph holding a point that is partially linked or not linked at
+    /// all — [`Self::verify`] would report it as unreachable. A failed
+    /// insert therefore invalidates the graph: discard it and rebuild rather
+    /// than continuing to insert. [`Self::build`] already does this by
+    /// dropping the partial graph. Rolling back instead would mean undoing
+    /// links and the prunes they triggered on other points, which is not
+    /// worth the complexity for a failure that means the vector store cannot
+    /// read its own rows.
+    ///
     /// # Errors
     ///
-    /// Returns [`SearchError::InvalidConfig`] if `id` is not the next row,
-    /// and propagates distance-computation failures.
+    /// Returns [`SearchError::InvalidConfig`] if `id` is not the next row or
+    /// the graph is full, and propagates distance-computation failures.
     pub fn insert<D: VectorDistance>(&mut self, id: u32, store: &D) -> SearchResult<()> {
         // Borrow the reusable visited buffer out of `self` so the insert
         // body can hold `&mut self` and the buffer at the same time; it is
@@ -600,7 +628,15 @@ impl NativeHnsw {
         store: &D,
         visited: &mut VisitedSet,
     ) -> SearchResult<()> {
-        let expected = u32::try_from(self.adjacency.len()).unwrap_or(u32::MAX);
+        // A saturating conversion here would let the (4-billionth) insert
+        // into a full graph look like a valid in-order one, so report the
+        // capacity explicitly instead.
+        let expected =
+            u32::try_from(self.adjacency.len()).map_err(|_| SearchError::InvalidConfig {
+                field: "points".to_owned(),
+                value: self.adjacency.len().to_string(),
+                reason: "graph is full: point ids must fit in u32".to_owned(),
+            })?;
         if id != expected {
             return Err(SearchError::InvalidConfig {
                 field: "id".to_owned(),
@@ -650,7 +686,7 @@ impl NativeHnsw {
                 visited,
             )?;
             let selected =
-                self.select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
+                Self::select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
 
             self.link(id, &selected, layer, store)?;
 
@@ -806,7 +842,6 @@ impl NativeHnsw {
     /// nearest-`m` selection prunes away, which is what keeps the graph
     /// navigable rather than clustered.
     fn select_neighbours<D: VectorDistance>(
-        &self,
         new_id: u32,
         candidates: &[Candidate],
         limit: usize,
@@ -923,7 +958,7 @@ impl NativeHnsw {
             });
         }
         scored.sort_unstable();
-        let mut kept = self.select_neighbours(id, &scored, budget, store)?;
+        let mut kept = Self::select_neighbours(id, &scored, budget, store)?;
         // Reinstate the protected edge if the heuristic dropped it, evicting
         // the farthest kept neighbour to stay inside the budget.
         //
@@ -1051,10 +1086,9 @@ impl NativeHnsw {
         let count = self.adjacency.len();
 
         if count == 0 {
-            return match self.entry {
-                Some(entry) => Err(GraphDefect::EntryPointInEmptyGraph { entry }),
-                None => Ok(()),
-            };
+            return self.entry.map_or(Ok(()), |entry| {
+                Err(GraphDefect::EntryPointInEmptyGraph { entry })
+            });
         }
 
         let entry = self.entry.ok_or(GraphDefect::MissingEntryPoint)?;
@@ -1090,7 +1124,7 @@ impl NativeHnsw {
                         budget,
                     });
                 }
-                let mut seen = neighbours.to_vec();
+                let mut seen = neighbours.clone();
                 seen.sort_unstable();
                 let before = seen.len();
                 seen.dedup();
