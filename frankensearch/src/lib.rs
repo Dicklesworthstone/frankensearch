@@ -319,7 +319,7 @@ pub use frankensearch_index::{
 };
 
 #[cfg(feature = "ann")]
-pub use frankensearch_index::{AnnFallbackReason, AnnSearchStats, HnswConfig, HnswIndex};
+pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex};
 
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
@@ -623,6 +623,49 @@ mod feature_matrix_smoke {
             &serde_json::json!({
                 "source_bytes": protection.source_size,
                 "repair_bytes": protection.repair_size,
+            }),
+        );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_lane_behavior() {
+        let dir = tempfile::tempdir().expect("ann tempdir");
+        let path = dir.path().join("feature-matrix.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &path,
+            "feature-matrix",
+            "v1",
+            4,
+            frankensearch_index::Quantization::F16,
+        )
+        .expect("create vector index");
+        writer
+            .write_record("doc-axis-x", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write x-axis vector");
+        writer
+            .write_record("doc-axis-y", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write y-axis vector");
+        writer.finish().expect("finish vector index");
+
+        let index = VectorIndex::open(&path).expect("reopen vector index");
+        let ann =
+            HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("build ann");
+        let (hits, stats): (Vec<VectorHit>, AnnSearchStats) = ann
+            .knn_search_with_stats(&[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .expect("query ann");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-axis-x");
+        assert_eq!(stats.index_size, 2);
+        assert_eq!(stats.k_returned, 1);
+        assert!(stats.is_approximate);
+        emit_evidence(
+            "ann",
+            "real_hnsw_build_query",
+            &serde_json::json!({
+                "dimension": stats.dimension,
+                "documents": stats.index_size,
+                "hits": stats.k_returned,
             }),
         );
     }
