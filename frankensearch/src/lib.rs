@@ -59,19 +59,24 @@
 //!     }
 //!
 //!     // With `--features quill`, IndexBuilder also emits a bulk-finalized
-//!     // native lexical index behind the engine-neutral facade exports.
+//!     // native lexical index. `open_hybrid` reopens every arm and attaches
+//!     // the active lexical reader — the wiring earlier examples dropped.
 //!     #[cfg(feature = "quill")]
 //!     {
-//!         let lexical = frankensearch::QuillIndex::open(
+//!         use frankensearch::LexicalSearch;
+//!
+//!         let parts = frankensearch::open_hybrid(
 //!             &cx,
-//!             "./my_index/lexical",
-//!             frankensearch::QuillConfig::default(),
+//!             "./my_index",
+//!             frankensearch::TwoTierConfig::default(),
 //!         )
 //!         .await
-//!         .expect("open Quill lexical index");
+//!         .expect("open hybrid index");
+//!         let lexical = parts.lexical.expect("lexical arm attached");
 //!         let lexical_hits = lexical
-//!             .search_results(&cx, "ownership", 10)
-//!             .expect("search Quill lexical index");
+//!             .search(&cx, "ownership", 10)
+//!             .await
+//!             .expect("search lexical arm");
 //!         assert!(!lexical_hits.is_empty());
 //!     }
 //! });

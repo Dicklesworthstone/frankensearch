@@ -907,6 +907,12 @@ async fn build_lexical_index(
     while let Some(document) = documents_iter.next() {
         match lexical.index_document(cx, document).await {
             Ok(()) => indexed += 1,
+            // Cancellation is a caller contract, not a document defect: abort
+            // the build with the typed error instead of laundering it into
+            // the receipt and spinning the recovery machinery.
+            Err(error @ frankensearch_quill::QuillIndexError::Cancelled { .. }) => {
+                return Err(error.into());
+            }
             Err(error) => {
                 tracing::warn!(
                     doc_id = %document.id,
@@ -1902,6 +1908,39 @@ mod tests {
                 error.to_string().contains("mixed"),
                 "error must carry the typed layout label: {error}"
             );
+        });
+    }
+
+    /// bd-8nqz.3 cancellation matrix: a cancelled `Cx` aborts the build with
+    /// the typed cancellation error — never a per-document receipt entry,
+    /// never recovery-machinery churn — and a cleared `Cx` builds clean.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn build_rejects_cancelled_cx_with_typed_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            cx.set_cancel_requested(true);
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect_err("cancelled cx must reject the build");
+            assert!(
+                matches!(error, SearchError::Cancelled { .. }),
+                "typed cancellation must survive to the caller, got {error:?}"
+            );
+
+            // Retry-clean: a cleared cx builds successfully from scratch.
+            cx.set_cancel_requested(false);
+            let fresh = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(fresh.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect("cleared cx must build clean");
+            assert_eq!(stats.doc_count, 1);
         });
     }
 
