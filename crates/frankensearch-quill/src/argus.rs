@@ -362,7 +362,16 @@ pub trait PostingCursor {
     }
 
     /// Conservative score ceiling over every remaining block in this term.
-    fn term_score_upper_bound(&self, _live_avgdl: f32, _weight: f32) -> Option<f32> {
+    ///
+    /// Implementations must apply `record_option` to the cursor's occurrence
+    /// count. In particular, [`TermRecordOption::Basic`] bounds use presence
+    /// frequency one even when a sealed POSTINGS row retains a raw count.
+    fn term_score_upper_bound(
+        &self,
+        _live_avgdl: f32,
+        _weight: f32,
+        _record_option: TermRecordOption,
+    ) -> Option<f32> {
         None
     }
 
@@ -377,7 +386,12 @@ pub trait PostingCursor {
     }
 
     /// Conservative score ceiling for the cursor's current posting block.
-    fn current_block_score_upper_bound(&self, _live_avgdl: f32, _weight: f32) -> Option<f32> {
+    fn current_block_score_upper_bound(
+        &self,
+        _live_avgdl: f32,
+        _weight: f32,
+        _record_option: TermRecordOption,
+    ) -> Option<f32> {
         None
     }
 
@@ -449,16 +463,26 @@ where
         (**self).fork_for_pruning()
     }
 
-    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
-        (**self).term_score_upper_bound(live_avgdl, weight)
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        (**self).term_score_upper_bound(live_avgdl, weight, record_option)
     }
 
     fn supports_block_max(&self) -> bool {
         (**self).supports_block_max()
     }
 
-    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
-        (**self).current_block_score_upper_bound(live_avgdl, weight)
+    fn current_block_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        (**self).current_block_score_upper_bound(live_avgdl, weight, record_option)
     }
 
     fn current_block_last_doc(&self) -> Option<u32> {
@@ -578,17 +602,28 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         }))
     }
 
-    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
-        self.inner.term_score_upper_bound(live_avgdl, weight)
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        self.inner
+            .term_score_upper_bound(live_avgdl, weight, record_option)
     }
 
     fn supports_block_max(&self) -> bool {
         self.inner.supports_block_max()
     }
 
-    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+    fn current_block_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
         self.inner
-            .current_block_score_upper_bound(live_avgdl, weight)
+            .current_block_score_upper_bound(live_avgdl, weight, record_option)
     }
 
     fn current_block_last_doc(&self) -> Option<u32> {
@@ -802,11 +837,21 @@ impl PostingCursor for SealedPostingCursor<'_> {
         }))
     }
 
-    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
         let entries = self.block_max.as_ref()?.entries();
         let mut maximum = None::<f32>;
         for entry in entries {
-            let bound = entry.score_upper_bound(live_avgdl, weight)?;
+            let bound = record_option.score_upper_bound(
+                entry.max_frequency(),
+                entry.min_fieldnorm_id(),
+                live_avgdl,
+                weight,
+            )?;
             maximum = Some(maximum.map_or(bound, |current| current.max(bound)));
         }
         maximum
@@ -820,16 +865,23 @@ impl PostingCursor for SealedPostingCursor<'_> {
                 .is_some_and(|entries| !entries.entries().is_empty())
     }
 
-    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+    fn current_block_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
         let SealedCursorInner::Docs(cursor) = &self.inner else {
             return None;
         };
         let block_index = cursor.block_index()?;
-        self.block_max
-            .as_ref()?
-            .entries()
-            .get(block_index)?
-            .score_upper_bound(live_avgdl, weight)
+        let entry = self.block_max.as_ref()?.entries().get(block_index)?;
+        record_option.score_upper_bound(
+            entry.max_frequency(),
+            entry.min_fieldnorm_id(),
+            live_avgdl,
+            weight,
+        )
     }
 
     fn current_block_last_doc(&self) -> Option<u32> {
@@ -1041,8 +1093,19 @@ impl PostingCursor for DeltaPostingCursor<'_> {
         Some(Box::new(self.clone()))
     }
 
-    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
-        self.block_max?.score_upper_bound(live_avgdl, weight)
+    fn term_score_upper_bound(
+        &self,
+        live_avgdl: f32,
+        weight: f32,
+        record_option: TermRecordOption,
+    ) -> Option<f32> {
+        let block_max = self.block_max?;
+        record_option.score_upper_bound(
+            block_max.max_frequency(),
+            block_max.min_fieldnorm_id(),
+            live_avgdl,
+            weight,
+        )
     }
 
     fn current_work_block(&self) -> Option<u64> {
@@ -1217,11 +1280,56 @@ impl FieldNormReader for DocLenField<'_> {
     }
 }
 
+/// Posting detail selected by the field schema for term scoring.
+///
+/// Snapshot field statistics retain the complete analyzed token count
+/// independently of posting detail. Tantivy's `Basic` record option scores
+/// every matching document with an effective term frequency of one, whether
+/// the cursor exposes a canonical one or a raw sealed count. Frequency-bearing
+/// options consume the cursor's recorded count unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TermRecordOption {
+    /// Document presence only; BM25 uses an effective term frequency of one.
+    Basic,
+    /// Document presence plus term frequency.
+    WithFreqs,
+    /// Document presence, term frequency, and positions.
+    WithFreqsAndPositions,
+}
+
+impl TermRecordOption {
+    #[inline]
+    const fn effective_frequency(self, raw_frequency: u32) -> u32 {
+        match self {
+            Self::Basic => 1,
+            Self::WithFreqs | Self::WithFreqsAndPositions => raw_frequency,
+        }
+    }
+
+    fn score_upper_bound(
+        self,
+        raw_max_frequency: u32,
+        min_fieldnorm_id: u8,
+        live_avgdl: f32,
+        weight: f32,
+    ) -> Option<f32> {
+        crate::contract::block_max_score(
+            crate::contract::block_max_frequency_to_code(
+                self.effective_frequency(raw_max_frequency),
+            ),
+            min_fieldnorm_id,
+            live_avgdl,
+            weight,
+        )
+    }
+}
+
 /// One BM25 term leaf bound to a segment cursor and fieldnorm view.
 pub struct TermScorer<'a> {
     cursor: Box<dyn PostingCursor + 'a>,
     fieldnorms: Box<dyn FieldNormReader + 'a>,
     snapshot: Bm25FieldSnapshot,
+    record_option: TermRecordOption,
     weight: f32,
     term_score_upper_bound: Option<f32>,
     cost: u64,
@@ -1249,6 +1357,7 @@ impl<'a> TermScorer<'a> {
         fieldnorms: F,
         snapshot: Bm25FieldSnapshot,
         snapshot_doc_freq: u64,
+        record_option: TermRecordOption,
         field_boost: f32,
     ) -> Result<Self, ArgusError>
     where
@@ -1333,12 +1442,13 @@ impl<'a> TermScorer<'a> {
             .average_field_length()
             .filter(|average| average.is_finite() && *average > 0.0)
             .filter(|_| !weight.is_sign_negative())
-            .and_then(|average| cursor.term_score_upper_bound(average, weight))
+            .and_then(|average| cursor.term_score_upper_bound(average, weight, record_option))
             .filter(|bound| bound.is_finite() && !bound.is_sign_negative());
         Ok(Self {
             cursor: Box::new(cursor),
             fieldnorms: Box::new(fieldnorms),
             snapshot,
+            record_option,
             weight,
             term_score_upper_bound,
             cost,
@@ -1403,6 +1513,7 @@ impl<'a> TermScorer<'a> {
                 "current posting has zero term frequency",
             ));
         }
+        let frequency = self.record_option.effective_frequency(frequency);
         let fieldnorm_id =
             self.fieldnorms
                 .fieldnorm_id(doc)
@@ -1423,6 +1534,7 @@ impl<'a> TermScorer<'a> {
             cursor: self.cursor.fork_for_pruning()?,
             live_avgdl,
             weight: self.weight,
+            record_option: self.record_option,
             term_upper_bound,
         })
     }
@@ -1432,6 +1544,7 @@ struct CompetitiveTermCursor<'a> {
     cursor: Box<dyn PostingCursor + 'a>,
     live_avgdl: f32,
     weight: f32,
+    record_option: TermRecordOption,
     term_upper_bound: f32,
 }
 
@@ -1453,9 +1566,11 @@ impl CompetitiveTermCursor<'_> {
     }
 
     fn current_block_upper_bound(&self) -> Option<f32> {
-        let bound = self
-            .cursor
-            .current_block_score_upper_bound(self.live_avgdl, self.weight)?;
+        let bound = self.cursor.current_block_score_upper_bound(
+            self.live_avgdl,
+            self.weight,
+            self.record_option,
+        )?;
         (bound.is_finite() && !bound.is_sign_negative()).then_some(bound)
     }
 
@@ -5221,7 +5336,12 @@ mod tests {
             Some(Box::new(self.clone()))
         }
 
-        fn term_score_upper_bound(&self, _live_avgdl: f32, weight: f32) -> Option<f32> {
+        fn term_score_upper_bound(
+            &self,
+            _live_avgdl: f32,
+            weight: f32,
+            _record_option: TermRecordOption,
+        ) -> Option<f32> {
             (weight.is_finite() && !weight.is_sign_negative()).then_some(weight)
         }
     }
@@ -5450,6 +5570,7 @@ mod tests {
             fieldnorms,
             snapshot.clone(),
             snapshot_doc_freq,
+            TermRecordOption::WithFreqs,
             boost,
         )?))
     }
@@ -5462,6 +5583,29 @@ mod tests {
         rows_by_term: &[Vec<Posting>],
         boosts: &[f32],
         segment_num_docs: u32,
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        sealed_union_with_record_option(
+            posting_lists,
+            block_max,
+            fieldnorms,
+            snapshot,
+            rows_by_term,
+            boosts,
+            segment_num_docs,
+            TermRecordOption::WithFreqs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sealed_union_with_record_option<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        record_option: TermRecordOption,
     ) -> Result<ReferenceScorer<'a>, ArgusError> {
         if posting_lists.len() != rows_by_term.len() || posting_lists.len() != boosts.len() {
             return Err(ArgusError::CursorInvariant(
@@ -5498,6 +5642,7 @@ mod tests {
                 u64::try_from(rows_by_term[index].len()).map_err(|_| {
                     ArgusError::CursorInvariant("fixture document frequency exceeds u64")
                 })?,
+                record_option,
                 boosts[index],
             )?;
             clauses.push(ScorerClause::should(ReferenceScorer::term(scorer)));
@@ -5520,11 +5665,36 @@ mod tests {
         segment_num_docs: u32,
         group_sizes: &[usize],
     ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        sealed_grouped_union_with_record_option(
+            posting_lists,
+            block_max,
+            fieldnorms,
+            snapshot,
+            rows_by_term,
+            boosts,
+            segment_num_docs,
+            group_sizes,
+            TermRecordOption::WithFreqs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sealed_grouped_union_with_record_option<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        group_sizes: &[usize],
+        record_option: TermRecordOption,
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
         let mut outer = Vec::new();
         let mut offset = 0_usize;
         for &size in group_sizes {
             let end = offset + size;
-            let group = sealed_union(
+            let group = sealed_union_with_record_option(
                 &posting_lists[offset..end],
                 block_max.map(|bounds| &bounds[offset..end]),
                 fieldnorms,
@@ -5532,6 +5702,7 @@ mod tests {
                 &rows_by_term[offset..end],
                 &boosts[offset..end],
                 segment_num_docs,
+                record_option,
             )?;
             outer.push(ScorerClause::should(group));
             offset = end;
@@ -5656,7 +5827,7 @@ mod tests {
     #[test]
     fn grouped_max_score_matches_exhaustive_and_prunes() -> Result<(), Box<dyn std::error::Error>> {
         const NUM_DOCS: u32 = 8_192;
-        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let lengths = vec![Some(32); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
         let encoded_doclens = EncodedDocLenSection::encode(
             0,
             u64::from(NUM_DOCS),
@@ -5665,7 +5836,7 @@ mod tests {
         )?;
         let doclens = encoded_doclens.section(&[1])?;
         let field = doclens.field(1).expect("field exists");
-        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 32, u64::from(NUM_DOCS))?;
         // Two multi-field groups of two terms. group0 (high ceiling) is active
         // at doc 0 (window 0) and doc 5_000 (window 1), so it stays *essential*;
         // group1 (low ceiling) holds doc 5_000 and — uniquely — doc 6_000. With
@@ -5673,14 +5844,14 @@ mod tests {
         // non-essential and doc 6_000 (present only in group1) is skipped while
         // the true top-1 (doc 0) is preserved bit-for-bit.
         let rows_by_term = vec![
-            vec![Posting::new(0, 1), Posting::new(5_000, 1)],
-            vec![Posting::new(0, 1), Posting::new(5_000, 1)],
-            vec![Posting::new(5_000, 1)],
-            vec![Posting::new(6_000, 1)],
+            vec![Posting::new(0, 7), Posting::new(5_000, 7)],
+            vec![Posting::new(0, 11), Posting::new(5_000, 11)],
+            vec![Posting::new(5_000, 5)],
+            vec![Posting::new(6_000, 17)],
         ];
         let boosts = [1.0e8, 1.0e8, 1.0, 1.0];
         let group_sizes = [2_usize, 2_usize];
-        let fieldnorm_id = fieldnorm_to_id(1);
+        let fieldnorm_id = fieldnorm_to_id(32);
         let encoded_terms = rows_by_term
             .iter()
             .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
@@ -5691,43 +5862,47 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
 
-        let mut oracle = sealed_grouped_union(
-            &posting_lists,
-            None,
-            field,
-            &snapshot,
-            &rows_by_term,
-            &boosts,
-            NUM_DOCS,
-            &group_sizes,
-        )?;
-        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
-        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
-        let oracle_hits = oracle_collector.finish()?.hits;
+        for record_option in [TermRecordOption::WithFreqs, TermRecordOption::Basic] {
+            let mut oracle = sealed_grouped_union_with_record_option(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                &rows_by_term,
+                &boosts,
+                NUM_DOCS,
+                &group_sizes,
+                record_option,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_hits = oracle_collector.finish()?.hits;
 
-        let mut candidate = sealed_grouped_union(
-            &posting_lists,
-            Some(&block_max),
-            field,
-            &snapshot,
-            &rows_by_term,
-            &boosts,
-            NUM_DOCS,
-            &group_sizes,
-        )?;
-        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
-        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
-        let stats = candidate
-            .union_pruning_stats()
-            .expect("top-level union retains pruning stats");
-        let candidate_hits = candidate_collector.finish()?.hits;
+            let mut candidate = sealed_grouped_union_with_record_option(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                &rows_by_term,
+                &boosts,
+                NUM_DOCS,
+                &group_sizes,
+                record_option,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("top-level union retains pruning stats");
+            let candidate_hits = candidate_collector.finish()?.hits;
 
-        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
-        assert_eq!(candidate_hits[0].global_docid, 0);
-        assert!(
-            stats.max_score_windows >= 1,
-            "grouped MaxScore should prune at least one window (got {stats:?})"
-        );
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits[0].global_docid, 0);
+            assert!(
+                stats.max_score_windows >= 1,
+                "{record_option:?} grouped MaxScore should prune (got {stats:?})"
+            );
+        }
         Ok(())
     }
 
@@ -5831,6 +6006,7 @@ mod tests {
                 u64::try_from(rows_by_term[index].len()).map_err(|_| {
                     ArgusError::CursorInvariant("fixture document frequency exceeds u64")
                 })?,
+                TermRecordOption::WithFreqs,
                 boosts[index],
             )?);
             group.push(ScorerClause::should(term));
@@ -6254,6 +6430,115 @@ mod tests {
     }
 
     #[test]
+    fn basic_record_option_clamps_repeated_edge_ngram_frequency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Minimized from the pinned 40-path CASS witness: the target prefix
+        // field has 1,775 analyzed tokens, and seven `tokens` source values
+        // each emit the `token` edge n-gram. Across the corpus that term has
+        // df=16 and the prefix field has 84,416 total tokens.
+        let mut lengths = vec![Some(0); 40];
+        lengths[39] = Some(1_775);
+        let encoded =
+            EncodedDocLenSection::encode(0, 40, &[9], &[DocLenFieldInput::new(9, &lengths)])?;
+        let section = encoded.section(&[9])?;
+        let field = section.field(9).expect("content_prefix field exists");
+        let snapshot = snapshot(9, 84_416, 40)?;
+        let scorer = |record_option| {
+            TermScorer::new(
+                VecCursor::new(vec![Posting::new(39, 7)], 1, 40),
+                field,
+                snapshot.clone(),
+                16,
+                record_option,
+                1.0,
+            )
+        };
+
+        let basic = scorer(TermRecordOption::Basic)?;
+        let with_freqs = scorer(TermRecordOption::WithFreqs)?;
+        let with_positions = scorer(TermRecordOption::WithFreqsAndPositions)?;
+        let fieldnorm_id = field.fieldnorm_id(39).expect("target fieldnorm exists");
+        let expected_basic = expected_term_score(&snapshot, 16, fieldnorm_id, 1, 1.0);
+        let expected_frequency = expected_term_score(&snapshot, 16, fieldnorm_id, 7, 1.0);
+
+        assert_eq!(basic.score()?.to_bits(), expected_basic.to_bits());
+        assert_eq!(with_freqs.score()?.to_bits(), expected_frequency.to_bits());
+        assert_eq!(
+            with_positions.score()?.to_bits(),
+            expected_frequency.to_bits(),
+            "frequency-bearing record options must retain the raw tf"
+        );
+        assert_eq!(
+            (with_freqs.score()? - basic.score()?).to_bits(),
+            0x3f41_a57a,
+            "the minimized Basic-vs-frequency leaf delta is 0.756431222"
+        );
+
+        let maximum = TermScorer::new(
+            VecCursor::new(vec![Posting::new(39, u32::MAX)], 1, 40),
+            field,
+            snapshot.clone(),
+            16,
+            TermRecordOption::Basic,
+            1.0,
+        )?;
+        assert_eq!(
+            maximum.score()?.to_bits(),
+            expected_basic.to_bits(),
+            "Basic scoring must remain presence-only at maximum stored frequency"
+        );
+
+        let bound_rows = vec![Posting::new(39, 7)];
+        let (encoded_postings, encoded_block_max) =
+            EncodedPostingList::encode_with_block_max(&bound_rows, |doc| {
+                field.fieldnorm_id(u64::from(doc))
+            })?;
+        let posting_list = encoded_postings.posting_list()?;
+        let bounds = encoded_block_max.block_max_list(&posting_list, field)?;
+        let bounds = Arc::<[BlockMaxEntry]>::from(bounds.entries());
+        let bounded = |record_option| {
+            TermScorer::new(
+                SealedPostingCursor::with_block_max(
+                    posting_list.cursor()?,
+                    Arc::clone(&bounds),
+                    posting_list.doc_freq(),
+                    40,
+                ),
+                field,
+                snapshot.clone(),
+                16,
+                record_option,
+                1.0,
+            )
+        };
+        for (record_option, expected) in [
+            (TermRecordOption::Basic, expected_basic),
+            (TermRecordOption::WithFreqs, expected_frequency),
+            (TermRecordOption::WithFreqsAndPositions, expected_frequency),
+        ] {
+            let scorer = bounded(record_option)?;
+            assert_eq!(
+                scorer
+                    .term_score_upper_bound
+                    .expect("sealed term bound")
+                    .to_bits(),
+                expected.to_bits(),
+                "{record_option:?} whole-term bound must use its effective frequency"
+            );
+            let competitive = scorer.competitive_cursor().expect("competitive cursor");
+            assert_eq!(
+                competitive
+                    .current_block_upper_bound()
+                    .expect("current block bound")
+                    .to_bits(),
+                expected.to_bits(),
+                "{record_option:?} current-block bound must use its effective frequency"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn term_scorer_rejects_nonprogress_backward_seek_and_resurrection()
     -> Result<(), Box<dyn std::error::Error>> {
         let lengths = [Some(1); 8];
@@ -6262,8 +6547,16 @@ mod tests {
         let section = encoded.section(&[1])?;
         let field = section.field(1).expect("field exists");
         let snapshot = snapshot(1, 8, 8)?;
-        let scorer =
-            |fault| TermScorer::new(FaultCursor::new(fault), field, snapshot.clone(), 2, 1.0);
+        let scorer = |fault| {
+            TermScorer::new(
+                FaultCursor::new(fault),
+                field,
+                snapshot.clone(),
+                2,
+                TermRecordOption::WithFreqs,
+                1.0,
+            )
+        };
 
         let mut sticky = scorer(CursorFault::StickyNext)?;
         assert!(matches!(sticky.next(), Err(ArgusError::CursorInvariant(_))));
@@ -6287,7 +6580,14 @@ mod tests {
         ));
 
         assert!(matches!(
-            TermScorer::new(VecCursor::new(Vec::new(), 1, 8), field, snapshot, 2, 1.0),
+            TermScorer::new(
+                VecCursor::new(Vec::new(), 1, 8),
+                field,
+                snapshot,
+                2,
+                TermRecordOption::WithFreqs,
+                1.0,
+            ),
             Err(ArgusError::CursorInvariant(_))
         ));
         Ok(())
@@ -7946,6 +8246,7 @@ mod tests {
                 },
                 snapshot.clone(),
                 docs.len() as u64,
+                TermRecordOption::WithFreqs,
                 1.0,
             )?))
         };
@@ -8449,6 +8750,7 @@ mod tests {
                 field,
                 valid.clone(),
                 2,
+                TermRecordOption::WithFreqs,
                 1.0
             ),
             Err(ArgusError::InvalidDocFrequency {
@@ -8463,6 +8765,7 @@ mod tests {
                 field,
                 empty_field,
                 1,
+                TermRecordOption::WithFreqs,
                 1.0
             ),
             Err(ArgusError::InvalidSnapshot { .. })
@@ -8473,6 +8776,7 @@ mod tests {
                 field,
                 valid,
                 1,
+                TermRecordOption::WithFreqs,
                 f32::NAN
             ),
             Err(ArgusError::InvalidBoost { .. })
@@ -8752,6 +9056,7 @@ mod tests {
                     field,
                     snapshot.clone(),
                     u64::from(NUM_DOCS),
+                    TermRecordOption::WithFreqs,
                     1.0,
                 )?,
             )));
@@ -8765,6 +9070,7 @@ mod tests {
                     field,
                     snapshot.clone(),
                     u64::from(NUM_DOCS),
+                    TermRecordOption::WithFreqs,
                     1.0,
                 )?,
             )));
@@ -8927,40 +9233,44 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
 
-            for k in [1, 10, 100, 1_000] {
-                let mut oracle = sealed_union(
-                    &posting_lists,
-                    None,
-                    field,
-                    &snapshot,
-                    &rows_by_term,
-                    &boosts,
-                    NUM_DOCS,
-                )?;
-                let mut oracle_collector = TopDocsCollector::new(k, 0)?;
-                oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
-                let oracle_hits = oracle_collector.finish()?.hits;
-                let mut candidate = sealed_union(
-                    &posting_lists,
-                    Some(&block_max),
-                    field,
-                    &snapshot,
-                    &rows_by_term,
-                    &boosts,
-                    NUM_DOCS,
-                )?;
-                let mut candidate_collector = TopDocsCollector::new(k, 0)?;
-                candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
-                let pruning_stats = candidate
-                    .union_pruning_stats()
-                    .expect("top-level union retains pruning stats");
-                let candidate_hits = candidate_collector.finish()?.hits;
-                assert_hits_bit_exact(&candidate_hits, &oracle_hits);
-                assert!(
-                    pruning_stats.max_score_windows > 0,
-                    "seed {seed}, k {k} silently fell back"
-                );
-                assert_eq!(pruning_stats.block_max_wand_windows, 0);
+            for record_option in [TermRecordOption::WithFreqs, TermRecordOption::Basic] {
+                for k in [1, 10, 100, 1_000] {
+                    let mut oracle = sealed_union_with_record_option(
+                        &posting_lists,
+                        None,
+                        field,
+                        &snapshot,
+                        &rows_by_term,
+                        &boosts,
+                        NUM_DOCS,
+                        record_option,
+                    )?;
+                    let mut oracle_collector = TopDocsCollector::new(k, 0)?;
+                    oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+                    let oracle_hits = oracle_collector.finish()?.hits;
+                    let mut candidate = sealed_union_with_record_option(
+                        &posting_lists,
+                        Some(&block_max),
+                        field,
+                        &snapshot,
+                        &rows_by_term,
+                        &boosts,
+                        NUM_DOCS,
+                        record_option,
+                    )?;
+                    let mut candidate_collector = TopDocsCollector::new(k, 0)?;
+                    candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+                    let pruning_stats = candidate
+                        .union_pruning_stats()
+                        .expect("top-level union retains pruning stats");
+                    let candidate_hits = candidate_collector.finish()?.hits;
+                    assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+                    assert!(
+                        pruning_stats.max_score_windows > 0,
+                        "{record_option:?} seed {seed}, k {k} silently fell back"
+                    );
+                    assert_eq!(pruning_stats.block_max_wand_windows, 0);
+                }
             }
         }
         Ok(())
@@ -9021,40 +9331,44 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
 
-            for k in [1, 10, 100, 1_000] {
-                let mut oracle = sealed_union(
-                    &posting_lists,
-                    None,
-                    field,
-                    &snapshot,
-                    &rows_by_term,
-                    &boosts,
-                    NUM_DOCS,
-                )?;
-                let mut oracle_collector = TopDocsCollector::new(k, 0)?;
-                oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
-                let oracle_hits = oracle_collector.finish()?.hits;
-                let mut candidate = sealed_union(
-                    &posting_lists,
-                    Some(&block_max),
-                    field,
-                    &snapshot,
-                    &rows_by_term,
-                    &boosts,
-                    NUM_DOCS,
-                )?;
-                let mut candidate_collector = TopDocsCollector::new(k, 0)?;
-                candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
-                let pruning_stats = candidate
-                    .union_pruning_stats()
-                    .expect("top-level union retains pruning stats");
-                let candidate_hits = candidate_collector.finish()?.hits;
-                assert_hits_bit_exact(&candidate_hits, &oracle_hits);
-                assert_eq!(pruning_stats.max_score_windows, 0);
-                assert!(
-                    pruning_stats.block_max_wand_windows > 0,
-                    "seed {seed}, k {k} silently fell back"
-                );
+            for record_option in [TermRecordOption::WithFreqs, TermRecordOption::Basic] {
+                for k in [1, 10, 100, 1_000] {
+                    let mut oracle = sealed_union_with_record_option(
+                        &posting_lists,
+                        None,
+                        field,
+                        &snapshot,
+                        &rows_by_term,
+                        &boosts,
+                        NUM_DOCS,
+                        record_option,
+                    )?;
+                    let mut oracle_collector = TopDocsCollector::new(k, 0)?;
+                    oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+                    let oracle_hits = oracle_collector.finish()?.hits;
+                    let mut candidate = sealed_union_with_record_option(
+                        &posting_lists,
+                        Some(&block_max),
+                        field,
+                        &snapshot,
+                        &rows_by_term,
+                        &boosts,
+                        NUM_DOCS,
+                        record_option,
+                    )?;
+                    let mut candidate_collector = TopDocsCollector::new(k, 0)?;
+                    candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+                    let pruning_stats = candidate
+                        .union_pruning_stats()
+                        .expect("top-level union retains pruning stats");
+                    let candidate_hits = candidate_collector.finish()?.hits;
+                    assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+                    assert_eq!(pruning_stats.max_score_windows, 0);
+                    assert!(
+                        pruning_stats.block_max_wand_windows > 0,
+                        "{record_option:?} seed {seed}, k {k} silently fell back"
+                    );
+                }
             }
         }
         Ok(())

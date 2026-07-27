@@ -31,7 +31,7 @@ use crate::argus::{
     DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
     PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
-    TermScorer, TopDocsCollector,
+    TermRecordOption, TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
@@ -6240,6 +6240,26 @@ fn query_field_kind(
     query_field_descriptor(schema, field_ord).map(|field| field.kind)
 }
 
+fn term_record_option(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<TermRecordOption, QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::Keyword
+        | FieldKind::Text {
+            positions: false, ..
+        } => Ok(TermRecordOption::Basic),
+        FieldKind::Text {
+            positions: true, ..
+        } => Ok(TermRecordOption::WithFreqsAndPositions),
+        FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
+            Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("term scorer names non-string field {field_ord}"),
+            })
+        }
+    }
+}
+
 fn query_field_descriptor(
     schema: SchemaDescriptor,
     field_ord: u16,
@@ -6838,13 +6858,14 @@ fn lower_leaf_term<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
     let doc_freq = checkpointed_snapshot_doc_freq(checkpoint, snapshot, field_ord, term)?;
+    let record_option = term_record_option(schema, field_ord)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             let (cursor, fieldnorms) =
                 open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
             let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
-            build_term_scorer(cursor, fieldnorms, stats, doc_freq, boost)
+            build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
         }
         QueryLeaf::Delta(delta) => {
             let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
@@ -6854,6 +6875,7 @@ fn lower_leaf_term<'a>(
                 DeltaFieldNorms::new(delta, field_ord),
                 stats,
                 doc_freq,
+                record_option,
                 boost,
             )
         }
@@ -6988,7 +7010,14 @@ fn lower_term(
     let doc_freq = snapshot_doc_freq(snapshot, schema, field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+    build_term_scorer(
+        cursor,
+        norms,
+        stats,
+        doc_freq,
+        term_record_option(schema, field_ord)?,
+        boost,
+    )
 }
 
 fn build_term_scorer<'a, C, F>(
@@ -6996,6 +7025,7 @@ fn build_term_scorer<'a, C, F>(
     fieldnorms: F,
     stats: SnapshotFieldStats,
     snapshot_doc_freq: u64,
+    record_option: TermRecordOption,
     boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError>
 where
@@ -7007,6 +7037,7 @@ where
         fieldnorms,
         Bm25FieldSnapshot::new(stats)?,
         snapshot_doc_freq,
+        record_option,
         boost,
     )?))
 }
@@ -7026,7 +7057,14 @@ fn lower_composite_sealed_term(
     let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+    build_term_scorer(
+        cursor,
+        norms,
+        stats,
+        doc_freq,
+        term_record_option(schema, field_ord)?,
+        boost,
+    )
 }
 
 #[cfg(test)]
@@ -7046,6 +7084,7 @@ fn lower_delta_term<'a>(
         DeltaFieldNorms::new(delta, field_ord),
         stats,
         doc_freq,
+        term_record_option(delta.schema(), field_ord)?,
         boost,
     )
 }
@@ -7793,6 +7832,20 @@ mod tests {
         document_id: &str,
         content: &str,
     ) {
+        let content_has_positions = delta
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.id == CONTENT_FIELD)
+            .is_some_and(|field| {
+                matches!(
+                    field.kind,
+                    FieldKind::Text {
+                        positions: true,
+                        ..
+                    }
+                )
+            });
         let mut term_positions = BTreeMap::<&str, Vec<u32>>::new();
         for (position, term) in content.split_ascii_whitespace().enumerate() {
             term_positions.entry(term).or_default().push(
@@ -7837,7 +7890,7 @@ mod tests {
                 field_ord: CONTENT_FIELD,
                 term: term.as_bytes(),
                 frequency: u32::try_from(positions.len()).expect("fixture frequency fits u32"),
-                positions: Some(positions),
+                positions: content_has_positions.then_some(positions.as_slice()),
             });
         }
         let ordinal = u64::from(global_docid).to_le_bytes();
@@ -11920,6 +11973,65 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn basic_record_option_scores_and_bounds_repeated_delta_occurrences_as_presence() {
+        let keeper = Arc::new(
+            KeeperSnapshot::in_memory(POSITIONLESS_QG_SCHEMA)
+                .expect("genesis positionless Keeper snapshot"),
+        );
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta =
+            DeltaSegment::new(POSITIONLESS_QG_SCHEMA, 0, usize::MAX).expect("Basic Delta shard");
+        apply_tokenized_delta_document(&mut delta, 0, "repeat", "token token neutral");
+        apply_tokenized_delta_document(&mut delta, 1, "single", "token single neutral");
+        let frozen = Arc::new(delta.freeze(generation));
+        let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+            .expect("positionless Delta composite snapshot");
+        let stats = composite
+            .bm25_field_stats(CONTENT_FIELD)
+            .expect("positionless Delta content statistics");
+        assert_eq!((stats.total_tokens, stats.doc_count), (6, 2));
+        assert_eq!(
+            composite
+                .bm25_doc_freq(CONTENT_FIELD, b"token")
+                .expect("positionless Delta token document frequency"),
+            2
+        );
+
+        let mut cursor = DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"token")
+            .expect("positionless Delta token cursor");
+        assert_eq!((cursor.doc(), cursor.freq()), (Some(0), Some(1)));
+        assert!(cursor.positions_handle().is_none());
+        assert_eq!(cursor.next().expect("advance Basic Delta cursor"), Some(1));
+        assert_eq!(cursor.freq(), Some(1));
+        assert!(cursor.positions_handle().is_none());
+
+        let average = stats
+            .average_field_length()
+            .expect("non-empty positionless Delta average");
+        let weight = crate::contract::idf(2, 2) * (1.0 + crate::contract::BM25_K1);
+        let bound = cursor
+            .term_score_upper_bound(average, weight, TermRecordOption::Basic)
+            .expect("positionless Delta term bound");
+        let mut scorer = lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"token", 1.0)
+            .expect("positionless Delta term scorer");
+        let repeated_score = scorer.score().expect("score repeated Delta occurrence");
+        assert_eq!(
+            repeated_score.to_bits(),
+            bound.to_bits(),
+            "Delta Basic term bound must use the scorer's effective tf=1"
+        );
+        assert_eq!(scorer.next().expect("advance Basic Delta scorer"), Some(1));
+        let single_score = scorer.score().expect("score single Delta occurrence");
+        assert_eq!(
+            repeated_score.to_bits(),
+            single_score.to_bits(),
+            "Delta Basic postings score document presence, not retained raw frequency"
+        );
+        assert_eq!(scorer.next().expect("exhaust Basic Delta scorer"), None);
+    }
+
     #[test]
     fn delta_and_sealed_term_cursors_have_rank_exact_corpus_parity() {
         run_with_cx(|cx| async move {
@@ -13085,6 +13197,169 @@ mod tests {
             assert!(
                 phrase.hits.iter().any(|hit| hit.document_id == "rust-1"),
                 "the positioned control must exercise a real phrase hit"
+            );
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_basic_scoring_uses_presence_for_repeated_edge_ngrams() {
+        run_with_cx(|cx| async move {
+            let positioned =
+                QuillIndex::in_memory_with_schema(POSITIONED_QG_SCHEMA, deterministic_config())
+                    .expect("construct the positioned control");
+            let positionless =
+                QuillIndex::in_memory_with_schema(POSITIONLESS_QG_SCHEMA, deterministic_config())
+                    .expect("construct the Basic fixture");
+            assert!(
+                positionless
+                    .search_paginated(&cx, "token", 10, 0, true)
+                    .expect("search empty Basic fixture")
+                    .hits
+                    .is_empty(),
+                "an empty Basic field must have no term hits"
+            );
+            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
+            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
+            assert_eq!(
+                repeated.split_whitespace().count(),
+                single.split_whitespace().count(),
+                "control documents must retain equal field lengths"
+            );
+            let documents = vec![
+                IndexableDocument::new("repeat", repeated).with_title("neutral"),
+                IndexableDocument::new("single", single).with_title("neutral"),
+            ];
+            positioned
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index positioned control documents");
+            positionless
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index Basic fixture documents");
+            let assert_record_semantics = |positioned: &QuillSearchResult,
+                                           positionless: &QuillSearchResult,
+                                           phase: &str| {
+                let score = |result: &QuillSearchResult, document_id: &str| {
+                    result
+                        .hits
+                        .iter()
+                        .find(|hit| hit.document_id == document_id)
+                        .unwrap_or_else(|| panic!("{phase}: missing {document_id} hit"))
+                        .score
+                };
+                let basic_repeat = score(positionless, "repeat");
+                let basic_single = score(positionless, "single");
+                let positioned_repeat = score(positioned, "repeat");
+                let positioned_single = score(positioned, "single");
+
+                assert_eq!(
+                    basic_repeat.to_bits(),
+                    basic_single.to_bits(),
+                    "{phase}: Basic postings score document presence, not retained raw frequency"
+                );
+                assert_eq!(
+                    basic_single.to_bits(),
+                    positioned_single.to_bits(),
+                    "{phase}: a unit frequency is unchanged across record options"
+                );
+                assert!(
+                    positioned_repeat > positioned_single,
+                    "{phase}: frequency-bearing postings retain the repeated edge n-gram boost"
+                );
+            };
+
+            positioned
+                .commit(&cx)
+                .await
+                .expect("publish positioned control");
+            positionless
+                .commit(&cx)
+                .await
+                .expect("publish Basic fixture");
+
+            let positioned = positioned
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search positioned control");
+            let positionless = positionless
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search Basic fixture");
+            assert_record_semantics(&positioned, &positionless, "sealed");
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_basic_scoring_survives_multiple_segments_and_reopen() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Basic scoring directory");
+            let writer = QuillWriterState::create_with_schema(
+                &cx,
+                directory.path(),
+                POSITIONLESS_QG_SCHEMA,
+                deterministic_config(),
+            )
+            .await
+            .expect("create durable Basic writer");
+            let index = QuillIndex::from_writer(writer);
+            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
+            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
+
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("repeat", repeated).with_title("neutral"),
+                )
+                .await
+                .expect("index repeated edge n-gram segment");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish first Basic segment");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("single", single).with_title("neutral"),
+                )
+                .await
+                .expect("index single edge n-gram segment");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish second Basic segment");
+            assert_eq!(
+                index.snapshot().segments().len(),
+                2,
+                "fixture must exercise composite scoring across two sealed segments"
+            );
+
+            let before_reopen = index
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search two-segment Basic fixture");
+            assert_eq!(before_reopen.hits.len(), 2);
+            assert_eq!(
+                before_reopen.hits[0].score.to_bits(),
+                before_reopen.hits[1].score.to_bits(),
+                "Basic tf=1 must remain exact across sealed segments"
+            );
+
+            drop(index);
+            let writer = KeeperWriter::open(&cx, directory.path(), POSITIONLESS_QG_SCHEMA)
+                .await
+                .expect("reopen custom-schema Keeper");
+            let reopened = QuillIndex::from_backend(
+                IndexBackend::Durable(writer),
+                POSITIONLESS_QG_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("bind reopened Basic index");
+            let after_reopen = reopened
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search reopened Basic fixture");
+            assert_eq!(
+                after_reopen, before_reopen,
+                "reopen must preserve Basic ids, order, score bits, and exact count"
             );
         });
     }

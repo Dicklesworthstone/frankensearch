@@ -83,6 +83,7 @@
         "query_canonicalization",
         "oracle_bug",
         "stats_semantics",
+        "posting_record_semantics",
         "unicode_edge",
         "oversized_query_token"
       ]

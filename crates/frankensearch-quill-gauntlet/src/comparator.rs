@@ -1023,7 +1023,10 @@ fn observe_search_error(error: &SearchError) -> LexicalErrorObservation {
         SearchError::ModelLoadFailed { path: _, source: _ } => {
             (LexicalErrorClass::Embedding, "model_load_failed".to_owned())
         }
-        SearchError::UnverifiableRemoteSpace { producer: _, reason: _ } => (
+        SearchError::UnverifiableRemoteSpace {
+            producer: _,
+            reason: _,
+        } => (
             LexicalErrorClass::Integrity,
             "unverifiable_remote_space".to_owned(),
         ),
@@ -1394,6 +1397,11 @@ pub enum DivergenceClass {
     QueryCanonicalization,
     OracleBug,
     StatsSemantics,
+    /// The field record option changes which stored posting statistics are
+    /// semantically observable. `Basic` fields, for example, require
+    /// effective tf=1 in both final scores and every pruning upper bound.
+    /// This class is fix-only and must never be accepted as oracle variance.
+    PostingRecordSemantics,
     UnicodeEdge,
     OversizedQueryToken,
 }
@@ -1413,7 +1421,8 @@ impl DivergenceClass {
             Self::RankMismatch
             | Self::SnippetMismatch
             | Self::CountMismatch
-            | Self::DocumentCountMismatch => true,
+            | Self::DocumentCountMismatch
+            | Self::PostingRecordSemantics => true,
         }
     }
 }
@@ -2480,6 +2489,16 @@ mod tests {
             assert_eq!(report.divergences.len(), 1);
             assert_eq!(report.divergences[0].class, expected_class);
         }
+    }
+
+    #[test]
+    fn posting_record_semantics_is_serialized_and_fix_only() {
+        let class = DivergenceClass::PostingRecordSemantics;
+        assert!(class.is_failure());
+        assert_eq!(
+            serde_json::to_string(&class).expect("serialize divergence class"),
+            "\"posting_record_semantics\""
+        );
     }
 
     #[test]

@@ -858,6 +858,7 @@ impl DivergenceDisposition {
                         | DivergenceClass::SnippetMismatch
                         | DivergenceClass::CountMismatch
                         | DivergenceClass::DocumentCountMismatch
+                        | DivergenceClass::PostingRecordSemantics
                 );
                 if raw_failure_class
                     || !is_bounded_register_text(
@@ -1445,7 +1446,7 @@ impl DivergenceRegisterLedger {
     }
 }
 
-const DIVERGENCE_CLASSES: [DivergenceClass; 13] = [
+const DIVERGENCE_CLASSES: [DivergenceClass; 14] = [
     DivergenceClass::TieOrder,
     DivergenceClass::ScoreEpsilon,
     DivergenceClass::RankMismatch,
@@ -1457,6 +1458,7 @@ const DIVERGENCE_CLASSES: [DivergenceClass; 13] = [
     DivergenceClass::QueryCanonicalization,
     DivergenceClass::OracleBug,
     DivergenceClass::StatsSemantics,
+    DivergenceClass::PostingRecordSemantics,
     DivergenceClass::UnicodeEdge,
     DivergenceClass::OversizedQueryToken,
 ];
@@ -1495,6 +1497,7 @@ const fn divergence_class_name(class: DivergenceClass) -> &'static str {
         DivergenceClass::QueryCanonicalization => "query_canonicalization",
         DivergenceClass::OracleBug => "oracle_bug",
         DivergenceClass::StatsSemantics => "stats_semantics",
+        DivergenceClass::PostingRecordSemantics => "posting_record_semantics",
         DivergenceClass::UnicodeEdge => "unicode_edge",
         DivergenceClass::OversizedQueryToken => "oversized_query_token",
     }
@@ -3155,6 +3158,7 @@ fn is_auto_class(class: DivergenceClass) -> bool {
         | DivergenceClass::QueryCanonicalization
         | DivergenceClass::OracleBug
         | DivergenceClass::StatsSemantics
+        | DivergenceClass::PostingRecordSemantics
         | DivergenceClass::UnicodeEdge
         | DivergenceClass::OversizedQueryToken => false,
     }
@@ -3433,7 +3437,8 @@ fn mismatch_cause_shape(divergence: &Divergence) -> String {
     match divergence.class {
         DivergenceClass::TieOrder
         | DivergenceClass::ScoreEpsilon
-        | DivergenceClass::RankMismatch => format!(
+        | DivergenceClass::RankMismatch
+        | DivergenceClass::PostingRecordSemantics => format!(
             "rank:{}:{}",
             rank_value(&divergence.oracle),
             rank_value(&divergence.subject)
@@ -3499,6 +3504,7 @@ const fn divergence_class_tag(class: DivergenceClass) -> u8 {
         DivergenceClass::OracleBug => 10,
         DivergenceClass::StatsSemantics => 11,
         DivergenceClass::UnicodeEdge => 12,
+        DivergenceClass::PostingRecordSemantics => 13,
     }
 }
 
@@ -4967,6 +4973,13 @@ fn auto_triage(target: DivergenceClass, report: &ComparisonReport) -> TriageVerd
                 evidence.push("reviewed snapshot-statistics divergence present".to_owned());
                 (SuspectedLayer::FieldNormArithmetic, TriageConfidence::High)
             }
+            DivergenceClass::PostingRecordSemantics => {
+                evidence.push(
+                    "posting record option disagrees with scorer or pruning-bound frequency"
+                        .to_owned(),
+                );
+                (SuspectedLayer::FieldNormArithmetic, TriageConfidence::High)
+            }
             DivergenceClass::OversizedQueryToken => unreachable!("covered above"),
         }
     };
@@ -5917,6 +5930,12 @@ mod tests {
         assert!(
             entry(DivergenceClass::RankMismatch).validate().is_err(),
             "generic result mismatch must never become a register wildcard"
+        );
+        assert!(
+            entry(DivergenceClass::PostingRecordSemantics)
+                .validate()
+                .is_err(),
+            "posting record semantics are fix-only and must never become an accepted wildcard"
         );
     }
 
@@ -8714,6 +8733,17 @@ mod tests {
         let verdict = auto_triage(DivergenceClass::TieOrder, &report);
         assert_eq!(verdict.suspected_layer, SuspectedLayer::TieOrder);
         assert_eq!(verdict.confidence, TriageConfidence::High);
+
+        let verdict = auto_triage(DivergenceClass::PostingRecordSemantics, &report);
+        assert_eq!(verdict.suspected_layer, SuspectedLayer::FieldNormArithmetic);
+        assert_eq!(verdict.confidence, TriageConfidence::High);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .any(|line| line.contains("record option")),
+            "posting-record triage must retain the fix-only root-cause hint"
+        );
     }
 
     #[test]
