@@ -379,7 +379,10 @@ pub use frankensearch_rerank::FastEmbedReranker;
 // ─── IndexBuilder convenience API ────────────────────────────────────────────
 
 mod index_builder;
-pub use index_builder::{IndexBuildStats, IndexBuilder, IndexProgress};
+pub use index_builder::{
+    HybridIndexParts, IndexBuildStats, IndexBuilder, IndexProgress, IndexSizeBreakdown,
+    LexicalArmReceipt, open_hybrid,
+};
 
 // ─── Prelude ────────────────────────────────────────────────────────────────
 
