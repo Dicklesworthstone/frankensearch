@@ -9,7 +9,13 @@ Conventions:
 - **Workload** = the exact bench id (`cargo bench` group/function) measured head-to-head.
 - **Ratio** = new_time / old_time. `< 1.0` is a speedup, `> 1.0` is a regression.
 - A lever is **reverted** if ratio ∈ [0.97, 1.03] (noise) or > 1.03 (regression).
-- Wins (ratio < 0.97, kept) go in `docs/PERF_LEDGER.md`, not here.
+- Kept results go in `docs/PERF_LEDGER.md` with an explicit comparison class.
+  In-repo before/after results are `SELF-SPEEDUP` maintenance. Only a named
+  actual legacy incumbent run side-by-side with the candidate in the same
+  invocation is an `INCUMBENT` comparison eligible for campaign or
+  competitive use.
+- A generic proxy, stored baseline, separate invocation, previous commit,
+  `HEAD`, `OLD`, or in-repo `ORIG` arm is not an incumbent win.
 
 ### 2026-07-17 — Quiver global `wide::u32x8` postings unpack policy (`bd-quill-e2-grimoire-quiver-accg.2`, BeigeHorse)
 
