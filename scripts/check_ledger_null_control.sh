@@ -347,7 +347,9 @@ coefficient of variation[_ -]*gate/ ||
       }
 
       checked++
-      upper = toupper(header)
+      # Verdict-bearing body lines are authoritative too. A neutral heading
+      # with "Decision: KEEP" must not bypass KEEP admission.
+      upper = toupper(header "\n" decision_lines)
       explicit_reject = (upper ~ /REJECT|REFUT|NO[- ]?SHIP|NO[- ]?LAND|\
 NOT A (WIN|LEVER)|REGRESS|WASH/)
       explicit_keep = (upper ~ /KEEP|LANDED|SHIPPED|MEASURED WIN/)
@@ -592,6 +594,13 @@ ELF sha256: ${sha}
 A/A null: 1.000 [0.990, 1.010], same invocation
 Incumbent ratio: 0.900.
 Invocation: candidate and incumbent ran side-by-side in the same invocation." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only KEEP without class is blocked" 2 "${ledger}" $"### 2099-01-12 — synthetic body-level verdict
+ELF sha256: ${sha}
+Decision: KEEP." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only SELF-SPEEDUP is admitted" 0 "${ledger}" $"### 2099-01-13 — synthetic body-level maintenance
+Comparison class: SELF-SPEEDUP
+ELF sha256: ${sha}
+Decision: KEEP." || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
