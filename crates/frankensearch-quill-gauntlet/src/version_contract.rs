@@ -14,8 +14,8 @@ const TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
 const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
-    0x2c, 0x31, 0x3c, 0x1c, 0xf8, 0x96, 0x78, 0x8f, 0x49, 0x2c, 0x6b, 0x79, 0x79, 0x52, 0x65, 0xab,
-    0xd2, 0x5b, 0x1d, 0x00, 0x10, 0x5f, 0xd7, 0x15, 0x9a, 0x98, 0xe1, 0x15, 0x48, 0x2f, 0x95, 0x26,
+    0x16, 0xd4, 0x4d, 0xf2, 0x13, 0x28, 0x25, 0xa5, 0x06, 0x7e, 0x49, 0x5c, 0xb5, 0x3d, 0x03, 0x38,
+    0xe5, 0xca, 0x5a, 0xf1, 0xc8, 0xe7, 0xaa, 0x07, 0x4b, 0x80, 0x94, 0x8c, 0xf3, 0x80, 0x00, 0x9c,
 ];
 
 /// Committed provenance contract for the shipping Tantivy oracle adapter.
@@ -60,7 +60,7 @@ impl OracleVersionContract {
     }
 }
 
-/// One Q1 obligation with an honest executable-or-deferred state.
+/// One Q1 obligation with its executable enforcement surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q1Fixture {
@@ -70,7 +70,7 @@ pub struct Q1Fixture {
     pub assertion: String,
 }
 
-/// Committed catalog of pending Q1 obligations and live internal differentials.
+/// Committed catalog of executable Q1 obligations and live internal differentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q1FixtureCatalog {
@@ -122,8 +122,7 @@ pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError>
 /// # Errors
 ///
 /// Returns an error when IDs are missing, duplicated, reordered, assigned an
-/// unknown status, or when the executable normative set differs from the
-/// bounded E3.5 acceptance surface.
+/// unknown status, or when any normative Q1 obligation is not executable.
 pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
     let catalog: Q1FixtureCatalog = serde_json::from_str(Q1_FIXTURE_CATALOG_JSON)?;
     let catalog_hash = Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes());
@@ -131,14 +130,14 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5", "Q1-OB6",
     ];
     const EXPECTED_STATUSES: [&str; 8] = [
-        "deferred",
         "executable",
         "executable",
         "executable",
         "executable",
-        "deferred",
-        "deferred",
-        "deferred",
+        "executable",
+        "executable",
+        "executable",
+        "executable",
     ];
     let ids = catalog
         .fixtures
@@ -173,7 +172,7 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || internal[0].assertion.is_empty()
     {
         return Err(GauntletError::InvalidContract {
-            reason: "fixture catalog must contain eight ordered Q1 rows with exactly OB2a, OB2b, OB2c, and OB3 executable, plus the executable Quiver differential"
+            reason: "fixture catalog must contain eight ordered executable Q1 rows plus the executable Quiver differential"
                 .to_owned(),
         });
     }
@@ -700,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn q1_catalog_promotes_e35_obligations_and_runs_live_merge_subfixtures() {
+    fn q1_catalog_marks_every_obligation_executable_and_runs_live_merge_subfixtures() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
             assert_eq!(
@@ -715,7 +714,10 @@ mod tests {
                     .filter(|fixture| fixture.status == "executable")
                     .map(|fixture| fixture.id.as_str())
                     .collect::<Vec<_>>(),
-                ["Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3"]
+                [
+                    "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5",
+                    "Q1-OB6",
+                ]
             );
             assert_eq!(
                 run_q1_live_fixtures(&cx).await.expect("live Q1 fixtures"),
