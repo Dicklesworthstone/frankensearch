@@ -621,7 +621,13 @@ impl FileProtector {
         let mmap = if len == 0 {
             None
         } else {
-            // SAFETY: mmap is read-only.
+            // SAFETY: read-only access is not what makes this sound — the
+            // hazard is another process truncating or rewriting the file
+            // while the mapping is live, mutating bytes behind a live
+            // `&[u8]`. Rust cannot express that cross-process invariant, so
+            // no safe wrapper exists. It is upheld by verification: these
+            // bytes are checked against a recorded digest before use, so a
+            // concurrent writer produces a verification failure.
             Some(unsafe { Mmap::map(&file).map_err(SearchError::Io)? })
         };
 
@@ -698,6 +704,16 @@ impl FileProtector {
                     // Bit-rot case: avoid feeding corrupted symbols, rely on repair symbols.
                     Vec::new()
                 } else {
+                    // SAFETY: `Mmap::map` is unsafe because the kernel lets any other
+                    // process truncate or rewrite the file while this mapping is
+                    // live, which would mutate bytes behind a live `&[u8]`. Rust
+                    // cannot express that invariant: it is an OS-level property
+                    // spanning processes, which is why no crate offers a safe
+                    // wrapper. Here it is upheld by the repair contract rather
+                    // than by exclusion — every byte read through this mapping is
+                    // re-validated against the trailer's CRC32 and xxh3 witnesses
+                    // before anything is published, so a concurrent writer causes
+                    // a verification failure, never a silent bad repair.
                     let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                     source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
                 }
@@ -847,6 +863,16 @@ impl FileProtector {
                         decoded_trailer,
                     )
                 } else {
+                    // SAFETY: `Mmap::map` is unsafe because the kernel lets any other
+                    // process truncate or rewrite the file while this mapping is
+                    // live, which would mutate bytes behind a live `&[u8]`. Rust
+                    // cannot express that invariant: it is an OS-level property
+                    // spanning processes, which is why no crate offers a safe
+                    // wrapper. Here it is upheld by the repair contract rather
+                    // than by exclusion — every byte read through this mapping is
+                    // re-validated against the trailer's CRC32 and xxh3 witnesses
+                    // before anything is published, so a concurrent writer causes
+                    // a verification failure, never a silent bad repair.
                     let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                     let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
                     let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
@@ -933,6 +959,16 @@ impl FileProtector {
                     Vec::new()
                 } else {
                     // Truncation case: we need the valid prefix.
+                    // SAFETY: `Mmap::map` is unsafe because the kernel lets any other
+                    // process truncate or rewrite the file while this mapping is
+                    // live, which would mutate bytes behind a live `&[u8]`. Rust
+                    // cannot express that invariant: it is an OS-level property
+                    // spanning processes, which is why no crate offers a safe
+                    // wrapper. Here it is upheld by the repair contract rather
+                    // than by exclusion — every byte read through this mapping is
+                    // re-validated against the trailer's CRC32 and xxh3 witnesses
+                    // before anything is published, so a concurrent writer causes
+                    // a verification failure, never a silent bad repair.
                     let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                     source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
                 }

@@ -181,7 +181,13 @@ impl FsviProtector {
         let actual_hash = if len == 0 {
             xxh3_64(&[])
         } else {
-            // SAFETY: mmap is read-only.
+            // SAFETY: read-only access is not what makes this sound — the
+            // hazard is another process truncating or rewriting the file
+            // while the mapping is live, mutating bytes behind a live
+            // `&[u8]`. Rust cannot express that cross-process invariant, so
+            // no safe wrapper exists. It is upheld by verification: these
+            // bytes are checked against a recorded digest before use, so a
+            // concurrent writer produces a verification failure.
             let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
             xxh3_64(&mmap)
         };
@@ -244,6 +250,15 @@ impl FsviProtector {
                 let hash_before = if len == 0 {
                     xxh3_64(&[])
                 } else {
+                    // SAFETY: `Mmap::map` is unsafe because another process may
+                    // truncate or rewrite the file while the mapping is live,
+                    // mutating bytes behind a live `&[u8]`. That invariant is an
+                    // OS-level, cross-process property Rust cannot express, which
+                    // is why no crate wraps it safely. It is upheld here by the
+                    // verification contract, not by exclusion: the digest computed
+                    // from these bytes is checked against the recorded witness
+                    // before the artifact is accepted, so a concurrent writer
+                    // yields a verification failure rather than a bad accept.
                     let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
                     xxh3_64(&mmap)
                 };
@@ -294,6 +309,15 @@ impl FsviProtector {
                 let hash_after = if repaired_len == 0 {
                     xxh3_64(&[])
                 } else {
+                    // SAFETY: `Mmap::map` is unsafe because another process may
+                    // truncate or rewrite the file while the mapping is live,
+                    // mutating bytes behind a live `&[u8]`. That invariant is an
+                    // OS-level, cross-process property Rust cannot express, which
+                    // is why no crate wraps it safely. It is upheld here by the
+                    // verification contract, not by exclusion: the digest computed
+                    // from these bytes is checked against the recorded witness
+                    // before the artifact is accepted, so a concurrent writer
+                    // yields a verification failure rather than a bad accept.
                     let mmap = unsafe { Mmap::map(&repaired_file).map_err(SearchError::Io)? };
                     xxh3_64(&mmap)
                 };
