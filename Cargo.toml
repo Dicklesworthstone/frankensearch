@@ -131,7 +131,7 @@ tantivy = "=0.26.1"
 ndarray = "0.17"
 
 # HNSW approximate nearest neighbors
-hnsw_rs = "0.3"
+hnsw_rs = { git = "https://github.com/Dicklesworthstone/hnswlib-rs", rev = "18a5a1a9982138822c34d4c3fb29f4c883715069", default-features = false }
 
 # CRC32 checksums for FSVI index integrity
 crc32fast = "1"

@@ -25,13 +25,14 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ahash::AHashMap;
+use frankensearch_core::config::{ZeroSignalReason, ZeroSignalState};
 use frankensearch_core::filter::{BuildIdentityHasherU64, SearchFilter, fnv1a_hash};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
 use rayon::prelude::*;
 
 use crate::VectorIndex;
-use crate::search::{PARALLEL_CHUNK_SIZE, SearchParams};
+use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
 use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
 
 /// Fully-resident in-memory vector index with f16 quantization.
@@ -289,6 +290,88 @@ impl InMemoryVectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<Vec<VectorHit>> {
         self.search_top_k_with_params(query, limit, filter, SearchParams::default())
+    }
+
+    /// Compute the zero-signal census for this in-memory index.
+    ///
+    /// The in-memory index has no tombstones and no WAL, so `live_count`
+    /// equals `record_count` and both WAL-derived states are structurally
+    /// unreachable. O(n·dim); intended for lazy classification of empty
+    /// results, not the hot path.
+    #[must_use]
+    pub fn zero_signal_state(&self) -> ZeroSignalState {
+        let record_count = self.record_count();
+        let mut usable_vector_count = 0usize;
+        for row in 0..record_count {
+            let start = row * self.dimension;
+            let row_slice = &self.vectors[start..start + self.dimension];
+            let mut norm_sq = 0.0_f32;
+            let mut finite = true;
+            for &value in row_slice {
+                let value = value.to_f32();
+                if !value.is_finite() {
+                    finite = false;
+                    break;
+                }
+                norm_sq += value * value;
+            }
+            if finite && norm_sq > 0.0 && norm_sq.is_finite() {
+                usable_vector_count += 1;
+            }
+        }
+        ZeroSignalState {
+            record_count,
+            live_count: record_count,
+            tombstone_count: 0,
+            wal_count: 0,
+            usable_vector_count,
+        }
+    }
+
+    /// Brute-force top-k with typed zero-signal classification.
+    ///
+    /// Mirrors [`VectorIndex::search_top_k_classified`] exactly (bd-tqhc
+    /// requires the in-memory and file-backed paths to classify equivalent
+    /// states identically): non-finite queries are rejected fail-closed and
+    /// an empty result always carries a typed [`ZeroSignalReason`].
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::search_top_k`] returns, plus
+    /// [`SearchError::InvalidConfig`] for non-finite query vectors.
+    pub fn search_top_k_classified(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<ClassifiedHits> {
+        if query.len() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: query.len(),
+            });
+        }
+        if limit == 0 {
+            return Ok(ClassifiedHits::empty(
+                ZeroSignalReason::CallerRequestedZeroK,
+            ));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "query".to_owned(),
+                value: "<contains non-finite values>".to_owned(),
+                reason: "query vector must be finite".to_owned(),
+            });
+        }
+        if query.iter().all(|&value| value == 0.0) {
+            return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
+        }
+        let hits = self.search_top_k(query, limit, filter)?;
+        let zero_signal = hits.is_empty().then(|| {
+            self.zero_signal_state()
+                .empty_result_reason(filter.is_some())
+        });
+        Ok(ClassifiedHits { hits, zero_signal })
     }
 
     /// Brute-force top-k search with configurable parallelism.
@@ -1017,6 +1100,26 @@ impl InMemoryTwoTierIndex {
     /// Propagates errors from [`InMemoryVectorIndex::search_top_k`].
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> SearchResult<Vec<VectorHit>> {
         self.fast_index.search_top_k(query_vec, k, None)
+    }
+
+    /// Search the fast tier with typed zero-signal classification.
+    ///
+    /// Mirrors [`crate::TwoTierIndex::search_fast_classified`] so in-memory
+    /// and persistent two-tier paths classify equivalent states identically
+    /// (bd-tqhc). The in-memory variant performs no transition logging: its
+    /// indexes are ephemeral, and the once-per-generation logging bound is
+    /// owned by the persistent path.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::search_fast`] returns, plus
+    /// [`SearchError::InvalidConfig`] for non-finite query vectors.
+    pub fn search_fast_classified(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+    ) -> SearchResult<ClassifiedHits> {
+        self.fast_index.search_top_k_classified(query_vec, k, None)
     }
 
     /// Search the fast tier with configurable parallelism.

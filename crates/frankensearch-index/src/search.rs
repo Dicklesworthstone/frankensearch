@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use ahash::AHashSet;
 
+use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::{DocIdHashSet, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
@@ -55,6 +56,31 @@ impl Default for SearchParams {
             parallel_threshold: PARALLEL_THRESHOLD,
             parallel_chunk_size: PARALLEL_CHUNK_SIZE,
             parallel_enabled: parallel_search_enabled(),
+        }
+    }
+}
+
+/// A top-k result plus a typed classification when it is empty.
+///
+/// The invariant `zero_signal.is_some() == hits.is_empty()` lets callers
+/// distinguish a legitimately empty answer (benign request/state outcome)
+/// from an unusable semantic lane (availability failure) without inferring
+/// anything from bare emptiness.
+#[derive(Debug, Clone)]
+pub struct ClassifiedHits {
+    /// Ranked hits, best first. May be empty.
+    pub hits: Vec<VectorHit>,
+    /// `Some(reason)` if and only if `hits` is empty.
+    pub zero_signal: Option<ZeroSignalReason>,
+}
+
+impl ClassifiedHits {
+    /// An empty result with its typed reason.
+    #[must_use]
+    pub const fn empty(reason: ZeroSignalReason) -> Self {
+        Self {
+            hits: Vec::new(),
+            zero_signal: Some(reason),
         }
     }
 }
@@ -177,6 +203,139 @@ impl VectorIndex {
             PARALLEL_CHUNK_SIZE,
             parallel_search_enabled(),
         )
+    }
+
+    /// Brute-force top-k with typed zero-signal classification.
+    ///
+    /// Behaves like [`Self::search_top_k`] with two fail-closed differences
+    /// that align the exact path with the ANN path:
+    /// - a query containing NaN or infinite components is rejected with
+    ///   [`SearchError::InvalidConfig`] instead of silently scoring garbage
+    ///   (parity with `HnswIndex`);
+    /// - an empty result always carries a typed
+    ///   [`ZeroSignalReason`], so a legitimate empty answer is
+    ///   distinguishable from an unusable semantic lane.
+    ///
+    /// Classification is lazy: the non-empty path costs nothing extra, and
+    /// an empty result pays one census pass comparable to the scan that
+    /// just ran.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::search_top_k`] returns, plus
+    /// [`SearchError::InvalidConfig`] for non-finite query vectors.
+    pub fn search_top_k_classified(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<ClassifiedHits> {
+        self.ensure_query_dimension(query)?;
+        if limit == 0 {
+            return Ok(ClassifiedHits::empty(
+                ZeroSignalReason::CallerRequestedZeroK,
+            ));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "query".to_owned(),
+                value: "<contains non-finite values>".to_owned(),
+                reason: "query vector must be finite".to_owned(),
+            });
+        }
+        if query.iter().all(|&value| value == 0.0) {
+            return Ok(ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery));
+        }
+        let hits = self.search_top_k(query, limit, filter)?;
+        if hits.is_empty() {
+            let reason = self.classify_empty_result(filter.is_some());
+            return Ok(ClassifiedHits {
+                hits,
+                zero_signal: Some(reason),
+            });
+        }
+        Ok(ClassifiedHits {
+            hits,
+            zero_signal: None,
+        })
+    }
+
+    /// Classify why a well-formed search (k > 0, finite non-zero query)
+    /// returned nothing, following the precedence documented on
+    /// [`ZeroSignalReason`].
+    pub(crate) fn classify_empty_result(&self, had_filter: bool) -> ZeroSignalReason {
+        self.zero_signal_state().empty_result_reason(had_filter)
+    }
+
+    /// Exact top-k over the persisted main slab only.
+    ///
+    /// HNSW uses this crate-private lane to repair a native underfill with the
+    /// same quantization decoder, dot-product implementation, tombstone
+    /// semantics, score ordering, physical row identities, and post-top-k
+    /// document-ID deduplication as canonical `VectorIndex` search. Resident
+    /// WAL entries and their supersession rules are deliberately excluded:
+    /// `TwoTierIndex` merges them exactly once after ANN candidate retrieval.
+    #[cfg(feature = "ann")]
+    pub(crate) fn search_main_top_k(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let mut hits = self.search_main_top_k_raw(query, limit)?;
+        let mut seen = AHashSet::with_capacity(hits.len());
+        hits.retain(|hit| seen.insert(hit.doc_id.clone()));
+        Ok(hits)
+    }
+
+    /// Raw physical top-k over the persisted main slab only.
+    ///
+    /// Unlike [`Self::search_main_top_k`], this does not apply document-ID
+    /// deduplication. Neither main-only lane applies resident-WAL supersession.
+    /// `TwoTierIndex` uses this raw lane only when an ANN underfill must be
+    /// repaired before main and WAL candidates are ranked together through the
+    /// canonical result resolver.
+    #[cfg(feature = "ann")]
+    pub(crate) fn search_main_top_k_raw(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let heap = self.scan_main_top_k_heap(query, limit)?;
+        let mut winners = heap.into_vec();
+        winners.sort_unstable_by(compare_best_first);
+        winners
+            .into_iter()
+            .map(|winner| {
+                let index =
+                    u32::try_from(winner.index).map_err(|_| SearchError::InvalidConfig {
+                        field: "index".to_owned(),
+                        value: winner.index.to_string(),
+                        reason: "winner index exceeds u32 range for VectorHit".to_owned(),
+                    })?;
+                Ok(VectorHit {
+                    index,
+                    score: winner.score,
+                    doc_id: self.doc_id_at(winner.index)?.into(),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "ann")]
+    fn scan_main_top_k_heap(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        self.ensure_query_dimension(query)?;
+        if limit == 0 || self.record_count() == 0 {
+            return Ok(BinaryHeap::new());
+        }
+        if parallel_search_enabled() && self.record_count() >= PARALLEL_THRESHOLD {
+            self.scan_parallel(query, limit, None, PARALLEL_CHUNK_SIZE)
+        } else {
+            self.scan_sequential(query, limit, None)
+        }
     }
 
     /// Brute-force cosine-similarity top-k search with configurable parallelism.
@@ -2075,7 +2234,8 @@ mod tests {
         let path = temp_index_path("parallel-match");
         let mut rows = Vec::new();
         for i in 0..64 {
-            let rank = f32::from(u16::try_from(i).expect("test index must fit in u16"));
+            // Start at 1: a zero-norm row would be rejected by the writer gate.
+            let rank = f32::from(u16::try_from(i + 1).expect("test index must fit in u16"));
             rows.push((
                 format!("doc-{i:03}"),
                 vec![rank, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -2108,7 +2268,8 @@ mod tests {
         let path = temp_index_path("parallel-match-filter");
         let mut rows = Vec::new();
         for i in 0..96 {
-            let rank = f32::from(u16::try_from(i).expect("test index must fit in u16"));
+            // Start at 1: a zero-norm row would be rejected by the writer gate.
+            let rank = f32::from(u16::try_from(i + 1).expect("test index must fit in u16"));
             rows.push((
                 format!("doc-{i:03}"),
                 vec![rank, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -2261,6 +2422,205 @@ mod tests {
 
         assert!(zero_limit.is_empty());
         assert!(empty_index.is_empty());
+    }
+
+    // ── search_top_k_classified (bd-tqhc) ───────────────────────────────
+
+    #[test]
+    fn classified_distinguishes_k_zero_from_newly_created_empty() {
+        let path = temp_index_path("classified-kzero-vs-empty");
+        let writer = VectorIndex::create_with_revision(&path, "hash", "test", 4, Quantization::F16)
+            .expect("writer");
+        writer.finish().expect("finish");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let k_zero = index
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 0, None)
+            .expect("k=0 search");
+        assert!(k_zero.hits.is_empty());
+        assert_eq!(
+            k_zero.zero_signal,
+            Some(ZeroSignalReason::CallerRequestedZeroK)
+        );
+
+        let empty = index
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("empty-index search");
+        assert!(empty.hits.is_empty());
+        assert_eq!(
+            empty.zero_signal,
+            Some(ZeroSignalReason::NewlyCreatedEmpty),
+            "an index that never held a record must classify as newly created, \
+             not collapse into the k=0 shape"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_non_finite_query_like_ann_does() {
+        let path = temp_index_path("classified-nonfinite-query");
+        write_index(&path, &[("doc-a", vec![0.1, 0.0, 0.0, 0.0])]).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let err = index
+            .search_top_k_classified(&[f32::NAN, 0.0, 0.0, 0.0], 5, None)
+            .expect_err("non-finite query must fail closed");
+        assert!(
+            matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "query"),
+            "expected InvalidConfig on query, got: {err:?}"
+        );
+
+        // The unclassified lane keeps its legacy behavior (no error), which is
+        // exactly why production flows through the classified lane.
+        index
+            .search_top_k(&[f32::NAN, 0.0, 0.0, 0.0], 5, None)
+            .expect("legacy lane is unchanged");
+    }
+
+    #[test]
+    fn classified_zero_norm_query_is_typed_not_silent() {
+        let path = temp_index_path("classified-zero-norm");
+        write_index(&path, &[("doc-a", vec![0.1, 0.0, 0.0, 0.0])]).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let classified = index
+            .search_top_k_classified(&[0.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("zero-norm search");
+        assert!(classified.hits.is_empty());
+        assert_eq!(
+            classified.zero_signal,
+            Some(ZeroSignalReason::ZeroNormQuery)
+        );
+    }
+
+    #[test]
+    fn classified_filter_eliminating_all_is_distinct_from_empty_index() {
+        let path = temp_index_path("classified-filter-all");
+        write_index(
+            &path,
+            &[
+                ("doc-a", vec![0.1, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.2, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let reject_all = PredicateFilter::new("reject-all", |_| false);
+        let classified = index
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, Some(&reject_all))
+            .expect("filtered search");
+        assert!(classified.hits.is_empty());
+        assert_eq!(
+            classified.zero_signal,
+            Some(ZeroSignalReason::FilterEliminatedAll)
+        );
+    }
+
+    #[test]
+    fn classified_all_tombstoned_is_distinct_from_newly_created() {
+        let path = temp_index_path("classified-all-tombstoned");
+        write_index(
+            &path,
+            &[
+                ("doc-a", vec![0.1, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.2, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+        let mut index = VectorIndex::open(&path).expect("open index");
+        index.soft_delete("doc-a").expect("tombstone doc-a");
+        index.soft_delete("doc-b").expect("tombstone doc-b");
+
+        let classified = index
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("search over tombstoned index");
+        assert!(classified.hits.is_empty());
+        assert_eq!(
+            classified.zero_signal,
+            Some(ZeroSignalReason::AllTombstoned)
+        );
+    }
+
+    #[test]
+    fn classified_nonempty_result_carries_no_reason() {
+        let path = temp_index_path("classified-nonempty");
+        write_index(&path, &[("doc-a", vec![0.1, 0.0, 0.0, 0.0])]).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let classified = index
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("search");
+        assert_eq!(classified.hits.len(), 1);
+        assert_eq!(classified.zero_signal, None);
+    }
+
+    #[test]
+    fn classified_in_memory_parity_on_request_scoped_states() {
+        // The bead requires equivalent states to classify identically across
+        // backends. Request-scoped states are representable in both; index
+        // states diverge only where a state is structurally unrepresentable
+        // in memory (tombstones compact away at load).
+        let path = temp_index_path("classified-parity");
+        write_index(
+            &path,
+            &[
+                ("doc-a", vec![0.1, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.2, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+        let file_backed = VectorIndex::open(&path).expect("open index");
+        let in_memory = crate::InMemoryVectorIndex::from_fsvi(&path).expect("load in-memory copy");
+
+        // k = 0.
+        let file_k0 = file_backed
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 0, None)
+            .expect("file k=0");
+        let mem_k0 = in_memory
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 0, None)
+            .expect("mem k=0");
+        assert_eq!(file_k0.zero_signal, mem_k0.zero_signal);
+
+        // Zero-norm query.
+        let file_zero = file_backed
+            .search_top_k_classified(&[0.0; 4], 5, None)
+            .expect("file zero-norm");
+        let mem_zero = in_memory
+            .search_top_k_classified(&[0.0; 4], 5, None)
+            .expect("mem zero-norm");
+        assert_eq!(file_zero.zero_signal, mem_zero.zero_signal);
+
+        // Non-finite query errors on both.
+        assert!(
+            file_backed
+                .search_top_k_classified(&[f32::INFINITY, 0.0, 0.0, 0.0], 5, None)
+                .is_err()
+        );
+        assert!(
+            in_memory
+                .search_top_k_classified(&[f32::INFINITY, 0.0, 0.0, 0.0], 5, None)
+                .is_err()
+        );
+
+        // Filter excludes all.
+        let reject_all = PredicateFilter::new("reject-all", |_| false);
+        let file_filtered = file_backed
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, Some(&reject_all))
+            .expect("file filter-all");
+        let mem_filtered = in_memory
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, Some(&reject_all))
+            .expect("mem filter-all");
+        assert_eq!(file_filtered.zero_signal, mem_filtered.zero_signal);
+
+        // Non-empty carries no reason on either.
+        let file_hits = file_backed
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("file search");
+        let mem_hits = in_memory
+            .search_top_k_classified(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .expect("mem search");
+        assert_eq!(file_hits.zero_signal, None);
+        assert_eq!(mem_hits.zero_signal, None);
     }
 
     #[test]
@@ -2954,7 +3314,8 @@ mod tests {
         let path = temp_index_path("with-params-default");
         let mut rows = Vec::new();
         for i in 0..32 {
-            let rank = f32::from(u16::try_from(i).expect("fits u16"));
+            // Start at 1: a zero-norm row would be rejected by the writer gate.
+            let rank = f32::from(u16::try_from(i + 1).expect("fits u16"));
             rows.push((format!("doc-{i:03}"), vec![rank, 0.0, 0.0, 0.0]));
         }
         let refs: Vec<(&str, Vec<f32>)> = rows
@@ -2984,7 +3345,8 @@ mod tests {
         let path = temp_index_path("with-params-custom");
         let mut rows = Vec::new();
         for i in 0..64 {
-            let rank = f32::from(u16::try_from(i).expect("fits u16"));
+            // Start at 1: a zero-norm row would be rejected by the writer gate.
+            let rank = f32::from(u16::try_from(i + 1).expect("fits u16"));
             rows.push((
                 format!("doc-{i:03}"),
                 vec![rank, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],

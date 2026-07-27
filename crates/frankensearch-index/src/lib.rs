@@ -63,16 +63,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
+use frankensearch_core::config::ZeroSignalState;
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
 use memmap2::MmapMut;
 use std::sync::OnceLock;
 use tracing::debug;
 
+pub use frankensearch_core::config::{ZERO_SIGNAL_SCHEMA_VERSION, ZeroSignalReason};
 #[cfg(feature = "ann")]
 pub use hnsw::{
-    AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH, HNSW_DEFAULT_M,
-    HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
+    AnnFallbackReason, AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH,
+    HNSW_DEFAULT_M, HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
 };
 pub use in_memory::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 pub use mrl::{MrlConfig, MrlSearchStats};
@@ -81,7 +83,7 @@ pub use recall_certificate::{
     CertifiedEf, EfCalibration, calibrate_certified_ef, certified_min_ef, certified_min_ef_mean,
     conformal_recall_lower_bound, mean_recall_lower_bound, mean_recall_lower_bound_bernstein,
 };
-pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
+pub use search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{
     PreparedQuery4bit, cosine_similarity_f16, dot_4bit_prepared, dot_4bit_prepared_dynamic,
     dot_4bit_prepared_generic, dot_i8_i8, dot_i8_i8_generic, dot_i8_i8_maddubs,
@@ -694,6 +696,50 @@ impl VectorIndex {
             .count()
     }
 
+    /// Number of live (non-tombstoned) records in the main index.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.record_count().saturating_sub(self.tombstone_count())
+    }
+
+    /// Whether the stored vector at `record_index` is usable for similarity
+    /// ranking: every component finite and the norm non-zero.
+    ///
+    /// Undecodable records are reported as unusable rather than erroring —
+    /// a vector that cannot be read cannot contribute signal.
+    #[must_use]
+    pub fn is_vector_usable(&self, record_index: usize) -> bool {
+        self.vector_at_f32(record_index)
+            .is_ok_and(|vector| vector_signal_usable(&vector))
+    }
+
+    /// Compute the zero-signal census for this index generation.
+    ///
+    /// O(n·dim): decodes every live vector once. Callers classify empty
+    /// search results with it lazily — an empty result costs one extra pass
+    /// comparable to the scan that just ran, and the hot (non-empty) path
+    /// pays nothing.
+    #[must_use]
+    pub fn zero_signal_state(&self) -> ZeroSignalState {
+        let record_count = self.record_count();
+        let mut tombstone_count = 0usize;
+        let mut usable_vector_count = 0usize;
+        for index in 0..record_count {
+            if self.is_deleted(index) {
+                tombstone_count += 1;
+            } else if self.is_vector_usable(index) {
+                usable_vector_count += 1;
+            }
+        }
+        ZeroSignalState {
+            record_count,
+            live_count: record_count - tombstone_count,
+            tombstone_count,
+            wal_count: self.wal_record_count(),
+            usable_vector_count,
+        }
+    }
+
     /// Fraction of records that are tombstoned (`tombstones / record_count`).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -817,6 +863,13 @@ impl VectorIndex {
                     field: "embedding".to_owned(),
                     value: "<contains non-finite values>".to_owned(),
                     reason: "all embedding values must be finite".to_owned(),
+                });
+            }
+            if !vector_signal_usable(vector) {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedding".to_owned(),
+                    value: "<zero-norm vector>".to_owned(),
+                    reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
                 });
             }
             let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
@@ -1765,6 +1818,13 @@ impl VectorIndexWriter {
                 reason: "all embedding values must be finite".to_owned(),
             });
         }
+        if !vector_signal_usable(embedding) {
+            return Err(SearchError::InvalidConfig {
+                field: "embedding".to_owned(),
+                value: "<zero-norm vector>".to_owned(),
+                reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
+            });
+        }
         let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
             field: "doc_id".to_owned(),
             value: doc_id.to_owned(),
@@ -1803,6 +1863,13 @@ impl VectorIndexWriter {
                 field: "embedding".to_owned(),
                 value: "<contains non-finite values>".to_owned(),
                 reason: "all embedding values must be finite".to_owned(),
+            });
+        }
+        if !vector_signal_usable(&embedding) {
+            return Err(SearchError::InvalidConfig {
+                field: "embedding".to_owned(),
+                value: "<zero-norm vector>".to_owned(),
+                reason: "embedding norm must be non-zero and finite; a zero vector can never match any query".to_owned(),
             });
         }
         let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
@@ -2320,6 +2387,21 @@ pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
     }
     hash
+}
+
+/// Whether a vector can contribute retrieval signal: every component is
+/// finite and the squared norm is non-zero and finite. An all-zero vector
+/// scores 0.0 against everything, so ranking it is arbitrary tie-breaking;
+/// a norm that overflows to infinity poisons downstream scores.
+pub(crate) fn vector_signal_usable(vector: &[f32]) -> bool {
+    let mut norm_sq = 0.0f32;
+    for &value in vector {
+        if !value.is_finite() {
+            return false;
+        }
+        norm_sq += value * value;
+    }
+    norm_sq > 0.0 && norm_sq.is_finite()
 }
 
 const fn is_tombstoned_flags(flags: u16) -> bool {
@@ -3284,7 +3366,9 @@ mod tests {
         let batch: Vec<(String, Vec<f32>)> = (0..100)
             .map(|i| {
                 #[allow(clippy::cast_precision_loss)]
-                let base = (i as f32) * 0.01;
+                // Offset keeps wal-000 above the zero-norm writer gate while
+                // staying below main-0's base of 1.0 for the ranking assert.
+                let base = (i as f32).mul_add(0.01, 0.005);
                 (format!("wal-{i:03}"), sample_vector(base, dim))
             })
             .collect();
@@ -3669,6 +3753,62 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn write_record_zero_norm_embedding_rejected() {
+        // bd-tqhc: an all-zero vector can never match any query, so writers
+        // reject it instead of planting a permanently unusable record.
+        let path = temp_index_path("zero-norm-embed");
+        let mut writer = VectorIndex::create(&path, "test", 3).unwrap();
+        let result = writer.write_record("doc", &[0.0, 0.0, 0.0]);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("non-zero"),
+            "expected zero-norm rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn append_zero_norm_embedding_rejected() {
+        let path = temp_index_path("zero-norm-append");
+        let mut writer = VectorIndex::create(&path, "test", 3).unwrap();
+        writer.write_record("doc-live", &[1.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        let result = index.append("doc-zero", &[0.0, 0.0, 0.0]);
+        assert!(result.is_err());
+        // The rejection must not have disturbed the live record.
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.wal_record_count(), 0);
+    }
+
+    #[test]
+    fn zero_signal_census_counts_are_consistent() {
+        let path = temp_index_path("zero-signal-census");
+        let mut writer = VectorIndex::create(&path, "test", 3).unwrap();
+        writer.write_record("doc-a", &[1.0, 0.0, 0.0]).unwrap();
+        writer.write_record("doc-b", &[0.0, 1.0, 0.0]).unwrap();
+        writer.write_record("doc-c", &[0.0, 0.0, 1.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut index = VectorIndex::open(&path).unwrap();
+        let healthy = index.zero_signal_state();
+        assert_eq!(healthy.record_count, 3);
+        assert_eq!(healthy.live_count, 3);
+        assert_eq!(healthy.tombstone_count, 0);
+        assert_eq!(healthy.wal_count, 0);
+        assert_eq!(healthy.usable_vector_count, 3);
+        assert_eq!(healthy.state_reason(), None);
+
+        index.soft_delete("doc-b").unwrap();
+        let after_delete = index.zero_signal_state();
+        assert_eq!(after_delete.live_count, 2);
+        assert_eq!(after_delete.tombstone_count, 1);
+        assert_eq!(after_delete.usable_vector_count, 2);
+        assert_eq!(index.live_count(), 2);
+    }
+
     // ─── VectorIndex::open edge cases ───────────────────────────────────
 
     #[test]
@@ -3767,7 +3907,7 @@ mod tests {
         let mut writer =
             VectorIndex::create_with_revision(&path, "emb-1", "rev-9", 16, Quantization::F32)
                 .unwrap();
-        writer.write_record("d", &[0.0; 16]).unwrap();
+        writer.write_record("d", &[0.5; 16]).unwrap();
         writer.finish().unwrap();
 
         let index = VectorIndex::open(&path).unwrap();

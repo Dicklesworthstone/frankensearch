@@ -6,19 +6,25 @@
 //! - doc-id alignment between both tiers
 
 use std::collections::HashMap;
+#[cfg(feature = "ann")]
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ann")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
+use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::{SearchError, SearchResult, TwoTierConfig, VectorHit};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "ann", test))]
 use crate::hnsw::HNSW_META_FORMAT_CURRENT;
 #[cfg(feature = "ann")]
 use crate::hnsw::HnswLoadDisposition;
+use crate::{ClassifiedHits, SearchParams, VectorIndex, dot_product_f32_f32};
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
-use crate::{SearchParams, VectorIndex, dot_product_f32_f32};
 
 /// Preferred fast-tier index filename.
 pub const VECTOR_INDEX_FAST_FILENAME: &str = "vector.fast.idx";
@@ -402,8 +408,33 @@ pub struct TwoTierIndex {
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
     quality_ann: Option<HnswIndex>,
+    #[cfg(feature = "ann")]
+    ann_fallback_count: AtomicU64,
+    /// Last state-scoped [`ZeroSignalReason`] observed on the fast tier,
+    /// encoded via [`zero_signal_code`]; [`ZERO_SIGNAL_NONE`] when the last
+    /// search produced hits. Availability transitions log once per state
+    /// change, never per query (bd-tqhc no-warn-storm policy).
+    last_zero_signal: AtomicU8,
     quality_alignment: QualityAlignment,
     config: TwoTierConfig,
+}
+
+/// Sentinel for "the last fast-tier search produced hits".
+const ZERO_SIGNAL_NONE: u8 = u8::MAX;
+
+/// Stable per-variant code for the transition state machine.
+const fn zero_signal_code(reason: ZeroSignalReason) -> u8 {
+    match reason {
+        ZeroSignalReason::CallerRequestedZeroK => 0,
+        ZeroSignalReason::FilterEliminatedAll => 1,
+        ZeroSignalReason::NonFiniteQuery => 2,
+        ZeroSignalReason::ZeroNormQuery => 3,
+        ZeroSignalReason::NewlyCreatedEmpty => 4,
+        ZeroSignalReason::AllTombstoned => 5,
+        ZeroSignalReason::WalOnlyNoLiveRecords => 6,
+        ZeroSignalReason::NoUsableVectors => 7,
+        ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors => 8,
+    }
 }
 
 impl TwoTierIndex {
@@ -690,6 +721,9 @@ impl TwoTierIndex {
             fast_ann,
             #[cfg(feature = "ann")]
             quality_ann,
+            #[cfg(feature = "ann")]
+            ann_fallback_count: AtomicU64::new(0),
+            last_zero_signal: AtomicU8::new(ZERO_SIGNAL_NONE),
             quality_alignment,
             config,
         })
@@ -711,8 +745,8 @@ impl TwoTierIndex {
     ///
     /// # Errors
     ///
-    /// Propagates errors from `HnswIndex::knn_search` (when ANN is selected)
-    /// or `VectorIndex::search_top_k` (brute-force fallback).
+    /// Propagates errors from source-aware HNSW candidate retrieval (when ANN
+    /// is selected) or `VectorIndex::search_top_k` (brute-force fallback).
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> SearchResult<Vec<VectorHit>> {
         self.search_fast_with_params(query_vec, k, None)
     }
@@ -725,8 +759,8 @@ impl TwoTierIndex {
     ///
     /// # Errors
     ///
-    /// Propagates errors from `HnswIndex::knn_search` (when ANN is selected)
-    /// or `VectorIndex::search_top_k_with_params` / `search_top_k`.
+    /// Propagates errors from source-aware HNSW candidate retrieval (when ANN
+    /// is selected) or `VectorIndex::search_top_k_with_params` / `search_top_k`.
     pub fn search_fast_with_params(
         &self,
         query_vec: &[f32],
@@ -735,73 +769,34 @@ impl TwoTierIndex {
     ) -> SearchResult<Vec<VectorHit>> {
         #[cfg(feature = "ann")]
         if let Some(ann) = &self.fast_ann {
-            // Fetch a few extra candidates to buffer against soft-deleted records.
-            // This isn't perfect but helps maintain recall when tombstones exist.
-            let fetch_k = k.saturating_add(10);
-            let hits = ann.knn_search(query_vec, fetch_k, self.config.hnsw_ef_search)?;
-
-            // Filter soft-deleted records from ANN results and resolve real VectorIndex positions.
-            // NOTE: hit.index from ANN is the compact HNSW d_id, NOT the VectorIndex position.
-            // We map it back to the canonical position so downstream consumers (like quality scoring)
-            // get valid indices.
-            let mut resolved_hits = Vec::with_capacity(hits.len());
-            for mut hit in hits {
-                // doc_id missing or decode error → treat as deleted
-                if let Ok(Some(pos)) = self.fast_index.find_index_by_doc_id(&hit.doc_id)
-                    && !self.fast_index.is_deleted(pos)
-                {
-                    hit.index = u32::try_from(pos).unwrap_or(u32::MAX);
-                    resolved_hits.push(hit);
-                }
+            // Source-aware HNSW filters tombstones and exact-repairs native
+            // underfill. Request exactly k physical main candidates so
+            // duplicate document IDs consume the same pre-resolution slots as
+            // canonical VectorIndex search; overfetching would incorrectly
+            // backfill lower-ranked public IDs.
+            let (hits, stats) = ann.knn_search_raw_with_stats_against(
+                &self.fast_index,
+                query_vec,
+                k,
+                self.config.hnsw_ef_search,
+            )?;
+            if let Some(reason) = stats.fallback_reason {
+                let fallback_count = self
+                    .ann_fallback_count
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    .saturating_add(1);
+                warn!(
+                    ?reason,
+                    fallback_count,
+                    index_size = stats.index_size,
+                    k_requested = stats.k_requested,
+                    ef_search = stats.ef_search,
+                    search_time_us = stats.search_time_us,
+                    "fast-tier ANN degraded to exact search"
+                );
             }
-            let mut hits = resolved_hits;
 
-            // Merge WAL entries (not yet in ANN).
-            if !self.fast_index.wal_entries.is_empty() {
-                let base_index = self.fast_index.record_count();
-                for (i, entry) in self.fast_index.wal_entries.iter().enumerate() {
-                    let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
-                    // Guard: corrupt WAL embeddings (e.g. from crash recovery) can
-                    // produce NaN/Inf scores that poison the top-k sort. Skip them.
-                    if !score.is_finite() {
-                        continue;
-                    }
-                    // Virtual index logic must match VectorIndex::resolve_wal_hit
-                    let index = u32::try_from(base_index + i).unwrap_or(u32::MAX);
-                    hits.push(VectorHit {
-                        index,
-                        score,
-                        doc_id: entry.doc_id.as_str().into(),
-                    });
-                }
-                // Re-sort and truncate after merging. The comparator is a strict
-                // total order (score `total_cmp` + unique `index` tiebreak), so
-                // `select_nth`/`sort_unstable` are bit-identical to the stable sort.
-                // For a large merged pool (ANN `ef` + resident WAL), partition to the
-                // top-`k` in O(n) then sort only those — the MRL rescored top-k lever
-                // (`mrl_topk_select_ab`, ~2×). Gated by `SELECT_NTH_MIN` so small pools
-                // keep the stable sort (n-dependent constant factors; see a0fd2090).
-                let by_score_index = |a: &VectorHit, b: &VectorHit| {
-                    b.score
-                        .total_cmp(&a.score)
-                        .then_with(|| a.index.cmp(&b.index))
-                };
-                const SELECT_NTH_MIN: usize = 256;
-                if k < hits.len() && hits.len() >= SELECT_NTH_MIN {
-                    hits.select_nth_unstable_by(k, by_score_index);
-                    hits.truncate(k);
-                    hits.sort_unstable_by(by_score_index);
-                } else {
-                    hits.sort_by(by_score_index);
-                    if hits.len() > k {
-                        hits.truncate(k);
-                    }
-                }
-            } else if hits.len() > k {
-                // If no WAL but we fetched extra for filtering, truncate back to k
-                hits.truncate(k);
-            }
-            return Ok(hits);
+            return self.resolve_fast_ann_and_wal(hits, query_vec, k);
         }
         let mrl_config = crate::mrl::MrlConfig {
             search_dims: self.config.mrl_search_dims,
@@ -833,6 +828,216 @@ impl TwoTierIndex {
                     .search_top_k_with_params(query_vec, k, None, params)
             },
         )
+    }
+
+    /// Search the fast tier with typed zero-signal classification.
+    ///
+    /// Behaves like [`Self::search_fast`] with the fail-closed differences
+    /// of the classified exact lane
+    /// ([`VectorIndex::search_top_k_classified`]): non-finite queries are
+    /// rejected instead of silently scoring garbage, and an empty result
+    /// always carries a typed [`ZeroSignalReason`]. Availability transitions
+    /// are logged once per state change, never per query.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::search_fast`] returns, plus
+    /// [`SearchError::InvalidConfig`] for non-finite query vectors.
+    pub fn search_fast_classified(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+    ) -> SearchResult<ClassifiedHits> {
+        if query_vec.len() != self.fast_index.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.fast_index.dimension(),
+                found: query_vec.len(),
+            });
+        }
+        if k == 0 {
+            let classified = ClassifiedHits::empty(ZeroSignalReason::CallerRequestedZeroK);
+            self.note_zero_signal(classified.zero_signal);
+            return Ok(classified);
+        }
+        if query_vec.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "query".to_owned(),
+                value: "<contains non-finite values>".to_owned(),
+                reason: "query vector must be finite".to_owned(),
+            });
+        }
+        if query_vec.iter().all(|&value| value == 0.0) {
+            let classified = ClassifiedHits::empty(ZeroSignalReason::ZeroNormQuery);
+            self.note_zero_signal(classified.zero_signal);
+            return Ok(classified);
+        }
+        let hits = self.search_fast(query_vec, k)?;
+        let zero_signal = hits.is_empty().then(|| self.classify_fast_empty());
+        self.note_zero_signal(zero_signal);
+        Ok(ClassifiedHits { hits, zero_signal })
+    }
+
+    /// Classify why a well-formed fast-tier search returned nothing.
+    ///
+    /// Mirrors [`VectorIndex::classify_empty_result`], with one refinement:
+    /// when ANN owns candidate retrieval and the census still shows usable
+    /// live vectors, the empty result is the ANN-availability anomaly rather
+    /// than a data problem.
+    fn classify_fast_empty(&self) -> ZeroSignalReason {
+        let state = self.fast_index.zero_signal_state();
+        if let Some(reason) = state.state_reason() {
+            return reason;
+        }
+        if state.is_wal_only() {
+            return ZeroSignalReason::WalOnlyNoLiveRecords;
+        }
+        #[cfg(feature = "ann")]
+        if self.fast_ann.is_some() {
+            return ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors;
+        }
+        ZeroSignalReason::NoUsableVectors
+    }
+
+    /// Record a zero-signal observation and log state transitions exactly
+    /// once.
+    ///
+    /// Request-scoped reasons (k = 0, filters, query vector defects) are
+    /// per-request events: they log at debug and never touch the state
+    /// machine, so an interleaved k = 0 query cannot fabricate a recovery
+    /// or a re-degradation. State-scoped reasons participate in the
+    /// transition machine: availability failures warn once per transition,
+    /// benign states log at info once per transition, and the first
+    /// hit-producing search after any state-scoped emptiness logs recovery.
+    fn note_zero_signal(&self, reason: Option<ZeroSignalReason>) {
+        match reason {
+            Some(request_scoped) if request_scoped.is_request_scoped() => {
+                debug!(
+                    reason_code = request_scoped.reason_code(),
+                    "fast-tier search returned empty: request-scoped zero-signal"
+                );
+            }
+            Some(state_scoped) => {
+                let code = zero_signal_code(state_scoped);
+                let previous = self.last_zero_signal.swap(code, AtomicOrdering::Relaxed);
+                if previous == code {
+                    return;
+                }
+                if state_scoped.is_availability_failure() {
+                    warn!(
+                        reason_code = state_scoped.reason_code(),
+                        reason = %state_scoped,
+                        "fast-tier semantic lane is unusable"
+                    );
+                } else {
+                    info!(
+                        reason_code = state_scoped.reason_code(),
+                        reason = %state_scoped,
+                        "fast-tier semantic lane has no signal"
+                    );
+                }
+            }
+            None => {
+                let previous = self
+                    .last_zero_signal
+                    .swap(ZERO_SIGNAL_NONE, AtomicOrdering::Relaxed);
+                if previous != ZERO_SIGNAL_NONE {
+                    info!("fast-tier semantic lane recovered: search produced hits");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ann")]
+    fn resolve_fast_ann_and_wal(
+        &self,
+        ann_hits: Vec<VectorHit>,
+        query_vec: &[f32],
+        k: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        // HNSW maps compact graph ids to canonical physical VectorIndex rows.
+        // Keep that identity: resolving through doc_id would collapse distinct
+        // physical rows before the canonical result resolver gets to rank them.
+        let base_index = self.fast_index.record_count();
+        let mut hits = Vec::with_capacity(
+            ann_hits
+                .len()
+                .saturating_add(self.fast_index.wal_entries.len()),
+        );
+        for hit in ann_hits {
+            if let Ok(position) = usize::try_from(hit.index)
+                && position < base_index
+                && !self.fast_index.is_deleted(position)
+            {
+                hits.push(hit);
+            }
+        }
+
+        // Resident WAL entries are not in the native graph. Preserve canonical
+        // `VectorIndex::resolve_sorted_entries` semantics exactly:
+        //
+        // 1. rank the physical main+WAL candidate pool;
+        // 2. retain only the physical top-k;
+        // 3. suppress a main hit when any resident WAL version of its doc_id
+        //    exists (including a non-finite/corrupt version);
+        // 4. deduplicate public doc_ids best-first.
+        //
+        // Suppression must happen after physical top-k selection. Doing it
+        // earlier backfills a lower-ranked hit that canonical exact search
+        // deliberately does not return.
+        for (wal_index, entry) in self.fast_index.wal_entries.iter().enumerate() {
+            let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
+            if !score.is_finite() {
+                continue;
+            }
+            let virtual_index =
+                base_index
+                    .checked_add(wal_index)
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "index".to_owned(),
+                        value: wal_index.to_string(),
+                        reason: "WAL virtual index overflow".to_owned(),
+                    })?;
+            let index = u32::try_from(virtual_index).map_err(|_| SearchError::InvalidConfig {
+                field: "index".to_owned(),
+                value: virtual_index.to_string(),
+                reason: "WAL entry index exceeds u32 range".to_owned(),
+            })?;
+            hits.push(VectorHit {
+                index,
+                score,
+                doc_id: entry.doc_id.as_str().into(),
+            });
+        }
+
+        let by_score_index = |left: &VectorHit, right: &VectorHit| {
+            left.cmp_by_score(right)
+                .then_with(|| left.index.cmp(&right.index))
+        };
+        const SELECT_NTH_MIN: usize = 256;
+        if k < hits.len() && hits.len() >= SELECT_NTH_MIN {
+            hits.select_nth_unstable_by(k, by_score_index);
+            hits.truncate(k);
+            hits.sort_unstable_by(by_score_index);
+        } else {
+            hits.sort_by(by_score_index);
+            hits.truncate(k);
+        }
+
+        let wal_doc_ids: HashSet<&str> = self
+            .fast_index
+            .wal_entries
+            .iter()
+            .map(|entry| entry.doc_id.as_str())
+            .collect();
+        let mut seen_doc_ids = HashSet::with_capacity(hits.len());
+        hits.retain(|hit| {
+            let is_main = usize::try_from(hit.index).is_ok_and(|index| index < base_index);
+            if is_main && wal_doc_ids.contains(hit.doc_id.as_str()) {
+                return false;
+            }
+            seen_doc_ids.insert(hit.doc_id.clone())
+        });
+        Ok(hits)
     }
 
     /// Compute quality-tier scores for fast-index document positions.
@@ -931,6 +1136,16 @@ impl TwoTierIndex {
     #[must_use]
     pub const fn has_quality_ann(&self) -> bool {
         self.quality_ann.is_some()
+    }
+
+    /// Number of fast-tier ANN queries that degraded to an exact scan.
+    ///
+    /// This monotonic counter makes persistent graph underfill observable even
+    /// through search APIs that return only hits.
+    #[cfg(feature = "ann")]
+    #[must_use]
+    pub fn ann_fallback_count(&self) -> u64 {
+        self.ann_fallback_count.load(AtomicOrdering::Relaxed)
     }
 
     /// Number of documents in the fast tier (canonical document count).
@@ -1612,6 +1827,8 @@ mod tests {
             .expect("fast search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-a");
+        #[cfg(feature = "ann")]
+        assert_eq!(index.ann_fallback_count(), 0);
     }
 
     #[test]
@@ -1838,6 +2055,222 @@ mod tests {
             .expect("ann search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_wal_merge_matches_canonical_resolution_before_and_after_exact_fallback() {
+        use crate::wal::WalEntry;
+
+        let dir = temp_index_dir("ann-wal-canonical-resolution");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[1.0, 0.0]),
+                ("doc-b", &[0.8, 0.6]),
+                ("doc-c", &[0.0, 1.0]),
+                ("doc-delete", &[-1.0, 0.0]),
+            ],
+        )
+        .expect("write fast index");
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 32,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
+        assert!(index.has_fast_ann());
+
+        // Model the crash-recovery window in which a durable WAL update exists
+        // but its best-effort main-slab tombstone did not land. Include a
+        // repeated WAL identity to exercise the canonical post-rank dedup rule.
+        index.fast_index.wal_entries.extend([
+            WalEntry {
+                doc_id: "doc-a".into(),
+                doc_id_hash: crate::fnv1a_hash(b"doc-a"),
+                embedding: vec![-1.0, 0.0],
+            },
+            WalEntry {
+                doc_id: "doc-a".into(),
+                doc_id_hash: crate::fnv1a_hash(b"doc-a"),
+                embedding: vec![0.2, 0.979_795_9],
+            },
+            WalEntry {
+                doc_id: "doc-new".into(),
+                doc_id_hash: crate::fnv1a_hash(b"doc-new"),
+                embedding: vec![0.95, 0.312_249_9],
+            },
+        ]);
+
+        let query = [1.0_f32, 0.0];
+        let assert_canonical = |index: &TwoTierIndex, label: &str| {
+            let expected = index
+                .fast_index
+                .search_top_k(&query, 10, None)
+                .expect("canonical main plus WAL search");
+            let actual = index.search_fast(&query, 10).expect("ANN plus WAL search");
+            let expected_identity: Vec<_> = expected
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.index))
+                .collect();
+            let actual_identity: Vec<_> = actual
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.index))
+                .collect();
+            assert_eq!(
+                actual_identity, expected_identity,
+                "{label}: ANN and exact search must resolve the same public identities"
+            );
+
+            let unique_ids: HashSet<_> = actual.iter().map(|hit| hit.doc_id.as_str()).collect();
+            assert_eq!(
+                unique_ids.len(),
+                actual.len(),
+                "{label}: public results must not contain duplicate document IDs"
+            );
+            let doc_a = actual
+                .iter()
+                .find(|hit| hit.doc_id == "doc-a")
+                .expect("WAL doc-a remains searchable");
+            assert!(
+                usize::try_from(doc_a.index).expect("u32 fits usize")
+                    >= index.fast_index.record_count(),
+                "{label}: WAL doc-a must supersede the stale main-slab version"
+            );
+        };
+
+        assert_canonical(&index, "normal ANN");
+        assert_eq!(index.ann_fallback_count(), 0);
+
+        // A post-build tombstone removes one native candidate. Fetching the
+        // entire four-point graph must therefore exact-repair the main tier,
+        // then merge the resident WAL exactly once through the same resolver.
+        assert!(
+            index
+                .fast_index
+                .soft_delete("doc-delete")
+                .expect("post-build tombstone")
+        );
+        assert_canonical(&index, "exact-underfill fallback");
+        assert_eq!(
+            index.ann_fallback_count(),
+            1,
+            "one underfilled ANN request must increment the public counter once"
+        );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_wal_shadowed_top_hit_stays_suppressed_through_raw_exact_fallback() {
+        use crate::wal::WalEntry;
+
+        let dir = temp_index_dir("ann-wal-shadowed-top");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("doc-a", &[0.9, 0.435_889_9]),
+                ("doc-b", &[0.8, -0.6]),
+                ("doc-tombstone", &[0.0, 1.0]),
+            ],
+        )
+        .expect("write fast index");
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 32,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
+        index.fast_index.wal_entries.push(WalEntry {
+            doc_id: "doc-a".into(),
+            doc_id_hash: crate::fnv1a_hash(b"doc-a"),
+            embedding: vec![-1.0, 0.0],
+        });
+
+        let normal_query = [1.0_f32, 0.0];
+        assert!(
+            index
+                .fast_index
+                .search_top_k(&normal_query, 1, None)
+                .expect("canonical normal search")
+                .is_empty(),
+            "the physical main winner is shadowed after top-k selection"
+        );
+        assert!(
+            index
+                .search_fast(&normal_query, 1)
+                .expect("normal ANN search")
+                .is_empty(),
+            "normal ANN must not backfill after suppressing a WAL-shadowed winner"
+        );
+        assert_eq!(index.ann_fallback_count(), 0);
+
+        assert!(
+            index
+                .fast_index
+                .soft_delete("doc-tombstone")
+                .expect("post-build tombstone")
+        );
+        let fallback_query = [0.0_f32, 1.0];
+        assert!(
+            index
+                .fast_index
+                .search_top_k(&fallback_query, 1, None)
+                .expect("canonical fallback search")
+                .is_empty(),
+            "the exact main winner is still shadowed by the WAL"
+        );
+        assert!(
+            index
+                .search_fast(&fallback_query, 1)
+                .expect("underfilled ANN search")
+                .is_empty(),
+            "raw exact repair must defer WAL suppression until after shared top-k selection"
+        );
+        assert_eq!(index.ann_fallback_count(), 1);
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_two_tier_duplicate_main_ids_consume_physical_top_k_slots() {
+        let dir = temp_index_dir("ann-duplicate-main-top-k");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("duplicate", &[1.0, 0.0]),
+                ("duplicate", &[0.95, 0.312_249_9]),
+                ("lower-unique", &[0.8, 0.6]),
+            ],
+        )
+        .expect("write duplicate-ID fast index");
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 32,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).expect("open ANN index");
+        let query = [1.0_f32, 0.0];
+        let expected = index
+            .fast_index
+            .search_top_k(&query, 2, None)
+            .expect("canonical duplicate-ID search");
+        let actual = index
+            .search_fast(&query, 2)
+            .expect("ANN duplicate-ID search");
+
+        assert_eq!(expected.len(), 1);
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].doc_id, "duplicate");
+        assert!(
+            actual.iter().all(|hit| hit.doc_id != "lower-unique"),
+            "requesting k=2 must not overfetch and backfill a third physical row"
+        );
     }
 
     #[cfg(feature = "ann")]

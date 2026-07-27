@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
@@ -129,6 +130,12 @@ pub struct MrlSearchStats {
     pub records_scanned: usize,
     /// Whether the search fell back to standard full-dimension scan.
     pub fell_back_to_full: bool,
+    /// Typed classification when the search produced zero hits.
+    ///
+    /// `Some(reason)` if and only if the returned hit list is empty, so the
+    /// MRL lane classifies zero-signal states with the same vocabulary as
+    /// the exact and ANN lanes (bd-tqhc).
+    pub zero_signal: Option<ZeroSignalReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,18 +283,32 @@ impl VectorIndex {
         // Fall back to standard search if truncation wouldn't help.
         if config.search_dims >= dim {
             let hits = self.search_top_k(query, limit, filter)?;
+            let zero_signal = self.classify_mrl_empty(&hits, limit, filter.is_some());
             let stats = MrlSearchStats {
                 scan_dims: dim,
                 rescore_dims: dim,
                 candidates_rescored: 0,
                 records_scanned: self.record_count() + self.wal_entries.len(),
                 fell_back_to_full: true,
+                zero_signal,
             };
             return Ok((hits, stats));
         }
 
         if limit == 0 || (self.record_count() == 0 && self.wal_entries.is_empty()) {
-            return Ok((Vec::new(), MrlSearchStats::default()));
+            // k = 0 and empty-index are distinct zero-signal states; k = 0 is
+            // request-scoped and takes precedence (bd-tqhc).
+            let zero_signal = if limit == 0 {
+                ZeroSignalReason::CallerRequestedZeroK
+            } else {
+                self.zero_signal_state()
+                    .empty_result_reason(filter.is_some())
+            };
+            let stats = MrlSearchStats {
+                zero_signal: Some(zero_signal),
+                ..MrlSearchStats::default()
+            };
+            return Ok((Vec::new(), stats));
         }
 
         let search_dims = config.search_dims;
@@ -351,15 +372,34 @@ impl VectorIndex {
         // Resolve doc_ids.
         let hits = self.resolve_mrl_hits(&rescored)?;
 
+        let zero_signal = self.classify_mrl_empty(&hits, limit, filter.is_some());
         let stats = MrlSearchStats {
             scan_dims: search_dims,
             rescore_dims,
             candidates_rescored,
             records_scanned,
             fell_back_to_full: false,
+            zero_signal,
         };
 
         Ok((hits, stats))
+    }
+
+    /// Maintain the `zero_signal.is_some() == hits.is_empty()` invariant for
+    /// MRL results (k = 0 cannot reach here; the guard classifies it).
+    fn classify_mrl_empty(
+        &self,
+        hits: &[VectorHit],
+        limit: usize,
+        had_filter: bool,
+    ) -> Option<ZeroSignalReason> {
+        if !hits.is_empty() {
+            return None;
+        }
+        if limit == 0 {
+            return Some(ZeroSignalReason::CallerRequestedZeroK);
+        }
+        Some(self.zero_signal_state().empty_result_reason(had_filter))
     }
 
     // ── Internal: truncated scan ─────────────────────────────────────
@@ -1389,6 +1429,7 @@ mod tests {
             candidates_rescored: 30,
             records_scanned: 1000,
             fell_back_to_full: true,
+            zero_signal: None,
         };
         let cloned = stats.clone();
         assert_eq!(cloned.scan_dims, 64);
