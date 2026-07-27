@@ -1264,7 +1264,7 @@ impl SharedFixtureSuite {
         }
     }
 
-    /// All 25 ground-truth relevance queries.
+    /// All 26 committed query fixtures, including the frozen known-miss control.
     #[must_use]
     pub fn relevance_queries(&self) -> &[SharedRelevanceQuery] {
         &self.relevance_queries
@@ -1539,7 +1539,7 @@ pub struct QueryGeneratorSpec {
     pub seed: u64,
     /// Default result limit for non-pagination probes.
     pub default_limit: u64,
-    /// Include all 25 committed relevance queries and seven E0.1 contract anchors.
+    /// Include all 26 committed query fixtures and seven E0.1 contract anchors.
     pub include_shared_relevance_queries: bool,
 }
 
@@ -3080,7 +3080,7 @@ mod tests {
             shared.documents(SharedCorpusView::Full120).len(),
             FULL_SHARED_DOCUMENT_COUNT
         );
-        assert_eq!(shared.relevance_queries().len(), 25);
+        assert_eq!(shared.relevance_queries().len(), 26);
         assert_eq!(shared.edge_cases().len(), 21);
         assert_eq!(shared.harvested_contract_queries().len(), 7);
         let core = shared
@@ -3120,7 +3120,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.source == "tests/fixtures/queries.json")
                 .count(),
-            25
+            26
         );
         assert_eq!(
             suite

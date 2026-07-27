@@ -4526,7 +4526,7 @@ mod tests {
                                 .iter()
                                 .map(|hit| (hit.doc_id.clone(), hit.score_bits))
                                 .collect::<Vec<_>>(),
-                            observation.match_count.clone(),
+                            observation.match_count,
                         )
                     };
                     quill_queries.push(summarize(&run.comparison.subject));
