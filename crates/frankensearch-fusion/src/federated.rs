@@ -892,12 +892,16 @@ mod tests {
     #[test]
     fn min_indices_enforced_when_shard_times_out() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // A zero deadline expires before any shard is polled under current
+            // timer semantics. A bounded positive budget lets the synchronous
+            // shard complete while the intentionally pending shard times out.
+            let timeout_ms = 80_u64;
             let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
             let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
-                    per_index_timeout_ms: 0,
+                    per_index_timeout_ms: timeout_ms,
                     min_indices: 2,
                     ..FederatedConfig::default()
                 })
