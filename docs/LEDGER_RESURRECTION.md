@@ -326,3 +326,47 @@ The tracked `.githooks/pre-commit` invokes that mode, and this checkout uses
 `.github/workflows/ledger-integrity-lint.yml`, so bypassing a local hook does
 not bypass the repository gate. `--all` is deliberately labeled a mechanical
 screen and never treated as hand adjudication.
+
+## 8. Model-integrity re-audit: 2026-07-25 20:40 through 2026-07-26 00:35 EDT
+
+The provider silently substituted a lower-capability model during this window.
+The 21-commit census below therefore re-read every first-parent commit plus the
+parallel formatting commit merged by `3407e060`. Existing ELF hashes, A/A
+controls, and byte-identity artifacts were not rerun. The review instead
+checked whether the workload reached the claimed code, whether each
+behavior-preservation argument was complete, whether each performance
+conclusion followed from its own numbers, and whether ungated code remained
+maintainable.
+
+`CORRECTED` means the original commit contained a false or incomplete claim or
+proof, but the named later change (or this re-audit) repaired it. `SOUND` means
+the commit's behavior and claims survive all four checks. No commit required
+retraction.
+
+| Commit | Verdict and fresh-eyes basis |
+|---|---|
+| `b9b3e969ec062455e07a6de33bb5127a8aa8ed89` | **CORRECTED** — the Rust formatting is behavior-neutral, but the accompanying `bd-l5x3` `REJECT/INVALID-CV` closure and byte-copy description were wrong; `c487a221`/§1 reclassify the measurement as `VALID-AB` and `dab52390` records that the stray files were stale copies. |
+| `85d0cc9725c0856d05accd2d8302261008224ccd` | **SOUND** — one `rustfmt`-only grouped-MaxScore test-signature change; no executable or evidence semantics changed. |
+| `75f4ccd978a482491103bd4ddf5cf07b70b351dc` | **SOUND** — the parallel copy of the same `rustfmt` change is redundant but behavior-neutral. |
+| `3407e0601136e49282a60494783e3c0b5cd6897d` | **SOUND** — clean merge of the two identical formatting changes, with no conflict resolution or semantic delta. |
+| `bb25935b92a540de2816cfcbacf9404071ac7900` | **SOUND** — the CASS oracle producer executes the real CASS query builder, preserves native `DocAddress` and score bits, expands cutoff ties before truncation, and explicitly covers prefix matching, filter-only browse, and structured filtering. |
+| `5cc07b79ab49c4f606f945636bc5523960f298e4` | **CORRECTED** — useful tracker evidence survived, but its speculative `CheckpointPostingCursor` explanation for zero grouped pruning was false; `afcb1478`/`dab52390` replace it with the drained-buffer root cause later fixed by `73c61d74`. |
+| `fcd4a4851adc5dbc470afc54ea5a82dfb17b7b88` | **CORRECTED** — the `295/398 VOID` census used a non-authoritative taxonomy and contradictory screen; `c487a221`/§1 replace it with the hand-adjudicated six-class `216/341` result and quarantine four untimed rows. |
+| `c435328e09358488a7e97059e86e70436819038b` | **CORRECTED** — provenance plumbing fails closed, but the original CASS v1/v2 semantic preimages misstated lowercase, edge-ngram, field, blank-query, term, and ranking semantics; `ace575cb` replaces them with the executable v2/v4 contracts and live adapters. |
+| `8e7f8fe178537883e506e1d0d21dd854ae1a0310` | **CORRECTED** — the production gate stayed safely closed, but the root-cause prose was wrong and the A/B fixture confused ingest batches with physical leaves and never built its claimed 1M shape; `73c61d74` fixes pruning correctness and `974a6453` repairs the evidence workload. |
+| `afcb1478399bfe0af2828225ca13302a7026abde` | **SOUND** — blocks activation, demonstrates that the closed gate preserves the prior path, corrects the root cause, and explicitly rejects the tempting ceiling-only fix that would drop buffered documents. |
+| `09f8aca819a6594c3cc79a3f18baa3c5fab4aa50` | **CORRECTED** — self-hash, same-invocation A/A, deterministic median CI, and the no-CV decision rule are sound, but ratchet reproduction initially accepted a different executing ELF; `308f038d` adds fail-closed SHA equality and `c487a221` completes admission parity checks. |
+| `3070c936e8631d61c4585b394d6bce34e3ff6483` | **SOUND** — forwards the required provenance selectors and prints the already-sealed artifact between unambiguous retrieval markers; it changes transport, not results or gate judgment. |
+| `3e135e2e27d0a12603b518b8485af4095b9ff667` | **SOUND** — folds only an empty JSON object to absent at the shared read boundary, retains non-empty metadata, and proves both hydrated search and deferred-fusion hydration without changing stored bytes or ordering. |
+| `e6ecdbe32907fe3069aa9753b0f3a5ae20a7af45` | **CORRECTED** — the cache logic and pinned revision check are valid, but the hard-coded `/data/projects/frankensearch` manifest is not RCH 1.0.52's content-addressed worker path, so normal workers skipped the warm; this re-audit discovers the newest matching `/data/tmp/rch/frankensearch/<hash>/Cargo.toml` while retaining an explicit override. |
+| `1b42dc9f7bd2dddc734d8e3d278f4b766a165359` | **SOUND** — removes two Cargo-unreachable, unreferenced stale source copies under the authorization recorded on `bd-kld2`; their differing blob IDs confirm deletion removes misleading phantom code rather than production targets. |
+| `bf982ae40ca01466971b02f235f5f1dde42074d6` | **CORRECTED** — ordinary-bin/thin-LTO admission and the closed shipping gate are sound, but the first parity checks omitted token position metadata and exact top-k order; `c487a221` adds complete token equality/order proof and `4d6316a9` records build-only link admission without inventing a performance result. |
+| `dab52390ad270c1360cc683a67953f852831852d` | **SOUND** — accurately corrects the stale-copy characterization, records recoverability and authorization, preserves the open E4.10 cross-engine obligation, and states the grouped-pruning correctness trap before implementation. |
+| `f2c0694f0b934f85615f3081752b4401faeda94c` | **CORRECTED** — it blocks one common `VOID-NONULL` write shape, but did not implement candidate lookup, KEEP SHA enforcement, or the mandatory local hook and used detached added-line heuristics; `c487a221` replaces it with the complete staged-blob three-part preflight plus CI. |
+| `73c61d749d7552b83276b52e0b2a47d0c299e60d` | **SOUND** — candidate discovery enumerates the current document, untaken buffered residue, and live child cursors; the construction-time ceiling is conservative, scoring order is unchanged, and the new k=3 fixture makes dropped residue observable before the gate can open. |
+| `79cce4b4ba36d38634443e633b4b80712f0c4071` | **SOUND** — closes only the now-proven pruning and feature-gating blockers, keeps grouped activation disabled, and retains the independent A/B admission requirement. |
+| `3ba2802b6fe3b7447bf5b4c63dc8cf1c4c4c0604` | **SOUND** — tracker-only handoff correctly places empty-index visibility at open/consumer boundaries, avoids per-query warning state, and does not claim an implementation or measurement. |
+
+The audit therefore yields **12 SOUND, 9 CORRECTED, 0 RETRACTED**. These are
+judgment verdicts, not new benchmark results. The allocation remains Lane B:
+no measurement was run and no QG baseline was fabricated.
