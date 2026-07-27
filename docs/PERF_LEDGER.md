@@ -1,4 +1,29 @@
-# PERF_LEDGER.md — frankensearch measured wins
+# PERF_LEDGER.md — frankensearch performance evidence
+
+## Comparison-class contract
+
+Every new `KEEP` must state exactly one comparison class:
+
+- `Comparison class: SELF-SPEEDUP` means frankensearch before versus
+  frankensearch after. This is maintenance evidence. It may justify landing
+  the change, but it is not campaign output and must not be described as a
+  competitive win.
+- `Comparison class: INCUMBENT` means the candidate ran against the **actual
+  legacy incumbent**, side-by-side in the same invocation. This is the only
+  class eligible to count as campaign output or support a competitive claim.
+
+An `INCUMBENT` row must also name the exact incumbent under `Actual legacy
+incumbent:`, report a numeric incumbent ratio, record a numeric A/A null from
+that same invocation, and identify the executing ELF SHA-256. A generic
+“Tantivy-class,” proxy, stored baseline, separate invocation, previous commit,
+`HEAD`, `OLD`, or in-repo `ORIG` arm does not satisfy this contract.
+
+Historical interpretation is likewise explicit: unless an older row contains
+the named actual legacy incumbent arm and proves side-by-side execution in the
+same invocation, its before/after number is `SELF-SPEEDUP / MAINTENANCE`
+regardless of whether its original heading says `WIN`, `KEEP`, or “measured
+win.” The number remains useful engineering evidence, but it is not a
+competitive result.
 
 ## 2026-07-25 — INFRA CHANGE / QG HOLD: admission probes now link without their crate-wide dev graphs; no QG is activated (`bd-7dbw`, `bd-l5x3`, `bd-3srq`, Codex)
 

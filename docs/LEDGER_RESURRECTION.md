@@ -10,6 +10,31 @@ Source of truth for the audit: `docs/NEGATIVE_EVIDENCE.md` @ `da149fd9`
 (16,151 lines, 398 `###` entries). Per campaign §4, **no row is ever deleted** —
 this file annotates, it does not rewrite history.
 
+## 2026-07-27 campaign-output classification
+
+The campaign now distinguishes engineering maintenance from competitive
+evidence:
+
+- `SELF-SPEEDUP` is frankensearch before versus frankensearch after. It may
+  remain landed and measured, but it is maintenance rather than campaign
+  output.
+- `INCUMBENT` requires the named actual legacy incumbent and candidate to run
+  side-by-side in the same invocation, with a numeric ratio, same-invocation
+  A/A null, and executing ELF SHA-256. Only this class can support a campaign
+  or competitive win.
+
+This rule applies when interpreting the existing ledgers. Older `WIN` or
+`KEEP` headings do not override the evidence topology: `HEAD`, `OLD`, in-repo
+`ORIG`, stored baselines, separate invocations, and generic incumbent proxies
+are self-speedup or diagnostic evidence, not incumbent wins.
+
+The retroactive public-doc audit covered the campaign-touched root and FSFS
+READMEs, fixture READMEs, benchmark-history README, QG contract docs, plus the
+top-level changelog, facade README, and scorecards as a boundary check. None
+contains a campaign retraction or withdrawal narrative that needs removal, so
+no public spec-sheet file was changed. Retraction and correction history
+remains confined to the internal ledgers and bead records.
+
 ## 0. Six-class taxonomy correction (authoritative)
 
 The fleet-wide frankenfs taxonomy supersedes the v1 C1–C5 counts and ranking

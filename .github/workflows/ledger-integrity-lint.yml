@@ -1,9 +1,10 @@
 name: Ledger Integrity Lint
 
 # Refuses a NEW rejected-lever row that cannot distinguish the lever from the
-# harness, and refuses a KEEP without an executing-binary SHA-256. See
-# scripts/check_ledger_null_control.sh for the contract and
-# docs/LEDGER_RESURRECTION.md for the audit that motivated it.
+# harness. A KEEP must carry an executing-binary SHA-256 and classify itself as
+# SELF-SPEEDUP maintenance or a same-invocation comparison against the named
+# actual legacy incumbent. See scripts/check_ledger_null_control.sh for the
+# contract and docs/LEDGER_RESURRECTION.md for the audit that motivated it.
 #
 # Ledger integrity DECAYS: across the fleet, repos that audited once and
 # institutionalized the check sit near 1.7% void, while repos that audited and

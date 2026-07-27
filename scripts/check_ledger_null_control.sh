@@ -10,7 +10,10 @@
 # This guard deliberately does not infer a verdict from a loose keyword hit.
 # It gates the complete newly added section from the staged/committed blob.
 # A new REJECT needs a positive, same-invocation A/A record or a counted
-# no-change mechanism. A new KEEP needs the executing ELF/binary SHA-256.
+# no-change mechanism. A new KEEP needs the executing ELF/binary SHA-256 and
+# an explicit comparison class. Only a side-by-side, same-invocation run
+# against the named actual legacy incumbent is campaign/competitive evidence;
+# an in-repo before/after comparison is SELF-SPEEDUP maintenance.
 
 set -euo pipefail
 
@@ -45,7 +48,13 @@ Row contract:
     * "A/A null: <numeric evidence> ... same invocation", or
     * a counted instructions/cycles/syscalls/allocations/faults line explicitly
       saying the count is unchanged, identical, flat, or the same.
-  KEEP: record "ELF sha256: <64 hex>" or "binary sha256: <64 hex>".
+  KEEP: record "ELF sha256: <64 hex>" or "binary sha256: <64 hex>", plus:
+    * "Comparison class: SELF-SPEEDUP" for in-repo before/after maintenance; or
+    * "Comparison class: INCUMBENT" with "Actual legacy incumbent: <identity>",
+      a numeric incumbent ratio, a same-invocation numeric A/A null, and an
+      explicit statement that candidate and incumbent ran side-by-side in that
+      same invocation.
+  SELF-SPEEDUP rows must not claim a campaign or competitive win.
 
 Exit 0 means clear. Exit 2 means BLOCKED. Exit 64 means usage/IO failure.
 USAGE
@@ -264,11 +273,14 @@ lint_one() {
       # are entries; undated headings are grouping labels.
       return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
     }
-    function note_line(line,    low, absent, metric, decisive) {
+    function note_line(line,    low, absent, metric, decisive, value) {
       low = tolower(line)
 
       if (low ~ /same[- ]invocation|same binary invocation/) {
         same_invocation = 1
+      }
+      if (low ~ /side[- ]by[- ]side/) {
+        side_by_side = 1
       }
 
       absent = (low ~ /no (a\/a|null[- ]control)|without (an )?(a\/a|null[- ]control)|\
@@ -293,6 +305,30 @@ no (counted )?change|0([.]0+)?% change)/)
         binary_sha = 1
       }
 
+      if (low ~ /(comparison|win)[-_ ]*class[[:space:]]*:[[:space:]]*self[-_ ]*speedup/) {
+        self_speedup_class = 1
+      }
+      if (low ~ /(comparison|win)[-_ ]*class[[:space:]]*:[[:space:]]*incumbent/) {
+        incumbent_class = 1
+      }
+      if (low ~ /actual legacy incumbent[[:space:]]*:/) {
+        value = low
+        sub(/^.*actual legacy incumbent[[:space:]]*:[[:space:]]*/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+        if (value != "" &&
+            value !~ /^(n\/a|none|unknown|not recorded|no counterpart)([[:space:]]|$)/) {
+          actual_incumbent = 1
+        }
+      }
+      if ((low ~ /incumbent.*ratio|ratio.*incumbent/) &&
+          line ~ /[0-9][.][0-9]/) {
+        incumbent_ratio = 1
+      }
+      if (low ~ /(campaign|competitive)[-_ ]+(win|speedup|claim|advantage)/ ||
+          low ~ /(beats?|faster than|dominates).*actual legacy incumbent/) {
+        competitive_claim = 1
+      }
+
       if (low ~ /invalid[-_ ]?cv|cv[_ -]*only|cv[_ -]*gate|\
 coefficient of variation[_ -]*gate/ ||
           low ~ /(decision|verdict|outcome|status).*(cv|coefficient of variation)/ ||
@@ -302,7 +338,8 @@ coefficient of variation[_ -]*gate/ ||
       }
     }
     function flush(    upper, explicit_reject, explicit_keep, exempt,
-                       is_reject, is_keep, new_entry, has_null) {
+                       is_reject, is_keep, new_entry, has_null,
+                       incumbent_complete) {
       if (header == "") return
       new_entry = (mode == "all" || mode == "selfcheck" || added[start_line])
       if (!new_entry) {
@@ -310,7 +347,9 @@ coefficient of variation[_ -]*gate/ ||
       }
 
       checked++
-      upper = toupper(header)
+      # Verdict-bearing body lines are authoritative too. A neutral heading
+      # with "Decision: KEEP" must not bypass KEEP admission.
+      upper = toupper(header "\n" decision_lines)
       explicit_reject = (upper ~ /REJECT|REFUT|NO[- ]?SHIP|NO[- ]?LAND|\
 NOT A (WIN|LEVER)|REGRESS|WASH/)
       explicit_keep = (upper ~ /KEEP|LANDED|SHIPPED|MEASURED WIN/)
@@ -324,6 +363,8 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
         is_reject = 1
       }
       has_null = numeric_null && same_invocation
+      incumbent_complete = actual_incumbent && incumbent_ratio &&
+                            has_null && side_by_side
 
       if (is_reject && !has_null && !counted_mechanism) {
         violations++
@@ -349,10 +390,45 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
           print "  missing: executing ELF/binary SHA-256"
         }
       }
+      if (is_keep && !self_speedup_class && !incumbent_class) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED KEEP-CLASS " ledger ":" start_line
+          print "  " header
+          print "  missing: Comparison class: SELF-SPEEDUP or INCUMBENT"
+        }
+      }
+      if (is_keep && self_speedup_class && incumbent_class) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED KEEP-CLASS " ledger ":" start_line
+          print "  " header
+          print "  conflict: a KEEP cannot be both SELF-SPEEDUP and INCUMBENT"
+        }
+      }
+      if (is_keep && competitive_claim && !incumbent_class) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED SELF-SPEEDUP-CLAIM " ledger ":" start_line
+          print "  " header
+          print "  forbidden: self-speedup maintenance presented as campaign/competitive output"
+        }
+      }
+      if (is_keep && incumbent_class && !incumbent_complete) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED INCUMBENT-WIN " ledger ":" start_line
+          print "  " header
+          print "  missing: named actual legacy incumbent, numeric incumbent ratio,"
+          print "           same-invocation numeric A/A null, or side-by-side execution"
+        }
+      }
 
       header = ""; evidence = ""; decision_lines = ""
       numeric_null = 0; same_invocation = 0
       counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
+      side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
+      actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
     }
 
     FNR == NR {
@@ -441,9 +517,12 @@ lint_ledgers() {
 
 [ledger-gate] BLOCKED. A new REJECT must distinguish the lever from the
 harness with a numeric same-invocation A/A null, or refute it with a counted
-unchanged mechanism. A new KEEP must identify the executing ELF/binary SHA-256.
-CV may be diagnostic only; the decision gate is median CI versus the A/A null
-floor.
+unchanged mechanism. A new KEEP must identify the executing ELF/binary SHA-256
+and classify the comparison. SELF-SPEEDUP is maintenance, never campaign or
+competitive output. INCUMBENT requires the named actual legacy incumbent,
+numeric ratio, same-invocation A/A null, and side-by-side execution in that
+invocation. CV may be diagnostic only; the decision gate is median CI versus
+the A/A null floor.
 EOF
   fi
   return "${status}"
@@ -452,43 +531,91 @@ EOF
 run_selfcheck_case() {
   local label="$1"
   local expected="$2"
-  local fixture="$3"
+  local ledger="$3"
+  local fixture="$4"
   local output rc
 
+  SELF_CHECK_TOTAL=$((SELF_CHECK_TOTAL + 1))
   SELF_CHECK_FIXTURE="${fixture}"
-  if output="$(lint_one "docs/NEGATIVE_EVIDENCE.md" 2>&1)"; then
+  if output="$(lint_one "${ledger}" 2>&1)"; then
     rc=0
   else
     rc=$?
   fi
 
   if [[ ${rc} -ne ${expected} ]]; then
-    echo "[ledger-selfcheck] FAIL ${label}: expected exit ${expected}, got ${rc}" >&2
+    echo "[ledger-selfcheck] FAIL ${ledger} ${label}: expected exit ${expected}, got ${rc}" >&2
     printf '%s\n' "${output}" >&2
     return 1
   fi
-  echo "[ledger-selfcheck] PASS ${label}: exit ${rc}"
+  SELF_CHECK_PASSED=$((SELF_CHECK_PASSED + 1))
+  echo "[ledger-selfcheck] PASS ${ledger} ${label}: exit ${rc}"
 }
 
-run_selfcheck() {
-  local failed=0
+run_selfcheck_suite() {
+  local ledger="$1"
   local sha
   sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-  run_selfcheck_case "VOID-NONULL reject is blocked" 2 $'### 2099-01-01 — REJECT: synthetic no-null row\nA/B median ratio: 1.001\nDecision: reject as no improvement.' || failed=1
-  run_selfcheck_case "CV-only reject is blocked" 2 $'### 2099-01-02 — REJECT / INVALID-CV: synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nA/B median CI: 0.980 [0.950, 1.020]\nDecision: reject because arm CV exceeded 5%.' || failed=1
-  run_selfcheck_case "null-floor reject is admitted" 0 $'### 2099-01-03 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nA/B median CI: 1.001 [0.990, 1.010]\nDecision: no-ship because the effect remains inside the A/A null floor.' || failed=1
-  run_selfcheck_case "counted-mechanism reject is admitted" 0 $'### 2099-01-04 — REJECT: synthetic counted-mechanism row\nInstructions count unchanged: baseline 100, candidate 100.\nDecision: reject because the counted mechanism removed no work.' || failed=1
-  run_selfcheck_case "KEEP without ELF SHA is blocked" 2 $'### 2099-01-05 — KEEP: synthetic unbound binary\nA/B median CI: 0.900 [0.880, 0.920].' || failed=1
-  run_selfcheck_case "KEEP with ELF SHA is admitted" 0 $"### 2099-01-06 — KEEP: synthetic bound binary
+  run_selfcheck_case "VOID-NONULL reject is blocked" 2 "${ledger}" $'### 2099-01-01 — REJECT: synthetic no-null row\nA/B median ratio: 1.001\nDecision: reject as no improvement.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "CV-only reject is blocked" 2 "${ledger}" $'### 2099-01-02 — REJECT / INVALID-CV: synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nA/B median CI: 0.980 [0.950, 1.020]\nDecision: reject because arm CV exceeded 5%.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "null-floor reject is admitted" 0 "${ledger}" $'### 2099-01-03 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nA/B median CI: 1.001 [0.990, 1.010]\nDecision: no-ship because the effect remains inside the A/A null floor.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "counted-mechanism reject is admitted" 0 "${ledger}" $'### 2099-01-04 — REJECT: synthetic counted-mechanism row\nInstructions count unchanged: baseline 100, candidate 100.\nDecision: reject because the counted mechanism removed no work.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "KEEP without ELF SHA is blocked" 2 "${ledger}" $'### 2099-01-05 — KEEP: synthetic unbound binary\nComparison class: SELF-SPEEDUP\nA/B median CI: 0.900 [0.880, 0.920].' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "KEEP without comparison class is blocked" 2 "${ledger}" $"### 2099-01-06 — KEEP: synthetic unclassified binary
 ELF sha256: ${sha}
-A/B median CI: 0.900 [0.880, 0.920]." || failed=1
+A/B median CI: 0.900 [0.880, 0.920]." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "SELF-SPEEDUP maintenance is admitted" 0 "${ledger}" $"### 2099-01-07 — KEEP: synthetic maintenance speedup
+Comparison class: SELF-SPEEDUP
+ELF sha256: ${sha}
+A/B median CI: 0.900 [0.880, 0.920]." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "SELF-SPEEDUP competitive claim is blocked" 2 "${ledger}" $"### 2099-01-08 — KEEP: synthetic mislabeled result
+Comparison class: SELF-SPEEDUP
+ELF sha256: ${sha}
+Competitive win: 1.11x.
+A/B median CI: 0.900 [0.880, 0.920]." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "INCUMBENT without actual identity is blocked" 2 "${ledger}" $"### 2099-01-09 — KEEP: synthetic unnamed incumbent
+Comparison class: INCUMBENT
+ELF sha256: ${sha}
+A/A null: 1.000 [0.990, 1.010], same invocation
+Incumbent ratio: 0.900.
+Invocation: candidate and incumbent ran side-by-side in the same invocation." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "INCUMBENT split invocation is blocked" 2 "${ledger}" $"### 2099-01-10 — KEEP: synthetic split incumbent
+Comparison class: INCUMBENT
+Actual legacy incumbent: Tantivy 0.26.1 shipping backend
+ELF sha256: ${sha}
+A/A null: 1.000 [0.990, 1.010].
+Incumbent ratio: 0.900.
+Invocation: candidate and incumbent ran side-by-side in separate invocations." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "same-invocation INCUMBENT win is admitted" 0 "${ledger}" $"### 2099-01-11 — KEEP: synthetic incumbent result
+Comparison class: INCUMBENT
+Actual legacy incumbent: Tantivy 0.26.1 shipping backend
+ELF sha256: ${sha}
+A/A null: 1.000 [0.990, 1.010], same invocation
+Incumbent ratio: 0.900.
+Invocation: candidate and incumbent ran side-by-side in the same invocation." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only KEEP without class is blocked" 2 "${ledger}" $"### 2099-01-12 — synthetic body-level verdict
+ELF sha256: ${sha}
+Decision: KEEP." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only SELF-SPEEDUP is admitted" 0 "${ledger}" $"### 2099-01-13 — synthetic body-level maintenance
+Comparison class: SELF-SPEEDUP
+ELF sha256: ${sha}
+Decision: KEEP." || SELF_CHECK_FAILED=1
+}
 
-  if [[ ${failed} -ne 0 ]]; then
+run_selfcheck() {
+  SELF_CHECK_FAILED=0
+  SELF_CHECK_TOTAL=0
+  SELF_CHECK_PASSED=0
+
+  run_selfcheck_suite "docs/NEGATIVE_EVIDENCE.md"
+  run_selfcheck_suite "docs/PERF_LEDGER.md"
+
+  if [[ ${SELF_CHECK_FAILED} -ne 0 ]]; then
     echo "[ledger-selfcheck] BLOCKED: one or more contract cases failed" >&2
     return 2
   fi
-  echo "[ledger-selfcheck] OK: 6/6 contract cases"
+  echo "[ledger-selfcheck] OK: ${SELF_CHECK_PASSED}/${SELF_CHECK_TOTAL} contract cases across both ledgers"
 }
 
 case "${MODE}" in
