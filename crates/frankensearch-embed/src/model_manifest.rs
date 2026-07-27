@@ -4,7 +4,7 @@
 //! it performs filesystem and hashing work only, and leaves transport/network
 //! to higher-level download orchestration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -842,6 +842,31 @@ impl ModelArtifactManifestV1 {
         }
         verify_no_extra_artifacts(model_dir, &self.artifacts)?;
         Ok(VerifiedModelArtifactsV1 { frozen })
+    }
+
+    /// Promote a fully verified frozen artifact set into its final directory.
+    ///
+    /// Every registered file is synced before the sibling-directory rename.
+    /// An existing generation is moved to a unique backup and is never deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed search error when verification, syncing, or publication
+    /// fails. If the final rename fails after moving the previous generation,
+    /// the implementation attempts to restore that generation immediately.
+    pub fn promote_verified_installation(
+        &self,
+        staged_dir: &Path,
+        destination_dir: &Path,
+    ) -> SearchResult<Option<PathBuf>> {
+        self.verify_dir(staged_dir)?;
+        sync_registered_artifacts(
+            staged_dir,
+            self.artifacts
+                .iter()
+                .map(|artifact| artifact.relative_path.as_str()),
+        )?;
+        promote_atomically(staged_dir, destination_dir)
     }
 
     /// Derive the identity declared by this frozen manifest without claiming
@@ -1951,6 +1976,7 @@ impl ModelManifest {
         destination_dir: &Path,
     ) -> SearchResult<Option<PathBuf>> {
         self.verify_dir(staged_dir)?;
+        sync_registered_artifacts(staged_dir, self.files.iter().map(|file| file.name.as_str()))?;
         promote_atomically(staged_dir, destination_dir)
     }
 
@@ -2076,6 +2102,10 @@ pub enum ModelState {
         total_bytes: u64,
     },
     Verifying,
+    /// Every staged byte is verified, but the generation is not published.
+    StagedVerified,
+    /// Artifacts are installed and load-tested, but no compatible index is selected yet.
+    AcquiredNeedsReindex,
     Ready,
     Disabled {
         reason: String,
@@ -2119,6 +2149,8 @@ impl ModelState {
                 format!("downloading ({progress_pct}%)")
             }
             Self::Verifying => "verifying".into(),
+            Self::StagedVerified => "staged and verified".into(),
+            Self::AcquiredNeedsReindex => "acquired; compatible index required".into(),
             Self::Ready => "ready".into(),
             Self::Disabled { reason } => format!("disabled: {reason}"),
             Self::VerificationFailed { reason } => format!("verification failed: {reason}"),
@@ -2351,6 +2383,51 @@ impl ModelLifecycle {
             &self.state,
             "begin_verification",
             "expected Downloading",
+        ))
+    }
+
+    /// Mark the unpublished staging directory verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` unless verification is the active phase.
+    pub fn mark_staged_verified(&mut self) -> SearchResult<()> {
+        if matches!(self.state, ModelState::Verifying) {
+            self.state = ModelState::StagedVerified;
+            return Ok(());
+        }
+        Err(invalid_state_transition(
+            &self.state,
+            "mark_staged_verified",
+            "expected Verifying",
+        ))
+    }
+
+    /// Record a published, load-tested generation that still needs a compatible index.
+    ///
+    /// A verified warm cache may bypass consent and transport states. A newly
+    /// acquired generation must arrive from `StagedVerified`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` while transport, verification, readiness, or a
+    /// disabled/update state is active.
+    pub fn mark_acquired_needs_reindex(&mut self) -> SearchResult<()> {
+        if matches!(
+            self.state,
+            ModelState::NotInstalled
+                | ModelState::NeedsConsent
+                | ModelState::StagedVerified
+                | ModelState::VerificationFailed { .. }
+                | ModelState::Cancelled
+        ) {
+            self.state = ModelState::AcquiredNeedsReindex;
+            return Ok(());
+        }
+        Err(invalid_state_transition(
+            &self.state,
+            "mark_acquired_needs_reindex",
+            "expected a verified warm cache or StagedVerified generation",
         ))
     }
 
@@ -2757,13 +2834,97 @@ pub fn verify_dir_cached(manifest: &ModelManifest, model_dir: &Path) -> SearchRe
     Ok(())
 }
 
+fn sync_registered_artifacts<'a>(
+    staged_dir: &Path,
+    relative_paths: impl IntoIterator<Item = &'a str>,
+) -> SearchResult<()> {
+    let mut parent_dirs = BTreeSet::<PathBuf>::new();
+    for relative_path in relative_paths {
+        let artifact_path = resolve_model_file_path(staged_dir, relative_path)?;
+        File::open(&artifact_path)
+            .and_then(|file| file.sync_all())
+            .map_err(SearchError::from)?;
+        if let Some(parent) = artifact_path.parent() {
+            parent_dirs.insert(parent.to_path_buf());
+        }
+    }
+    for parent in &parent_dirs {
+        sync_directory(parent)?;
+    }
+    sync_directory(staged_dir)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> SearchResult<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(SearchError::from)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> SearchResult<()> {
+    // Windows does not expose a portable directory fsync through std. Every
+    // registered file is still synced before the atomic rename.
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationBoundary {
+    InstallingParentSync,
+    BackupParentSync,
+    PublishRename,
+    PublishedParentSync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PUBLICATION_FAULT: std::cell::Cell<Option<PublicationBoundary>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[allow(clippy::unnecessary_wraps)] // Test builds inject typed durability failures here.
+fn publication_boundary(boundary: PublicationBoundary) -> SearchResult<()> {
+    #[cfg(test)]
+    if TEST_PUBLICATION_FAULT.with(|fault| fault.get() == Some(boundary)) {
+        return Err(SearchError::from(std::io::Error::other(format!(
+            "injected publication failure at {boundary:?}"
+        ))));
+    }
+    #[cfg(not(test))]
+    let _ = boundary;
+    Ok(())
+}
+
+#[cfg(test)]
+struct PublicationFaultGuard;
+
+#[cfg(test)]
+impl PublicationFaultGuard {
+    fn install(boundary: PublicationBoundary) -> Self {
+        TEST_PUBLICATION_FAULT.with(|fault| {
+            assert!(
+                fault.replace(Some(boundary)).is_none(),
+                "publication test fault already installed"
+            );
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationFaultGuard {
+    fn drop(&mut self) {
+        TEST_PUBLICATION_FAULT.with(|fault| fault.set(None));
+    }
+}
+
 fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult<Option<PathBuf>> {
     let destination_parent =
         destination_dir
             .parent()
             .ok_or_else(|| SearchError::InvalidConfig {
                 field: "destination_dir".to_owned(),
-                value: destination_dir.display().to_string(),
+                value: "redacted".to_owned(),
                 reason: "destination must have a parent directory".to_owned(),
             })?;
     fs::create_dir_all(destination_parent).map_err(SearchError::from)?;
@@ -2779,16 +2940,46 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
     let stage_target =
         destination_parent.join(format!(".{stage_name}.installing.{timestamp}.{pid}"));
     fs::rename(staged_dir, &stage_target).map_err(SearchError::from)?;
+    publication_boundary(PublicationBoundary::InstallingParentSync)?;
+    sync_directory(destination_parent)?;
 
     let backup_path = if destination_dir.exists() {
         let backup = destination_parent.join(format!("{stage_name}.backup.{timestamp}.{pid}"));
         fs::rename(destination_dir, &backup).map_err(SearchError::from)?;
+        let backup_sync = publication_boundary(PublicationBoundary::BackupParentSync)
+            .and_then(|()| sync_directory(destination_parent));
+        if let Err(sync_error) = backup_sync {
+            if let Err(rollback_error) = fs::rename(&backup, destination_dir) {
+                tracing::error!(
+                    rollback_error_kind = ?rollback_error.kind(),
+                    "model backup sync failed and the prior generation remains in its backup"
+                );
+            } else {
+                let _ = sync_directory(destination_parent);
+            }
+            return Err(sync_error);
+        }
         Some(backup)
     } else {
         None
     };
 
-    fs::rename(&stage_target, destination_dir).map_err(SearchError::from)?;
+    let publish = publication_boundary(PublicationBoundary::PublishRename)
+        .and_then(|()| fs::rename(&stage_target, destination_dir).map_err(SearchError::from));
+    if let Err(publish_error) = publish {
+        if let Some(backup) = &backup_path
+            && let Err(rollback_error) = fs::rename(backup, destination_dir)
+        {
+            tracing::error!(
+                rollback_error_kind = ?rollback_error.kind(),
+                "model publication failed and prior generation remains in its backup"
+            );
+        }
+        let _ = sync_directory(destination_parent);
+        return Err(publish_error);
+    }
+    publication_boundary(PublicationBoundary::PublishedParentSync)?;
+    sync_directory(destination_parent)?;
     Ok(backup_path)
 }
 
@@ -3600,9 +3791,11 @@ mod tests {
         lifecycle.begin_download(100).unwrap();
         lifecycle.update_download_progress(40).unwrap();
         lifecycle.begin_verification().unwrap();
-        lifecycle.mark_ready();
+        lifecycle.mark_staged_verified().unwrap();
+        assert_eq!(lifecycle.state(), &ModelState::StagedVerified);
+        lifecycle.mark_acquired_needs_reindex().unwrap();
 
-        assert_eq!(lifecycle.state(), &ModelState::Ready);
+        assert_eq!(lifecycle.state(), &ModelState::AcquiredNeedsReindex);
     }
 
     #[test]
@@ -4017,6 +4210,8 @@ mod tests {
                 total_bytes: 2000,
             },
             ModelState::Verifying,
+            ModelState::StagedVerified,
+            ModelState::AcquiredNeedsReindex,
             ModelState::Ready,
             ModelState::Disabled {
                 reason: "out of disk".to_owned(),
@@ -4318,6 +4513,125 @@ mod tests {
             .unwrap();
         assert!(backup.is_some());
         assert!(dest.join("model.bin").exists());
+    }
+
+    fn publication_failure_fixture() -> (tempfile::TempDir, ModelManifest, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let destination = temp.path().join("final");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        write_temp_file(&staged.join("model.bin"), b"new model");
+        write_temp_file(&destination.join("prior.bin"), b"prior model");
+        let manifest = ModelManifest {
+            id: "publication-fault-fixture".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "owner/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: to_hex_lowercase(&Sha256::digest(b"new model")),
+                size: 9,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 9,
+        };
+        (temp, manifest, staged, destination)
+    }
+
+    fn sibling_names_with_prefix(parent: &Path, prefix: &str) -> Vec<String> {
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    }
+
+    #[test]
+    fn interrupted_installing_parent_fsync_preserves_prior_generation() {
+        let (temp, manifest, staged, destination) = publication_failure_fixture();
+        let _fault = PublicationFaultGuard::install(PublicationBoundary::InstallingParentSync);
+
+        let error = manifest
+            .promote_verified_installation(&staged, &destination)
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::Io(_)));
+        assert_eq!(
+            fs::read(destination.join("prior.bin")).unwrap(),
+            b"prior model"
+        );
+        assert_eq!(
+            sibling_names_with_prefix(temp.path(), ".final.installing.").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn interrupted_backup_parent_fsync_rolls_prior_generation_back() {
+        let (temp, manifest, staged, destination) = publication_failure_fixture();
+        let _fault = PublicationFaultGuard::install(PublicationBoundary::BackupParentSync);
+
+        let error = manifest
+            .promote_verified_installation(&staged, &destination)
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::Io(_)));
+        assert_eq!(
+            fs::read(destination.join("prior.bin")).unwrap(),
+            b"prior model"
+        );
+        assert_eq!(
+            sibling_names_with_prefix(temp.path(), ".final.installing.").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn interrupted_publish_rename_rolls_prior_generation_back() {
+        let (temp, manifest, staged, destination) = publication_failure_fixture();
+        let _fault = PublicationFaultGuard::install(PublicationBoundary::PublishRename);
+
+        let error = manifest
+            .promote_verified_installation(&staged, &destination)
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::Io(_)));
+        assert_eq!(
+            fs::read(destination.join("prior.bin")).unwrap(),
+            b"prior model"
+        );
+        assert_eq!(
+            sibling_names_with_prefix(temp.path(), ".final.installing.").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn interrupted_published_parent_fsync_preserves_prior_backup() {
+        let (temp, manifest, staged, destination) = publication_failure_fixture();
+        let _fault = PublicationFaultGuard::install(PublicationBoundary::PublishedParentSync);
+
+        let error = manifest
+            .promote_verified_installation(&staged, &destination)
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::Io(_)));
+        assert_eq!(
+            fs::read(destination.join("model.bin")).unwrap(),
+            b"new model"
+        );
+        let backups = sibling_names_with_prefix(temp.path(), "final.backup.");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(temp.path().join(&backups[0]).join("prior.bin")).unwrap(),
+            b"prior model"
+        );
     }
 
     #[test]

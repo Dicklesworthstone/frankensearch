@@ -119,7 +119,15 @@ pub use fastembed_embedder::{FastEmbedEmbedder, OnnxEmbedderConfig};
 pub mod model_download;
 
 #[cfg(feature = "download")]
-pub use model_download::{DownloadConfig, DownloadProgress, ModelDownloader};
+pub use model_download::{
+    DownloadConfig, DownloadProgress, MODEL_ACQUISITION_PROGRESS_SCHEMA_V1,
+    MODEL_ACQUISITION_RECEIPT_SCHEMA_V1, MODEL_ACQUISITION_RECOVERY_SCHEMA_V1,
+    ModelAcquisitionCacheReasonV1, ModelAcquisitionOutcomeV1, ModelAcquisitionProgressV1,
+    ModelAcquisitionReceiptV1, ModelAcquisitionRecoveryV1, ModelAcquisitionRequest,
+    ModelAcquisitionSource, ModelAcquisitionSourceKindV1, ModelAcquisitionStageV1,
+    ModelAcquisitionVerificationResultV1, ModelDownloader, VerifiedModelStageV1,
+    diagnose_model_acquisition,
+};
 
 #[cfg(feature = "api")]
 pub mod api_provider;
