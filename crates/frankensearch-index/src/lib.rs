@@ -47,6 +47,7 @@ pub mod hnsw;
 pub mod in_memory;
 pub mod mapped_file;
 pub mod mrl;
+pub mod native_hnsw;
 pub mod quantization;
 pub mod recall_certificate;
 mod repro_soft_delete_rollback;
