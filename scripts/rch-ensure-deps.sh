@@ -53,9 +53,12 @@ FRANKENTUI_REF="4f2803a7c99d4fc439f3503e93c69e9ca68f354c"
 # the `rch` executable at `/tmp/rch`, so that legacy path cannot be a directory.
 RCH_REMOTE_DEPS_DIR="${RCH_REMOTE_DEPS_DIR:-/data/tmp/rch/frankensearch}"
 
-# Absolute path rch rsyncs the project to on a worker. Used only to warm cargo's
-# caches; absence is tolerated (the worker simply has not synced yet).
-RCH_REMOTE_PROJECT_DIR="${RCH_REMOTE_PROJECT_DIR:-/data/projects/frankensearch}"
+# Optional explicit worker-side project path used to warm Cargo's shared caches.
+# RCH 1.0.52 normally syncs into a content-addressed directory below
+# `${RCH_REMOTE_DEPS_DIR}` (for example
+# `/data/tmp/rch/frankensearch/<project-hash>`), so an unset override is
+# discovered remotely after at least one sync.
+RCH_REMOTE_PROJECT_DIR="${RCH_REMOTE_PROJECT_DIR:-}"
 
 # Workspace git dependency (frankentorch: ft-api / ft-autograd / ft-core), pinned
 # in the root Cargo.toml. Unlike the sibling PATH deps above, cargo resolves this
@@ -543,7 +546,7 @@ fast_cmaes_repo="$7"
 fast_cmaes_ref="$8"
 frankentui_repo="${9:-}"
 frankentui_ref="${10:-}"
-project_dir="${11:-/data/projects/frankensearch}"
+project_dir="${11:-}"
 frankentorch_ref="${12:-}"
 provision_models="${13:-false}"
 models_only="${14:-false}"
@@ -733,9 +736,42 @@ fi
 # Populate the crates.io index and every git dependency in cargo's shared caches
 # so a cold worker-scoped target pool starts compiling immediately instead of
 # spending its admission window on the network.
+resolve_remote_project_manifest() {
+    local candidate candidate_dir candidate_name newest=""
+
+    if [[ -n "${project_dir}" && -f "${project_dir}/Cargo.toml" ]]; then
+        printf '%s\n' "${project_dir}/Cargo.toml"
+        return 0
+    fi
+
+    # RCH's remote path is `${remote_base}/${project_id}/${project_hash}`.
+    # The sibling-dependency bootstrap lives at the project-id level, so the
+    # content-addressed project roots are its immediate children. Exclude the
+    # fixed sibling clones and require a frankensearch-specific workspace
+    # member before accepting a candidate.
+    for candidate in "${deps_dir}"/*/Cargo.toml; do
+        [[ -f "${candidate}" ]] || continue
+        candidate_dir="$(dirname "${candidate}")"
+        candidate_name="$(basename "${candidate_dir}")"
+        case "${candidate_name}" in
+            asupersync|fast_cmaes|frankensqlite|frankentui)
+                continue
+                ;;
+        esac
+        grep -Fq '"crates/frankensearch-core"' "${candidate}" || continue
+        if [[ -z "${newest}" || "${candidate}" -nt "${newest}" ]]; then
+            newest="${candidate}"
+        fi
+    done
+
+    [[ -n "${newest}" ]] || return 1
+    printf '%s\n' "${newest}"
+}
+
 warm_cargo_caches_remote() {
-    if [[ ! -f "${project_dir}/Cargo.toml" ]]; then
-        log "cargo caches: ${project_dir} not synced yet, skipping warm"
+    local manifest
+    if ! manifest="$(resolve_remote_project_manifest)"; then
+        log "cargo caches: no synced frankensearch manifest below ${deps_dir}; skipping warm"
         return 0
     fi
     if ! command -v cargo >/dev/null 2>&1; then
@@ -746,9 +782,9 @@ warm_cargo_caches_remote() {
         log "cargo caches: frankentorch ${frankentorch_ref:0:12} already cached, skipping"
         return 0
     fi
-    log "cargo caches: fetching registry index + git deps (one-time)..."
+    log "cargo caches: fetching registry index + git deps from ${manifest} (one-time)..."
     # Never fail the bootstrap on a fetch problem — a cold cache is slow, not broken.
-    if cargo fetch --locked --manifest-path "${project_dir}/Cargo.toml" >/dev/null 2>&1; then
+    if cargo fetch --locked --manifest-path "${manifest}" >/dev/null 2>&1; then
         log "cargo caches: warm."
     else
         warn "cargo caches: 'cargo fetch --locked' failed; cold builds stay slow"
