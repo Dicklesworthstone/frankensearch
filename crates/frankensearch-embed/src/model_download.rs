@@ -1093,19 +1093,22 @@ mod tests {
             display_name: None,
             description: None,
             repo: "owner/repo".to_owned(),
-            revision: "deadbeef".to_owned(),
+            revision: "d".repeat(40),
             files: vec![ModelFile {
-                // Invalid URL path segment (space) forces an immediate client error.
-                name: "bad file.bin".to_owned(),
+                name: "bad-file.bin".to_owned(),
                 sha256: "0".repeat(64),
                 size: 1,
-                url: None,
+                // The manifest remains valid and production-ready, while the
+                // missing authority forces an immediate client error.
+                url: Some("https://".to_owned()),
             }],
             license: "Apache-2.0".to_owned(),
             dimension: None,
             tier: None,
             download_size_bytes: 0,
         };
+        assert!(manifest.validate().is_ok());
+        assert!(manifest.is_production_ready());
         let consent = crate::model_manifest::DownloadConsent::granted(
             crate::model_manifest::ConsentSource::Environment,
         );
