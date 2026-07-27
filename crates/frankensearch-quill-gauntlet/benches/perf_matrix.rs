@@ -39,7 +39,8 @@ use frankensearch_quill_gauntlet::{
     PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample,
     PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
     PositionMode, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, estimate_paired_experiment,
-    machine_fingerprint, peak_rss_bytes, seeded_balanced_pair_order, validate_matrix,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, seeded_balanced_pair_order,
+    validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -1893,11 +1894,50 @@ fn run_child_mode() -> bool {
     true
 }
 
+/// Prove at RUNTIME that the incumbent arm is the real Tantivy, not us.
+///
+/// This is the dispatch trap, and it is not hypothetical: a peer repo published
+/// a "2.6x faster" claim whose baseline had already been dispatched to its own
+/// implementation — genuine upstream was 1.88x *slower*. This repo is mid-
+/// migration to Quill, so `frankensearch-lexical` being quietly re-pointed at a
+/// Quill backend is exactly the shape that failure would take here, and every
+/// QG ratio would silently become Quill measuring itself.
+///
+/// A manifest pin alone cannot catch that — it describes what Cargo resolved,
+/// not what the process linked. So this asserts both: the pinned contract
+/// (version, checksum, lexical package + git revision, `tantivy = "=0.26.1"`)
+/// *and* the version string the linked Tantivy reports about itself at run
+/// time. Printed so it lands in the evidence log beside the ratios.
+fn assert_incumbent_is_genuine_tantivy() -> String {
+    let contract = oracle_version_contract().expect(
+        "QG oracle version contract must validate before any ratio is measured (dispatch trap)",
+    );
+    let linked = frankensearch_lexical::tantivy_crate::version_string();
+    assert!(
+        linked.contains(&contract.tantivy_version),
+        "incumbent arm is not the pinned Tantivy: linked runtime reports {linked:?} but the \
+         oracle contract pins {:?}. Refusing to measure — a QG ratio against a non-incumbent \
+         baseline is worthless.",
+        contract.tantivy_version,
+    );
+    eprintln!(
+        "[quill-perf-oracle] incumbent=tantivy linked_runtime={linked} contract_version={} \
+         lexical={}@{} lexical_git={}",
+        contract.tantivy_version,
+        contract.lexical_package,
+        contract.lexical_package_version,
+        contract.lexical_git_revision,
+    );
+    linked.to_owned()
+}
+
 fn main() {
     if run_child_mode() {
         return;
     }
     let identity = print_bench_elf_sha256().expect("hash executing QG benchmark");
+    // Fail closed before a single cell is timed.
+    let _oracle = assert_incumbent_is_genuine_tantivy();
     let mut criterion = Criterion::default().configure_from_args();
     bench_matrix(&mut criterion, &identity.sha256);
     criterion.final_summary();
