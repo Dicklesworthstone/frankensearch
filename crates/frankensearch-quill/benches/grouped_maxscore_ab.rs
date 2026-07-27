@@ -62,30 +62,32 @@ use frankensearch_core::bench_support::paired_median_ratio;
 use frankensearch_quill::{QuillConfig, QuillIndex};
 use sha2::{Digest, Sha256};
 
-/// One benchmark corpus shape: sealed segments times documents per segment.
+/// One benchmark corpus shape: explicit ingest batches times documents per
+/// batch. Physical leaf count is reported separately because Quill must split
+/// a batch that crosses a 65,536-document lease boundary.
 struct Shape {
     name: &'static str,
-    segments: usize,
-    docs_per_segment: usize,
+    batches: usize,
+    docs_per_batch: usize,
 }
 
 static FULL_SHAPES: [Shape; 2] = [
     Shape {
-        name: "seg8x12500",
-        segments: 8,
-        docs_per_segment: 12_500,
+        name: "batch8x12500",
+        batches: 8,
+        docs_per_batch: 12_500,
     },
     Shape {
-        name: "seg4x25000",
-        segments: 4,
-        docs_per_segment: 25_000,
+        name: "batch4x250000",
+        batches: 4,
+        docs_per_batch: 250_000,
     },
 ];
 
 static SMOKE_SHAPES: [Shape; 1] = [Shape {
     name: "smoke4x500",
-    segments: 4,
-    docs_per_segment: 500,
+    batches: 4,
+    docs_per_batch: 500,
 }];
 
 /// Query classes. Every entry must lower to a root union of 2..=8 *groups*
@@ -143,14 +145,22 @@ fn self_elf_sha256() -> String {
 /// every group with a single active child and understate the lever.
 async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
     let config = QuillConfig {
+        // Total live documents are part of the benchmark contract. Suppress
+        // avoidable visibility-timer seals and ordinary tier promotion;
+        // mandatory docid-lease splits remain shipping-realistic and are
+        // reported separately before timing.
+        scribe_shard_budget_bytes: 512 * 1024 * 1024,
+        delta_budget_bytes: 512 * 1024 * 1024,
+        bulk_load_mode: true,
         deterministic_ingest: true,
+        max_visibility_lag_ms: u64::MAX,
         ..QuillConfig::default()
     };
     let index = QuillIndex::in_memory(config).expect("in-memory bench index");
     let mut state = seed | 1;
-    for segment in 0..shape.segments {
-        let mut batch = Vec::with_capacity(shape.docs_per_segment);
-        for ordinal in 0..shape.docs_per_segment {
+    for batch_index in 0..shape.batches {
+        let mut batch = Vec::with_capacity(shape.docs_per_batch);
+        for ordinal in 0..shape.docs_per_batch {
             let word_count = 6 + usize::try_from(xorshift(&mut state) % 30).expect("word count");
             let mut text = String::with_capacity(word_count * 8);
             for position in 0..word_count {
@@ -170,7 +180,7 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
                 title.push_str(VOCABULARY[pick]);
             }
             batch.push(
-                IndexableDocument::new(format!("e851-s{segment:03}-d{ordinal:05}"), text)
+                IndexableDocument::new(format!("e851-b{batch_index:03}-d{ordinal:07}"), text)
                     .with_title(title),
             );
         }
@@ -178,12 +188,13 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
             .index_documents(cx, &batch)
             .await
             .expect("accumulate bench batch");
-        index.commit(cx).await.expect("seal bench segment");
+        index.commit(cx).await.expect("seal bench batch");
     }
+    let expected_documents = shape.batches * shape.docs_per_batch;
     assert_eq!(
-        index.snapshot().segments().len(),
-        shape.segments,
-        "each commit must seal exactly one segment"
+        usize::try_from(index.snapshot().doc_count()).expect("snapshot document count fits usize"),
+        expected_documents,
+        "every benchmark document must be live before timing"
     );
     index
 }
@@ -336,16 +347,21 @@ fn main() {
         "[harness] scale={scale} rounds={rounds} limits={limits:?} rayon_threads={}",
         rayon::current_num_threads()
     );
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    let cx = Cx::for_testing();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("grouped MaxScore benchmark runtime");
+    runtime.block_on(async move {
         for shape in shapes {
             let seed = 0x0e85_1000_0000_0001_u64
-                ^ (u64::try_from(shape.segments).expect("segment count") << 32);
+                ^ (u64::try_from(shape.batches).expect("batch count") << 32);
             let built_at = Instant::now();
             let index = build_index(&cx, shape, seed).await;
             eprintln!(
-                "[setup] shape={} docs={} build_ms={:.1}",
+                "[setup] shape={} docs={} physical_segments={} build_ms={:.1}",
                 shape.name,
-                shape.segments * shape.docs_per_segment,
+                shape.batches * shape.docs_per_batch,
+                index.snapshot().segments().len(),
                 built_at.elapsed().as_secs_f64() * 1_000.0,
             );
             run_shape(&cx, shape, rounds, &limits, &index);
