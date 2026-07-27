@@ -79,6 +79,19 @@ jobs:
           shared-key: workspace-${{ matrix.os }}-nightly
           cache-targets: true
 
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
+
+      - name: Provision verified bundled model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
       - name: Resolve validation profile
         id: validation_profile
         shell: bash
