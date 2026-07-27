@@ -340,6 +340,54 @@ impl PartialOrd for Nearest {
     }
 }
 
+/// Reusable "have I seen this point?" set for a beam search.
+///
+/// A fresh `vec![false; len]` per beam search would make construction
+/// quadratic in the corpus size purely in zeroing cost — every insert runs
+/// one beam search per layer, so an n-point build writes O(n² · layers)
+/// bytes before doing any useful work. Instead the buffer is allocated once
+/// and reused: each search bumps an epoch, and a point counts as visited
+/// only if its mark equals the current epoch, so clearing is O(1).
+#[derive(Debug, Clone, Default)]
+struct VisitedSet {
+    marks: Vec<u32>,
+    epoch: u32,
+}
+
+impl VisitedSet {
+    /// Begin a new search over `len` points, discarding previous marks.
+    fn begin(&mut self, len: usize) {
+        if self.marks.len() < len {
+            self.marks.resize(len, 0);
+        }
+        // `0` means "never visited", so the epoch must never be 0. On
+        // wraparound, clear the marks once rather than let a stale mark
+        // from 2^32 searches ago read as visited.
+        match self.epoch.checked_add(1) {
+            Some(next) => self.epoch = next,
+            None => {
+                self.marks.fill(0);
+                self.epoch = 1;
+            }
+        }
+    }
+
+    /// Mark `id` visited, returning whether it was already seen.
+    ///
+    /// Ids outside the buffer report as already-visited so callers skip
+    /// them; a point that does not exist cannot be explored.
+    fn visit(&mut self, id: u32) -> bool {
+        let Some(mark) = self.marks.get_mut(id as usize) else {
+            return true;
+        };
+        if *mark == self.epoch {
+            return true;
+        }
+        *mark = self.epoch;
+        false
+    }
+}
+
 /// Deterministic level sampler.
 ///
 /// HNSW assigns each point a level from a geometric distribution. Using a
@@ -456,6 +504,9 @@ pub struct NativeHnsw {
     /// Entry point: the id of a point at the current maximum level.
     entry: Option<u32>,
     max_level: usize,
+    /// Visited-set buffer reused across every insert, so construction does
+    /// not re-zero an n-sized array per layer per point.
+    scratch: VisitedSet,
 }
 
 impl NativeHnsw {
@@ -472,6 +523,7 @@ impl NativeHnsw {
             adjacency: Vec::new(),
             entry: None,
             max_level: 0,
+            scratch: VisitedSet::default(),
         })
     }
 
@@ -533,6 +585,21 @@ impl NativeHnsw {
     /// Returns [`SearchError::InvalidConfig`] if `id` is not the next row,
     /// and propagates distance-computation failures.
     pub fn insert<D: VectorDistance>(&mut self, id: u32, store: &D) -> SearchResult<()> {
+        // Borrow the reusable visited buffer out of `self` so the insert
+        // body can hold `&mut self` and the buffer at the same time; it is
+        // restored on every path, including the error path.
+        let mut visited = std::mem::take(&mut self.scratch);
+        let outcome = self.insert_with(id, store, &mut visited);
+        self.scratch = visited;
+        outcome
+    }
+
+    fn insert_with<D: VectorDistance>(
+        &mut self,
+        id: u32,
+        store: &D,
+        visited: &mut VisitedSet,
+    ) -> SearchResult<()> {
         let expected = u32::try_from(self.adjacency.len()).unwrap_or(u32::MAX);
         if id != expected {
             return Err(SearchError::InvalidConfig {
@@ -574,8 +641,14 @@ impl NativeHnsw {
         // this minimum.
         let mut entry_points = vec![current];
         for layer in (0..=level.min(previous_max)).rev() {
-            let candidates =
-                self.search_layer(&entry_points, id, layer, self.params.ef_construction, store)?;
+            let candidates = self.search_layer(
+                &entry_points,
+                id,
+                layer,
+                self.params.ef_construction,
+                store,
+                visited,
+            )?;
             let selected =
                 self.select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
 
@@ -633,8 +706,9 @@ impl NativeHnsw {
         layer: usize,
         ef: usize,
         store: &D,
+        visited: &mut VisitedSet,
     ) -> SearchResult<Vec<Candidate>> {
-        self.beam_search(entry_points, layer, ef, store, &mut |id, store| {
+        self.beam_search(entry_points, layer, ef, store, visited, &mut |id, store| {
             store.distance_between(id, target_id)
         })
     }
@@ -647,8 +721,9 @@ impl NativeHnsw {
         layer: usize,
         ef: usize,
         store: &D,
+        visited: &mut VisitedSet,
     ) -> SearchResult<Vec<Candidate>> {
-        self.beam_search(entry_points, layer, ef, store, &mut |id, store| {
+        self.beam_search(entry_points, layer, ef, store, visited, &mut |id, store| {
             store.distance_to_query(id, query)
         })
     }
@@ -664,21 +739,18 @@ impl NativeHnsw {
         layer: usize,
         ef: usize,
         store: &D,
+        visited: &mut VisitedSet,
         distance: &mut dyn FnMut(u32, &D) -> SearchResult<f32>,
     ) -> SearchResult<Vec<Candidate>> {
         let ef = ef.max(1);
-        let mut visited = vec![false; self.adjacency.len()];
+        visited.begin(self.adjacency.len());
         let mut frontier: BinaryHeap<Nearest> = BinaryHeap::new();
         let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
 
         for &entry in entry_points {
-            let Some(slot) = visited.get_mut(entry as usize) else {
-                continue;
-            };
-            if *slot {
+            if visited.visit(entry) {
                 continue;
             }
-            *slot = true;
             let candidate = Candidate {
                 distance: distance(entry, store)?,
                 id: entry,
@@ -700,13 +772,9 @@ impl NativeHnsw {
                 break;
             }
             for &neighbour in self.neighbours_at(current.id, layer) {
-                let Some(slot) = visited.get_mut(neighbour as usize) else {
-                    continue;
-                };
-                if *slot {
+                if visited.visit(neighbour) {
                     continue;
                 }
-                *slot = true;
                 let candidate = Candidate {
                     distance: distance(neighbour, store)?,
                     id: neighbour,
@@ -858,10 +926,24 @@ impl NativeHnsw {
         let mut kept = self.select_neighbours(id, &scored, budget, store)?;
         // Reinstate the protected edge if the heuristic dropped it, evicting
         // the farthest kept neighbour to stay inside the budget.
+        //
+        // The eviction must find the genuinely farthest entry rather than
+        // popping the last one: `select_neighbours` appends its top-up fill
+        // after the heuristic's picks, so the list is not in distance order
+        // and popping would usually evict a NEAR neighbour. `scored` is
+        // sorted ascending, so the last kept entry it mentions is the
+        // farthest.
         if let Some(protected) = protected
             && !kept.contains(&protected)
         {
-            kept.pop();
+            if let Some(farthest) = scored
+                .iter()
+                .rev()
+                .find(|candidate| kept.contains(&candidate.id))
+                .map(|candidate| candidate.id)
+            {
+                kept.retain(|&neighbour| neighbour != farthest);
+            }
             kept.push(protected);
         }
 
@@ -931,20 +1013,24 @@ impl NativeHnsw {
             return Ok(Vec::new());
         };
         let ef = ef.unwrap_or(self.params.ef_search).max(k);
+        // One buffer for the whole query rather than one per layer.
+        let mut visited = VisitedSet::default();
 
         // Descend the upper layers greedily, then run one wide beam search
         // at layer 0 where every point participates.
         let mut current = entry;
         let mut layer = self.max_level;
         while layer > 0 {
-            let found = self.search_layer_query(&[current], query, layer, 1, store)?;
+            let found =
+                self.search_layer_query(&[current], query, layer, 1, store, &mut visited)?;
             if let Some(best) = found.first() {
                 current = best.id;
             }
             layer -= 1;
         }
 
-        let mut candidates = self.search_layer_query(&[current], query, 0, ef, store)?;
+        let mut candidates =
+            self.search_layer_query(&[current], query, 0, ef, store, &mut visited)?;
         candidates.truncate(k);
         Ok(candidates
             .into_iter()

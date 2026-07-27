@@ -227,10 +227,12 @@ fn async_lexical_boundaries_reject_a_cancelled_cx_and_retry_clean() {
 
 #[test]
 fn cancelled_cx_still_rejects_on_an_empty_query_class_matrix() {
-    // Cancellation must dominate other request properties: an empty query,
-    // a zero limit, and an offset past the end all still observe the
-    // cancelled Cx before doing work (or return their benign empty results
-    // without touching the snapshot — either way, no panic, no mutation).
+    // Cancellation dominates every other request property. A zero limit, an
+    // empty query and an offset past the end would each short-circuit to an
+    // empty result on their own, but the entry checkpoint runs first, so all
+    // three report the typed cancellation instead. Asserting the exact
+    // outcome matters: accepting "either a cancellation or an empty result"
+    // would pass whichever way the precedence ran, and so would pin nothing.
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let index = fixture_index(&cx).await;
         let snapshot_before = index.search_snapshot();
@@ -245,14 +247,20 @@ fn cancelled_cx_still_rejects_on_an_empty_query_class_matrix() {
                 "empty query",
                 index.search_results(&cx, "", LIMIT).map(|hits| hits.len()),
             ),
+            (
+                "offset past the end",
+                index
+                    .search_paginated(&cx, QUERY, LIMIT, 9_999, true)
+                    .map(|page| page.hits.len()),
+            ),
         ] {
-            match result {
-                Err(QuillIndexError::Cancelled { .. }) => {}
-                Ok(0) => {}
-                other => panic!(
-                    "{label}: expected typed cancellation or benign empty result, got {other:?}"
-                ),
-            }
+            let error = result.expect_err(&format!(
+                "{label}: cancellation must take precedence over the degenerate request"
+            ));
+            assert!(
+                matches!(&error, QuillIndexError::Cancelled { phase } if *phase == "search"),
+                "{label}: expected Cancelled at the search phase, got {error:?}"
+            );
         }
         cx.set_cancel_requested(false);
 
