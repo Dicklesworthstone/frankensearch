@@ -197,6 +197,15 @@ pub use frankensearch_index as index;
 /// Pre-flip Tantivy lexical backend.
 pub use frankensearch_lexical as lexical;
 
+#[cfg(feature = "lexical-tantivy")]
+/// Explicit Tantivy-native backend for oracle and foreign-index consumers.
+///
+/// Unlike `lexical`, this namespace is stable across the facade's default
+/// lexical-backend transition. Consumers that read or write Tantivy-native
+/// formats must opt into `lexical-tantivy` (or `cass-compat`) and import this
+/// namespace explicitly.
+pub use frankensearch_lexical as lexical_tantivy;
+
 #[cfg(feature = "quill")]
 /// Native Quill lexical backend.
 pub use frankensearch_quill as quill;
@@ -702,6 +711,7 @@ mod feature_matrix_smoke {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn lexical_tantivy_lane_behavior() {
+        let _explicit_tantivy_namespace = lexical_tantivy::CASS_SCHEMA_VERSION;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().expect("Tantivy feature tempdir");
             let index = TantivyIndex::create(dir.path()).expect("create Tantivy index");
@@ -731,6 +741,10 @@ mod feature_matrix_smoke {
     #[cfg(feature = "cass-compat")]
     #[test]
     fn cass_compat_lane_behavior() {
+        assert_eq!(
+            lexical_tantivy::CASS_SCHEMA_VERSION,
+            cass_compat::CASS_SCHEMA_VERSION
+        );
         let dir = tempfile::tempdir().expect("CASS feature tempdir");
         let mut index =
             cass_compat::CassTantivyIndex::open_or_create(dir.path()).expect("create CASS index");

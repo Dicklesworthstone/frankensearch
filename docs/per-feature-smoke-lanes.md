@@ -48,14 +48,17 @@ and writing that format while the integration exists. The facade dependency
 chain is explicit:
 
 ```text
-cass-compat -> lexical-tantivy -> lexical -> frankensearch-lexical
+cass-compat -> lexical-tantivy -> frankensearch-lexical
 ```
 
-The default facade feature set is only `hash`, so this chain must never enter a
-default build. CI protects both sides of the boundary: the dedicated
-`cass-compat` lane above compile-checks and executes its exact behavior test,
-while the all-features facade check prevents the cfg-gated adapter from
-silently rotting.
+The generic `lexical` feature is deliberately absent from this chain. Native
+Tantivy-format consumers import `frankensearch::lexical_tantivy`, so a later
+change to the facade-selected lexical backend cannot silently redirect foreign
+schema-v8 reads. The default facade feature set is only `hash`, so the
+compatibility chain must never enter a default build. CI protects both sides of
+the boundary: the dedicated `cass-compat` lane above compile-checks and
+executes its exact behavior test, while the all-features facade check prevents
+the cfg-gated adapter from silently rotting.
 
 Delete the lane only after coordination with the CASS project confirms one of
 these external events:

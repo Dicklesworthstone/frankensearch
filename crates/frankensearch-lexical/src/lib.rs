@@ -30,8 +30,10 @@ pub use cass_compat::{
 };
 
 // Re-export tantivy types that appear in frankensearch-lexical's public API.
-// Consumers can import these from `frankensearch::lexical::` instead of adding
-// a direct tantivy dependency.
+// Consumers can import these from `frankensearch::lexical_tantivy::` instead
+// of adding a direct Tantivy dependency. The explicit namespace keeps
+// foreign-format and oracle callers stable when the facade's generic
+// `lexical` feature selects Quill.
 pub use tantivy::collector::{Count, TopDocs};
 pub use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 pub use tantivy::schema::{Field, IndexRecordOption, Schema, Value};

@@ -844,6 +844,7 @@ mod tests {
     /// plausible results at query time. Without a machine-readable signal on
     /// the build result there is nothing for a caller to check, which is
     /// exactly how this shipped unnoticed.
+    #[cfg(feature = "hash")]
     #[test]
     fn build_reports_hash_only_generation_as_degraded() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
