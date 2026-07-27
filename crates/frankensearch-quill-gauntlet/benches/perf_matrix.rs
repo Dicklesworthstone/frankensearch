@@ -28,8 +28,8 @@ use frankensearch_core::{IndexableDocument, LexicalSearch};
 use frankensearch_lexical::TantivyIndex;
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
-    Analyzer, CompactionPolicy, FieldDescriptor, FieldKind, QuillConfig, QuillIndex,
-    SchemaDescriptor, SegmentStatsProvider,
+    Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
+    QuillIndex, SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, CorpusIdentity, DistributionSummary, EvidenceCell,
@@ -259,6 +259,108 @@ fn tantivy_create(path: &Path, spec: &PerfCellSpec) -> TantivyIndex {
         spec.positions.unwrap_or(PositionMode::On).enabled(),
     )
     .expect("create pinned on-disk Tantivy oracle")
+}
+
+fn preflight_index<E: LexicalSearch>(
+    context: &BenchContext,
+    index: &E,
+    documents: &[IndexableDocument],
+) -> Vec<String> {
+    context.runtime.block_on(async {
+        index
+            .index_documents(&context.cx, documents)
+            .await
+            .expect("QG fixture preflight index");
+        index
+            .commit(&context.cx)
+            .await
+            .expect("QG fixture preflight commit");
+        index
+            .search(&context.cx, "term00001", 3)
+            .await
+            .expect("QG fixture preflight bare-term query")
+            .into_iter()
+            .map(|result| result.doc_id.into())
+            .collect()
+    })
+}
+
+/// Construct and query every selected QG-1 matrix cell before collecting any
+/// timing samples. This is deliberately driven by the validated normative
+/// matrix rather than a second handwritten fixture list, so a newly added
+/// position/schema cell cannot reach release measurement without first
+/// proving that both engines can serve its position-independent query.
+fn preflight_qg1_fixtures(
+    context: &BenchContext,
+    matrix: &PerfMatrixSpec,
+    selected: &[PerfCellSpec],
+) {
+    let documents = [
+        IndexableDocument::new(
+            "qg-preflight-repeated",
+            "term00001 term00001 term00001 qgpreflight",
+        ),
+        IndexableDocument::new("qg-preflight-single", "term00001 qgpreflight"),
+        IndexableDocument::new("qg-preflight-decoy", "term00002 qgpreflight"),
+    ];
+    let expected = [
+        "qg-preflight-repeated".to_owned(),
+        "qg-preflight-single".to_owned(),
+    ];
+
+    for spec in selected.iter().filter(|spec| spec.gate == PerfGate::Qg1) {
+        assert!(
+            matrix.cells.contains(spec),
+            "selected QG-1 fixture is absent from the normative matrix: {}",
+            spec.fixture
+        );
+        if spec.metric == "tokenize_docs_per_second" {
+            let mut tokenizer = FrankensearchTokenizer::default();
+            let mut token_count = 0_usize;
+            tokenizer.analyze(
+                Analyzer::FrankensearchDefault,
+                &documents[0].content,
+                &mut |_| token_count = token_count.saturating_add(1),
+            );
+            assert!(token_count > 0, "QG tokenizer preflight emitted no terms");
+            eprintln!(
+                "[qg-fixture-preflight] manifest={} fixture={} schema=tokenizer-only \
+                 operator=tokenize status=ok token_count={token_count}",
+                matrix.manifest, spec.fixture,
+            );
+            continue;
+        }
+
+        let positions = spec.positions.unwrap_or(PositionMode::On);
+        let schema = if positions.enabled() {
+            DEFAULT_SCHEMA.name
+        } else {
+            NO_POSITION_SCHEMA.name
+        };
+        let quill = quill_in_memory(spec);
+        let tantivy = tantivy_in_memory(spec);
+        let quill_hits = preflight_index(context, &quill, &documents);
+        let tantivy_hits = preflight_index(context, &tantivy, &documents);
+        assert_eq!(
+            quill_hits, expected,
+            "Quill QG fixture preflight changed independent expected order for {}",
+            spec.fixture
+        );
+        assert_eq!(
+            tantivy_hits, expected,
+            "Tantivy QG fixture preflight changed independent expected order for {}",
+            spec.fixture
+        );
+        eprintln!(
+            "[qg-fixture-preflight] manifest={} fixture={} schema={schema} \
+             operator=bare_term positions={} threads={} status=ok hits={}",
+            matrix.manifest,
+            spec.fixture,
+            positions.label(),
+            spec.threads.unwrap_or(1),
+            expected.len(),
+        );
+    }
 }
 
 fn index_batches<E: LexicalSearch>(
@@ -1568,6 +1670,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let matrix = PerfMatrixSpec::complete();
     validate_matrix(&matrix).expect("normative QG matrix");
     let selected = selected_cells(&matrix, scale);
+    preflight_qg1_fixtures(&context, &matrix, &selected);
     let configured_runs = std::env::var("QUILL_PERF_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
