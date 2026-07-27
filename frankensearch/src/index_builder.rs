@@ -41,7 +41,9 @@ use frankensearch_index::{
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
 use frankensearch_lexical::TantivyIndex;
 #[cfg(feature = "quill")]
-use frankensearch_quill::{QuillConfig, QuillIndex};
+use frankensearch_quill::{
+    BlueGreenEngine, LexicalLayout, QuillConfig, QuillIndex, inspect_lexical_layout,
+};
 
 /// Per-arm byte accounting for a completed build (bd-8nqz.3).
 ///
@@ -806,7 +808,34 @@ async fn open_lexical_reader(
     cx: &Cx,
     dir: &Path,
 ) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
-    let index = QuillIndex::open(cx, dir, QuillConfig::default()).await?;
+    // bd-8nqz.2: dispatch on the inspected layout instead of blindly opening
+    // the root — a blue-green root opens its ACTIVE engine dir, a foreign or
+    // damaged layout is a typed error, and inspection never adopts/publishes.
+    let layout =
+        inspect_lexical_layout(dir).map_err(|source| SearchError::SubsystemError {
+            subsystem: "facade.lexical.layout",
+            source: Box::new(source),
+        })?;
+    let target = match layout {
+        LexicalLayout::Empty => return Ok(None),
+        LexicalLayout::DirectQuill => dir.to_path_buf(),
+        LexicalLayout::BlueGreen { ref pointer, .. }
+            if pointer.engine() == BlueGreenEngine::Quill =>
+        {
+            pointer.engine_dir(dir)
+        }
+        ref layout => {
+            return Err(SearchError::InvalidConfig {
+                field: "data_dir/lexical".to_owned(),
+                value: dir.display().to_string(),
+                reason: format!(
+                    "lexical layout is {}, which this Quill-backed build cannot open",
+                    layout.label()
+                ),
+            });
+        }
+    };
+    let index = QuillIndex::open(cx, target, QuillConfig::default()).await?;
     Ok(Some(Arc::new(index)))
 }
 
@@ -833,6 +862,28 @@ async fn build_lexical_index(
     data_dir: &Path,
     documents: &[IndexableDocument],
 ) -> SearchResult<LexicalArmReceipt> {
+    // bd-8nqz.2: never initialize Quill on top of a foreign, damaged,
+    // blue-green, or ambiguous layout — MANIFEST absence is NOT emptiness.
+    // Empty proceeds; DirectQuill preserves the existing create-over-own
+    // behavior; everything else is a typed refusal.
+    match inspect_lexical_layout(data_dir).map_err(|source| SearchError::SubsystemError {
+        subsystem: "facade.lexical.layout",
+        source: Box::new(source),
+    })? {
+        LexicalLayout::Empty | LexicalLayout::DirectQuill => {}
+        layout => {
+            return Err(SearchError::InvalidConfig {
+                field: "data_dir/lexical".to_owned(),
+                value: data_dir.display().to_string(),
+                reason: format!(
+                    "refusing to initialize Quill over a {} lexical layout; \
+                     inspect or repair the directory first",
+                    layout.label()
+                ),
+            });
+        }
+    }
+
     let config = QuillConfig {
         bulk_load_mode: true,
         ..QuillConfig::default()
@@ -1796,6 +1847,61 @@ mod tests {
                 .map(|hit| hit.document_id)
                 .collect::<Vec<_>>();
             assert_eq!(gamma_ids, vec!["doc-ok".to_owned()]);
+        });
+    }
+
+    /// bd-8nqz.2: a tantivy meta.json squatting in the lexical dir must be a
+    /// typed refusal, not a silent Quill initialization beside it (MANIFEST
+    /// absence is not emptiness).
+    #[cfg(feature = "quill")]
+    #[test]
+    fn build_refuses_quill_init_over_foreign_lexical_layout() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let lexical_dir = dir.path().join("lexical");
+            std::fs::create_dir_all(&lexical_dir).unwrap();
+            std::fs::write(lexical_dir.join("meta.json"), b"{}").unwrap();
+
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect_err("foreign lexical layout must refuse Quill init");
+            let message = error.to_string();
+            assert!(
+                message.contains("direct-tantivy"),
+                "error must carry the typed layout label: {message}"
+            );
+            assert!(
+                !lexical_dir.join("MANIFEST").exists(),
+                "no Quill artifacts may appear beside the foreign index"
+            );
+        });
+    }
+
+    /// bd-8nqz.2: `open_hybrid` reports a mixed lexical layout as a typed
+    /// error instead of silently picking an engine.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn open_hybrid_reports_mixed_layout_as_typed_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Alpha content")
+                .build(&cx)
+                .await
+                .unwrap();
+            std::fs::write(dir.path().join("lexical").join("meta.json"), b"{}").unwrap();
+
+            let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect_err("mixed layout must be a typed error");
+            assert!(
+                error.to_string().contains("mixed"),
+                "error must carry the typed layout label: {error}"
+            );
         });
     }
 
