@@ -504,9 +504,13 @@ resolve_worker_identity_file() {
 
 bootstrap_remote_worker() {
     local requested_worker="$1"
-    local worker identity_file
+    local worker identity_file remote_project_dir_arg
     worker="$(resolve_worker_target "${requested_worker}")"
     identity_file="$(resolve_worker_identity_file "${requested_worker}")"
+    # OpenSSH command serialization does not preserve an empty positional
+    # argument. Use a non-empty sentinel so later flags cannot shift left when
+    # the worker should auto-discover its content-addressed project root.
+    remote_project_dir_arg="${RCH_REMOTE_PROJECT_DIR:-__RCH_DISCOVER_PROJECT__}"
     local -a encoded_model_specs=()
     local -a ssh_options=(-o BatchMode=yes -o ConnectTimeout=10)
     local spec
@@ -532,7 +536,7 @@ bootstrap_remote_worker() {
         "${FRANKENSQLITE_REPO}" "${FRANKENSQLITE_REF}" \
         "${FAST_CMAES_REPO}" "${FAST_CMAES_REF}" \
         "${FRANKENTUI_REPO}" "${FRANKENTUI_REF}" \
-        "${RCH_REMOTE_PROJECT_DIR}" "${FRANKENTORCH_REF}" \
+        "${remote_project_dir_arg}" "${FRANKENTORCH_REF}" \
         "${PROVISION_MODELS}" "${MODELS_ONLY}" "${encoded_model_specs[@]}" <<'EOF'
 set -euo pipefail
 
@@ -552,6 +556,9 @@ provision_models="${13:-false}"
 models_only="${14:-false}"
 shift 14
 encoded_model_specs=("$@")
+if [[ "${project_dir}" == "__RCH_DISCOVER_PROJECT__" ]]; then
+    project_dir=""
+fi
 model_specs=()
 model_root="${FRANKENSEARCH_BUNDLED_MODELS_SOURCE_DIR:-${FRANKENSEARCH_MODEL_DIR:-${HOME}/.local/share/frankensearch/models}}"
 
