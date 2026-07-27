@@ -136,9 +136,17 @@ pub mod api_provider;
 pub mod api_embedder;
 
 #[cfg(feature = "api")]
-pub use api_embedder::ApiEmbedder;
+pub use api_embedder::{
+    ApiEmbedder, ApiEmbedderConfig, AssumedRemoteApi, AssumedRemoteEmbeddingBatchV1,
+    PinnedRemoteAttesterV1, RemoteApiTrustLevelV1,
+};
 #[cfg(feature = "api")]
-pub use api_provider::{ApiProvider, GeminiProvider, OpenAiProvider, RemoteEmbeddingAttestationV1};
+pub use api_provider::{
+    ApiProvider, GeminiProvider, MIN_REMOTE_ATTESTATION_KEY_BYTES, OpenAiProvider,
+    REMOTE_EMBEDDING_ATTESTATION_SCHEMA_V1, REMOTE_EMBEDDING_CHALLENGE_SCHEMA_V1,
+    RemoteEmbeddingAttestationV1, RemoteEmbeddingChallengeV1, remote_embedding_payload_sha256,
+    remote_endpoint_fingerprint, remote_ordered_request_sha256,
+};
 
 #[cfg(test)]
 mod build_policy_tests {
