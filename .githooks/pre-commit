@@ -3,4 +3,5 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+"${repo_root}/scripts/check_ledger_null_control.sh" --selfcheck
 exec "${repo_root}/scripts/check_ledger_null_control.sh" --staged

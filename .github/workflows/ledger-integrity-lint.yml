@@ -39,6 +39,9 @@ jobs:
           echo "Gating ledger rows added since ${BASE_REF}"
           scripts/check_ledger_null_control.sh --since "${BASE_REF}"
 
+      - name: Exercise fail-closed gate contract
+        run: scripts/check_ledger_null_control.sh --selfcheck
+
       - name: Report mechanical historical backlog (never fails)
         if: always()
         run: scripts/check_ledger_null_control.sh --all

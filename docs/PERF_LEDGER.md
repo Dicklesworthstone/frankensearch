@@ -6858,6 +6858,12 @@ dispatch/generic speedup be cited from this legacy target.
 
 ## 2026-07-22 — BLOCKED / UNTIMED: retained top-k A/A CV audit never links remotely (`bd-3srq`, IndigoOtter)
 
+> **2026-07-27 model-integrity correction:** the link/admission finding remains
+> `BLOCKED/UNTIMED`, but every CV-based retry requirement below is superseded.
+> A future timed run must self-report its ELF SHA-256, collect same-invocation
+> A/A and A/B, and decide solely from the candidate median CI versus the A/A
+> null floor. Raw CV is diagnostic only.
+
 Negative-evidence mining closed the proposed duplicate retrofit before any
 source edit: `int8_vs_f16_fast_ab` already measures the real shipped exact-f16
 and int8-two-pass methods in one binary, includes an interleaved f16/f16 A/A
@@ -6888,6 +6894,11 @@ full `FusedHit` equality, an interleaved map/map A/A, and all compared arm CVs
 below 5% before retaining any harness change.
 
 ## 2026-07-22 — BLOCKED / NO ADMISSIBLE VERDICT: short-token ASCII boundary selection mask (`bd-l5x3`, IndigoOtter)
+
+> **2026-07-27 model-integrity correction:** this remains an undecidable,
+> non-KEEP run, but every CV-based retry requirement below is superseded.
+> Re-entry requires the same executing ELF, same-invocation A/A and A/B, exact
+> token parity, and a median-CI/null-floor decision. Raw CV is diagnostic only.
 
 Alien-graveyard routing selected vectorized selection masks (§8.2) for the
 still-open short-token tokenizer gap. The candidate classified one eight-byte
@@ -6994,6 +7005,11 @@ shows neither a p95 nor invocation-count benefit.
 
 ## 2026-07-23 — BLOCKED / UNTIMED: isolated short-token boundary-mask retry still cannot enter Criterion (`bd-l5x3`, TurquoiseTern)
 
+> **2026-07-27 model-integrity correction:** this remains `BLOCKED/UNTIMED`,
+> while the CV gate in the historical retry text is withdrawn. Gate any future
+> timed evidence on same-ELF, same-invocation A/A and A/B median CIs plus exact
+> token parity; never on CV.
+
 Ledger-first routing reopened the previously untimed short-token selection-mask
 candidate without touching the closed SIMD dot-product, top-k, RRF, or
 architectural lanes. The same binary retained the pre-change shipping SWAR
@@ -7016,6 +7032,14 @@ requires exact SWAR/scalar/shipping parity, 64-pass A/A p5–p95 wholly within
 candidate/shipping <=0.97, and no decidable long-token regression.
 
 ## 2026-07-23 — REJECT / INVALID-CV: short-token ASCII boundary selection mask remains inside its null floor (`bd-l5x3`, TurquoiseTern)
+
+> **2026-07-27 model-integrity correction — supersedes this historical
+> verdict:** classify the row as `VALID-AB / UNDECIDABLE`, not a lever
+> rejection. The favorable `0.8223` short median lies inside its own
+> `[0.7606, 1.2099]` same-invocation A/A null interval. CV cannot turn that
+> overlap into a rejection. Production restoration remains valid; the retry
+> predicate is same ELF, exact parity, same-invocation A/A+A/B, and a
+> median-CI/null-floor decision.
 
 The previously blocked retry reached both proof and timing on a fully reserved
 worker. Strict-remote job `j-29944835100115026` used all 8/8 slots on
@@ -7044,6 +7068,11 @@ CPU; require exact scalar/shipping parity, both A/A bands wholly within
 decidable long-token regression.
 
 ## 2026-07-23 — BLOCKED / UNTIMED: isolated top-k A/A/CV retry still cannot link inside its admission window (`bd-3srq`, TurquoiseTern)
+
+> **2026-07-27 model-integrity correction:** build/link admission was later
+> repaired, but this historical run remains untimed. The CV conditions below
+> are superseded by same-ELF, same-invocation A/A+A/B and a median-CI/null-floor
+> decision; raw CV is diagnostic only.
 
 Ledger and recent-history mining selected the existing
 `int8_vs_f16_fast_ab` target rather than duplicating benchmark infrastructure

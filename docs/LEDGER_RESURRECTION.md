@@ -370,3 +370,53 @@ retraction.
 The audit therefore yields **12 SOUND, 9 CORRECTED, 0 RETRACTED**. These are
 judgment verdicts, not new benchmark results. The allocation remains Lane B:
 no measurement was run and no QG baseline was fabricated.
+
+## 9. Model-integrity remediation closure: 2026-07-27
+
+Every `CORRECTED` verdict above now maps to a concrete fix that is an ancestor
+of `origin/main`. There are no fix-required verdicts whose repair exists only
+in a worktree, unmerged branch, tracker comment, or prose promise.
+
+| Corrected commit | Landed remediation |
+|---|---|
+| `b9b3e969` | `c487a221` installs the authoritative taxonomy/admission contract; `dab52390` corrects the stale-copy characterization. |
+| `5cc07b79` | `afcb1478` and `dab52390` replace the speculative cursor diagnosis; `73c61d74` fixes the real drained-buffer candidate enumeration. |
+| `fcd4a485` | `c487a221` replaces the v1 census with the hand-adjudicated six-class `216/341` result and four untimed quarantines. |
+| `c435328e` | `ace575cb` replaces the inaccurate CASS preimages with executable v2/v4 contracts and real Quill/Tantivy adapters. |
+| `8e7f8fe1` | `73c61d74` repairs grouped pruning correctness; `974a6453` repairs the evidence workload and document-count assertion. |
+| `09f8aca8` | `308f038d` requires rerun/executing ELF SHA equality; `c487a221` completes the harness parity and ledger gates. |
+| `e6ecdbe3` | `93534e8f` replaces the nonexistent fixed worker path with content-addressed RCH project-root discovery. |
+| `bf982ae4` | `c487a221` adds full token metadata and exact top-k order parity; `4d6316a9` records build/link admission without inventing timing. |
+| `f2c0694f` | `c487a221` replaces the partial added-line heuristic with candidate lookup, staged-blob reject/KEEP enforcement, pre-commit wiring, and CI. |
+
+The downstream-citation sweep covered `NEGATIVE_EVIDENCE`, `PERF_LEDGER`,
+all repository READMEs, scorecard-named files/content, and every bead body.
+This incident window contains **zero `RETRACTED` verdicts**, so it has no
+retraction-dependent claims to unwind. It did expose stale dependents of a
+`CORRECTED` verdict: five mirrored `bd-l5x3`/`bd-3srq` sections in each ledger
+and the two bead contracts. All ten ledger sections now carry adjacent
+model-integrity corrections, `bd-l5x3` is closed as `VALID-AB / UNDECIDABLE`,
+and `bd-3srq` is closed as `BLOCKED/UNTIMED` under the median-CI contract.
+README and scorecard scans found no incident-window dependent claim.
+
+The gate itself was not complete at the start of this closure pass. A synthetic
+`REJECT/INVALID-CV` row with a numeric same-invocation A/A null still passed:
+the guard enforced null presence but not the decision rule. The remediation
+adds a fail-closed CV-verdict check and an executable six-case self-check:
+
+1. `VOID-NONULL` rejection is blocked.
+2. CV-only rejection is blocked even when an A/A null exists.
+3. A median-CI effect inside its same-invocation null is admitted as a
+   no-ship/null-contained row.
+4. A counted unchanged mechanism is admitted.
+5. A KEEP without an executing ELF SHA-256 is blocked.
+6. A KEEP with a 64-hex executing ELF SHA-256 is admitted.
+
+The tracked pre-commit hook and ledger-integrity CI both execute that
+self-check. A historical replay beginning before `f36ea6ce` now exits 2 and
+identifies the original `bd-l5x3` row specifically as `BLOCKED CV-VERDICT`.
+The candidate preflight also exits 2 for the boundary-selection-mask/tokenizer
+surface and prints the existing retry context.
+
+Closure counters: `verdicts_total=21`, `fixes_landed=9/9`,
+`downstream_citations_corrected=12`, `gate_selfcheck_pass=true`.

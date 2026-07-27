@@ -20,12 +20,14 @@ SINCE_REF=""
 CANDIDATE=""
 SURFACE=""
 LEDGER_OVERRIDE=""
+SELF_CHECK_FIXTURE=""
 
 usage() {
   cat <<'USAGE'
 Usage:
   scripts/check_ledger_null_control.sh --candidate <lever> --surface <target>
   scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
+  scripts/check_ledger_null_control.sh --selfcheck
   scripts/check_ledger_null_control.sh --install-hook
 
 Options:
@@ -34,6 +36,7 @@ Options:
   --staged            Gate newly added staged rows (default; pre-commit).
   --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
   --all               Mechanical whole-ledger report; never blocks.
+  --selfcheck         Exercise fail-closed synthetic contract cases.
   --ledger <path>     Override the default ledger set (test/diagnostic use).
   --install-hook      Point this checkout at the tracked .githooks directory.
 
@@ -80,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all)
       MODE="all"
+      shift
+      ;;
+    --selfcheck)
+      MODE="selfcheck"
       shift
       ;;
     --ledger)
@@ -210,6 +217,9 @@ diff_stream() {
     all)
       # No hunks are needed in report mode; awk checks every entry.
       ;;
+    selfcheck)
+      # Synthetic self-check entries are all considered newly added.
+      ;;
   esac
 }
 
@@ -230,6 +240,9 @@ blob_stream() {
       ;;
     since|all)
       command cat "${abs}"
+      ;;
+    selfcheck)
+      printf '%s\n' "${SELF_CHECK_FIXTURE}"
       ;;
   esac
 }
@@ -279,11 +292,19 @@ no (counted )?change|0([.]0+)?% change)/)
           has_hex64(line)) {
         binary_sha = 1
       }
+
+      if (low ~ /invalid[-_ ]?cv|cv[_ -]*only|cv[_ -]*gate|\
+coefficient of variation[_ -]*gate/ ||
+          low ~ /(decision|verdict|outcome|status).*(cv|coefficient of variation)/ ||
+          low ~ /(reject|no[- ]?ship|no[- ]?land).*(cv|coefficient of variation)/ ||
+          low ~ /(cv|coefficient of variation).*(reject|invalid|inadmissible)/) {
+        cv_verdict = 1
+      }
     }
     function flush(    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null) {
       if (header == "") return
-      new_entry = (mode == "all" || added[start_line])
+      new_entry = (mode == "all" || mode == "selfcheck" || added[start_line])
       if (!new_entry) {
         header = ""; evidence = ""; return
       }
@@ -312,6 +333,14 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
           print "  missing: same-invocation numeric A/A null OR counted no-change mechanism"
         }
       }
+      if (is_reject && cv_verdict) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED CV-VERDICT " ledger ":" start_line
+          print "  " header
+          print "  forbidden: CV-based decision; gate on median CI versus the A/A null floor"
+        }
+      }
       if (is_keep && !binary_sha) {
         violations++
         if (mode != "all" || violations <= 20) {
@@ -323,7 +352,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
 
       header = ""; evidence = ""; decision_lines = ""
       numeric_null = 0; same_invocation = 0
-      counted_mechanism = 0; binary_sha = 0
+      counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
     }
 
     FNR == NR {
@@ -413,10 +442,53 @@ lint_ledgers() {
 [ledger-gate] BLOCKED. A new REJECT must distinguish the lever from the
 harness with a numeric same-invocation A/A null, or refute it with a counted
 unchanged mechanism. A new KEEP must identify the executing ELF/binary SHA-256.
-Never use cv_pct as the decision gate.
+CV may be diagnostic only; the decision gate is median CI versus the A/A null
+floor.
 EOF
   fi
   return "${status}"
+}
+
+run_selfcheck_case() {
+  local label="$1"
+  local expected="$2"
+  local fixture="$3"
+  local output rc
+
+  SELF_CHECK_FIXTURE="${fixture}"
+  if output="$(lint_one "docs/NEGATIVE_EVIDENCE.md" 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  if [[ ${rc} -ne ${expected} ]]; then
+    echo "[ledger-selfcheck] FAIL ${label}: expected exit ${expected}, got ${rc}" >&2
+    printf '%s\n' "${output}" >&2
+    return 1
+  fi
+  echo "[ledger-selfcheck] PASS ${label}: exit ${rc}"
+}
+
+run_selfcheck() {
+  local failed=0
+  local sha
+  sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+  run_selfcheck_case "VOID-NONULL reject is blocked" 2 $'### 2099-01-01 — REJECT: synthetic no-null row\nA/B median ratio: 1.001\nDecision: reject as no improvement.' || failed=1
+  run_selfcheck_case "CV-only reject is blocked" 2 $'### 2099-01-02 — REJECT / INVALID-CV: synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nA/B median CI: 0.980 [0.950, 1.020]\nDecision: reject because arm CV exceeded 5%.' || failed=1
+  run_selfcheck_case "null-floor reject is admitted" 0 $'### 2099-01-03 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nA/B median CI: 1.001 [0.990, 1.010]\nDecision: no-ship because the effect remains inside the A/A null floor.' || failed=1
+  run_selfcheck_case "counted-mechanism reject is admitted" 0 $'### 2099-01-04 — REJECT: synthetic counted-mechanism row\nInstructions count unchanged: baseline 100, candidate 100.\nDecision: reject because the counted mechanism removed no work.' || failed=1
+  run_selfcheck_case "KEEP without ELF SHA is blocked" 2 $'### 2099-01-05 — KEEP: synthetic unbound binary\nA/B median CI: 0.900 [0.880, 0.920].' || failed=1
+  run_selfcheck_case "KEEP with ELF SHA is admitted" 0 $"### 2099-01-06 — KEEP: synthetic bound binary
+ELF sha256: ${sha}
+A/B median CI: 0.900 [0.880, 0.920]." || failed=1
+
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-selfcheck] BLOCKED: one or more contract cases failed" >&2
+    return 2
+  fi
+  echo "[ledger-selfcheck] OK: 6/6 contract cases"
 }
 
 case "${MODE}" in
@@ -425,6 +497,9 @@ case "${MODE}" in
     ;;
   install-hook)
     install_hook
+    ;;
+  selfcheck)
+    run_selfcheck
     ;;
   staged|since|all)
     lint_ledgers

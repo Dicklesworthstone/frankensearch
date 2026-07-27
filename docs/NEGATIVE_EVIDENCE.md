@@ -15958,6 +15958,12 @@ union3 or phrase.
 
 ### 2026-07-22 — BLOCKED / UNTIMED: top-k A/A CV revalidation cannot reach its timed path (`bd-3srq`, IndigoOtter)
 
+> **2026-07-27 model-integrity correction:** the link/admission finding remains
+> `BLOCKED/UNTIMED`, but every CV-based retry requirement below is superseded.
+> A future timed run must self-report its ELF SHA-256, collect same-invocation
+> A/A and A/B, and decide solely from the candidate median CI versus the A/A
+> null floor. Raw CV is diagnostic only.
+
 The mandatory ledger pass prevented a duplicate benchmark edit. The existing
 `int8_vs_f16_fast_ab` target already supplies the real-method f16/f16 A/A null,
 exact-f16/int8-two-pass A/B, recall@10=1.0000, and 32/32 exact-order proof that
@@ -16025,6 +16031,11 @@ the same null-controlled 5/20/50% matrix and never a 0% fixture.
 
 ### 2026-07-22 — BLOCKED / NO ADMISSIBLE VERDICT: short-token ASCII boundary selection mask (`bd-l5x3`, IndigoOtter)
 
+> **2026-07-27 model-integrity correction:** this remains an undecidable,
+> non-KEEP run, but every CV-based retry requirement below is superseded.
+> Re-entry requires the same executing ELF, same-invocation A/A and A/B, exact
+> token parity, and a median-CI/null-floor decision. Raw CV is diagnostic only.
+
 The mandatory ledger and recent-log pass left the short-token tokenizer gap
 open while closing cached SWAR-window reuse, dot-product measurement noise,
 and the cold-link top-k/RRF retry. Alien-graveyard §8.2 supplied a different
@@ -16061,6 +16072,11 @@ CV below 5%, short candidate/shipping <=0.97, and no decidable long regression.
 
 ### 2026-07-23 — BLOCKED / UNTIMED retry: isolated short-token boundary-mask Criterion path remains inadmissible (`bd-l5x3`, TurquoiseTern)
 
+> **2026-07-27 model-integrity correction:** this remains `BLOCKED/UNTIMED`,
+> while the CV gate in the historical retry text is withdrawn. Gate any future
+> timed evidence on same-ELF, same-invocation A/A and A/B median CIs plus exact
+> token parity; never on CV.
+
 The mandatory ledger and recent-log pass reopened only the prior boundary-mask
 candidate; the cached-window primitive remains rejected, and no dot-product,
 top-k, RRF, or architectural source was touched. The candidate and retained
@@ -16089,6 +16105,14 @@ SWAR/scalar/shipping parity, 64-pass shipping/shipping A/A p5–p95 wholly withi
 short candidate/shipping <=0.97, and no decidable long-token regression.
 
 ### 2026-07-23 — REJECT / INVALID-CV: short-token ASCII boundary selection mask remains inside its null floor (`bd-l5x3`, TurquoiseTern)
+
+> **2026-07-27 model-integrity correction — supersedes this historical
+> verdict:** classify the row as `VALID-AB / UNDECIDABLE`, not a lever
+> rejection. The favorable `0.8223` short median lies inside its own
+> `[0.7606, 1.2099]` same-invocation A/A null interval. CV cannot turn that
+> overlap into a rejection. Production restoration remains valid; the retry
+> predicate is same ELF, exact parity, same-invocation A/A+A/B, and a
+> median-CI/null-floor decision.
 
 The retry predicate above was finally satisfied operationally: strict-remote
 job `j-29944835100115026` reserved all 8/8 slots on `vmi1227854` and passed all
@@ -16122,6 +16146,11 @@ every arm CV below 5%, short candidate/shipping at most 0.97, and no decidable
 long-token regression.
 
 ### 2026-07-23 — BLOCKED / UNTIMED: isolated top-k A/A/CV retry still cannot link inside its admission window (`bd-3srq`, TurquoiseTern)
+
+> **2026-07-27 model-integrity correction:** build/link admission was later
+> repaired, but this historical run remains untimed. The CV conditions below
+> are superseded by same-ELF, same-invocation A/A+A/B and a median-CI/null-floor
+> decision; raw CV is diagnostic only.
 
 The fresh ledger/log pass selected the retained `int8_vs_f16_fast_ab` harness
 without changing production source. It already contains the real-method
