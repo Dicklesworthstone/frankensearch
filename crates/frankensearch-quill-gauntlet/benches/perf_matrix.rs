@@ -43,7 +43,7 @@ use frankensearch_quill_gauntlet::{
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
     RankClass, RankedHit, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, compare_observations,
     estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
-    seeded_balanced_pair_order, validate_matrix,
+    perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -2061,7 +2061,7 @@ fn git_revision(scale: MatrixScale) -> String {
 }
 
 fn manifest_sha256() -> String {
-    lower_hex(&Sha256::digest(MANIFEST.as_bytes()))
+    perf_manifest_contract_sha256(MANIFEST)
 }
 
 fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> String {

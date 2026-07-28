@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
     PerfEvidenceArtifact, PerfEvidenceFile, PerfGate, PerfGateArtifact, PerfGateDecision,
-    PerfRatchetMode, PerfRatchetRequest, evaluate_perf_ratchet,
+    PerfRatchetMode, PerfRatchetRequest, evaluate_perf_ratchet, perf_manifest_contract_sha256,
 };
 use sha2::{Digest, Sha256};
 
@@ -64,8 +64,8 @@ fn main() -> ExitCode {
 fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let args = parse_args(env::args_os().skip(1))?;
     let manifest_bytes = fs::read(&args.manifest)?;
-    let manifest_sha256 = sha256_hex(&manifest_bytes);
     let manifest_text = std::str::from_utf8(&manifest_bytes)?;
+    let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
     let manifest = toml::from_str::<toml::Value>(manifest_text)?;
 
     let (baseline, baseline_bytes) = read_artifact(&args.baseline)?;

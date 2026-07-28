@@ -3,7 +3,9 @@
 //! The benchmark harness emits measurements; this module decides whether a
 //! result may advance the committed `.bench-history` baseline. It deliberately
 //! keeps noisy results in quarantine and requires a same-revision rerun before
-//! a performance result can be promoted.
+//! a performance result can be promoted. An explicit unmeasured bootstrap may
+//! establish the first admitted baseline even when the target is missed; that
+//! MISS is retained in the decision reasons and remains claim-ineligible.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -18,7 +20,7 @@ use crate::{
 };
 
 /// Version of the machine-readable ratchet decision artifact.
-pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v2";
+pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v3";
 /// Maximum directional pass-over-pass regression admitted for a cell.
 pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 /// Maximum disagreement admitted between same-revision candidate reruns.
@@ -262,6 +264,7 @@ fn finish_evaluation(
 #[must_use]
 pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEvaluation {
     let gate = request.candidate.gate;
+    let baseline_is_bootstrap = request.baseline.is_some_and(is_explicit_bootstrap);
     let mut state = DecisionState::default();
     let candidate_cells = validate_artifact(
         request.candidate,
@@ -393,6 +396,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
                     &rerun_cells,
                     rerun_evidence,
                     request.gate_activated,
+                    baseline_is_bootstrap,
                     &mut state,
                 );
             }
@@ -433,6 +437,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
             &candidate_cells,
             candidate_evidence,
             request.gate_activated,
+            baseline_is_bootstrap,
             &mut state,
         );
         if !request.gate_activated {
@@ -1318,12 +1323,7 @@ fn compare_baseline(
     comparisons: &mut Vec<PerfCellComparison>,
     state: &mut DecisionState,
 ) {
-    let explicit_bootstrap = baseline.cells.is_empty()
-        && baseline.machine_fingerprint == "unmeasured"
-        && baseline.bench_elf_sha256 == "unmeasured"
-        && baseline.git_rev == "unmeasured"
-        && baseline.run_window == "unmeasured"
-        && baseline.run_id == "unmeasured";
+    let explicit_bootstrap = is_explicit_bootstrap(baseline);
     if explicit_bootstrap {
         if mode == PerfRatchetMode::RegressionAlarm {
             state.quarantine(
@@ -1445,6 +1445,15 @@ fn compare_baseline(
             }
         }
     }
+}
+
+fn is_explicit_bootstrap(artifact: &PerfGateArtifact) -> bool {
+    artifact.cells.is_empty()
+        && artifact.machine_fingerprint == "unmeasured"
+        && artifact.bench_elf_sha256 == "unmeasured"
+        && artifact.git_rev == "unmeasured"
+        && artifact.run_window == "unmeasured"
+        && artifact.run_id == "unmeasured"
 }
 
 fn compare_reproduction(
@@ -1621,6 +1630,7 @@ struct GateTargetEvaluator<'a, 'b> {
     artifact: &'a PerfGateArtifact,
     cells: &'b BTreeMap<CellKey, &'a PerfCellResult>,
     activated: bool,
+    observe_only: bool,
     state: &'b mut DecisionState,
 }
 
@@ -1673,12 +1683,20 @@ impl GateTargetEvaluator<'_, '_> {
         if passed {
             return;
         }
-        if self.activated {
+        if self.observe_only {
+            self.state
+                .note("perf.ratchet.bootstrap_target_missed", message);
+        } else if self.activated {
             self.state.block("perf.ratchet.gate_target_missed", message);
         } else {
             self.state
                 .quarantine("perf.ratchet.provisional_target_missed", message);
         }
+    }
+
+    fn target_inconclusive(&mut self, message: impl Into<String>) {
+        self.state
+            .quarantine("perf.ratchet.gate_target_ci_inconclusive", message);
     }
 
     fn target_higher_ci(
@@ -1695,10 +1713,7 @@ impl GateTargetEvaluator<'_, '_> {
         if ci_high < threshold {
             self.target(false, message);
         } else {
-            self.state.quarantine(
-                "perf.ratchet.gate_target_ci_inconclusive",
-                format!("{message}; the median CI crosses {threshold:.6}"),
-            );
+            self.target_inconclusive(format!("{message}; the median CI crosses {threshold:.6}"));
         }
     }
 
@@ -1716,10 +1731,7 @@ impl GateTargetEvaluator<'_, '_> {
         if ci_low > threshold {
             self.target(false, message);
         } else {
-            self.state.quarantine(
-                "perf.ratchet.gate_target_ci_inconclusive",
-                format!("{message}; the median CI crosses {threshold:.6}"),
-            );
+            self.target_inconclusive(format!("{message}; the median CI crosses {threshold:.6}"));
         }
     }
 
@@ -1738,13 +1750,10 @@ impl GateTargetEvaluator<'_, '_> {
         if ci_high < allowed_low || ci_low > allowed_high {
             self.target(false, message);
         } else {
-            self.state.quarantine(
-                "perf.ratchet.gate_target_ci_inconclusive",
-                format!(
-                    "{message}; the median CI overlaps but is not contained in \
-                     [{allowed_low:.6}, {allowed_high:.6}]"
-                ),
-            );
+            self.target_inconclusive(format!(
+                "{message}; the median CI overlaps but is not contained in \
+                 [{allowed_low:.6}, {allowed_high:.6}]"
+            ));
         }
     }
 }
@@ -1754,12 +1763,14 @@ fn evaluate_gate_targets(
     cells: &BTreeMap<CellKey, &PerfCellResult>,
     current_evidence: Option<&PerfEvidenceArtifact>,
     activated: bool,
+    observe_only: bool,
     state: &mut DecisionState,
 ) {
     let mut target = GateTargetEvaluator {
         artifact,
         cells,
         activated,
+        observe_only,
         state,
     };
     match artifact.gate {
@@ -3043,6 +3054,7 @@ mod tests {
             artifact: &artifact,
             cells: &cells,
             activated: true,
+            observe_only: false,
             state: &mut state,
         };
         evaluate_qg6(&mut target, Some(&evidence));
@@ -3086,6 +3098,7 @@ mod tests {
             artifact: &artifact,
             cells: &cells,
             activated: true,
+            observe_only: false,
             state: &mut state,
         };
         evaluate_qg6(&mut target, Some(&evidence));
@@ -3151,6 +3164,7 @@ mod tests {
             artifact: &artifact,
             cells: &cells,
             activated: true,
+            observe_only: false,
             state: &mut state,
         };
         evaluate_qg6(&mut target, Some(&evidence));
@@ -3191,6 +3205,7 @@ mod tests {
             artifact: &artifact,
             cells: &cells,
             activated: true,
+            observe_only: false,
             state: &mut state,
         };
         evaluate_qg6(&mut target, Some(&evidence));
@@ -3216,6 +3231,7 @@ mod tests {
             artifact: &artifact,
             cells: &missing_cells,
             activated: true,
+            observe_only: false,
             state: &mut missing_state,
         };
         evaluate_qg6(&mut missing_target, Some(&evidence));
@@ -3608,7 +3624,7 @@ mod tests {
     }
 
     #[test]
-    fn activated_bootstrap_can_establish_first_measured_baseline() {
+    fn activated_bootstrap_records_target_miss_and_establishes_measured_baseline() {
         let mut baseline = qg2_artifact("unmeasured", 0.0, 1.0);
         baseline.machine_fingerprint = "unmeasured".to_owned();
         baseline.bench_elf_sha256 = "unmeasured".to_owned();
@@ -3616,8 +3632,8 @@ mod tests {
         baseline.run_id = "unmeasured".to_owned();
         baseline.cells.clear();
         baseline.laws_attested = false;
-        let candidate = qg2_artifact("new", 161.0, 100.0);
-        let mut rerun = qg2_artifact("new", 161.0, 100.0);
+        let candidate = qg2_artifact("new", 110.0, 100.0);
+        let mut rerun = qg2_artifact("new", 110.0, 100.0);
         rerun.run_id = "rerun".to_owned();
         let result = evaluate(
             &baseline,
@@ -3632,6 +3648,13 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.code == "perf.ratchet.bootstrap_promotion")
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.bootstrap_target_missed"),
+            "initial activation must retain the target MISS verdict"
         );
     }
 

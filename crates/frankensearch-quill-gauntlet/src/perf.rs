@@ -43,6 +43,37 @@ pub const QG6_QUERY_GROUPS: usize = 4;
 /// Canonical QG-6 group IDs. Prepared queries are indexed in manifest order.
 pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] = [0, 1, 2, 3];
 
+/// Hash the normative performance contract without binding administrative
+/// activation state into measurement identity.
+///
+/// A gate is necessarily measured before its `activated` flag can be flipped.
+/// Canonicalizing every exact `activated = true` assignment to `false` keeps
+/// that review-only transition from invalidating the evidence it activates,
+/// while every fixture, target, estimator, and provenance change still moves
+/// the digest.
+#[must_use]
+pub fn perf_manifest_contract_sha256(manifest: &str) -> String {
+    let mut normalized = String::with_capacity(manifest.len());
+    for line in manifest.split_inclusive('\n') {
+        match line {
+            "activated = true\n" => normalized.push_str("activated = false\n"),
+            "activated = true\r\n" => normalized.push_str("activated = false\r\n"),
+            "activated = true" => normalized.push_str("activated = false"),
+            _ => normalized.push_str(line),
+        }
+    }
+    lower_sha256_hex(normalized.as_bytes())
+}
+
+fn lower_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Equal total heap budget for one thread-count cell.
 #[must_use]
 pub const fn perf_writer_heap_bytes(threads: usize) -> usize {
@@ -2475,6 +2506,44 @@ mod tests {
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg8).len(), 6);
         assert_eq!(matrix.for_gate(PerfGate::Qg10).len(), 1);
+    }
+
+    #[test]
+    fn manifest_contract_hash_ignores_only_activation_state() {
+        let manifest = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+        assert_eq!(manifest.matches("activated = false").count(), 10);
+        assert_eq!(
+            perf_manifest_contract_sha256(manifest),
+            lower_sha256_hex(manifest.as_bytes()),
+            "the all-inactive manifest retains its historical raw-file digest"
+        );
+
+        let activated = manifest.replacen("activated = false", "activated = true", 1);
+        assert_eq!(
+            perf_manifest_contract_sha256(manifest),
+            perf_manifest_contract_sha256(&activated),
+            "administrative activation must not invalidate pre-flip evidence"
+        );
+
+        let changed_comment =
+            manifest.replacen("PROVISIONAL until `activated = true`", "measured", 1);
+        assert_ne!(
+            perf_manifest_contract_sha256(manifest),
+            perf_manifest_contract_sha256(&changed_comment),
+            "only assignment lines are administrative; comments remain hash-bound"
+        );
+        assert_ne!(
+            perf_manifest_contract_sha256("activated = true # explanatory suffix\n"),
+            perf_manifest_contract_sha256("activated = false # explanatory suffix\n"),
+            "assignment-like prose with a suffix remains hash-bound"
+        );
+
+        let changed_target = manifest.replacen("docs_per_sec >= 3.0x", "docs_per_sec >= 3.1x", 1);
+        assert_ne!(
+            perf_manifest_contract_sha256(manifest),
+            perf_manifest_contract_sha256(&changed_target),
+            "a performance-contract change must invalidate old evidence"
+        );
     }
 
     #[test]

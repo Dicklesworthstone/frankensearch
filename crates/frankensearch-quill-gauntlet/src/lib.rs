@@ -80,8 +80,8 @@ pub use perf::{
     PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
     PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
     QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment, machine_fingerprint,
-    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
-    seeded_balanced_pair_order, validate_matrix,
+    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_manifest_contract_sha256,
+    perf_writer_heap_bytes, seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,

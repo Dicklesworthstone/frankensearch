@@ -5,7 +5,12 @@
 
 ## Activation discipline
 
-Every gate ships `activated = false` until ALL of its pins are real: fixture committed (or generator landed for xlarge lanes), oracle config verified byte-identical in the harness (same analyzer semantics, same heap budget, commits inside timed windows for both engines), build profile applied, and the statistical rule wired. Activating a gate = a PR flipping the flag with the evidence linked. **No number from a non-activated gate may be quoted anywhere** (README, docs, commit messages) except marked "provisional, gate inactive".
+Every gate ships `activated = false` until ALL of its pins are real: fixture committed (or generator landed for xlarge lanes), oracle config verified byte-identical in the harness (same analyzer semantics, same heap budget, commits inside timed windows for both engines), build profile applied, and the statistical rule wired. Activating a gate = a PR flipping the flag with a complete, admissible candidate and same-revision reproduction linked. Activation certifies the measurement, not the target: the target evaluator records PASS or MISS separately, and an active MISS never supports a competitive claim. **No number from a non-activated gate may be quoted anywhere** (README, docs, commit messages) except marked "provisional, gate inactive".
+
+The manifest-contract SHA-256 canonicalizes only administrative `activated`
+assignments to `false`. This makes the evidence used for a false→true review
+stable across the flip itself; changing a fixture, target, estimator, or any
+other manifest byte still invalidates prior evidence.
 
 ## The five standing laws (bind every published number)
 
@@ -39,8 +44,10 @@ an invalid median CI, or comparisons across differing `corpus_manifest_hash`.
 
 The bootstrap files contain no measurements. They make the absence of a real
 machine-class baseline visible without fabricating a number and force PR alarms
-to `Quarantine`. After a gate is activated, an otherwise-allowable full
-candidate/rerun pair may establish its first measured baseline.
+to `Quarantine`. A full, evidence-admissible candidate/rerun pair may establish
+the first measured baseline and activate the gate with either a PASS or MISS
+target verdict. That first MISS baseline is a reference point, not a speed
+claim.
 `quill-perf-ratchet` evaluates later candidates against that committed baseline
 with a directional 5% pass-over-pass threshold. A movement beyond 5% is
 `Block` only when the baseline and candidate bootstrap median CIs prove the
