@@ -468,7 +468,7 @@ impl SyncTwoTierSearcher {
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
         metrics.zero_signal = if fast_hits.is_empty() {
-            self.classify_fast_empty(query_vec, fetch, filter)
+            Some(self.classify_fast_empty(query_vec, fetch, filter))
         } else {
             None
         };
@@ -691,17 +691,17 @@ impl SyncTwoTierSearcher {
         query_vec: &[f32],
         fetch: usize,
         filter: Option<&dyn SearchFilter>,
-    ) -> Option<ZeroSignalReason> {
+    ) -> ZeroSignalReason {
         // Request-scoped conditions take precedence over index state, in the
         // order documented on `ZeroSignalReason`.
         if fetch == 0 {
-            return Some(ZeroSignalReason::CallerRequestedZeroK);
+            return ZeroSignalReason::CallerRequestedZeroK;
         }
         if query_vec.iter().any(|value| !value.is_finite()) {
-            return Some(ZeroSignalReason::NonFiniteQuery);
+            return ZeroSignalReason::NonFiniteQuery;
         }
         if query_vec.iter().all(|&value| value == 0.0) {
-            return Some(ZeroSignalReason::ZeroNormQuery);
+            return ZeroSignalReason::ZeroNormQuery;
         }
         // State-scoped reasons come from the index census rather than from a
         // second search. Re-scanning would cost a full extra pass on a path
@@ -710,12 +710,10 @@ impl SyncTwoTierSearcher {
         // the two can disagree, which would leave an empty result carrying
         // no reason at all. The census cannot disagree with itself, and
         // always yields a reason.
-        Some(
-            self.index
-                .fast_index()
-                .zero_signal_state()
-                .empty_result_reason(filter.is_some()),
-        )
+        self.index
+            .fast_index()
+            .zero_signal_state()
+            .empty_result_reason(filter.is_some())
     }
 }
 
