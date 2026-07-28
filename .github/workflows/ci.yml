@@ -7,13 +7,14 @@ on:
       - main
     tags:
       - "v*"
+      - "crates-v*"
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -107,6 +108,40 @@ jobs:
           fi
           echo "profile=${profile}" >> "${GITHUB_OUTPUT}"
           echo "validation_profile=${profile}" >> "${GITHUB_ENV}"
+
+      - name: Validate crates.io publication planner
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/check_crates_publish_contract.sh --mode self-test
+          scripts/check_crates_publish_contract.sh \
+            --mode audit \
+            --scope workspace \
+            --output "${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+          jq -e '
+            .schema == "frankensearch-crates-publish-plan-v1"
+            and .scope == "workspace"
+            and ([.packages[].name] | index("frankensearch-quill")) != null
+            and ([.packages[].name] | index("frankensearch-fusion")) != null
+            and ([.packages[].name] | index("frankensearch")) != null
+            and (
+              ([.packages[].name] | index("frankensearch-quill"))
+              < ([.packages[].name] | index("frankensearch-fusion"))
+            )
+            and (
+              ([.packages[].name] | index("frankensearch-quill"))
+              < ([.packages[].name] | index("frankensearch"))
+            )
+          ' "${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+
+      - name: Upload crates.io publication-plan receipt
+        if: matrix.os == 'ubuntu-latest' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crates-publish-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/frankensearch-crates-publish-plan.json
+          if-no-files-found: error
 
       - name: cargo check
         run: cargo check --workspace --all-targets
@@ -1173,8 +1208,8 @@ jobs:
 
   publish-crates:
     name: Publish crates.io packages
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && vars.ENABLE_CRATES_PUBLISH == 'true' && github.repository_owner == 'Dicklesworthstone'
-    needs: release-publish
+    if: startsWith(github.ref, 'refs/tags/crates-v') && vars.ENABLE_CRATES_PUBLISH == 'true' && github.repository_owner == 'Dicklesworthstone'
+    needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -1219,76 +1254,63 @@ jobs:
             sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
           find "$GITHUB_WORKSPACE" -name '*.bak' -delete
 
-      - name: Resolve publish sequence + validate tag/version alignment
+      - name: Resolve and authenticate publication plan
         id: publish_plan
         shell: bash
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          plan_path="${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+          scripts/check_crates_publish_contract.sh \
+            --mode gate \
+            --scope workspace \
+            --registry-census live \
+            --release-tag "${TAG_NAME}" \
+            --output "${plan_path}"
 
-          crates=(
-            frankensearch-core
-            frankensearch-embed
-            frankensearch-index
-            frankensearch-lexical
-            frankensearch-fusion
-            frankensearch-storage
-            frankensearch
-          )
+          sequence="$(jq -r '[.packages[] | select(.action == "publish") | .name] | join(" ")' "${plan_path}")"
+          exact_existing="$(jq -r '[.packages[] | select(.action == "skip_exact_archive") | .name] | join(" ")' "${plan_path}")"
+          echo "Publication sequence: ${sequence:-<nothing-new>}"
+          echo "Exact-source versions already present: ${exact_existing:-<none>}"
+          echo "sequence=${sequence}" >> "${GITHUB_OUTPUT}"
+          echo "plan_path=${plan_path}" >> "${GITHUB_OUTPUT}"
 
-          version="${TAG_NAME#v}"
-          if [[ "${version}" == "${TAG_NAME}" ]]; then
-            echo "Tag '${TAG_NAME}' must use the v<semver> format." >&2
-            exit 1
-          fi
-
-          cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
-          release_crate_version="$(jq -r '.packages[] | select(.name == "frankensearch") | .version' /tmp/cargo-metadata.json)"
-          if [[ -z "${release_crate_version}" || "${release_crate_version}" == "null" ]]; then
-            echo "Release crate 'frankensearch' not found in workspace metadata." >&2
-            exit 1
-          fi
-          if [[ "${release_crate_version}" != "${version}" ]]; then
-            echo "Version mismatch for release crate 'frankensearch': crate=${release_crate_version}, tag=${version}" >&2
-            exit 1
-          fi
-
-          for crate in "${crates[@]}"; do
-            crate_version="$(jq -r --arg crate "${crate}" '.packages[] | select(.name == $crate) | .version' /tmp/cargo-metadata.json)"
-            if [[ -z "${crate_version}" || "${crate_version}" == "null" ]]; then
-              echo "Crate '${crate}' not found in workspace metadata." >&2
-              exit 1
-            fi
-            echo "Publish plan includes ${crate} ${crate_version}"
-          done
-
-          echo "sequence=${crates[*]}" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Upload authenticated publication-plan receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crates-publish-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/frankensearch-crates-publish-plan.json
+          if-no-files-found: error
 
       - name: Publish crates in dependency order
+        if: steps.publish_plan.outputs.sequence != ''
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          RELEASE_VERSION: ${{ steps.publish_plan.outputs.version }}
+          PLAN_PATH: ${{ steps.publish_plan.outputs.plan_path }}
+          PUBLISH_SEQUENCE: ${{ steps.publish_plan.outputs.sequence }}
         run: |
           set -euo pipefail
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
             echo "CARGO_REGISTRY_TOKEN is required when ENABLE_CRATES_PUBLISH=true" >&2
             exit 1
           fi
-          already_published() {
-            grep -qiE 'already (uploaded|exists)|is already uploaded'
-          }
 
-          for crate in ${{ steps.publish_plan.outputs.sequence }}; do
+          for crate in ${PUBLISH_SEQUENCE}; do
+            crate_version="$(
+              jq -r --arg crate "${crate}" \
+                '.packages[] | select(.name == $crate) | .version' \
+                "${PLAN_PATH}"
+            )"
             for attempt in 1 2 3 4 5; do
               set +e
               dry_run_output="$(cargo publish -p "${crate}" --locked --dry-run 2>&1)"
               dry_run_status=$?
               set -e
               echo "${dry_run_output}"
-              if [[ "${dry_run_status}" -eq 0 ]] || already_published <<< "${dry_run_output}"; then
+              if [[ "${dry_run_status}" -eq 0 ]]; then
                 break
               fi
               if [[ "${attempt}" -eq 5 ]]; then
@@ -1297,18 +1319,10 @@ jobs:
               fi
               sleep 20
             done
-            echo "Publishing ${crate} (${RELEASE_VERSION})"
-            set +e
-            publish_output="$(cargo publish -p "${crate}" --locked --token "${CARGO_REGISTRY_TOKEN}" 2>&1)"
-            publish_status=$?
-            set -e
-            echo "${publish_output}"
-            if [[ "${publish_status}" -ne 0 ]]; then
-              if already_published <<< "${publish_output}"; then
-                echo "${crate} is already published; continuing."
-              else
-                exit "${publish_status}"
-              fi
-            fi
+            echo "Publishing ${crate} ${crate_version}"
+            cargo publish \
+              -p "${crate}" \
+              --locked \
+              --token "${CARGO_REGISTRY_TOKEN}"
             sleep 30
           done
