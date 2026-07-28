@@ -2513,6 +2513,22 @@ fn output_dir() -> PathBuf {
         .unwrap_or_else(|| scratch_path("artifacts"))
 }
 
+fn evidence_policy_from_env() -> EvidencePolicy {
+    let mut policy = EvidencePolicy::predeclared();
+    policy.warmup_rounds = match std::env::var("QUILL_PERF_WARMUP_ROUNDS") {
+        Ok(value) => value.parse::<usize>().unwrap_or_else(|error| {
+            panic!("QUILL_PERF_WARMUP_ROUNDS must be a positive integer: {error}")
+        }),
+        Err(std::env::VarError::NotPresent) => policy.warmup_rounds,
+        Err(error) => panic!("QUILL_PERF_WARMUP_ROUNDS is not valid Unicode: {error}"),
+    };
+    assert!(
+        policy.warmup_rounds > 0,
+        "QUILL_PERF_WARMUP_ROUNDS must preserve at least one excluded warmup"
+    );
+    policy
+}
+
 fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let scale = MatrixScale::from_env();
     let build_profile = build_profile_label(scale);
@@ -2548,9 +2564,14 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0x5155_494c_4c45_5644);
+    let evidence_policy = evidence_policy_from_env();
+    eprintln!(
+        "[quill-perf-policy] warmup_rounds={}",
+        evidence_policy.warmup_rounds
+    );
     let evidence_context = EvidenceContext {
         config: PairedEstimatorConfig::predeclared(bootstrap_seed),
-        policy: EvidencePolicy::predeclared(),
+        policy: evidence_policy,
         sample_provenance: PerfSampleProvenance {
             run_id: run_id.clone(),
             executable_sha256: bench_elf_sha256.to_owned(),
