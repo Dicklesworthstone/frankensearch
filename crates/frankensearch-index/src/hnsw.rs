@@ -2849,17 +2849,6 @@ mod tests {
         bytes: Option<Vec<u8>>,
     }
 
-    #[cfg(unix)]
-    fn snapshot_permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
-        use std::os::unix::fs::PermissionsExt;
-        Some(metadata.permissions().mode())
-    }
-
-    #[cfg(not(unix))]
-    fn snapshot_permission_mode(_: &std::fs::Metadata) -> Option<u32> {
-        None
-    }
-
     fn snapshot_immutable_tree(root: &Path) -> std::io::Result<Vec<ImmutableTreeEntry>> {
         fn visit(
             root: &Path,
@@ -2882,13 +2871,20 @@ mod tests {
                 .is_file()
                 .then(|| std::fs::read(path))
                 .transpose()?;
+            #[cfg(unix)]
+            let permission_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                Some(metadata.permissions().mode())
+            };
+            #[cfg(not(unix))]
+            let permission_mode = None;
             entries.push(ImmutableTreeEntry {
                 relative_path,
                 kind,
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
                 readonly: metadata.permissions().readonly(),
-                permission_mode: snapshot_permission_mode(&metadata),
+                permission_mode,
                 bytes,
             });
             if file_type.is_dir() {
