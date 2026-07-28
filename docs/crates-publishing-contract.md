@@ -31,9 +31,14 @@ records the actual version of every package, the complete publication order,
 the candidate Git SHA, the `Cargo.lock` SHA-256, the Rust/Cargo versions, and
 the registry identity of every occupied `(crate, version)` pair.
 
-A dirty tracked worktree is never a release candidate. Untracked files do not
-change Cargo's Git package file selection and are deliberately excluded from
-the dirty bit.
+A dirty tracked worktree is never a release candidate. Non-ignored untracked
+files are also forbidden: Cargo package selection can include them even though
+they have no committed provenance. The planner records their repository-relative
+paths and emits `UNTRACKED_PACKAGE_FILES`. Ignored untracked files remain
+allowed because Cargo excludes Git-ignored files by default.
+
+`--allow-dirty` exists only for the planner's synthetic self-tests. Release
+gates and `cargo package` / `cargo publish` invocations MUST NOT use it.
 
 ## Publication scope
 
@@ -94,6 +99,7 @@ route work without parsing prose.
 | Code | Meaning |
 |---|---|
 | `DIRTY_TRACKED_WORKTREE` | The candidate bytes are not the named Git commit. |
+| `UNTRACKED_PACKAGE_FILES` | Non-ignored untracked files may enter Cargo package selection without committed provenance. |
 | `INTERNAL_DEPENDENCY_CYCLE` | No valid crates.io publication order exists. |
 | `INTERNAL_DEPENDENCY_VERSION_REQUIRED` | A path dependency would lose its usable registry requirement when packaged. |
 | `INTERNAL_DEPENDENCY_VERSION_MISMATCH` | A dependent does not require the exact candidate internal version. |
@@ -156,6 +162,10 @@ scripts/check_crates_publish_contract.sh \
 jq '{status, blocker_codes, packages}' \
   /tmp/frankensearch-crates-publish-contract/audit.json
 ```
+
+The self-test uses a committed temporary Git repository and proves that a clean
+tree passes, ignored untracked files remain allowed, and non-ignored untracked
+files fail with `UNTRACKED_PACKAGE_FILES`.
 
 `audit` always preserves its receipt when readiness blockers exist. `gate`
 uses the same analysis but exits non-zero unless the receipt status is

@@ -136,9 +136,75 @@ sha256_file() {
   fi
 }
 
+run_source_cleanliness_self_test() {
+  local temp_dir="$1"
+  local metadata_path="$2"
+  local census_path="$3"
+  local source_root="$4"
+  local fixture_script="$5"
+  local clean_receipt ignored_receipt untracked_receipt
+
+  clean_receipt="${temp_dir}/receipt-source-clean.json"
+  ignored_receipt="${temp_dir}/receipt-source-ignored-untracked.json"
+  untracked_receipt="${temp_dir}/receipt-source-untracked.json"
+
+  bash "$fixture_script" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --output "$clean_receipt"
+
+  jq -e '
+    .status == "ready"
+    and .source.tracked_worktree_dirty == false
+    and .source.non_ignored_untracked_files == []
+    and ([.blockers[].code] | index("UNTRACKED_PACKAGE_FILES")) == null
+  ' "$clean_receipt" >/dev/null
+
+  mkdir -p "${source_root}/core/src"
+  printf 'ignored fixture\n' >"${source_root}/core/src/cache.ignored"
+
+  bash "$fixture_script" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --output "$ignored_receipt"
+
+  jq -e '
+    .status == "ready"
+    and .source.tracked_worktree_dirty == false
+    and .source.non_ignored_untracked_files == []
+    and ([.blockers[].code] | index("UNTRACKED_PACKAGE_FILES")) == null
+  ' "$ignored_receipt" >/dev/null
+
+  printf 'pub const PACKAGE_INPUT: bool = true;\n' >"${source_root}/core/src/package_input.rs"
+
+  if bash "$fixture_script" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --output "$untracked_receipt"; then
+    echo "ERROR: non-ignored untracked source self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .status == "blocked"
+    and .source.tracked_worktree_dirty == false
+    and .source.non_ignored_untracked_files == ["core/src/package_input.rs"]
+    and ([.blockers[].code] | index("UNTRACKED_PACKAGE_FILES")) != null
+  ' "$untracked_receipt" >/dev/null
+}
+
 run_self_test() {
   local temp_dir metadata_path census_path positive_receipt negative_metadata negative_census
-  local negative_receipt script_path source_sha
+  local negative_receipt script_path source_root source_sha
   temp_dir="$(mktemp -d /tmp/frankensearch-publish-contract-self-test.XXXXXX)"
   metadata_path="${temp_dir}/metadata-positive.json"
   census_path="${temp_dir}/census-positive.json"
@@ -146,8 +212,21 @@ run_self_test() {
   negative_metadata="${temp_dir}/metadata-negative.json"
   negative_census="${temp_dir}/census-negative.json"
   negative_receipt="${temp_dir}/receipt-negative.json"
-  script_path="${BASH_SOURCE[0]}"
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  source_root="${temp_dir}/source-cleanliness-repo"
   source_sha="1111111111111111111111111111111111111111"
+
+  mkdir -p "${source_root}/scripts"
+  cp "$script_path" "${source_root}/scripts/check_crates_publish_contract.sh"
+  script_path="${source_root}/scripts/check_crates_publish_contract.sh"
+  printf '*.ignored\n' >"${source_root}/.gitignore"
+  printf '# Synthetic lockfile for publication-contract self-tests.\n' >"${source_root}/Cargo.lock"
+
+  git -C "$source_root" init -q
+  git -C "$source_root" config user.name "Frankensearch Publish Contract"
+  git -C "$source_root" config user.email "publish-contract@example.invalid"
+  git -C "$source_root" add .gitignore Cargo.lock scripts/check_crates_publish_contract.sh
+  git -C "$source_root" -c commit.gpgsign=false commit -qm "seed clean source fixture"
 
   jq -n --arg root "$temp_dir" '{
     workspace_root: $root,
@@ -296,9 +375,19 @@ run_self_test() {
     and ([.blockers[].code] | index("PUBLISHED_VERSION_SOURCE_MISMATCH")) != null
   ' "$negative_receipt" >/dev/null
 
+  run_source_cleanliness_self_test \
+    "$temp_dir" \
+    "$metadata_path" \
+    "$census_path" \
+    "$source_root" \
+    "$script_path"
+
   echo "publish-contract self-test passed"
   echo "positive receipt: $positive_receipt"
   echo "negative receipt: $negative_receipt"
+  echo "source-clean receipt: ${temp_dir}/receipt-source-clean.json"
+  echo "source-ignored-untracked receipt: ${temp_dir}/receipt-source-ignored-untracked.json"
+  echo "source-untracked receipt: ${temp_dir}/receipt-source-untracked.json"
 }
 
 if [[ "$MODE" == "self-test" ]]; then
@@ -387,6 +476,14 @@ SOURCE_DIRTY=false
 if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]]; then
   SOURCE_DIRTY=true
 fi
+
+SOURCE_UNTRACKED_LIST="${TEMP_DIR}/source-untracked-files.zlist"
+git -C "$ROOT_DIR" ls-files --others --exclude-standard -z >"$SOURCE_UNTRACKED_LIST"
+mapfile -d '' -t SOURCE_UNTRACKED_FILES <"$SOURCE_UNTRACKED_LIST"
+SOURCE_UNTRACKED_FILES_JSON="$(
+  jq -cn --args '$ARGS.positional' "${SOURCE_UNTRACKED_FILES[@]}"
+)"
+
 if [[ "$SOURCE_DIRTY" == true && "$ALLOW_DIRTY" == false ]]; then
   add_blocker \
     "DIRTY_TRACKED_WORKTREE" \
@@ -395,6 +492,15 @@ if [[ "$SOURCE_DIRTY" == true && "$ALLOW_DIRTY" == false ]]; then
     "bd-8nqz.6" \
     "Tracked files differ from candidate source SHA ${SOURCE_SHA}." \
     "Run the gate from a clean checkout at the exact release commit."
+fi
+if (( ${#SOURCE_UNTRACKED_FILES[@]} > 0 )) && [[ "$ALLOW_DIRTY" == false ]]; then
+  add_blocker \
+    "UNTRACKED_PACKAGE_FILES" \
+    "" \
+    "" \
+    "bd-8nqz.6" \
+    "The candidate contains ${#SOURCE_UNTRACKED_FILES[@]} non-ignored untracked file(s) that may enter Cargo package selection." \
+    "Commit intended package inputs or ignore non-package artifacts, then rerun from a clean checkout; never bypass a release gate with --allow-dirty."
 fi
 
 LOCKFILE="${ROOT_DIR}/Cargo.lock"
@@ -1107,6 +1213,7 @@ jq -n \
   --arg release_tag "$RELEASE_TAG" \
   --arg source_sha "$SOURCE_SHA" \
   --argjson source_dirty "$SOURCE_DIRTY" \
+  --argjson source_untracked_files "$SOURCE_UNTRACKED_FILES_JSON" \
   --arg lockfile_sha256 "$LOCKFILE_SHA" \
   --arg rustc "$RUSTC_VERSION" \
   --arg cargo "$CARGO_VERSION" \
@@ -1130,6 +1237,7 @@ jq -n \
     source: {
       git_sha: $source_sha,
       tracked_worktree_dirty: $source_dirty,
+      non_ignored_untracked_files: $source_untracked_files,
       cargo_lock_sha256: (if $lockfile_sha256 == "" then null else $lockfile_sha256 end),
       rustc: $rustc,
       cargo: $cargo
