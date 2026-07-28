@@ -41,9 +41,9 @@ use frankensearch_quill_gauntlet::{
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
-    RankClass, RankedHit, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, compare_observations,
-    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
-    perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
+    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
+    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
+    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -1427,7 +1427,11 @@ fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     hasher.update(spec.writer_heap_bytes.unwrap_or(50_000_000).to_le_bytes());
     hasher.update(spec.k.expect("QG-6 k").to_le_bytes());
     hasher.update(b"frankensearch-default-lexical-schema-and-parser-v1");
-    hasher.update(b"qg6-rank-parity/full-corpus-exact-score-native-tie-envelope-v2");
+    hasher.update(b"qg6-rank-parity/full-corpus-native-tie-envelope-reviewed-score-epsilon-v3");
+    hasher.update(
+        b"score-epsilon=0.0001;reason=oracle-segment-geometry;\
+          exact-membership-and-counts;epsilon-connected-order",
+    );
     hasher.update(
         u64::try_from(QG6_TIE_EXPANSION_LIMIT)
             .expect("QG-6 tie expansion fits u64")
@@ -1704,7 +1708,7 @@ fn prepared_qg6_streams(
                 .collect(),
         )
     };
-    let mut semantic_compare = |_query: &Qg6QuerySpec,
+    let mut semantic_compare = |query: &Qg6QuerySpec,
                                 expected_role: Qg6ArmRole,
                                 expected: &PreparedQueryPreflight,
                                 observed_role: Qg6ArmRole,
@@ -1727,12 +1731,27 @@ fn prepared_qg6_streams(
             .observation
             .clone()
             .ok_or_else(|| "Tantivy preflight omitted tie-envelope evidence".to_owned())?;
-        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+        let comparator_config = ComparatorConfig::default()
+            .with_score_epsilon_reason(ScoreEpsilonReason::OracleSegmentGeometry);
+        let report = compare_observations(subject, oracle, comparator_config)
             .map_err(|error| error.to_string())?;
+        eprintln!(
+            "[qg6-semantic-parity] query_id={} status={:?} rank={:?} \
+             score_epsilon_reason={:?} score_epsilon_bits={} topk={} \
+             count_equal={} doc_count_equal={}",
+            query.id(),
+            report.status,
+            report.rank_class,
+            report.score_epsilon_reason,
+            comparator_config.score_epsilon_bits,
+            report.subject.hits.len(),
+            report.subject.match_count == report.oracle.match_count,
+            report.subject.doc_count == report.oracle.doc_count,
+        );
         if report.status == ComparisonStatus::Failed
             || !matches!(
                 report.rank_class,
-                RankClass::RankExact | RankClass::TieOrder
+                RankClass::RankExact | RankClass::TieOrder | RankClass::ScoreEpsilon
             )
         {
             let first_rank = report

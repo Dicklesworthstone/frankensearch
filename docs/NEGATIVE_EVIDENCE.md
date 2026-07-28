@@ -16922,3 +16922,41 @@ Quill adapter repair and pass the exact full source revision in
 timing. Only then attempt all 20 normative QG-6 cells on a quiet reference
 host; require every same-invocation A/A control plus an immediate same-ELF
 reproduction before activation.
+
+### 2026-07-28 — QG-6 filtered semantic preflight finds one-ULP cross-engine score drift (`bd-h6eh`, FoggySquirrel)
+
+Filtered diagnostic
+`qg6-natural-k100-preflight-020b6ce0-20260728T1625Z` used the exact source
+revision `020b6ce0e507cb759b16718fe65987b70c288391`, self-reported executing ELF
+SHA-256
+`92e43957ea91a60d0504897edfcb60324b3b9f9fc6cae5c2ea55b9182b118c7f`
+(76,681,576 bytes), and the actual linked Tantivy 0.26.1 incumbent. It selected
+only `query/naturallanguage/k100/100k`, so it was incomplete and
+non-promotable by construction.
+
+The independent native-result and count collectors now agreed. Semantic
+preflight reached query `naturallanguage-2`, then rejected rank 65. The Quill
+and Tantivy top-100 membership sets, exact match counts, and document counts
+were identical; one common document's score differed by one `f32` ULP
+(`1083368074` versus `1083368073`), moving it within the oracle's near-equal
+score component. The run exited 101 before any timed block or A/A control and
+sealed no artifact. This does not resurrect the older rejected plain-query
+bypass: that same-engine source lever changed the query tree and flipped
+membership/order without a reviewed oracle-variance reason.
+
+**Decision: INVALID-SEMANTIC-PREFLIGHT / NO CLAIM.** The QG-6 comparator now
+uses the existing contract-pinned `0.0001` score epsilon only with the explicit
+`OracleSegmentGeometry` reason. It still requires identical top-k membership,
+exact match/document counts, per-document scores within the bound, and
+nondecreasing order across oracle epsilon-connected components. Regression
+tests prove that a membership substitution or count mismatch remains a hard
+failure. The semantic configuration hash also binds this policy.
+
+**Retry predicate:** build a new self-hashing release-perf ELF from the landed
+policy, then rerun this exact filtered fixture with the exact source revision.
+Require all four independent arms to complete preflight and print a bounded
+semantic-parity receipt before any timing. Only then run all 20 normative QG-6
+cells on a quiet reference host; require every same-invocation A/A control and
+an immediate same-ELF reproduction before activation. Never admit a changed
+membership set, count mismatch, score delta above `0.0001`, or reorder across
+distinct oracle epsilon components.

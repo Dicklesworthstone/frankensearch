@@ -7525,3 +7525,31 @@ full source revision. Require the same filtered natural-language `k=100`,
 timing. A complete gate run still requires all 20 normative cells, every
 same-invocation A/A control, and an immediate same-ELF reproduction on a quiet
 reference host.
+
+## 2026-07-28 — QG-6 INVALID-SEMANTIC-PREFLIGHT: one-ULP cross-engine score drift (`bd-h6eh`, FoggySquirrel)
+
+Filtered, non-promotable diagnostic
+`qg6-natural-k100-preflight-020b6ce0-20260728T1625Z` ran source revision
+`020b6ce0e507cb759b16718fe65987b70c288391` from exact self-reporting ELF
+SHA-256
+`92e43957ea91a60d0504897edfcb60324b3b9f9fc6cae5c2ea55b9182b118c7f`
+(76,681,576 bytes) against the linked Tantivy 0.26.1 incumbent. Independent
+native top-k and count collectors agreed, but semantic preflight rejected
+`naturallanguage-2` at rank 65: top-100 membership and exact counts matched,
+while one common score differed by one `f32` ULP (`1083368074` versus
+`1083368073`). No timed sample, A/A control, or artifact followed.
+
+No QG-6 number follows. The repair enables only the comparator's existing,
+contract-pinned `0.0001` epsilon with the artifact-visible
+`OracleSegmentGeometry` reason. Exact top-k membership and counts remain
+mandatory, per-document score deltas remain bounded, and reordering is limited
+to oracle epsilon-connected components. New tests prove membership and count
+changes still fail. This is not the previously rejected same-engine
+plain-query bypass, whose altered query tree produced unreviewed rank changes.
+
+Retry from a newly built exact ELF and require this filtered fixture to pass
+all four semantic-preflight arms with a printed policy receipt. Only then run
+and reproduce the complete 20-cell QG-6 matrix on a quiet reference host.
+Reject any changed membership, count mismatch, score delta above `0.0001`, or
+cross-component reorder; all same-invocation A/A controls and reproduction
+laws remain unchanged.

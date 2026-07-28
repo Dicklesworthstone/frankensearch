@@ -7338,6 +7338,54 @@ mod tests {
     }
 
     #[test]
+    fn epsilon_rejects_membership_substitution() {
+        let subject = observation(vec![
+            quill_hit("a", 10.000_05, 1),
+            quill_hit("subject-only", 9.0, 2),
+        ]);
+        let oracle = observation(vec![
+            tantivy_hit("a", 10.0, 1),
+            tantivy_hit("oracle-only", 9.0, 2),
+        ]);
+
+        let report = compare_observations(
+            subject,
+            oracle,
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::OracleSegmentGeometry),
+        )
+        .expect("membership mismatch remains a classified report");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
+        assert_eq!(report.score_epsilon_reason, None);
+    }
+
+    #[test]
+    fn epsilon_does_not_mask_count_mismatch() {
+        let mut subject = observation(vec![quill_hit("a", 10.000_05, 1)]);
+        subject.match_count = CountState::Value(2);
+        let oracle = observation(vec![tantivy_hit("a", 10.0, 1)]);
+
+        let report = compare_observations(
+            subject,
+            oracle,
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::OracleSegmentGeometry),
+        )
+        .expect("count mismatch remains a classified report");
+
+        assert_eq!(report.rank_class, RankClass::ScoreEpsilon);
+        assert_eq!(report.status, ComparisonStatus::Failed);
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| { divergence.class == DivergenceClass::CountMismatch })
+        );
+    }
+
+    #[test]
     fn epsilon_above_contract_or_without_reason_is_rejected() {
         assert!(ComparatorConfig::new(0.001).is_err());
         let subject = observation(vec![quill_hit("a", 1.000_05, 1)]);
