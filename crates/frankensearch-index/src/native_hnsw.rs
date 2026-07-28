@@ -50,8 +50,19 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use frankensearch_core::error::{SearchError, SearchResult};
+
+const NATIVE_HNSW_MAGIC: [u8; 8] = *b"FSHNSW\0\0";
+/// Current owned native-HNSW graph format.
+pub const NATIVE_HNSW_FORMAT_VERSION: u32 = 1;
+const NATIVE_HNSW_HEADER_LEN: usize = 96;
+const NATIVE_HNSW_HEADER_LEN_U64: u64 = 96;
+const NATIVE_HNSW_HEADER_CRC_OFFSET: usize = NATIVE_HNSW_HEADER_LEN - 4;
+const NATIVE_HNSW_NO_ENTRY: u64 = u64::MAX;
 
 /// A violation of the graph's structural invariants.
 ///
@@ -75,6 +86,11 @@ pub enum GraphDefect {
     EntryPointInEmptyGraph {
         /// The spurious entry point id.
         entry: u32,
+    },
+    /// A graph with no points nonetheless claims an occupied upper layer.
+    MaxLevelInEmptyGraph {
+        /// The spurious maximum level.
+        max_level: usize,
     },
     /// A graph with points has no entry point, so nothing is searchable.
     MissingEntryPoint,
@@ -161,6 +177,16 @@ pub enum GraphDefect {
         /// The peer missing the reverse edge.
         neighbour: u32,
     },
+    /// A point's persisted layer count disagrees with the level sampled from
+    /// the graph's seed and parameters.
+    SampledLevelMismatch {
+        /// The point whose level is not reproducible.
+        id: u32,
+        /// Level deterministically sampled for this point.
+        expected: usize,
+        /// Level stored in the graph.
+        actual: usize,
+    },
     /// Some points cannot be reached from the entry point at layer 0, so no
     /// query can find them however wide the beam.
     Unreachable {
@@ -185,6 +211,9 @@ impl fmt::Display for GraphDefect {
             ),
             Self::EntryPointInEmptyGraph { entry } => {
                 write!(f, "empty graph names entry point {entry}")
+            }
+            Self::MaxLevelInEmptyGraph { max_level } => {
+                write!(f, "empty graph claims maximum level {max_level}")
             }
             Self::MissingEntryPoint => write!(f, "non-empty graph has no entry point"),
             Self::EntryPointUnknown { entry } => {
@@ -248,6 +277,14 @@ impl fmt::Display for GraphDefect {
                 "point {id} names neighbour {neighbour} at layer {layer}, but the reverse edge is \
                  missing"
             ),
+            Self::SampledLevelMismatch {
+                id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "point {id} stores level {actual}, but seed and parameters sample level {expected}"
+            ),
             Self::Unreachable {
                 reached,
                 total,
@@ -285,6 +322,52 @@ pub struct HnswParams {
     pub ef_construction: usize,
     /// Default beam width during search. Callers may override per query.
     pub ef_search: usize,
+}
+
+/// Integrity metadata read from or written with one owned graph artifact.
+///
+/// The CRC fields detect accidental corruption inside the graph format. They
+/// are not a cryptographic generation identity; the production wiring layer
+/// binds the complete artifact to its FSVI generation with a SHA-256 receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeHnswFileMetadata {
+    format_version: u32,
+    byte_len: u64,
+    point_count: u64,
+    payload_crc32: u32,
+    header_crc32: u32,
+}
+
+impl NativeHnswFileMetadata {
+    /// Binary format version.
+    #[must_use]
+    pub const fn format_version(self) -> u32 {
+        self.format_version
+    }
+
+    /// Complete file length.
+    #[must_use]
+    pub const fn byte_len(self) -> u64 {
+        self.byte_len
+    }
+
+    /// Number of graph points encoded in the artifact.
+    #[must_use]
+    pub const fn point_count(self) -> u64 {
+        self.point_count
+    }
+
+    /// CRC-32 of the canonical adjacency payload.
+    #[must_use]
+    pub const fn payload_crc32(self) -> u32 {
+        self.payload_crc32
+    }
+
+    /// CRC-32 of the fixed header before its checksum field.
+    #[must_use]
+    pub const fn header_crc32(self) -> u32 {
+        self.header_crc32
+    }
 }
 
 impl Default for HnswParams {
@@ -594,6 +677,243 @@ impl MutationJournal {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NativeHnswHeader {
+    params: HnswParams,
+    seed: u64,
+    point_count: usize,
+    entry: Option<u32>,
+    max_level: usize,
+    payload_len: u64,
+    payload_crc32: u32,
+    header_crc32: u32,
+}
+
+impl NativeHnswHeader {
+    fn encode(self) -> SearchResult<[u8; NATIVE_HNSW_HEADER_LEN]> {
+        let mut bytes = [0_u8; NATIVE_HNSW_HEADER_LEN];
+        bytes[..NATIVE_HNSW_MAGIC.len()].copy_from_slice(&NATIVE_HNSW_MAGIC);
+        put_u32(&mut bytes, 8, NATIVE_HNSW_FORMAT_VERSION);
+        put_u32(
+            &mut bytes,
+            12,
+            u32::try_from(NATIVE_HNSW_HEADER_LEN).map_err(|_| SearchError::InvalidConfig {
+                field: "native_hnsw_header_len".to_owned(),
+                value: NATIVE_HNSW_HEADER_LEN.to_string(),
+                reason: "header length must fit in u32".to_owned(),
+            })?,
+        );
+        put_u64(&mut bytes, 16, usize_to_u64(self.params.m, "m")?);
+        put_u64(&mut bytes, 24, usize_to_u64(self.params.m0, "m0")?);
+        put_u64(
+            &mut bytes,
+            32,
+            usize_to_u64(self.params.ef_construction, "ef_construction")?,
+        );
+        put_u64(
+            &mut bytes,
+            40,
+            usize_to_u64(self.params.ef_search, "ef_search")?,
+        );
+        put_u64(&mut bytes, 48, self.seed);
+        put_u64(
+            &mut bytes,
+            56,
+            usize_to_u64(self.point_count, "point_count")?,
+        );
+        put_u64(
+            &mut bytes,
+            64,
+            self.entry.map_or(NATIVE_HNSW_NO_ENTRY, u64::from),
+        );
+        put_u64(&mut bytes, 72, usize_to_u64(self.max_level, "max_level")?);
+        put_u64(&mut bytes, 80, self.payload_len);
+        put_u32(&mut bytes, 88, self.payload_crc32);
+        let header_crc32 = crc32fast::hash(&bytes[..NATIVE_HNSW_HEADER_CRC_OFFSET]);
+        put_u32(&mut bytes, NATIVE_HNSW_HEADER_CRC_OFFSET, header_crc32);
+        Ok(bytes)
+    }
+
+    // ubs:ignore — this parses the owned graph header, not a JWT or authentication token.
+    fn decode(
+        path: &Path,
+        bytes: &[u8; NATIVE_HNSW_HEADER_LEN],
+        file_len: u64,
+    ) -> SearchResult<Self> {
+        if bytes[..NATIVE_HNSW_MAGIC.len()] != NATIVE_HNSW_MAGIC {
+            return Err(native_hnsw_corrupted(path, "bad native HNSW magic"));
+        }
+        let version = get_u32(bytes, 8);
+        if version != NATIVE_HNSW_FORMAT_VERSION {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!(
+                    "unsupported native HNSW format version {version}; expected \
+                     {NATIVE_HNSW_FORMAT_VERSION}"
+                ),
+            ));
+        }
+        let header_len = usize::try_from(get_u32(bytes, 12)).map_err(|_| {
+            native_hnsw_corrupted(path, "native HNSW header length does not fit usize")
+        })?;
+        if header_len != NATIVE_HNSW_HEADER_LEN {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!(
+                    "native HNSW header length {header_len} does not equal \
+                     {NATIVE_HNSW_HEADER_LEN}"
+                ),
+            ));
+        }
+        let header_crc32 = get_u32(bytes, NATIVE_HNSW_HEADER_CRC_OFFSET);
+        let expected_header_crc32 = crc32fast::hash(&bytes[..NATIVE_HNSW_HEADER_CRC_OFFSET]);
+        if header_crc32 != expected_header_crc32 {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW header CRC mismatch",
+            ));
+        }
+
+        let params = HnswParams {
+            m: persisted_usize(path, get_u64(bytes, 16), "m")?,
+            m0: persisted_usize(path, get_u64(bytes, 24), "m0")?,
+            ef_construction: persisted_usize(path, get_u64(bytes, 32), "ef_construction")?,
+            ef_search: persisted_usize(path, get_u64(bytes, 40), "ef_search")?,
+        };
+        params.validate().map_err(|error| {
+            native_hnsw_corrupted(path, format!("invalid persisted HNSW parameters: {error}"))
+        })?;
+
+        let point_count_wire = get_u64(bytes, 56);
+        let u32_id_space = u64::from(u32::MAX) + 1;
+        if point_count_wire > u32_id_space {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW point count exceeds u32 id space",
+            ));
+        }
+        let point_count = persisted_usize(path, point_count_wire, "point_count")?;
+        let entry_wire = get_u64(bytes, 64);
+        let entry =
+            if entry_wire == NATIVE_HNSW_NO_ENTRY {
+                None
+            } else {
+                Some(u32::try_from(entry_wire).map_err(|_| {
+                    native_hnsw_corrupted(path, "native HNSW entry point exceeds u32")
+                })?)
+            };
+        let max_level = persisted_usize(path, get_u64(bytes, 72), "max_level")?;
+        if max_level >= MAX_LEVEL {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!("native HNSW maximum level {max_level} exceeds format cap"),
+            ));
+        }
+        let payload_len = get_u64(bytes, 80);
+        let expected_file_len = NATIVE_HNSW_HEADER_LEN_U64
+            .checked_add(payload_len)
+            .ok_or_else(|| native_hnsw_corrupted(path, "native HNSW file length overflow"))?;
+        if file_len != expected_file_len {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!(
+                    "native HNSW file length {file_len} does not match header-declared \
+                     length {expected_file_len}"
+                ),
+            ));
+        }
+        let minimum_payload = usize_to_u64(point_count, "point_count")?
+            .checked_mul(8)
+            .ok_or_else(|| native_hnsw_corrupted(path, "minimum payload length overflow"))?;
+        if payload_len < minimum_payload {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW payload is too short for its point count",
+            ));
+        }
+
+        Ok(Self {
+            params,
+            seed: get_u64(bytes, 48),
+            point_count,
+            entry,
+            max_level,
+            payload_len,
+            payload_crc32: get_u32(bytes, 88),
+            header_crc32,
+        })
+    }
+
+    fn metadata(self) -> SearchResult<NativeHnswFileMetadata> {
+        Ok(NativeHnswFileMetadata {
+            format_version: NATIVE_HNSW_FORMAT_VERSION,
+            byte_len: NATIVE_HNSW_HEADER_LEN_U64
+                .checked_add(self.payload_len)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "native_hnsw_file_len".to_owned(),
+                    value: self.payload_len.to_string(),
+                    reason: "file length overflow".to_owned(),
+                })?,
+            point_count: usize_to_u64(self.point_count, "point_count")?,
+            payload_crc32: self.payload_crc32,
+            header_crc32: self.header_crc32,
+        })
+    }
+}
+
+struct NativeHnswPayloadReader<'a> {
+    file: &'a mut File,
+    remaining: u64,
+    hasher: crc32fast::Hasher,
+}
+
+impl<'a> NativeHnswPayloadReader<'a> {
+    fn new(file: &'a mut File, payload_len: u64) -> Self {
+        Self {
+            file,
+            remaining: payload_len,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    fn read_u32(&mut self, path: &Path, field: &str) -> SearchResult<u32> {
+        let field_len = 4_u64;
+        if self.remaining < field_len {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!("native HNSW payload ended while reading {field}"),
+            ));
+        }
+        let mut bytes = [0_u8; 4];
+        self.file.read_exact(&mut bytes).map_err(|error| {
+            native_hnsw_corrupted(path, format!("could not read native HNSW {field}: {error}"))
+        })?;
+        self.hasher.update(&bytes);
+        self.remaining -= field_len;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn finish(self, path: &Path, expected_crc32: u32) -> SearchResult<()> {
+        if self.remaining != 0 {
+            return Err(native_hnsw_corrupted(
+                path,
+                format!(
+                    "native HNSW payload has {} unparsed trailing bytes",
+                    self.remaining
+                ),
+            ));
+        }
+        let actual_crc32 = self.hasher.finalize();
+        if actual_crc32 != expected_crc32 {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW payload CRC mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A navigable small-world graph over rows of a vector store.
 #[derive(Debug, Clone)]
 pub struct NativeHnsw {
@@ -648,6 +968,290 @@ impl NativeHnsw {
     #[must_use]
     pub const fn max_level(&self) -> usize {
         self.max_level
+    }
+
+    /// Construction and search parameters persisted with this graph.
+    #[must_use]
+    pub const fn params(&self) -> HnswParams {
+        self.params
+    }
+
+    /// Deterministic level-sampling seed persisted with this graph.
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
+        self.sampler.seed
+    }
+
+    /// Persist this graph as an owned, versioned adjacency artifact.
+    ///
+    /// The graph is structurally attested before the destination is touched.
+    /// Publication writes and syncs a temporary file, atomically renames it
+    /// over `path`, then syncs the parent directory. Existing symlink and
+    /// special-file targets are rejected rather than followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] when the in-memory graph fails
+    /// structural attestation, [`SearchError::InvalidConfig`] when a value
+    /// cannot be represented by the format, and [`SearchError::Io`] for
+    /// filesystem failures.
+    pub fn save(&self, path: &Path) -> SearchResult<NativeHnswFileMetadata> {
+        self.verify()
+            .map_err(|defect| native_hnsw_corrupted(path, defect.to_string()))?;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(SearchError::Io)?;
+        reject_non_regular_destination(path)?;
+
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
+        temporary
+            .as_file_mut()
+            .write_all(&[0_u8; NATIVE_HNSW_HEADER_LEN])
+            .map_err(SearchError::Io)?;
+
+        let mut payload_hasher = crc32fast::Hasher::new();
+        let mut payload_len = 0_u64;
+        for point in &self.adjacency {
+            write_payload_u32(
+                temporary.as_file_mut(),
+                &mut payload_hasher,
+                &mut payload_len,
+                u32::try_from(point.layers.len()).map_err(|_| SearchError::InvalidConfig {
+                    field: "native_hnsw_layer_count".to_owned(),
+                    value: point.layers.len().to_string(),
+                    reason: "layer count must fit in u32".to_owned(),
+                })?,
+            )?;
+            for neighbours in &point.layers {
+                write_payload_u32(
+                    temporary.as_file_mut(),
+                    &mut payload_hasher,
+                    &mut payload_len,
+                    u32::try_from(neighbours.len()).map_err(|_| SearchError::InvalidConfig {
+                        field: "native_hnsw_neighbour_count".to_owned(),
+                        value: neighbours.len().to_string(),
+                        reason: "neighbour count must fit in u32".to_owned(),
+                    })?,
+                )?;
+                for &neighbour in neighbours {
+                    write_payload_u32(
+                        temporary.as_file_mut(),
+                        &mut payload_hasher,
+                        &mut payload_len,
+                        neighbour,
+                    )?;
+                }
+            }
+        }
+
+        let payload_crc32 = payload_hasher.finalize();
+        let header = NativeHnswHeader {
+            params: self.params,
+            seed: self.sampler.seed,
+            point_count: self.adjacency.len(),
+            entry: self.entry,
+            max_level: self.max_level,
+            payload_len,
+            payload_crc32,
+            header_crc32: 0,
+        };
+        let encoded_header = header.encode()?;
+        temporary
+            .as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(SearchError::Io)?;
+        temporary
+            .as_file_mut()
+            .write_all(&encoded_header)
+            .map_err(SearchError::Io)?;
+        temporary.as_file().sync_all().map_err(SearchError::Io)?;
+
+        let metadata = NativeHnswHeader {
+            header_crc32: get_u32(&encoded_header, NATIVE_HNSW_HEADER_CRC_OFFSET),
+            ..header
+        }
+        .metadata()?;
+        temporary.persist(path).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.error.kind(),
+                format!(
+                    "failed to atomically publish native HNSW graph '{}': {}",
+                    path.display(),
+                    error.error
+                ),
+            ))
+        })?;
+        sync_parent_directory(path)?;
+        Ok(metadata)
+    }
+
+    /// Load and attest an owned graph artifact against its exact vector store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexNotFound`] when `path` is absent,
+    /// [`SearchError::IndexCorrupted`] for malformed bytes or a graph/store
+    /// mismatch, and [`SearchError::Io`] for other filesystem failures.
+    pub fn load<D: VectorDistance>(path: &Path, store: &D) -> SearchResult<Self> {
+        Self::load_with_metadata(path, store).map(|(graph, _)| graph)
+    }
+
+    /// Load a graph together with its checked format metadata.
+    ///
+    /// The parser reads bounded fields directly into owned adjacency lists;
+    /// it never exposes persisted bytes as graph memory. The opened inode is
+    /// compared with the path metadata to reject symlink and replacement
+    /// races at the open boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load`].
+    pub fn load_with_metadata<D: VectorDistance>(
+        path: &Path,
+        store: &D,
+    ) -> SearchResult<(Self, NativeHnswFileMetadata)> {
+        let mut file = open_regular_file(path)?;
+        let file_len = file.metadata().map_err(SearchError::Io)?.len();
+        if file_len < NATIVE_HNSW_HEADER_LEN_U64 {
+            return Err(native_hnsw_corrupted(
+                path,
+                "native HNSW file is shorter than its fixed header",
+            ));
+        }
+
+        let mut header_bytes = [0_u8; NATIVE_HNSW_HEADER_LEN];
+        file.read_exact(&mut header_bytes).map_err(|error| {
+            native_hnsw_corrupted(path, format!("could not read native HNSW header: {error}"))
+        })?;
+        // ubs:ignore — this decodes the owned graph header, not a JWT or authentication token.
+        let header = NativeHnswHeader::decode(path, &header_bytes, file_len)?;
+        let metadata = header.metadata()?;
+        if header.point_count != store.len() {
+            return Err(native_hnsw_corrupted(
+                path,
+                GraphDefect::StoreCardinalityMismatch {
+                    graph_points: header.point_count,
+                    store_rows: store.len(),
+                }
+                .to_string(),
+            ));
+        }
+
+        let mut adjacency = Vec::new();
+        adjacency
+            .try_reserve_exact(header.point_count)
+            .map_err(|error| {
+                native_hnsw_corrupted(
+                    path,
+                    format!(
+                        "could not allocate native HNSW point table for {} points: {error}",
+                        header.point_count
+                    ),
+                )
+            })?;
+        let sampler = LevelSampler::new(header.params.m, header.seed);
+        let mut payload = NativeHnswPayloadReader::new(&mut file, header.payload_len);
+        for point_index in 0..header.point_count {
+            let point_id = u32::try_from(point_index)
+                .map_err(|_| native_hnsw_corrupted(path, "native HNSW point id exceeds u32"))?;
+            let layer_count = persisted_usize(
+                path,
+                u64::from(payload.read_u32(path, "point layer count")?),
+                "layer_count",
+            )?;
+            if !(1..=MAX_LEVEL).contains(&layer_count) {
+                return Err(native_hnsw_corrupted(
+                    path,
+                    format!("point {point_id} has invalid native HNSW layer count {layer_count}"),
+                ));
+            }
+            let expected_level = sampler.level_for(point_id);
+            let actual_level = layer_count - 1;
+            if actual_level != expected_level {
+                return Err(native_hnsw_corrupted(
+                    path,
+                    GraphDefect::SampledLevelMismatch {
+                        id: point_id,
+                        expected: expected_level,
+                        actual: actual_level,
+                    }
+                    .to_string(),
+                ));
+            }
+
+            let mut layers = Vec::new();
+            layers.try_reserve_exact(layer_count).map_err(|error| {
+                native_hnsw_corrupted(
+                    path,
+                    format!(
+                        "could not allocate {layer_count} native HNSW layers for point \
+                         {point_id}: {error}"
+                    ),
+                )
+            })?;
+            for layer in 0..layer_count {
+                let neighbour_count = persisted_usize(
+                    path,
+                    u64::from(payload.read_u32(path, "layer neighbour count")?),
+                    "neighbour_count",
+                )?;
+                let budget = header.params.degree_at(layer);
+                if neighbour_count > budget {
+                    return Err(native_hnsw_corrupted(
+                        path,
+                        format!(
+                            "point {point_id} layer {layer} holds {neighbour_count} neighbours, \
+                             exceeding degree budget {budget}"
+                        ),
+                    ));
+                }
+                let neighbour_bytes = usize_to_u64(neighbour_count, "neighbour_count")?
+                    .checked_mul(4)
+                    .ok_or_else(|| {
+                        native_hnsw_corrupted(path, "native HNSW neighbour-byte count overflow")
+                    })?;
+                if neighbour_bytes > payload.remaining {
+                    return Err(native_hnsw_corrupted(
+                        path,
+                        format!(
+                            "point {point_id} layer {layer} declares {neighbour_count} \
+                             neighbours beyond the remaining payload"
+                        ),
+                    ));
+                }
+                let mut neighbours = Vec::new();
+                neighbours
+                    .try_reserve_exact(neighbour_count)
+                    .map_err(|error| {
+                        native_hnsw_corrupted(
+                            path,
+                            format!(
+                                "could not allocate {neighbour_count} native HNSW neighbours for \
+                                 point {point_id} layer {layer}: {error}"
+                            ),
+                        )
+                    })?;
+                for _ in 0..neighbour_count {
+                    neighbours.push(payload.read_u32(path, "neighbour id")?);
+                }
+                layers.push(neighbours);
+            }
+            adjacency.push(Adjacency { layers });
+        }
+        payload.finish(path, header.payload_crc32)?;
+
+        let graph = Self {
+            params: header.params,
+            sampler,
+            adjacency,
+            entry: header.entry,
+            max_level: header.max_level,
+            scratch: VisitedSet::default(),
+        };
+        graph
+            .verify_for_store(store)
+            .map_err(|defect| native_hnsw_corrupted(path, defect.to_string()))?;
+        Ok((graph, metadata))
     }
 
     /// Build a graph over every row of `store`, in row order.
@@ -1197,9 +1801,15 @@ impl NativeHnsw {
         let count = self.adjacency.len();
 
         if count == 0 {
-            return self.entry.map_or(Ok(()), |entry| {
-                Err(GraphDefect::EntryPointInEmptyGraph { entry })
-            });
+            if let Some(entry) = self.entry {
+                return Err(GraphDefect::EntryPointInEmptyGraph { entry });
+            }
+            if self.max_level != 0 {
+                return Err(GraphDefect::MaxLevelInEmptyGraph {
+                    max_level: self.max_level,
+                });
+            }
+            return Ok(());
         }
 
         let entry = self.entry.ok_or(GraphDefect::MissingEntryPoint)?;
@@ -1218,6 +1828,14 @@ impl NativeHnsw {
 
         for (id, point) in self.adjacency.iter().enumerate() {
             let id = u32::try_from(id).unwrap_or(u32::MAX);
+            let expected_level = self.sampler.level_for(id);
+            if point.level() != expected_level {
+                return Err(GraphDefect::SampledLevelMismatch {
+                    id,
+                    expected: expected_level,
+                    actual: point.level(),
+                });
+            }
             if point.level() > self.max_level {
                 return Err(GraphDefect::LevelAboveMax {
                     id,
@@ -1328,6 +1946,156 @@ impl NativeHnsw {
         }
         Ok(())
     }
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u32(bytes: &[u8], offset: usize) -> u32 {
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
+}
+
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(value)
+}
+
+fn usize_to_u64(value: usize, field: &str) -> SearchResult<u64> {
+    u64::try_from(value).map_err(|_| SearchError::InvalidConfig {
+        field: format!("native_hnsw_{field}"),
+        value: value.to_string(),
+        reason: "value must fit in the persisted u64 field".to_owned(),
+    })
+}
+
+fn persisted_usize(path: &Path, value: u64, field: &str) -> SearchResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        native_hnsw_corrupted(
+            path,
+            format!("native HNSW {field} value {value} does not fit this platform"),
+        )
+    })
+}
+
+fn native_hnsw_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
+    SearchError::IndexCorrupted {
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+fn write_payload_u32(
+    file: &mut File,
+    hasher: &mut crc32fast::Hasher,
+    payload_len: &mut u64,
+    value: u32,
+) -> SearchResult<()> {
+    let next_len = payload_len
+        .checked_add(4)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "native_hnsw_payload_len".to_owned(),
+            value: payload_len.to_string(),
+            reason: "payload length overflow".to_owned(),
+        })?;
+    let bytes = value.to_le_bytes();
+    file.write_all(&bytes).map_err(SearchError::Io)?;
+    hasher.update(&bytes);
+    *payload_len = next_len;
+    Ok(())
+}
+
+fn reject_non_regular_destination(path: &Path) -> SearchResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "native HNSW destination '{}' must be a regular file, not a symlink or special \
+                 file",
+                path.display()
+            ),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SearchError::Io(error)),
+    }
+}
+
+fn open_regular_file(path: &Path) -> SearchResult<File> {
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SearchError::IndexNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(SearchError::Io(error)),
+    };
+    if !path_metadata.file_type().is_file() {
+        return Err(SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "native HNSW artifact '{}' must be a regular file, not a symlink or special file",
+                path.display()
+            ),
+        )));
+    }
+    let file = File::open(path).map_err(SearchError::Io)?;
+    ensure_same_open_file(&path_metadata, &file.metadata().map_err(SearchError::Io)?)
+        .map_err(SearchError::Io)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn ensure_same_open_file(
+    path_metadata: &std::fs::Metadata,
+    opened_metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() != opened_metadata.dev() || path_metadata.ino() != opened_metadata.ino()
+    {
+        return Err(std::io::Error::other(
+            "native HNSW artifact changed while it was being opened",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_same_open_file(
+    _: &std::fs::Metadata,
+    opened_metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    if !opened_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "native HNSW artifact must be a regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> SearchResult<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(SearchError::Io)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1505,6 +2273,36 @@ mod tests {
         )
     }
 
+    fn reseal_persisted_checksums(bytes: &mut [u8]) {
+        let payload_crc32 = crc32fast::hash(&bytes[NATIVE_HNSW_HEADER_LEN..]);
+        put_u32(bytes, 88, payload_crc32);
+        let header_crc32 = crc32fast::hash(&bytes[..NATIVE_HNSW_HEADER_CRC_OFFSET]);
+        put_u32(bytes, NATIVE_HNSW_HEADER_CRC_OFFSET, header_crc32);
+    }
+
+    fn first_persisted_neighbour(bytes: &[u8]) -> Option<(usize, u32)> {
+        let point_count = usize::try_from(get_u64(bytes, 56)).expect("test point count");
+        let mut offset = NATIVE_HNSW_HEADER_LEN;
+        for point in 0..point_count {
+            let layer_count =
+                usize::try_from(get_u32(bytes, offset)).expect("test layer count fits usize");
+            offset += 4;
+            for _ in 0..layer_count {
+                let neighbour_count = usize::try_from(get_u32(bytes, offset))
+                    .expect("test neighbour count fits usize");
+                offset += 4;
+                if neighbour_count > 0 {
+                    return Some((
+                        offset,
+                        u32::try_from(point).expect("test point id fits u32"),
+                    ));
+                }
+                offset += neighbour_count * 4;
+            }
+        }
+        None
+    }
+
     fn params() -> HnswParams {
         HnswParams {
             m: 8,
@@ -1512,6 +2310,333 @@ mod tests {
             ef_construction: 64,
             ef_search: 64,
         }
+    }
+
+    // ─── Owned persistence ──────────────────────────────────────────────
+
+    #[test]
+    fn owned_empty_graph_round_trip_preserves_empty_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("empty.fshnsw");
+        let store = TestStore::new(Vec::new());
+        let graph = NativeHnsw::build(params(), 0x5eed_cafe, &store).expect("build empty");
+
+        let saved = graph.save(&path).expect("save empty");
+        let loaded = NativeHnsw::load(&path, &store).expect("load empty");
+
+        assert_eq!(saved.point_count(), 0);
+        assert_eq!(
+            saved.byte_len(),
+            u64::try_from(NATIVE_HNSW_HEADER_LEN).expect("header length fits u64")
+        );
+        assert_eq!(loaded.params(), graph.params());
+        assert_eq!(loaded.seed(), graph.seed());
+        assert_eq!(loaded.len(), 0);
+        assert!(loaded.entry_point().is_none());
+        assert_eq!(loaded.max_level(), 0);
+        assert!(
+            loaded
+                .search(&[1.0], 10, None, &store)
+                .expect("search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn owned_empty_graph_rejects_resealed_nonzero_max_level() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("empty.fshnsw");
+        let store = TestStore::new(Vec::new());
+        NativeHnsw::build(params(), 0x5eed_cafe, &store)
+            .expect("build empty")
+            .save(&path)
+            .expect("save empty");
+
+        let mut bytes = std::fs::read(&path).expect("empty graph bytes");
+        put_u64(&mut bytes, 72, 1);
+        reseal_persisted_checksums(&mut bytes);
+        std::fs::write(&path, bytes).expect("write resealed empty-level forgery");
+
+        let error =
+            NativeHnsw::load(&path, &store).expect_err("empty graph maximum must remain zero");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("empty graph claims maximum level 1")),
+            "unexpected empty-graph maximum-level error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owned_graph_round_trip_preserves_topology_identity_and_search() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(96, 8);
+        let graph = NativeHnsw::build(params(), 0x5eed_cafe, &store).expect("build");
+
+        let saved = graph.save(&path).expect("save");
+        let (loaded, observed) =
+            NativeHnsw::load_with_metadata(&path, &store).expect("load and attest");
+
+        assert_eq!(saved, observed);
+        assert_eq!(saved.format_version(), NATIVE_HNSW_FORMAT_VERSION);
+        assert_eq!(saved.point_count(), 96);
+        assert_eq!(
+            saved.byte_len(),
+            std::fs::metadata(&path).expect("metadata").len()
+        );
+        assert_ne!(saved.payload_crc32(), 0);
+        assert_ne!(saved.header_crc32(), 0);
+        assert_eq!(loaded.params(), graph.params());
+        assert_eq!(loaded.seed(), graph.seed());
+        assert_eq!(topology_snapshot(&loaded), topology_snapshot(&graph));
+
+        for query_id in 0..8 {
+            let query = TestStore::query(query_id, 8);
+            assert_eq!(
+                loaded
+                    .search(&query, 10, None, &store)
+                    .expect("loaded search"),
+                graph
+                    .search(&query, 10, None, &store)
+                    .expect("original search")
+            );
+        }
+    }
+
+    #[test]
+    fn owned_graph_serialization_is_byte_deterministic() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first_path = directory.path().join("first.fshnsw");
+        let second_path = directory.path().join("second.fshnsw");
+        let store = TestStore::synthetic(64, 6);
+        let graph = NativeHnsw::build(params(), 0x1234_5678, &store).expect("build");
+
+        graph.save(&first_path).expect("first save");
+        graph.save(&second_path).expect("second save");
+
+        assert_eq!(
+            std::fs::read(first_path).expect("first bytes"),
+            std::fs::read(second_path).expect("second bytes")
+        );
+    }
+
+    #[test]
+    fn owned_graph_load_rejects_truncation_and_payload_tampering() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(48, 6);
+        let graph = NativeHnsw::build(params(), 91, &store).expect("build");
+        graph.save(&path).expect("save");
+        let original = std::fs::read(&path).expect("graph bytes");
+
+        std::fs::write(&path, &original[..original.len() - 1]).expect("truncate");
+        let error = NativeHnsw::load(&path, &store).expect_err("truncation must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "unexpected truncation error: {error:?}"
+        );
+
+        let mut tampered = original;
+        let last = tampered.last_mut().expect("non-empty graph file");
+        *last ^= 0x80;
+        std::fs::write(&path, tampered).expect("tamper payload");
+        let error = NativeHnsw::load(&path, &store).expect_err("payload tamper must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("payload CRC mismatch")),
+            "payload tamper did not reach the CRC gate: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owned_graph_load_rejects_header_version_and_checksum_tampering() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(24, 4);
+        NativeHnsw::build(params(), 17, &store)
+            .expect("build")
+            .save(&path)
+            .expect("save");
+        let original = std::fs::read(&path).expect("graph bytes");
+
+        let mut wrong_version = original.clone();
+        put_u32(
+            &mut wrong_version,
+            8,
+            NATIVE_HNSW_FORMAT_VERSION.saturating_add(1),
+        );
+        reseal_persisted_checksums(&mut wrong_version);
+        std::fs::write(&path, wrong_version).expect("write version tamper");
+        let error = NativeHnsw::load(&path, &store).expect_err("version tamper must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("unsupported native HNSW format version")),
+            "unexpected version error: {error:?}"
+        );
+
+        let mut bad_header_crc = original;
+        bad_header_crc[NATIVE_HNSW_HEADER_CRC_OFFSET] ^= 0x01;
+        std::fs::write(&path, bad_header_crc).expect("write CRC tamper");
+        let error = NativeHnsw::load(&path, &store).expect_err("header CRC tamper must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("header CRC mismatch")),
+            "unexpected header CRC error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owned_graph_structural_attestation_rejects_resealed_forgery() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(40, 6);
+        NativeHnsw::build(params(), 73, &store)
+            .expect("build")
+            .save(&path)
+            .expect("save");
+
+        let mut bytes = std::fs::read(&path).expect("graph bytes");
+        let (neighbour_offset, owner) =
+            first_persisted_neighbour(&bytes).expect("non-trivial graph contains an edge");
+        put_u32(&mut bytes, neighbour_offset, owner);
+        reseal_persisted_checksums(&mut bytes);
+        std::fs::write(&path, bytes).expect("write resealed forgery");
+
+        let error =
+            NativeHnsw::load(&path, &store).expect_err("resealed structural forgery must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("is its own neighbour")),
+            "unexpected structural error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owned_graph_seed_is_attested_against_every_persisted_level() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(64, 6);
+        let graph = NativeHnsw::build(params(), 11, &store).expect("build");
+        graph.save(&path).expect("save");
+
+        let mut bytes = std::fs::read(&path).expect("graph bytes");
+        let forged_seed = (12_u64..=u64::from(u16::MAX))
+            .find(|&candidate| {
+                let sampler = LevelSampler::new(params().m, candidate);
+                graph.adjacency.iter().enumerate().any(|(id, point)| {
+                    sampler.level_for(u32::try_from(id).expect("test id")) != point.level()
+                })
+            })
+            .expect("some alternate seed changes a sampled level");
+        put_u64(&mut bytes, 48, forged_seed);
+        reseal_persisted_checksums(&mut bytes);
+        std::fs::write(&path, bytes).expect("write resealed seed forgery");
+
+        let error = NativeHnsw::load(&path, &store).expect_err("seed forgery must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("seed and parameters sample level")),
+            "unexpected seed-attestation error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn owned_graph_load_rejects_store_cardinality_mismatch() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let store = TestStore::synthetic(16, 4);
+        NativeHnsw::build(params(), 41, &store)
+            .expect("build")
+            .save(&path)
+            .expect("save");
+        let wrong_store = TestStore::synthetic(15, 4);
+
+        let error =
+            NativeHnsw::load(&path, &wrong_store).expect_err("store cardinality must bind load");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("vector store exposes 15 rows")),
+            "unexpected cardinality error: {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_graph_load_and_save_reject_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target.fshnsw");
+        let alias = directory.path().join("alias.fshnsw");
+        let store = TestStore::synthetic(8, 4);
+        let graph = NativeHnsw::build(params(), 29, &store).expect("build");
+        graph.save(&target).expect("save target");
+        symlink(&target, &alias).expect("create symlink");
+
+        let load_error = NativeHnsw::load(&alias, &store).expect_err("load must reject symlink");
+        assert!(matches!(load_error, SearchError::Io(_)));
+        let save_error = graph.save(&alias).expect_err("save must reject symlink");
+        assert!(matches!(save_error, SearchError::Io(_)));
+        assert!(
+            NativeHnsw::load(&target, &store).is_ok(),
+            "rejecting the alias must not alter its target"
+        );
+    }
+
+    #[test]
+    fn malformed_graph_refuses_save_before_touching_existing_artifact() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let sentinel = b"existing artifact must survive";
+        std::fs::write(&path, sentinel).expect("write sentinel");
+        let store = TestStore::synthetic(32, 4);
+        let mut graph = NativeHnsw::build(params(), 17, &store).expect("build");
+        let (id, layer, neighbour) = graph
+            .adjacency
+            .iter()
+            .enumerate()
+            .find_map(|(id, point)| {
+                point
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .find_map(|(layer, neighbours)| {
+                        neighbours
+                            .first()
+                            .copied()
+                            .map(|neighbour| (id, layer, neighbour))
+                    })
+            })
+            .expect("non-trivial graph edge");
+        let id = u32::try_from(id).expect("test id");
+        graph.adjacency[neighbour as usize].layers[layer].retain(|&candidate| candidate != id);
+
+        let error = graph
+            .save(&path)
+            .expect_err("malformed graph must not publish");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "unexpected save error: {error:?}"
+        );
+        assert_eq!(std::fs::read(path).expect("surviving bytes"), sentinel);
+    }
+
+    #[test]
+    fn owned_graph_save_atomically_replaces_complete_prior_generation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("graph.fshnsw");
+        let first_store = TestStore::synthetic(12, 4);
+        let first = NativeHnsw::build(params(), 3, &first_store).expect("first build");
+        let first_metadata = first.save(&path).expect("first save");
+
+        let second_store = TestStore::synthetic(48, 4);
+        let second = NativeHnsw::build(params(), 5, &second_store).expect("second build");
+        let second_metadata = second.save(&path).expect("replacement save");
+        let loaded = NativeHnsw::load(&path, &second_store).expect("load replacement");
+
+        assert_ne!(first_metadata.point_count(), second_metadata.point_count());
+        assert_eq!(second_metadata.point_count(), 48);
+        assert_eq!(topology_snapshot(&loaded), topology_snapshot(&second));
     }
 
     // ─── bd-u3wt regression fixtures ────────────────────────────────────
@@ -1545,12 +2670,17 @@ mod tests {
         // Force the exact shape by driving the sampler's output through a
         // constructed graph rather than hoping the seed produces it.
         let store = TestStore::new(vec![vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]]);
-        let mut graph = NativeHnsw::new(params(), 1).expect("new");
-        graph.adjacency.push(Adjacency::with_level(3));
+        // Seed 3 deterministically samples levels [1, 1, 0] for ids
+        // [0, 1, 2] with this parameter set.
+        let mut graph = NativeHnsw::new(params(), 3).expect("new");
+        let first_level = graph.sampler.level_for(0);
+        assert_eq!(first_level, 1);
+        graph.adjacency.push(Adjacency::with_level(first_level));
         graph.entry = Some(0);
-        graph.max_level = 3;
-        // Points 1 and 2 arrive at level 3 and level 0 respectively.
-        for (id, level) in [(1u32, 3usize), (2, 0)] {
+        graph.max_level = first_level;
+        // Points 1 and 2 arrive at level 1 and level 0 respectively.
+        for id in [1_u32, 2] {
+            let level = graph.sampler.level_for(id);
             graph.adjacency.push(Adjacency::with_level(level));
             let selected = (0..id).collect::<Vec<_>>();
             for layer in 0..=level.min(graph.max_level) {
