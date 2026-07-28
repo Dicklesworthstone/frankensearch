@@ -3551,6 +3551,10 @@ impl QuillWriterState {
 impl QuillReader {
     #[cfg(not(feature = "conformance-internals"))]
     #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
     fn query_checkpoint<'a>(
         &self,
         cx: &'a Cx,
