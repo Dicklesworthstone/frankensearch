@@ -1,0 +1,3649 @@
+{
+  "schema_version": "quill-perf-evidence-v1",
+  "gate": "Qg5",
+  "policy": {
+    "reconciliation_dead_band_log": 0.004987541511038968,
+    "reconciliation_tolerance_log": 0.22314355131420976,
+    "min_hierarchical_groups": 2,
+    "min_group_pairs": 2,
+    "warmup_rounds": 1,
+    "max_raw_samples": 20000
+  },
+  "provenance": {
+    "run_id": "qg5-candidate-final-20260728T1405Z",
+    "run_window": "qg5-final-window-966958a1-fmd-20260728T1405Z",
+    "manifest_sha256": "68be56bd481ae44433b42b2310fa97352b08483a1f619366be549c20b07ae851",
+    "build": {
+      "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+      "git_revision": "966958a19fa050054ebe095cbd3f30c2f1572e1d",
+      "git_dirty": false,
+      "worktree_state_sha256": null,
+      "cargo_lock_sha256": "b1ebda6f16c6b7f21853ad183ae8cac1278ab05cb65e2f52eef993920841064e",
+      "rustc_version": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "build_profile": "release-perf",
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
+    },
+    "machine": {
+      "fingerprint": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+      "os": "linux",
+      "arch": "x86_64",
+      "logical_cpus": 16,
+      "cpu_governor": "powersave",
+      "load_average_start": 1.15,
+      "load_average_end": 2.02
+    },
+    "peak_rss": {
+      "method": "linux_vmhwm",
+      "bytes": 6404104192
+    },
+    "corpus": {
+      "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+      "query_set_sha256": "749b38f35df58646c9812fa5aa07aa500f1bfffd585ae102e2a93eb3f74ab111",
+      "qrels_sha256": null,
+      "document_count": 1000000,
+      "content_bytes": null,
+      "generator_seed": 5860671082139239762,
+      "generator_revision": "synthetic-zipf-s11-vocab8192-doc4096-v1"
+    }
+  },
+  "cells": [
+    {
+      "cell_id": "QG-5/compaction/xlarge/5pct/wall_clock_ms",
+      "spec": {
+        "gate": "Qg5",
+        "fixture": "compaction/xlarge/5pct",
+        "metric": "wall_clock_ms",
+        "unit": "ms",
+        "role": "required",
+        "cold_cache": null
+      },
+      "estimand": "paired_log_ratio",
+      "body": {
+        "kind": "paired",
+        "paired": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+            "version": 1,
+            "semantics": "gauge_lower_is_better",
+            "unit": "ms"
+          },
+          "provenance": {
+            "run_id": "qg5-candidate-final-20260728T1405Z",
+            "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+            "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+            "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": 4.397258374612448,
+            "treatment_over_control": 81.22786672916538,
+            "ci95_low_log": 4.3779574276848505,
+            "ci95_high_log": 4.48450392120996,
+            "ci95_low_ratio": 79.67512488121493,
+            "ci95_high_ratio": 88.63297096813291,
+            "log_mad": 0.02819172728123176,
+            "mean_log_ratio": 4.429817826594995,
+            "ratio_of_arm_medians": 84.37182066916169,
+            "algebraic_reconciliation_error": 1.7763568394002505e-15,
+            "control": {
+              "value": 5595.3566465,
+              "p50": 5595.3566465,
+              "median_ci95_low": 5519.775866,
+              "median_ci95_high": 5750.195213999999,
+              "p95": 6209.259851,
+              "p99": 6209.259851,
+              "mad": 81.59203999999954,
+              "cv_pct": 3.6415716714241846,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 472090.42755849997,
+              "p50": 472090.42755849997,
+              "median_ci95_low": 454368.242804,
+              "median_ci95_high": 496948.375705,
+              "p95": 513933.646762,
+              "p99": 513933.646762,
+              "mad": 21775.318037999998,
+              "cv_pct": 4.99540668205927,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": -0.025522018747268227,
+            "drift_log": -0.10174987382664025
+          },
+          "null": {
+            "median_log_ratio": -0.00616289779863302,
+            "treatment_over_control": 0.9938560539035508,
+            "ci95_low_log": -0.144500847138379,
+            "ci95_high_log": 0.0037028186750564657,
+            "ci95_low_ratio": 0.8654541792433458,
+            "ci95_high_ratio": 1.0037096825774405,
+            "log_mad": 0.012603541792214037,
+            "mean_log_ratio": -0.0925056458671846,
+            "ratio_of_arm_medians": 0.9792634645548269,
+            "algebraic_reconciliation_error": 8.326672684688674e-17,
+            "control": {
+              "value": 5715.848378499999,
+              "p50": 5715.848378499999,
+              "median_ci95_low": 5450.167810999999,
+              "median_ci95_high": 8341.542098,
+              "p95": 11591.447003000001,
+              "p99": 11591.447003000001,
+              "mad": 373.19583099999863,
+              "cv_pct": 31.308861899124903,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 5597.321485999999,
+              "p50": 5597.321485999999,
+              "median_ci95_low": 5417.218741,
+              "median_ci95_high": 6014.917256000001,
+              "p95": 11829.572873,
+              "p99": 11829.572873,
+              "mad": 232.50569799999994,
+              "cv_pct": 29.97072554823856,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.002820586058910733,
+            "drift_log": -0.002820586058910733
+          },
+          "status": "invalid_null",
+          "claim_state": "no_decision",
+          "reasons": [
+            {
+              "code": "paired.null_too_wide",
+              "message": "A/A log-CI half width 0.144501 exceeds 0.095310"
+            }
+          ],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1286454842590,
+              "ended_ns": 1842627566740,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 496948.375705,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1842627573913,
+              "ended_ns": 1867618587042,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5606.811667,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1867618588275,
+              "ended_ns": 1892128945926,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5467.598652000001,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1892128947068,
+              "ended_ns": 2437303307585,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 497851.987265,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2437303314929,
+              "ended_ns": 3000719609643,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 513933.646762,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3000719611516,
+              "ended_ns": 3025151825878,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5458.595064,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3025151827040,
+              "ended_ns": 3049647459188,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5571.95308,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3049647460711,
+              "ended_ns": 3581060876174,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 482647.200947,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3581060877927,
+              "ended_ns": 3609063210251,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6209.259851,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3609063211704,
+              "ended_ns": 4152957646084,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 495915.53125,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4152957648188,
+              "ended_ns": 4177460893329,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5563.580444,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4177460894521,
+              "ended_ns": 4680947060950,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 456924.39148800005,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4680947062413,
+              "ended_ns": 5182592806381,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 454368.242804,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5182592808324,
+              "ended_ns": 5208304197685,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5750.195213999999,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5208304199177,
+              "ended_ns": 5704205270212,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 440692.287255,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5704205271825,
+              "ended_ns": 5727878704003,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5583.901626,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5727878705355,
+              "ended_ns": 5752058140691,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5630.782732,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5752058142024,
+              "ended_ns": 6260235984146,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 452364.895174,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 6260235985849,
+              "ended_ns": 6771826523203,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 461533.65417,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 6771826524446,
+              "ended_ns": 6796961333580,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5764.975635,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1000000,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 56927498164,
+              "ended_ns": 101425787520,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 11591.447003000001,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1000001,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 101425789493,
+              "ended_ns": 135105101049,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5596.926866999999,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000002,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 135105102131,
+              "ended_ns": 159162028613,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5541.024552999999,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000003,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 159162029835,
+              "ended_ns": 183341346424,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5522.540318,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000005,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 183341348017,
+              "ended_ns": 207268790354,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5417.218741,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000004,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 207268791316,
+              "ended_ns": 231232957710,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5359.311069,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000007,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 231232958842,
+              "ended_ns": 254603681196,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5300.741736,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000006,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 254603682228,
+              "ended_ns": 277862759219,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5325.994026,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000009,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 277862760110,
+              "ended_ns": 301297612969,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5335.831441,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000008,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 301297614001,
+              "ended_ns": 325009023994,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5516.020303,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000010,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 325009025096,
+              "ended_ns": 358717331655,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5586.7562609999995,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000011,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 358717333188,
+              "ended_ns": 383364045730,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5597.7161049999995,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000012,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 383364047373,
+              "ended_ns": 409227960132,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5844.940495999999,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000013,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 409227961775,
+              "ended_ns": 441117687431,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5800.842837,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000014,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 441117688573,
+              "ended_ns": 482172732528,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 7915.194804999999,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000015,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 482172733931,
+              "ended_ns": 507508864091,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6014.917256000001,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000017,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 507508865544,
+              "ended_ns": 539066198546,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6186.430213000001,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000016,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 539066199878,
+              "ended_ns": 565567066618,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6276.535776000001,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000019,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 565567067850,
+              "ended_ns": 604072438277,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 11829.572873,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000018,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/5pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 604072441833,
+              "ended_ns": 652933216028,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 10406.54842,
+              "group_id": null
+            }
+          ]
+        },
+        "hierarchical": null,
+        "reconciliation": {
+          "paired_median_ratio": 81.22786672916538,
+          "marginal_median_ratio": 84.37182066916169,
+          "abs_log_delta": 0.03797509291221779,
+          "direction_agrees": true,
+          "within_tolerance": true
+        }
+      },
+      "status": "invalid_null",
+      "reasons": [
+        {
+          "code": "evidence.paired_invalid",
+          "message": "paired estimator status InvalidNull with 1 reason(s)",
+          "severity": "no_claim"
+        }
+      ]
+    },
+    {
+      "cell_id": "QG-5/compaction/xlarge/20pct/wall_clock_ms",
+      "spec": {
+        "gate": "Qg5",
+        "fixture": "compaction/xlarge/20pct",
+        "metric": "wall_clock_ms",
+        "unit": "ms",
+        "role": "required",
+        "cold_cache": null
+      },
+      "estimand": "paired_log_ratio",
+      "body": {
+        "kind": "paired",
+        "paired": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+            "version": 1,
+            "semantics": "gauge_lower_is_better",
+            "unit": "ms"
+          },
+          "provenance": {
+            "run_id": "qg5-candidate-final-20260728T1405Z",
+            "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+            "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+            "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": 4.301092039624118,
+            "treatment_over_control": 73.78032075597054,
+            "ci95_low_log": 4.1621470495937185,
+            "ci95_high_log": 4.3331183050984,
+            "ci95_low_ratio": 64.20923512140787,
+            "ci95_high_ratio": 76.18147364382527,
+            "log_mad": 0.04758206626921968,
+            "mean_log_ratio": 4.254031214248348,
+            "ratio_of_arm_medians": 72.9198662909576,
+            "algebraic_reconciliation_error": -3.552713678800501e-15,
+            "control": {
+              "value": 5173.235015,
+              "p50": 5173.235015,
+              "median_ci95_low": 4883.248757,
+              "median_ci95_high": 6012.0749575,
+              "p95": 7598.501491,
+              "p99": 7598.501491,
+              "mad": 306.07292000000007,
+              "cv_pct": 15.382404355972296,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 377231.6055855,
+              "p50": 377231.6055855,
+              "median_ci95_low": 366001.962062,
+              "median_ci95_high": 398262.353689,
+              "p95": 445301.137102,
+              "p99": 445301.137102,
+              "mad": 11321.039167500014,
+              "cv_pct": 6.4751927218363,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.030472751004330334,
+            "drift_log": 0.030472751004330334
+          },
+          "null": {
+            "median_log_ratio": 0.02278493375584853,
+            "treatment_over_control": 1.0230464931189187,
+            "ci95_low_log": -0.03119610695673896,
+            "ci95_high_log": 0.07069088191931469,
+            "ci95_low_ratio": 0.9692854708125547,
+            "ci95_high_ratio": 1.0732494137875561,
+            "log_mad": 0.05094349443802683,
+            "mean_log_ratio": 0.01072825678916999,
+            "ratio_of_arm_medians": 1.0174484424357322,
+            "algebraic_reconciliation_error": 2.1337098754514727e-16,
+            "control": {
+              "value": 5051.1207705,
+              "p50": 5051.1207705,
+              "median_ci95_low": 4959.711683,
+              "median_ci95_high": 5533.77147,
+              "p95": 8115.554322999999,
+              "p99": 8115.554322999999,
+              "mad": 83.13800799999945,
+              "cv_pct": 17.477558239151815,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 5139.2549605,
+              "p50": 5139.2549605,
+              "median_ci95_low": 5018.710352,
+              "median_ci95_high": 5734.869162999999,
+              "p95": 7418.13069,
+              "p99": 7418.13069,
+              "mad": 234.79798650000066,
+              "cv_pct": 13.43682795298666,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.04434941641040087,
+            "drift_log": 0.04434941641040087
+          },
+          "status": "invalid_null",
+          "claim_state": "no_decision",
+          "reasons": [
+            {
+              "code": "paired.null_dispersion",
+              "message": "A/A log-MAD 0.050943 exceeds 0.048790"
+            }
+          ],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1055462785361,
+              "ended_ns": 1080736980386,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5036.860796,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1080736982219,
+              "ended_ns": 1521579369445,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 366001.962062,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1521579371509,
+              "ended_ns": 1963651824425,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 366991.131515,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1963651825867,
+              "ended_ns": 1987769749939,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4817.327809,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1987769751612,
+              "ended_ns": 2011916984588,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4868.156397,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2011916985540,
+              "ended_ns": 2459580189939,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 376671.638922,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2459580191262,
+              "ended_ns": 2910447432987,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 377791.572249,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2910447434440,
+              "ended_ns": 2941246231805,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6543.847678,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2941246233148,
+              "ended_ns": 2971627285237,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 7598.501491,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2971627286399,
+              "ended_ns": 3490721882197,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 445301.137102,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3490721884421,
+              "ended_ns": 3927141103522,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 361860.04338,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3927141105155,
+              "ended_ns": 3954274190343,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5480.302237,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3954274191495,
+              "ended_ns": 3981275104834,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5554.072174,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3981275105916,
+              "ended_ns": 4449896839593,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 390733.512015,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4449896841226,
+              "ended_ns": 4477397830514,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5279.507068,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4477397831816,
+              "ended_ns": 4967119237472,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 413707.050338,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4967119238985,
+              "ended_ns": 5406395684613,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 365819.170774,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5406395685986,
+              "ended_ns": 5430673849762,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4883.248757,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5430673851004,
+              "ended_ns": 5899969106684,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 382817.65703999996,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5899969109109,
+              "ended_ns": 5924963202776,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5066.962962,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1000001,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 55266179040,
+              "ended_ns": 82180561346,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5415.8298460000005,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1000000,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 82180562518,
+              "ended_ns": 108419685176,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5046.198746,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000002,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 108419686268,
+              "ended_ns": 134066060509,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5056.042794999999,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000003,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 134066062032,
+              "ended_ns": 159469506424,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4900.748820999999,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000004,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 159469507806,
+              "ended_ns": 184418481063,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5066.896406,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000005,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 184418481954,
+              "ended_ns": 214448545394,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5018.710352,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000007,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 214448546677,
+              "ended_ns": 240127313735,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5126.065221,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000006,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 240127315047,
+              "ended_ns": 265909685371,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5066.67785,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000008,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 265909686603,
+              "ended_ns": 297176741885,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 8115.554322999999,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000009,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 297176743478,
+              "ended_ns": 333234095464,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 7418.13069,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000010,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 333234096666,
+              "ended_ns": 358609414116,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4951.116226,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000011,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 358609415509,
+              "ended_ns": 383988470686,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5121.922792,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000012,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 383988472320,
+              "ended_ns": 409222547306,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4953.728452,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000013,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 409222548348,
+              "ended_ns": 435480799276,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6088.211975,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000015,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 435480800929,
+              "ended_ns": 460991433974,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5381.5263509999995,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000014,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 460991435116,
+              "ended_ns": 486437761952,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4959.711683,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000017,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 486437763505,
+              "ended_ns": 511814289366,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 5152.4447,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000016,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 511814290798,
+              "ended_ns": 536961742197,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4976.253842,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000019,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 536961743459,
+              "ended_ns": 562010949546,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4908.165127,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000018,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/20pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 562010950898,
+              "ended_ns": 588006907784,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6000.865089999999,
+              "group_id": null
+            }
+          ]
+        },
+        "hierarchical": null,
+        "reconciliation": {
+          "paired_median_ratio": 73.78032075597054,
+          "marginal_median_ratio": 72.9198662909576,
+          "abs_log_delta": 0.011730923455523623,
+          "direction_agrees": true,
+          "within_tolerance": true
+        }
+      },
+      "status": "invalid_null",
+      "reasons": [
+        {
+          "code": "evidence.paired_invalid",
+          "message": "paired estimator status InvalidNull with 1 reason(s)",
+          "severity": "no_claim"
+        }
+      ]
+    },
+    {
+      "cell_id": "QG-5/compaction/xlarge/50pct/wall_clock_ms",
+      "spec": {
+        "gate": "Qg5",
+        "fixture": "compaction/xlarge/50pct",
+        "metric": "wall_clock_ms",
+        "unit": "ms",
+        "role": "required",
+        "cold_cache": null
+      },
+      "estimand": "paired_log_ratio",
+      "body": {
+        "kind": "paired",
+        "paired": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+            "version": 1,
+            "semantics": "gauge_lower_is_better",
+            "unit": "ms"
+          },
+          "provenance": {
+            "run_id": "qg5-candidate-final-20260728T1405Z",
+            "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+            "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+            "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": 4.118311532949136,
+            "treatment_over_control": 61.45538921308959,
+            "ci95_low_log": 3.837949900510715,
+            "ci95_high_log": 4.176842293852953,
+            "ci95_low_ratio": 46.430190292764564,
+            "ci95_high_ratio": 65.15977259975793,
+            "log_mad": 0.08470149460835463,
+            "mean_log_ratio": 4.015962565823395,
+            "ratio_of_arm_medians": 62.46796463800683,
+            "algebraic_reconciliation_error": 3.552713678800501e-15,
+            "control": {
+              "value": 3993.916614,
+              "p50": 3993.916614,
+              "median_ci95_low": 3801.433994,
+              "median_ci95_high": 5572.5663779999995,
+              "p95": 7955.429824000001,
+              "p99": 7955.429824000001,
+              "mad": 218.19697650000012,
+              "cv_pct": 30.289111199757514,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 249491.8418105,
+              "p50": 249491.8418105,
+              "median_ci95_low": 242260.1269045,
+              "median_ci95_high": 260605.80356899998,
+              "p95": 265873.976535,
+              "p99": 265873.976535,
+              "mad": 7932.606108999986,
+              "cv_pct": 3.8703073764497056,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.0053800410236926055,
+            "drift_log": -0.08222908020369868
+          },
+          "null": {
+            "median_log_ratio": -0.004697103724588822,
+            "treatment_over_control": 0.9953139104155102,
+            "ci95_low_log": -0.10254398550426048,
+            "ci95_high_log": 0.09559983606094231,
+            "ci95_low_ratio": 0.9025384502709815,
+            "ci95_high_ratio": 1.1003186680321457,
+            "log_mad": 0.04906290909447626,
+            "mean_log_ratio": 0.05109434060778362,
+            "ratio_of_arm_medians": 1.001976594753984,
+            "algebraic_reconciliation_error": -9.992007221626409e-16,
+            "control": {
+              "value": 3833.9196665,
+              "p50": 3833.9196665,
+              "median_ci95_low": 3742.641188,
+              "median_ci95_high": 4268.3543245,
+              "p95": 4716.589129,
+              "p99": 4716.589129,
+              "mad": 66.50649149999981,
+              "cv_pct": 9.09382969522839,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 3841.4977719999997,
+              "p50": 3841.4977719999997,
+              "median_ci95_low": 3728.479131,
+              "median_ci95_high": 4264.307046,
+              "p95": 7611.210655,
+              "p99": 7611.210655,
+              "mad": 114.77566849999971,
+              "cv_pct": 26.680274829208727,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": -0.001145985279597127,
+            "drift_log": -0.02535179921241702
+          },
+          "status": "invalid_null",
+          "claim_state": "no_decision",
+          "reasons": [
+            {
+              "code": "paired.null_too_wide",
+              "message": "A/A log-CI half width 0.102544 exceeds 0.095310"
+            },
+            {
+              "code": "paired.null_dispersion",
+              "message": "A/A log-MAD 0.049063 exceeds 0.048790"
+            }
+          ],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 998895051914,
+              "ended_ns": 1026012769753,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3801.433994,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1026012770906,
+              "ended_ns": 1410859365144,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 234582.52798699998,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1410859367067,
+              "ended_ns": 1798521137185,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 260605.80356899998,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1798521138167,
+              "ended_ns": 1825830322702,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3787.679044,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1825830323864,
+              "ended_ns": 2225691284629,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 265873.976535,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2225691286953,
+              "ended_ns": 2265381019524,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 6918.11051,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2265381022229,
+              "ended_ns": 2310683476783,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3993.1377540000003,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2310683478827,
+              "ended_ns": 2704526612268,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 244740.591351,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2704526614372,
+              "ended_ns": 2731121880006,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3763.760231,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 2731121881188,
+              "ended_ns": 3116907766696,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 260629.556073,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3116907769010,
+              "ended_ns": 3494566641326,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 246156.84227400002,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3494566642749,
+              "ended_ns": 3523442333545,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3994.695474,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3523442334667,
+              "ended_ns": 3568877535952,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 7955.429824000001,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3568877538056,
+              "ended_ns": 3989618414629,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 251571.930692,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 3989618416713,
+              "ended_ns": 4375604386440,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 247411.75292899998,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4375604387903,
+              "ended_ns": 4403314416437,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3855.079363,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4403314417709,
+              "ended_ns": 4797039319389,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 251940.470178,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4797039321924,
+              "ended_ns": 4834514506811,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4432.628793,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4834514508604,
+              "ended_ns": 4864963134155,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4227.0222459999995,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 4864963135457,
+              "ended_ns": 5263176212042,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 237108.50088,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1000000,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 52180251499,
+              "ended_ns": 78086752743,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3724.5152460000004,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1000001,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 78086753986,
+              "ended_ns": 103970590152,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3734.274853,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000003,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 103970591094,
+              "ended_ns": 129756415221,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3722.968991,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000002,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 129756416133,
+              "ended_ns": 155575924393,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3742.641188,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000004,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 155575925475,
+              "ended_ns": 181466925187,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3740.358967,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000005,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 181466926239,
+              "ended_ns": 207668656136,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3724.965076,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000007,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 207668657519,
+              "ended_ns": 239221553066,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 7611.210655,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000006,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 239221554869,
+              "ended_ns": 269949538644,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3853.622843,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000008,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 269949540037,
+              "ended_ns": 297457293671,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3860.322807,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000009,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 297457295024,
+              "ended_ns": 330524410800,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4661.482536,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000011,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 330524411932,
+              "ended_ns": 358452482639,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3865.330391,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000010,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 358452483661,
+              "ended_ns": 386719409972,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4716.589129,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000013,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 386719411615,
+              "ended_ns": 418543952416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4091.0034809999997,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000012,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 418543953639,
+              "ended_ns": 445636362611,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3793.918266,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000014,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 445636363803,
+              "ended_ns": 479912395354,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 4676.385842000001,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000015,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 479912396566,
+              "ended_ns": 508336454617,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3867.131556,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000017,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 508336455699,
+              "ended_ns": 536351522149,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3817.665153,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000016,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 536351523231,
+              "ended_ns": 563732990096,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3875.6541709999997,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000018,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 563732991088,
+              "ended_ns": 591085317073,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3814.21649,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000019,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-5.compaction/xlarge/50pct.wall_clock_ms",
+                "version": 1,
+                "semantics": "gauge_lower_is_better",
+                "unit": "ms"
+              },
+              "provenance": {
+                "run_id": "qg5-candidate-final-20260728T1405Z",
+                "executable_sha256": "f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00",
+                "corpus_sha256": "133ed6d335b8e1286987a2cdd886bffc4ddb5b77c8e59129c21161f182a7e3af",
+                "worker_id": "linux-x86_64-16cpu-AMD_Ryzen_7_5800X_8-Core_Processor",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 591085318355,
+              "ended_ns": 618462093383,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 3728.479131,
+              "group_id": null
+            }
+          ]
+        },
+        "hierarchical": null,
+        "reconciliation": {
+          "paired_median_ratio": 61.45538921308959,
+          "marginal_median_ratio": 62.46796463800683,
+          "abs_log_delta": 0.016342326594578793,
+          "direction_agrees": true,
+          "within_tolerance": true
+        }
+      },
+      "status": "invalid_null",
+      "reasons": [
+        {
+          "code": "evidence.paired_invalid",
+          "message": "paired estimator status InvalidNull with 2 reason(s)",
+          "severity": "no_claim"
+        }
+      ]
+    }
+  ],
+  "gate_status": "invalid_null",
+  "gate_decision": null,
+  "reasons": [
+    {
+      "code": "evidence.gate_cell_invalid_null",
+      "message": "required cell QG-5/compaction/xlarge/5pct/wall_clock_ms has an invalid A/A null",
+      "severity": "no_claim"
+    },
+    {
+      "code": "evidence.gate_cell_invalid_null",
+      "message": "required cell QG-5/compaction/xlarge/20pct/wall_clock_ms has an invalid A/A null",
+      "severity": "no_claim"
+    },
+    {
+      "code": "evidence.gate_cell_invalid_null",
+      "message": "required cell QG-5/compaction/xlarge/50pct/wall_clock_ms has an invalid A/A null",
+      "severity": "no_claim"
+    }
+  ],
+  "artifact_sha256": "1b2e36cddbf1d36d81a42c68caa6f8b103cf48d8df9a757dcc8bc08af63d9354"
+}

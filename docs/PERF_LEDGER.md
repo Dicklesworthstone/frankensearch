@@ -7399,10 +7399,21 @@ but its open 1M-document Quill fixture was actually
 32 GiB tmpfs. Static adjudication confirmed that both QG-5 arms used
 `tempfile::Builder::tempdir()` and bypassed the declared scratch helper.
 
-No QG-5 ratio or PASS/MISS follows from this route, even if the already-running
-invocation later seals an artifact: its storage provenance does not describe
-the filesystem that carried the measured fixtures. The invocation was left to
-finish rather than terminated mid-write.
+The invocation was left to finish rather than terminated mid-write. It sealed
+all three densities, but every same-invocation null was independently invalid:
+5% failed CI width at `0.993856 [0.865454, 1.003710]`; 20% failed dispersion
+at `1.023046 [0.969285, 1.073249]`; and 50% failed CI width plus dispersion at
+`0.995314 [0.902538, 1.100319]`. The apparent Quill/Tantivy wall ratios
+`81.227867`, `73.780321`, and `61.455389` are non-claims.
+
+No QG-5 ratio or PASS/MISS follows from this route: its storage provenance
+does not describe the filesystem that carried the measured fixtures, and no
+required A/A control admitted. Evidence JSON SHA-256
+`7df4266455f62f4a6415a943c58175c3f7e0da549adca2ff1aad90848ff43aee`
+with embedded seal
+`1b2e36cddbf1d36d81a42c68caa6f8b103cf48d8df9a757dcc8bc08af63d9354`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-5/qg5-candidate-final-20260728T1405Z/`.
 
 The harness now creates both QG-5 arm directories with
 `tempdir_in(scratch_root())`. Retry only from a newly built, self-hashing exact

@@ -16795,9 +16795,22 @@ Source inspection established the cause: both compaction arms called
 `tempfile::Builder::tempdir()` directly instead of the harness's declared
 scratch-root helper.
 
-**Decision: INVALID-HARNESS / NO CLAIM.** The process was allowed to finish,
-but any apparent ratios it emits remain non-evidence because the timed storage
-surface and the recorded scratch provenance disagree.
+The process was allowed to finish and sealed all three densities, but that did
+not repair the provenance defect. Its same-invocation A/A controls were also
+independently invalid: 5% failed CI width at `0.993856
+[0.865454, 1.003710]`; 20% failed dispersion at `1.023046
+[0.969285, 1.073249]`; and 50% failed CI width plus dispersion at `0.995314
+[0.902538, 1.100319]`. The apparent Quill/Tantivy wall ratios of `81.227867`,
+`73.780321`, and `61.455389` are therefore non-claims twice over.
+
+**Decision: INVALID-HARNESS + INVALID-NULL / NO CLAIM.** Evidence JSON
+SHA-256 `7df4266455f62f4a6415a943c58175c3f7e0da549adca2ff1aad90848ff43aee`
+and embedded seal
+`1b2e36cddbf1d36d81a42c68caa6f8b103cf48d8df9a757dcc8bc08af63d9354`
+are retained under
+`.bench-history/attempts/2026-07-28/QG-5/qg5-candidate-final-20260728T1405Z/`.
+No ratio from this run is a QG-5 number because the timed storage surface and
+recorded scratch provenance disagree and every required null is invalid.
 
 The source fix routes both Quill and Tantivy QG-5 temporary directories through
 `tempdir_in(scratch_root())`.
