@@ -115,7 +115,7 @@ Required manifest body fields:
 |---|---|---|
 | `suite` | Yes | Which test suite produced this pack |
 | `determinism_tier` | Yes | Reproducibility guarantee level |
-| `seed` | Yes | Master randomness seed |
+| `seed` | Yes | Root randomness seed |
 | `config_hash` | Yes | SHA-256 of the effective test configuration |
 | `model_versions` | Yes | List of model name/revision/digest tuples |
 | `platform` | Yes | OS, architecture, and compiler version |
@@ -360,7 +360,7 @@ All suites must map producer-specific fields to the following canonical envelope
 |---|---|
 | `suite` | Producer lane identifier normalized to `core` / `fsfs` / `ops` / `interaction` |
 | `run_id` | Shared ULID across every file in one artifact pack |
-| `seed` | Suite master seed (single deterministic replay root) |
+| `seed` | Suite root seed (single deterministic replay root) |
 | `config_hash` | SHA-256 of effective run config, not raw config text |
 | `reason_code` | Stable machine code (`e2e.*` namespace), never free-form text |
 | `artifacts[].file` | Canonical file names defined in this contract |
