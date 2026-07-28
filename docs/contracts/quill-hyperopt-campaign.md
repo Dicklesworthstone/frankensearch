@@ -15,22 +15,31 @@ existing honesty machinery.
 ## 0. Premise, stated honestly
 
 The campaign premise ("Quill ≥ 3.0x Tantivy at bulk indexing") is currently
-**falsified by the only admissible data produced so far**:
+**falsified by the admissible and diagnostic data produced so far**:
 
 - **QG-1 (bulk indexing), provisional, gate inactive:** Quill at
   0.1066–0.1725x Tantivy docs/s on `bulk/medium/*` — 5.8–9.4x behind, a ~23x
   miss against the ≥3.0x target (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-27,
   `bd-h6eh`).
+- **QG-2 (single-worker indexing, current-schema activated baseline):** at
+  timed source `5bb74e76` and activation commit `73444b59`, Quill measured
+  about 59,818 docs/s versus Tantivy at about 171,223 docs/s: ratio 0.349775,
+  CI95 [0.344698, 0.356240]. The same-worker confirmation measured 0.345546,
+  CI95 [0.341425, 0.351114], and both A/A controls were valid. The raw bundle
+  remains authoritative while `benchmark_join_workers_and_rearm` fairness is
+  resolved by proof or a terminal-join rerun; activation state must be
+  reconciled explicitly if that audit fails.
 - **QG-6 (query latency), smoke scale only:** ~25x slower at 500 docs, with
   Round-0 profiling attributing >83% to immutable TERMDICT reparse/validation
   (`bd-quill-e8-perf-doctrine-x4e4.5`, `bd-quill-gauntlet-qg6-cache-termdict-gwd4`).
 
 This campaign therefore does not start from "optimize Quill." It starts from
-"close a 6–25x deficit, one attributed lever at a time, on three
-microarchitectures, with a built-in renegotiation checkpoint if the 3x target
-proves unreachable." A miss honestly measured and ledgered is a campaign
-success; a win that cannot survive a hostile reading of its own artifacts is a
-campaign failure.
+"measure every runnable lane, close each attributed deficit one lever at a
+time, and surface infeasible targets as soon as the evidence supports that
+decision." A miss honestly measured and ledgered is a campaign success; a win
+that cannot survive a hostile reading of its own artifacts is a campaign
+failure. An unavailable machine class limits claim scope; it never suppresses
+useful measurements on ready hardware.
 
 ## 1. Standing laws
 
@@ -59,7 +68,7 @@ fleet:
 | Class ID | Hardware | Campaign role | Mandatory provenance (beyond the evidence-v1 contract) |
 |---|---|---|---|
 | `x86-vps-ovh` | existing rch workers | continuity baseline; CI ratchet | existing (ELF SHA-256, worker id, governor) |
-| `trj-zen3-*` | AMD Threadripper PRO 5995WX ("trj": Zen 3, 64c/128t, NPS1) | scale-out truth: QG-1 high-thread cells, QG-8 thread scaling, allocator/NUMA attribution | governor=performance pinned; SMT state; NUMA topology dump (`lscpu -e`, `numactl -H`); isolated `CARGO_TARGET_DIR`; exclusive build-slot during timed windows. Class-ID convention: `trj-zen3-<width>c` per the first committed baseline (`QG-2.trj-zen3-16c.latest.json`); this contract's earlier `trj-zen-128c` label is superseded — committed baselines own their names. Zen 3 has no AVX-512. |
+| `trj-zen3-*` | AMD Threadripper PRO 5995WX ("trj": Zen 3, 64c/128t, NPS1; no AVX-512) | scale-out truth: QG-1 high-thread cells, QG-8 thread scaling, allocator/NUMA attribution | governor=performance pinned; SMT state; NUMA topology dump (`lscpu -e`, `numactl -H`); isolated `CARGO_TARGET_DIR`; exclusive build-slot during timed windows. Class-ID convention `trj-zen3-<width>c` per the first committed baseline (`QG-2.trj-zen3-16c.latest.json`); the earlier `trj-zen-128c` label is superseded — committed baselines own their names. |
 | `m4-macos` | Apple M4 (ARMv9, NEON, 16 KiB pages, P+E cores) | ARM64 latency truth: QG-6/QG-9; P-vs-E scaling curves | `sysctl hw`/`machdep.cpu` dump; thermal pressure sampled around runs; `F_FULLFSYNC` symmetry attestation; page size recorded |
 | `m5-macos` | Apple M5 | same as `m4-macos` + generational-delta lane | same |
 
@@ -67,6 +76,9 @@ Rules:
 
 - Candidate and rerun on the same machine, same run window (existing
   promotion contract).
+- Admission is per `(gate, fixture, machine-class, source SHA, executable
+  SHA)`. Onboarding or calibration for one class never blocks diagnostic or
+  activation-eligible work on another class.
 - `trj` and the Macs are NOT rch workers. They run via
   `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure),
   which captures the fingerprint, runs detached, and emits the same sealed
@@ -79,19 +91,20 @@ Rules:
 ## 3. Phase plan
 
 ```
-Phase 0  INSTRUMENT INTEGRITY + MACHINE-CLASS ONBOARDING   (blocking)
-Phase 1  ROUND-0 PROFILING TRUTH                           (per gate x class; local, never rch — rch cannot symbolize, bd-e41k)
-Phase 2  HYPOTHESIS LEDGER SEEDING + PRIOR MINING          (mandatory pre-flight)
-Phase 3  OPTIMIZATION ROUNDS                               (workstreams W1–W5; >=10 rounds)
+Phase 0  LANE-LOCAL INSTRUMENT INTEGRITY + ONBOARDING
+Phase 1  PROFILE TRUTH                                     (per gate x class; local, never rch — rch cannot symbolize, bd-e41k)
+Phase 2  HYPOTHESIS LEDGER SEEDING + PRIOR MINING          (mandatory before a production lever)
+Phase 3  INDEPENDENT OPTIMIZATION LOOPS                    (workstreams W1–W5)
 Phase 4  MATH-FAMILY ARTIFACTS                             (bounded to 3 families)
-Phase 5  CONVERGENCE + GATE ACTIVATION + RENEGOTIATION     (2 consecutive clean rounds; Round-6 checkpoint)
+Phase 5  PER-LANE CONVERGENCE + ACTIVATION + RENEGOTIATION
 ```
 
-### Phase 0 — Instrument integrity + onboarding (nothing counts until green)
+### Phase 0 — Lane-local instrument integrity + onboarding
 
-1. `bd-h6eh` validator repairs land (force_no_claim self-rejection, QG-6
-   corpus-digest scope, ignored hierarchical estimator). Every measurement
-   sealed to the defective validator SHA stays diagnostic-only.
+1. `bd-h6eh` validator repairs land for any lane seeking activation
+   (force_no_claim self-rejection, QG-6 corpus-digest scope, ignored
+   hierarchical estimator). Every measurement sealed to a defective validator
+   SHA stays diagnostic-only, retained with its exact defect; it is not hidden.
 2. The QG-3/5/6 validity gaps from the 2026-07-28 read-only audit close:
    version-unique visibility probes, on-disk merge arms with reopen parity,
    prepared four-arm reuse, terminal per-cell artifacts + shard assembly so a
@@ -101,17 +114,22 @@ Phase 5  CONVERGENCE + GATE ACTIVATION + RENEGOTIATION     (2 consecutive clean 
    global rch timeout is not raised.
 4. Machine-class onboarding: `perf-runner.sh` verified on trj/M4/M5 with
    fingerprint artifacts committed, then one **A/A-only calibration run per
-   class** (trj at 1/16/64/max threads; M4/M5 P-only and P+E) to fix each
-   class's null tolerances from measured dispersion before any A/B runs.
+   class** (trj at 1/16/64/max threads; M4/M5 P-only and P+E) to fix that
+   class's null tolerances from measured dispersion before activation-eligible
+   A/B runs on that class. Diagnostic A/B runs may execute earlier if labeled
+   non-claim.
    Manifest (`quill-perf-gates.toml`) additions for the new classes are
    coordinated with the manifest's reservation holder — not edited
    unilaterally.
 
-**Exit:** QG-1 + QG-6 activation-eligible artifacts on `x86-vps-ovh`;
-admissible A/A nulls on all four classes; ratchet consumes four class
-baselines.
+**Lane exit:** the exact lane has a valid instrument/schema, matched workload,
+required A/A calibration, complete immutable provenance, and a ratchet that
+consumes that class's artifact. QG-1, QG-2, and QG-6 on `x86-vps-ovh` may
+advance while trj or Apple onboarding remains incomplete. Conversely, Apple or
+trj lanes advance when their own prerequisites pass. There is no fleet-wide
+barrier.
 
-### Phase 1 — Round-0 profiling truth
+### Phase 1 — Profile truth
 
 Local lanes (flamegraph + samply + dhat allocation census + `strace -c` /
 `fs_usage` syscall+fsync census) under `release-perf` with frame pointers.
@@ -147,15 +165,21 @@ recorded retry predicate):
 - SWAR tokenizer — length-dependent win; bench long and short corpora.
 - Tombstone bitmap at ~1% density — wash inside the A/A null.
 
-### Phase 3 — Optimization rounds (see § Workstreams)
+### Phase 3 — Independent optimization loops (see § Workstreams)
 
 One lever per commit. Every lever ships: a recommendation-contract card (see
-§ Keep-gates), the paired A/B + same-invocation A/A evidence per claimed
-class, and a **green differential parity campaign at the same SHA** — the
-gauntlet is this campaign's isomorphism oracle. Rank-exactness (the vendored
-BM25 fieldnorm table and f32 op order in `contract.rs`) is the invariant most
-levers can silently break; "Floating-point: identical" is a load-bearing line
-of every proof.
+§ Keep-gates), same-window old-Quill/new-Quill causal evidence, a genuine
+Tantivy incumbent arm, a same-invocation A/A control per claimed class, and a
+**green differential parity campaign at the same SHA** — the gauntlet is this
+campaign's isomorphism oracle. Rank-exactness (the vendored BM25 fieldnorm table
+and f32 op order in `contract.rs`) is the invariant most levers can silently
+break; "Floating-point: identical" is a load-bearing line of every proof.
+
+Each `(gate, fixture, class)` lane advances independently through hypothesis,
+implementation, verdict, and re-profile. Chronological batches may still be
+called rounds in status reports, but no round is a synchronization barrier and
+no round count is an acceptance criterion. After three rejects in one
+candidate family, switch veins.
 
 ### Phase 4 — Math families (complexity budget: 3)
 
@@ -181,23 +205,35 @@ Each gets a hypothesis-ledger row with the predicate that would revive it.
 
 ### Phase 5 — Convergence, activation, renegotiation
 
-- A round = every active workstream lands or ledgers ≥1 lever with receipts.
-- Convergence = ≥10 rounds AND 2 consecutive rounds with <3 new genuine
-  findings AND zero unresolved hypothesis rows.
+- A lane converges after one of three auditable outcomes:
+  1. it meets its predeclared target and passes independent confirmation;
+  2. measured tokenize/stage ceilings plus confidence bounds prove the target
+     infeasible; or
+  3. two consecutive clean profile/discovery passes leave no unresolved
+     high-impact hypothesis above the documented EV threshold, and every
+     currently valid high-EV row is KEEP or REJECT with a retry predicate.
 - Gates activate per gate per class exactly per the existing activation
-  contract.
-- **Renegotiation checkpoint (non-optional), end of Round 6:** if the QG-1
-  admissible best cell is still <1.0x on every class, the campaign formally
-  presents the evidence for retargeting the flip criterion from "≥3.0x" to a
-  bounded envelope (e.g., ≥0.8x bulk + p50 query parity per class + memory ≤
-  oracle + Quill's structural wins). `bd-3beo` already frames the flip as
-  needing a bounded safety envelope, not the full leapfrog; the checkpoint
-  makes that decision explicit and user-owned instead of drifting. The
-  decision belongs to the user, not the fleet.
+  contract. A complete eligible lane need not wait for unrelated gates or
+  hardware. Diagnostic runs remain visible but cannot activate a claim.
+- **Renegotiation checkpoint (non-optional when evidence-triggered):** open the
+  decision as soon as outcome 2 or 3 occurs while the lane remains below its
+  target. Present absolute and relative results, ceilings, old/new Quill causal
+  artifacts, the real Tantivy incumbent, null validity, parity, memory and
+  durability effects, retained rejects, retry predicates, and unmeasured
+  scopes. Recommend a bounded envelope if justified. `bd-3beo` consumes only
+  an explicitly user-ratified envelope; the decision belongs to the user, not
+  the fleet.
+- Performance proceeds in parallel with the conformance-gated library flip.
+  It becomes a flip blocker only if the user explicitly ratifies a bounded
+  performance safety gate.
 
 ## 4. Workstreams
 
-### W1 — Query fixed-cost elimination (QG-6, QG-9; first truth machine: m4/m5)
+### W1 — Query fixed-cost elimination (QG-6, QG-9)
+
+Discovery starts on the first calibrated machine with symbolized profiles;
+M4/M5 validation determines ARM64 claim scope but does not delay an x86
+profile or portable implementation.
 
 | Lever | Basis | Notes |
 |---|---|---|
@@ -205,7 +241,13 @@ Each gets a hypothesis-ledger row with the predicate that would revive it.
 | Verify-once checksum memoization | reparse/validation attribution | Section checksums validated at first touch per snapshot, sealed thereafter; invalidated on generation change. |
 | Collector allocation churn | `collect_id_hits` lazy-Vec sibling win | Audit Argus collectors for per-query allocs; apply the proven pattern. |
 
-### W2 — Bulk-index single-thread cost (QG-1; thread=1 cell is 8.9x behind, so per-doc work is the core deficit)
+### W2 — Bulk-index single-thread cost (QG-1 and QG-2)
+
+The provisional QG-1 thread=1 cell is 8.9x behind. The authoritative QG-2
+current-schema baseline is about 2.86x behind parity after harness evolution.
+They are separate contracts, not interchangeable ratios, but both identify
+single-worker per-document work as a priority. QG-2 first resolves the
+join/rearm fairness question described in §0.
 
 | Lever | Hypothesis | Caution |
 |---|---|---|
@@ -253,8 +295,11 @@ A lever is KEEP only if ALL hold:
 
 1. Profile-first: hotspot evidence ≥0.1% self-time exists BEFORE the source
    touch, committed as a profile card.
-2. Paired estimator (`quill-paired-estimator-v1`) A/B with same-invocation A/A
-   null whose CI contains 1.0, per claimed machine class.
+2. The claimed causal speedup compares old Quill and new Quill in one
+   source-state-controlled window. The same evidence window also runs the
+   genuine Tantivy incumbent and a same-invocation A/A null whose CI contains
+   1.0, per claimed machine class. A cross-commit Quill/Tantivy ratio or a
+   Quill self-speedup alone is not an incumbent KEEP.
 3. `release-perf` profile; never a bare `--release` with different codegen.
 4. Focused and broad gates moved in the same run window (same git state, same
    target dir, same machine, same window).
@@ -264,7 +309,10 @@ A lever is KEEP only if ALL hold:
    rank-exactness explicitly attested.
 7. Ratchet `Allow` on every claimed class; per-class KEEP/NoClaim split stated
    in the ledger row.
-8. Ledger entry written before merge (`PERF_LEDGER.md` wins;
+8. Both-engine absolute metrics, p50/p95/p99 or throughput distributions,
+   RSS/bytes, disk bytes, and durability/maintenance work are reported beside
+   ratios. An unavailable metric is explicit and limits scope.
+9. Ledger entry written before merge (`PERF_LEDGER.md` wins;
    `NEGATIVE_EVIDENCE.md` rejects with comparison class INCUMBENT vs SELF
    tagged, per the 2026-07-27 ledger gates).
 
@@ -274,15 +322,19 @@ Every lever bead body carries the recommendation contract:
 Change:
 Hotspot evidence (frame, % self-time, class):
 EV score (Impact x Confidence x Reuse / Effort x Friction, >=2.0):
+Expected recoverable fraction of measured gap:
 Machine-class scope:
 Adoption wedge:
 Budgeted mode (caps + on-exhaust behavior):
 Isomorphism proof plan (parity campaign + rank-exactness):
 p50/p95/p99 before/after target (as % of ceiling gap):
+Old Quill / new Quill / Tantivy / A-A evidence plan:
+Source, executable, corpus, and worker identity:
 Primary failure risk + countermeasure:
 Fallback trigger:
 Baseline comparator:
 Rollback:
+Reject retry predicate:
 ```
 
 ## 6. Campaign anti-patterns
@@ -291,9 +343,17 @@ Rollback:
 - Running trj timed windows while the agent swarm builds on the same box —
   isolated target dir + exclusive build slot, or the A/A null vetoes the run.
 - Treating M4 results as M5 results.
+- Waiting for every machine class, every gate, or a fleet-wide phase before
+  recording or acting on a locally valid diagnostic.
+- Requiring an arbitrary number of rounds, or requiring all workstreams to
+  produce a lever in lockstep.
 - Calling QG-6 done at smoke scale; the gate decision runs at 100K/1M with
   hierarchical per-query resampling.
 - macOS commit-latency numbers without the Law-7 attestation.
+- Treating a Quill self-speedup, or ratios collected from different source
+  commits, as proof against the genuine Tantivy incumbent.
+- Hiding a failed, truncated, or validator-defective run instead of retaining
+  it with a precise non-claim reason and retry predicate.
 - Touching `perf_matrix.rs`, `quill-perf-gates.toml`, `PERF_LEDGER.md`, or
   `NEGATIVE_EVIDENCE.md` without coordinating with their reservation holders.
 - Optimizing anything without its hypothesis row and prior-mining pre-flight.
@@ -303,13 +363,17 @@ Rollback:
 Epic `bd-quill-e8-hyperopt-*` under the E8 doctrine (not a parallel taxonomy).
 Children: `p0-*` (onboarding/calibration), `p1-*` (per-class profile cards),
 `p2-*` (hypothesis ledger), `w1-*`/`w2-*` (specified levers), `w3-*`/`w4-*`/
-`w5-*`/`math-*` (stubs behind Phase 0/1), `convergence`, `renegotiation`.
+`w5-*`/`math-*` (stubs behind their lane-local profile prerequisites),
+`convergence`, `renegotiation`. `bd-quill-e8-hyperopt-nyps.1` owns the
+progressive-admission contract repair and must close before convergence or
+target renegotiation, but it does not block measurements or optimization.
 External anchors: `bd-h6eh` (instrument), `gwd4` (W1 base lever), `bd-6oiq` +
 `x4e4.5.4` (x86 profiling cards), `bd-3beo` (consumes the renegotiation
 evidence).
 
-Lanes: **I** instrument (Phase 0, currently FoggySquirrel/CobaltWillow's
-surface), **P** profiling cards, **O** one agent per workstream with
+Lanes: **I** lane-local instrument and calibration (currently
+FoggySquirrel/CobaltWillow's surface), **P** profiling cards, **O** one agent
+per workstream with
 exclusive per-module reservations, **V** standing read-only auditor +
 ledger/ratchet curation (the role that caught two instrument defects the week
 this contract was written).
@@ -322,6 +386,8 @@ this contract was written).
   `scripts/check_ledger_null_control.sh` commit gate).
 - Runner: `scripts/perf-runner.sh` (machine-class provenance capture).
 - QG-1 provisional miss row: `docs/NEGATIVE_EVIDENCE.md` § 2026-07-27
-  (bd-h6eh). QG-6 attribution: `gwd4` bead body.
+  (bd-h6eh). QG-2 current baseline: `73444b59` from timed source `5bb74e76`,
+  pending the fairness disposition in `x4e4.5.5`. QG-6 attribution: `gwd4`
+  bead body.
 - Flip decision consumer: `bd-3beo`; conformance authority:
   `bd-quill-flip-conformance-release-gate-0r2p`.
