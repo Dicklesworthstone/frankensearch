@@ -16397,3 +16397,73 @@ identifies a materially different way to avoid opening/scoring non-essential
 groups; first require grouped2 and grouped4 to clear an admissible same-binary
 100k A/A median-CI in the winning direction, then run the full 1M and
 randomized/mixed/tombstone/offset parity matrix.
+
+### 2026-07-27 — QG-1 PROVISIONAL MISS (gate inactive): Quill bulk indexing is ~6-9x SLOWER than the Tantivy oracle, against a >=3.0x target (`bd-h6eh`, SageCardinal)
+
+**Comparison class: INCUMBENT.** This is not a self-speedup.
+
+- **Actual legacy incumbent: Tantivy 0.26.1** (via `frankensearch-lexical`, feature `tantivy-oracle`).
+- **Incumbent ratio (quill/tantivy docs_per_second): 0.1297** at the gate's own
+  fixture `bulk/medium/8/positions_on`; range 0.1066–0.1725 across medium.
+- **Same-invocation A/A null (tantivy/tantivy): 0.9945 [0.9336, 1.0790]** at
+  `bulk/medium/4/positions_on`, measured in that same invocation.
+- Candidate and incumbent ran **side-by-side**, interleaved with alternating
+  per-round order, inside that one invocation.
+
+**Incumbent identity asserted at RUNTIME**, not assumed (dispatch trap):
+
+```
+[quill-perf-oracle] incumbent=tantivy linked_runtime=tantivy v0.26.1, index_format v7
+                    contract_version=0.26.1 lexical=frankensearch-lexical@0.2.1
+                    lexical_git=062a5e5b2d41653b1c8b07888eda1a765e421f49
+```
+
+Executing bench ELF SHA-256
+`414d9175110df470cb62201a25161ac3a7cea5e4724dc8dc83eaceca1c4642c6`, worker
+`ovh-a`, `release-perf`, `QUILL_PERF_SCALE=full`.
+
+`ab_median` is `quill_docs_per_second / tantivy_docs_per_second`, so **>1 means
+Quill is faster**. The gate target is **>= 3.0x**.
+
+| fixture (positions_on) | A/A null median [ci95] | A/B median [ci95] | reading |
+|---|---|---|---|
+| `bulk/medium/1` | 1.0058 [0.8747, 1.0966] | **0.1129** [0.1111, 0.1143] | Tantivy 8.9x faster |
+| `bulk/medium/4` | 0.9945 [0.9336, 1.0790] | **0.1066** [0.1015, 0.1228] | Tantivy 9.4x faster |
+| `bulk/medium/8` | 0.9682 [0.6830, 0.9946] | **0.1297** [0.1279, 0.1328] | Tantivy 7.7x faster |
+| `bulk/medium/16` | 1.0317 [0.9202, 1.4009] | **0.1725** [0.1685, 0.1875] | Tantivy 5.8x faster |
+| `bulk/small/16` | 0.9990 [0.9565, 1.0254] | **0.2706** [0.2541, 0.2816] | Tantivy 3.7x faster |
+
+**QG-1 target >= 3.0x oracle; measured 0.11-0.17x on medium. The gate MISSES by
+roughly a factor of 23.** The direction is the opposite of the campaign premise:
+Quill does not leapfrog Tantivy at bulk indexing, it is far behind it.
+
+**Null admissibility, stated rather than buried.** The contract requires the A/A
+CI to contain 1.0. It does for `medium/1`, `medium/4`, `medium/16` and
+`small/16`; it does **not** for `medium/8` (`[0.6830, 0.9946]`, upper bound below
+1.0), so that single cell is not certifiable on its own. It is reported because
+the four admissible cells bracket it and agree: every one lands in 0.107-0.271.
+No conclusion here rests on that one cell. `bulk/small/16/positions_on` carries
+the narrowest A/A null of the set, `[0.9565, 1.0254]`, and still reads 3.7x
+behind. Every decision here is made on the median against the A/A null floor.
+
+**Fairness audited in the direction that would flatter us.** Both arms take
+`writer_heap_bytes` (50 MB) and `threads` from the same `PerfCellSpec`, both use
+matched `positions`, and **commit is inside the timed window for both**. Quill
+runs its shipping default config — `bulk_load_mode` is NOT enabled — per standing
+law 1 (benchmark settings match shipped defaults). Corpus generation sits outside
+the timed region, so this measures engine work, not harness work. Arms are
+interleaved with per-round alternating order inside one routine.
+
+**Decision: PROVISIONAL MISS, gate remains `activated = false`.** No baseline was
+committed to `.bench-history` because the run hit `RCH-E104` (SSH timeout at
+1800s) before reaching the `xlarge` cells and the `tokenize_only` honesty
+denominator, so `QG-1.json` was never emitted. Per the activation contract this
+number may be quoted only as "provisional, gate inactive", which is how it is
+labelled here. The 24 completed cells are each self-contained (own A/A + A/B in
+one invocation); the timeout truncated the matrix, it did not corrupt them.
+
+**Retry predicate:** re-run QG-1 with `QUILL_PERF_FIXTURE` narrowing to the
+decisive cells so compile + measurement fit inside the 1800s window, capture
+`xlarge` and `tokenize_only`, and emit a complete `QG-1.json`. Only then flip
+`activated = true`. Do not raise the global `build_timeout_sec`; that file is
+shared by 11 repos and lengthening leases starves the Lane M measurement window.
