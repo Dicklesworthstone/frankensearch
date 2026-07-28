@@ -8271,7 +8271,10 @@ fn remove_stale_generation_claim(
             path: path.to_path_buf(),
             source,
         })?;
-    if stat.st_dev != metadata.dev() || stat.st_ino != metadata.ino() || stat.st_size != 0 {
+    if stat_dev_as_u64(&stat) != metadata.dev()
+        || stat.st_ino != metadata.ino()
+        || stat.st_size != 0
+    {
         return Err(KeeperError::InvalidClaimArtifact {
             path: path.to_path_buf(),
             detail: "claim pathname changed during stale recovery".to_owned(),
@@ -9418,6 +9421,16 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// `rustix::fs::Stat::st_dev` carries the platform's native device type
+/// (`i32` on macOS, `u64` on Linux) while `std::os::unix::fs::MetadataExt::
+/// dev()` always yields the raw value widened to `u64` with a sign-extending
+/// cast. Device-identity checks must apply the identical conversion or they
+/// compare different bits on macOS.
+#[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+fn stat_dev_as_u64(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_dev as u64
+}
+
 struct GenerationClaimGuard {
     admission: Arc<WriterAdmissionInner>,
     name: OsString,
@@ -9558,7 +9571,7 @@ fn release_generation_claim(claim: &GenerationClaimGuard) {
     ) else {
         return;
     };
-    if stat.st_dev != claim.device || stat.st_ino != claim.inode || stat.st_size != 0 {
+    if stat_dev_as_u64(&stat) != claim.device || stat.st_ino != claim.inode || stat.st_size != 0 {
         return;
     }
     if unlinkat(
