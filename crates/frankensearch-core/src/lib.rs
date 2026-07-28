@@ -167,6 +167,7 @@ pub use traits::{
     cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
-    DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,
-    ScoreSource, ScoredResult, SearchMetrics, SearchMode, SearchPhase, VectorHit,
+    BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
+    PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
+    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
