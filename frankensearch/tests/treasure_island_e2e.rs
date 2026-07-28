@@ -231,7 +231,7 @@ fn chapters_of(passages: &[Passage], ids: &[String]) -> BTreeSet<u32> {
 
 // ─── Model resolution ────────────────────────────────────────────────────────
 
-/// Where a real MiniLM sentence-embedder may live.
+/// Where a real `MiniLM` sentence-embedder may live.
 ///
 /// Mirrors the library's own precedence: `FRANKENSEARCH_MODEL_DIR` first (both
 /// as a model root and as a direct model directory), then the default per-user
