@@ -24,7 +24,7 @@ perf-harness = [
 [dependencies]
 asupersync = { workspace = true }
 frankensearch-core = { workspace = true }
-frankensearch-quill = { workspace = true }
+frankensearch-quill = { workspace = true, features = ["conformance-internals"] }
 frankensearch-lexical = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }

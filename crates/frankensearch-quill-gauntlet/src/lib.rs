@@ -47,9 +47,12 @@ pub use comparator::{
     LexicalSideCoverage, LexicalWaivedDifference, LexicalWaiverTarget, LexicalWinnerOrigin,
     LexicalWinnerProjection, MAX_LEXICAL_DOC_ID_BYTES, MAX_LEXICAL_ERROR_SOURCE_DEPTH,
     MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT, MAX_LEXICAL_OBSERVATION_HITS, MAX_LEXICAL_QUERY_BYTES,
-    MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES, NativeTieKey, RankClass, RankedHit, SCORE_EPSILON,
+    MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES, NativeTieKey, QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION,
+    QuillCancellationCheckpoint, QuillCancellationEvidenceOrigin, QuillCancellationObservation,
+    QuillCancellationReceipt, QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON,
     ScoreEpsilonReason, SensitiveValueObservation, compare_lexical_contracts,
     compare_lexical_observations, compare_observations, observe_lexical_outcome,
+    observe_live_quill_cancellation_receipt,
 };
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,

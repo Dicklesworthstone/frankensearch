@@ -4,9 +4,14 @@ use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::{
-    ExplanationPhase, HitExplanation, LexicalSearch, QueryClass, ScoreSource, ScoredResult,
-    SearchError,
+    ExplanationPhase, HitExplanation, IndexableDocument, LexicalRead, LexicalSearch, LexicalWrite,
+    QueryClass, ScoreSource, ScoredResult, SearchError,
 };
+use frankensearch_quill::index::{
+    ConformanceCancellationController, ConformanceCancellationStage, QuillIndex,
+    QuillSearchSnapshot,
+};
+use frankensearch_quill::{CURRENT_ENGINE_VERSION, QuillConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -20,6 +25,10 @@ pub const LEXICAL_OBSERVATION_SCHEMA_VERSION: &str = "lexical-observation-v3";
 pub const LEXICAL_CONTRACT_BUNDLE_SCHEMA_VERSION: &str = "lexical-contract-bundle-v3";
 /// Stable schema identifier for a replayable total-contract comparison.
 pub const LEXICAL_CONTRACT_COMPARISON_SCHEMA_VERSION: &str = "lexical-contract-comparison-v3";
+/// Stable schema identifier for the live, method-bound Quill cancellation
+/// receipt owned by bd-fjpu.
+pub const QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION: &str =
+    "quill-cancellation-contract-receipt-v2";
 /// Maximum number of hits admitted into one lexical observation artifact.
 pub const MAX_LEXICAL_OBSERVATION_HITS: usize = 100_000;
 /// Maximum UTF-8 byte length of a consumer-visible document identifier.
@@ -746,6 +755,1012 @@ impl LexicalContractBundle {
     pub fn mixed_winners_hydration(&self) -> &LexicalHydrationTransition {
         &self.mixed_winners_hydration
     }
+}
+
+/// Provenance class for one cancellation receipt.
+///
+/// Spy and synthetic variants are serializable so replay can explain why an
+/// older or hand-constructed artifact is inadmissible. Validation accepts
+/// only a witness produced by real Quill public methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuillCancellationEvidenceOrigin {
+    LiveQuillPublicMethod,
+    SpyOnly,
+    Synthetic,
+}
+
+/// Required cancellation point in the method-bound bd-fjpu phase matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuillCancellationCheckpoint {
+    SearchBeforeParse,
+    SearchDuringCollection,
+    FusionCandidatesDuringCollection,
+    FusionHydrationBefore,
+    FusionHydrationWithin,
+    CommitBeforePublication,
+}
+
+impl QuillCancellationCheckpoint {
+    const REQUIRED: [Self; 6] = [
+        Self::SearchBeforeParse,
+        Self::SearchDuringCollection,
+        Self::FusionCandidatesDuringCollection,
+        Self::FusionHydrationBefore,
+        Self::FusionHydrationWithin,
+        Self::CommitBeforePublication,
+    ];
+
+    const fn expected_phase(self) -> &'static str {
+        match self {
+            Self::SearchBeforeParse
+            | Self::SearchDuringCollection
+            | Self::FusionCandidatesDuringCollection => "search",
+            Self::FusionHydrationBefore | Self::FusionHydrationWithin => {
+                "fusion metadata hydration"
+            }
+            Self::CommitBeforePublication => "commit publish",
+        }
+    }
+
+    const fn is_injected(self) -> bool {
+        !matches!(self, Self::SearchBeforeParse | Self::FusionHydrationBefore)
+    }
+}
+
+/// One real public-method cancellation observation.
+///
+/// `post_state_sha256` binds any local mutation retained when cancellation is
+/// returned, including Quill's canonical complete pending-writer fingerprint
+/// at the publication boundary. `replay_post_state_sha256` proves the same
+/// checkpoint produces the same retained state on replay. Published-snapshot
+/// content, exact epochs/generations, and `Arc` identity are recorded
+/// separately for the first cancellation and its replay so equal bytes cannot
+/// hide process-local snapshot replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+// These are independent, human-auditable receipt attestations rather than
+// interchangeable internal state bits. In particular, snapshot identity must
+// remain an explicit JSON boolean so replay tooling cannot mistake equal
+// content for equal process-local publication identity.
+#[allow(clippy::struct_excessive_bools)]
+pub struct QuillCancellationObservation {
+    pub checkpoint: QuillCancellationCheckpoint,
+    pub trigger_ordinal: u64,
+    pub observed_checkpoints: u64,
+    pub error_code: String,
+    pub phase: String,
+    pub reason: String,
+    pub snapshot_before_sha256: String,
+    pub snapshot_after_cancel_sha256: String,
+    pub snapshot_after_replay_sha256: String,
+    pub snapshot_epoch_before: u64,
+    pub snapshot_epoch_after_cancel: u64,
+    pub snapshot_epoch_after_replay: u64,
+    pub keeper_generation_before: u64,
+    pub keeper_generation_after_cancel: u64,
+    pub keeper_generation_after_replay: u64,
+    pub snapshot_identity_preserved_after_cancel: bool,
+    pub snapshot_identity_preserved_after_replay: bool,
+    pub doc_count_before: u64,
+    pub doc_count_after_cancel: u64,
+    pub doc_count_after_replay: u64,
+    pub post_state_sha256: String,
+    pub replay_post_state_sha256: String,
+    pub control_result_sha256: String,
+    pub retry_result_sha256: String,
+    pub retained_hydrated_prefix: u64,
+    pub pending_state_retained: bool,
+    pub success_published: bool,
+    pub replay_verified: bool,
+}
+
+/// Content-addressed body of a complete Quill cancellation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuillCancellationReceiptBody {
+    pub schema_version: String,
+    pub origin: QuillCancellationEvidenceOrigin,
+    pub engine_revision: String,
+    pub corpus_sha256: String,
+    pub query_sha256: String,
+    pub observations: Vec<QuillCancellationObservation>,
+}
+
+/// Replayable, content-addressed bd-fjpu release evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuillCancellationReceipt {
+    pub body: QuillCancellationReceiptBody,
+    pub body_sha256: String,
+}
+
+impl QuillCancellationReceipt {
+    /// Seal one live receipt body with a canonical JSON SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-observation error when canonical serialization
+    /// fails or any method-bound cancellation invariant is absent.
+    pub fn seal(body: QuillCancellationReceiptBody) -> Result<Self, GauntletError> {
+        let body_sha256 = sha256_hex(&canonical_json_bytes(&body).map_err(|error| {
+            GauntletError::InvalidObservation {
+                reason: format!("could not canonicalize Quill cancellation receipt body: {error}"),
+            }
+        })?);
+        let receipt = Self { body, body_sha256 };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Validate schema, provenance, phase coverage, immutable shared state,
+    /// deterministic replay, and the content-addressed body binding.
+    ///
+    /// # Errors
+    ///
+    /// Rejects partial, spy-only, synthetic, mutation-bearing, unbounded, or
+    /// non-replayable evidence.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.body.schema_version != QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION
+            || self.body.origin != QuillCancellationEvidenceOrigin::LiveQuillPublicMethod
+            || self.body.engine_revision.trim().is_empty()
+            || self.body.engine_revision.len() > 256
+            || !is_lower_sha256(&self.body.corpus_sha256)
+            || !is_lower_sha256(&self.body.query_sha256)
+            || self.body.observations.len() != QuillCancellationCheckpoint::REQUIRED.len()
+        {
+            return Err(GauntletError::InvalidObservation {
+                reason:
+                    "Quill cancellation receipt schema, provenance, identity, or coverage is invalid"
+                        .to_owned(),
+            });
+        }
+        let expected_body_sha256 =
+            sha256_hex(&canonical_json_bytes(&self.body).map_err(|error| {
+                GauntletError::InvalidObservation {
+                    reason: format!("could not replay Quill cancellation receipt body: {error}"),
+                }
+            })?);
+        if self.body_sha256 != expected_body_sha256 {
+            return Err(GauntletError::InvalidObservation {
+                reason: "Quill cancellation receipt body hash does not match canonical replay"
+                    .to_owned(),
+            });
+        }
+        for (observation, expected_checkpoint) in self
+            .body
+            .observations
+            .iter()
+            .zip(QuillCancellationCheckpoint::REQUIRED)
+        {
+            if observation.checkpoint != expected_checkpoint
+                || observation.error_code != "cancelled"
+                || observation.phase != observation.checkpoint.expected_phase()
+                || observation.reason != "Quill observed request cancellation"
+                || observation.reason.len() > 128
+                || observation.success_published
+                || !observation.replay_verified
+                || observation.snapshot_before_sha256 != observation.snapshot_after_cancel_sha256
+                || observation.snapshot_before_sha256 != observation.snapshot_after_replay_sha256
+                || observation.snapshot_epoch_before != observation.snapshot_epoch_after_cancel
+                || observation.snapshot_epoch_before != observation.snapshot_epoch_after_replay
+                || observation.keeper_generation_before
+                    != observation.keeper_generation_after_cancel
+                || observation.keeper_generation_before
+                    != observation.keeper_generation_after_replay
+                || !observation.snapshot_identity_preserved_after_cancel
+                || !observation.snapshot_identity_preserved_after_replay
+                || observation.doc_count_before != observation.doc_count_after_cancel
+                || observation.doc_count_before != observation.doc_count_after_replay
+                || observation.post_state_sha256 != observation.replay_post_state_sha256
+                || observation.control_result_sha256 != observation.retry_result_sha256
+                || ![
+                    &observation.snapshot_before_sha256,
+                    &observation.snapshot_after_cancel_sha256,
+                    &observation.snapshot_after_replay_sha256,
+                    &observation.post_state_sha256,
+                    &observation.replay_post_state_sha256,
+                    &observation.control_result_sha256,
+                    &observation.retry_result_sha256,
+                ]
+                .into_iter()
+                .all(|value| is_lower_sha256(value))
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "Quill cancellation observation {:?} is not typed, immutable, bounded, or replayable",
+                        observation.checkpoint
+                    ),
+                });
+            }
+            if observation.checkpoint.is_injected() {
+                if observation.trigger_ordinal == 0
+                    || observation.observed_checkpoints != observation.trigger_ordinal
+                {
+                    return Err(GauntletError::InvalidObservation {
+                        reason: format!(
+                            "Quill cancellation observation {:?} did not reach its injected checkpoint",
+                            observation.checkpoint
+                        ),
+                    });
+                }
+            } else if observation.trigger_ordinal != 0 || observation.observed_checkpoints != 0 {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "Quill entry cancellation observation {:?} claims an injected checkpoint",
+                        observation.checkpoint
+                    ),
+                });
+            }
+            let expected_prefix = u64::from(
+                observation.checkpoint == QuillCancellationCheckpoint::FusionHydrationWithin,
+            );
+            if observation.retained_hydrated_prefix != expected_prefix
+                || observation.pending_state_retained
+                    != (observation.checkpoint
+                        == QuillCancellationCheckpoint::CommitBeforePublication)
+            {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "Quill cancellation observation {:?} retained the wrong exact post-state",
+                        observation.checkpoint
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Restores caller-owned cancellation state even when live receipt collection
+/// exits through an error after arming a deterministic checkpoint.
+///
+/// The public witness borrows its caller's `Cx`; it does not own the right to
+/// leave that request cancelled. Controller disarm is likewise unconditional
+/// so a failed evidence attempt cannot poison a later retry.
+struct LiveCancellationStateGuard<'a> {
+    cx: &'a Cx,
+    controller: Arc<ConformanceCancellationController>,
+    original_cancel_requested: bool,
+}
+
+impl<'a> LiveCancellationStateGuard<'a> {
+    fn new(cx: &'a Cx, controller: Arc<ConformanceCancellationController>) -> Self {
+        Self {
+            cx,
+            controller,
+            original_cancel_requested: cx.is_cancel_requested(),
+        }
+    }
+}
+
+impl Drop for LiveCancellationStateGuard<'_> {
+    fn drop(&mut self) {
+        self.controller.disarm();
+        self.cx.set_cancel_requested(self.original_cancel_requested);
+    }
+}
+
+fn cancellation_error_fields(
+    error: SearchError,
+) -> Result<(String, String, String), GauntletError> {
+    let SearchError::Cancelled { phase, reason } = error else {
+        return Err(GauntletError::InvalidObservation {
+            reason: format!("live Quill cancellation checkpoint returned {error:?}"),
+        });
+    };
+    if phase.len() > 128 || reason.len() > 128 {
+        return Err(GauntletError::InvalidObservation {
+            reason: "live Quill cancellation error exceeded the bounded receipt fields".to_owned(),
+        });
+    }
+    Ok(("cancelled".to_owned(), phase, reason))
+}
+
+fn cancellation_result_sha256(results: &[ScoredResult]) -> Result<String, GauntletError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/quill/cancellation-result/v1\0");
+    hasher.update(
+        u64::try_from(results.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for result in results {
+        hasher.update(
+            u64::try_from(result.doc_id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(result.doc_id.as_bytes());
+        hasher.update(result.score.to_bits().to_be_bytes());
+        hasher.update(
+            result
+                .lexical_score
+                .map_or(u32::MAX, f32::to_bits)
+                .to_be_bytes(),
+        );
+        hasher.update([match result.source {
+            ScoreSource::Lexical => 0,
+            ScoreSource::SemanticFast => 1,
+            ScoreSource::SemanticQuality => 2,
+            ScoreSource::Hybrid => 3,
+            ScoreSource::Reranked => 4,
+        }]);
+        match &result.metadata {
+            None => hasher.update([0]),
+            Some(metadata) => {
+                hasher.update([1]);
+                let bytes = canonical_json_bytes(metadata.as_ref()).map_err(|error| {
+                    GauntletError::InvalidObservation {
+                        reason: format!(
+                            "could not canonicalize cancellation result metadata: {error}"
+                        ),
+                    }
+                })?;
+                hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+                hasher.update(bytes);
+            }
+        }
+    }
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+fn cancellation_post_state_sha256(
+    checkpoint: QuillCancellationCheckpoint,
+    results: Option<&[ScoredResult]>,
+    pending_writer_state_sha256: Option<[u8; 32]>,
+) -> Result<String, GauntletError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/quill/cancellation-post-state/v2\0");
+    hasher.update([match checkpoint {
+        QuillCancellationCheckpoint::SearchBeforeParse => 0,
+        QuillCancellationCheckpoint::SearchDuringCollection => 1,
+        QuillCancellationCheckpoint::FusionCandidatesDuringCollection => 2,
+        QuillCancellationCheckpoint::FusionHydrationBefore => 3,
+        QuillCancellationCheckpoint::FusionHydrationWithin => 4,
+        QuillCancellationCheckpoint::CommitBeforePublication => 5,
+    }]);
+    match pending_writer_state_sha256 {
+        None => hasher.update([0]),
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+    }
+    match results {
+        None => hasher.update([0]),
+        Some(results) => {
+            hasher.update([1]);
+            hasher.update(cancellation_result_sha256(results)?.as_bytes());
+        }
+    }
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+struct CancellationSnapshotCapture {
+    snapshot: Arc<QuillSearchSnapshot>,
+    sha256: String,
+    snapshot_epoch: u64,
+    keeper_generation: u64,
+    doc_count: u64,
+}
+
+fn capture_cancellation_snapshot(
+    index: &QuillIndex,
+    documents: &[IndexableDocument],
+) -> Result<CancellationSnapshotCapture, GauntletError> {
+    let snapshot = index.search_snapshot();
+    let keeper = snapshot.keeper_snapshot();
+    let manifest = &keeper.loaded_manifest().manifest;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/quill/cancellation-published-snapshot/v3\0");
+    hasher.update(snapshot.snapshot_epoch().to_be_bytes());
+    hasher.update(snapshot.keeper_generation().to_be_bytes());
+    hasher.update(snapshot.live_doc_count().to_be_bytes());
+    hasher.update(snapshot.bm25_doc_count().to_be_bytes());
+    hasher.update(
+        u64::try_from(snapshot.delta_count())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(manifest.generation.to_be_bytes());
+    hasher.update(manifest.docid_high_watermark.to_be_bytes());
+    hasher.update(manifest.schema_id.to_be_bytes());
+    hasher.update(manifest.engine_version.to_be_bytes());
+    hasher.update(manifest.flags.to_be_bytes());
+    for segment in &manifest.segments {
+        hasher.update(segment.segment_id.to_be_bytes());
+        hasher.update(segment.seal_seq.to_be_bytes());
+        hasher.update(segment.file_len.to_be_bytes());
+        hasher.update(segment.file_xxh3.to_be_bytes());
+        hasher.update(segment.docid_lo.to_be_bytes());
+        hasher.update(segment.docid_hi.to_be_bytes());
+        hasher.update(segment.doc_count.to_be_bytes());
+        hasher.update(segment.tombstones.cardinality().to_be_bytes());
+    }
+    for document in documents {
+        hasher.update(
+            u64::try_from(document.id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(document.id.as_bytes());
+        match index.document_witness(&document.id)? {
+            Some(witness) => {
+                hasher.update([1]);
+                hasher.update(witness.global_docid.to_be_bytes());
+                hasher.update(witness.content_hash.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    let snapshot_epoch = snapshot.snapshot_epoch();
+    let keeper_generation = snapshot.keeper_generation();
+    let doc_count = snapshot.live_doc_count();
+    Ok(CancellationSnapshotCapture {
+        snapshot,
+        sha256: lower_hex(&hasher.finalize()),
+        snapshot_epoch,
+        keeper_generation,
+        doc_count,
+    })
+}
+
+async fn cancellation_fixture(
+    cx: &Cx,
+    documents: &[IndexableDocument],
+) -> Result<QuillIndex, GauntletError> {
+    let index = QuillIndex::in_memory(QuillConfig {
+        deterministic_ingest: true,
+        ..QuillConfig::default()
+    })
+    .map_err(|error| GauntletError::InvalidObservation {
+        reason: format!("could not create live Quill cancellation fixture: {error}"),
+    })?;
+    LexicalWrite::index_documents(&index, cx, documents)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("could not ingest live Quill cancellation fixture: {error}"),
+        })?;
+    LexicalWrite::commit(&index, cx)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("could not commit live Quill cancellation fixture: {error}"),
+        })?;
+    Ok(index)
+}
+
+fn cancellation_documents() -> Vec<IndexableDocument> {
+    (0_u32..8)
+        .map(|ordinal| {
+            IndexableDocument::new(
+                format!("cancel-doc-{ordinal:02}"),
+                format!("alpha beta gamma cancellation fixture {ordinal:02}"),
+            )
+            .with_metadata("ordinal", ordinal.to_string())
+        })
+        .collect()
+}
+
+fn cancelled_search_error(
+    result: Result<Vec<ScoredResult>, SearchError>,
+    boundary: &str,
+) -> Result<(String, String, String), GauntletError> {
+    let error = result
+        .err()
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: format!("{boundary} fabricated success after cancellation"),
+        })?;
+    cancellation_error_fields(error)
+}
+
+async fn cancellation_query(
+    index: &QuillIndex,
+    cx: &Cx,
+    query: &str,
+    limit: usize,
+    candidate_boundary: bool,
+) -> Result<Vec<ScoredResult>, SearchError> {
+    if candidate_boundary {
+        let batch = LexicalRead::search_candidates(index, cx, query, limit).await?;
+        Ok(batch.into_parts().0)
+    } else {
+        LexicalRead::search(index, cx, query, limit).await
+    }
+}
+
+fn make_cancellation_observation(
+    checkpoint: QuillCancellationCheckpoint,
+    trigger_ordinal: u64,
+    observed_checkpoints: u64,
+    error: (String, String, String),
+    snapshot_before: &CancellationSnapshotCapture,
+    snapshot_after_cancel: &CancellationSnapshotCapture,
+    snapshot_after_replay: &CancellationSnapshotCapture,
+    post_state_sha256: String,
+    replay_post_state_sha256: String,
+    control_result_sha256: String,
+    retry_result_sha256: String,
+    retained_hydrated_prefix: u64,
+    pending_state_retained: bool,
+) -> QuillCancellationObservation {
+    let replay_verified = post_state_sha256 == replay_post_state_sha256;
+    let snapshot_identity_preserved_after_cancel =
+        Arc::ptr_eq(&snapshot_before.snapshot, &snapshot_after_cancel.snapshot);
+    let snapshot_identity_preserved_after_replay =
+        Arc::ptr_eq(&snapshot_before.snapshot, &snapshot_after_replay.snapshot);
+    tracing::info!(
+        target: "frankensearch.quill.cancellation",
+        boundary = ?checkpoint,
+        checkpoint_ordinal = trigger_ordinal,
+        observed_checkpoints,
+        snapshot_epoch_before = snapshot_before.snapshot_epoch,
+        snapshot_epoch_after_cancel = snapshot_after_cancel.snapshot_epoch,
+        snapshot_epoch_after_replay = snapshot_after_replay.snapshot_epoch,
+        keeper_generation_before = snapshot_before.keeper_generation,
+        keeper_generation_after_cancel = snapshot_after_cancel.keeper_generation,
+        keeper_generation_after_replay = snapshot_after_replay.keeper_generation,
+        snapshot_identity_preserved_after_cancel,
+        snapshot_identity_preserved_after_replay,
+        snapshot_before_sha256 = %snapshot_before.sha256,
+        snapshot_after_cancel_sha256 = %snapshot_after_cancel.sha256,
+        snapshot_after_replay_sha256 = %snapshot_after_replay.sha256,
+        cancellation_observed = true,
+        replay_verified,
+        "recorded live method-bound Quill cancellation checkpoint"
+    );
+    QuillCancellationObservation {
+        checkpoint,
+        trigger_ordinal,
+        observed_checkpoints,
+        error_code: error.0,
+        phase: error.1,
+        reason: error.2,
+        snapshot_before_sha256: snapshot_before.sha256.clone(),
+        snapshot_after_cancel_sha256: snapshot_after_cancel.sha256.clone(),
+        snapshot_after_replay_sha256: snapshot_after_replay.sha256.clone(),
+        snapshot_epoch_before: snapshot_before.snapshot_epoch,
+        snapshot_epoch_after_cancel: snapshot_after_cancel.snapshot_epoch,
+        snapshot_epoch_after_replay: snapshot_after_replay.snapshot_epoch,
+        keeper_generation_before: snapshot_before.keeper_generation,
+        keeper_generation_after_cancel: snapshot_after_cancel.keeper_generation,
+        keeper_generation_after_replay: snapshot_after_replay.keeper_generation,
+        snapshot_identity_preserved_after_cancel,
+        snapshot_identity_preserved_after_replay,
+        doc_count_before: snapshot_before.doc_count,
+        doc_count_after_cancel: snapshot_after_cancel.doc_count,
+        doc_count_after_replay: snapshot_after_replay.doc_count,
+        post_state_sha256,
+        replay_post_state_sha256,
+        control_result_sha256,
+        retry_result_sha256,
+        retained_hydrated_prefix,
+        pending_state_retained,
+        success_published: false,
+        replay_verified,
+    }
+}
+
+/// Execute and seal the complete live Quill cancellation phase matrix.
+///
+/// The witness invokes real `LexicalRead` search/candidate/hydration methods
+/// and the real `LexicalWrite` commit method. Deterministic injection merely
+/// requests cancellation on the real `Cx` at exact engine checkpoints; it
+/// does not fabricate return values.
+///
+/// # Errors
+///
+/// Returns fail-closed evidence errors for a missing cancellation, unstable
+/// replay, mutated snapshot, dirty retry, or malformed receipt.
+pub async fn observe_live_quill_cancellation_receipt(
+    cx: &Cx,
+) -> Result<QuillCancellationReceipt, GauntletError> {
+    const QUERY: &str = "alpha OR beta";
+    const LIMIT: usize = 8;
+    const DURING_ORDINAL: u64 = 2;
+
+    let documents = cancellation_documents();
+    let corpus_sha256 = sha256_hex(&canonical_json_bytes(&documents).map_err(|error| {
+        GauntletError::InvalidObservation {
+            reason: format!("could not canonicalize cancellation corpus: {error}"),
+        }
+    })?);
+    let query_sha256 = sha256_hex(QUERY.as_bytes());
+    let index = cancellation_fixture(cx, &documents).await?;
+    let controller = index.conformance_cancellation_controller();
+    let _caller_state_guard = LiveCancellationStateGuard::new(cx, Arc::clone(&controller));
+    let control = LexicalRead::search(&index, cx, QUERY, LIMIT)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("live cancellation control search failed: {error}"),
+        })?;
+    let control_sha256 = cancellation_result_sha256(&control)?;
+    let control_candidates = cancellation_query(&index, cx, QUERY, LIMIT, true)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("live cancellation candidate control failed: {error}"),
+        })?;
+    let candidate_control_sha256 = cancellation_result_sha256(&control_candidates)?;
+    let mut observations = Vec::with_capacity(QuillCancellationCheckpoint::REQUIRED.len());
+
+    let snapshot_before = capture_cancellation_snapshot(&index, &documents)?;
+    cx.set_cancel_requested(true);
+    let first = cancelled_search_error(
+        LexicalRead::search(&index, cx, QUERY, LIMIT).await,
+        "search-before-parse",
+    )?;
+    let snapshot_after_cancel = capture_cancellation_snapshot(&index, &documents)?;
+    let post_state =
+        cancellation_post_state_sha256(QuillCancellationCheckpoint::SearchBeforeParse, None, None)?;
+    cx.set_cancel_requested(false);
+    let retry = LexicalRead::search(&index, cx, QUERY, LIMIT)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("search-before-parse retry failed: {error}"),
+        })?;
+    cx.set_cancel_requested(true);
+    let replay = cancelled_search_error(
+        LexicalRead::search(&index, cx, QUERY, LIMIT).await,
+        "search-before-parse replay",
+    )?;
+    let snapshot_after_replay = capture_cancellation_snapshot(&index, &documents)?;
+    cx.set_cancel_requested(false);
+    if first != replay {
+        return Err(GauntletError::InvalidObservation {
+            reason: "search-before-parse cancellation replay changed typed error".to_owned(),
+        });
+    }
+    observations.push(make_cancellation_observation(
+        QuillCancellationCheckpoint::SearchBeforeParse,
+        0,
+        0,
+        first,
+        &snapshot_before,
+        &snapshot_after_cancel,
+        &snapshot_after_replay,
+        post_state.clone(),
+        post_state,
+        control_sha256.clone(),
+        cancellation_result_sha256(&retry)?,
+        0,
+        false,
+    ));
+
+    for (checkpoint, candidate_boundary) in [
+        (QuillCancellationCheckpoint::SearchDuringCollection, false),
+        (
+            QuillCancellationCheckpoint::FusionCandidatesDuringCollection,
+            true,
+        ),
+    ] {
+        let snapshot_before = capture_cancellation_snapshot(&index, &documents)?;
+        controller.arm(
+            ConformanceCancellationStage::QueryCollection,
+            DURING_ORDINAL,
+        )?;
+        let first_result = cancellation_query(&index, cx, QUERY, LIMIT, candidate_boundary).await;
+        let first = cancelled_search_error(first_result, "during-collection")?;
+        let first_observed = controller.observed_checkpoints();
+        let snapshot_after_cancel = capture_cancellation_snapshot(&index, &documents)?;
+        let post_state = cancellation_post_state_sha256(checkpoint, None, None)?;
+        controller.disarm();
+        cx.set_cancel_requested(false);
+        let retry = cancellation_query(&index, cx, QUERY, LIMIT, candidate_boundary)
+            .await
+            .map_err(|error| GauntletError::InvalidObservation {
+                reason: format!("during-collection retry failed: {error}"),
+            })?;
+
+        controller.arm(
+            ConformanceCancellationStage::QueryCollection,
+            DURING_ORDINAL,
+        )?;
+        let replay_result = cancellation_query(&index, cx, QUERY, LIMIT, candidate_boundary).await;
+        let replay = cancelled_search_error(replay_result, "during-collection replay")?;
+        let replay_observed = controller.observed_checkpoints();
+        let snapshot_after_replay = capture_cancellation_snapshot(&index, &documents)?;
+        controller.disarm();
+        cx.set_cancel_requested(false);
+        if first != replay || first_observed != replay_observed {
+            return Err(GauntletError::InvalidObservation {
+                reason: format!(
+                    "{checkpoint:?} cancellation replay changed its typed error or checkpoint count"
+                ),
+            });
+        }
+        observations.push(make_cancellation_observation(
+            checkpoint,
+            DURING_ORDINAL,
+            first_observed,
+            first,
+            &snapshot_before,
+            &snapshot_after_cancel,
+            &snapshot_after_replay,
+            post_state.clone(),
+            post_state,
+            if candidate_boundary {
+                candidate_control_sha256.clone()
+            } else {
+                control_sha256.clone()
+            },
+            cancellation_result_sha256(&retry)?,
+            0,
+            false,
+        ));
+    }
+
+    for (checkpoint, trigger_ordinal) in [
+        (QuillCancellationCheckpoint::FusionHydrationBefore, 0),
+        (
+            QuillCancellationCheckpoint::FusionHydrationWithin,
+            DURING_ORDINAL,
+        ),
+    ] {
+        let snapshot_before = capture_cancellation_snapshot(&index, &documents)?;
+        let control_batch = LexicalRead::search_candidates(&index, cx, QUERY, LIMIT)
+            .await
+            .map_err(|error| GauntletError::InvalidObservation {
+                reason: format!("hydration control candidates failed: {error}"),
+            })?;
+        let (mut control_candidates, control_context) = control_batch.into_parts();
+        LexicalRead::hydrate_candidates(
+            &index,
+            cx,
+            control_context.as_ref(),
+            &mut control_candidates,
+        )
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("hydration control failed: {error}"),
+        })?;
+        let control_hydration_sha256 = cancellation_result_sha256(&control_candidates)?;
+        let first_batch = LexicalRead::search_candidates(&index, cx, QUERY, LIMIT)
+            .await
+            .map_err(|error| GauntletError::InvalidObservation {
+                reason: format!("first hydration candidates failed: {error}"),
+            })?;
+        let (mut first_candidates, first_context) = first_batch.into_parts();
+        let replay_batch = LexicalRead::search_candidates(&index, cx, QUERY, LIMIT)
+            .await
+            .map_err(|error| GauntletError::InvalidObservation {
+                reason: format!("replay hydration candidates failed: {error}"),
+            })?;
+        let (mut replay_candidates, replay_context) = replay_batch.into_parts();
+
+        if trigger_ordinal == 0 {
+            cx.set_cancel_requested(true);
+        } else {
+            controller.arm(
+                ConformanceCancellationStage::FusionHydration,
+                trigger_ordinal,
+            )?;
+        }
+        let first_error = LexicalRead::hydrate_candidates(
+            &index,
+            cx,
+            first_context.as_ref(),
+            &mut first_candidates,
+        )
+        .await
+        .err()
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: format!("{checkpoint:?} fabricated hydration success"),
+        })?;
+        let first = cancellation_error_fields(first_error)?;
+        let first_observed = if trigger_ordinal == 0 {
+            0
+        } else {
+            controller.observed_checkpoints()
+        };
+        let retained_prefix = first_candidates
+            .iter()
+            .take_while(|candidate| candidate.metadata.is_some())
+            .count();
+        let snapshot_after_cancel = capture_cancellation_snapshot(&index, &documents)?;
+        let post_state = cancellation_post_state_sha256(checkpoint, Some(&first_candidates), None)?;
+        controller.disarm();
+        cx.set_cancel_requested(false);
+        LexicalRead::hydrate_candidates(&index, cx, first_context.as_ref(), &mut first_candidates)
+            .await
+            .map_err(|error| GauntletError::InvalidObservation {
+                reason: format!("{checkpoint:?} hydration retry failed: {error}"),
+            })?;
+        let retry_sha256 = cancellation_result_sha256(&first_candidates)?;
+
+        if trigger_ordinal == 0 {
+            cx.set_cancel_requested(true);
+        } else {
+            controller.arm(
+                ConformanceCancellationStage::FusionHydration,
+                trigger_ordinal,
+            )?;
+        }
+        let replay_error = LexicalRead::hydrate_candidates(
+            &index,
+            cx,
+            replay_context.as_ref(),
+            &mut replay_candidates,
+        )
+        .await
+        .err()
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: format!("{checkpoint:?} replay fabricated hydration success"),
+        })?;
+        let replay = cancellation_error_fields(replay_error)?;
+        let replay_observed = if trigger_ordinal == 0 {
+            0
+        } else {
+            controller.observed_checkpoints()
+        };
+        let replay_post_state =
+            cancellation_post_state_sha256(checkpoint, Some(&replay_candidates), None)?;
+        let snapshot_after_replay = capture_cancellation_snapshot(&index, &documents)?;
+        controller.disarm();
+        cx.set_cancel_requested(false);
+        if first != replay
+            || first_observed != replay_observed
+            || retained_prefix
+                != replay_candidates
+                    .iter()
+                    .take_while(|candidate| candidate.metadata.is_some())
+                    .count()
+        {
+            return Err(GauntletError::InvalidObservation {
+                reason: format!("{checkpoint:?} hydration replay changed exact retained state"),
+            });
+        }
+        observations.push(make_cancellation_observation(
+            checkpoint,
+            trigger_ordinal,
+            first_observed,
+            first,
+            &snapshot_before,
+            &snapshot_after_cancel,
+            &snapshot_after_replay,
+            post_state,
+            replay_post_state,
+            control_hydration_sha256,
+            retry_sha256,
+            u64::try_from(retained_prefix).unwrap_or(u64::MAX),
+            false,
+        ));
+    }
+
+    let staged_document =
+        IndexableDocument::new("cancel-doc-pending", "alpha beta pending publication")
+            .with_metadata("ordinal", "pending");
+    let mut commit_documents = documents.clone();
+    commit_documents.push(staged_document.clone());
+    LexicalWrite::index_document(&index, cx, &staged_document)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("could not stage commit-cancellation document: {error}"),
+        })?;
+    let snapshot_before = capture_cancellation_snapshot(&index, &commit_documents)?;
+
+    let control_index = cancellation_fixture(cx, &commit_documents).await?;
+    let control_commit_results = LexicalRead::search(&control_index, cx, QUERY, LIMIT + 1)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("commit control search failed: {error}"),
+        })?;
+    let control_commit_sha256 = cancellation_result_sha256(&control_commit_results)?;
+
+    controller.arm(ConformanceCancellationStage::CommitPublication, 1)?;
+    let first_error = LexicalWrite::commit(&index, cx)
+        .await
+        .err()
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "commit-before-publication fabricated success".to_owned(),
+        })?;
+    let first = cancellation_error_fields(first_error)?;
+    let first_observed = controller.observed_checkpoints();
+    let pending_state_retained = index.has_uncommitted_changes();
+    let pending_writer_state = index.conformance_pending_writer_state()?;
+    let snapshot_after_cancel = capture_cancellation_snapshot(&index, &commit_documents)?;
+    if pending_writer_state.shard_count() == 0
+        || pending_writer_state.dirty_shard_count() != 0
+        || pending_writer_state.pending_identity_count() != 0
+        || pending_writer_state.uncommitted_id_count() != 1
+        || pending_writer_state.pending_segment_count() != 1
+        || pending_writer_state.pending_owned_segment_count() != 1
+        || pending_writer_state.staged_flush_present()
+        || !pending_writer_state.pending_manifest_present()
+        || pending_writer_state.pending_replacement_manifest_present()
+        || pending_writer_state.pending_delta_seal_present()
+        || !pending_writer_state.unpublished_since_present()
+        || pending_writer_state.ingest_retry_required()
+    {
+        return Err(GauntletError::InvalidObservation {
+            reason:
+                "commit-before-publication did not retain the exact expected scalar transaction"
+                    .to_owned(),
+        });
+    }
+    let post_state = cancellation_post_state_sha256(
+        QuillCancellationCheckpoint::CommitBeforePublication,
+        None,
+        Some(pending_writer_state.digest_sha256()),
+    )?;
+    controller.disarm();
+    cx.set_cancel_requested(false);
+
+    controller.arm(ConformanceCancellationStage::CommitPublication, 1)?;
+    let replay_error = LexicalWrite::commit(&index, cx)
+        .await
+        .err()
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "commit-before-publication replay fabricated success".to_owned(),
+        })?;
+    let replay = cancellation_error_fields(replay_error)?;
+    let replay_observed = controller.observed_checkpoints();
+    let replay_pending_state_retained = index.has_uncommitted_changes();
+    let replay_pending_writer_state = index.conformance_pending_writer_state()?;
+    let snapshot_after_replay = capture_cancellation_snapshot(&index, &commit_documents)?;
+    let replay_post_state = cancellation_post_state_sha256(
+        QuillCancellationCheckpoint::CommitBeforePublication,
+        None,
+        Some(replay_pending_writer_state.digest_sha256()),
+    )?;
+    controller.disarm();
+    cx.set_cancel_requested(false);
+    if first != replay
+        || first_observed != replay_observed
+        || !pending_state_retained
+        || !replay_pending_state_retained
+        || pending_writer_state != replay_pending_writer_state
+    {
+        return Err(GauntletError::InvalidObservation {
+            reason: "commit-before-publication replay changed its error or exact retained writer transaction"
+                .to_owned(),
+        });
+    }
+    LexicalWrite::commit(&index, cx)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("commit cancellation retry failed: {error}"),
+        })?;
+    let published_after_retry = index.search_snapshot();
+    if published_after_retry.snapshot_epoch() != snapshot_before.snapshot_epoch.saturating_add(1)
+        || published_after_retry.keeper_generation()
+            != snapshot_before.keeper_generation.saturating_add(1)
+        || index.has_uncommitted_changes()
+    {
+        return Err(GauntletError::InvalidObservation {
+            reason: "commit cancellation retry did not publish exactly one successor generation"
+                .to_owned(),
+        });
+    }
+    let retry_commit_results = LexicalRead::search(&index, cx, QUERY, LIMIT + 1)
+        .await
+        .map_err(|error| GauntletError::InvalidObservation {
+            reason: format!("commit cancellation retry search failed: {error}"),
+        })?;
+    observations.push(make_cancellation_observation(
+        QuillCancellationCheckpoint::CommitBeforePublication,
+        1,
+        first_observed,
+        first,
+        &snapshot_before,
+        &snapshot_after_cancel,
+        &snapshot_after_replay,
+        post_state,
+        replay_post_state,
+        control_commit_sha256,
+        cancellation_result_sha256(&retry_commit_results)?,
+        0,
+        true,
+    ));
+
+    QuillCancellationReceipt::seal(QuillCancellationReceiptBody {
+        schema_version: QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION.to_owned(),
+        origin: QuillCancellationEvidenceOrigin::LiveQuillPublicMethod,
+        engine_revision: format!("quill-engine-{CURRENT_ENGINE_VERSION}"),
+        corpus_sha256,
+        query_sha256,
+        observations,
+    })
 }
 
 /// Registered equivalence laws applied by the lexical comparator.
@@ -4774,6 +5789,262 @@ fn escape_json_pointer_token(value: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn assert_cancellation_receipt_tamper_rejected(
+        receipt: &QuillCancellationReceipt,
+        mutate: impl FnOnce(&mut QuillCancellationReceipt),
+    ) {
+        let mut tampered = receipt.clone();
+        mutate(&mut tampered);
+        assert!(
+            matches!(
+                tampered.validate(),
+                Err(GauntletError::InvalidObservation { .. })
+            ),
+            "content-addressed replay must reject a mutated cancellation receipt"
+        );
+    }
+
+    fn assert_cancellation_receipt_body_tamper_rejected(
+        receipt: &QuillCancellationReceipt,
+        mutate: impl FnOnce(&mut QuillCancellationReceiptBody),
+    ) {
+        let mut body = receipt.body.clone();
+        mutate(&mut body);
+        assert!(
+            matches!(
+                QuillCancellationReceipt::seal(body),
+                Err(GauntletError::InvalidObservation { .. })
+            ),
+            "freshly sealed cancellation evidence must reject a semantic invariant violation"
+        );
+    }
+
+    fn fail_after_arming_live_cancellation(
+        cx: &Cx,
+        controller: &Arc<ConformanceCancellationController>,
+    ) -> Result<(), GauntletError> {
+        let _caller_state_guard = LiveCancellationStateGuard::new(cx, Arc::clone(controller));
+        controller.arm(ConformanceCancellationStage::QueryCollection, 1)?;
+        cx.set_cancel_requested(true);
+        Err(GauntletError::InvalidObservation {
+            reason: "focused failure after live cancellation arm".to_owned(),
+        })
+    }
+
+    #[test]
+    fn live_cancellation_failure_restores_caller_cx_and_disarms_controller() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index =
+                QuillIndex::in_memory(QuillConfig::default()).expect("in-memory Quill index");
+            let controller = index.conformance_cancellation_controller();
+            assert!(!cx.is_cancel_requested());
+
+            assert!(matches!(
+                fail_after_arming_live_cancellation(&cx, &controller),
+                Err(GauntletError::InvalidObservation { .. })
+            ));
+            assert!(
+                !cx.is_cancel_requested(),
+                "failed receipt collection must restore the caller's cancellation bit"
+            );
+
+            controller
+                .arm(ConformanceCancellationStage::QueryCollection, 1)
+                .expect("failure guard must disarm the controller");
+            controller.disarm();
+        });
+    }
+
+    #[test]
+    fn live_cancellation_failure_preserves_preexisting_caller_cancellation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index =
+                QuillIndex::in_memory(QuillConfig::default()).expect("in-memory Quill index");
+            let controller = index.conformance_cancellation_controller();
+            cx.set_cancel_requested(true);
+
+            assert!(matches!(
+                fail_after_arming_live_cancellation(&cx, &controller),
+                Err(GauntletError::InvalidObservation { .. })
+            ));
+            assert!(
+                cx.is_cancel_requested(),
+                "failed receipt collection must preserve preexisting caller cancellation"
+            );
+
+            controller
+                .arm(ConformanceCancellationStage::QueryCollection, 1)
+                .expect("failure guard must disarm while preserving the caller bit");
+            controller.disarm();
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn live_quill_cancellation_receipt_covers_every_phase_and_round_trips() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let receipt = observe_live_quill_cancellation_receipt(&cx)
+                .await
+                .expect("observe the live Quill cancellation matrix");
+            receipt
+                .validate()
+                .expect("untampered live receipt validates");
+            assert_eq!(
+                receipt
+                    .body
+                    .observations
+                    .iter()
+                    .map(|observation| observation.checkpoint)
+                    .collect::<Vec<_>>(),
+                QuillCancellationCheckpoint::REQUIRED
+            );
+            assert!(receipt.body.observations.iter().all(|observation| {
+                observation.error_code == "cancelled"
+                    && observation.reason == "Quill observed request cancellation"
+                    && !observation.success_published
+                    && observation.replay_verified
+                    && observation.snapshot_before_sha256
+                        == observation.snapshot_after_cancel_sha256
+                    && observation.snapshot_before_sha256
+                        == observation.snapshot_after_replay_sha256
+                    && observation.snapshot_epoch_before == observation.snapshot_epoch_after_cancel
+                    && observation.snapshot_epoch_before == observation.snapshot_epoch_after_replay
+                    && observation.keeper_generation_before
+                        == observation.keeper_generation_after_cancel
+                    && observation.keeper_generation_before
+                        == observation.keeper_generation_after_replay
+                    && observation.snapshot_identity_preserved_after_cancel
+                    && observation.snapshot_identity_preserved_after_replay
+                    && observation.doc_count_before == observation.doc_count_after_cancel
+                    && observation.doc_count_before == observation.doc_count_after_replay
+                    && observation.control_result_sha256 == observation.retry_result_sha256
+            }));
+
+            let within_hydration = receipt
+                .body
+                .observations
+                .iter()
+                .find(|observation| {
+                    observation.checkpoint == QuillCancellationCheckpoint::FusionHydrationWithin
+                })
+                .expect("within-hydration checkpoint");
+            assert_eq!(within_hydration.trigger_ordinal, 2);
+            assert_eq!(within_hydration.observed_checkpoints, 2);
+            assert_eq!(within_hydration.retained_hydrated_prefix, 1);
+
+            let before_publication = receipt
+                .body
+                .observations
+                .iter()
+                .find(|observation| {
+                    observation.checkpoint == QuillCancellationCheckpoint::CommitBeforePublication
+                })
+                .expect("before-publication checkpoint");
+            assert!(before_publication.pending_state_retained);
+
+            let encoded = serde_json::to_vec(&receipt).expect("serialize cancellation receipt");
+            let replayed: QuillCancellationReceipt =
+                serde_json::from_slice(&encoded).expect("deserialize cancellation receipt");
+            assert_eq!(replayed, receipt);
+            replayed
+                .validate()
+                .expect("persisted cancellation receipt replays");
+        });
+    }
+
+    #[test]
+    fn quill_cancellation_receipt_rejects_phase_code_state_and_snapshot_tampering() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let receipt = observe_live_quill_cancellation_receipt(&cx)
+                .await
+                .expect("observe the live Quill cancellation matrix");
+
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[0].phase = "different phase".to_owned();
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[1].error_code = "fabricated_success".to_owned();
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[4].post_state_sha256 = "0".repeat(64);
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[4].replay_post_state_sha256 = "1".repeat(64);
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[2].snapshot_after_cancel_sha256 = "2".repeat(64);
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[3].doc_count_after_replay += 1;
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[5].pending_state_retained = false;
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations[4].retained_hydrated_prefix = 0;
+            });
+            assert_cancellation_receipt_tamper_rejected(&receipt, |tampered| {
+                tampered.body.observations.swap(1, 2);
+            });
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.observations[1].snapshot_identity_preserved_after_cancel = false;
+            });
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.observations[2].snapshot_identity_preserved_after_replay = false;
+            });
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.observations[3].snapshot_epoch_after_cancel = body.observations[3]
+                    .snapshot_epoch_after_cancel
+                    .saturating_add(1);
+            });
+            assert_cancellation_receipt_body_tamper_rejected(&receipt, |body| {
+                body.observations[4].keeper_generation_after_replay = body.observations[4]
+                    .keeper_generation_after_replay
+                    .saturating_add(1);
+            });
+        });
+    }
+
+    #[test]
+    fn quill_cancellation_receipt_rejects_spy_synthetic_and_unknown_field_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let receipt = observe_live_quill_cancellation_receipt(&cx)
+                .await
+                .expect("observe the live Quill cancellation matrix");
+
+            for origin in [
+                QuillCancellationEvidenceOrigin::SpyOnly,
+                QuillCancellationEvidenceOrigin::Synthetic,
+            ] {
+                let mut body = receipt.body.clone();
+                body.origin = origin;
+                assert!(
+                    matches!(
+                        QuillCancellationReceipt::seal(body),
+                        Err(GauntletError::InvalidObservation { .. })
+                    ),
+                    "non-live cancellation provenance must fail even when freshly sealed"
+                );
+            }
+
+            let mut unknown_top_level =
+                serde_json::to_value(&receipt).expect("serialize cancellation receipt");
+            unknown_top_level
+                .as_object_mut()
+                .expect("receipt object")
+                .insert("unexpected".to_owned(), serde_json::json!(true));
+            assert!(serde_json::from_value::<QuillCancellationReceipt>(unknown_top_level).is_err());
+
+            let mut unknown_observation =
+                serde_json::to_value(&receipt).expect("serialize cancellation receipt");
+            unknown_observation["body"]["observations"][0]["query_source_text"] =
+                serde_json::json!("must never be admitted");
+            assert!(
+                serde_json::from_value::<QuillCancellationReceipt>(unknown_observation).is_err()
+            );
+        });
+    }
 
     fn quill_hit(doc_id: &str, score: f32, native_doc_id: u32) -> RankedHit {
         RankedHit {
