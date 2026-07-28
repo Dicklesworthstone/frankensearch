@@ -7316,3 +7316,25 @@ indexing hot path, do not resample this Zen3/source pair. Retry only with one
 exact current-main ELF on a quiet 16-core Genoa worker; both candidate and
 rerun must independently pass every null law and remain within paired-log
 reproduction delta `0.0198026273`.
+
+## 2026-07-28 — QG-3 INVALID-NULL: every cell fails the VPS noise floor (`bd-h6eh`, FoggySquirrel)
+
+A complete 80-pair full-scale run on 8-vCPU EPYC worker `vmi1156319` used
+revision `96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd`, exact ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`,
+and same-invocation Tantivy 0.26.1 A/A plus Quill/Tantivy A/B arms.
+
+All five required nulls were invalid. Their log-MAD values ranged from
+`0.124731` to `0.212927` against a `0.048790` limit, with additional order and
+drift failures. The apparent in-process `3.117017 [2.991030, 3.256942]` and
+fresh-process `2.460239 [2.366650, 2.593945]` update-to-searchable ratios are
+not gate numbers. Seal
+`699a2d21ec4e5e6d21511e36c6e53c5b633d5199f0c2315388d62ddaab5e674b`
+is retained under the QG-3 2026-07-28 attempt tree.
+
+After three VPS/noise failures, switch veins. Retry only on a quiet physical
+16-thread Zen3 worker with current exact ELF
+`d7396f0c236cb6da7cb4bed4f461928de1cbc5b55f6a756f6f10433f11947182`,
+persistent scratch with at least 120 GiB free, and 10 pairs per cell. Require
+all five A/A controls and an immediate same-ELF reproduction to admit before
+evaluating the 4x target; never weaken the log-MAD law or gate on CV.

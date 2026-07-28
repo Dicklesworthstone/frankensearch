@@ -16699,3 +16699,32 @@ immediate reproduction. Admit each run independently under all A/A center,
 CI-width, log-MAD, order-effect, and drift laws, then require paired-log
 reproduction delta at most `0.0198026273`. Do not resample this Zen3/source
 pair or weaken the identity requirement.
+
+### 2026-07-28 — QG-3 complete 80-pair VPS attempt fails all five null controls (`bd-h6eh`, FoggySquirrel)
+
+A complete full-scale run on 8-vCPU EPYC worker `vmi1156319` used revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd`, exact executing ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`,
+80 paired blocks per cell, persistent-on-root scratch, and the actual Tantivy
+0.26.1 incumbent plus Tantivy/Tantivy A/A in the same invocation.
+
+All five required cells failed the predeclared null laws. Null log-MAD ranged
+from `0.124731` to `0.212927`, above the `0.048790` maximum; four cells also
+failed the order-effect law, and two failed drift. The apparent in-process and
+fresh-process Quill/Tantivy update-to-searchable ratios were respectively
+`3.117017 [2.991030, 3.256942]` and
+`2.460239 [2.366650, 2.593945]`. They are provenance-only and are not QG-3
+numbers.
+
+**Decision: INVALID-NULL / NO CLAIM.** The complete artifact is retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-r5-80-20260728T0939Z/`
+with seal `699a2d21ec4e5e6d21511e36c6e53c5b633d5199f0c2315388d62ddaab5e674b`.
+
+**Retry predicate:** three VPS/noise routes have now failed, so switch veins
+to a quiet physical 16-thread Zen3 worker. Use exact current-main ELF
+`d7396f0c236cb6da7cb4bed4f461928de1cbc5b55f6a756f6f10433f11947182`,
+place `QUILL_PERF_SCRATCH_DIR` on a persistent filesystem with at least
+120 GiB free, and start with the minimum 10 pairs per cell rather than another
+80-pair VPS run. A candidate and immediate same-ELF reproduction must each
+admit all five A/A controls before any target comparison; do not relax the
+log-MAD or substitute CV.
