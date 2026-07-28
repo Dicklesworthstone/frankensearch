@@ -18,7 +18,10 @@ default = []
 # Quill's dependency graph even when durability is enabled.
 durability = ["dep:frankensearch-durability"]
 # Same-binary A/B helpers are available only to explicit benchmark builds.
-bench-internals = ["frankensearch-core/bench-internals"]
+bench-internals = ["frankensearch-core/bench-internals", "dep:sha2"]
+# Deterministic fault-injection seams used only by method-bound conformance
+# witnesses. Shipping consumers never enable this feature.
+conformance-internals = ["dep:sha2"]
 # Tantivy differential tests are valuable oracle coverage, but they must remain
 # opt-in: a crate-wide dev-dependency made every Quill test and bench compile
 # the full lexical/Tantivy graph and repeatedly missed the admission window.
@@ -47,6 +50,7 @@ serde = { workspace = true }
 # Stored metadata stays opaque until result materialization. Durable formats
 # never use serde or serde_json.
 serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }
@@ -55,11 +59,6 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 # Deterministic LabRuntime helpers remain test-only.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
-# Dev-only: A/B benches self-report the SHA-256 of their own ELF so a published
-# ratio is bound to the binary that produced it (fleet bench-harness contract
-# part 1). rch builds into an opaque per-worker pool target dir, so a hash taken
-# outside the process proves nothing about which binary ran.
-sha2 = { workspace = true }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }
 

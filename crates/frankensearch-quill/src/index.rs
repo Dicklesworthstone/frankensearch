@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "conformance-internals")]
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +25,8 @@ use frankensearch_core::{
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
 use rayon::prelude::*;
+#[cfg(feature = "conformance-internals")]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -1138,15 +1142,256 @@ struct QueryFuelState {
     position_docs: AtomicU64,
 }
 
+/// Deterministic request-cancellation checkpoints exposed only to the
+/// conformance harness.
+///
+/// Synchronous Quill collection cannot be preempted from an external test
+/// task at a reproducible work unit. The conformance controller therefore
+/// requests cancellation on the real [`Cx`] from an exact engine checkpoint;
+/// the public method must still observe that request through its normal
+/// cancellation poll and return its own typed outcome.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConformanceCancellationStage {
+    /// One admitted collection work unit.
+    QueryCollection = 1,
+    /// One deferred-metadata candidate before materialization.
+    FusionHydration = 2,
+    /// The retained commit transaction immediately before publication.
+    CommitPublication = 3,
+}
+
+/// Fixed-size conformance receipt for the complete retained scalar writer
+/// transaction.
+///
+/// The digest binds canonical pending segment bytes and identities, staged
+/// flush state, retained MANIFEST proposals, dirty shard document witnesses,
+/// allocator leases, and all publication-relevant flags. Summary counters stay
+/// explicit so a receipt cannot hide a missing state class behind an opaque
+/// digest. This type and the hashing work do not exist in shipping builds.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformancePendingWriterState {
+    digest_sha256: [u8; 32],
+    shard_count: u64,
+    dirty_shard_count: u64,
+    pending_identity_count: u64,
+    uncommitted_id_count: u64,
+    pending_segment_count: u64,
+    pending_owned_segment_count: u64,
+    flags: u8,
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformancePendingWriterState {
+    const STAGED_FLUSH_PRESENT: u8 = 1 << 0;
+    const PENDING_MANIFEST_PRESENT: u8 = 1 << 1;
+    const PENDING_REPLACEMENT_MANIFEST_PRESENT: u8 = 1 << 2;
+    const PENDING_DELTA_SEAL_PRESENT: u8 = 1 << 3;
+    const UNPUBLISHED_SINCE_PRESENT: u8 = 1 << 4;
+    const INGEST_RETRY_REQUIRED: u8 = 1 << 5;
+
+    const fn has_flag(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// SHA-256 over the canonical complete pending writer transaction.
+    #[must_use]
+    pub const fn digest_sha256(self) -> [u8; 32] {
+        self.digest_sha256
+    }
+
+    /// Number of configured scalar writer shards represented by the digest.
+    #[must_use]
+    pub const fn shard_count(self) -> u64 {
+        self.shard_count
+    }
+
+    /// Number of shards retaining documents, identities, or an active lease.
+    #[must_use]
+    pub const fn dirty_shard_count(self) -> u64 {
+        self.dirty_shard_count
+    }
+
+    /// Canonical document identity rows still resident in dirty shards.
+    #[must_use]
+    pub const fn pending_identity_count(self) -> u64 {
+        self.pending_identity_count
+    }
+
+    /// Stable document IDs reserved by all unpublished scalar state.
+    #[must_use]
+    pub const fn uncommitted_id_count(self) -> u64 {
+        self.uncommitted_id_count
+    }
+
+    /// Installed but unpublished MANIFEST segment rows.
+    #[must_use]
+    pub const fn pending_segment_count(self) -> u64 {
+        self.pending_segment_count
+    }
+
+    /// Canonical in-memory FSLX buffers retained for pending segments.
+    #[must_use]
+    pub const fn pending_owned_segment_count(self) -> u64 {
+        self.pending_owned_segment_count
+    }
+
+    /// Whether a flush transaction has been encoded but not fully installed.
+    #[must_use]
+    pub const fn staged_flush_present(self) -> bool {
+        self.has_flag(Self::STAGED_FLUSH_PRESENT)
+    }
+
+    /// Whether the exact next ordinary MANIFEST proposal is retained.
+    #[must_use]
+    pub const fn pending_manifest_present(self) -> bool {
+        self.has_flag(Self::PENDING_MANIFEST_PRESENT)
+    }
+
+    /// Whether a complete replacement MANIFEST proposal is retained.
+    #[must_use]
+    pub const fn pending_replacement_manifest_present(self) -> bool {
+        self.has_flag(Self::PENDING_REPLACEMENT_MANIFEST_PRESENT)
+    }
+
+    /// Whether a Delta-seal publication transaction is retained.
+    #[must_use]
+    pub const fn pending_delta_seal_present(self) -> bool {
+        self.has_flag(Self::PENDING_DELTA_SEAL_PRESENT)
+    }
+
+    /// Whether the writer is tracking an unpublished visibility interval.
+    #[must_use]
+    pub const fn unpublished_since_present(self) -> bool {
+        self.has_flag(Self::UNPUBLISHED_SINCE_PRESENT)
+    }
+
+    /// Whether scalar ingest requires reconciliation before more mutation.
+    #[must_use]
+    pub const fn ingest_retry_required(self) -> bool {
+        self.has_flag(Self::INGEST_RETRY_REQUIRED)
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformanceCancellationStage {
+    const fn code(self) -> u8 {
+        match self {
+            Self::QueryCollection => 1,
+            Self::FusionHydration => 2,
+            Self::CommitPublication => 3,
+        }
+    }
+}
+
+/// Per-index deterministic cancellation requester for live conformance tests.
+///
+/// This type, its atomics, and every call site are absent unless the dedicated
+/// `conformance-internals` feature is enabled. It cannot fabricate a return
+/// value: firing only marks the real request [`Cx`] as cancelled.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Default)]
+pub struct ConformanceCancellationController {
+    stage: AtomicU8,
+    trigger_ordinal: AtomicU64,
+    observed_checkpoints: AtomicU64,
+    fired: AtomicBool,
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformanceCancellationController {
+    const DISARMED: u8 = 0;
+    const ARMING: u8 = u8::MAX;
+
+    /// Arm one exact nonzero checkpoint ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state error for ordinal zero or when a prior stage
+    /// remains armed.
+    pub fn arm(
+        &self,
+        stage: ConformanceCancellationStage,
+        trigger_ordinal: u64,
+    ) -> Result<(), QuillIndexError> {
+        if trigger_ordinal == 0 {
+            return Err(invalid_state(
+                "conformance cancellation trigger ordinal must be nonzero",
+            ));
+        }
+        self.stage
+            .compare_exchange(
+                Self::DISARMED,
+                Self::ARMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| invalid_state("conformance cancellation controller is already armed"))?;
+        self.trigger_ordinal
+            .store(trigger_ordinal, Ordering::Relaxed);
+        self.observed_checkpoints.store(0, Ordering::Relaxed);
+        self.fired.store(false, Ordering::Relaxed);
+        self.stage.store(stage.code(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Stop injecting checkpoints without changing request cancellation.
+    ///
+    /// The caller must clear the real [`Cx`] explicitly. Keeping those actions
+    /// separate proves the request context remains the cancellation authority.
+    pub fn disarm(&self) {
+        self.stage.store(Self::DISARMED, Ordering::Release);
+    }
+
+    /// Number of matching stage checkpoints observed by the current arm.
+    #[must_use]
+    pub fn observed_checkpoints(&self) -> u64 {
+        self.observed_checkpoints.load(Ordering::Acquire)
+    }
+
+    /// Whether the current arm requested cancellation on its real [`Cx`].
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
+        if self.stage.load(Ordering::Acquire) != stage.code() {
+            return;
+        }
+        let ordinal = self
+            .observed_checkpoints
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
+            return;
+        }
+        self.fired.store(true, Ordering::Release);
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            event = "quill.conformance.cancellation_checkpoint",
+            ?stage,
+            ordinal,
+            "deterministic conformance checkpoint requested cancellation on the real Cx"
+        );
+        cx.set_cancel_requested(true);
+    }
+}
+
 struct QueryCheckpoint<'a> {
     cx: &'a Cx,
     phase: &'static str,
     budget: u64,
     metering: bool,
     state: QueryFuelState,
+    #[cfg(feature = "conformance-internals")]
+    conformance_controller: Arc<ConformanceCancellationController>,
 }
 
 impl<'a> QueryCheckpoint<'a> {
+    #[cfg(any(not(feature = "conformance-internals"), test))]
     fn new(cx: &'a Cx, phase: &'static str, budget: u64, upper_bound: u64) -> Arc<Self> {
         Arc::new(Self {
             cx,
@@ -1154,6 +1399,26 @@ impl<'a> QueryCheckpoint<'a> {
             budget,
             metering: upper_bound > budget,
             state: QueryFuelState::default(),
+            #[cfg(feature = "conformance-internals")]
+            conformance_controller: Arc::default(),
+        })
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn new_with_controller(
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        conformance_controller: Arc<ConformanceCancellationController>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cx,
+            phase,
+            budget,
+            metering: upper_bound > budget,
+            state: QueryFuelState::default(),
+            conformance_controller,
         })
     }
 
@@ -1191,6 +1456,9 @@ impl<'a> QueryCheckpoint<'a> {
 
 impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if self.cx.is_cancel_requested() {
             return Err(ArgusError::QueryCancelled { phase: self.phase });
         }
@@ -1327,6 +1595,8 @@ struct QuillReader {
     schema: SchemaDescriptor,
     parser: Option<DefaultQueryParser>,
     published_snapshot: Arc<SnapshotPublisher>,
+    #[cfg(feature = "conformance-internals")]
+    conformance_controller: Arc<ConformanceCancellationController>,
 }
 
 /// Shared Quill index handle with lock-free readers and one cancel-aware writer.
@@ -1725,6 +1995,8 @@ impl QuillWriterState {
                 schema,
                 parser,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
             backend,
             shards,
@@ -2004,6 +2276,200 @@ impl QuillWriterState {
             || self.pending_manifest.is_some()
             || self.pending_replacement_manifest.is_some()
             || self.pending_delta_seal.is_some()
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn conformance_pending_writer_state(
+        &self,
+    ) -> Result<ConformancePendingWriterState, QuillIndexError> {
+        let shard_count = conformance_usize_to_u64(self.shards.len(), "writer shard count")?;
+        let dirty_shard_count = conformance_usize_to_u64(
+            self.shards
+                .iter()
+                .filter(|shard| {
+                    shard.accumulator.document_count() != 0
+                        || !shard.identities.is_empty()
+                        || shard.current_lease_base.is_some()
+                })
+                .count(),
+            "dirty writer shard count",
+        )?;
+        let pending_identity_count = self.shards.iter().try_fold(0_u64, |total, shard| {
+            total
+                .checked_add(conformance_usize_to_u64(
+                    shard.identities.len(),
+                    "pending identity count",
+                )?)
+                .ok_or_else(|| invalid_state("pending identity count overflow"))
+        })?;
+        let uncommitted_id_count =
+            conformance_usize_to_u64(self.uncommitted_ids.len(), "uncommitted id count")?;
+        let pending_segment_count =
+            conformance_usize_to_u64(self.pending_segments.len(), "pending segment count")?;
+        let pending_owned_segment_count = conformance_usize_to_u64(
+            self.pending_owned_segments.len(),
+            "pending owned segment count",
+        )?;
+        let staged_flush_present = self.staged_flush.is_some();
+        let pending_manifest_present = self.pending_manifest.is_some();
+        let pending_replacement_manifest_present = self.pending_replacement_manifest.is_some();
+        let pending_delta_seal_present = self.pending_delta_seal.is_some();
+        let unpublished_since_present = self.unpublished_since.is_some();
+        let mut flags = 0_u8;
+        if staged_flush_present {
+            flags |= ConformancePendingWriterState::STAGED_FLUSH_PRESENT;
+        }
+        if pending_manifest_present {
+            flags |= ConformancePendingWriterState::PENDING_MANIFEST_PRESENT;
+        }
+        if pending_replacement_manifest_present {
+            flags |= ConformancePendingWriterState::PENDING_REPLACEMENT_MANIFEST_PRESENT;
+        }
+        if pending_delta_seal_present {
+            flags |= ConformancePendingWriterState::PENDING_DELTA_SEAL_PRESENT;
+        }
+        if unpublished_since_present {
+            flags |= ConformancePendingWriterState::UNPUBLISHED_SINCE_PRESENT;
+        }
+        if self.ingest_retry_required {
+            flags |= ConformancePendingWriterState::INGEST_RETRY_REQUIRED;
+        }
+
+        let published = self.published_snapshot.load();
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch/quill/pending-writer-state/v2\0");
+        conformance_hash_bytes(&mut hasher, &self.schema.canonical_encoding()?);
+        conformance_hash_bytes(
+            &mut hasher,
+            &conformance_manifest_bytes(
+                &published.keeper_snapshot().loaded_manifest().manifest,
+                "published composite MANIFEST",
+            )?,
+        );
+        hasher.update(published.snapshot_epoch().to_be_bytes());
+        hasher.update(published.keeper_generation().to_be_bytes());
+        hasher.update(published.bm25_doc_count().to_be_bytes());
+        hasher.update(published.live_doc_count().to_be_bytes());
+        hasher.update(
+            conformance_usize_to_u64(published.delta_count(), "published Delta count")?
+                .to_be_bytes(),
+        );
+        for delta in published.delta_snapshots() {
+            conformance_hash_bytes(&mut hasher, &delta.conformance_content_sha256()?);
+        }
+        conformance_hash_bytes(
+            &mut hasher,
+            &conformance_manifest_bytes(
+                &self.backend.snapshot().loaded_manifest().manifest,
+                "writer backend MANIFEST",
+            )?,
+        );
+        hasher.update([u8::from(matches!(&self.backend, IndexBackend::Durable(_)))]);
+        hasher.update(self.next_lease_base.to_be_bytes());
+        hasher.update(self.next_seal_seq.to_be_bytes());
+        hasher.update(self.docid_allocator.watermark().to_be_bytes());
+        hasher.update(shard_count.to_be_bytes());
+        hasher.update(dirty_shard_count.to_be_bytes());
+        hasher.update(pending_identity_count.to_be_bytes());
+        hasher.update(uncommitted_id_count.to_be_bytes());
+        hasher.update(pending_segment_count.to_be_bytes());
+        hasher.update(pending_owned_segment_count.to_be_bytes());
+        hasher.update([flags]);
+
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            hasher
+                .update(conformance_usize_to_u64(shard_index, "writer shard index")?.to_be_bytes());
+            hasher.update(
+                conformance_usize_to_u64(
+                    shard.accumulator.document_count(),
+                    "shard document count",
+                )?
+                .to_be_bytes(),
+            );
+            hasher.update(
+                conformance_usize_to_u64(shard.accumulator.token_count(), "shard token count")?
+                    .to_be_bytes(),
+            );
+            hasher.update(
+                conformance_usize_to_u64(shard.accumulator.bytes_used(), "shard bytes used")?
+                    .to_be_bytes(),
+            );
+            conformance_hash_optional_u64(&mut hasher, shard.current_lease_base);
+            conformance_hash_optional_lease(
+                &mut hasher,
+                self.docid_allocator.live_lease(shard_index),
+            );
+            hasher.update(
+                conformance_usize_to_u64(
+                    shard.accumulator.document_ords().len(),
+                    "shard document ordinal count",
+                )?
+                .to_be_bytes(),
+            );
+            for document_ord in shard.accumulator.document_ords() {
+                hasher.update(document_ord.to_be_bytes());
+            }
+            hasher.update(
+                conformance_usize_to_u64(shard.identities.len(), "shard identity count")?
+                    .to_be_bytes(),
+            );
+            for identity in &shard.identities {
+                hasher.update(identity.doc_ord.to_be_bytes());
+                conformance_hash_bytes(&mut hasher, identity.document_id.as_bytes());
+                conformance_hash_bytes(&mut hasher, &identity.canonical_content);
+            }
+        }
+
+        hasher.update(uncommitted_id_count.to_be_bytes());
+        for document_id in &self.uncommitted_ids {
+            conformance_hash_bytes(&mut hasher, document_id.as_bytes());
+        }
+
+        match &self.staged_flush {
+            None => hasher.update([0]),
+            Some(staged) => {
+                hasher.update([1]);
+                hasher.update(
+                    conformance_usize_to_u64(staged.shard, "staged flush shard")?.to_be_bytes(),
+                );
+                conformance_hash_bytes(&mut hasher, staged.encoded.as_bytes());
+                conformance_hash_manifest_segment(&mut hasher, &staged.manifest_segment);
+                conformance_hash_field_stats(&mut hasher, &staged.pending_field_stats)?;
+                hasher.update(staged.next_seal_seq.to_be_bytes());
+            }
+        }
+
+        hasher.update(pending_segment_count.to_be_bytes());
+        for segment in &self.pending_segments {
+            conformance_hash_manifest_segment(&mut hasher, segment);
+        }
+        hasher.update(pending_owned_segment_count.to_be_bytes());
+        for segment in &self.pending_owned_segments {
+            conformance_hash_bytes(&mut hasher, segment.as_bytes());
+        }
+        conformance_hash_field_stats(&mut hasher, &self.pending_field_stats)?;
+        conformance_hash_optional_manifest(
+            &mut hasher,
+            self.pending_manifest.as_ref(),
+            "pending MANIFEST",
+        )?;
+        conformance_hash_optional_manifest(
+            &mut hasher,
+            self.pending_replacement_manifest.as_ref(),
+            "pending replacement MANIFEST",
+        )?;
+        conformance_hash_optional_delta_seal(&mut hasher, self.pending_delta_seal.as_ref())?;
+
+        Ok(ConformancePendingWriterState {
+            digest_sha256: hasher.finalize().into(),
+            shard_count,
+            dirty_shard_count,
+            pending_identity_count,
+            uncommitted_id_count,
+            pending_segment_count,
+            pending_owned_segment_count,
+            flags,
+        })
     }
 
     fn has_active_deltas(&self) -> bool {
@@ -2296,6 +2762,10 @@ impl QuillWriterState {
         let _commit_timer = crate::tracing_conventions::StageTimer::new(&commit_span);
         let instrumented = commit_span.clone();
         async {
+            #[cfg(feature = "conformance-internals")]
+            self.reader
+                .conformance_controller
+                .checkpoint(ConformanceCancellationStage::CommitPublication, cx);
             check_cancel(cx, "commit publish")?;
             let open_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -3079,6 +3549,36 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    #[cfg(not(feature = "conformance-internals"))]
+    #[inline]
+    fn query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new(cx, phase, budget, upper_bound)
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[inline]
+    fn query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new_with_controller(
+            cx,
+            phase,
+            budget,
+            upper_bound,
+            Arc::clone(&self.conformance_controller),
+        )
+    }
+
     fn default_parser(&self) -> Result<&DefaultQueryParser, QuillIndexError> {
         self.parser.as_ref().ok_or_else(|| {
             invalid_state("string query APIs are unavailable for this preparsed-only index")
@@ -3406,7 +3906,7 @@ impl QuillReader {
         let mut collector = TopDocsCollector::new(limit, 0)?;
         let work_upper_bound =
             query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
             self.config.query_fuel_budget,
@@ -3445,7 +3945,7 @@ impl QuillReader {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
             self.config.query_fuel_budget,
@@ -3784,7 +4284,7 @@ impl QuillReader {
         let mut collector = DocSetCollector::new();
         let work_upper_bound =
             query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
             self.config.query_fuel_budget,
@@ -3812,7 +4312,7 @@ impl QuillReader {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
             self.config.query_fuel_budget,
@@ -3985,6 +4485,8 @@ impl PreparsedQuillIndex {
                 schema,
                 parser: None,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
         })
     }
@@ -4042,6 +4544,8 @@ impl QuillSearchIndex {
                 config,
                 schema: DEFAULT_SCHEMA,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
             directory,
         })
@@ -4252,7 +4756,7 @@ impl QuillIndex {
     ) -> Result<(), QuillIndexError> {
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.reader.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.reader.query_checkpoint(
             cx,
             "search",
             self.reader.config.query_fuel_budget,
@@ -4387,6 +4891,34 @@ impl QuillIndex {
     #[must_use]
     pub fn search_snapshot(&self) -> Arc<QuillSearchSnapshot> {
         self.reader.published_snapshot.load()
+    }
+
+    /// Clone the deterministic real-`Cx` cancellation requester used by the
+    /// method-bound conformance harness.
+    ///
+    /// This API and its per-index state do not exist in normal builds.
+    #[cfg(feature = "conformance-internals")]
+    #[must_use]
+    pub fn conformance_cancellation_controller(&self) -> Arc<ConformanceCancellationController> {
+        Arc::clone(&self.reader.conformance_controller)
+    }
+
+    /// Capture a fixed-size digest receipt for the complete retained scalar
+    /// writer transaction.
+    ///
+    /// This conformance-only surface hashes actual canonical pending FSLX
+    /// bytes and identity rows rather than reporting only a dirty boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the writer is busy or any retained MANIFEST
+    /// proposal cannot be canonically encoded.
+    #[cfg(feature = "conformance-internals")]
+    pub fn conformance_pending_writer_state(
+        &self,
+    ) -> Result<ConformancePendingWriterState, QuillIndexError> {
+        let writer = self.writer.try_lock().map_err(map_try_lock_error)?;
+        writer.conformance_pending_writer_state()
     }
 
     /// Resolve one published document through IDHASH and return its IDMAP hash.
@@ -4902,6 +5434,14 @@ impl LexicalSearch for QuillIndex {
 /// Backend tag carried by Quill hydration contexts (bd-8nqz.1).
 pub const QUILL_LEXICAL_BACKEND: &str = "quill";
 
+/// Feature-only snapshot pin that carries the deterministic hydration
+/// checkpoint alongside the immutable scoring generation.
+#[cfg(feature = "conformance-internals")]
+struct ConformanceHydrationPin {
+    snapshot: Arc<QuillSearchSnapshot>,
+    controller: Arc<ConformanceCancellationController>,
+}
+
 /// Shared generation-pinned candidate search for Quill readers (bd-8nqz.1).
 fn quill_search_candidates<'a>(
     reader: &'a QuillReader,
@@ -4913,10 +5453,17 @@ fn quill_search_candidates<'a>(
         let (results, snapshot) = reader
             .scored_results_pinned(cx, query, limit, false)
             .map_err(SearchError::from)?;
-        Ok(LexicalCandidateBatch::deferred(
-            results,
-            LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot)),
-        ))
+        #[cfg(not(feature = "conformance-internals"))]
+        let context = LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot));
+        #[cfg(feature = "conformance-internals")]
+        let context = LexicalHydrationContext::new(
+            QUILL_LEXICAL_BACKEND,
+            Box::new(ConformanceHydrationPin {
+                snapshot,
+                controller: Arc::clone(&reader.conformance_controller),
+            }),
+        );
+        Ok(LexicalCandidateBatch::deferred(results, context))
     })
 }
 
@@ -4938,6 +5485,7 @@ fn quill_hydrate_candidates<'a>(
                     .into(),
             });
         };
+        #[cfg(not(feature = "conformance-internals"))]
         let Some(snapshot) = context.downcast_ref::<Arc<QuillSearchSnapshot>>() else {
             return Err(SearchError::SubsystemError {
                 subsystem: "quill.hydration",
@@ -4949,10 +5497,29 @@ fn quill_hydrate_candidates<'a>(
                 .into(),
             });
         };
+        #[cfg(feature = "conformance-internals")]
+        let Some(conformance_pin) = context.downcast_ref::<ConformanceHydrationPin>() else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: format!(
+                    "hydration context from backend {:?} is not a Quill snapshot pin; \
+                     refusing cross-engine hydration",
+                    context.backend()
+                )
+                .into(),
+            });
+        };
+        #[cfg(feature = "conformance-internals")]
+        let snapshot = &conformance_pin.snapshot;
         for result in results
             .iter_mut()
             .filter(|result| result.lexical_score.is_some())
         {
+            #[cfg(feature = "conformance-internals")]
+            conformance_pin
+                .controller
+                .checkpoint(ConformanceCancellationStage::FusionHydration, cx);
+            check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
             let Some(global_docid) = snapshot
                 .resolve_document_id(result.doc_id.as_str())
                 .map_err(SearchError::from)?
@@ -5314,6 +5881,156 @@ pub fn indexable_document_content_hash(
 ) -> Result<u64, QuillIndexError> {
     let metadata = canonical_metadata(&document.metadata)?;
     Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_usize_to_u64(value: usize, label: &'static str) -> Result<u64, QuillIndexError> {
+    u64::try_from(value).map_err(|_| invalid_state(format!("{label} does not fit u64")))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        None => hasher.update([0]),
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_lease(hasher: &mut Sha256, lease: Option<(u64, u32)>) {
+    match lease {
+        None => hasher.update([0]),
+        Some((base, used)) => {
+            hasher.update([1]);
+            hasher.update(base.to_be_bytes());
+            hasher.update(used.to_be_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_manifest_bytes(
+    manifest: &Manifest,
+    label: &'static str,
+) -> Result<Vec<u8>, QuillIndexError> {
+    manifest
+        .to_bytes()
+        .map_err(|error| invalid_state(format!("could not encode {label} receipt: {error}")))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_manifest_segment(hasher: &mut Sha256, segment: &ManifestSegment) {
+    hasher.update(segment.segment_id.to_be_bytes());
+    hasher.update(segment.seal_seq.to_be_bytes());
+    hasher.update(segment.file_len.to_be_bytes());
+    hasher.update(segment.file_xxh3.to_be_bytes());
+    hasher.update(segment.docid_lo.to_be_bytes());
+    hasher.update(segment.docid_hi.to_be_bytes());
+    hasher.update(segment.doc_count.to_be_bytes());
+    conformance_hash_bytes(hasher, segment.tombstones.as_bytes());
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_field_stats(
+    hasher: &mut Sha256,
+    field_stats: &BTreeMap<u16, (u64, u32)>,
+) -> Result<(), QuillIndexError> {
+    hasher.update(
+        conformance_usize_to_u64(field_stats.len(), "pending field-stat count")?.to_be_bytes(),
+    );
+    for (&field_ord, &(total_tokens, document_count)) in field_stats {
+        hasher.update(field_ord.to_be_bytes());
+        hasher.update(total_tokens.to_be_bytes());
+        hasher.update(document_count.to_be_bytes());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_manifest(
+    hasher: &mut Sha256,
+    manifest: Option<&Manifest>,
+    label: &'static str,
+) -> Result<(), QuillIndexError> {
+    match manifest {
+        None => hasher.update([0]),
+        Some(manifest) => {
+            hasher.update([1]);
+            conformance_hash_bytes(hasher, &conformance_manifest_bytes(manifest, label)?);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_delta_seal(
+    hasher: &mut Sha256,
+    pending: Option<&PendingDeltaSeal>,
+) -> Result<(), QuillIndexError> {
+    let Some(pending) = pending else {
+        hasher.update([0]);
+        return Ok(());
+    };
+    hasher.update([1]);
+    match &pending.encoded {
+        None => hasher.update([0]),
+        Some(encoded) => {
+            hasher.update([1]);
+            conformance_hash_bytes(hasher, encoded.as_bytes());
+        }
+    }
+    hasher.update([u8::from(pending.segment_installed)]);
+    conformance_hash_bytes(
+        hasher,
+        &conformance_manifest_bytes(&pending.manifest, "pending Delta MANIFEST")?,
+    );
+    hasher.update(pending.next_seal_seq.to_be_bytes());
+    hasher.update(pending.successor_watermark.to_be_bytes());
+
+    let prepared = &pending.prepared;
+    hasher.update(prepared.snapshot_epoch.to_be_bytes());
+    hasher.update(prepared.expected_keeper_generation.to_be_bytes());
+    hasher.update(prepared.expected_schema_id.to_be_bytes());
+    hasher.update(prepared.expected_docid_high_watermark.to_be_bytes());
+    conformance_hash_bytes(hasher, &prepared.schema.canonical_encoding()?);
+    hasher.update(
+        conformance_usize_to_u64(prepared.field_stats.len(), "prepared field-stat count")?
+            .to_be_bytes(),
+    );
+    for field_stats in &prepared.field_stats {
+        hasher.update(field_stats.field_ord.to_be_bytes());
+        hasher.update(field_stats.total_tokens.to_be_bytes());
+        hasher.update(field_stats.doc_count.to_be_bytes());
+    }
+    hasher.update(prepared.bm25_doc_count.to_be_bytes());
+    hasher.update(prepared.live_doc_count.to_be_bytes());
+    hasher.update(prepared.delta_live_doc_count.to_be_bytes());
+    hasher.update(
+        conformance_usize_to_u64(prepared.deltas.len(), "prepared Delta count")?.to_be_bytes(),
+    );
+    for delta in &prepared.deltas {
+        hasher.update(delta.keeper_generation().to_be_bytes());
+        let (lineage_id, generation, lease_base, lease_end) = delta.publication_lineage();
+        hasher.update(lineage_id.to_be_bytes());
+        hasher.update(generation.to_be_bytes());
+        hasher.update(lease_base.to_be_bytes());
+        hasher.update(lease_end.to_be_bytes());
+        hasher.update(
+            conformance_usize_to_u64(delta.live_document_count(), "prepared Delta live rows")?
+                .to_be_bytes(),
+        );
+        conformance_hash_bytes(hasher, &delta.conformance_content_sha256()?);
+    }
+    Ok(())
 }
 
 fn manifest_segment(encoded: &EncodedSegment, seal_seq: u64) -> ManifestSegment {
