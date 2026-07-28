@@ -18,7 +18,8 @@ pub mod model_manifest;
 pub mod model_registry;
 pub mod simd;
 pub use auto_detect::{
-    DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus, TwoTierAvailability,
+    DetectOptions, DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus,
+    TwoTierAvailability,
 };
 pub use batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
