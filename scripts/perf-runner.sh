@@ -66,7 +66,9 @@ while [ $# -gt 0 ]; do
 done
 
 case "$CLASS" in
-    x86-vps-ovh|trj-zen-128c) EXPECT_OS="Linux" ;;
+    # trj-zen3-<width>c per the committed-baseline convention
+    # (QG-2.trj-zen3-16c.latest.json); trj-zen-128c is the superseded label.
+    x86-vps-ovh|trj-zen-128c|trj-zen3-*) EXPECT_OS="Linux" ;;
     m4-macos|m5-macos) EXPECT_OS="Darwin" ;;
     "") echo "error: --class is required" >&2; exit 64 ;;
     *) echo "error: unknown machine class '$CLASS'" >&2; exit 64 ;;

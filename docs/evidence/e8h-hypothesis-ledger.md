@@ -25,27 +25,47 @@ Retry predicate:   <filled only on REJECT>
 ## Machine-class fingerprint corrections (authoritative over class-ID labels)
 
 - The trj classes follow the committed-baseline convention **`trj-zen3-<width>c`**
-  (first artifact: `QG-2.trj-zen3-16c.latest.json`, activated on 2026-07-28
-  with a measured 0.350 [0.345–0.356] MISS vs the ≥1.5x target — Quill
-  59.8k vs Tantivy 171.2k docs/s single-thread, 30 paired runs, clean A/A
-  null). That pre-fix artifact is now **quarantined**, not an active baseline:
-  the Tantivy arm constructed and dropped an unused replacement writer after
-  its measured worker join. Although replacement construction was excluded
-  from `join_elapsed_ns`, its post-sample work and resource churn could bleed
-  into later paired samples. Commit `ebd91757` replaces that path with a
-  terminal join whose receipt says `writer_rearmed=false`; only its fresh
-  candidate plus immediate same-worker reproduction can establish the new
-  ratio. The direction and magnitude are deliberately not predicted, and
-  0.35 must not be used as a floor or current performance claim. The machine
-  is a Threadripper PRO **5995WX: Zen 3, 64 cores / 128 threads**, single
-  NUMA node (NPS1), 512 GB, governor=performance, SMT on
+  (first baseline: `QG-2.trj-zen3-16c.latest.json`, ACTIVATED 2026-07-28 as an
+  honest 0.350 [0.345–0.356] MISS vs the ≥1.5x target — Quill 59.8k vs Tantivy
+  171.2k docs/s single-thread, 30 paired runs, clean A/A null). The machine is a
+  Threadripper PRO **5995WX: Zen 3, 64 cores / 128 threads**, single NUMA node
+  (NPS1), 512 GB, governor=performance, SMT on
   (`docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/` — directory name
   predates the convention; contents authoritative). Consequences: **no AVX-512
   in silicon** (Zen 4+ only); per-CCD L3 partitioning still applies (8 CCDs).
+  Known QG-2 fairness item: a rearmed-writer construct/drop sits inside Quill's
+  timed window that Tantivy's arm does not pay — the rerun will improve Quill's
+  ratio; W2 rows should treat 0.35x as a floor, not the exact deficit.
 - `m4-macos` is a Mac mini **M4 Pro, 14 cores (10P+4E), 64 GB, 16 KiB pages**
   (`docs/evidence/e8h/fingerprints/m4-macos-20260728/`).
 - `m5-macos`: no reachable host as of 2026-07-28 (mmini/mmini-legacy asleep on the
   tailnet). Class stays declared; beads must not block on it (see p1-m5 bead body).
+
+## First m4-macos diagnostic (2026-07-28, NON-CLAIM label, run receipt m4-macos/20260728T233512Z-qg2-diag-w5-r30-v2)
+
+QG-2 cell `bulk/medium/1/positions_on`, warmup 5, 30 paired runs, ELF built at
+`f9c6c57e` (the aarch64 fix commit — this cell was UNRUNNABLE on ARM before it):
+
+| arm | p50 docs/s | median CI95 |
+|---|---|---|
+| quill | 82,229.6 | [81,164.4, 83,185.6] |
+| tantivy | 212,316.3 | [174,742.3, 225,244.3] |
+| paired_ab | **0.3742** | [0.3609, 0.4810] |
+| paired_null | 1.0395 | [0.9108, 1.1377] — contains 1.0, admissible |
+
+**Finding 1 — the single-thread deficit is architecture-invariant.** 0.374 on
+Apple M4 Pro vs the activated 0.350 on trj (Zen 3): the gap is per-doc
+algorithmic work, not a microarchitecture or SIMD artifact. This re-ranks the
+workstreams: W2 (interner, accumulation, seal/sync costs) is the deficit's
+home on every class; W4 SIMD kernels cannot close this class of gap.
+
+**Finding 2 — m4-macos null dispersion is ~4x wider than trj's** (null CI
+±11% vs trj ±2.5%; the incumbent arm's CI is especially wide). P0.3's m4
+bands must be derived at this width, and tightening levers (thread QoS
+pinning to P-cores, thermal windows, longer runs) belong to the P0.3/P1-m4
+beads before any KEEP/Block decision cites an m4 cell. Law 6 reminder: the
+0.374-vs-0.350 similarity is an observation about gap STRUCTURE, never a
+cross-class ratio claim.
 
 ## Open rows
 
