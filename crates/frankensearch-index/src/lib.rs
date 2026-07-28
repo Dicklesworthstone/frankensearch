@@ -1069,6 +1069,218 @@ impl ValidatedFsviBytes {
         Ok(owner)
     }
 
+    /// Publish one completed sibling generation from its exact sealed bytes.
+    ///
+    /// The completed sibling is admitted before the destination is touched and
+    /// remains in place as evidence. Publication copies only the admitted
+    /// owner's exact bytes into a fresh same-directory file, syncs that file,
+    /// atomically replaces the destination, and syncs the directory. Any stale
+    /// destination WAL is removed and directory-synced only after the v2 main
+    /// file is durable. Therefore a crash cannot leave the old main file with
+    /// its committed WAL silently discarded; the only intermediate state is a
+    /// v2 main file beside a WAL, which strict admission rejects fail-closed.
+    ///
+    /// The returned owner is an exact witness-checked reopen of the published
+    /// pathname after WAL removal. No mutable [`VectorIndex`] is created or
+    /// exposed for the v2 generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed admission error when the completed sibling is not an
+    /// exact identity-complete v2 generation, the paths are not distinct
+    /// siblings, publication or durability fails, a stale WAL cannot be
+    /// removed, or the final bytes differ from the pre-publication witness.
+    pub fn publish_completed_sibling(
+        destination: &Path,
+        completed_sibling: &Path,
+        expected: &FsviV2IdentityBinding,
+    ) -> Result<Self, FsviAdmissionError> {
+        Self::publish_completed_sibling_with_hooks(
+            destination,
+            completed_sibling,
+            expected,
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+    }
+
+    fn publish_completed_sibling_with_hooks<B, P, A, R>(
+        destination: &Path,
+        completed_sibling: &Path,
+        expected: &FsviV2IdentityBinding,
+        before_temp_admission: B,
+        before_replace: P,
+        after_main_sync: A,
+        before_final_reopen: R,
+    ) -> Result<Self, FsviAdmissionError>
+    where
+        B: FnOnce(&Path) -> SearchResult<()>,
+        P: FnOnce() -> SearchResult<()>,
+        A: FnOnce() -> SearchResult<()>,
+        R: FnOnce() -> SearchResult<()>,
+    {
+        let destination_parent = snapshot_parent_or_current(destination);
+        let completed_parent = snapshot_parent_or_current(completed_sibling);
+        let destination_parent_metadata =
+            fs::symlink_metadata(destination_parent).map_err(SearchError::Io)?;
+        let completed_parent_metadata =
+            fs::symlink_metadata(completed_parent).map_err(SearchError::Io)?;
+        if !destination_parent_metadata.file_type().is_dir()
+            || !completed_parent_metadata.file_type().is_dir()
+        {
+            return Err(snapshot_rejected(
+                FsviSnapshotRejectionReason::DirectoryChangedDuringRead,
+                "FSVI v2 publication requires real source and destination parent directories",
+            ));
+        }
+        #[cfg(unix)]
+        let same_parent = {
+            let destination_parent_identity = stable_file_identity(&destination_parent_metadata);
+            let completed_parent_identity = stable_file_identity(&completed_parent_metadata);
+            destination_parent_identity.device == completed_parent_identity.device
+                && destination_parent_identity.inode == completed_parent_identity.inode
+        };
+        #[cfg(not(unix))]
+        let same_parent = fs::canonicalize(destination_parent)
+            .and_then(|destination| {
+                fs::canonicalize(completed_parent).map(|completed| destination == completed)
+            })
+            .map_err(SearchError::Io)?;
+        if !same_parent {
+            return Err(SearchError::InvalidConfig {
+                field: "fsvi_v2.completed_sibling".to_owned(),
+                value: completed_sibling.display().to_string(),
+                reason: "completed generation and destination must share one parent directory"
+                    .to_owned(),
+            }
+            .into());
+        }
+        let destination_identity = match fs::symlink_metadata(destination) {
+            Ok(metadata) => Some(validate_single_link_regular_file(&metadata)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(SearchError::Io(error).into()),
+        };
+
+        let completed_metadata_before =
+            fs::symlink_metadata(completed_sibling).map_err(SearchError::Io)?;
+        let completed_identity_before =
+            validate_single_link_regular_file(&completed_metadata_before)?;
+        let completed_owner = Self::open_published(completed_sibling, expected)?;
+        let completed_metadata_after =
+            fs::symlink_metadata(completed_sibling).map_err(SearchError::Io)?;
+        let completed_identity_after =
+            validate_single_link_regular_file(&completed_metadata_after)?;
+        if completed_identity_before != completed_identity_after {
+            return Err(snapshot_rejected(
+                FsviSnapshotRejectionReason::PathChangedDuringRead,
+                "completed sibling identity changed across sealed-byte admission",
+            ));
+        }
+        #[cfg(unix)]
+        let aliases_destination = destination_identity.is_some_and(|identity| {
+            identity.device == completed_identity_after.device
+                && identity.inode == completed_identity_after.inode
+        });
+        #[cfg(not(unix))]
+        let aliases_destination = if destination_identity.is_some() {
+            fs::canonicalize(destination)
+                .and_then(|destination| {
+                    fs::canonicalize(completed_sibling).map(|completed| destination == completed)
+                })
+                .map_err(SearchError::Io)?
+        } else {
+            false
+        };
+        if aliases_destination {
+            return Err(SearchError::InvalidConfig {
+                field: "fsvi_v2.completed_sibling".to_owned(),
+                value: completed_sibling.display().to_string(),
+                reason: "completed sibling and destination resolve to the same file".to_owned(),
+            }
+            .into());
+        }
+
+        let wal_path = wal::wal_path_for(destination);
+        let aliases_destination_wal = match fs::symlink_metadata(&wal_path) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    let identity = stable_file_identity(&metadata);
+                    identity.device == completed_identity_after.device
+                        && identity.inode == completed_identity_after.inode
+                }
+                #[cfg(not(unix))]
+                {
+                    !metadata.file_type().is_symlink()
+                        && fs::canonicalize(&wal_path)
+                            .and_then(|wal| {
+                                fs::canonicalize(completed_sibling)
+                                    .map(|completed| wal == completed)
+                            })
+                            .map_err(SearchError::Io)?
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(SearchError::Io(error).into()),
+        };
+        if aliases_destination_wal {
+            return Err(SearchError::InvalidConfig {
+                field: "fsvi_v2.completed_sibling".to_owned(),
+                value: completed_sibling.display().to_string(),
+                reason: "completed sibling resolves to the destination WAL pathname".to_owned(),
+            }
+            .into());
+        }
+        let witness = completed_owner.witness.clone();
+        let completed_bytes = Arc::clone(&completed_owner.bytes);
+
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(destination_parent).map_err(SearchError::Io)?;
+        temporary
+            .as_file_mut()
+            .write_all(completed_bytes.as_ref())
+            .map_err(SearchError::Io)?;
+        temporary.as_file().sync_all().map_err(SearchError::Io)?;
+        before_temp_admission(temporary.path())?;
+        let _validated_temporary = Self::reopen_exact(temporary.path(), expected, &witness)?;
+        before_replace()?;
+        temporary.persist(destination).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.error.kind(),
+                format!(
+                    "failed to atomically publish sealed FSVI v2 bytes at '{}': {}",
+                    destination.display(),
+                    error.error
+                ),
+            ))
+        })?;
+        sync_parent_directory(destination)?;
+
+        after_main_sync()?;
+
+        let completed_metadata_before_wal =
+            fs::symlink_metadata(completed_sibling).map_err(SearchError::Io)?;
+        let completed_identity_before_wal =
+            validate_single_link_regular_file(&completed_metadata_before_wal)?;
+        if completed_identity_before_wal != completed_identity_after {
+            return Err(snapshot_rejected(
+                FsviSnapshotRejectionReason::PathChangedDuringRead,
+                "completed sibling identity changed before destination WAL removal",
+            ));
+        }
+        match fs::symlink_metadata(&wal_path) {
+            Ok(_) => fs::remove_file(&wal_path).map_err(SearchError::Io)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SearchError::Io(error).into()),
+        }
+        sync_parent_directory(&wal_path)?;
+
+        before_final_reopen()?;
+        Self::reopen_exact(destination, expected, &witness)
+    }
+
     /// Redacted, serializable proof of the exact owned image.
     #[must_use]
     pub const fn witness(&self) -> &FsviV2Witness {
@@ -6715,6 +6927,599 @@ mod tests {
         assert!(
             wal_path.exists(),
             "refusal must preserve the pre-existing WAL for operator recovery"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn completed_sibling_publication_uses_sealed_bytes_and_preserves_evidence() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding(
+            "completed-sibling-publication",
+            4,
+            Quantization::F16,
+            31,
+            0x91,
+        );
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"stale destination WAL").expect("write stale WAL");
+
+        let mut completed_writer =
+            VectorIndex::create_v2(&completed_sibling, binding.clone()).expect("v2 writer");
+        completed_writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write alpha");
+        completed_writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write beta");
+        completed_writer.finish().expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("read completed evidence");
+        let completed_owner = ValidatedFsviBytes::open_published(&completed_sibling, &binding)
+            .expect("admit completed evidence");
+        let expected_witness = completed_owner.witness().clone();
+
+        let published = ValidatedFsviBytes::publish_completed_sibling(
+            &destination,
+            &completed_sibling,
+            &binding,
+        )
+        .expect("publish exact completed bytes");
+
+        assert_eq!(published.witness(), &expected_witness);
+        assert!(published.published_wal_absent());
+        assert_eq!(
+            fs::read(&destination).expect("read published generation"),
+            completed_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains readable"),
+            completed_bytes
+        );
+        assert!(
+            !destination_wal.exists(),
+            "stale destination WAL must be removed only after main publication"
+        );
+        let hits = published
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None)
+            .expect("search exact published owner");
+        assert_eq!(hits[0].doc_id, "doc-alpha");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn completed_sibling_alias_path_is_rejected_without_touching_evidence() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let destination_alias = directory.path().join(".").join("completed.fsvi");
+        let binding = fsvi_v2_binding("completed-sibling-alias", 4, Quantization::F16, 36, 0x96);
+
+        let mut writer =
+            VectorIndex::create_v2(&completed_sibling, binding.clone()).expect("v2 writer");
+        writer
+            .write_record("doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write record");
+        writer.finish().expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed evidence");
+        let entries_before = directory_entry_names(directory.path());
+
+        let error = ValidatedFsviBytes::publish_completed_sibling(
+            &destination_alias,
+            &completed_sibling,
+            &binding,
+        )
+        .expect_err("same-inode alias must be rejected");
+        assert!(matches!(
+            error,
+            FsviAdmissionError::Index(SearchError::InvalidConfig {
+                ref field,
+                ref reason,
+                ..
+            }) if field == "fsvi_v2.completed_sibling"
+                && reason.contains("same file")
+        ));
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+        assert_eq!(directory_entry_names(directory.path()), entries_before);
+        let reopened = ValidatedFsviBytes::open_published(&completed_sibling, &binding)
+            .expect("completed evidence remains admissible");
+        let expected_digest: [u8; SHA256_BYTES] = Sha256::digest(&completed_bytes).into();
+        assert_eq!(reopened.witness().whole_image_sha256, expected_digest);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn completed_sibling_cannot_alias_destination_wal_path() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = wal::wal_path_for(&destination);
+        let binding = fsvi_v2_binding(
+            "completed-sibling-wal-alias",
+            4,
+            Quantization::F16,
+            38,
+            0x98,
+        );
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+
+        let mut writer =
+            VectorIndex::create_v2(&completed_sibling, binding.clone()).expect("v2 writer");
+        writer
+            .write_record("new-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write record");
+        writer.finish().expect("finish completed sibling");
+        let old_main_bytes = fs::read(&destination).expect("snapshot old main");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed evidence");
+        let entries_before = directory_entry_names(directory.path());
+
+        let error = ValidatedFsviBytes::publish_completed_sibling(
+            &destination,
+            &completed_sibling,
+            &binding,
+        )
+        .expect_err("completed evidence at the WAL pathname must be rejected");
+        assert!(matches!(
+            error,
+            FsviAdmissionError::Index(SearchError::InvalidConfig {
+                ref field,
+                ref reason,
+                ..
+            }) if field == "fsvi_v2.completed_sibling"
+                && reason.contains("destination WAL")
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("old main remains"),
+            old_main_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+        assert_eq!(directory_entry_names(directory.path()), entries_before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rejected_completed_sibling_leaves_old_main_and_wal_untouched() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let actual_binding =
+            fsvi_v2_binding_with_input_variant("same-model", 4, 41, 0xa1, "actual-chunking");
+        let expected_binding =
+            fsvi_v2_binding_with_input_variant("same-model", 4, 41, 0xa1, "different-chunking");
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+        let old_main_bytes = fs::read(&destination).expect("snapshot old main");
+        let old_wal_bytes = fs::read(&destination_wal).expect("snapshot old WAL");
+
+        VectorIndex::create_v2(&completed_sibling, actual_binding)
+            .expect("v2 writer")
+            .finish()
+            .expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+        let entries_before = directory_entry_names(directory.path());
+        let destination_before = stable_file_identity(
+            &fs::symlink_metadata(&destination).expect("destination metadata before rejection"),
+        );
+        let destination_wal_before = stable_file_identity(
+            &fs::symlink_metadata(&destination_wal).expect("WAL metadata before rejection"),
+        );
+        let completed_before = stable_file_identity(
+            &fs::symlink_metadata(&completed_sibling)
+                .expect("completed evidence metadata before rejection"),
+        );
+        let parent_before = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("parent metadata before rejection"),
+        );
+
+        assert!(matches!(
+            ValidatedFsviBytes::publish_completed_sibling(
+                &destination,
+                &completed_sibling,
+                &expected_binding,
+            ),
+            Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::IdentityMismatch,
+                ..
+            }))
+        ));
+        let destination_after = stable_file_identity(
+            &fs::symlink_metadata(&destination).expect("destination metadata after rejection"),
+        );
+        let destination_wal_after = stable_file_identity(
+            &fs::symlink_metadata(&destination_wal).expect("WAL metadata after rejection"),
+        );
+        let completed_after = stable_file_identity(
+            &fs::symlink_metadata(&completed_sibling)
+                .expect("completed evidence metadata after rejection"),
+        );
+        let parent_after = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("parent metadata after rejection"),
+        );
+        assert_eq!(destination_after, destination_before);
+        assert_eq!(destination_wal_after, destination_wal_before);
+        assert_eq!(completed_after, completed_before);
+        assert_eq!(parent_after, parent_before);
+        assert_eq!(directory_entry_names(directory.path()), entries_before);
+        assert_eq!(
+            fs::read(&destination).expect("old main remains"),
+            old_main_bytes
+        );
+        assert_eq!(
+            fs::read(&destination_wal).expect("old WAL remains"),
+            old_wal_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pre_replace_failure_leaves_old_generation_and_completed_evidence_untouched() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding("pre-replace-failure", 4, Quantization::F16, 44, 0xa4);
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+        let old_main_bytes = fs::read(&destination).expect("snapshot old main");
+        let old_wal_bytes = fs::read(&destination_wal).expect("snapshot old WAL");
+
+        VectorIndex::create_v2(&completed_sibling, binding.clone())
+            .expect("v2 writer")
+            .finish()
+            .expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+
+        let error = ValidatedFsviBytes::publish_completed_sibling_with_hooks(
+            &destination,
+            &completed_sibling,
+            &binding,
+            |_| Ok(()),
+            || {
+                Err(SearchError::Cancelled {
+                    phase: "before-fsvi-main-replace".to_owned(),
+                    reason: "injected publication interruption".to_owned(),
+                })
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .expect_err("injected boundary must stop before destination replacement");
+        assert!(matches!(
+            error,
+            FsviAdmissionError::Index(SearchError::Cancelled { ref phase, .. })
+                if phase == "before-fsvi-main-replace"
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("old main remains"),
+            old_main_bytes
+        );
+        assert_eq!(
+            fs::read(&destination_wal).expect("old WAL remains"),
+            old_wal_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn corrupt_durable_temp_is_rejected_before_old_generation_is_touched() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding(
+            "pre-publish-temp-validation",
+            4,
+            Quantization::F16,
+            46,
+            0xa6,
+        );
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+        let old_main_bytes = fs::read(&destination).expect("snapshot old main");
+        let old_wal_bytes = fs::read(&destination_wal).expect("snapshot old WAL");
+
+        VectorIndex::create_v2(&completed_sibling, binding.clone())
+            .expect("v2 writer")
+            .finish()
+            .expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+
+        assert!(matches!(
+            ValidatedFsviBytes::publish_completed_sibling_with_hooks(
+                &destination,
+                &completed_sibling,
+                &binding,
+                |temporary_path| {
+                    let mut corrupted = OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(temporary_path)?;
+                    corrupted.write_all(&FSVI_MAGIC)?;
+                    corrupted.sync_all()?;
+                    Ok(())
+                },
+                || Ok(()),
+                || Ok(()),
+                || Ok(()),
+            ),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("old main remains"),
+            old_main_bytes
+        );
+        assert_eq!(
+            fs::read(&destination_wal).expect("old WAL remains"),
+            old_wal_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn post_main_sync_failure_leaves_v2_plus_wal_fail_closed() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding("post-main-sync-failure", 4, Quantization::F16, 51, 0xb1);
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+        let old_wal_bytes = fs::read(&destination_wal).expect("snapshot old WAL");
+
+        let mut completed_writer =
+            VectorIndex::create_v2(&completed_sibling, binding.clone()).expect("v2 writer");
+        completed_writer
+            .write_record("new-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("new record");
+        completed_writer.finish().expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+
+        let error = ValidatedFsviBytes::publish_completed_sibling_with_hooks(
+            &destination,
+            &completed_sibling,
+            &binding,
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                Err(SearchError::Cancelled {
+                    phase: "after-fsvi-main-sync".to_owned(),
+                    reason: "injected publication interruption".to_owned(),
+                })
+            },
+            || Ok(()),
+        )
+        .expect_err("injected boundary must stop before WAL removal");
+        assert!(matches!(
+            error,
+            FsviAdmissionError::Index(SearchError::Cancelled { ref phase, .. })
+                if phase == "after-fsvi-main-sync"
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("new v2 main remains durable"),
+            completed_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+        assert_eq!(
+            fs::read(&destination_wal).expect("old WAL remains fail-closed"),
+            old_wal_bytes
+        );
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&destination, &binding),
+            FsviSnapshotRejectionReason::PublishedWalPresent,
+        );
+        assert!(matches!(
+            VectorIndex::inspect(&destination),
+            Ok(FsviInspection::V2IdentityComplete(_))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn post_wal_sync_failure_leaves_exact_admissible_v2_generation() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding("post-wal-sync-failure", 4, Quantization::F16, 56, 0xb6);
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+
+        let mut completed_writer =
+            VectorIndex::create_v2(&completed_sibling, binding.clone()).expect("v2 writer");
+        completed_writer
+            .write_record("new-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("new record");
+        completed_writer.finish().expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+        let completed_owner = ValidatedFsviBytes::open_published(&completed_sibling, &binding)
+            .expect("admit completed evidence");
+        let completed_witness = completed_owner.witness().clone();
+
+        let error = ValidatedFsviBytes::publish_completed_sibling_with_hooks(
+            &destination,
+            &completed_sibling,
+            &binding,
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+            || {
+                Err(SearchError::Cancelled {
+                    phase: "before-fsvi-final-reopen".to_owned(),
+                    reason: "injected publication interruption".to_owned(),
+                })
+            },
+        )
+        .expect_err("injected boundary must stop before final exact reopen");
+        assert!(matches!(
+            error,
+            FsviAdmissionError::Index(SearchError::Cancelled { ref phase, .. })
+                if phase == "before-fsvi-final-reopen"
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("new v2 main remains durable"),
+            completed_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
+        );
+        assert!(
+            !destination_wal.exists(),
+            "WAL absence must already be durable before the final reopen boundary"
+        );
+        let reopened = ValidatedFsviBytes::reopen_exact(&destination, &binding, &completed_witness)
+            .expect("post-WAL crash state is exact and admissible");
+        assert_eq!(reopened.witness(), &completed_witness);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn completed_sibling_publication_is_typed_and_non_mutating_without_noatime() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let destination = directory.path().join("current.fsvi");
+        let completed_sibling = directory.path().join("completed.fsvi");
+        let binding = fsvi_v2_binding(
+            "unsupported-noatime-publication",
+            4,
+            Quantization::F16,
+            61,
+            0xc1,
+        );
+
+        let mut old_writer =
+            VectorIndex::create(&destination, "legacy-space", 4).expect("legacy writer");
+        old_writer
+            .write_record("old-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("old record");
+        old_writer.finish().expect("finish old generation");
+        let destination_wal = wal::wal_path_for(&destination);
+        fs::write(&destination_wal, b"committed old-generation WAL").expect("write old WAL");
+        let old_main_bytes = fs::read(&destination).expect("snapshot old main");
+        let old_wal_bytes = fs::read(&destination_wal).expect("snapshot old WAL");
+
+        VectorIndex::create_v2(&completed_sibling, binding.clone())
+            .expect("v2 writer")
+            .finish()
+            .expect("finish completed sibling");
+        let completed_bytes = fs::read(&completed_sibling).expect("snapshot completed sibling");
+        let entries_before = directory_entry_names(directory.path());
+        let destination_before = stable_file_identity(
+            &fs::symlink_metadata(&destination).expect("destination metadata before rejection"),
+        );
+        let destination_wal_before = stable_file_identity(
+            &fs::symlink_metadata(&destination_wal).expect("WAL metadata before rejection"),
+        );
+        let completed_before = stable_file_identity(
+            &fs::symlink_metadata(&completed_sibling)
+                .expect("completed evidence metadata before rejection"),
+        );
+        let parent_before = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("parent metadata before rejection"),
+        );
+
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::publish_completed_sibling(
+                &destination,
+                &completed_sibling,
+                &binding,
+            ),
+            FsviSnapshotRejectionReason::NoAtimeUnsupported,
+        );
+        let destination_after = stable_file_identity(
+            &fs::symlink_metadata(&destination).expect("destination metadata after rejection"),
+        );
+        let destination_wal_after = stable_file_identity(
+            &fs::symlink_metadata(&destination_wal).expect("WAL metadata after rejection"),
+        );
+        let completed_after = stable_file_identity(
+            &fs::symlink_metadata(&completed_sibling)
+                .expect("completed evidence metadata after rejection"),
+        );
+        let parent_after = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("parent metadata after rejection"),
+        );
+        assert_eq!(destination_after, destination_before);
+        assert_eq!(destination_wal_after, destination_wal_before);
+        assert_eq!(completed_after, completed_before);
+        assert_eq!(parent_after, parent_before);
+        assert_eq!(directory_entry_names(directory.path()), entries_before);
+        assert_eq!(
+            fs::read(&destination).expect("old main remains"),
+            old_main_bytes
+        );
+        assert_eq!(
+            fs::read(&destination_wal).expect("old WAL remains"),
+            old_wal_bytes
+        );
+        assert_eq!(
+            fs::read(&completed_sibling).expect("completed evidence remains"),
+            completed_bytes
         );
     }
 
