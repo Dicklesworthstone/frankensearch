@@ -1070,7 +1070,7 @@ pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Buc
 /// durable hashing elsewhere in Quill is xxh3 by contract, FSLX §2). Tests
 /// inject a constant hasher to force every key through the `Many`
 /// verification path.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     arena: ByteArena,
     spans: Vec<ArenaSpan>,
@@ -1084,6 +1084,38 @@ pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     /// ingested document). Exactly equals the former recompute because each
     /// increment already accounts for the arena key, span, and bucket bytes.
     running_bytes_used: usize,
+    /// Retained capacity of `Bucket::Many` collision-id vectors.
+    ///
+    /// Maintaining this total at the two mutation sites keeps
+    /// [`Self::bytes_reserved`] exact without scanning every distinct term
+    /// after every ingested document.
+    running_collision_bytes_reserved: usize,
+}
+
+impl<S: BuildHasher + Clone> Clone for TermInterner<S> {
+    fn clone(&self) -> Self {
+        let buckets = self.buckets.clone();
+        // `Vec::clone` is allowed to choose a different capacity, so copy the
+        // logical cache from the cloned collision vectors rather than from the
+        // source interner.
+        let running_collision_bytes_reserved =
+            buckets.values().fold(0_usize, |reserved, bucket| {
+                let bucket_reserved = match bucket {
+                    Bucket::One(_) => 0,
+                    Bucket::Many(ids) => ids.capacity().saturating_mul(std::mem::size_of::<u32>()),
+                };
+                reserved.saturating_add(bucket_reserved)
+            });
+        Self {
+            arena: self.arena.clone(),
+            spans: self.spans.clone(),
+            buckets,
+            hasher: self.hasher.clone(),
+            key_scratch: self.key_scratch.clone(),
+            running_bytes_used: self.running_bytes_used,
+            running_collision_bytes_reserved,
+        }
+    }
 }
 
 impl TermInterner<ahash::RandomState> {
@@ -1109,6 +1141,7 @@ impl<S: BuildHasher> TermInterner<S> {
             hasher,
             key_scratch: Vec::with_capacity(64),
             running_bytes_used: 0,
+            running_collision_bytes_reserved: 0,
         }
     }
 
@@ -1173,23 +1206,33 @@ impl<S: BuildHasher> TermInterner<S> {
         let span = self.arena.push(&self.key_scratch);
         let id = u32::try_from(self.spans.len()).expect("term id space exceeds u32");
         self.spans.push(span);
-        let bucket_bytes = match self.buckets.entry(hash) {
+        let (bucket_bytes, collision_reserved_delta) = match self.buckets.entry(hash) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Bucket::One(id));
-                TERM_BUCKET_BYTES_ESTIMATE
+                (TERM_BUCKET_BYTES_ESTIMATE, 0)
             }
             std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
                 Bucket::One(existing) => {
                     let existing = *existing;
-                    *o.get_mut() = Bucket::Many(vec![existing, id]);
-                    2 * std::mem::size_of::<u32>()
+                    let ids = vec![existing, id];
+                    let reserved = ids.capacity().saturating_mul(std::mem::size_of::<u32>());
+                    *o.get_mut() = Bucket::Many(ids);
+                    (2 * std::mem::size_of::<u32>(), reserved)
                 }
                 Bucket::Many(ids) => {
+                    let capacity_before = ids.capacity();
                     ids.push(id);
-                    std::mem::size_of::<u32>()
+                    let reserved_delta = ids
+                        .capacity()
+                        .saturating_sub(capacity_before)
+                        .saturating_mul(std::mem::size_of::<u32>());
+                    (std::mem::size_of::<u32>(), reserved_delta)
                 }
             },
         };
+        self.running_collision_bytes_reserved = self
+            .running_collision_bytes_reserved
+            .saturating_add(collision_reserved_delta);
         let added_bytes = FIELD_PREFIX_BYTES
             .saturating_add(term.len())
             .saturating_add(std::mem::size_of::<ArenaSpan>())
@@ -1257,14 +1300,6 @@ impl<S: BuildHasher> TermInterner<S> {
     /// Complete retained interner allocation for RSS/reuse diagnostics.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        let collision_ids = self
-            .buckets
-            .values()
-            .map(|bucket| match bucket {
-                Bucket::One(_) => 0,
-                Bucket::Many(ids) => ids.capacity() * std::mem::size_of::<u32>(),
-            })
-            .sum::<usize>();
         self.arena
             .bytes_reserved()
             .saturating_add(
@@ -1278,7 +1313,7 @@ impl<S: BuildHasher> TermInterner<S> {
                     .saturating_mul(TERM_BUCKET_BYTES_ESTIMATE),
             )
             .saturating_add(self.key_scratch.capacity())
-            .saturating_add(collision_ids)
+            .saturating_add(self.running_collision_bytes_reserved)
     }
 
     /// Reset for the next flush cycle: clears terms, retains arena chunk and
@@ -1289,6 +1324,7 @@ impl<S: BuildHasher> TermInterner<S> {
         self.buckets.clear();
         self.key_scratch.clear();
         self.running_bytes_used = 0;
+        self.running_collision_bytes_reserved = 0;
     }
 
     /// Arena diagnostics for flush-cycle tracing:
@@ -4810,6 +4846,34 @@ mod tests {
     }
     type ConstBuild = BuildHasherDefault<ConstHasher>;
 
+    fn rescanned_term_interner_bytes_reserved<S: BuildHasher>(interner: &TermInterner<S>) -> usize {
+        let collision_ids = interner
+            .buckets
+            .values()
+            .map(|bucket| match bucket {
+                Bucket::One(_) => 0,
+                Bucket::Many(ids) => ids.capacity() * std::mem::size_of::<u32>(),
+            })
+            .sum::<usize>();
+        interner
+            .arena
+            .bytes_reserved()
+            .saturating_add(
+                interner
+                    .spans
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ArenaSpan>()),
+            )
+            .saturating_add(
+                interner
+                    .buckets
+                    .capacity()
+                    .saturating_mul(TERM_BUCKET_BYTES_ESTIMATE),
+            )
+            .saturating_add(interner.key_scratch.capacity())
+            .saturating_add(collision_ids)
+    }
+
     const MIXED_POSITION_FIELDS: [FieldDescriptor; 4] = [
         FieldDescriptor {
             id: 0,
@@ -6625,6 +6689,52 @@ mod tests {
         assert_eq!(duplicate, ids[1]);
         assert_eq!(duplicate_bytes, 0);
         assert_eq!(interner.bytes_used(), before_duplicate);
+    }
+
+    #[test]
+    fn collision_bucket_reserved_bytes_match_full_rescan() {
+        let mut interner: TermInterner<ConstBuild> =
+            TermInterner::with_hasher(ConstBuild::default());
+        assert_eq!(
+            interner.bytes_reserved(),
+            rescanned_term_interner_bytes_reserved(&interner)
+        );
+
+        for i in 0..257_u32 {
+            let term = format!("collision-reservation-{i:03}");
+            interner.intern((i % 5) as u16, term.as_bytes());
+            assert_eq!(
+                interner.bytes_reserved(),
+                rescanned_term_interner_bytes_reserved(&interner),
+                "cached collision capacity diverged after insertion {i}"
+            );
+        }
+
+        let before_duplicate = interner.bytes_reserved();
+        assert_eq!(
+            interner.intern(3, b"collision-reservation-003"),
+            3,
+            "duplicate lookup must retain its original id"
+        );
+        assert_eq!(interner.bytes_reserved(), before_duplicate);
+        assert_eq!(
+            interner.bytes_reserved(),
+            rescanned_term_interner_bytes_reserved(&interner)
+        );
+
+        let cloned = interner.clone();
+        assert_eq!(
+            cloned.bytes_reserved(),
+            rescanned_term_interner_bytes_reserved(&cloned),
+            "clone must recompute capacities through its cloned containers"
+        );
+
+        interner.reset();
+        assert_eq!(
+            interner.bytes_reserved(),
+            rescanned_term_interner_bytes_reserved(&interner),
+            "reset drops collision vectors while retaining outer containers"
+        );
     }
 
     #[test]
