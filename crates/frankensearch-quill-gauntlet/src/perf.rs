@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::GauntletError;
@@ -37,6 +38,10 @@ pub const PERF_WRITER_HEAP_BYTES: usize = 50_000_000;
 pub const PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES: usize = 15_000_000;
 /// Version of the metric-specific paired estimator contract.
 pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
+/// Exact ordered query groups required by every normative QG-6 cell.
+pub const QG6_QUERY_GROUPS: usize = 4;
+/// Canonical QG-6 group IDs. Prepared queries are indexed in manifest order.
+pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] = [0, 1, 2, 3];
 
 /// Equal total heap budget for one thread-count cell.
 #[must_use]
@@ -515,6 +520,73 @@ impl PerfOperationScope {
     }
 }
 
+/// Exact prepared-corpus, query, and semantic-configuration identity.
+///
+/// This cell-level identity deliberately remains separate from
+/// [`PerfSampleProvenance::corpus_sha256`], which names the invocation-wide
+/// selection manifest. One invocation can prepare multiple exact corpus
+/// subsets, ordered query manifests, and configuration contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfInputIdentity {
+    /// SHA-256 of the exact ordered corpus prepared for this cell.
+    pub prepared_corpus_sha256: String,
+    /// SHA-256 of the exact ordered query manifest.
+    pub query_manifest_sha256: String,
+    /// SHA-256 of the semantic configuration shared by both engines.
+    pub config_contract_sha256: String,
+    /// Number of ordered query groups represented by the manifest.
+    pub query_group_count: usize,
+    /// Exact ordered group IDs emitted into both A/B and A/A raw streams.
+    pub query_group_ids: Vec<u64>,
+}
+
+impl PerfInputIdentity {
+    pub(crate) fn validate(&self) -> Result<(), PairedEstimatorError> {
+        if !is_lower_hex_digest(&self.prepared_corpus_sha256)
+            || !is_lower_hex_digest(&self.query_manifest_sha256)
+            || !is_lower_hex_digest(&self.config_contract_sha256)
+            || self.query_group_count != QG6_QUERY_GROUPS
+            || self.query_group_ids.as_slice() != QG6_QUERY_GROUP_IDS.as_slice()
+        {
+            return Err(PairedEstimatorError::InvalidProvenance {
+                reason: "prepared-input identity requires separate lowercase SHA-256 prepared \
+                         corpus, ordered query, and configuration hashes plus the exact four \
+                         canonical query-group IDs"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Domain-separated SHA-256 of all exact prepared inputs for telemetry.
+    ///
+    /// The three component hashes remain serialized separately for diagnosis
+    /// and independent verification. This digest is only a concise log key.
+    #[must_use]
+    pub fn fingerprint_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.perf-input-identity.v1\0");
+        hasher.update(b"prepared-corpus-sha256\0");
+        hasher.update(self.prepared_corpus_sha256.as_bytes());
+        hasher.update(b"ordered-query-manifest-sha256\0");
+        hasher.update(self.query_manifest_sha256.as_bytes());
+        hasher.update(b"config-contract-sha256\0");
+        hasher.update(self.config_contract_sha256.as_bytes());
+        hasher.update(b"query-group-count\0");
+        hasher.update(self.query_group_count.to_string().as_bytes());
+        hasher.update(b"\0query-group-ids\0");
+        for group_id in &self.query_group_ids {
+            hasher.update(group_id.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut encoded = String::with_capacity(64);
+        for byte in digest {
+            write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+}
+
 /// Immutable execution context shared by every record in one paired run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfSampleProvenance {
@@ -522,8 +594,12 @@ pub struct PerfSampleProvenance {
     pub run_id: String,
     /// SHA-256 reported by the executing benchmark binary.
     pub executable_sha256: String,
-    /// SHA-256 of the exact corpus/query manifest.
+    /// SHA-256 of the invocation-wide corpus-selection manifest.
     pub corpus_sha256: String,
+    /// Exact cell-level prepared-input identity, separate from the
+    /// invocation-wide corpus manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_identity: Option<PerfInputIdentity>,
     /// Stable worker or machine identity.
     pub worker_id: String,
     /// Exact Cargo profile label.
@@ -544,12 +620,16 @@ impl PerfSampleProvenance {
                     .to_owned(),
             });
         }
+        if let Some(identity) = self.input_identity.as_ref() {
+            identity.validate()?;
+        }
         Ok(())
     }
 
-    fn same_reproduction_context(&self, other: &Self) -> bool {
+    pub(crate) fn same_reproduction_context(&self, other: &Self) -> bool {
         self.executable_sha256 == other.executable_sha256
             && self.corpus_sha256 == other.corpus_sha256
+            && self.input_identity == other.input_identity
             && self.worker_id == other.worker_id
             && self.build_profile == other.build_profile
     }
@@ -1837,6 +1917,48 @@ pub fn validate_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prepared_input_fingerprint_binds_each_component_independently() {
+        let identity = PerfInputIdentity {
+            prepared_corpus_sha256: "a".repeat(64),
+            query_manifest_sha256: "b".repeat(64),
+            config_contract_sha256: "c".repeat(64),
+            query_group_count: QG6_QUERY_GROUPS,
+            query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+        };
+        let fingerprint = identity.fingerprint_sha256();
+        assert!(is_lower_hex_digest(&fingerprint));
+
+        for field in [
+            "prepared_corpus_sha256",
+            "query_manifest_sha256",
+            "config_contract_sha256",
+        ] {
+            let mut mutated = identity.clone();
+            match field {
+                "prepared_corpus_sha256" => mutated.prepared_corpus_sha256 = "d".repeat(64),
+                "query_manifest_sha256" => mutated.query_manifest_sha256 = "e".repeat(64),
+                "config_contract_sha256" => mutated.config_contract_sha256 = "f".repeat(64),
+                _ => unreachable!("enumerated identity field"),
+            }
+            assert_ne!(
+                fingerprint,
+                mutated.fingerprint_sha256(),
+                "{field} is not bound by the telemetry fingerprint"
+            );
+        }
+
+        let mut wrong_count = identity.clone();
+        wrong_count.query_group_count -= 1;
+        assert_ne!(fingerprint, wrong_count.fingerprint_sha256());
+        assert!(wrong_count.validate().is_err());
+
+        let mut wrong_ids = identity;
+        wrong_ids.query_group_ids.swap(0, 1);
+        assert_ne!(fingerprint, wrong_ids.fingerprint_sha256());
+        assert!(wrong_ids.validate().is_err());
+    }
+
     fn estimator_config() -> PairedEstimatorConfig {
         PairedEstimatorConfig {
             bootstrap_seed: 0x5eed_1234_5678_9abc,
@@ -1873,6 +1995,7 @@ mod tests {
             run_id: run_id.to_owned(),
             executable_sha256: "a".repeat(64),
             corpus_sha256: "b".repeat(64),
+            input_identity: None,
             worker_id: "synthetic-worker".to_owned(),
             build_profile: "release-perf".to_owned(),
         }

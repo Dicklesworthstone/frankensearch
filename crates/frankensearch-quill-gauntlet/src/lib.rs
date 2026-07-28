@@ -76,10 +76,11 @@ pub use perf::{
     PERF_MAX_CV_PCT, PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES,
     PairedClaimState, PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError,
     PairedEstimatorReason, PairedEvidenceStatus, PairedExperimentResult, PerfCellResult,
-    PerfCellSpec, PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfMetricSemantics,
-    PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder,
-    PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode, estimate_paired_experiment,
-    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
+    PerfCellSpec, PerfCorpus, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
+    PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
+    QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment, machine_fingerprint,
+    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf_evidence::{
