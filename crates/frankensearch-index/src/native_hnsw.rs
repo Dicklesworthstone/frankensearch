@@ -48,7 +48,7 @@
 //! casting mapped bytes.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -63,6 +63,14 @@ use frankensearch_core::error::{SearchError, SearchResult};
 /// defect into `SearchError::IndexCorrupted`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphDefect {
+    /// The graph and its caller-owned vector store describe different row
+    /// counts, so graph ids cannot be interpreted against that store.
+    StoreCardinalityMismatch {
+        /// Rows indexed by the graph.
+        graph_points: usize,
+        /// Rows exposed by the vector store.
+        store_rows: usize,
+    },
     /// A graph with no points nonetheless names an entry point.
     EntryPointInEmptyGraph {
         /// The spurious entry point id.
@@ -143,6 +151,16 @@ pub enum GraphDefect {
         /// The level the neighbour actually reaches.
         neighbour_level: usize,
     },
+    /// One endpoint names an edge whose peer does not name the reverse edge
+    /// at the same logical layer.
+    MissingReciprocalEdge {
+        /// The point holding the one-way edge.
+        id: u32,
+        /// The layer containing the one-way edge.
+        layer: usize,
+        /// The peer missing the reverse edge.
+        neighbour: u32,
+    },
     /// Some points cannot be reached from the entry point at layer 0, so no
     /// query can find them however wide the beam.
     Unreachable {
@@ -158,6 +176,13 @@ pub enum GraphDefect {
 impl fmt::Display for GraphDefect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StoreCardinalityMismatch {
+                graph_points,
+                store_rows,
+            } => write!(
+                f,
+                "graph indexes {graph_points} points but the vector store exposes {store_rows} rows"
+            ),
             Self::EntryPointInEmptyGraph { entry } => {
                 write!(f, "empty graph names entry point {entry}")
             }
@@ -213,6 +238,15 @@ impl fmt::Display for GraphDefect {
                 f,
                 "point {id} has an edge to {neighbour} at layer {layer}, but {neighbour} only \
                  reaches level {neighbour_level}"
+            ),
+            Self::MissingReciprocalEdge {
+                id,
+                layer,
+                neighbour,
+            } => write!(
+                f,
+                "point {id} names neighbour {neighbour} at layer {layer}, but the reverse edge is \
+                 missing"
             ),
             Self::Unreachable {
                 reached,
@@ -512,6 +546,54 @@ impl Adjacency {
     }
 }
 
+/// Original neighbour lists touched by one insertion.
+///
+/// Insertion mutates only a bounded neighbourhood, so journaling those lists
+/// avoids cloning the complete graph while still making every returned error
+/// failure-atomic. Lists belonging to the newly appended point are omitted:
+/// rollback removes that point wholesale.
+#[derive(Debug)]
+struct MutationJournal {
+    original_point_count: usize,
+    original_lists: BTreeMap<(usize, usize), Vec<u32>>,
+}
+
+impl MutationJournal {
+    fn new(original_point_count: usize) -> Self {
+        Self {
+            original_point_count,
+            original_lists: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, adjacency: &[Adjacency], id: u32, layer: usize) {
+        let point_index = id as usize;
+        if point_index >= self.original_point_count
+            || self.original_lists.contains_key(&(point_index, layer))
+        {
+            return;
+        }
+        if let Some(original) = adjacency
+            .get(point_index)
+            .and_then(|point| point.layers.get(layer))
+        {
+            self.original_lists
+                .insert((point_index, layer), original.clone());
+        }
+    }
+
+    fn rollback(self, adjacency: &mut [Adjacency]) {
+        for ((point_index, layer), original) in self.original_lists {
+            if let Some(neighbours) = adjacency
+                .get_mut(point_index)
+                .and_then(|point| point.layers.get_mut(layer))
+            {
+                *neighbours = original;
+            }
+        }
+    }
+}
+
 /// A navigable small-world graph over rows of a vector store.
 #[derive(Debug, Clone)]
 pub struct NativeHnsw {
@@ -597,16 +679,11 @@ impl NativeHnsw {
 
     /// Insert row `id`, which must be the next unindexed row.
     ///
-    /// **Not atomic.** The point is appended before any linking, and linking
-    /// reads vectors through `store`, so a store that fails partway leaves
-    /// the graph holding a point that is partially linked or not linked at
-    /// all — [`Self::verify`] would report it as unreachable. A failed
-    /// insert therefore invalidates the graph: discard it and rebuild rather
-    /// than continuing to insert. [`Self::build`] already does this by
-    /// dropping the partial graph. Rolling back instead would mean undoing
-    /// links and the prunes they triggered on other points, which is not
-    /// worth the complexity for a failure that means the vector store cannot
-    /// read its own rows.
+    /// Failure-atomic: every existing neighbour list touched by linking or
+    /// pruning is journaled before mutation. If the vector store returns an
+    /// error at any distance-computation boundary, those lists, the entry
+    /// point, the maximum level, and the point count are restored exactly.
+    /// The same row can then be retried without rebuilding the graph.
     ///
     /// # Errors
     ///
@@ -644,62 +721,85 @@ impl NativeHnsw {
                 reason: format!("points must be inserted in row order; expected {expected}"),
             });
         }
+        if id as usize >= store.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "store.len".to_owned(),
+                value: store.len().to_string(),
+                reason: format!("store does not contain insertion row {id}"),
+            });
+        }
 
+        let original_point_count = self.adjacency.len();
+        let original_entry = self.entry;
+        let original_max_level = self.max_level;
+        let mut journal = MutationJournal::new(original_point_count);
         let level = self.sampler.level_for(id);
         self.adjacency.push(Adjacency::with_level(level));
 
-        // First point: it becomes the entry and has nothing to link to.
-        let Some(mut current) = self.entry else {
-            self.entry = Some(id);
-            self.max_level = level;
-            return Ok(());
-        };
+        let outcome = (|| {
+            // First point: it becomes the entry and has nothing to link to.
+            let Some(mut current) = self.entry else {
+                self.entry = Some(id);
+                self.max_level = level;
+                return Ok(());
+            };
 
-        let previous_max = self.max_level;
+            let previous_max = self.max_level;
 
-        // Phase 1 — greedy descent through the layers ABOVE this point's
-        // own level, purely to find a good entry point.
-        //
-        // bd-u3wt defect (1): this descent must never link the new point.
-        // It runs strictly above `level`, so no edge can be created in a
-        // layer the new point does not occupy.
-        let mut layer = previous_max;
-        while layer > level {
-            current = self.greedy_descend(current, id, layer, store)?;
-            layer -= 1;
-        }
-
-        // Phase 2 — connect, starting at min(new level, previous max).
-        //
-        // bd-u3wt defect (2): starting above `previous_max` would link at
-        // layers no other point occupies; starting below the new point's
-        // level would leave its upper layers empty. The floor is exactly
-        // this minimum.
-        let mut entry_points = vec![current];
-        for layer in (0..=level.min(previous_max)).rev() {
-            let candidates = self.search_layer(
-                &entry_points,
-                id,
-                layer,
-                self.params.ef_construction,
-                store,
-                visited,
-            )?;
-            let selected =
-                Self::select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
-
-            self.link(id, &selected, layer, store)?;
-
-            entry_points = candidates.iter().map(|candidate| candidate.id).collect();
-            if entry_points.is_empty() {
-                entry_points.push(current);
+            // Phase 1 — greedy descent through the layers ABOVE this point's
+            // own level, purely to find a good entry point.
+            //
+            // bd-u3wt defect (1): this descent must never link the new point.
+            // It runs strictly above `level`, so no edge can be created in a
+            // layer the new point does not occupy.
+            let mut layer = previous_max;
+            while layer > level {
+                current = self.greedy_descend(current, id, layer, store)?;
+                layer -= 1;
             }
-        }
 
-        // A point sampled above the previous maximum becomes the new entry.
-        if level > previous_max {
-            self.entry = Some(id);
-            self.max_level = level;
+            // Phase 2 — connect, starting at min(new level, previous max).
+            //
+            // bd-u3wt defect (2): starting above `previous_max` would link at
+            // layers no other point occupies; starting below the new point's
+            // level would leave its upper layers empty. The floor is exactly
+            // this minimum.
+            let mut entry_points = vec![current];
+            for layer in (0..=level.min(previous_max)).rev() {
+                let candidates = self.search_layer(
+                    &entry_points,
+                    id,
+                    layer,
+                    self.params.ef_construction,
+                    store,
+                    visited,
+                )?;
+                let selected =
+                    Self::select_neighbours(id, &candidates, self.params.degree_at(layer), store)?;
+
+                self.link(id, &selected, layer, store, &mut journal)?;
+
+                entry_points = candidates.iter().map(|candidate| candidate.id).collect();
+                if entry_points.is_empty() {
+                    entry_points.push(current);
+                }
+            }
+
+            // A point sampled above the previous maximum becomes the new
+            // entry only after every fallible operation has succeeded.
+            if level > previous_max {
+                self.entry = Some(id);
+                self.max_level = level;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = outcome {
+            journal.rollback(&mut self.adjacency);
+            self.adjacency.truncate(original_point_count);
+            self.entry = original_entry;
+            self.max_level = original_max_level;
+            return Err(error);
         }
         Ok(())
     }
@@ -898,6 +998,7 @@ impl NativeHnsw {
         selected: &[u32],
         layer: usize,
         store: &D,
+        journal: &mut MutationJournal,
     ) -> SearchResult<()> {
         for &neighbour in selected {
             if neighbour == id {
@@ -915,12 +1016,14 @@ impl NativeHnsw {
                 continue;
             }
 
+            journal.record(&self.adjacency, id, layer);
             if let Some(point) = self.adjacency.get_mut(id as usize)
                 && let Some(list) = point.layers.get_mut(layer)
                 && !list.contains(&neighbour)
             {
                 list.push(neighbour);
             }
+            journal.record(&self.adjacency, neighbour, layer);
             if let Some(point) = self.adjacency.get_mut(neighbour as usize)
                 && let Some(list) = point.layers.get_mut(layer)
                 && !list.contains(&id)
@@ -932,7 +1035,7 @@ impl NativeHnsw {
             // `id` is protected: pruning the edge that was just created
             // would orphan the new point, since nothing else links to it
             // yet. Measured before this guard: 33 of 5000 points reachable.
-            self.prune(neighbour, layer, Some(id), store)?;
+            self.prune(neighbour, layer, Some(id), store, journal)?;
         }
         Ok(())
     }
@@ -944,6 +1047,7 @@ impl NativeHnsw {
         layer: usize,
         protected: Option<u32>,
         store: &D,
+        journal: &mut MutationJournal,
     ) -> SearchResult<()> {
         let budget = self.params.degree_at(layer);
         let current = self.neighbours_at(id, layer).to_vec();
@@ -993,12 +1097,14 @@ impl NativeHnsw {
             .map(|candidate| candidate.id)
             .filter(|candidate| !kept.contains(candidate))
             .collect();
+        journal.record(&self.adjacency, id, layer);
         if let Some(point) = self.adjacency.get_mut(id as usize)
             && let Some(list) = point.layers.get_mut(layer)
         {
             *list = kept;
         }
         for neighbour in dropped {
+            journal.record(&self.adjacency, neighbour, layer);
             if let Some(point) = self.adjacency.get_mut(neighbour as usize)
                 && let Some(list) = point.layers.get_mut(layer)
             {
@@ -1041,6 +1147,11 @@ impl NativeHnsw {
         ef: Option<usize>,
         store: &D,
     ) -> SearchResult<Vec<(u32, f32)>> {
+        self.verify_store_cardinality(store)
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "native-hnsw",
+                source: Box::new(source),
+            })?;
         if k == 0 || self.adjacency.is_empty() {
             return Ok(Vec::new());
         }
@@ -1152,6 +1263,13 @@ impl NativeHnsw {
                             neighbour_level: target.level(),
                         });
                     }
+                    if !target.neighbours(layer).contains(&id) {
+                        return Err(GraphDefect::MissingReciprocalEdge {
+                            id,
+                            layer,
+                            neighbour,
+                        });
+                    }
                 }
             }
         }
@@ -1186,11 +1304,36 @@ impl NativeHnsw {
         }
         Ok(())
     }
+
+    /// Verify graph structure against the exact caller-owned vector store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphDefect::StoreCardinalityMismatch`] before structural
+    /// verification when graph ids and store rows do not describe the same
+    /// universe; otherwise returns the first defect from [`Self::verify`].
+    pub fn verify_for_store<D: VectorDistance>(&self, store: &D) -> Result<(), GraphDefect> {
+        self.verify_store_cardinality(store)?;
+        self.verify()
+    }
+
+    fn verify_store_cardinality<D: VectorDistance>(&self, store: &D) -> Result<(), GraphDefect> {
+        let graph_points = self.adjacency.len();
+        let store_rows = store.len();
+        if graph_points != store_rows {
+            return Err(GraphDefect::StoreCardinalityMismatch {
+                graph_points,
+                store_rows,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// An in-memory store of unit-normalised vectors using cosine distance
     /// (`1 - dot`), which is the metric the two-tier index uses.
@@ -1306,6 +1449,62 @@ mod tests {
         }
     }
 
+    struct FailingStore<'a> {
+        inner: &'a TestStore,
+        fail_between_at: Option<usize>,
+        between_calls: Cell<usize>,
+    }
+
+    impl<'a> FailingStore<'a> {
+        fn new(inner: &'a TestStore, fail_between_at: Option<usize>) -> Self {
+            Self {
+                inner,
+                fail_between_at,
+                between_calls: Cell::new(0),
+            }
+        }
+
+        fn between_calls(&self) -> usize {
+            self.between_calls.get()
+        }
+    }
+
+    impl VectorDistance for FailingStore<'_> {
+        fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+            self.inner.distance_to_query(id, query)
+        }
+
+        fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+            let ordinal = self.between_calls.get() + 1;
+            self.between_calls.set(ordinal);
+            if self.fail_between_at == Some(ordinal) {
+                return Err(SearchError::InvalidConfig {
+                    field: "fault_injection".to_owned(),
+                    value: ordinal.to_string(),
+                    reason: "injected distance_between failure".to_owned(),
+                });
+            }
+            self.inner.distance_between(a, b)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    fn topology_snapshot(graph: &NativeHnsw) -> (Vec<Vec<Vec<u32>>>, Option<u32>, usize, usize) {
+        (
+            graph
+                .adjacency
+                .iter()
+                .map(|point| point.layers.clone())
+                .collect(),
+            graph.entry,
+            graph.max_level,
+            graph.len(),
+        )
+    }
+
     fn params() -> HnswParams {
         HnswParams {
             m: 8,
@@ -1355,7 +1554,10 @@ mod tests {
             graph.adjacency.push(Adjacency::with_level(level));
             let selected = (0..id).collect::<Vec<_>>();
             for layer in 0..=level.min(graph.max_level) {
-                graph.link(id, &selected, layer, &store).expect("link");
+                let mut journal = MutationJournal::new(id as usize);
+                graph
+                    .link(id, &selected, layer, &store, &mut journal)
+                    .expect("link");
             }
         }
         graph
@@ -1404,6 +1606,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_rejects_a_missing_reciprocal_edge() {
+        let store = TestStore::synthetic(32, 4);
+        let mut graph = NativeHnsw::build(params(), 17, &store).expect("build");
+        graph.verify().expect("a freshly built graph is sound");
+
+        let (id, layer, neighbour) = graph
+            .adjacency
+            .iter()
+            .enumerate()
+            .find_map(|(id, point)| {
+                point
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .find_map(|(layer, neighbours)| {
+                        neighbours
+                            .first()
+                            .copied()
+                            .map(|neighbour| (id, layer, neighbour))
+                    })
+            })
+            .expect("a non-trivial graph has an edge");
+        let id = u32::try_from(id).expect("test graph length fits u32");
+        graph.adjacency[neighbour as usize].layers[layer].retain(|&candidate| candidate != id);
+
+        assert_eq!(
+            graph
+                .verify()
+                .expect_err("a one-way edge must fail structural attestation"),
+            GraphDefect::MissingReciprocalEdge {
+                id,
+                layer,
+                neighbour,
+            }
+        );
+    }
+
+    #[test]
+    fn store_cardinality_is_part_of_attestation_and_search_admission() {
+        let store = TestStore::synthetic(12, 4);
+        let graph = NativeHnsw::build(params(), 23, &store).expect("build");
+        graph.verify_for_store(&store).expect("matching store");
+
+        for mismatched_count in [11usize, 13] {
+            let mismatched = TestStore::synthetic(mismatched_count, 4);
+            assert_eq!(
+                graph
+                    .verify_for_store(&mismatched)
+                    .expect_err("mismatched store must fail attestation"),
+                GraphDefect::StoreCardinalityMismatch {
+                    graph_points: 12,
+                    store_rows: mismatched_count,
+                }
+            );
+            let error = graph
+                .search(&[1.0, 0.0, 0.0, 0.0], 0, None, &mismatched)
+                .expect_err("cardinality admission must precede the zero-k fast path");
+            assert!(
+                error.to_string().contains("vector store exposes"),
+                "typed cardinality defect was not preserved: {error}"
+            );
+        }
+
+        let empty = NativeHnsw::new(params(), 23).expect("empty graph");
+        let error = empty
+            .search(&[1.0, 0.0, 0.0, 0.0], 0, None, &store)
+            .expect_err("cardinality admission must precede the empty-graph fast path");
+        assert!(
+            error.to_string().contains("graph indexes 0 points"),
+            "empty mismatch was silently accepted: {error}"
+        );
+    }
+
+    #[test]
+    fn insert_is_failure_atomic_at_every_distance_boundary() {
+        let store = TestStore::synthetic(48, 8);
+        let mut before = NativeHnsw::new(params(), 0x00a7_0b1c).expect("new");
+        for id in 0..40u32 {
+            before.insert(id, &store).expect("build prefix");
+        }
+        before.verify().expect("prefix graph");
+        let before_topology = topology_snapshot(&before);
+
+        let counting = FailingStore::new(&store, None);
+        let mut expected = before.clone();
+        expected.insert(40, &counting).expect("reference insertion");
+        let distance_boundaries = counting.between_calls();
+        assert!(
+            distance_boundaries > params().m0,
+            "fixture must exercise search, selection, and post-link pruning boundaries"
+        );
+        let expected_topology = topology_snapshot(&expected);
+
+        for fail_at in 1..=distance_boundaries {
+            let failing = FailingStore::new(&store, Some(fail_at));
+            let mut trial = before.clone();
+            let error = trial
+                .insert(40, &failing)
+                .expect_err("the selected distance boundary must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected distance_between failure"),
+                "unexpected error at distance boundary {fail_at}: {error}"
+            );
+            assert_eq!(
+                topology_snapshot(&trial),
+                before_topology,
+                "distance failure {fail_at}/{distance_boundaries} changed graph topology, entry, \
+                 maximum level, or point count"
+            );
+            trial.verify().expect("rollback must leave a sound graph");
+
+            trial
+                .insert(40, &store)
+                .expect("retry after a rolled-back failure must succeed");
+            assert_eq!(
+                topology_snapshot(&trial),
+                expected_topology,
+                "retry after distance failure {fail_at} did not reproduce the clean insertion"
+            );
+        }
+    }
+
     // ─── Boundaries ─────────────────────────────────────────────────────
 
     #[test]
@@ -1411,11 +1738,9 @@ mod tests {
         // n = 0,1,2,3 and around the degree budget m and m+1.
         for count in [0usize, 1, 2, 3, 8, 9, 17] {
             let store = TestStore::synthetic(count, 6);
-            let graph = NativeHnsw::build(params(), 42, &store)
-                .unwrap_or_else(|e| panic!("build with {count} points: {e}"));
-            graph
-                .verify()
-                .unwrap_or_else(|e| panic!("verify with {count} points: {e}"));
+            let graph =
+                NativeHnsw::build(params(), 42, &store).expect("boundary-sized graph must build");
+            graph.verify().expect("boundary-sized graph must verify");
             assert_eq!(graph.len(), count);
 
             let hits = graph

@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 pub type DocId = CompactString;
 
 use crate::SearchError;
+use crate::error::SearchResult;
 use crate::explanation::HitExplanation;
+use crate::generation::EmbeddingIdentityBundleV1;
 use crate::query_class::QueryClass;
 
 // ---------------------------------------------------------------------------
@@ -122,6 +124,217 @@ impl VectorHit {
     pub fn cmp_rank(&self, other: &Self) -> std::cmp::Ordering {
         self.cmp_by_score(other)
             .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed per-tier query embeddings (bd-9xuj)
+// ---------------------------------------------------------------------------
+
+/// A query embedding bound to the complete identity of the embedding space
+/// that produced it.
+///
+/// Raw `&[f32]` crossing an API boundary is how one vector gets applied to
+/// multiple spaces: same dimensions make the bug silently plausible, and
+/// different dimensions merely error. A bound embedding carries its
+/// [`EmbeddingIdentityBundleV1`], so every consumer can verify the vector
+/// belongs to the space it is about to search — by fingerprint, not by
+/// dimension coincidence.
+#[derive(Debug, Clone)]
+pub struct BoundQueryEmbedding {
+    vector: Vec<f32>,
+    identity: EmbeddingIdentityBundleV1,
+    identity_fingerprint: String,
+}
+
+impl BoundQueryEmbedding {
+    /// Bind a vector to the identity of the space that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::DimensionMismatch`] when the vector length
+    /// does not match the identity's storage dimension — a bound embedding
+    /// must be internally consistent before it can prove anything to a
+    /// consumer.
+    pub fn new(vector: Vec<f32>, identity: EmbeddingIdentityBundleV1) -> SearchResult<Self> {
+        let expected = identity.storage.dimension as usize;
+        if vector.len() != expected {
+            return Err(SearchError::DimensionMismatch {
+                expected,
+                found: vector.len(),
+            });
+        }
+        let identity_fingerprint = identity.fingerprint();
+        Ok(Self {
+            vector,
+            identity,
+            identity_fingerprint,
+        })
+    }
+
+    /// The query vector.
+    #[must_use]
+    pub fn vector(&self) -> &[f32] {
+        &self.vector
+    }
+
+    /// The complete identity of the producing space.
+    #[must_use]
+    pub const fn identity(&self) -> &EmbeddingIdentityBundleV1 {
+        &self.identity
+    }
+
+    /// Lowercase SHA-256 fingerprint of the full identity bundle, computed
+    /// once at bind time.
+    #[must_use]
+    pub fn identity_fingerprint(&self) -> &str {
+        &self.identity_fingerprint
+    }
+
+    /// Verify this embedding was produced in the space a consumer expects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming `tier` when the
+    /// fingerprints differ — including the same-dimension wrong-space case
+    /// that raw vector APIs silently accept.
+    pub fn verify_space(&self, expected_fingerprint: &str, tier: &str) -> SearchResult<()> {
+        if self.identity_fingerprint == expected_fingerprint {
+            return Ok(());
+        }
+        Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.identity"),
+            value: self.identity_fingerprint.clone(),
+            reason: format!(
+                "query embedding was produced in a different embedding space than the \
+                 {tier} index expects (expected identity fingerprint {expected_fingerprint})"
+            ),
+        })
+    }
+}
+
+/// Per-tier query embeddings, each independently bound to its own space.
+///
+/// Replaces raw cross-tier `&[f32]` parameters (bd-9xuj): the fast and
+/// quality tiers are different embedding spaces, so a search that consults
+/// both must carry one bound embedding per tier. At least one tier is
+/// always present — a tier-less value is unrepresentable.
+#[derive(Debug, Clone)]
+pub struct TieredQueryEmbeddings {
+    fast: Option<BoundQueryEmbedding>,
+    quality: Option<BoundQueryEmbedding>,
+}
+
+impl TieredQueryEmbeddings {
+    /// Embeddings for both tiers (full progressive search).
+    #[must_use]
+    pub const fn progressive(fast: BoundQueryEmbedding, quality: BoundQueryEmbedding) -> Self {
+        Self {
+            fast: Some(fast),
+            quality: Some(quality),
+        }
+    }
+
+    /// Fast-tier only (quality unavailable or deliberately skipped).
+    #[must_use]
+    pub const fn fast_only(fast: BoundQueryEmbedding) -> Self {
+        Self {
+            fast: Some(fast),
+            quality: None,
+        }
+    }
+
+    /// Quality-tier only: the quality index is the primary retrieval arm,
+    /// never a rescoring pass over a fast-selected pool.
+    #[must_use]
+    pub const fn quality_only(quality: BoundQueryEmbedding) -> Self {
+        Self {
+            fast: None,
+            quality: Some(quality),
+        }
+    }
+
+    /// The fast-tier embedding, when present.
+    #[must_use]
+    pub const fn fast(&self) -> Option<&BoundQueryEmbedding> {
+        self.fast.as_ref()
+    }
+
+    /// The quality-tier embedding, when present.
+    #[must_use]
+    pub const fn quality(&self) -> Option<&BoundQueryEmbedding> {
+        self.quality.as_ref()
+    }
+
+    /// The topology these embeddings can support on their own (before
+    /// index/coverage constraints narrow it).
+    #[must_use]
+    pub const fn supported_topology(&self) -> RetrievalTopology {
+        match (&self.fast, &self.quality) {
+            (Some(_), Some(_)) => RetrievalTopology::FullProgressive,
+            (Some(_), None) => RetrievalTopology::FastOnly,
+            (None, Some(_)) => RetrievalTopology::QualityOnly,
+            // Unreachable by construction; lexical-only is the honest floor.
+            (None, None) => RetrievalTopology::LexicalOnly,
+        }
+    }
+}
+
+/// The retrieval shape a search actually ran with.
+///
+/// Requested versus realized topology is first-class telemetry (bd-9xuj):
+/// a caller that asked for full progressive search and silently received a
+/// hash-candidate pool rescored by the quality model was the defining
+/// failure this vocabulary exists to make impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "topology")]
+pub enum RetrievalTopology {
+    /// No semantic arm ran; lexical results only.
+    LexicalOnly,
+    /// Non-semantic hash vectors, as an explicit test/control lane or a
+    /// declared lexical degradation — never semantic availability.
+    HashControl,
+    /// Fast-tier retrieval only.
+    FastOnly,
+    /// Quality index as the primary retrieval arm.
+    QualityOnly,
+    /// Fast retrieval for latency plus direct quality retrieval unioned
+    /// before fusion; never a mere rescoring of the fast pool.
+    FullProgressive,
+    /// Progressive retrieval where only part of the doc set has
+    /// quality-tier coverage.
+    PartialQuality {
+        /// Fraction of live documents with quality-tier embeddings, in
+        /// parts per million for exact serialization.
+        coverage_ppm: u32,
+    },
+}
+
+impl RetrievalTopology {
+    /// Stable `snake_case` code for logs and machine payloads.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::LexicalOnly => "lexical_only",
+            Self::HashControl => "hash_control",
+            Self::FastOnly => "fast_only",
+            Self::QualityOnly => "quality_only",
+            Self::FullProgressive => "full_progressive",
+            Self::PartialQuality { .. } => "partial_quality",
+        }
+    }
+
+    /// True when semantic vectors contribute to results. `HashControl` is
+    /// deliberately non-semantic.
+    #[must_use]
+    pub const fn is_semantic(&self) -> bool {
+        matches!(
+            self,
+            Self::FastOnly
+                | Self::QualityOnly
+                | Self::FullProgressive
+                | Self::PartialQuality { .. }
+        )
     }
 }
 
@@ -423,6 +636,130 @@ mod tests {
             score,
             doc_id: doc_id.into(),
         }
+    }
+
+    fn identity(name: &str, dim: u32) -> EmbeddingIdentityBundleV1 {
+        EmbeddingIdentityBundleV1::explicit_test_model(name, dim)
+    }
+
+    #[test]
+    fn bound_embedding_rejects_dimension_mismatch_at_bind_time() {
+        let error = BoundQueryEmbedding::new(vec![0.5; 7], identity("fast-model", 8))
+            .expect_err("7-dim vector cannot bind an 8-dim space");
+        assert!(matches!(
+            error,
+            SearchError::DimensionMismatch {
+                expected: 8,
+                found: 7
+            }
+        ));
+    }
+
+    #[test]
+    fn same_dimension_wrong_space_is_rejected_by_fingerprint() {
+        // The defining bd-9xuj case: identical dimensions, different models.
+        // A raw &[f32] API cannot tell these apart; the bound embedding must.
+        let fast =
+            BoundQueryEmbedding::new(vec![0.5; 8], identity("fast-model", 8)).expect("bind fast");
+        let quality_space = identity("quality-model", 8);
+        assert_ne!(
+            fast.identity_fingerprint(),
+            quality_space.fingerprint(),
+            "distinct models must have distinct fingerprints"
+        );
+        let error = fast
+            .verify_space(&quality_space.fingerprint(), "quality")
+            .expect_err("fast vector must not enter the quality space");
+        match error {
+            SearchError::InvalidConfig { field, reason, .. } => {
+                assert_eq!(field, "query_embedding.quality.identity");
+                assert!(reason.contains("different embedding space"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matching_space_verifies() {
+        let bundle = identity("fast-model", 8);
+        let expected = bundle.fingerprint();
+        let bound = BoundQueryEmbedding::new(vec![0.5; 8], bundle).expect("bind");
+        bound
+            .verify_space(&expected, "fast")
+            .expect("same space must verify");
+        assert_eq!(bound.vector().len(), 8);
+    }
+
+    #[test]
+    fn tiered_constructors_report_supported_topology() {
+        let fast = BoundQueryEmbedding::new(vec![0.1; 8], identity("fast-model", 8)).unwrap();
+        let quality =
+            BoundQueryEmbedding::new(vec![0.2; 16], identity("quality-model", 16)).unwrap();
+
+        let progressive = TieredQueryEmbeddings::progressive(fast.clone(), quality.clone());
+        assert_eq!(
+            progressive.supported_topology(),
+            RetrievalTopology::FullProgressive
+        );
+        assert!(progressive.fast().is_some() && progressive.quality().is_some());
+
+        assert_eq!(
+            TieredQueryEmbeddings::fast_only(fast).supported_topology(),
+            RetrievalTopology::FastOnly
+        );
+        let quality_only = TieredQueryEmbeddings::quality_only(quality);
+        assert_eq!(
+            quality_only.supported_topology(),
+            RetrievalTopology::QualityOnly
+        );
+        assert!(quality_only.fast().is_none());
+    }
+
+    #[test]
+    fn topology_codes_are_stable_and_semantic_partition_is_correct() {
+        let all = [
+            RetrievalTopology::LexicalOnly,
+            RetrievalTopology::HashControl,
+            RetrievalTopology::FastOnly,
+            RetrievalTopology::QualityOnly,
+            RetrievalTopology::FullProgressive,
+            RetrievalTopology::PartialQuality {
+                coverage_ppm: 750_000,
+            },
+        ];
+        let codes: Vec<&str> = all.iter().map(RetrievalTopology::code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "lexical_only",
+                "hash_control",
+                "fast_only",
+                "quality_only",
+                "full_progressive",
+                "partial_quality",
+            ]
+        );
+        for topology in all {
+            let semantic = topology.is_semantic();
+            match topology {
+                RetrievalTopology::LexicalOnly | RetrievalTopology::HashControl => {
+                    assert!(!semantic, "{topology:?} must not claim semantic");
+                }
+                _ => assert!(semantic, "{topology:?} is semantic"),
+            }
+        }
+    }
+
+    #[test]
+    fn topology_serde_roundtrips_with_coverage() {
+        let topology = RetrievalTopology::PartialQuality {
+            coverage_ppm: 333_333,
+        };
+        let json = serde_json::to_string(&topology).expect("serialize");
+        assert!(json.contains("partial_quality"));
+        assert!(json.contains("333333"));
+        let decoded: RetrievalTopology = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, topology);
     }
 
     /// `cmp_rank` must be a total order: score descending, ties broken on `doc_id`.
