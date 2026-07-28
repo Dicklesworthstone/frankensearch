@@ -7628,3 +7628,40 @@ receipt for that boundary, a newly built self-hashing exact ELF, all five valid
 A/A controls on an eligible quiet host, and one immediate same-ELF
 reproduction. Do not resample either current Threadripper route, weaken a null
 law, or use CV as the gate.
+
+## 2026-07-28 — QG-3 LIFECYCLE PREFLIGHT / INVALID-NULL: fence is counted; smoke timing is not admissible (`bd-h6eh`, FoggySquirrel)
+
+Filtered smoke preflight
+`qg3-lifecycle-preflight-b083-20260728T1845Z` ran clean revision
+`b083751e2198519c15beed3bac939e21c63783c4` from self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+(76,818,792 bytes) on the eligible Threadripper PRO 5995WX host. The linked
+incumbent was Tantivy 0.26.1. The incomplete smoke selection intentionally ran
+only `watch/medium/initial`, so it could not activate QG-3.
+
+The new lifecycle sidecar counted 563 `measured_work` fences. Every fence
+joined Tantivy's indexing/merge workers and rearmed the writer; join time
+ranged from 141,044 ns to 580,066 ns (median 271,689 ns), and no searchable
+segment count changed across the join boundary. The sidecar SHA-256 is
+`8ea955fea03d6471c0f08f34260a671d65ab8b49cc6c31ce6c9f3c65b151c176`.
+This proves the missing harness boundary is now executed and counted.
+
+The same-invocation Tantivy/Tantivy control nevertheless failed:
+**0.946217**, log-CI corresponding to ratio
+**[0.711185, 1.037331]**, log-MAD `0.099718`, order effect `-0.155310`,
+and drift `-0.053459`. Two consecutive small-fixture operations were about
+10x slower than the other 18 A/A arm observations even though their join
+receipts stayed below 0.6 ms. Accordingly, the apparent Quill/Tantivy
+`0.898246 [0.814406, 0.995098]` ratio is not a gate number.
+
+**Decision: INVALID-NULL / NO CLAIM.** Evidence JSON SHA-256
+`8b249f5439c1ef31447461829adc36b270a47ef74b771c7b0b25da564dba6dc8`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-lifecycle-preflight-b083-20260728T1845Z/`.
+
+Retry only with the required full-scale five-cell QG-3 candidate after the
+hourly `git-prune-broken-refs` timer is explicitly suspended for the complete
+candidate/reproduction window. Require every counted lifecycle receipt, all
+five A/A controls, and an immediate same-ELF reproduction to admit. Do not
+repeat the small smoke slice, weaken a null law, or gate on CV.

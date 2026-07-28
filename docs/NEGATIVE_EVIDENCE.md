@@ -17046,3 +17046,43 @@ remains inside the declared metric. Emit a counted segment/merge lifecycle
 receipt proving that boundary, build a new self-hashing exact ELF, and rerun all
 five cells on an eligible quiet host. Admit only if every A/A null passes, then
 run one immediate same-ELF reproduction; never weaken a null law or gate on CV.
+
+### 2026-07-28 — QG-3 lifecycle fence is counted; smoke A/A remains invalid (`bd-h6eh`, FoggySquirrel)
+
+Filtered smoke preflight
+`qg3-lifecycle-preflight-b083-20260728T1845Z` used clean revision
+`b083751e2198519c15beed3bac939e21c63783c4`, self-reported executing ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+(76,818,792 bytes), and the actual linked Tantivy 0.26.1 incumbent on the
+eligible 128-logical-CPU Threadripper PRO 5995WX host. It selected only the
+smoke-scaled `watch/medium/initial` cell, so it was incomplete and
+non-promotable by construction.
+
+The repaired harness emitted 563 counted `measured_work` lifecycle receipts:
+each consumed Tantivy's writer, joined indexing and merge workers, and rearmed
+the writer before the next operation. Join durations were 141,044–580,066 ns
+(median 271,689 ns); no searchable segment count changed across a join. The
+sidecar SHA-256 is
+`8ea955fea03d6471c0f08f34260a671d65ab8b49cc6c31ce6c9f3c65b151c176`.
+Thus the prior missing-maintenance defect is mechanically closed.
+
+The A/A control still failed at **0.946217**, ratio CI
+**[0.711185, 1.037331]**, log-MAD `0.099718`, order effect `-0.155310`,
+and drift `-0.053459`. Raw samples identify two consecutive small-fixture
+operations around 10x slower than the other 18 arms while their lifecycle
+joins remained sub-millisecond. That external scheduling sensitivity makes
+the apparent Quill/Tantivy `0.898246 [0.814406, 0.995098]` result
+undecidable; CV is recorded only as provenance.
+
+**Decision: INVALID-NULL / NO CLAIM.** The sealed evidence JSON SHA-256 is
+`8b249f5439c1ef31447461829adc36b270a47ef74b771c7b0b25da564dba6dc8`;
+all artifacts are retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-lifecycle-preflight-b083-20260728T1845Z/`.
+
+**Retry predicate:** do not repeat the smoke slice. Run the complete
+full-scale five-cell QG-3 candidate only after explicit suspension of the
+hourly `git-prune-broken-refs` timer for the whole candidate/reproduction
+window. Require every lifecycle receipt and all five same-invocation A/A
+controls to admit, then reproduce immediately from this same ELF; never weaken
+a null law or gate on CV.
