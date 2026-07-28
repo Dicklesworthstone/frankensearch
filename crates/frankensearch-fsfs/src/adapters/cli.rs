@@ -1054,6 +1054,8 @@ fn is_known_cli_flag(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -1154,6 +1156,51 @@ mod tests {
             parse_cli_args(["version"]).unwrap().command,
             CliCommand::Version
         );
+    }
+
+    #[test]
+    fn advertised_doctor_diagnostics_commands_parse_without_hidden_flags() {
+        let global = parse_cli_args(["doctor", "--format", "json"]).expect("global doctor command");
+        assert_eq!(global.command, CliCommand::Doctor);
+        assert_eq!(global.format, OutputFormat::Json);
+
+        let scoped = parse_cli_args([
+            "doctor",
+            "--index-dir",
+            "/tmp/frankensearch-index",
+            "--format",
+            "json",
+        ])
+        .expect("index-scoped doctor command");
+        assert_eq!(scoped.command, CliCommand::Doctor);
+        assert_eq!(
+            scoped.index_dir.as_deref(),
+            Some(Path::new("/tmp/frankensearch-index"))
+        );
+        assert_eq!(scoped.format, OutputFormat::Json);
+
+        let reindex = parse_cli_args([
+            "index",
+            ".",
+            "--full",
+            "--index-dir",
+            "/tmp/frankensearch-index",
+        ])
+        .expect("identity-change recovery command");
+        assert_eq!(reindex.command, CliCommand::Index);
+        assert!(reindex.full_reindex);
+        assert_eq!(
+            reindex.index_dir.as_deref(),
+            Some(Path::new("/tmp/frankensearch-index"))
+        );
+        assert_eq!(reindex.target_path.as_deref(), Some(Path::new(".")));
+
+        for unsupported in ["--check-models", "--fix"] {
+            assert!(
+                parse_cli_args(["doctor", unsupported]).is_err(),
+                "operator guidance must not advertise unsupported {unsupported}"
+            );
+        }
     }
 
     #[test]

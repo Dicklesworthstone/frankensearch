@@ -347,7 +347,7 @@ pub fn model_cache_cold_diagnostics_fixture() -> ModelCacheDiagnosticsReport {
                 "quality model artifacts exist but cold warmup is over budget",
                 "FRANKENSEARCH_MODEL_DIR",
                 "indexing.model_dir",
-                "fsfs doctor --check-models --format json",
+                "fsfs doctor --format json",
             ),
             advice(
                 "model_cache.cold.fast_only_escape",
@@ -541,7 +541,7 @@ fn model_cache_report(
         kind: MODEL_CACHE_DIAGNOSTICS_REPORT_KIND.to_owned(),
         v: MODEL_CACHE_DIAGNOSTICS_SCHEMA_VERSION,
         generated_at: "2026-05-08T00:00:00Z".to_owned(),
-        surface: "fsfs doctor --check-models --format json".to_owned(),
+        surface: "fsfs doctor --format json".to_owned(),
         diagnostics: ModelCacheWarmupDiagnostics {
             state,
             warmup_latency_ms,

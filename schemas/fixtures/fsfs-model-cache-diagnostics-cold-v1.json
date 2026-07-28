@@ -2,7 +2,7 @@
   "kind": "fsfs_model_cache_diagnostics_report",
   "v": 1,
   "generated_at": "2026-05-08T00:00:00Z",
-  "surface": "fsfs doctor --check-models --format json",
+  "surface": "fsfs doctor --format json",
   "diagnostics": {
     "state": "cold",
     "warmup_latency_ms": 420,
@@ -25,7 +25,7 @@
       "summary": "quality model artifacts exist but cold warmup is over budget",
       "env_var": "FRANKENSEARCH_MODEL_DIR",
       "config_knob": "indexing.model_dir",
-      "command": "fsfs doctor --check-models --format json"
+      "command": "fsfs doctor --format json"
     },
     {
       "reason_code": "model_cache.cold.fast_only_escape",
