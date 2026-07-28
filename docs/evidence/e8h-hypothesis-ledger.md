@@ -25,17 +25,23 @@ Retry predicate:   <filled only on REJECT>
 ## Machine-class fingerprint corrections (authoritative over class-ID labels)
 
 - The trj classes follow the committed-baseline convention **`trj-zen3-<width>c`**
-  (first baseline: `QG-2.trj-zen3-16c.latest.json`, ACTIVATED 2026-07-28 as an
-  honest 0.350 [0.345–0.356] MISS vs the ≥1.5x target — Quill 59.8k vs Tantivy
-  171.2k docs/s single-thread, 30 paired runs, clean A/A null). The machine is a
-  Threadripper PRO **5995WX: Zen 3, 64 cores / 128 threads**, single NUMA node
-  (NPS1), 512 GB, governor=performance, SMT on
+  (first artifact: `QG-2.trj-zen3-16c.latest.json`, activated on 2026-07-28
+  with a measured 0.350 [0.345–0.356] MISS vs the ≥1.5x target — Quill
+  59.8k vs Tantivy 171.2k docs/s single-thread, 30 paired runs, clean A/A
+  null). That pre-fix artifact is now **quarantined**, not an active baseline:
+  the Tantivy arm constructed and dropped an unused replacement writer after
+  its measured worker join. Although replacement construction was excluded
+  from `join_elapsed_ns`, its post-sample work and resource churn could bleed
+  into later paired samples. Commit `ebd91757` replaces that path with a
+  terminal join whose receipt says `writer_rearmed=false`; only its fresh
+  candidate plus immediate same-worker reproduction can establish the new
+  ratio. The direction and magnitude are deliberately not predicted, and
+  0.35 must not be used as a floor or current performance claim. The machine
+  is a Threadripper PRO **5995WX: Zen 3, 64 cores / 128 threads**, single
+  NUMA node (NPS1), 512 GB, governor=performance, SMT on
   (`docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/` — directory name
   predates the convention; contents authoritative). Consequences: **no AVX-512
   in silicon** (Zen 4+ only); per-CCD L3 partitioning still applies (8 CCDs).
-  Known QG-2 fairness item: a rearmed-writer construct/drop sits inside Quill's
-  timed window that Tantivy's arm does not pay — the rerun will improve Quill's
-  ratio; W2 rows should treat 0.35x as a floor, not the exact deficit.
 - `m4-macos` is a Mac mini **M4 Pro, 14 cores (10P+4E), 64 GB, 16 KiB pages**
   (`docs/evidence/e8h/fingerprints/m4-macos-20260728/`).
 - `m5-macos`: no reachable host as of 2026-07-28 (mmini/mmini-legacy asleep on the

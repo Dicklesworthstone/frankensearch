@@ -21,14 +21,18 @@ The campaign premise ("Quill ≥ 3.0x Tantivy at bulk indexing") is currently
   0.1066–0.1725x Tantivy docs/s on `bulk/medium/*` — 5.8–9.4x behind, a ~23x
   miss against the ≥3.0x target (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-27,
   `bd-h6eh`).
-- **QG-2 (single-worker indexing, current-schema activated baseline):** at
-  timed source `5bb74e76` and activation commit `73444b59`, Quill measured
-  about 59,818 docs/s versus Tantivy at about 171,223 docs/s: ratio 0.349775,
-  CI95 [0.344698, 0.356240]. The same-worker confirmation measured 0.345546,
-  CI95 [0.341425, 0.351114], and both A/A controls were valid. The raw bundle
-  remains authoritative while `benchmark_join_workers_and_rearm` fairness is
-  resolved by proof or a terminal-join rerun; activation state must be
-  reconciled explicitly if that audit fails.
+- **QG-2 (single-worker indexing, pre-fix quarantined diagnostic):** at timed
+  source `5bb74e76` and activation commit `73444b59`, Quill measured about
+  59,818 docs/s versus Tantivy at about 171,223 docs/s: ratio 0.349775, CI95
+  [0.344698, 0.356240]. The same-worker confirmation measured 0.345546, CI95
+  [0.341425, 0.351114], and both A/A controls were valid. A later lifecycle
+  audit found that the Tantivy arm constructed and dropped an unused
+  replacement writer after its measured worker join. That work was outside
+  `join_elapsed_ns` but could contaminate later paired samples. The raw bundle
+  remains diagnostic provenance, not a current baseline or claim. Commit
+  `ebd91757` installs a terminal join with `writer_rearmed=false`; a fresh
+  candidate plus immediate same-worker reproduction determines the corrected
+  ratio without a predeclared direction.
 - **QG-6 (query latency), smoke scale only:** ~25x slower at 500 docs, with
   Round-0 profiling attributing >83% to immutable TERMDICT reparse/validation
   (`bd-quill-e8-perf-doctrine-x4e4.5`, `bd-quill-gauntlet-qg6-cache-termdict-gwd4`).
@@ -243,11 +247,12 @@ profile or portable implementation.
 
 ### W2 — Bulk-index single-thread cost (QG-1 and QG-2)
 
-The provisional QG-1 thread=1 cell is 8.9x behind. The authoritative QG-2
-current-schema baseline is about 2.86x behind parity after harness evolution.
-They are separate contracts, not interchangeable ratios, but both identify
-single-worker per-document work as a priority. QG-2 first resolves the
-join/rearm fairness question described in §0.
+The provisional QG-1 thread=1 cell is 8.9x behind. The quarantined pre-fix
+QG-2 diagnostic suggested a roughly 2.86x deficit after harness evolution,
+but it is not a baseline and must not size a performance claim. The two
+contracts are not interchangeable; both nevertheless justify profiling
+single-worker per-document work. The corrected QG-2 terminal-lifecycle rerun
+described in §0 establishes its usable ratio.
 
 | Lever | Hypothesis | Caution |
 |---|---|---|
@@ -256,7 +261,7 @@ join/rearm fairness question described in §0.
 | Seal-time section checksum cost | if sealing hashes every byte with a heavy hash, it is a prime constant-factor suspect | Algorithm change = FSLX format-registry bump; EV-scored; registry owners coordinate. |
 | Commit-path fsync count | batch directory syncs; two-slot manifest bounds the floor | `strace -c` / `fs_usage` census first; Law 7 on macOS. |
 
-### W3 — Parallel scale-out (QG-1 high-thread, QG-8; truth machine: trj-zen-128c)
+### W3 — Parallel scale-out (QG-1 high-thread, QG-8; truth machine: trj-zen3-*)
 
 Shard-per-worker indexing into independent segments, then
 `KeeperWriter::concat_merge` (already exists) — N independent single-thread
@@ -386,8 +391,8 @@ this contract was written).
   `scripts/check_ledger_null_control.sh` commit gate).
 - Runner: `scripts/perf-runner.sh` (machine-class provenance capture).
 - QG-1 provisional miss row: `docs/NEGATIVE_EVIDENCE.md` § 2026-07-27
-  (bd-h6eh). QG-2 current baseline: `73444b59` from timed source `5bb74e76`,
-  pending the fairness disposition in `x4e4.5.5`. QG-6 attribution: `gwd4`
-  bead body.
+  (bd-h6eh). QG-2 pre-fix quarantined diagnostic: `73444b59` from timed
+  source `5bb74e76`; the corrected terminal-lifecycle rerun is owned by
+  `x4e4.5.5`. QG-6 attribution: `gwd4` bead body.
 - Flip decision consumer: `bd-3beo`; conformance authority:
   `bd-quill-flip-conformance-release-gate-0r2p`.
