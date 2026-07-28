@@ -7676,3 +7676,37 @@ hourly `git-prune-broken-refs` timer is explicitly suspended for the complete
 candidate/reproduction window. Require every counted lifecycle receipt, all
 five A/A controls, and an immediate same-ELF reproduction to admit. Do not
 repeat the small smoke slice, weaken a null law, or gate on CV.
+
+## 2026-07-28 — QG-2 INVALID-EXECUTION: maintenance guard misread `activating` as inactive (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Candidate and incumbent ran side-by-side in one invocation from clean revision
+`b083751e2198519c15beed3bac939e21c63783c4` and self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+on the eligible Threadripper PRO 5995WX host. The launcher gated on
+`systemctl is-active --quiet`, which returned nonzero even though
+`git-prune-broken-refs.service` still reported
+`ActiveState=activating, SubState=start`. The measurement consequently
+overlapped the hourly prune job.
+
+A/A null: `0.970095 [0.936478, 1.011197]`, same invocation. Its order effect
+was `-0.063025`, outside the predeclared bound. The apparent Quill/Tantivy
+ratio `0.342649 [0.330444, 0.358951]` is not a QG-2 number. The counted
+lifecycle sidecar recorded 33 Tantivy joins at 9,297,158–15,888,253 ns
+(median 10,409,801 ns), no segment-count changes, and SHA-256
+`2df747267e80a7351bbd760d16a7643abefd73fa920e39c90206d0fe88b11c3f`.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE + INVALID-NULL / NO CLAIM.**
+Evidence JSON SHA-256
+`2dbdbe0f5762ed3e8216f0f1e141fd9cad4b95da245204351dc5982b461cbd74`
+with embedded seal
+`d77ebb732788e4775c5ea939de83a81a2bbebbaad95785b9f26245a264ae6cff`
+is retained at
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-20260728T1927Z/`.
+
+Retry only after literal `ActiveState` and `SubState` checks prove the prune
+service is neither `activating` nor `start`, with the next timer deadline and
+quiet load recorded. Then run a fresh candidate plus immediate same-ELF
+reproduction; both A/A controls and the 2% reproduction bound must admit before
+activation. CV remains provenance only.

@@ -17099,3 +17099,39 @@ hourly `git-prune-broken-refs` timer for the whole candidate/reproduction
 window. Require every lifecycle receipt and all five same-invocation A/A
 controls to admit, then reproduce immediately from this same ELF; never weaken
 a null law or gate on CV.
+
+### 2026-07-28 — QG-2 launcher misclassified active maintenance; result is invalid (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Attempt `qg2-candidate-trj-b083-20260728T1927Z` executed clean revision
+`b083751e2198519c15beed3bac939e21c63783c4` from self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+on the eligible Threadripper PRO 5995WX host. Candidate and incumbent ran
+side-by-side in the same invocation. The launcher used
+`systemctl is-active --quiet` as its maintenance guard, but that command
+returned nonzero while `git-prune-broken-refs.service` was still
+`ActiveState=activating, SubState=start`. The benchmark therefore overlapped
+the known hourly prune job.
+
+A/A null: `0.970095 [0.936478, 1.011197]`, same invocation. It failed the
+predeclared order-effect law at `-0.063025`; CV is provenance only. The
+apparent Quill/Tantivy ratio `0.342649 [0.330444, 0.358951]` is not a QG-2
+number. Thirty-three counted Tantivy lifecycle joins took 9,297,158–15,888,253
+ns (median 10,409,801 ns), with no segment-count change; sidecar SHA-256 is
+`2df747267e80a7351bbd760d16a7643abefd73fa920e39c90206d0fe88b11c3f`.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE + INVALID-NULL / NO CLAIM.**
+Evidence JSON SHA-256
+`2dbdbe0f5762ed3e8216f0f1e141fd9cad4b95da245204351dc5982b461cbd74`
+with embedded seal
+`d77ebb732788e4775c5ea939de83a81a2bbebbaad95785b9f26245a264ae6cff`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-20260728T1927Z/`.
+
+**Retry predicate:** wait until literal service fields report neither
+`ActiveState=activating` nor `SubState=start`, record the next timer deadline
+and a quiet-host receipt, then run one new candidate and immediate same-ELF
+reproduction inside that maintenance-free window. Require both A/A controls
+and the 2% reproduction law to admit before activating QG-2; never use this
+overlapped attempt or CV as a decision.
