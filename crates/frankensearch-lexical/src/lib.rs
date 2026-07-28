@@ -1408,11 +1408,19 @@ impl TantivyIndex {
         } else {
             limit.saturating_add(tie_expansion_limit)
         };
-        let search_result = execute_query_with_offset(&searcher, &*parsed, fetch_limit, 0)?;
+        // Preserve the exact shipping TopDocs-only path for both `hits` and
+        // the expanded tie evidence. Tantivy may choose a different score
+        // accumulation or cutoff strategy when `TopDocs` is paired with
+        // `Count`, and a larger collector limit may select a different member
+        // of an exact-score cutoff tie. Count therefore runs independently,
+        // and the expanded query may describe the tie envelope but must never
+        // redefine the incumbent result whose latency and rank we compare.
+        let native_hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
+        let expanded_hits = execute_top_k(&searcher, &*parsed, fetch_limit, 0)?;
+        let total_count = execute_query_with_offset(&searcher, &*parsed, 0, 0)?.total_count;
         let snippet_gen =
             try_build_snippet_generator(&searcher, &*parsed, self.fields.content, snippet_config);
-        let mut materialized = Vec::with_capacity(search_result.hits.len());
-        for hit in search_result.hits {
+        let materialize = |hit: LexicalDocHit| -> SearchResult<OracleRankedHit> {
             let doc = load_doc(&searcher, hit.doc_address)?;
             let doc_id = doc
                 .get_first(self.fields.id)
@@ -1427,23 +1435,27 @@ impl TantivyIndex {
                     &snippet_config.highlight_postfix,
                 )
             });
-            materialized.push(OracleRankedHit {
+            Ok(OracleRankedHit {
                 doc_id,
                 score_bits: hit.bm25_score.to_bits(),
                 rank: hit.rank,
                 segment_ord: hit.doc_address.segment_ord,
                 segment_doc_id: hit.doc_address.doc_id,
                 snippet,
-            });
-        }
+            })
+        };
+        let hits = native_hits
+            .into_iter()
+            .map(&materialize)
+            .collect::<SearchResult<Vec<_>>>()?;
+        let expanded_hits = expanded_hits
+            .into_iter()
+            .map(materialize)
+            .collect::<SearchResult<Vec<_>>>()?;
 
-        let top_len = limit.min(materialized.len());
-        let cutoff_bits = top_len
-            .checked_sub(1)
-            .and_then(|index| materialized.get(index))
-            .map(|hit| hit.score_bits);
+        let cutoff_bits = hits.last().map(|hit| hit.score_bits);
         let cutoff_tie_group = cutoff_bits.map_or_else(Vec::new, |cutoff| {
-            materialized
+            expanded_hits
                 .iter()
                 .filter(|hit| {
                     f32::from_bits(hit.score_bits)
@@ -1454,20 +1466,19 @@ impl TantivyIndex {
                 .collect()
         });
         let cutoff_tie_complete = cutoff_bits.is_none_or(|cutoff| {
-            search_result.total_count <= fetch_limit
-                || materialized.last().is_none_or(|last| {
+            total_count <= fetch_limit
+                || expanded_hits.last().is_none_or(|last| {
                     !f32::from_bits(last.score_bits)
                         .total_cmp(&f32::from_bits(cutoff))
                         .is_eq()
                 })
         });
-        materialized.truncate(top_len);
 
         Ok(OracleQueryObservation {
-            hits: materialized,
+            hits,
             cutoff_tie_group,
             cutoff_tie_complete,
-            total_count: search_result.total_count,
+            total_count,
             doc_count: self.doc_count.load(Ordering::Relaxed),
         })
     }
@@ -2820,6 +2831,71 @@ mod tests {
                     .expect("snippet search")
                     .is_empty()
             );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn oracle_tie_expansion_preserves_the_shipping_top_k() {
+        let idx = TantivyIndex::in_memory_single_threaded_oracle().expect("create oracle");
+        run_with_cx(|cx| async move {
+            idx.writer
+                .lock(&cx)
+                .await
+                .expect("lock writer")
+                .set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+
+            const DOC_COUNT: usize = 256;
+            const SEGMENT_SIZE: usize = 32;
+            const LIMIT: usize = 100;
+            const QUERY: &str = "term00001 term00007 generated record";
+            for segment_start in (0..DOC_COUNT).step_by(SEGMENT_SIZE) {
+                let docs = (segment_start..segment_start + SEGMENT_SIZE)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("tie-{ordinal:03}"),
+                            "term00001 term00007 generated record",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                idx.index_documents(&cx, &docs)
+                    .await
+                    .expect("index tie segment");
+                idx.commit(&cx).await.expect("commit tie segment");
+            }
+
+            let native = idx
+                .search_doc_ids(&cx, QUERY, LIMIT)
+                .expect("shipping top-k");
+            let observed = idx
+                .oracle_observe_query(
+                    &cx,
+                    QUERY,
+                    LIMIT,
+                    DOC_COUNT,
+                    &SnippetConfig {
+                        max_chars: 0,
+                        ..SnippetConfig::default()
+                    },
+                )
+                .expect("expanded oracle observation");
+            let native_rows = native
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.bm25_score.to_bits()))
+                .collect::<Vec<_>>();
+            let observed_rows = observed
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                observed_rows, native_rows,
+                "expanded tie evidence must not redefine the shipping top-k"
+            );
+            assert_eq!(observed.total_count, DOC_COUNT);
+            assert!(observed.cutoff_tie_complete);
+            assert_eq!(observed.cutoff_tie_group.len(), DOC_COUNT);
         });
     }
 

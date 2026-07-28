@@ -7411,3 +7411,80 @@ persistent filesystem with at least 120 GiB free. Before admitting the
 candidate, verify from the live process that an open `qg5-{quill,tantivy}-*`
 fixture is below that exact root; then require all three A/A controls and an
 immediate same-ELF reproduction before evaluating the 5x target.
+
+## 2026-07-28 — QG-6 EXECUTION FAILURE: expanded oracle evidence redefined native top-k (`bd-h6eh`, FoggySquirrel)
+
+Full-scale candidate `qg6-candidate-final-20260728T1353Z` ran on the quiet
+32-core reference host from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+It used the linked Tantivy 0.26.1 incumbent, four independently populated arms
+per fixture, and same-invocation Tantivy/Tantivy A/A controls. After completing
+10 of 20 required fixtures, the first natural-language `k=100` preflight
+stopped with exit 101 before any artifact could be sealed:
+`AdapterFailure { phase: Preflight, arm: NullLeft, query_id:
+"naturallanguage-0", error_sha256:
+"5278b0954f07e15ab4ae302a7dc2b4113fd287e7198fc22d5ae20f1d21730459",
+error_bytes: 70 }`.
+
+The hash resolves exactly to `Tantivy native timed query disagrees with its
+tie-evidence observation`. Source adjudication found that the timed arm used
+Tantivy's shipping `TopDocs`-only top-k path, while
+`oracle_observe_query` populated its nominal native hits from a larger
+`(TopDocs, Count)` collection. A larger/count-paired collector can select a
+different exact-score cutoff-tie member or score-accumulation path, so the
+evidence query had incorrectly been allowed to redefine the incumbent result.
+This is an oracle self-consistency defect, not a Quill/Tantivy mismatch.
+
+No QG-6 ratio or PASS/MISS follows. The ten printed partial cells are
+diagnostic-only because the normative 20-cell gate did not complete and no
+candidate artifact exists.
+
+The repair preserves `oracle_observe_query.hits` from the exact shipping
+`TopDocs`-only path, builds expanded cutoff-tie evidence with a second
+`TopDocs`-only collection, and obtains exact match count from an independent
+`Count` query.
+
+Retry only from a newly built, self-hashing exact ELF containing that repair.
+First require the focused natural-language `k=100` preflight to establish that
+the oracle's native `(doc_id, score_bits)` rows equal `search_doc_ids`; then
+run all 20 full-scale fixtures at the 10-pair minimum on the quiet 32-core
+reference host. Admit a gate result only if every same-invocation A/A control
+passes and an immediate same-ELF reproduction completes; never promote the
+ten-cell partial output.
+
+## 2026-07-28 — QG-3 INVALID-NULL: 32-core 5975WX route fails two controls (`bd-h6eh`, FoggySquirrel)
+
+Full-scale candidate `qg3-candidate-final2-20260728T1532Z` completed all five
+required cells on the 32-core Threadripper PRO 5975WX host from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+It used the actual linked Tantivy 0.26.1 incumbent, same-invocation
+Tantivy/Tantivy A/A, 10 paired blocks per cell, and a clean build identity.
+The machine receipt recorded 64 logical CPUs, `powersave` governor, and load
+average `1.99` at start / `4.14` at end.
+
+Three cells admitted, but two did not:
+
+- initial ingest: A/A log-MAD `0.060301` exceeded `0.048790`, and drift
+  `0.097409` exceeded `0.048790`;
+- in-process update throughput: A/A center `-0.070367` with log-CI
+  `[-0.115867,-0.006122]`, CI half-width `0.115867`, and order effect
+  `-0.050491` each failed their predeclared law.
+
+The valid in-process and fresh-process update-to-searchable A/B ratios were
+respectively `1.989707 [1.870255,2.111947]` and
+`1.245745 [1.210001,1.295709]` Quill/Tantivy, but they are not QG-3 gate
+numbers because the required gate is indivisible.
+
+No QG-3 PASS or MISS follows. Artifact
+`1f0b5a5d313e4bdb02f2fc149d6d41ba93e73acc5ebd0b0e05c7fce828f12f4b`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final2-20260728T1532Z/`.
+
+Close the 5975WX/powersave vein. Retry only after switching to the isolated
+Threadripper PRO 5995WX host with its `performance` governor, after its natural
+maintenance sweep and the already-prioritized QG-2 pair complete. Preserve the
+exact `f9ab…` ELF and 10-pair minimum; require all five A/A controls to admit,
+then start one immediate same-window reproduction. Do not resample this host,
+change its governor, weaken a null law, or gate on CV.

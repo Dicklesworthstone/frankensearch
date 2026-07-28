@@ -4592,7 +4592,7 @@ sites (`.get()`, `.as_object()`, filters) mostly compile unchanged; construction
 feature needed for `Deserialize<Arc<T>>`.** Landing it (carefully — with `--all-features`/`full` lane checks per
 [[cfg-gated-feature-migration-blindspot]]) is the next step. `metadata_clone_ab` bench kept as evidence.
 
-**✅ LANDED `f5e9c9d` (2026-07-02, pushed main+master).** `ScoredResult.metadata: Option<serde_json::Value>` →
+**✅ LANDED `f5e9c9d` (2026-07-02, pushed to main and mirrored to the legacy compatibility branch).** `ScoredResult.metadata: Option<serde_json::Value>` →
 `Option<Arc<serde_json::Value>>`. The async searcher's `lexical_metadata_by_doc` map now holds `&Arc<Value>` so the
 per-winner `.copied().cloned()` at `searcher.rs:2514` is an `Arc::clone` (the win); `filter.matches` sites use
 `.as_deref()` (trait unchanged, `Arc` derefs to `Value`); serde `rc` feature added to core for `Deserialize<Arc>`.
@@ -9390,7 +9390,7 @@ Route-next from `45530fb`: do my two independent quality wins — pool-local min
 3. **The best config is RECALL-SATURATION-gated (the session's recurring axis), NOT "use both".** Deeply recall-bound nfcorpus → RRF + SAFE TRIPLE (+0.0158) wins, because protecting smoothing's feed-recall (which RRF does, poolMM does not) matters most where recall is the bottleneck. Near-saturated arguana/scidocs → poolMM + SAFE TRIPLE wins (+0.0144, +0.0090), because there the game is top-ORDER and poolMM's magnitude signal outweighs its small recall cost. Saturated + pure-re-order scifact (smoothing feed-recall Δ=0) → a SINGLE lever is best (poolMM alone +0.0052); stacking two order-fiddling levers just compounds noise to −0.0030.
 4. **This re-derives the recall-saturation gate from a NEW angle and prevents a naive deployment mistake.** One would expect two orthogonal wins (different pipeline stages) to stack; measured, they don't — because both ultimately fight over the same top-k slots with OPPOSITE magnitude priors. The correct deployment is a SELECTOR keyed on recall@50, not a stack: recall-bound → RRF+smoothing; recall-saturated → poolMM (+smoothing only where near-saturated, not fully-saturated).
 
-**Net:** pool-min-max score fusion and SAFE TRIPLE smoothing are each net-positive alone but do NOT compose — they interfere because poolMM's magnitude preference demotes exactly the moderate-magnitude neighbor-supported relevants that smoothing works to promote (halving nfcorpus's feed-recall gain), making the pair sub-additive everywhere and net-negative on saturated scifact. Deploy by SELECTION on recall@50: RRF+SAFE-TRIPLE where recall-bound (protect recall), poolMM(+SAFE-TRIPLE) where near/fully-saturated (top-order magnitude). This closes the `45530fb` route-next (a) and reinforces that recall-saturation is the master gate across BOTH the smoothing and fusion sub-veins. Caveats: BGE-small, single tier weight 1.3×, no reranker (feed-recall proxy shown for the mechanism); α=0.3/M=10. Verified: `fastembed` BGE-small + `rank_bm25` + `sklearn` TF-IDF graph, BEIR scifact/nfcorpus/arguana/scidocs full test sets, no cargo/torch. `compose.py` in `$D`.
+**Net:** pool-min-max score fusion and SAFE TRIPLE smoothing are each net-positive alone but do NOT compose — they interfere because poolMM's magnitude preference demotes exactly the moderate-magnitude neighbor-supported relevants that smoothing works to promote (halving nfcorpus's feed-recall gain), making the pair sub-additive everywhere and net-negative on saturated scifact. Deploy by SELECTION on recall@50: RRF+SAFE-TRIPLE where recall-bound (protect recall), poolMM(+SAFE-TRIPLE) where near/fully-saturated (top-order magnitude). This closes the `45530fb` route-next (a) and reinforces that recall-saturation is the primary gate across BOTH the smoothing and fusion sub-veins. Caveats: BGE-small, single tier weight 1.3×, no reranker (feed-recall proxy shown for the mechanism); α=0.3/M=10. Verified: `fastembed` BGE-small + `rank_bm25` + `sklearn` TF-IDF graph, BEIR scifact/nfcorpus/arguana/scidocs full test sets, no cargo/torch. `compose.py` in `$D`.
 
 ### 2026-07-04 — CopperKestrel — Pool-score-fusion MECHANISM confirmed + refined: the `45530fb` gain IS top-match-magnitude recovery — ANY normalization that COMPRESSES the top match's relative magnitude destroys it (tanh harmful everywhere −0.004…−0.011; robust-z/median-IQR −0.0088 on arguana where the top has real spread). Methodological fix: out-of-pool = tier pool-MIN (not mean) lifts z-score POOL to the best average (+0.0059 mean nDCG over RRF)
 
@@ -11414,7 +11414,7 @@ now the async default too.)
 Consolidated map after a long session. The earlier 2026-07-11 HOLD entries were true for each path inspected
 in isolation but MISSED a sibling divergence between the sync and async searchers — corrected below.
 
-**SHIPPED this session (recall-preserving, median-gated, pushed main+master):**
+**SHIPPED this session (recall-preserving, median-gated, pushed to main and mirrored to the legacy compatibility branch):**
 1. `03769fc` — simhash byte-fast `split_whitespace` (per-doc ingest tokenizer) — **1.42x**, token-identical
    (lever median 0.7031 < null p5 0.9785). Found by mining the INGEST path the frontier maps had skipped.
 2. `bc16256` — async `TwoTierIndex::search_fast_with_params` fast tier: exact f16 scan → lossless int8
@@ -16810,3 +16810,76 @@ During the first live sample, confirm an open
 only a complete three-density candidate whose A/A controls all pass, followed
 immediately by a same-ELF reproduction that also passes every null and
 reproduction law; never promote this `f9ab…` route.
+
+### 2026-07-28 — QG-6 expanded-oracle top-k mismatch aborts the full candidate (`bd-h6eh`, FoggySquirrel)
+
+Full-scale candidate `qg6-candidate-final-20260728T1353Z` used revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+the actual linked Tantivy 0.26.1 incumbent, four independently populated arms
+per fixture, and same-invocation Tantivy/Tantivy A/A controls on the quiet
+32-core reference host.
+
+The process completed 10 of 20 normative fixtures, then exited 101 during the
+first natural-language `k=100` preflight with
+`AdapterFailure { phase: Preflight, arm: NullLeft, query_id:
+"naturallanguage-0", error_sha256:
+"5278b0954f07e15ab4ae302a7dc2b4113fd287e7198fc22d5ae20f1d21730459",
+error_bytes: 70 }`. The SHA-256 and length identify the exact bounded error
+`Tantivy native timed query disagrees with its tie-evidence observation`.
+
+Manual source adjudication showed that this was a Tantivy-oracle
+self-consistency failure. The timed/native result came from shipping
+`TopDocs` only, but the evidence path derived its nominal native top-k from a
+larger `(TopDocs, Count)` collection. Under a large exact-score cutoff tie,
+collector shape and limit are not permitted to redefine which native result is
+being measured.
+
+**Decision: INVALID-EXECUTION / NO CLAIM.** No artifact sealed, and none of the
+ten partial ratios is a QG-6 number.
+
+The source repair keeps the observation's `hits` on the exact shipping
+`TopDocs`-only path, collects the expanded cutoff-tie envelope with a second
+`TopDocs`-only query, and obtains exact total count through an independent
+`Count` query.
+
+**Retry predicate:** build a new exact self-reporting ELF containing the repair.
+Require a focused natural-language `k=100` preflight to prove byte/score
+identity between `oracle_observe_query.hits` and `search_doc_ids`, then run a
+complete 20-fixture candidate with 10 pairs per cell on the quiet 32-core
+reference host. Start the immediate same-ELF reproduction only if every A/A
+admits, and promote only if both complete artifacts satisfy all null and
+reproduction laws.
+
+### 2026-07-28 — QG-3 5975WX candidate remains undecidable in two required cells (`bd-h6eh`, FoggySquirrel)
+
+Candidate `qg3-candidate-final2-20260728T1532Z` completed all five full-scale
+cells on the 32-core Threadripper PRO 5975WX machine with revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+the actual linked Tantivy 0.26.1 incumbent, 10 pairs, and a same-invocation
+Tantivy/Tantivy control. The machine receipt recorded the `powersave` governor
+and load-average movement from `1.99` to `4.14`.
+
+The initial-ingest null failed dispersion (`0.060301 > 0.048790`) and drift
+(`0.097409 > 0.048790`). The in-process update-throughput null failed center
+(`-0.070367`, CI `[-0.115867,-0.006122]`), CI half-width
+(`0.115867 > 0.095310`), and order effect
+(`-0.050491 > 0.048790`). The other three controls admitted. Their apparent
+in-process and fresh-process update-to-searchable ratios were
+`1.989707 [1.870255,2.111947]` and
+`1.245745 [1.210001,1.295709]`, but an indivisible gate with two invalid
+required cells has no competitive number.
+
+**Decision: INVALID-NULL / NO CLAIM.** Evidence artifact
+`1f0b5a5d313e4bdb02f2fc149d6d41ba93e73acc5ebd0b0e05c7fce828f12f4b`
+is retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final2-20260728T1532Z/`.
+
+**Retry predicate:** close the 5975WX/powersave vein. After the natural
+maintenance sweep and prioritized QG-2 pair complete, switch to the isolated
+Threadripper PRO 5995WX host with its already-observed `performance` governor.
+Use the same exact `f9ab…` ELF and 10-pair minimum, require all five A/A
+controls to admit, and run one immediate same-window reproduction before
+promotion. Do not mutate either host's governor, weaken the null laws, or gate
+on CV.
