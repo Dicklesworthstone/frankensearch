@@ -341,7 +341,7 @@ mod tests {
     };
     use crate::schema::Analyzer;
     #[cfg(feature = "tantivy-oracle")]
-    use frankensearch_core::{IndexableDocument, LexicalSearch};
+    use frankensearch_core::{IndexableDocument, LexicalWrite};
     #[cfg(feature = "tantivy-oracle")]
     use frankensearch_lexical::{SnippetConfig as OracleSnippetConfig, TantivyIndex};
     #[cfg(feature = "tantivy-oracle")]

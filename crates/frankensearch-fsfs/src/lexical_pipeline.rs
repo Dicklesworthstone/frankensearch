@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use asupersync::Cx;
 use compact_str::CompactString;
-use frankensearch_core::{IndexableDocument, LexicalSearch, SearchError, SearchResult};
+use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
 use frankensearch_quill::{QuillIndex, indexable_document_content_hash};
 use tracing::debug;
 
@@ -601,11 +601,11 @@ impl<'a> QuillLexicalBackend<'a> {
                 }
                 LexicalAction::Delete { doc_id, .. } => {
                     if !documents.is_empty() {
-                        LexicalSearch::index_documents(self.index, cx, &documents).await?;
+                        LexicalWrite::index_documents(self.index, cx, &documents).await?;
                         documents.clear();
                     }
                     if self.index.has_uncommitted_changes() {
-                        LexicalSearch::commit(self.index, cx).await?;
+                        LexicalWrite::commit(self.index, cx).await?;
                     }
                     if self.index.delete_document(cx, &doc_id).await? {
                         stats.deleted = stats.deleted.saturating_add(1);
@@ -615,7 +615,7 @@ impl<'a> QuillLexicalBackend<'a> {
             }
         }
         if !documents.is_empty() {
-            LexicalSearch::index_documents(self.index, cx, &documents).await?;
+            LexicalWrite::index_documents(self.index, cx, &documents).await?;
         }
         Ok(stats)
     }

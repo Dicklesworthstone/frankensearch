@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::traits::LexicalWrite;
 use frankensearch_core::types::IndexableDocument;
 use frankensearch_lexical::TantivyIndex;
 

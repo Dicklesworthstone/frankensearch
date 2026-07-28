@@ -34,7 +34,7 @@ use tempfile::TempDir;
 #[cfg(feature = "lexical-tantivy")]
 use frankensearch_core::query_class::QueryClass;
 #[cfg(feature = "lexical-tantivy")]
-use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::traits::LexicalWrite;
 #[cfg(feature = "lexical-tantivy")]
 use frankensearch_core::types::IndexableDocument;
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};

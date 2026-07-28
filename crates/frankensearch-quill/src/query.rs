@@ -3976,7 +3976,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "tantivy-oracle")]
-    use frankensearch_core::traits::LexicalSearch;
+    use frankensearch_core::traits::LexicalWrite;
     #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::types::IndexableDocument;
     #[cfg(feature = "tantivy-oracle")]
