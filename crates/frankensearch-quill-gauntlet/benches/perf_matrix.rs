@@ -25,24 +25,25 @@ use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
 use frankensearch_core::bench_support::print_bench_elf_sha256;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
-use frankensearch_lexical::TantivyIndex;
+use frankensearch_lexical::{SnippetConfig, TantivyIndex};
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
     QuillIndex, SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
-    BuildIdentity, ColdCacheEvidence, CorpusIdentity, DistributionSummary, EvidenceCell,
-    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity,
+    BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
+    CountState, DistributionSummary, EngineObservation, EvidenceCell, EvidenceCellSpec,
+    EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity, NativeTieKey,
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence,
     PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
-    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, estimate_paired_experiment,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, seeded_balanced_pair_order,
-    validate_matrix,
+    RankClass, RankedHit, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, compare_observations,
+    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
+    seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -54,6 +55,7 @@ const FULL_BATCH_DOCUMENTS: usize = 5_000;
 const SMOKE_BATCH_DOCUMENTS: usize = 250;
 const FULL_SEGMENTS: usize = 10;
 const SMOKE_SEGMENTS: usize = 4;
+const QG6_TIE_EXPANSION_LIMIT: usize = 100_000;
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -167,13 +169,23 @@ impl EngineArm {
 }
 
 enum PreparedQueryArm {
-    Quill(Box<QuillIndex>),
-    Tantivy(Box<TantivyIndex>),
+    Quill {
+        index: Box<QuillIndex>,
+    },
+    Tantivy {
+        role: Qg6ArmRole,
+        index: Box<TantivyIndex>,
+    },
 }
 
 enum PreparedQueryResult {
     Quill(Vec<frankensearch_quill::QuillHit>),
     Tantivy(Vec<frankensearch_lexical::LexicalIdHit>),
+}
+
+struct PreparedQueryPreflight {
+    native_hits: Vec<(String, u32)>,
+    observation: Option<EngineObservation>,
 }
 
 struct BenchContext {
@@ -1404,7 +1416,148 @@ fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     hasher.update(spec.writer_heap_bytes.unwrap_or(50_000_000).to_le_bytes());
     hasher.update(spec.k.expect("QG-6 k").to_le_bytes());
     hasher.update(b"frankensearch-default-lexical-schema-and-parser-v1");
+    hasher.update(b"qg6-rank-parity/exact-score-native-tie-envelope-v1");
     lower_hex(&hasher.finalize())
+}
+
+fn qg6_preflight_result(
+    context: &BenchContext,
+    arm: &PreparedQueryArm,
+    query: &Qg6QuerySpec,
+    k: usize,
+) -> Result<PreparedQueryPreflight, String> {
+    match arm {
+        PreparedQueryArm::Tantivy { role, index } => {
+            let native = index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| error.to_string())?;
+            let native_hits = native
+                .iter()
+                .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
+                .collect::<Vec<_>>();
+            if *role != Qg6ArmRole::NullLeft {
+                return Ok(PreparedQueryPreflight {
+                    native_hits,
+                    observation: None,
+                });
+            }
+            let mut snippet_config = SnippetConfig::default();
+            snippet_config.max_chars = 0;
+            let observed = index
+                .oracle_observe_query(
+                    &context.cx,
+                    query.text(),
+                    k,
+                    QG6_TIE_EXPANSION_LIMIT,
+                    &snippet_config,
+                )
+                .map_err(|error| error.to_string())?;
+            let observed_native = observed
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            if native_hits != observed_native {
+                return Err(
+                    "Tantivy native timed query disagrees with its tie-evidence observation"
+                        .to_owned(),
+                );
+            }
+            let hits = observed
+                .hits
+                .into_iter()
+                .map(|hit| RankedHit {
+                    doc_id: hit.doc_id,
+                    score_bits: hit.score_bits,
+                    native_tie_key: NativeTieKey::TantivyDocAddress {
+                        segment_ord: hit.segment_ord,
+                        doc_id: hit.segment_doc_id,
+                    },
+                })
+                .collect();
+            let cutoff_tie_group = observed
+                .cutoff_tie_group
+                .into_iter()
+                .map(|hit| RankedHit {
+                    doc_id: hit.doc_id,
+                    score_bits: hit.score_bits,
+                    native_tie_key: NativeTieKey::TantivyDocAddress {
+                        segment_ord: hit.segment_ord,
+                        doc_id: hit.segment_doc_id,
+                    },
+                })
+                .collect();
+            Ok(PreparedQueryPreflight {
+                native_hits,
+                observation: Some(EngineObservation {
+                    hits,
+                    cutoff_tie_group,
+                    cutoff_tie_complete: observed.cutoff_tie_complete,
+                    offset_tie_group: Vec::new(),
+                    offset_tie_complete: false,
+                    snippets: BTreeMap::new(),
+                    match_count: CountState::Value(
+                        u64::try_from(observed.total_count)
+                            .map_err(|_| "Tantivy match count does not fit u64")?,
+                    ),
+                    doc_count: u64::try_from(observed.doc_count)
+                        .map_err(|_| "Tantivy document count does not fit u64")?,
+                    ast_differences: Vec::new(),
+                }),
+            })
+        }
+        PreparedQueryArm::Quill { index, .. } => {
+            let native = index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| error.to_string())?;
+            let native_hits = native
+                .iter()
+                .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            let evidence = index
+                .search_paginated(&context.cx, query.text(), k, 0, true)
+                .map_err(|error| error.to_string())?;
+            let evidence_native = evidence
+                .hits
+                .iter()
+                .take(k)
+                .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            if native_hits != evidence_native {
+                return Err(
+                    "Quill native timed query disagrees with its tie-evidence observation"
+                        .to_owned(),
+                );
+            }
+            let total_count = evidence
+                .total_count
+                .ok_or_else(|| "Quill tie evidence omitted its exact count".to_owned())?;
+            let hits = native
+                .into_iter()
+                .map(|hit| RankedHit {
+                    doc_id: hit.document_id,
+                    score_bits: hit.score.to_bits(),
+                    native_tie_key: NativeTieKey::QuillDocId {
+                        doc_id: hit.global_docid,
+                    },
+                })
+                .collect();
+            Ok(PreparedQueryPreflight {
+                native_hits,
+                observation: Some(EngineObservation {
+                    hits,
+                    cutoff_tie_group: Vec::new(),
+                    cutoff_tie_complete: false,
+                    offset_tie_group: Vec::new(),
+                    offset_tie_complete: false,
+                    snippets: BTreeMap::new(),
+                    match_count: CountState::Value(total_count),
+                    doc_count: evidence.doc_count,
+                    ast_differences: Vec::new(),
+                }),
+            })
+        }
+    }
 }
 
 fn qg6_query_specs(spec: &PerfCellSpec) -> Vec<Qg6QuerySpec> {
@@ -1499,7 +1652,9 @@ fn prepared_qg6_streams(
                 );
                 let _ = commit(context, &index);
                 setup.record_commit();
-                Ok(PreparedQueryArm::Quill(Box::new(index)))
+                Ok(PreparedQueryArm::Quill {
+                    index: Box::new(index),
+                })
             } else {
                 let index = tantivy_in_memory(spec);
                 let _ = index_batches_observed(
@@ -1512,17 +1667,77 @@ fn prepared_qg6_streams(
                 );
                 let _ = commit(context, &index);
                 setup.record_commit();
-                Ok(PreparedQueryArm::Tantivy(Box::new(index)))
+                Ok(PreparedQueryArm::Tantivy {
+                    role,
+                    index: Box::new(index),
+                })
             }
         },
     )
     .expect("prepare four independent QG-6 arms");
+    let mut preflight_search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| {
+        qg6_preflight_result(context, arm, query, k)
+    };
+    let mut preflight_normalize = |result: &PreparedQueryPreflight| {
+        Qg6SearchResult::from_ordered_doc_ids(
+            result
+                .native_hits
+                .iter()
+                .map(|(doc_id, _)| doc_id.clone())
+                .collect(),
+        )
+    };
+    let mut semantic_compare = |_query: &Qg6QuerySpec,
+                                expected_role: Qg6ArmRole,
+                                expected: &PreparedQueryPreflight,
+                                observed_role: Qg6ArmRole,
+                                observed: &PreparedQueryPreflight| {
+        if expected_role != Qg6ArmRole::NullLeft {
+            return Err("QG-6 semantic comparator baseline is not null-left".to_owned());
+        }
+        if observed_role != Qg6ArmRole::EffectTreatment {
+            return if expected.native_hits == observed.native_hits {
+                Ok(())
+            } else {
+                Err("Tantivy A/A preflight changed native ranked hits".to_owned())
+            };
+        }
+        let subject = observed
+            .observation
+            .clone()
+            .ok_or_else(|| "Quill preflight omitted tie-envelope evidence".to_owned())?;
+        let oracle = expected
+            .observation
+            .clone()
+            .ok_or_else(|| "Tantivy preflight omitted tie-envelope evidence".to_owned())?;
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .map_err(|error| error.to_string())?;
+        if report.status == ComparisonStatus::Failed
+            || !matches!(
+                report.rank_class,
+                RankClass::RankExact | RankClass::TieOrder
+            )
+        {
+            return Err(format!(
+                "cross-engine result parity failed: status={:?} rank={:?} first={:?}",
+                report.status, report.rank_class, report.first_divergence
+            ));
+        }
+        Ok(())
+    };
+    let validated = prepared
+        .validate_semantic_parity_with(
+            &mut preflight_search,
+            &mut preflight_normalize,
+            &mut semantic_compare,
+        )
+        .expect("QG-6 score/tie-envelope preflight parity");
     let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| match arm {
-        PreparedQueryArm::Quill(index) => index
+        PreparedQueryArm::Quill { index, .. } => index
             .search_doc_ids(&context.cx, query.text(), k)
             .map(PreparedQueryResult::Quill)
             .map_err(|error| error.to_string()),
-        PreparedQueryArm::Tantivy(index) => index
+        PreparedQueryArm::Tantivy { index, .. } => index
             .search_doc_ids(&context.cx, query.text(), k)
             .map(PreparedQueryResult::Tantivy)
             .map_err(|error| error.to_string()),
@@ -1538,9 +1753,6 @@ fn prepared_qg6_streams(
         };
         Qg6SearchResult::from_ordered_doc_ids(ordered_doc_ids)
     };
-    let validated = prepared
-        .validate_exact_parity_with(&mut search, &mut normalize)
-        .expect("QG-6 exact ordered preflight parity");
     let rounds_per_query = runs
         .div_ceil(QG6_QUERY_GROUPS)
         .max(evidence.policy.min_group_pairs);

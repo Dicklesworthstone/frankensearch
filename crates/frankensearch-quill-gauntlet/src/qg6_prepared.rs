@@ -2,9 +2,10 @@
 //!
 //! The generic runner deliberately owns the lifecycle boundary: engines are
 //! constructed and populated through [`Qg6PreparedExperiment::prepare_with`],
-//! validated for exact ordered-result parity, warmed equally, and only then
-//! exposed to the timed schedule. This keeps corpus construction, commits,
-//! configuration, warmup, and parity checks outside every timed interval.
+//! validated for exact or explicitly proven semantic result parity, warmed
+//! equally, and only then exposed to the timed schedule. This keeps corpus
+//! construction, commits, configuration, warmup, and parity checks outside
+//! every timed interval.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -462,6 +463,23 @@ pub enum Qg6HarnessError {
         /// SHA-256 of the compared document ID.
         observed_doc_sha256: String,
     },
+    /// An explicit semantic-parity proof rejected one preflight comparison.
+    #[error(
+        "QG-6 preflight semantic-parity failure for query {query_id:?}: \
+         {expected_arm:?} vs {observed_arm:?}, sha256={error_sha256}, bytes={error_bytes}"
+    )]
+    SemanticParityFailure {
+        /// Stable query ID.
+        query_id: String,
+        /// Baseline arm.
+        expected_arm: Qg6ArmRole,
+        /// Compared arm.
+        observed_arm: Qg6ArmRole,
+        /// SHA-256 of the bounded adapter diagnostic.
+        error_sha256: String,
+        /// Diagnostic byte length.
+        error_bytes: usize,
+    },
     /// A warmup or timed result drifted from its accepted preflight receipt.
     #[error(
         "QG-6 {phase:?} result drift for {arm:?}, query {query_id:?}: \
@@ -518,10 +536,10 @@ pub struct Qg6PreparedExperiment<A> {
     lifecycle: Qg6LifecycleReceipt,
 }
 
-/// Prepared arms whose complete frozen query set passed exact parity.
+/// Prepared arms whose complete frozen query set passed result parity.
 pub struct Qg6ValidatedExperiment<A> {
     prepared: Qg6PreparedExperiment<A>,
-    expected_results: Vec<Qg6ResultReceipt>,
+    expected_results: Vec<Qg6FourArms<Qg6ResultReceipt>>,
 }
 
 impl<A> Qg6PreparedExperiment<A> {
@@ -626,7 +644,7 @@ impl<A> Qg6PreparedExperiment<A> {
     {
         let mut expected_results = Vec::with_capacity(self.queries.len());
         for query in &self.queries {
-            let baseline = invoke_search(
+            let null_left = invoke_search(
                 &self.arms,
                 query,
                 self.identity.k,
@@ -638,24 +656,155 @@ impl<A> Qg6PreparedExperiment<A> {
             self.lifecycle
                 .arm_mut(Qg6ArmRole::NullLeft)
                 .preflight_search_calls += 1;
-            for role in [
+            let null_right = invoke_search(
+                &self.arms,
+                query,
+                self.identity.k,
                 Qg6ArmRole::NullRight,
+                Qg6Phase::Preflight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::NullRight)
+                .preflight_search_calls += 1;
+            let effect_control = invoke_search(
+                &self.arms,
+                query,
+                self.identity.k,
                 Qg6ArmRole::EffectControl,
+                Qg6Phase::Preflight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::EffectControl)
+                .preflight_search_calls += 1;
+            let effect_treatment = invoke_search(
+                &self.arms,
+                query,
+                self.identity.k,
                 Qg6ArmRole::EffectTreatment,
+                Qg6Phase::Preflight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::EffectTreatment)
+                .preflight_search_calls += 1;
+            for (role, observed) in [
+                (Qg6ArmRole::NullRight, &null_right),
+                (Qg6ArmRole::EffectControl, &effect_control),
+                (Qg6ArmRole::EffectTreatment, &effect_treatment),
             ] {
-                let observed = invoke_search(
-                    &self.arms,
-                    query,
-                    self.identity.k,
-                    role,
-                    Qg6Phase::Preflight,
-                    search,
-                    normalize,
-                )?;
-                self.lifecycle.arm_mut(role).preflight_search_calls += 1;
-                compare_exact(query.id(), Qg6ArmRole::NullLeft, &baseline, role, &observed)?;
+                compare_exact(query.id(), Qg6ArmRole::NullLeft, &null_left, role, observed)?;
             }
-            expected_results.push(baseline.receipt);
+            expected_results.push(Qg6FourArms {
+                null_left: null_left.receipt,
+                null_right: null_right.receipt,
+                effect_control: effect_control.receipt,
+                effect_treatment: effect_treatment.receipt,
+            });
+        }
+        Ok(Qg6ValidatedExperiment {
+            prepared: self,
+            expected_results,
+        })
+    }
+
+    /// Validate parity with an explicit untimed semantic proof.
+    ///
+    /// The preflight adapter may return engine-native score and cutoff-tie
+    /// evidence. `normalize` extracts the exact native top-k result whose
+    /// per-arm receipt must remain stable during warmup and measurement, while
+    /// `compare` proves that each compared result is semantically equivalent
+    /// to the baseline. This permits reviewed native tie-order differences
+    /// without requiring every engine to return the same external ID at a
+    /// top-k cutoff.
+    ///
+    /// # Errors
+    ///
+    /// Stops at the first adapter, digest, result-shape, or semantic-parity
+    /// failure.
+    pub fn validate_semantic_parity_with<R, F, N, C>(
+        mut self,
+        search: &mut F,
+        normalize: &mut N,
+        compare: &mut C,
+    ) -> Result<Qg6ValidatedExperiment<A>, Qg6HarnessError>
+    where
+        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+        N: FnMut(&R) -> Qg6SearchResult,
+        C: FnMut(&Qg6QuerySpec, Qg6ArmRole, &R, Qg6ArmRole, &R) -> Result<(), String>,
+    {
+        let mut expected_results = Vec::with_capacity(self.queries.len());
+        for query in &self.queries {
+            let (null_left_native, null_left) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                Qg6ArmRole::NullLeft,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::NullLeft)
+                .preflight_search_calls += 1;
+            let (null_right_native, null_right) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                Qg6ArmRole::NullRight,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::NullRight)
+                .preflight_search_calls += 1;
+            let (effect_control_native, effect_control) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                Qg6ArmRole::EffectControl,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::EffectControl)
+                .preflight_search_calls += 1;
+            let (effect_treatment_native, effect_treatment) = invoke_search_borrowed(
+                &self.arms,
+                query,
+                self.identity.k,
+                Qg6ArmRole::EffectTreatment,
+                search,
+                normalize,
+            )?;
+            self.lifecycle
+                .arm_mut(Qg6ArmRole::EffectTreatment)
+                .preflight_search_calls += 1;
+            for (role, observed) in [
+                (Qg6ArmRole::NullRight, &null_right_native),
+                (Qg6ArmRole::EffectControl, &effect_control_native),
+                (Qg6ArmRole::EffectTreatment, &effect_treatment_native),
+            ] {
+                compare(
+                    query,
+                    Qg6ArmRole::NullLeft,
+                    &null_left_native,
+                    role,
+                    observed,
+                )
+                .map_err(|error| {
+                    semantic_parity_failure(query.id(), Qg6ArmRole::NullLeft, role, &error)
+                })?;
+            }
+            expected_results.push(Qg6FourArms {
+                null_left: null_left.receipt,
+                null_right: null_right.receipt,
+                effect_control: effect_control.receipt,
+                effect_treatment: effect_treatment.receipt,
+            });
         }
         Ok(Qg6ValidatedExperiment {
             prepared: self,
@@ -758,7 +907,7 @@ impl<A> Qg6ValidatedExperiment<A> {
                     Qg6Phase::Measurement,
                     role,
                     query.id(),
-                    &self.expected_results[block.query_index],
+                    self.expected_results[block.query_index].get(role),
                     &observed.receipt,
                 )?;
                 let sample_id = block
@@ -832,7 +981,7 @@ impl<A> Qg6ValidatedExperiment<A> {
                         Qg6Phase::Warmup,
                         role,
                         query.id(),
-                        &self.expected_results[query_index],
+                        self.expected_results[query_index].get(role),
                         &observed.receipt,
                     )?;
                     black_box(observed);
@@ -1004,6 +1153,24 @@ where
     observe_result(normalize(result), k, phase, role, query.id())
 }
 
+fn invoke_search_borrowed<A, R, F, N>(
+    arms: &Qg6FourArms<A>,
+    query: &Qg6QuerySpec,
+    k: usize,
+    role: Qg6ArmRole,
+    search: &mut F,
+    normalize: &mut N,
+) -> Result<(R, ObservedResult), Qg6HarnessError>
+where
+    F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+    N: FnMut(&R) -> Qg6SearchResult,
+{
+    let native = search(arms.get(role), black_box(query), black_box(k))
+        .map_err(|error| adapter_failure(Qg6Phase::Preflight, role, query.id(), &error))?;
+    let observed = observe_result(normalize(&native), k, Qg6Phase::Preflight, role, query.id())?;
+    Ok((native, observed))
+}
+
 fn observe_result(
     result: Qg6SearchResult,
     k: usize,
@@ -1094,6 +1261,21 @@ fn compare_exact(
         });
     }
     Ok(())
+}
+
+fn semantic_parity_failure(
+    query_id: &str,
+    expected_arm: Qg6ArmRole,
+    observed_arm: Qg6ArmRole,
+    error: &str,
+) -> Qg6HarnessError {
+    Qg6HarnessError::SemanticParityFailure {
+        query_id: query_id.to_owned(),
+        expected_arm,
+        observed_arm,
+        error_sha256: sha256_hex(error.as_bytes()),
+        error_bytes: error.len(),
+    }
 }
 
 fn ensure_stable(
@@ -1409,6 +1591,81 @@ mod tests {
             assert_eq!(lifecycle.timed_search_calls, 40);
             assert_eq!(lifecycle.timed_setup_calls, 0);
         }
+    }
+
+    #[test]
+    fn semantic_parity_retains_each_arms_native_result_receipt() {
+        let native_result = |role: Qg6ArmRole, query: &Qg6QuerySpec| {
+            let mut ids = canonical_result(query);
+            if role == Qg6ArmRole::EffectTreatment {
+                ids[1].push_str("-native-tie-choice");
+            }
+            (role, ids)
+        };
+        let mut preflight =
+            |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| Ok(native_result(arm.role, query));
+        let mut normalize =
+            |result: &(Qg6ArmRole, Vec<String>)| Qg6SearchResult::from(result.1.clone());
+        let mut compare = |_query: &Qg6QuerySpec,
+                           _expected_role: Qg6ArmRole,
+                           expected: &(Qg6ArmRole, Vec<String>),
+                           observed_role: Qg6ArmRole,
+                           observed: &(Qg6ArmRole, Vec<String>)| {
+            if observed_role == Qg6ArmRole::EffectTreatment || expected.1 == observed.1 {
+                Ok(())
+            } else {
+                Err("non-treatment native result changed".to_owned())
+            }
+        };
+        let validated = prepare()
+            .validate_semantic_parity_with(&mut preflight, &mut normalize, &mut compare)
+            .expect("semantic tie-envelope parity");
+        let mut timed_search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            Ok(Qg6SearchResult::from(native_result(arm.role, query).1))
+        };
+        let measurement = validated
+            .measure(1, 2, 0x5eed, &mut timed_search)
+            .expect("per-arm native receipts remain stable");
+
+        assert!(
+            measurement
+                .samples
+                .iter()
+                .any(|sample| sample.arm == Qg6ArmRole::EffectTreatment)
+        );
+    }
+
+    #[test]
+    fn semantic_parity_failure_hashes_adapter_diagnostic() {
+        let canary = "SECRET-SEMANTIC-PARITY-DIAGNOSTIC";
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            Ok((arm.role, canonical_result(query)))
+        };
+        let mut normalize =
+            |result: &(Qg6ArmRole, Vec<String>)| Qg6SearchResult::from(result.1.clone());
+        let mut compare = |_query: &Qg6QuerySpec,
+                           _expected_role: Qg6ArmRole,
+                           _expected: &(Qg6ArmRole, Vec<String>),
+                           observed_role: Qg6ArmRole,
+                           _observed: &(Qg6ArmRole, Vec<String>)| {
+            if observed_role == Qg6ArmRole::EffectTreatment {
+                Err(canary.to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let error = prepare()
+            .validate_semantic_parity_with(&mut preflight, &mut normalize, &mut compare)
+            .err()
+            .expect("semantic parity rejection");
+        assert!(matches!(
+            error,
+            Qg6HarnessError::SemanticParityFailure {
+                observed_arm: Qg6ArmRole::EffectTreatment,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains(canary));
     }
 
     #[test]
