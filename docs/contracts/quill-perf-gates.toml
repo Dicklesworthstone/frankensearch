@@ -33,7 +33,7 @@ source = "fsfs benchmark_baseline_matrix golden profile 'small'"
 source = "fsfs benchmark_baseline_matrix golden profile 'medium'"
 [corpus.xlarge]
 source = "synthetic 1M docs; Zipf terms s in {0.8,1.1,1.4}; code-file length distribution capped 2MiB; unicode mix lanes; generator = quill-e6.1 (content-addressed seed manifest embedded in artifacts)"
-status = "PENDING generator (quill-e6.1); gates depending on xlarge stay provisional until it lands"
+status = "LANDED deterministic content-addressed 1M-doc generator (quill-e6.1)"
 
 [gate.QG-1]
 name = "bulk indexing, multi-core"
