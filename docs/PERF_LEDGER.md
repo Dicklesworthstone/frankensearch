@@ -7295,3 +7295,24 @@ Retry only after the selected `QUILL_PERF_SCRATCH_DIR` is proven to reside on a
 persistent non-tmpfs filesystem with at least 120 GiB free. Require all five
 cells, valid same-run A/A controls, and a sealed artifact; otherwise preserve
 the attempt as execution diagnostics only.
+
+## 2026-07-28 — QG-2 INVALID-NULL: Zen3 reproduction excludes identity (`bd-h6eh`, FoggySquirrel)
+
+An 80-pair candidate and immediate reproduction on quiet 16-thread Zen3
+worker `ovh-a` used revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70`, exact ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`,
+and same-invocation Tantivy 0.26.1 A/A plus Quill/Tantivy A/B arms.
+
+The candidate was admissible: A/A **1.007384 [0.997673, 1.016251]** and
+apparent effect **0.114468 [0.113013, 0.115198]**. The reproduction was
+`INVALID-NULL`: A/A **0.987888 [0.976918, 0.998038]**, excluding identity.
+Its apparent `0.116139 [0.114059, 0.118162]` effect supports no gate verdict.
+The sealed artifacts are retained under the QG-2 2026-07-28 attempt tree.
+
+Because three QG-2 evidence routes in this sequence have now failed admission
+or reproduction and `a70977d727a938de73c6355366f3f635df3ca5dd` changed the
+indexing hot path, do not resample this Zen3/source pair. Retry only with one
+exact current-main ELF on a quiet 16-core Genoa worker; both candidate and
+rerun must independently pass every null law and remain within paired-log
+reproduction delta `0.0198026273`.

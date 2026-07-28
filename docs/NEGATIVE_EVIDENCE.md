@@ -16667,3 +16667,35 @@ gate numbers.
 non-tmpfs volume. Preserve the same exact-ELF, same-invocation A/A+A/B
 protocol, and require a complete sealed five-cell artifact; a writer error,
 partial cell set, or full scratch filesystem remains non-evidence.
+
+### 2026-07-28 — QG-2 Zen3 reproduction invalidates an otherwise admissible candidate (`bd-h6eh`, FoggySquirrel)
+
+The worker-family switch required by the preceding invalid-null row produced
+two 80-pair runs on quiet 16-thread Zen3 worker `ovh-a`. Both used revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70`, exact executing ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`,
+and the actual Tantivy 0.26.1 incumbent in the same invocation.
+
+The candidate was individually admissible. Its Tantivy/Tantivy A/A was
+**1.007384 [0.997673, 1.016251]**, and its Quill/Tantivy effect was
+**0.114468 [0.113013, 0.115198]**. The immediate same-window reproduction was
+not admissible: its A/A was **0.987888 [0.976918, 0.998038]**, excluding
+identity. The reproduction's apparent effect of
+`0.116139 [0.114059, 0.118162]` is therefore not a QG-2 number.
+
+**Decision: INVALID-NULL / NO CLAIM.** Candidate seal
+`bb090200dbfefeff1f63eb58bf75c63fdaae93e6dd73b1a0c01880366c86acc2`
+and reproduction seal
+`4489ef09f347f7608c4bd0946975c9faec00cca7d0d8749f70bb24974eb2eee1`
+are retained under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-{candidate-r4,rerun-r5}-*/`.
+Revision `a70977d727a938de73c6355366f3f635df3ca5dd` subsequently changed the
+QG-2 indexing hot path, so this pair is worker-route evidence and cannot be a
+current-main baseline even if both controls had passed.
+
+**Retry predicate:** the next QG-2 attempt must switch veins to a quiet
+16-core Genoa worker and use one exact current-main ELF for both candidate and
+immediate reproduction. Admit each run independently under all A/A center,
+CI-width, log-MAD, order-effect, and drift laws, then require paired-log
+reproduction delta at most `0.0198026273`. Do not resample this Zen3/source
+pair or weaken the identity requirement.
