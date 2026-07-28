@@ -35,7 +35,9 @@ use frankensearch_core::explanation::{
 };
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
-use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, Reranker};
+use frankensearch_core::traits::{
+    Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker,
+};
 use frankensearch_core::types::{
     EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics, SearchMode,
     SearchPhase, VectorHit,
@@ -126,7 +128,7 @@ pub struct TwoTierSearcher {
     index: Arc<TwoTierIndex>,
     fast_embedder: Arc<dyn Embedder>,
     quality_embedder: Option<Arc<dyn Embedder>>,
-    lexical: Option<Arc<dyn LexicalSearch>>,
+    lexical: Option<Arc<dyn LexicalRead>>,
     reranker: Option<Arc<dyn Reranker>>,
     #[cfg(feature = "rerank")]
     rerank_combine: frankensearch_rerank::RerankCombine,
@@ -293,8 +295,12 @@ impl TwoTierSearcher {
     }
 
     /// Set the lexical search backend for hybrid RRF fusion.
+    ///
+    /// Read-only by contract (bd-8nqz.1): the searcher never indexes or
+    /// commits through this handle, so any [`LexicalRead`] — including a
+    /// leaseless read-only reader — is a valid backend.
     #[must_use]
-    pub fn with_lexical(mut self, lexical: Arc<dyn LexicalSearch>) -> Self {
+    pub fn with_lexical(mut self, lexical: Arc<dyn LexicalRead>) -> Self {
         self.lexical = Some(lexical);
         self
     }
@@ -1339,7 +1345,7 @@ impl TwoTierSearcher {
             let lex_res = if let Some(lex) = self.lexical.as_ref() {
                 let start_lex = Instant::now();
                 let res = lex
-                    .search_fusion_candidates(cx, semantic_query, lexical_budget)
+                    .search_candidates(cx, semantic_query, lexical_budget)
                     .await;
                 (Some(res), start_lex.elapsed())
             } else {
@@ -1368,7 +1374,7 @@ impl TwoTierSearcher {
                         || (None, Duration::ZERO),
                         |lex| {
                             let start = Instant::now();
-                            let result = poll_immediate(lex.search_fusion_candidates(
+                            let result = poll_immediate(lex.search_candidates(
                                 cx,
                                 semantic_query,
                                 lexical_budget,
@@ -1389,10 +1395,16 @@ impl TwoTierSearcher {
         let (fast_embed_result, fast_embed_elapsed) = embed_timed;
         metrics.fast_embed_ms = fast_embed_elapsed.as_secs_f64() * 1000.0;
 
+        // bd-8nqz.1: the candidate batch's hydration context pins the exact
+        // snapshot that scored these candidates; it travels alongside the
+        // results so hydration can never read a newer generation.
+        let mut lexical_context: Option<LexicalHydrationContext> = None;
         let mut lexical_results: Option<Vec<ScoredResult>> = match lexical_timed {
-            (Some(Ok(results)), elapsed) => {
+            (Some(Ok(batch)), elapsed) => {
                 metrics.lexical_search_ms = elapsed.as_secs_f64() * 1000.0;
+                let (results, context) = batch.into_parts();
                 metrics.lexical_candidates = results.len();
+                lexical_context = context;
                 Some(results)
             }
             (Some(Err(e)), elapsed) => {
@@ -1421,15 +1433,7 @@ impl TwoTierSearcher {
             && fast_embed_result.is_ok()
         {
             let lexical = self
-                .lexical_results_for_direct_return(
-                    cx,
-                    semantic_query,
-                    lexical_budget,
-                    normalized_exclusions,
-                    text_fn,
-                    lexical,
-                    metrics,
-                )
+                .lexical_results_for_direct_return(cx, lexical, lexical_context.as_ref(), metrics)
                 .await?;
             metrics.skip_reason =
                 Some("non_semantic_fast_embedder_lexical_short_circuit".to_owned());
@@ -1471,11 +1475,8 @@ impl TwoTierSearcher {
                     let lexical = self
                         .lexical_results_for_direct_return(
                             cx,
-                            semantic_query,
-                            lexical_budget,
-                            normalized_exclusions,
-                            text_fn,
                             lexical,
+                            lexical_context.as_ref(),
                             metrics,
                         )
                         .await?;
@@ -1661,9 +1662,11 @@ impl TwoTierSearcher {
                 );
                 if lexical_results.is_some()
                     && let Some(lexical) = self.lexical.as_ref()
-                    && lexical.fusion_metadata_is_deferred()
+                    && let Some(context) = lexical_context.as_ref()
                 {
-                    lexical.hydrate_fusion_metadata(cx, &mut results).await?;
+                    lexical
+                        .hydrate_candidates(cx, Some(context), &mut results)
+                        .await?;
                 }
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1704,11 +1707,8 @@ impl TwoTierSearcher {
                     let lexical = self
                         .lexical_results_for_direct_return(
                             cx,
-                            semantic_query,
-                            lexical_budget,
-                            normalized_exclusions,
-                            text_fn,
                             lexical,
+                            lexical_context.as_ref(),
                             metrics,
                         )
                         .await?;
@@ -1723,28 +1723,27 @@ impl TwoTierSearcher {
         }
     }
 
+    /// Prepare fusion candidates for direct return to the caller.
+    ///
+    /// Eager batches (no hydration context) already carry full metadata. A
+    /// deferred batch is hydrated in place from its PINNED scoring snapshot —
+    /// never by re-querying, which would both pay a second search and read a
+    /// possibly newer generation than the one that scored these candidates
+    /// (bd-8nqz.1). The candidates arrive already negation-filtered.
     async fn lexical_results_for_direct_return(
         &self,
         cx: &Cx,
-        query: &str,
-        lexical_budget: usize,
-        normalized_exclusions: Option<&NormalizedExclusions>,
-        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         fusion_candidates: &[ScoredResult],
+        context: Option<&LexicalHydrationContext>,
         metrics: &mut TwoTierMetrics,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let Some(lexical) = self.lexical.as_ref() else {
-            return Ok(fusion_candidates.to_vec());
-        };
-        if !lexical.fusion_metadata_is_deferred() {
-            return Ok(fusion_candidates.to_vec());
-        }
-
-        let start = Instant::now();
-        let mut results = lexical.search(cx, query, lexical_budget).await?;
-        metrics.lexical_search_ms += start.elapsed().as_secs_f64() * 1000.0;
-        if let Some(exclusions) = normalized_exclusions {
-            results = filter_scored_results_by_negations(results, exclusions, text_fn, "lexical");
+        let mut results = fusion_candidates.to_vec();
+        if let (Some(lexical), Some(context)) = (self.lexical.as_ref(), context) {
+            let start = Instant::now();
+            lexical
+                .hydrate_candidates(cx, Some(context), &mut results)
+                .await?;
+            metrics.lexical_search_ms += start.elapsed().as_secs_f64() * 1000.0;
         }
         metrics.lexical_candidates = results.len();
         Ok(results)
@@ -3322,7 +3321,7 @@ fn contains_term_with_word_boundaries(text: &str, term: &str) -> bool {
 
 /// Poll an immediately-ready future to completion without an async runtime.
 ///
-/// All frankensearch `Embedder::embed` and `LexicalSearch::search` implementations
+/// All frankensearch `Embedder::embed` and `LexicalRead::search` implementations
 /// are synchronous code wrapped in `Box::pin(async move { ... })` — they complete
 /// on the first poll. This helper exploits that property to call them from
 /// synchronous contexts (e.g., `rayon::join` threads).
@@ -3587,7 +3586,7 @@ mod tests {
 
     struct StubLexical;
 
-    impl LexicalSearch for StubLexical {
+    impl LexicalRead for StubLexical {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -3610,26 +3609,6 @@ mod tests {
                     })
                     .collect())
             })
-        }
-
-        fn index_document<'a>(
-            &'a self,
-            _cx: &'a Cx,
-            _doc: &'a frankensearch_core::types::IndexableDocument,
-        ) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn index_documents<'a>(
-            &'a self,
-            _cx: &'a Cx,
-            _docs: &'a [frankensearch_core::types::IndexableDocument],
-        ) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
         }
 
         fn doc_count(&self) -> usize {
@@ -3659,7 +3638,7 @@ mod tests {
         }
     }
 
-    impl LexicalSearch for DeferredMetadataLexical {
+    impl LexicalRead for DeferredMetadataLexical {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -3669,25 +3648,31 @@ mod tests {
             Box::pin(async move { Ok(Self::results(limit, Some("direct"))) })
         }
 
-        fn search_fusion_candidates<'a>(
+        fn search_candidates<'a>(
             &'a self,
             _cx: &'a Cx,
             _query: &'a str,
             limit: usize,
-        ) -> SearchFuture<'a, Vec<ScoredResult>> {
-            Box::pin(async move { Ok(Self::results(limit, None)) })
+        ) -> SearchFuture<'a, frankensearch_core::LexicalCandidateBatch> {
+            Box::pin(async move {
+                Ok(frankensearch_core::LexicalCandidateBatch::deferred(
+                    Self::results(limit, None),
+                    LexicalHydrationContext::new("stub-deferred", Box::new(())),
+                ))
+            })
         }
 
-        fn fusion_metadata_is_deferred(&self) -> bool {
-            true
-        }
-
-        fn hydrate_fusion_metadata<'a>(
+        fn hydrate_candidates<'a>(
             &'a self,
             _cx: &'a Cx,
+            context: Option<&'a LexicalHydrationContext>,
             results: &'a mut [ScoredResult],
         ) -> SearchFuture<'a, ()> {
             Box::pin(async move {
+                assert!(
+                    context.is_some_and(|context| context.backend() == "stub-deferred"),
+                    "hydration must receive the batch's own context"
+                );
                 for result in results
                     .iter_mut()
                     .filter(|result| result.lexical_score.is_some())
@@ -3698,18 +3683,6 @@ mod tests {
             })
         }
 
-        fn index_document<'a>(
-            &'a self,
-            _cx: &'a Cx,
-            _doc: &'a frankensearch_core::types::IndexableDocument,
-        ) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
         fn doc_count(&self) -> usize {
             3
         }
@@ -3717,7 +3690,7 @@ mod tests {
 
     struct CancelledLexical;
 
-    impl LexicalSearch for CancelledLexical {
+    impl LexicalRead for CancelledLexical {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -3730,26 +3703,6 @@ mod tests {
                     reason: "test cancellation".to_owned(),
                 })
             })
-        }
-
-        fn index_document<'a>(
-            &'a self,
-            _cx: &'a Cx,
-            _doc: &'a frankensearch_core::types::IndexableDocument,
-        ) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn index_documents<'a>(
-            &'a self,
-            _cx: &'a Cx,
-            _docs: &'a [frankensearch_core::types::IndexableDocument],
-        ) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
         }
 
         fn doc_count(&self) -> usize {
@@ -4203,7 +4156,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(ZeroQueryEmbedder);
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
                 .with_lexical(lexical);
 
@@ -4331,8 +4284,15 @@ mod tests {
         });
     }
 
+    /// bd-8nqz.1: BOTH the hybrid path and the direct lexical fallback
+    /// hydrate deferred metadata through the batch's pinned scoring snapshot.
+    /// The fallback previously RE-SEARCHED (a second query that could read a
+    /// newer generation than the one that scored the candidates — metadata
+    /// arrived as "direct"); it now hydrates the retained candidates in
+    /// place, so every lane converges on "hydrated" and no lane ever pays a
+    /// second query or crosses generations.
     #[test]
-    fn deferred_lexical_metadata_hydrates_hybrid_but_direct_fallback_reloads() {
+    fn deferred_lexical_metadata_hydrates_in_every_lane_via_the_pinned_batch() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let hybrid = TwoTierSearcher::new(
                 build_test_index(4),
@@ -4369,13 +4329,14 @@ mod tests {
                 .await
                 .expect("lexical fallback");
             assert_eq!(metrics.skip_reason.as_deref(), Some("fast_embed_failed"));
+            assert!(!fallback_results.is_empty());
             assert!(fallback_results.iter().all(|result| {
                 result
                     .metadata
                     .as_deref()
                     .and_then(|metadata| metadata.get("path"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("direct")
+                    == Some("hydrated")
             }));
         });
     }
@@ -4627,7 +4588,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let config = TwoTierConfig {
                 graph_ranking_enabled: true,
                 graph_ranking_weight: 0.9,
@@ -4668,7 +4629,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
                 TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
 
@@ -4705,7 +4666,7 @@ mod tests {
             let index = build_test_index(4);
             let expected_doc_count = index.doc_count();
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
                 TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
 
@@ -4735,7 +4696,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("custom-hash", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
                 TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
 
@@ -5257,7 +5218,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
 
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
                 .with_lexical(lexical);
@@ -5290,7 +5251,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
                 .with_lexical(lexical);
 
@@ -5362,7 +5323,7 @@ mod tests {
             let index = build_test_index(4);
             let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("quality", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
 
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
                 .with_quality_embedder(quality)
@@ -5410,7 +5371,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(CancelledEmbedder);
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
                 .with_lexical(lexical);
 
@@ -5428,7 +5389,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(CancelledLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(CancelledLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
                 .with_lexical(lexical);
 
@@ -5540,7 +5501,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
                 TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
 
@@ -5610,7 +5571,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
                 TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_lexical(lexical);
 
@@ -5767,7 +5728,7 @@ mod tests {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
                 .with_quality_embedder(quality)
                 .with_lexical(lexical);
@@ -6203,7 +6164,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
 
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -6335,7 +6296,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
-            let lexical: Arc<dyn LexicalSearch> = Arc::new(StubLexical);
+            let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let exporter = Arc::new(RecordingExporter::default());
             let config = TwoTierConfig::default().with_metrics_exporter(exporter.clone());
 

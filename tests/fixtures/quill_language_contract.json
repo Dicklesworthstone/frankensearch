@@ -17,12 +17,12 @@
       "id": "source-corpus-120",
       "path": "tests/fixtures/corpus.json",
       "expected_document_count": 120,
-      "purpose": "120 documents spanning the shared five-cluster relevance corpus"
+      "purpose": "100 documents spanning five relevance clusters plus 20 supplemental adversarial, code, config, and log fixtures"
     },
     {
-      "id": "source-queries-25",
+      "id": "source-queries-26",
       "path": "tests/fixtures/queries.json",
-      "purpose": "harvested identifier, short-keyword, and natural-language relevance slices"
+      "purpose": "harvested identifier, short-keyword, natural-language relevance, and known-miss control slices"
     },
     {
       "id": "source-quality-harness",

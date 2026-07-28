@@ -317,18 +317,46 @@ impl EmbedderStack {
     ///
     /// Returns `SearchError::EmbedderUnavailable` when no usable fast embedder is available.
     pub fn auto_detect_with(model_root: Option<&Path>) -> SearchResult<Self> {
+        Self::auto_detect_with_options(model_root, &DetectOptions::default())
+    }
+
+    /// Auto-detect embedders under caller-supplied policy (bd-p6z6.2).
+    ///
+    /// Callers (fsfs config, library hosts) pass policy EXPLICITLY instead
+    /// of relying on process environment: `options.offline = Some(true)`
+    /// forbids model downloads for this detection regardless of
+    /// `FRANKENSEARCH_OFFLINE`, and `Some(false)` ignores the env variable
+    /// entirely — environment cannot silently change library semantics when
+    /// the caller states intent. `None` fields defer to the environment,
+    /// preserving `auto_detect_with` behavior. Detection itself never
+    /// prompts: interactive consent is a product-surface concern.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::EmbedderUnavailable` when no usable fast
+    /// embedder is available, and `SearchError::UnverifiableRemoteSpace`
+    /// when explicit remote configuration cannot be verified.
+    pub fn auto_detect_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<Self> {
         #[cfg(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         ))]
         {
-            Self::auto_detect_with_policy(model_root, download_policy_from_environment())
+            let mut policy = download_policy_from_environment();
+            if let Some(offline) = options.offline {
+                policy.offline = offline;
+            }
+            Self::auto_detect_with_policy(model_root, policy)
         }
         #[cfg(not(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         )))]
         {
+            let _ = options;
             Self::auto_detect_with_policy(model_root)
         }
     }
@@ -1699,6 +1727,20 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 /// model name is never treated as compatibility evidence.
 ///
 /// Returns a cached `ApiEmbedder` for the quality tier.
+/// Caller-supplied detection policy (bd-p6z6.2).
+///
+/// Every `None` defers to the process environment; every `Some` overrides
+/// it, so hosts with explicit configuration are immune to ambient
+/// environment drift.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DetectOptions {
+    /// `Some(true)`: never download models during this detection.
+    /// `Some(false)`: permit downloads (still subject to consent policy)
+    /// even if `FRANKENSEARCH_OFFLINE` is set. `None`: follow the
+    /// environment.
+    pub offline: Option<bool>,
+}
+
 /// Snapshot of the remote-embedding environment, taken once so the intent
 /// resolver is a pure function (testable without process-global env
 /// mutation, which this workspace forbids).

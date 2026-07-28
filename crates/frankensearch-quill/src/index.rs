@@ -3400,7 +3400,8 @@ impl QuillReader {
         validate_query_lowering(&parsed.query, 1.0, self.schema)?;
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
-        let rank_pruning = limit != 0
+        let topdocs_root = limit != 0;
+        let rank_pruning = topdocs_root
             && rank_pruning.unwrap_or_else(|| query_has_prunable_root_union(&parsed.query, 1.0));
         let mut collector = TopDocsCollector::new(limit, 0)?;
         let work_upper_bound =
@@ -3420,6 +3421,7 @@ impl QuillReader {
             &parsed.query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out && !metering,
         )?;
         let collected = collector.finish()?;
@@ -3461,7 +3463,8 @@ impl QuillReader {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        let rank_pruning = !exact_count && limit != 0 && query_has_prunable_root_union(query, 1.0);
+        let topdocs_root = !exact_count && limit != 0;
+        let rank_pruning = topdocs_root && query_has_prunable_root_union(query, 1.0);
         let sealed_docs: u64 = keeper
             .segments()
             .iter()
@@ -3475,6 +3478,7 @@ impl QuillReader {
             query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out,
         )?;
         for delta in snapshot.delta_snapshots() {
@@ -3505,6 +3509,7 @@ impl QuillReader {
                 self.schema,
                 self.config.glob_expansion_limit,
                 rank_pruning,
+                topdocs_root,
             )?;
             collector.collect(&mut scorer, delta.as_ref())?;
             record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -3573,6 +3578,7 @@ impl QuillReader {
         query: &Query,
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
+        topdocs_root: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -3612,6 +3618,7 @@ impl QuillReader {
                         schema,
                         glob_expansion_limit,
                         rank_pruning,
+                        topdocs_root,
                     )?;
                     local.collect(&mut scorer, segment)?;
                     record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -3650,6 +3657,7 @@ impl QuillReader {
                     self.schema,
                     self.config.glob_expansion_limit,
                     rank_pruning,
+                    topdocs_root,
                 )?;
                 collector.collect(&mut scorer, segment)?;
                 record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -4239,6 +4247,7 @@ impl QuillIndex {
         query: &Query,
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
+        topdocs_root: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let work_upper_bound =
@@ -4258,6 +4267,7 @@ impl QuillIndex {
             query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out && !metering,
         )
     }
@@ -5646,6 +5656,7 @@ fn lower_query<'a>(
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     rank_pruning: bool,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         cx,
@@ -5658,6 +5669,7 @@ fn lower_query<'a>(
         glob_expansion_limit,
         QueryLoweringMode::Scored,
         rank_pruning,
+        topdocs_root,
     )
 }
 
@@ -5681,6 +5693,7 @@ fn lower_query_unscored<'a>(
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Unscored,
+        false,
         false,
     )
 }
@@ -6003,8 +6016,10 @@ enum QueryLoweringMode {
 fn lower_boolean(
     clauses: Vec<ScorerClause<'_>>,
     mode: QueryLoweringMode,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'_>, QuillIndexError> {
     match mode {
+        QueryLoweringMode::Scored if topdocs_root => ReferenceScorer::boolean_topdocs(clauses),
         QueryLoweringMode::Scored => ReferenceScorer::boolean(clauses),
         QueryLoweringMode::Unscored => ReferenceScorer::boolean_unscored(clauses),
     }
@@ -6022,6 +6037,7 @@ fn lower_query_with_mode<'a>(
     glob_expansion_limit: usize,
     mode: QueryLoweringMode,
     rank_pruning: bool,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match query {
         Query::Empty => Ok(ReferenceScorer::empty()),
@@ -6051,7 +6067,7 @@ fn lower_query_with_mode<'a>(
                     checkpoint,
                 )?));
             }
-            lower_boolean(clauses, mode)
+            lower_boolean(clauses, mode, topdocs_root)
         }
         Query::Phrase {
             fields,
@@ -6079,7 +6095,7 @@ fn lower_query_with_mode<'a>(
                         checkpoint,
                     )?));
                 }
-                return lower_boolean(clauses, mode);
+                return lower_boolean(clauses, mode, topdocs_root);
             }
             let mut clauses = Vec::new();
             for field in fields {
@@ -6147,7 +6163,7 @@ fn lower_query_with_mode<'a>(
                 };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
             }
-            lower_boolean(clauses, mode)
+            lower_boolean(clauses, mode, topdocs_root)
         }
         Query::Boolean { clauses, .. } => {
             let mut lowered = Vec::new();
@@ -6168,10 +6184,11 @@ fn lower_query_with_mode<'a>(
                         glob_expansion_limit,
                         mode,
                         rank_pruning,
+                        false,
                     )?,
                 ));
             }
-            lower_boolean(lowered, mode)
+            lower_boolean(lowered, mode, topdocs_root)
         }
         Query::Boost { query, factor } => {
             let boost = inherited_boost * *factor;
@@ -6191,6 +6208,7 @@ fn lower_query_with_mode<'a>(
                 glob_expansion_limit,
                 mode,
                 rank_pruning,
+                topdocs_root,
             )
         }
         Query::Range {
@@ -6788,7 +6806,7 @@ fn lower_numeric_field_set<'a>(
             document_count,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -6816,7 +6834,7 @@ fn lower_leaf_string_predicate<'a>(
             leaf, snapshot, schema, field_ord, &term, 1.0, false, checkpoint,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -6854,7 +6872,7 @@ fn lower_leaf_glob<'a>(
         )?;
         fields.push(ScorerClause::should(field_scorer));
     }
-    lower_boolean(fields, mode)
+    lower_boolean(fields, mode, false)
 }
 
 fn snapshot_glob_terms(
@@ -8706,6 +8724,7 @@ mod tests {
         let snapshot = index.search_snapshot();
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        let topdocs_root = !exact_count && limit != 0;
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)
         } else {
@@ -8719,6 +8738,7 @@ mod tests {
                 &parsed.query,
                 &snapshot,
                 rank_pruning,
+                topdocs_root,
                 fan_out,
             )
             .expect("sealed collection");
@@ -12612,6 +12632,7 @@ mod tests {
                 DEFAULT_SCHEMA,
                 1_024,
                 true,
+                true,
             )
             .expect("lower direct disjunction with pruning metadata");
             let mut direct_collector = TopDocsCollector::new(1, 0).expect("top-one collector");
@@ -15031,8 +15052,8 @@ mod tests {
     fn lexical_read_hydration_is_pinned_to_the_scoring_generation() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(QuillConfig::default()).expect("in-memory index");
-            let doc_v1 = IndexableDocument::new("doc-a", "alpha pinned content")
-                .with_metadata("rev", "v1");
+            let doc_v1 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v1");
             index
                 .index_documents(&cx, std::slice::from_ref(&doc_v1))
                 .await
@@ -15052,8 +15073,8 @@ mod tests {
             let mut legacy_path = batch.results().to_vec();
 
             // Publish generation N+1 with different metadata for the same doc.
-            let doc_v2 = IndexableDocument::new("doc-a", "alpha pinned content")
-                .with_metadata("rev", "v2");
+            let doc_v2 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v2");
             LexicalWrite::index_document(&index, &cx, &doc_v2)
                 .await
                 .expect("upsert generation N+1");
@@ -15110,10 +15131,9 @@ mod tests {
 
             // Foreign context: typed rejection of cross-engine mixing.
             let foreign = LexicalHydrationContext::new("not-quill", Box::new(7_u32));
-            let mixed =
-                LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
-                    .await
-                    .expect_err("foreign hydration context must fail");
+            let mixed = LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
+                .await
+                .expect_err("foreign hydration context must fail");
             assert!(
                 matches!(mixed, SearchError::SubsystemError { subsystem, .. }
                     if subsystem == "quill.hydration"),

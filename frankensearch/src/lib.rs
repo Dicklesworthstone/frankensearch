@@ -63,7 +63,7 @@
 //!     // the active lexical reader — the wiring earlier examples dropped.
 //!     #[cfg(feature = "quill")]
 //!     {
-//!         use frankensearch::LexicalSearch;
+//!         use frankensearch::LexicalRead;
 //!
 //!         let parts = frankensearch::open_hybrid(
 //!             &cx,

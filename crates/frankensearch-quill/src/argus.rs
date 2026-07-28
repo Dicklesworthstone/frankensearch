@@ -2606,6 +2606,13 @@ impl<'a> ReferenceScorer<'a> {
         matches!(&self.node, ScorerNode::Term(_))
     }
 
+    fn is_tantivy_topdocs_frequency_term(&self) -> bool {
+        matches!(
+            &self.node,
+            ScorerNode::Term(term) if term.record_option != TermRecordOption::Basic
+        )
+    }
+
     fn competitive_term_cursor(&self) -> Option<CompetitiveTermCursor<'_>> {
         match &self.node {
             ScorerNode::Term(term) => term.competitive_cursor(),
@@ -2718,7 +2725,22 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns a typed error if bounded scorer buffers cannot be allocated or
     /// initial cursor alignment detects malformed state.
     pub fn boolean(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Scored)
+        Self::boolean_with_mode(clauses, BooleanMode::Scored, false)
+    }
+
+    /// Lower a ranked root Boolean through Tantivy's frequency-term `TopDocs`
+    /// accumulation order when the final scorer shape permits it.
+    ///
+    /// This is deliberately root-only: nested unions and counted collectors
+    /// keep the ordinary exhaustive scorer order. The union constructor also
+    /// fails closed unless every surviving child is a frequency-bearing term.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed allocation, cursor-alignment, and scorer-shape
+    /// failures as [`Self::boolean`].
+    pub(crate) fn boolean_topdocs(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
+        Self::boolean_with_mode(clauses, BooleanMode::Scored, true)
     }
 
     /// Lower Boolean clauses into a genuinely scoreless matching tree.
@@ -2733,12 +2755,13 @@ impl<'a> ReferenceScorer<'a> {
     /// Rejects a child tree containing a scored buffered union, or any ordinary
     /// allocation and cursor-alignment failure.
     pub fn boolean_unscored(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Unscored)
+        Self::boolean_with_mode(clauses, BooleanMode::Unscored, false)
     }
 
     fn boolean_with_mode(
         clauses: Vec<ScorerClause<'a>>,
         mode: BooleanMode,
+        topdocs_root: bool,
     ) -> Result<Self, ArgusError> {
         if mode == BooleanMode::Unscored
             && clauses
@@ -2800,7 +2823,7 @@ impl<'a> ReferenceScorer<'a> {
                 if should.is_empty() || mode == BooleanMode::Unscored {
                     required
                 } else {
-                    let optional = scorer_union(should)?;
+                    let optional = scorer_union(should, false)?;
                     Self {
                         node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
                             required, optional,
@@ -2814,10 +2837,12 @@ impl<'a> ReferenceScorer<'a> {
                 (Some(all), BooleanMode::Scored) => {
                     // Preserve Tantivy's nested score order: first aggregate
                     // the ordinary SHOULD scorers, then union one AllScorer.
-                    let ordinary_should = scorer_union(should)?;
-                    scorer_union(vec![ordinary_should, all])?
+                    let ordinary_should = scorer_union(should, false)?;
+                    scorer_union(vec![ordinary_should, all], false)?
                 }
-                (None, BooleanMode::Scored) => scorer_union(should)?,
+                (None, BooleanMode::Scored) => {
+                    scorer_union(should, topdocs_root && excluded.is_empty())?
+                }
                 (None, BooleanMode::Unscored) => scorer_union_unscored(should)?,
             },
         };
@@ -3186,14 +3211,17 @@ fn scorer_intersection(
     }
 }
 
-fn scorer_union(mut scorers: Vec<ReferenceScorer<'_>>) -> Result<ReferenceScorer<'_>, ArgusError> {
+fn scorer_union(
+    mut scorers: Vec<ReferenceScorer<'_>>,
+    topdocs_root: bool,
+) -> Result<ReferenceScorer<'_>, ArgusError> {
     match scorers.len() {
         0 => Ok(ReferenceScorer::empty()),
         1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
             "optional scorer count changed during lowering",
         )),
         _ => Ok(ReferenceScorer {
-            node: ScorerNode::Union(BufferedUnionScorer::new(scorers)?),
+            node: ScorerNode::Union(BufferedUnionScorer::new(scorers, topdocs_root)?),
         }),
     }
 }
@@ -3833,6 +3861,12 @@ struct CompetitiveCandidates {
 
 struct BufferedUnionScorer<'a> {
     active: Vec<ReferenceScorer<'a>>,
+    /// Ranked `TopDocs` over a direct frequency-term root follows Tantivy's
+    /// specialized term-union traversal. That path repeatedly scores the
+    /// scorers on the current minimum document, swap-removes exhausted
+    /// scorers, and stably re-sorts survivors by their next document. The
+    /// resulting f32 addition order is observable in raw score bits.
+    tantivy_topdocs_term_union: bool,
     score_window: Vec<Option<f32>>,
     window_start: Option<u32>,
     scan_offset: usize,
@@ -3857,9 +3891,13 @@ struct BufferedUnionScorer<'a> {
 }
 
 impl<'a> BufferedUnionScorer<'a> {
-    fn new(mut scorers: Vec<ReferenceScorer<'a>>) -> Result<Self, ArgusError> {
+    fn new(mut scorers: Vec<ReferenceScorer<'a>>, topdocs_root: bool) -> Result<Self, ArgusError> {
         let segment_num_docs = shared_segment_num_docs(&scorers)?;
         scorers.retain(|scorer| scorer.doc().is_some());
+        let tantivy_topdocs_term_union = topdocs_root
+            && scorers
+                .iter()
+                .all(ReferenceScorer::is_tantivy_topdocs_frequency_term);
         let mut score_window = Vec::new();
         score_window
             .try_reserve_exact(UNION_HORIZON)
@@ -3884,6 +3922,7 @@ impl<'a> BufferedUnionScorer<'a> {
         };
         let mut scorer = Self {
             active: scorers,
+            tantivy_topdocs_term_union,
             score_window,
             window_start: None,
             scan_offset: 0,
@@ -3998,6 +4037,10 @@ impl<'a> BufferedUnionScorer<'a> {
         window_start: u32,
         horizon_end: u64,
     ) -> Result<(), ArgusError> {
+        if self.tantivy_topdocs_term_union {
+            return self.fill_tantivy_topdocs_term_window(window_start, horizon_end);
+        }
+
         let mut index = 0;
         while index < self.active.len() {
             loop {
@@ -4020,6 +4063,55 @@ impl<'a> BufferedUnionScorer<'a> {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Fill one exhaustive window in the same evolving scorer order as
+    /// Tantivy's direct frequency-term `BlockWAND` specialization while its
+    /// threshold is `Score::MIN`.
+    ///
+    /// Tantivy initially performs a stable sort by current document. At each
+    /// pivot it sums the equal-document prefix, advances that prefix,
+    /// swap-removes every exhausted scorer, then stably sorts the survivors by
+    /// their new document. Quill buffers documents in windows, but preserving
+    /// these mutations across refill boundaries retains the same per-document
+    /// f32 accumulation order.
+    fn fill_tantivy_topdocs_term_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+    ) -> Result<(), ArgusError> {
+        self.active.sort_by_key(ReferenceScorer::doc);
+        while let Some(doc) = self.active.first().and_then(ReferenceScorer::doc) {
+            if u64::from(doc) >= horizon_end {
+                break;
+            }
+            let pivot_len = self
+                .active
+                .iter()
+                .take_while(|scorer| scorer.doc() == Some(doc))
+                .count();
+            let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
+                .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
+            let mut score = 0.0_f32;
+            for scorer in &mut self.active[..pivot_len] {
+                score += scorer.score()?;
+            }
+            self.score_window[offset] = Some(finite_score(score, doc)?);
+
+            for scorer in &mut self.active[..pivot_len] {
+                scorer.next()?;
+            }
+            let mut index = 0;
+            while index < self.active.len() {
+                if self.active[index].doc().is_none() {
+                    self.active.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            self.active.sort_by_key(ReferenceScorer::doc);
         }
         Ok(())
     }
@@ -4428,9 +4520,8 @@ impl<'a> BufferedUnionScorer<'a> {
         candidates: &[u32],
     ) -> Result<(), ArgusError> {
         // Candidate discovery advances only shadow cursors. Real cursors still
-        // visit the selected docs in the original scorer-vector order and use
-        // the exhaustive path's identical swap-remove exhaustion behavior, so
-        // pruning cannot regroup f32 contributions or change score bits.
+        // visit selected documents in their current scorer-vector order, so
+        // pruning cannot regroup ordinary exhaustive contributions.
         let mut index = 0;
         while index < self.active.len() {
             loop {
@@ -7687,6 +7778,40 @@ mod tests {
         let parse_order = ((0.0_f32 + positive) + negative) + small;
         assert_ne!(expected.to_bits(), parse_order.to_bits());
         assert_eq!(query.score()?.to_bits(), expected.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_union_ranked_topdocs_tracks_term_union_order_across_horizon()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = vec![Some(1); 5_001];
+        let encoded =
+            EncodedDocLenSection::encode(0, 5_001, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 5_001, 5_001)?;
+        let clauses = vec![
+            ScorerClause::should(term(postings(&[1, 5_000]), field, &snapshot, 2, 1, 1.0e8)?),
+            ScorerClause::should(term(postings(&[3, 5_000]), field, &snapshot, 2, 1, -1.0e8)?),
+            ScorerClause::should(term(postings(&[0, 5_000]), field, &snapshot, 2, 1, 1.0)?),
+            ScorerClause::should(term(postings(&[2, 5_000]), field, &snapshot, 2, 1, 1.0)?),
+        ];
+        let mut query = ReferenceScorer::boolean_topdocs(clauses)?;
+        assert_eq!(query.doc(), Some(0));
+        while query.doc().is_some_and(|doc| doc < 5_000) {
+            query.next()?;
+        }
+        assert_eq!(query.doc(), Some(5_000));
+
+        let small = expected_term_score(&snapshot, 2, fieldnorm_to_id(1), 1, 1.0);
+        let positive = expected_term_score(&snapshot, 2, fieldnorm_to_id(1), 1, 1.0e8);
+        let negative = expected_term_score(&snapshot, 2, fieldnorm_to_id(1), 1, -1.0e8);
+        // The current-document traversal reaches the target in B, C, A, D
+        // order. A scorer-major buffered union would retain A, B, C, D.
+        let tantivy_term_union = (((0.0_f32 + negative) + small) + positive) + small;
+        let scorer_major = (((0.0_f32 + positive) + negative) + small) + small;
+        assert_ne!(tantivy_term_union.to_bits(), scorer_major.to_bits());
+        assert_eq!(query.score()?.to_bits(), tantivy_term_union.to_bits());
         Ok(())
     }
 

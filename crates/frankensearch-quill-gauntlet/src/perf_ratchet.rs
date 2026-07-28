@@ -1886,7 +1886,7 @@ mod tests {
         .expect("evidence cell");
         let paired = match &cell.body {
             EvidenceCellBody::Paired { paired, .. } => Some(paired),
-            _ => None,
+            EvidenceCellBody::Facts { .. } => None,
         }
         .expect("QG-2 must be paired");
         let artifact = PerfGateArtifact {

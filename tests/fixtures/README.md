@@ -6,7 +6,8 @@ This directory contains deterministic fixture data for workspace and cross-crate
 
 - `corpus.json`: Document corpus used by indexing/search tests.
 - `relevance.json`: 20-query ground-truth mapping (`query` -> expected top-10 doc IDs).
-- `queries.json`: Extended query set with `query_class` annotations (25 queries).
+- `queries.json`: Extended query set with `query_class` annotations (26 queries),
+  including a single-token known-miss control.
 - `edge_cases.json`: Canonicalization and query edge-case inputs.
 - `treasure_island/`: A full public-domain novel plus lexical and semantic
   ground truth, for retrieval tests that must distinguish *real* semantic
@@ -29,12 +30,14 @@ This directory contains deterministic fixture data for workspace and cross-crate
 Current corpus composition:
 
 - Core set: 100 documents across 5 clusters (`rust`, `ml`, `sysadmin`, `cooking`, `mixed`), 20 each.
-- Supplemental set: 6 additional machine-wide style documents required by extended query fixtures:
-  - `adversarial`: 3
-  - `code`: 2
-  - `config`: 1
+- Supplemental set: 20 additional machine-wide style documents required by
+  extended query fixtures:
+  - `adversarial`: 14
+  - `code`: 3
+  - `config`: 2
+  - `log`: 1
 
-Total documents: 106.
+Total documents: 120.
 
 ## Ground Truth Notes
 

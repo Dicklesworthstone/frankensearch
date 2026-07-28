@@ -1256,7 +1256,7 @@ mod tests {
                 .collect()
         }
 
-        fn dot(&self, a: &[f32], b: &[f32]) -> f32 {
+        fn dot(a: &[f32], b: &[f32]) -> f32 {
             a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
         }
 
@@ -1266,7 +1266,10 @@ mod tests {
                 .vectors
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (1.0 - self.dot(v, query), i as u32))
+                .map(|(i, v)| {
+                    let id = u32::try_from(i).expect("test corpus length fits u32");
+                    (1.0 - Self::dot(v, query), id)
+                })
                 .collect();
             scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             scored.into_iter().take(k).map(|(_, id)| id).collect()
@@ -1283,7 +1286,7 @@ mod tests {
                         value: id.to_string(),
                         reason: "row index out of range".to_owned(),
                     })?;
-            Ok(1.0 - self.dot(vector, query))
+            Ok(1.0 - Self::dot(vector, query))
         }
 
         fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
@@ -1385,7 +1388,8 @@ mod tests {
             .iter()
             .position(|point| point.level() >= 1)
             .expect("some point reaches level 1");
-        graph.adjacency[high].layers[1].push(low as u32);
+        let low_id = u32::try_from(low).expect("test graph length fits u32");
+        graph.adjacency[high].layers[1].push(low_id);
 
         let defect = graph
             .verify()
@@ -1394,7 +1398,7 @@ mod tests {
             matches!(
                 defect,
                 GraphDefect::EdgeAboveNeighbourLevel { neighbour, .. }
-                    if neighbour == low as u32
+                    if neighbour == low_id
             ),
             "expected the layer-violation defect naming point {low}, got: {defect:?}"
         );
@@ -1516,7 +1520,8 @@ mod tests {
         let second = NativeHnsw::build(params(), 99, &store).expect("build");
         assert_eq!(first.max_level(), second.max_level());
         assert_eq!(first.entry_point(), second.entry_point());
-        for id in 0..first.len() as u32 {
+        let point_count = u32::try_from(first.len()).expect("test graph length fits u32");
+        for id in 0..point_count {
             for layer in 0..=first.max_level() {
                 assert_eq!(
                     first.neighbours_at(id, layer),

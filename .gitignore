@@ -57,6 +57,9 @@ target-codex*/
 # symlink into /data/tmp/rch-targets-pool, regenerated per job.
 .rch-targets/
 .rch-target*/
+# Per-job Cargo homes/checkouts created by RCH inside the synced workspace.
+# Dependency source bytes are attested separately by evidence runners.
+.rch-tmp/
 
 # Agent scratch trees. Grow without bound and are reclaimed by mtime.
 .scratch/

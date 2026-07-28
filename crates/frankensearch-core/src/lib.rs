@@ -71,7 +71,14 @@ pub use contract_sanity::{
     ContractViolationDiagnostic, MAX_SCHEMA_VERSION_LAG, ViolationSeverity, classify_version,
     classify_version_against, replay_command_for_reason,
 };
-pub use daemon::{DaemonClient, DaemonError, DaemonRetryConfig, apply_jitter, next_request_id};
+pub use daemon::{
+    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
+    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
+    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
+    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, apply_jitter,
+    daemon_embedding_payload_sha256, daemon_endpoint_fingerprint, daemon_executable_fingerprint,
+    daemon_ordered_request_sha256, next_request_id,
+};
 pub use decision_plane::{
     CalibrationFallbackReason, CalibrationStatus, CalibrationThresholds, DecisionContext,
     DecisionOutcome, EvidenceEventType, EvidenceRecord, ExhaustionPolicy, LossVector, LossWeights,

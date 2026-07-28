@@ -21,7 +21,7 @@ use asupersync::test_utils::run_test_with_cx;
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::SearchError;
-use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, SearchFuture};
+use frankensearch_core::traits::{Embedder, LexicalRead, ModelCategory, SearchFuture};
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult, SearchPhase};
 use frankensearch_index::TwoTierIndex;
 
@@ -104,7 +104,7 @@ impl StubLexical {
     }
 }
 
-impl LexicalSearch for StubLexical {
+impl LexicalRead for StubLexical {
     fn search<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -135,26 +135,6 @@ impl LexicalSearch for StubLexical {
                 })
                 .collect())
         })
-    }
-
-    fn index_document<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        _doc: &'a IndexableDocument,
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn index_documents<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        _docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
     }
 
     fn doc_count(&self) -> usize {

@@ -358,5 +358,11 @@
       "test-ml-006"
     ],
     "note": "German cross-lingual query - should find German doc and semantically similar English docs"
+  },
+  {
+    "query": "flurbnozzlezyphraxicqvktmps",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [],
+    "note": "Single-token known miss for non-vacuous empty-result conformance"
   }
 ]

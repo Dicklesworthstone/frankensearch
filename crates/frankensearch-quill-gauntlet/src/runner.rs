@@ -14,11 +14,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 
+use frankensearch_core::LexicalSearch;
+
 use crate::GauntletError;
-use crate::artifact::{ArtifactObject, ArtifactStore, CampaignArtifactContext};
+use crate::artifact::{
+    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CampaignArtifactContext,
+};
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
-    EngineObservation, RankClass, compare_observations,
+    EngineObservation, LexicalBackendIdentity, LexicalComparisonStatus,
+    LexicalContractBuildContext, LexicalEngineRole, LexicalFieldMismatch, LexicalMismatchClass,
+    LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
+    compare_observations, observe_live_lexical_contract,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::engine::GauntletEngine;
@@ -37,7 +44,7 @@ use crate::generator::{
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 5;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 1;
 /// Redaction policy required by committed Divergence Register evidence.
@@ -60,7 +67,11 @@ pub const CASS_SCHEMA_CONTRACT_PREIMAGE: &str = "v4;profile=cass;schema=frankens
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
     "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
 const MISMATCH_SIGNATURE_DOMAIN: &[u8] = b"frankensearch/quill/mismatch-signature/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v1\0";
+const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
+    b"frankensearch/quill/lexical-mismatch-signature/v1\0";
+const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
+const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
+const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v5\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v1\0";
@@ -201,10 +212,24 @@ impl GeneratedCorpusReplay for BorrowedCorpus<'_> {
 }
 
 /// Full ingest/query boundary required by the E6 differential campaign.
-pub trait DifferentialCampaignEngine: Send {
+pub trait DifferentialCampaignEngine: Send + Sync {
     fn descriptor(&self) -> EngineDescriptor;
     /// Adapter-owned semantic identity; never copied from the runner request.
     fn semantic_contract(&self) -> SemanticContract;
+
+    /// Ordinary backend-neutral lexical facade for total result-contract proof.
+    ///
+    /// CASS adapters intentionally retain the default `None`: their richer
+    /// retrieval, hydration, post-filter, and CLI projection contract is not
+    /// representable by the ordinary [`LexicalSearch`] boundary.
+    ///
+    /// # Errors
+    ///
+    /// Implementations may return a typed adapter error when their ordinary
+    /// lexical facade cannot be exposed safely for the current lifecycle.
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+        Ok(None)
+    }
 
     fn begin_corpus<'a>(
         &'a mut self,
@@ -1507,11 +1532,28 @@ fn count_to_u64(value: usize) -> Result<u64, GauntletError> {
     u64::try_from(value).map_err(|_| campaign_error("divergence census count overflow"))
 }
 
+/// Public-contract evidence required from each selected campaign case.
+///
+/// The value is part of [`CampaignConfig`] and therefore covered by both the
+/// run reservation and the final report hash. `RankEnvelopeOnly` is retained
+/// for legacy fixtures and the dedicated CASS campaign; it is not admissible
+/// evidence for a provenance-bearing default-syntax replacement decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignContractMode {
+    #[default]
+    RankEnvelopeOnly,
+    CoreLexicalV3,
+}
+
 /// Deterministic runner policy included in the report hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CampaignConfig {
     pub selection: CampaignSelection,
     pub comparator_config: ComparatorConfig,
+    /// Total public lexical contract required for selected query cases.
+    #[serde(default)]
+    pub contract_mode: CampaignContractMode,
     /// Require complete, environment-matched production provenance.
     ///
     /// Deterministic unit/regression fixtures may leave this disabled. Every
@@ -1537,6 +1579,7 @@ impl Default for CampaignConfig {
         Self {
             selection: CampaignSelection::All,
             comparator_config: ComparatorConfig::default(),
+            contract_mode: CampaignContractMode::RankEnvelopeOnly,
             require_provenance: false,
             index_batch_size: 4_096,
             index_batch_max_bytes: 16 * 1024 * 1024,
@@ -1590,6 +1633,27 @@ impl CampaignDisposition {
     }
 }
 
+/// Total-lexical evidence retained for one submitted query.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CampaignLexicalCaseSummary {
+    /// Decode-only marker for pre-v5 campaign reports.
+    #[default]
+    LegacyMissing,
+    /// The case exercised only the older rich result-envelope comparator.
+    RankEnvelopeOnly,
+    /// Core-v3 was required, but observation or replay failed before an
+    /// immutable comparison could be persisted.
+    CoreLexicalV3Unavailable,
+    /// Replay-derived summary of the immutable total-contract comparison.
+    CoreLexicalV3 {
+        status: LexicalComparisonStatus,
+        first_mismatch: Option<LexicalFieldMismatch>,
+        mismatch_count: u64,
+        waived_difference_count: u64,
+    },
+}
+
 /// Stable evidence row for one campaign query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CampaignCaseResult {
@@ -1598,6 +1662,13 @@ pub struct CampaignCaseResult {
     pub disposition: CampaignDisposition,
     pub comparison_status: Option<ComparisonStatus>,
     pub rank_class: Option<RankClass>,
+    /// Explicit scope and result of the total lexical comparison.
+    #[serde(default)]
+    pub lexical_contract: CampaignLexicalCaseSummary,
+    /// Domain-separated SHA-256 address of the current immutable artifact object.
+    ///
+    /// Legacy 16-hex XXH3-64 addresses are decode-only and cannot satisfy a
+    /// current campaign report.
     pub artifact_hash: Option<String>,
     pub registered_divergence: Option<DivergenceRegisterEntry>,
     pub first_divergence: Option<String>,
@@ -1660,6 +1731,56 @@ pub struct MismatchGroup {
     pub case_ids: Vec<String>,
 }
 
+/// Deduplicated total-lexical mismatch descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalMismatchGroup {
+    pub signature: String,
+    pub mismatch: LexicalFieldMismatch,
+    pub occurrence_count: u64,
+    pub case_ids: Vec<String>,
+}
+
+/// Aggregate count of each replay-derived probe state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeCoverageCounts {
+    pub success: u64,
+    pub restoration: u64,
+    pub error: u64,
+    pub empty: u64,
+    pub not_run: u64,
+}
+
+/// Aggregate coverage for every public lexical boundary on one engine side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LexicalSideCoverageCounts {
+    pub full_search: ProbeCoverageCounts,
+    pub fusion_candidates: ProbeCoverageCounts,
+    pub all_lexical_winners_hydration: ProbeCoverageCounts,
+    pub strict_hybrid_winners_hydration: ProbeCoverageCounts,
+    pub semantic_only_hydration: ProbeCoverageCounts,
+    pub mixed_winners_hydration: ProbeCoverageCounts,
+    pub metadata_deferred_cases: u64,
+}
+
+/// Campaign-level total-contract coverage, kept separate from equivalence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CampaignLexicalCoverageSummary {
+    /// Decode-only marker for pre-v5 campaign reports.
+    #[default]
+    LegacyMissing,
+    /// This campaign intentionally exercised only the rich rank envelope.
+    RankEnvelopeOnly,
+    /// Aggregated immutable core-v3 probe coverage.
+    CoreLexicalV3 {
+        subject: Box<LexicalSideCoverageCounts>,
+        oracle: Box<LexicalSideCoverageCounts>,
+        admissible: bool,
+    },
+}
+
 /// Deterministic campaign report; wall-clock data deliberately lives outside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CampaignReport {
@@ -1680,6 +1801,10 @@ pub struct CampaignReport {
     pub cases: Vec<CampaignCaseResult>,
     pub query_classes: Vec<QueryClassSummary>,
     pub mismatches: Vec<MismatchGroup>,
+    #[serde(default)]
+    pub lexical_mismatches: Vec<LexicalMismatchGroup>,
+    #[serde(default)]
+    pub lexical_coverage: CampaignLexicalCoverageSummary,
     pub passed: bool,
     /// Immutable source/toolchain provenance for production campaigns
     /// (bd-quill-e6-gauntlet-scale-rm3q.9). Deterministic regression fixtures
@@ -2135,6 +2260,69 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+#[derive(Serialize)]
+struct LexicalQueryContractPreimage<'a> {
+    schema_version: u32,
+    analyzer_contract_sha256: &'a str,
+    schema_contract_sha256: &'a str,
+}
+
+pub fn lexical_query_contract_sha256(
+    semantic_contract: &SemanticContract,
+) -> Result<String, GauntletError> {
+    semantic_contract.validate()?;
+    let preimage = LexicalQueryContractPreimage {
+        schema_version: 1,
+        analyzer_contract_sha256: &semantic_contract.analyzer_contract_hash,
+        schema_contract_sha256: &semantic_contract.schema_contract_hash,
+    };
+    let bytes = serde_json::to_vec(&preimage).map_err(|error| {
+        campaign_error(format!(
+            "lexical query-contract identity serialization failed: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(LEXICAL_QUERY_CONTRACT_DOMAIN);
+    hasher.update(bytes);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+#[derive(Serialize)]
+struct LexicalIndexIdentityPreimage<'a> {
+    schema_version: u32,
+    descriptor: &'a EngineDescriptor,
+    logical_snapshot_sha256: &'a str,
+}
+
+pub fn lexical_backend_identity(
+    descriptor: &EngineDescriptor,
+    logical_snapshot_sha256: &str,
+) -> Result<LexicalBackendIdentity, GauntletError> {
+    if !is_lower_sha256(logical_snapshot_sha256) {
+        return Err(campaign_error(
+            "lexical backend logical snapshot must be lowercase SHA-256",
+        ));
+    }
+    let preimage = LexicalIndexIdentityPreimage {
+        schema_version: 1,
+        descriptor,
+        logical_snapshot_sha256,
+    };
+    let bytes = serde_json::to_vec(&preimage).map_err(|error| {
+        campaign_error(format!(
+            "lexical backend identity serialization failed: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(LEXICAL_INDEX_IDENTITY_DOMAIN);
+    hasher.update(bytes);
+    Ok(LexicalBackendIdentity {
+        engine: descriptor.implementation.clone(),
+        revision: descriptor.source_revision.clone(),
+        index_identity: lower_hex(&hasher.finalize()),
+    })
+}
+
 impl CampaignReport {
     /// Validate every self-contained report invariant before structural hashing.
     ///
@@ -2154,6 +2342,11 @@ impl CampaignReport {
         self.semantic_contract.validate()?;
         self.config.validate()?;
         self.divergence_registry.validate()?;
+        if matches!(self.schema_version, 3 | 4) {
+            return Err(campaign_error(
+                "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign",
+            ));
+        }
         if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
             return Err(campaign_error("campaign report schema version is invalid"));
         }
@@ -2224,7 +2417,12 @@ impl CampaignReport {
         }
 
         for (query, result) in selected.iter().zip(&self.cases) {
-            validate_campaign_case_result(query, result, &self.divergence_registry)?;
+            validate_campaign_case_result(
+                query,
+                result,
+                &self.divergence_registry,
+                self.config.contract_mode,
+            )?;
         }
         let confidence = f64::from_bits(self.config.posterior_confidence_bits);
         if summarize_query_classes(&self.cases, confidence) != self.query_classes {
@@ -2233,9 +2431,25 @@ impl CampaignReport {
             ));
         }
         validate_mismatch_groups(&self.mismatches, &self.cases)?;
-        if self.passed != self.cases.iter().all(|result| result.disposition.passes()) {
+        validate_lexical_mismatch_groups(&self.lexical_mismatches, &self.cases)?;
+        if self.config.contract_mode == CampaignContractMode::RankEnvelopeOnly
+            && !self.lexical_mismatches.is_empty()
+        {
             return Err(campaign_error(
-                "campaign report pass bit does not match case dispositions",
+                "rank-envelope-only campaign cannot claim total lexical mismatch evidence",
+            ));
+        }
+        validate_lexical_coverage_summary(
+            &self.lexical_coverage,
+            self.config.contract_mode,
+            self.selected_query_count,
+        )?;
+        if self.passed
+            != (self.cases.iter().all(|result| result.disposition.passes())
+                && lexical_coverage_is_admissible(&self.lexical_coverage))
+        {
+            return Err(campaign_error(
+                "campaign report pass bit does not match case dispositions and lexical coverage",
             ));
         }
         Ok(())
@@ -2308,6 +2522,8 @@ pub struct CampaignEvidenceValidator<'a> {
     selected: Vec<&'a GeneratedQueryCase>,
     next_ordinal: usize,
     mismatches: MismatchCollection,
+    lexical_mismatches: LexicalMismatchCollection,
+    lexical_coverage: CampaignLexicalCoverageAccumulator,
 }
 
 impl<'a> CampaignEvidenceValidator<'a> {
@@ -2323,6 +2539,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
             selected,
             next_ordinal: 0,
             mismatches: MismatchCollection::default(),
+            lexical_mismatches: LexicalMismatchCollection::default(),
+            lexical_coverage: CampaignLexicalCoverageAccumulator::new(report.config.contract_mode),
         })
     }
 
@@ -2359,8 +2577,13 @@ impl<'a> CampaignEvidenceValidator<'a> {
             self.report.query_suite.manifest.source,
             &self.report.corpus_manifest_hash,
         );
-        let (disposition, reason, registered_divergence) =
-            classify_case(query, &object.comparison, &self.report.divergence_registry);
+        let (disposition, reason, registered_divergence) = classify_case_with_lexical(
+            query,
+            &object.comparison,
+            &object.lexical_contract,
+            &self.report.divergence_registry,
+        );
+        let lexical_summary = lexical_case_summary(&object.lexical_contract)?;
         let expected_context = CampaignArtifactContext {
             corpus_manifest_hash: self.report.corpus_manifest_hash.clone(),
             query_manifest_hash: self.report.query_manifest_hash.clone(),
@@ -2372,6 +2595,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
                 .source_identity_sha256
                 .clone(),
             semantic_contract: self.report.semantic_contract.clone(),
+            contract_mode: self.report.config.contract_mode,
+            query_seed: self.report.query_suite.manifest.spec.seed,
             query: (*query).clone(),
             registered_divergence: registered_divergence.clone(),
         };
@@ -2384,6 +2609,7 @@ impl<'a> CampaignEvidenceValidator<'a> {
             || result.registered_divergence != registered_divergence
             || result.comparison_status != Some(object.comparison.status)
             || result.rank_class != Some(object.comparison.rank_class)
+            || result.lexical_contract != lexical_summary
             || result.first_divergence != object.comparison.first_divergence
             || result.artifact_hash.as_deref() != Some(object_hash)
         {
@@ -2392,6 +2618,9 @@ impl<'a> CampaignEvidenceValidator<'a> {
             ));
         }
         self.mismatches.record(&object.comparison, &query.id)?;
+        self.lexical_mismatches
+            .record(&object.lexical_contract, &query.id)?;
+        self.lexical_coverage.record(&object.lexical_contract);
         self.advance()
     }
 
@@ -2402,9 +2631,12 @@ impl<'a> CampaignEvidenceValidator<'a> {
                 "campaign evidence ended before every selected query was validated",
             ));
         }
-        if self.mismatches.finish() != self.report.mismatches {
+        if self.mismatches.finish() != self.report.mismatches
+            || self.lexical_mismatches.finish() != self.report.lexical_mismatches
+            || self.lexical_coverage.finish() != self.report.lexical_coverage
+        {
             return Err(campaign_error(
-                "campaign mismatch groups do not match immutable case artifacts",
+                "campaign mismatch groups or lexical coverage do not match immutable case artifacts",
             ));
         }
         Ok(())
@@ -2423,6 +2655,7 @@ fn validate_campaign_case_result(
     query: &GeneratedQueryCase,
     result: &CampaignCaseResult,
     registry: &DivergenceRegistry,
+    contract_mode: CampaignContractMode,
 ) -> Result<(), GauntletError> {
     if result.case_id != query.id
         || result.query_class != query_class(query)
@@ -2451,7 +2684,35 @@ fn validate_campaign_case_result(
 
     let non_infrastructure_fields = result.comparison_status.is_some()
         && result.rank_class.is_some()
-        && result.artifact_hash.as_deref().is_some_and(is_lower_xxh3);
+        && result.artifact_hash.as_deref().is_some_and(is_lower_sha256);
+    let lexical_shape = match (&result.lexical_contract, contract_mode) {
+        (CampaignLexicalCaseSummary::RankEnvelopeOnly, CampaignContractMode::RankEnvelopeOnly) => {
+            true
+        }
+        (
+            CampaignLexicalCaseSummary::CoreLexicalV3Unavailable,
+            CampaignContractMode::CoreLexicalV3,
+        ) => result.disposition == CampaignDisposition::InfrastructureError,
+        (
+            CampaignLexicalCaseSummary::CoreLexicalV3 {
+                status,
+                first_mismatch,
+                mismatch_count,
+                ..
+            },
+            CampaignContractMode::CoreLexicalV3,
+        ) => match status {
+            LexicalComparisonStatus::Equivalent => *mismatch_count == 0 && first_mismatch.is_none(),
+            LexicalComparisonStatus::Mismatch => *mismatch_count > 0 && first_mismatch.is_some(),
+        },
+        (
+            CampaignLexicalCaseSummary::LegacyMissing
+            | CampaignLexicalCaseSummary::RankEnvelopeOnly
+            | CampaignLexicalCaseSummary::CoreLexicalV3Unavailable
+            | CampaignLexicalCaseSummary::CoreLexicalV3 { .. },
+            CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3,
+        ) => false,
+    };
     let valid_shape = match result.disposition {
         CampaignDisposition::Exact => {
             non_infrastructure_fields
@@ -2495,9 +2756,28 @@ fn validate_campaign_case_result(
                 && result.reason.is_some()
         }
     };
-    if !valid_shape {
+    let lexical_disposition_matches = match &result.lexical_contract {
+        CampaignLexicalCaseSummary::CoreLexicalV3 {
+            status: LexicalComparisonStatus::Mismatch,
+            ..
+        } => {
+            result.disposition == CampaignDisposition::Unclassified
+                && result.reason.as_deref() == Some("lexical_contract_mismatch")
+                && result.registered_divergence.is_none()
+        }
+        CampaignLexicalCaseSummary::CoreLexicalV3 {
+            status: LexicalComparisonStatus::Equivalent,
+            ..
+        }
+        | CampaignLexicalCaseSummary::RankEnvelopeOnly => true,
+        CampaignLexicalCaseSummary::CoreLexicalV3Unavailable => {
+            result.disposition == CampaignDisposition::InfrastructureError
+        }
+        CampaignLexicalCaseSummary::LegacyMissing => false,
+    };
+    if !valid_shape || !lexical_shape || !lexical_disposition_matches {
         return Err(campaign_error(
-            "campaign case disposition and evidence fields are inconsistent",
+            "campaign case disposition, lexical scope, and evidence fields are inconsistent",
         ));
     }
     Ok(())
@@ -2560,6 +2840,142 @@ fn validate_mismatch_groups(
         ));
     }
     Ok(())
+}
+
+fn validate_lexical_mismatch_groups(
+    mismatches: &[LexicalMismatchGroup],
+    cases: &[CampaignCaseResult],
+) -> Result<(), GauntletError> {
+    if mismatches.len() > MAX_MISMATCH_GROUPS {
+        return Err(campaign_error(
+            "campaign lexical mismatch groups exceed their count budget",
+        ));
+    }
+    let selected_ids = cases
+        .iter()
+        .map(|case| case.case_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut previous_signature = None::<&str>;
+    let mut aggregate_text_bytes = 0_usize;
+    for group in mismatches {
+        let sorted_unique_case_ids = group.case_ids.windows(2).all(|pair| pair[0] < pair[1]);
+        let ids_are_valid = !group.case_ids.is_empty()
+            && group.case_ids.iter().all(|case_id| {
+                is_canonical_query_id(case_id) && selected_ids.contains(case_id.as_str())
+            });
+        let mismatch_is_bounded = group.mismatch.path.starts_with('/')
+            && group.mismatch.path.len() <= MAX_CAMPAIGN_POINTER_BYTES
+            && group.mismatch.oracle.len() <= MAX_CAMPAIGN_POINTER_BYTES
+            && group.mismatch.subject.len() <= MAX_CAMPAIGN_POINTER_BYTES
+            && !group.mismatch.path.chars().any(char::is_control)
+            && !group.mismatch.oracle.chars().any(char::is_control)
+            && !group.mismatch.subject.chars().any(char::is_control);
+        if !is_lower_sha256(&group.signature)
+            || previous_signature.is_some_and(|previous| previous >= group.signature.as_str())
+            || group.signature != lexical_mismatch_signature(&group.mismatch)
+            || group.occurrence_count == 0
+            || group.occurrence_count < u64::try_from(group.case_ids.len()).unwrap_or(u64::MAX)
+            || !sorted_unique_case_ids
+            || !ids_are_valid
+            || !mismatch_is_bounded
+        {
+            return Err(campaign_error(
+                "campaign lexical mismatch group is malformed, unsorted, or unbounded",
+            ));
+        }
+        aggregate_text_bytes = aggregate_text_bytes
+            .checked_add(group.signature.len())
+            .and_then(|bytes| bytes.checked_add(group.mismatch.path.len()))
+            .and_then(|bytes| bytes.checked_add(group.mismatch.oracle.len()))
+            .and_then(|bytes| bytes.checked_add(group.mismatch.subject.len()))
+            .and_then(|bytes| {
+                group
+                    .case_ids
+                    .iter()
+                    .try_fold(bytes, |sum, case_id| sum.checked_add(case_id.len()))
+            })
+            .ok_or_else(|| campaign_error("campaign lexical mismatch text overflow"))?;
+        previous_signature = Some(&group.signature);
+    }
+    if aggregate_text_bytes > MAX_MISMATCH_TEXT_BYTES {
+        return Err(campaign_error(
+            "campaign lexical mismatch groups exceed their aggregate text budget",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lexical_coverage_summary(
+    coverage: &CampaignLexicalCoverageSummary,
+    mode: CampaignContractMode,
+    selected_query_count: u64,
+) -> Result<(), GauntletError> {
+    match (mode, coverage) {
+        (
+            CampaignContractMode::RankEnvelopeOnly,
+            CampaignLexicalCoverageSummary::RankEnvelopeOnly,
+        ) => Ok(()),
+        (
+            CampaignContractMode::CoreLexicalV3,
+            CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible,
+            },
+        ) => {
+            let all_probes = [
+                &subject.full_search,
+                &subject.fusion_candidates,
+                &subject.all_lexical_winners_hydration,
+                &subject.strict_hybrid_winners_hydration,
+                &subject.semantic_only_hydration,
+                &subject.mixed_winners_hydration,
+                &oracle.full_search,
+                &oracle.fusion_candidates,
+                &oracle.all_lexical_winners_hydration,
+                &oracle.strict_hybrid_winners_hydration,
+                &oracle.semantic_only_hydration,
+                &oracle.mixed_winners_hydration,
+            ];
+            for probe in all_probes {
+                let total = probe
+                    .success
+                    .checked_add(probe.restoration)
+                    .and_then(|value| value.checked_add(probe.error))
+                    .and_then(|value| value.checked_add(probe.empty))
+                    .and_then(|value| value.checked_add(probe.not_run))
+                    .ok_or_else(|| campaign_error("lexical coverage count overflow"))?;
+                if total > selected_query_count {
+                    return Err(campaign_error(
+                        "lexical coverage exceeds the selected case count",
+                    ));
+                }
+            }
+            if subject.metadata_deferred_cases > selected_query_count
+                || oracle.metadata_deferred_cases > selected_query_count
+            {
+                return Err(campaign_error(
+                    "lexical deferred-capability coverage exceeds the selected case count",
+                ));
+            }
+            let expected_admissible = lexical_side_coverage_is_admissible(subject)
+                && lexical_side_coverage_is_admissible(oracle);
+            if *admissible != expected_admissible {
+                return Err(campaign_error(
+                    "lexical coverage admissibility is inconsistent",
+                ));
+            }
+            Ok(())
+        }
+        (
+            CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3,
+            CampaignLexicalCoverageSummary::LegacyMissing
+            | CampaignLexicalCoverageSummary::RankEnvelopeOnly
+            | CampaignLexicalCoverageSummary::CoreLexicalV3 { .. },
+        ) => Err(campaign_error(
+            "campaign lexical coverage scope does not match its hashed contract mode",
+        )),
+    }
 }
 
 /// Core E6.2 campaign runner.
@@ -2683,6 +3099,27 @@ impl DifferentialCampaignRunner {
             );
             evidence_case.validate_shape()?;
             prepared_cases.push((query, query_class(query), evidence_case));
+        }
+        let selected_default_query = prepared_cases
+            .iter()
+            .any(|(query, _, _)| query.syntax == QuerySyntax::Default);
+        let selected_non_default_query = prepared_cases
+            .iter()
+            .any(|(query, _, _)| query.syntax != QuerySyntax::Default);
+        match self.config.contract_mode {
+            CampaignContractMode::CoreLexicalV3 if selected_non_default_query => {
+                return Err(campaign_error(
+                    "core lexical v3 cannot be used for CASS or other non-default query syntax",
+                ));
+            }
+            CampaignContractMode::RankEnvelopeOnly
+                if self.config.require_provenance && selected_default_query =>
+            {
+                return Err(campaign_error(
+                    "provenance-bearing default campaigns require core lexical v3 evidence",
+                ));
+            }
+            CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
         }
         let mut engines = EnginePairIdentity::new(
             ComparisonMode::CrossEngine,
@@ -2812,6 +3249,9 @@ impl DifferentialCampaignRunner {
 
         let mut cases = Vec::with_capacity(prepared_cases.len());
         let mut mismatches = MismatchCollection::default();
+        let mut lexical_mismatches = LexicalMismatchCollection::default();
+        let mut lexical_coverage =
+            CampaignLexicalCoverageAccumulator::new(self.config.contract_mode);
         for (ordinal, (query, query_class, evidence_case)) in prepared_cases.into_iter().enumerate()
         {
             validate_engine_state(
@@ -2828,36 +3268,89 @@ impl DifferentialCampaignRunner {
                 .oracle
                 .observe_generated(cx, query, &evidence_case)
                 .await;
+            let lexical_result = match self.config.contract_mode {
+                CampaignContractMode::RankEnvelopeOnly => {
+                    Ok(ArtifactLexicalContractEvidence::RankEnvelopeOnly)
+                }
+                CampaignContractMode::CoreLexicalV3 => {
+                    let subject_bundle = observe_core_lexical_bundle(
+                        cx,
+                        &*index_session.subject,
+                        LexicalEngineRole::Subject,
+                        &engines.subject,
+                        &corpus_manifest_hash,
+                        &self.semantic_contract,
+                        query_suite.manifest.spec.seed,
+                        query,
+                    )
+                    .await;
+                    let oracle_bundle = observe_core_lexical_bundle(
+                        cx,
+                        &*index_session.oracle,
+                        LexicalEngineRole::Oracle,
+                        &engines.oracle,
+                        &corpus_manifest_hash,
+                        &self.semantic_contract,
+                        query_suite.manifest.spec.seed,
+                        query,
+                    )
+                    .await;
+                    match (subject_bundle, oracle_bundle) {
+                        (Ok(subject), Ok(oracle)) => compare_lexical_contracts(subject, oracle)
+                            .map(
+                                |comparison| ArtifactLexicalContractEvidence::CoreLexicalV3 {
+                                    comparison: Box::new(comparison),
+                                },
+                            ),
+                        (Err(subject), Err(oracle)) => Err(campaign_error(format!(
+                            "both core lexical observations failed; subject: {subject}; oracle: {oracle}"
+                        ))),
+                        (Err(subject), Ok(_)) => Err(campaign_error(format!(
+                            "subject core lexical observation failed: {subject}"
+                        ))),
+                        (Ok(_), Err(oracle)) => Err(campaign_error(format!(
+                            "oracle core lexical observation failed: {oracle}"
+                        ))),
+                    }
+                }
+            };
             validate_engine_state(
                 &*index_session.subject,
                 &*index_session.oracle,
                 &engines,
                 &self.semantic_contract,
             )?;
-            let result = match (subject_result, oracle_result) {
-                (Ok(subject_observation), Ok(oracle_observation)) => self.finish_case(
-                    run_id,
-                    ordinal,
-                    query,
-                    query_class,
-                    &query_manifest_hash,
-                    query_suite.manifest.source,
-                    &query_suite.manifest.source_identity_sha256,
-                    &engines,
-                    corpus_manifest.document_count,
-                    evidence_case,
-                    subject_observation,
-                    oracle_observation,
-                    &mut mismatches,
-                ),
-                (subject_result, oracle_result) => {
-                    let (reason, diagnostic) = engine_error_details(subject_result, oracle_result);
+            let result = match (subject_result, oracle_result, lexical_result) {
+                (Ok(subject_observation), Ok(oracle_observation), Ok(lexical_contract)) => self
+                    .finish_case(
+                        run_id,
+                        ordinal,
+                        query,
+                        query_class,
+                        &query_manifest_hash,
+                        query_suite.manifest.source,
+                        &query_suite.manifest.source_identity_sha256,
+                        query_suite.manifest.spec.seed,
+                        &engines,
+                        corpus_manifest.document_count,
+                        evidence_case,
+                        subject_observation,
+                        oracle_observation,
+                        &mut mismatches,
+                        &mut lexical_mismatches,
+                        &mut lexical_coverage,
+                        lexical_contract,
+                    ),
+                (subject_result, oracle_result, lexical_result) => {
+                    let (reason, diagnostic) =
+                        observation_error_details(&subject_result, &oracle_result, &lexical_result);
                     CampaignCaseResult {
                         case_id: query.id.clone(),
                         query_class,
                         disposition: CampaignDisposition::InfrastructureError,
                         comparison_status: None,
                         rank_class: None,
+                        lexical_contract: unavailable_lexical_summary(self.config.contract_mode),
                         artifact_hash: None,
                         registered_divergence: None,
                         first_divergence: None,
@@ -2872,7 +3365,10 @@ impl DifferentialCampaignRunner {
         let confidence = f64::from_bits(self.config.posterior_confidence_bits);
         let query_classes = summarize_query_classes(&cases, confidence);
         let mismatches = mismatches.finish();
-        let passed = cases.iter().all(|result| result.disposition.passes());
+        let lexical_mismatches = lexical_mismatches.finish();
+        let lexical_coverage = lexical_coverage.finish();
+        let passed = cases.iter().all(|result| result.disposition.passes())
+            && lexical_coverage_is_admissible(&lexical_coverage);
         let report = CampaignReport {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
@@ -2891,6 +3387,8 @@ impl DifferentialCampaignRunner {
             cases,
             query_classes,
             mismatches,
+            lexical_mismatches,
+            lexical_coverage,
             passed,
             provenance: self.provenance.clone(),
         };
@@ -2924,17 +3422,22 @@ impl DifferentialCampaignRunner {
         query_manifest_hash: &str,
         query_suite_source: QuerySuiteSource,
         query_source_identity_sha256: &str,
+        query_seed: u64,
         engines: &EnginePairIdentity,
         expected_doc_count: u64,
         evidence_case: DifferentialCase,
         subject: EngineObservation,
         oracle: EngineObservation,
         mismatches: &mut MismatchCollection,
+        lexical_mismatches: &mut LexicalMismatchCollection,
+        lexical_coverage: &mut CampaignLexicalCoverageAccumulator,
+        lexical_contract: ArtifactLexicalContractEvidence,
     ) -> CampaignCaseResult {
-        if subject.doc_count != expected_doc_count && oracle.doc_count != expected_doc_count {
+        if subject.doc_count != expected_doc_count || oracle.doc_count != expected_doc_count {
             return infrastructure_case(
                 query,
                 query_class,
+                self.config.contract_mode,
                 "observation_document_count_drift",
                 format!(
                     "expected {expected_doc_count}; subject {}; oracle {}",
@@ -2951,6 +3454,7 @@ impl DifferentialCampaignRunner {
                 return infrastructure_case(
                     query,
                     query_class,
+                    self.config.contract_mode,
                     "comparison_failed",
                     error.to_string(),
                 );
@@ -2962,16 +3466,42 @@ impl DifferentialCampaignRunner {
                 return infrastructure_case(
                     query,
                     query_class,
+                    self.config.contract_mode,
                     "mismatch_budget_exceeded",
                     error.to_string(),
                 );
             }
         };
+        let lexical_mismatch_text_bytes =
+            match lexical_mismatches.preflight(&lexical_contract, &query.id) {
+                Ok(text_bytes) => text_bytes,
+                Err(error) => {
+                    return infrastructure_case(
+                        query,
+                        query_class,
+                        self.config.contract_mode,
+                        "lexical_mismatch_budget_exceeded",
+                        error.to_string(),
+                    );
+                }
+            };
         let (disposition, reason, registered_divergence) =
-            classify_case(query, &comparison, &self.registry);
+            classify_case_with_lexical(query, &comparison, &lexical_contract, &self.registry);
         let first_divergence = comparison.first_divergence.clone();
         let comparison_status = Some(comparison.status);
         let rank_class = Some(comparison.rank_class);
+        let lexical_summary = match lexical_case_summary(&lexical_contract) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return infrastructure_case(
+                    query,
+                    query_class,
+                    self.config.contract_mode,
+                    "lexical_summary_failed",
+                    error.to_string(),
+                );
+            }
+        };
         let run = HarnessRun {
             engines: engines.clone(),
             case: evidence_case,
@@ -2984,15 +3514,18 @@ impl DifferentialCampaignRunner {
             query_suite_source,
             query_source_identity_sha256: query_source_identity_sha256.to_owned(),
             semantic_contract: self.semantic_contract.clone(),
+            contract_mode: self.config.contract_mode,
+            query_seed,
             query: query.clone(),
             registered_divergence: registered_divergence.clone(),
         };
-        let object = match ArtifactObject::from_campaign_run(run, context) {
+        let object = match ArtifactObject::from_campaign_run(run, context, lexical_contract) {
             Ok(object) => object,
             Err(error) => {
                 return infrastructure_case(
                     query,
                     query_class,
+                    self.config.contract_mode,
                     "artifact_validation_failed",
                     error.to_string(),
                 );
@@ -3013,6 +3546,7 @@ impl DifferentialCampaignRunner {
                     return infrastructure_case(
                         query,
                         query_class,
+                        self.config.contract_mode,
                         "artifact_prepare_failed",
                         error.to_string(),
                     );
@@ -3022,17 +3556,25 @@ impl DifferentialCampaignRunner {
             return infrastructure_case(
                 query,
                 query_class,
+                self.config.contract_mode,
                 "artifact_persist_failed",
                 error.to_string(),
             );
         }
         mismatches.apply(&object.comparison, &query.id, mismatch_text_bytes);
+        lexical_mismatches.apply(
+            &object.lexical_contract,
+            &query.id,
+            lexical_mismatch_text_bytes,
+        );
+        lexical_coverage.record(&object.lexical_contract);
         CampaignCaseResult {
             case_id: query.id.clone(),
             query_class,
             disposition,
             comparison_status,
             rank_class,
+            lexical_contract: lexical_summary,
             artifact_hash: Some(prepared.object_hash().to_owned()),
             registered_divergence,
             first_divergence,
@@ -3066,6 +3608,7 @@ fn evidence_case_for(
 fn infrastructure_case(
     query: &GeneratedQueryCase,
     query_class: String,
+    contract_mode: CampaignContractMode,
     reason: &'static str,
     diagnostic: String,
 ) -> CampaignCaseResult {
@@ -3075,11 +3618,45 @@ fn infrastructure_case(
         disposition: CampaignDisposition::InfrastructureError,
         comparison_status: None,
         rank_class: None,
+        lexical_contract: unavailable_lexical_summary(contract_mode),
         artifact_hash: None,
         registered_divergence: None,
         first_divergence: None,
         reason: Some(reason.to_owned()),
         diagnostic: Some(diagnostic),
+    }
+}
+
+fn unavailable_lexical_summary(contract_mode: CampaignContractMode) -> CampaignLexicalCaseSummary {
+    match contract_mode {
+        CampaignContractMode::RankEnvelopeOnly => CampaignLexicalCaseSummary::RankEnvelopeOnly,
+        CampaignContractMode::CoreLexicalV3 => CampaignLexicalCaseSummary::CoreLexicalV3Unavailable,
+    }
+}
+
+fn lexical_case_summary(
+    evidence: &ArtifactLexicalContractEvidence,
+) -> Result<CampaignLexicalCaseSummary, GauntletError> {
+    match evidence {
+        ArtifactLexicalContractEvidence::LegacyPreV3Missing => Err(campaign_error(
+            "legacy lexical evidence cannot produce a v5 case summary",
+        )),
+        ArtifactLexicalContractEvidence::RankEnvelopeOnly => {
+            Ok(CampaignLexicalCaseSummary::RankEnvelopeOnly)
+        }
+        ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } => {
+            comparison.validate_replay()?;
+            Ok(CampaignLexicalCaseSummary::CoreLexicalV3 {
+                status: comparison.status,
+                first_mismatch: comparison.first_mismatch.clone(),
+                mismatch_count: u64::try_from(comparison.mismatches.len())
+                    .map_err(|_| campaign_error("lexical mismatch count does not fit u64"))?,
+                waived_difference_count: u64::try_from(comparison.waived_differences.len())
+                    .map_err(|_| {
+                        campaign_error("lexical waived-difference count does not fit u64")
+                    })?,
+            })
+        }
     }
 }
 
@@ -3144,6 +3721,30 @@ fn classify_case(
             }
         }
     }
+}
+
+fn classify_case_with_lexical(
+    query: &GeneratedQueryCase,
+    comparison: &ComparisonReport,
+    lexical_contract: &ArtifactLexicalContractEvidence,
+    registry: &DivergenceRegistry,
+) -> (
+    CampaignDisposition,
+    Option<String>,
+    Option<DivergenceRegisterEntry>,
+) {
+    if let ArtifactLexicalContractEvidence::CoreLexicalV3 {
+        comparison: lexical,
+    } = lexical_contract
+        && lexical.status == LexicalComparisonStatus::Mismatch
+    {
+        return (
+            CampaignDisposition::Unclassified,
+            Some("lexical_contract_mismatch".to_owned()),
+            None,
+        );
+    }
+    classify_case(query, comparison, registry)
 }
 
 fn is_auto_class(class: DivergenceClass) -> bool {
@@ -3389,6 +3990,309 @@ impl MismatchCollection {
     }
 }
 
+#[derive(Debug)]
+struct LexicalMismatchAccumulator {
+    signature: String,
+    mismatch: LexicalFieldMismatch,
+    occurrence_count: u64,
+    case_ids: BTreeSet<String>,
+}
+
+impl LexicalMismatchAccumulator {
+    fn finish(self) -> LexicalMismatchGroup {
+        LexicalMismatchGroup {
+            signature: self.signature,
+            mismatch: self.mismatch,
+            occurrence_count: self.occurrence_count,
+            case_ids: self.case_ids.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LexicalMismatchCollection {
+    entries: BTreeMap<String, LexicalMismatchAccumulator>,
+    text_bytes: usize,
+}
+
+impl LexicalMismatchCollection {
+    fn preflight(
+        &self,
+        evidence: &ArtifactLexicalContractEvidence,
+        case_id: &str,
+    ) -> Result<usize, GauntletError> {
+        let mismatches = match evidence {
+            ArtifactLexicalContractEvidence::LegacyPreV3Missing
+            | ArtifactLexicalContractEvidence::RankEnvelopeOnly => return Ok(self.text_bytes),
+            ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } => {
+                comparison.validate_replay()?;
+                &comparison.mismatches
+            }
+        };
+        let mut new_groups = BTreeMap::<String, LexicalFieldMismatch>::new();
+        let mut case_id_additions = BTreeSet::<String>::new();
+        for mismatch in mismatches {
+            if !mismatch.path.starts_with('/')
+                || mismatch.path.len() > MAX_CAMPAIGN_POINTER_BYTES
+                || mismatch.oracle.len() > MAX_CAMPAIGN_POINTER_BYTES
+                || mismatch.subject.len() > MAX_CAMPAIGN_POINTER_BYTES
+            {
+                return Err(campaign_error(
+                    "lexical mismatch exceeds the campaign mismatch budget",
+                ));
+            }
+            let signature = lexical_mismatch_signature(mismatch);
+            if !self.entries.contains_key(&signature) {
+                new_groups
+                    .entry(signature.clone())
+                    .or_insert_with(|| mismatch.clone());
+            }
+            if !self
+                .entries
+                .get(&signature)
+                .is_some_and(|entry| entry.case_ids.contains(case_id))
+            {
+                case_id_additions.insert(signature);
+            }
+        }
+        let new_text_bytes = new_groups
+            .iter()
+            .try_fold(0_usize, |bytes, (signature, mismatch)| {
+                bytes
+                    .checked_add(signature.len())
+                    .and_then(|sum| sum.checked_add(mismatch.path.len()))
+                    .and_then(|sum| sum.checked_add(mismatch.oracle.len()))
+                    .and_then(|sum| sum.checked_add(mismatch.subject.len()))
+            })
+            .and_then(|bytes| {
+                case_id
+                    .len()
+                    .checked_mul(case_id_additions.len())
+                    .and_then(|case_bytes| bytes.checked_add(case_bytes))
+            })
+            .ok_or_else(|| campaign_error("lexical mismatch text byte count overflow"))?;
+        let final_group_count = self
+            .entries
+            .len()
+            .checked_add(new_groups.len())
+            .ok_or_else(|| campaign_error("lexical mismatch group count overflow"))?;
+        let final_text_bytes = self
+            .text_bytes
+            .checked_add(new_text_bytes)
+            .ok_or_else(|| campaign_error("lexical mismatch text byte count overflow"))?;
+        if final_group_count > MAX_MISMATCH_GROUPS || final_text_bytes > MAX_MISMATCH_TEXT_BYTES {
+            return Err(campaign_error(
+                "lexical mismatch groups exceed their count or text budget",
+            ));
+        }
+        Ok(final_text_bytes)
+    }
+
+    fn apply(
+        &mut self,
+        evidence: &ArtifactLexicalContractEvidence,
+        case_id: &str,
+        final_text_bytes: usize,
+    ) {
+        if let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } = evidence {
+            for mismatch in &comparison.mismatches {
+                let signature = lexical_mismatch_signature(mismatch);
+                let entry = self.entries.entry(signature.clone()).or_insert_with(|| {
+                    LexicalMismatchAccumulator {
+                        signature,
+                        mismatch: mismatch.clone(),
+                        occurrence_count: 0,
+                        case_ids: BTreeSet::new(),
+                    }
+                });
+                entry.occurrence_count = entry.occurrence_count.saturating_add(1);
+                entry.case_ids.insert(case_id.to_owned());
+            }
+        }
+        self.text_bytes = final_text_bytes;
+    }
+
+    fn record(
+        &mut self,
+        evidence: &ArtifactLexicalContractEvidence,
+        case_id: &str,
+    ) -> Result<(), GauntletError> {
+        let final_text_bytes = self.preflight(evidence, case_id)?;
+        self.apply(evidence, case_id, final_text_bytes);
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<LexicalMismatchGroup> {
+        self.entries
+            .into_values()
+            .map(LexicalMismatchAccumulator::finish)
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct CampaignLexicalCoverageAccumulator {
+    mode: CampaignContractMode,
+    subject: LexicalSideCoverageCounts,
+    oracle: LexicalSideCoverageCounts,
+}
+
+impl CampaignLexicalCoverageAccumulator {
+    fn new(mode: CampaignContractMode) -> Self {
+        Self {
+            mode,
+            subject: LexicalSideCoverageCounts::default(),
+            oracle: LexicalSideCoverageCounts::default(),
+        }
+    }
+
+    fn record(&mut self, evidence: &ArtifactLexicalContractEvidence) {
+        if let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } = evidence {
+            record_side_coverage(&comparison.coverage.subject, &mut self.subject);
+            record_side_coverage(&comparison.coverage.oracle, &mut self.oracle);
+            if comparison.subject.fusion_metadata_is_deferred() {
+                self.subject.metadata_deferred_cases =
+                    self.subject.metadata_deferred_cases.saturating_add(1);
+            }
+            if comparison.oracle.fusion_metadata_is_deferred() {
+                self.oracle.metadata_deferred_cases =
+                    self.oracle.metadata_deferred_cases.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(self) -> CampaignLexicalCoverageSummary {
+        match self.mode {
+            CampaignContractMode::RankEnvelopeOnly => {
+                CampaignLexicalCoverageSummary::RankEnvelopeOnly
+            }
+            CampaignContractMode::CoreLexicalV3 => {
+                let admissible = lexical_side_coverage_is_admissible(&self.subject)
+                    && lexical_side_coverage_is_admissible(&self.oracle);
+                CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                    subject: Box::new(self.subject),
+                    oracle: Box::new(self.oracle),
+                    admissible,
+                }
+            }
+        }
+    }
+}
+
+fn record_side_coverage(observed: &LexicalSideCoverage, aggregate: &mut LexicalSideCoverageCounts) {
+    record_probe_coverage(&observed.full_search, &mut aggregate.full_search);
+    record_probe_coverage(
+        &observed.fusion_candidates,
+        &mut aggregate.fusion_candidates,
+    );
+    record_probe_coverage(
+        &observed.all_lexical_winners_hydration,
+        &mut aggregate.all_lexical_winners_hydration,
+    );
+    record_probe_coverage(
+        &observed.strict_hybrid_winners_hydration,
+        &mut aggregate.strict_hybrid_winners_hydration,
+    );
+    record_probe_coverage(
+        &observed.semantic_only_hydration,
+        &mut aggregate.semantic_only_hydration,
+    );
+    record_probe_coverage(
+        &observed.mixed_winners_hydration,
+        &mut aggregate.mixed_winners_hydration,
+    );
+}
+
+fn record_probe_coverage(observed: &LexicalProbeCoverage, aggregate: &mut ProbeCoverageCounts) {
+    match observed {
+        LexicalProbeCoverage::ExercisedSuccess => {
+            aggregate.success = aggregate.success.saturating_add(1);
+        }
+        LexicalProbeCoverage::ExercisedRestoration => {
+            aggregate.restoration = aggregate.restoration.saturating_add(1);
+        }
+        LexicalProbeCoverage::ExercisedError => {
+            aggregate.error = aggregate.error.saturating_add(1);
+        }
+        LexicalProbeCoverage::ExercisedEmpty => {
+            aggregate.empty = aggregate.empty.saturating_add(1);
+        }
+        LexicalProbeCoverage::NotRun { .. } => {
+            aggregate.not_run = aggregate.not_run.saturating_add(1);
+        }
+    }
+}
+
+fn lexical_side_coverage_is_admissible(side: &LexicalSideCoverageCounts) -> bool {
+    let hydration_success = [
+        &side.all_lexical_winners_hydration,
+        &side.strict_hybrid_winners_hydration,
+        &side.semantic_only_hydration,
+        &side.mixed_winners_hydration,
+    ]
+    .into_iter()
+    .all(|probe| probe.success.saturating_add(probe.restoration) > 0);
+    let deferred_metadata_shapes_are_exercised = side.metadata_deferred_cases == 0
+        || [
+            &side.all_lexical_winners_hydration,
+            &side.strict_hybrid_winners_hydration,
+            &side.mixed_winners_hydration,
+        ]
+        .into_iter()
+        .all(|probe| probe.restoration > 0);
+    side.full_search.success > 0
+        && side.full_search.empty > 0
+        && side.fusion_candidates.success > 0
+        && side.fusion_candidates.empty > 0
+        && hydration_success
+        && deferred_metadata_shapes_are_exercised
+}
+
+fn lexical_coverage_is_admissible(coverage: &CampaignLexicalCoverageSummary) -> bool {
+    match coverage {
+        CampaignLexicalCoverageSummary::LegacyMissing => false,
+        CampaignLexicalCoverageSummary::RankEnvelopeOnly => true,
+        CampaignLexicalCoverageSummary::CoreLexicalV3 { admissible, .. } => *admissible,
+    }
+}
+
+fn lexical_mismatch_signature(mismatch: &LexicalFieldMismatch) -> String {
+    let pointer = normalized_pointer(&mismatch.path);
+    let cause = format!(
+        "{}:{}",
+        normalized_diagnostic_shape(&mismatch.oracle),
+        normalized_diagnostic_shape(&mismatch.subject)
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(LEXICAL_MISMATCH_SIGNATURE_DOMAIN);
+    hasher.update([lexical_mismatch_class_tag(mismatch.class)]);
+    hasher.update(
+        u64::try_from(pointer.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(pointer.as_bytes());
+    hasher.update(u64::try_from(cause.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(cause.as_bytes());
+    lower_hex(&hasher.finalize())
+}
+
+const fn lexical_mismatch_class_tag(class: LexicalMismatchClass) -> u8 {
+    match class {
+        LexicalMismatchClass::Context => 0,
+        LexicalMismatchClass::Outcome => 1,
+        LexicalMismatchClass::Ordering => 2,
+        LexicalMismatchClass::Score => 3,
+        LexicalMismatchClass::SourceIdentity => 4,
+        LexicalMismatchClass::Snippet => 5,
+        LexicalMismatchClass::Highlight => 6,
+        LexicalMismatchClass::Metadata => 7,
+        LexicalMismatchClass::Explanation => 8,
+        LexicalMismatchClass::Count => 9,
+        LexicalMismatchClass::Error => 10,
+    }
+}
+
 fn mismatch_signature(rank_class: RankClass, divergence: &Divergence) -> String {
     let pointer = normalized_pointer(&divergence.pointer);
     let cause = mismatch_cause_shape(divergence);
@@ -3522,6 +4426,50 @@ fn normalized_pointer(pointer: &str) -> String {
         .join("/")
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn observe_core_lexical_bundle(
+    cx: &Cx,
+    engine: &dyn DifferentialCampaignEngine,
+    role: LexicalEngineRole,
+    descriptor: &EngineDescriptor,
+    corpus_manifest_hash: &str,
+    semantic_contract: &SemanticContract,
+    query_seed: u64,
+    query: &GeneratedQueryCase,
+) -> Result<crate::comparator::LexicalContractBundle, GauntletError> {
+    if query.syntax != QuerySyntax::Default {
+        return Err(campaign_error(
+            "core lexical contract observation requires default query syntax",
+        ));
+    }
+    if engine.descriptor() != *descriptor {
+        return Err(campaign_error(
+            "engine descriptor changed before total lexical observation",
+        ));
+    }
+    let limit = usize::try_from(query.limit)
+        .map_err(|_| campaign_error("core lexical query limit does not fit usize"))?;
+    let backend = lexical_backend_identity(descriptor, corpus_manifest_hash)?;
+    let query_contract_sha256 = lexical_query_contract_sha256(semantic_contract)?;
+    let build = LexicalContractBuildContext::new(
+        role,
+        backend,
+        corpus_manifest_hash.to_owned(),
+        corpus_manifest_hash.to_owned(),
+        query_contract_sha256,
+        &query.query,
+        query_seed,
+        limit,
+    )?;
+    let lexical = engine.core_lexical_search()?.ok_or_else(|| {
+        campaign_error(format!(
+            "engine {} does not expose the required ordinary LexicalSearch contract",
+            descriptor.implementation
+        ))
+    })?;
+    observe_live_lexical_contract(cx, lexical, build).await
+}
+
 fn validate_engine_state(
     subject: &dyn DifferentialCampaignEngine,
     oracle: &dyn DifferentialCampaignEngine,
@@ -3545,20 +4493,41 @@ fn validate_engine_state(
     Ok(())
 }
 
-fn engine_error_details(
-    subject: Result<EngineObservation, GauntletError>,
-    oracle: Result<EngineObservation, GauntletError>,
+fn observation_error_details(
+    subject: &Result<EngineObservation, GauntletError>,
+    oracle: &Result<EngineObservation, GauntletError>,
+    lexical: &Result<ArtifactLexicalContractEvidence, GauntletError>,
 ) -> (String, String) {
-    match (subject, oracle) {
-        (Err(subject), Err(oracle)) => (
+    match (subject, oracle, lexical) {
+        (Ok(_), Ok(_), Err(lexical)) => (
+            "lexical_contract_observation_failed".to_owned(),
+            lexical.to_string(),
+        ),
+        (Err(subject), Err(oracle), Ok(_)) => (
             "both_engine_executions_failed".to_owned(),
             format!("subject: {subject}; oracle: {oracle}"),
         ),
-        (Err(subject), Ok(_)) => ("subject_execution_failed".to_owned(), subject.to_string()),
-        (Ok(_), Err(oracle)) => ("oracle_execution_failed".to_owned(), oracle.to_string()),
-        (Ok(_), Ok(_)) => (
+        (Err(subject), Ok(_), Ok(_)) => {
+            ("subject_execution_failed".to_owned(), subject.to_string())
+        }
+        (Ok(_), Err(oracle), Ok(_)) => ("oracle_execution_failed".to_owned(), oracle.to_string()),
+        (Err(subject), oracle, Err(lexical)) => (
+            "multiple_observation_lanes_failed".to_owned(),
+            format!(
+                "subject legacy: {subject}; oracle legacy: {}; lexical: {lexical}",
+                oracle
+                    .as_ref()
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), ToString::to_string)
+            ),
+        ),
+        (Ok(_), Err(oracle), Err(lexical)) => (
+            "multiple_observation_lanes_failed".to_owned(),
+            format!("oracle legacy: {oracle}; lexical: {lexical}"),
+        ),
+        (Ok(_), Ok(_), Ok(_)) => (
             "invalid_engine_error_state".to_owned(),
-            "both engine results unexpectedly succeeded".to_owned(),
+            "all observation results unexpectedly succeeded".to_owned(),
         ),
     }
 }
@@ -3819,6 +4788,11 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
         SemanticContract::scalar_g1a()
     }
 
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+        self.require_committed()?;
+        Ok(Some(self.index()?))
+    }
+
     fn begin_corpus<'a>(
         &'a mut self,
         _cx: &'a Cx,
@@ -3928,6 +4902,11 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
 
     fn semantic_contract(&self) -> SemanticContract {
         self.campaign_semantic_contract().clone()
+    }
+
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+        self.require_committed()?;
+        Ok(Some(self.index()))
     }
 
     fn begin_corpus<'a>(
@@ -5821,6 +6800,142 @@ mod tests {
         SemanticContract::shipping_default()
     }
 
+    fn fixture_provenance(
+        fixture: &Fixture,
+        config: &CampaignConfig,
+        semantic_contract: &SemanticContract,
+        subject: &EngineDescriptor,
+        oracle: &EngineDescriptor,
+    ) -> CampaignProvenance {
+        CampaignProvenance {
+            subject_git_revision: subject.source_revision.clone(),
+            subject_source_dirty: subject.source_dirty,
+            oracle_git_revision: oracle.source_revision.clone(),
+            oracle_source_dirty: oracle.source_dirty,
+            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
+            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
+            rust_toolchain_channel: collect_dated_toolchain_channel()
+                .expect("dated nightly provenance"),
+            unicode_version: format!(
+                "{}.{}.{}",
+                char::UNICODE_VERSION.0,
+                char::UNICODE_VERSION.1,
+                char::UNICODE_VERSION.2
+            ),
+            unicode_normalization_version: locked_crate_version("unicode-normalization")
+                .expect("locked normalization version"),
+            unicode_normalization_table_version: unicode_normalization_table_version(),
+            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
+            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
+            query_seed: fixture.query_suite.manifest.spec.seed,
+            query_source_identity_sha256: fixture
+                .query_suite
+                .manifest
+                .source_identity_sha256
+                .clone(),
+            query_profile_sha256: query_profile_sha256(
+                &fixture.query_suite.manifest,
+                &config.selection,
+                semantic_contract,
+            )
+            .expect("query profile hash"),
+            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
+            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
+            corpus_manifest_hash: fixture
+                .corpus_manifest
+                .manifest_hash()
+                .expect("corpus manifest hash"),
+            query_manifest_hash: fixture
+                .query_suite
+                .manifest
+                .manifest_hash()
+                .expect("query manifest hash"),
+            corpus_seed: Some(0x6200),
+        }
+    }
+
+    #[test]
+    fn core_lexical_coverage_requires_nonempty_and_empty_search_paths() {
+        let searched = ProbeCoverageCounts {
+            success: 1,
+            empty: 1,
+            ..ProbeCoverageCounts::default()
+        };
+        let hydrated = ProbeCoverageCounts {
+            success: 1,
+            ..ProbeCoverageCounts::default()
+        };
+        let mut side = LexicalSideCoverageCounts {
+            full_search: searched.clone(),
+            fusion_candidates: searched,
+            all_lexical_winners_hydration: hydrated.clone(),
+            strict_hybrid_winners_hydration: hydrated.clone(),
+            semantic_only_hydration: hydrated.clone(),
+            mixed_winners_hydration: hydrated,
+            metadata_deferred_cases: 0,
+        };
+        assert!(lexical_side_coverage_is_admissible(&side));
+
+        side.full_search.empty = 0;
+        assert!(
+            !lexical_side_coverage_is_admissible(&side),
+            "a campaign that never observes empty full search is vacuous"
+        );
+        side.full_search.empty = 1;
+        side.fusion_candidates.empty = 0;
+        assert!(
+            !lexical_side_coverage_is_admissible(&side),
+            "a campaign that never observes empty candidates is vacuous"
+        );
+    }
+
+    #[test]
+    fn core_lexical_coverage_requires_every_deferred_metadata_restoration_shape() {
+        let searched = ProbeCoverageCounts {
+            success: 1,
+            empty: 1,
+            ..ProbeCoverageCounts::default()
+        };
+        let restored = ProbeCoverageCounts {
+            restoration: 1,
+            ..ProbeCoverageCounts::default()
+        };
+        let semantic_control = ProbeCoverageCounts {
+            success: 1,
+            ..ProbeCoverageCounts::default()
+        };
+        let side = LexicalSideCoverageCounts {
+            full_search: searched.clone(),
+            fusion_candidates: searched,
+            all_lexical_winners_hydration: restored.clone(),
+            strict_hybrid_winners_hydration: restored.clone(),
+            semantic_only_hydration: semantic_control,
+            mixed_winners_hydration: restored,
+            metadata_deferred_cases: 1,
+        };
+        assert!(lexical_side_coverage_is_admissible(&side));
+
+        let mut missing_all = side.clone();
+        missing_all.all_lexical_winners_hydration.restoration = 0;
+        missing_all.all_lexical_winners_hydration.success = 1;
+        let mut missing_strict = side.clone();
+        missing_strict.strict_hybrid_winners_hydration.restoration = 0;
+        missing_strict.strict_hybrid_winners_hydration.success = 1;
+        let mut missing_mixed = side;
+        missing_mixed.mixed_winners_hydration.restoration = 0;
+        missing_mixed.mixed_winners_hydration.success = 1;
+        for (shape, missing_shape) in [
+            ("all lexical winners", missing_all),
+            ("strict hybrid winners", missing_strict),
+            ("mixed winners", missing_mixed),
+        ] {
+            assert!(
+                !lexical_side_coverage_is_admissible(&missing_shape),
+                "a deferred-metadata campaign must restore {shape}"
+            );
+        }
+    }
+
     #[test]
     fn cass_selection_is_complete_profile_specific_and_manifest_ordered() {
         let fixture = make_fixture();
@@ -6453,7 +7568,8 @@ mod tests {
             ArtifactStore::new(temp.path()),
             semantic_contract(),
             CampaignConfig {
-                selection: CampaignSelection::All,
+                selection: CampaignSelection::DefaultSyntax,
+                contract_mode: CampaignContractMode::CoreLexicalV3,
                 require_provenance: true,
                 ..CampaignConfig::default()
             },
@@ -6479,6 +7595,162 @@ mod tests {
             );
             assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
             assert_eq!(oracle.index_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn production_default_rank_envelope_is_rejected_before_ingest_with_valid_provenance() {
+        let fixture = make_fixture();
+        let semantic_contract = semantic_contract();
+        let subject_descriptor = EngineDescriptor {
+            source_revision: "1".repeat(40),
+            ..subject_descriptor()
+        };
+        let oracle_descriptor = oracle_descriptor();
+        let config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            contract_mode: CampaignContractMode::RankEnvelopeOnly,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let provenance = fixture_provenance(
+            &fixture,
+            &config,
+            &semantic_contract,
+            &subject_descriptor,
+            &oracle_descriptor,
+        );
+        let mut engines = EnginePairIdentity::new(
+            ComparisonMode::CrossEngine,
+            subject_descriptor.clone(),
+            oracle_descriptor.clone(),
+        )
+        .expect("distinct engines");
+        engines
+            .bind_semantic_contract(semantic_contract.clone())
+            .expect("semantic contract");
+        provenance
+            .validate_for_campaign(
+                &engines,
+                &semantic_contract,
+                &config,
+                &fixture.corpus_manifest,
+                &fixture.query_suite.manifest,
+            )
+            .expect("the policy regression must carry otherwise-valid provenance");
+
+        let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            semantic_contract,
+            config,
+            DivergenceRegistry::default(),
+        )
+        .expect("production rank-envelope policy")
+        .with_provenance(provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = campaign
+                .run(
+                    &cx,
+                    "default-rank-envelope-is-not-replacement-evidence",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect_err("default production evidence requires core lexical v3");
+            assert!(
+                error
+                    .to_string()
+                    .contains("require core lexical v3 evidence"),
+                "unexpected fail-closed reason: {error}"
+            );
+            assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(oracle.index_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn production_cass_rank_envelope_remains_admissible_with_valid_provenance() {
+        let fixture = make_fixture();
+        let semantic_contract = SemanticContract::cass();
+        let subject_descriptor = EngineDescriptor {
+            source_revision: "1".repeat(40),
+            ..subject_descriptor()
+        };
+        let oracle_descriptor = EngineDescriptor {
+            config_hash: crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+            ..oracle_descriptor()
+        };
+        let config = CampaignConfig {
+            selection: CampaignSelection::CassSyntax,
+            contract_mode: CampaignContractMode::RankEnvelopeOnly,
+            require_provenance: true,
+            index_batch_size: 5,
+            ..CampaignConfig::default()
+        };
+        let provenance = fixture_provenance(
+            &fixture,
+            &config,
+            &semantic_contract,
+            &subject_descriptor,
+            &oracle_descriptor,
+        );
+        let mut engines = EnginePairIdentity::new(
+            ComparisonMode::CrossEngine,
+            subject_descriptor.clone(),
+            oracle_descriptor.clone(),
+        )
+        .expect("distinct CASS engines");
+        engines
+            .bind_semantic_contract(semantic_contract.clone())
+            .expect("CASS semantic contract");
+        provenance
+            .validate_for_campaign(
+                &engines,
+                &semantic_contract,
+                &config,
+                &fixture.corpus_manifest,
+                &fixture.query_suite.manifest,
+            )
+            .expect("the CASS positive control must carry valid provenance");
+        let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new())
+            .with_semantic_contract(semantic_contract.clone());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new())
+            .with_semantic_contract(semantic_contract.clone());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            semantic_contract,
+            config,
+            DivergenceRegistry::default(),
+        )
+        .expect("CASS production rank-envelope policy")
+        .with_provenance(provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report = campaign
+                .run(
+                    &cx,
+                    "cass-rank-envelope-remains-supported",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect("CASS retains its profile-specific rank-envelope contract");
+            assert!(report.passed);
+            assert!(!report.cases.is_empty());
+            assert!(report.cases.iter().all(|case| {
+                case.lexical_contract == CampaignLexicalCaseSummary::RankEnvelopeOnly
+            }));
+            assert!(subject.index_calls.load(Ordering::Relaxed) > 0);
+            assert!(oracle.index_calls.load(Ordering::Relaxed) > 0);
         });
     }
 
@@ -7098,13 +8370,33 @@ mod tests {
             let mut wrong_summary = report.clone();
             wrong_summary.query_classes[0].total += 1;
             assert!(wrong_summary.canonical_bytes().is_err());
+            for legacy_version in [3, 4] {
+                let mut legacy = report.clone();
+                legacy.schema_version = legacy_version;
+                let error = legacy
+                    .validate_contract()
+                    .expect_err("pre-v5 report must require a campaign rerun");
+                assert!(matches!(
+                    error,
+                    GauntletError::InvalidCampaign { ref reason }
+                        if reason.contains("legacy campaign report")
+                            && reason.contains("non-admissible")
+                            && reason.contains("rerun")
+                ));
+            }
             let mut changed_query = report.clone();
             changed_query.query_suite.cases[0]
                 .query
                 .push_str(" tampered");
             assert!(changed_query.canonical_bytes().is_err());
+            let mut legacy_address = report.clone();
+            legacy_address.cases[0].artifact_hash = Some("0".repeat(16));
+            assert!(
+                legacy_address.canonical_bytes().is_err(),
+                "current reports must reject legacy XXH3-64 object addresses"
+            );
             let mut wrong_artifact = report.clone();
-            wrong_artifact.cases[0].artifact_hash = Some("0".repeat(16));
+            wrong_artifact.cases[0].artifact_hash = Some("0".repeat(64));
             assert!(
                 ArtifactStore::new(&root)
                     .complete_campaign(&wrong_artifact)
@@ -7245,7 +8537,7 @@ mod tests {
                                 && case.source == "tests/fixtures/queries.json"
                         })
                         .count(),
-                    25,
+                    26,
                     "all committed harvested relevance queries must enter the live campaign",
                 );
                 let mut observed_regression_hit = false;
@@ -7341,34 +8633,32 @@ mod tests {
                 };
                 let expected_golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
                     .expect("parse committed E4.10 rank-list golden");
+                let actual_golden_json = serde_json::to_string_pretty(&actual_golden)
+                    .expect("serialize actual E4.10 rank-list golden");
                 assert_eq!(
                     actual_golden.schema_version, expected_golden.schema_version,
-                    "corpus_hash={} query_seed={} rank golden schema drifted",
+                    "corpus_hash={} query_seed={} rank golden schema drifted; actual={actual_golden_json}",
                     first.corpus_manifest_hash, actual_golden.query_seed,
                 );
                 assert_eq!(
                     actual_golden.corpus_manifest_hash, expected_golden.corpus_manifest_hash,
-                    "corpus_hash={} query_seed={} rank golden corpus binding drifted",
+                    "corpus_hash={} query_seed={} rank golden corpus binding drifted; actual={actual_golden_json}",
                     first.corpus_manifest_hash, actual_golden.query_seed,
                 );
                 assert_eq!(
-                    actual_golden.query_manifest_hash,
-                    expected_golden.query_manifest_hash,
-                    "corpus_hash={} query_seed={} rank golden query-manifest binding drifted; actual={}",
-                    first.corpus_manifest_hash,
-                    actual_golden.query_seed,
-                    serde_json::to_string_pretty(&actual_golden)
-                        .expect("serialize actual E4.10 rank-list golden"),
+                    actual_golden.query_manifest_hash, expected_golden.query_manifest_hash,
+                    "corpus_hash={} query_seed={} rank golden query-manifest binding drifted; actual={actual_golden_json}",
+                    first.corpus_manifest_hash, actual_golden.query_seed,
                 );
                 assert_eq!(
                     actual_golden.query_seed, expected_golden.query_seed,
-                    "corpus_hash={} query_seed={} rank golden replay seed drifted",
+                    "corpus_hash={} query_seed={} rank golden replay seed drifted; actual={actual_golden_json}",
                     first.corpus_manifest_hash, actual_golden.query_seed,
                 );
                 assert_eq!(
                     actual_golden.cases.len(),
                     expected_golden.cases.len(),
-                    "corpus_hash={} query_seed={} rank golden case count drifted",
+                    "corpus_hash={} query_seed={} rank golden case count drifted; actual={actual_golden_json}",
                     first.corpus_manifest_hash,
                     actual_golden.query_seed,
                 );
@@ -7904,7 +9194,7 @@ mod tests {
     }
 
     #[test]
-    fn asymmetric_document_count_drift_is_persisted_but_shared_drift_fails_closed() {
+    fn any_document_count_drift_fails_closed_without_persisting_untrusted_evidence() {
         let fixture = make_fixture();
         let selected = CampaignSelection::CaseIds {
             ids: vec!["term".to_owned()],
@@ -7931,51 +9221,26 @@ mod tests {
             assert!(!report.passed);
             assert_eq!(
                 report.cases[0].disposition,
-                CampaignDisposition::Unclassified
+                CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                report.cases[0].first_divergence.as_deref(),
-                Some("/comparison/subject/doc_count")
+                report.cases[0].reason.as_deref(),
+                Some("observation_document_count_drift")
             );
-            let object_hash = report.cases[0]
-                .artifact_hash
-                .as_deref()
-                .expect("persisted mismatch object");
-            let object: ArtifactObject = serde_json::from_slice(
-                &std::fs::read(root.join("objects").join(format!("{object_hash}.json")))
-                    .expect("read mismatch object"),
-            )
-            .expect("decode mismatch object");
-            assert!(
-                object.comparison.divergences.iter().any(|divergence| {
-                    divergence.class == DivergenceClass::DocumentCountMismatch
-                })
-            );
+            assert!(report.cases[0].artifact_hash.is_none());
             let report_path = root.join("campaigns/asymmetric-doc-count/report.json");
             let stored: CampaignReport = serde_json::from_slice(
-                &std::fs::read(report_path).expect("stored unclassified report"),
+                &std::fs::read(report_path).expect("stored infrastructure report"),
             )
-            .expect("decode unclassified report");
+            .expect("decode infrastructure report");
             assert!(!stored.passed);
             assert_eq!(
                 stored.cases[0].disposition,
-                CampaignDisposition::Unclassified
+                CampaignDisposition::InfrastructureError
             );
-            let mut forged_semantics = object.clone();
-            forged_semantics
-                .campaign
-                .as_mut()
-                .expect("campaign context")
-                .semantic_contract
-                .schema_contract_hash = "f".repeat(64);
-            assert!(
-                ArtifactStore::new(root.join("forged"))
-                    .prepare(
-                        "forged-semantic-contract",
-                        &forged_semantics,
-                        BTreeMap::new()
-                    )
-                    .is_err()
+            assert_eq!(
+                stored.cases[0].reason.as_deref(),
+                Some("observation_document_count_drift")
             );
         });
 
@@ -8864,6 +10129,7 @@ mod tests {
             semantic_contract,
             CampaignConfig {
                 selection,
+                contract_mode: CampaignContractMode::CoreLexicalV3,
                 require_provenance: true,
                 index_batch_size: 5,
                 snippet_max_chars: None,
@@ -8947,6 +10213,298 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    fn assert_persisted_core_object_mutation_matrix_fails(
+        source_root: &std::path::Path,
+        report: &CampaignReport,
+    ) {
+        let scratch = tempfile::tempdir().expect("isolated mutation store");
+        let scratch_root = scratch.path();
+        let source_campaign = source_root.join("campaigns").join(&report.run_id);
+        let scratch_campaign = scratch_root.join("campaigns").join(&report.run_id);
+        let scratch_cases = scratch_campaign.join("cases");
+        let scratch_objects = scratch_root.join("objects");
+        std::fs::create_dir_all(&scratch_cases).expect("create scratch campaign cases");
+        std::fs::create_dir_all(&scratch_objects).expect("create scratch object store");
+        for name in ["reservation.json", "report.json"] {
+            std::fs::copy(source_campaign.join(name), scratch_campaign.join(name))
+                .expect("copy campaign control file");
+        }
+        for (ordinal, result) in report.cases.iter().enumerate() {
+            let Some(hash) = result.artifact_hash.as_deref() else {
+                continue;
+            };
+            std::fs::copy(
+                source_campaign
+                    .join("cases")
+                    .join(format!("q{ordinal:06}.json")),
+                scratch_cases.join(format!("q{ordinal:06}.json")),
+            )
+            .expect("copy case run manifest");
+            let name = format!("{hash}.json");
+            std::fs::copy(
+                source_root.join("objects").join(&name),
+                scratch_objects.join(name),
+            )
+            .expect("copy immutable object");
+        }
+        let store = ArtifactStore::new(scratch_root);
+        assert_eq!(
+            store
+                .load_verified_campaign(&report.run_id)
+                .expect("copied campaign starts verified"),
+            *report
+        );
+
+        let (target_ordinal, target_hash, target_object) = report
+            .cases
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, result)| {
+                let hash = result.artifact_hash.as_ref()?;
+                let object = load_campaign_case_object(source_root, result);
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &object.lexical_contract
+                else {
+                    return None;
+                };
+                let crate::comparator::LexicalObservationOutcome::Success { hits, .. } =
+                    &comparison.subject.full_search.outcome
+                else {
+                    return None;
+                };
+                if hits.is_empty()
+                    || !matches!(
+                        &comparison.subject.all_lexical_winners_hydration.execution,
+                        crate::comparator::LexicalHydrationExecution::Attempted { .. }
+                    )
+                {
+                    return None;
+                }
+                Some((ordinal, hash.clone(), object))
+            })
+            .expect("live Core V3 campaign has a nonempty, hydrated persisted case");
+        let target_path = scratch_objects.join(format!("{target_hash}.json"));
+        let original_bytes = std::fs::read(&target_path).expect("read scratch target object");
+        let target_case_path = scratch_cases.join(format!("q{target_ordinal:06}.json"));
+        let original_case_bytes =
+            std::fs::read(&target_case_path).expect("read scratch target run manifest");
+        let report_path = scratch_campaign.join("report.json");
+        let original_report_bytes =
+            std::fs::read(&report_path).expect("read scratch campaign report");
+
+        let assert_stale_address_rejected = |label: &str, bytes: &[u8]| {
+            assert_ne!(bytes, original_bytes, "{label} must alter persisted bytes");
+            std::fs::write(&target_path, bytes).expect("write scratch mutation");
+            assert!(
+                store.load_verified_campaign(&report.run_id).is_err(),
+                "verified campaign reload accepted persisted mutation {label}"
+            );
+            std::fs::write(&target_path, &original_bytes).expect("restore scratch object");
+            store
+                .load_verified_campaign(&report.run_id)
+                .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
+        };
+
+        let mut raw_content_tamper = original_bytes.clone();
+        raw_content_tamper.push(b' ');
+        assert_stale_address_rejected("raw_content_byte", &raw_content_tamper);
+
+        let original_value: serde_json::Value =
+            serde_json::from_slice(&original_bytes).expect("object JSON");
+        for lane in [
+            "full_search",
+            "fusion_candidates",
+            "all_lexical_winners_hydration",
+            "strict_hybrid_winners_hydration",
+            "semantic_only_hydration",
+            "mixed_winners_hydration",
+        ] {
+            let mut missing_lane = original_value.clone();
+            assert!(
+                missing_lane["lexical_contract"]["comparison"]["subject"]
+                    .as_object_mut()
+                    .expect("subject lexical bundle")
+                    .remove(lane)
+                    .is_some(),
+                "persisted fixture must contain lane {lane}"
+            );
+            assert_stale_address_rejected(
+                &format!("missing_lane_{lane}"),
+                &serde_json::to_vec(&missing_lane).expect("encode missing-lane mutation"),
+            );
+        }
+
+        type TypedMutation = fn(&mut ArtifactObject);
+        let typed_mutations: [(&str, TypedMutation); 6] = [
+            ("schema", |object| {
+                object.canonicalization_version = object.canonicalization_version.saturating_add(1);
+            }),
+            ("context", |object| {
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut object.lexical_contract
+                else {
+                    unreachable!()
+                };
+                comparison.subject.full_search.context.seed ^= 1;
+            }),
+            ("hit", |object| {
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut object.lexical_contract
+                else {
+                    unreachable!()
+                };
+                let crate::comparator::LexicalObservationOutcome::Success { hits, .. } =
+                    &mut comparison.subject.full_search.outcome
+                else {
+                    unreachable!()
+                };
+                hits[0].doc_id.push_str("-tampered");
+            }),
+            ("error", |object| {
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut object.lexical_contract
+                else {
+                    unreachable!()
+                };
+                let error = frankensearch_core::SearchError::QueryParseError {
+                    query: "redacted by persisted mutation test".to_owned(),
+                    detail: "typed failure replacement".to_owned(),
+                };
+                comparison.subject.full_search.outcome =
+                    crate::comparator::LexicalObservationOutcome::Error(
+                        crate::comparator::observe_lexical_search_error(&error)
+                            .expect("observe typed mutation error"),
+                    );
+            }),
+            ("hydration", |object| {
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut object.lexical_contract
+                else {
+                    unreachable!()
+                };
+                comparison.subject.all_lexical_winners_hydration.selection =
+                    crate::comparator::LexicalHydrationSelection::SemanticOnlyControl {
+                        control_id: u32::MAX,
+                    };
+            }),
+            ("derived", |object| {
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut object.lexical_contract
+                else {
+                    unreachable!()
+                };
+                comparison.status = LexicalComparisonStatus::Mismatch;
+            }),
+        ];
+        for (label, mutate) in typed_mutations {
+            let mut mutated = target_object.clone();
+            mutate(&mut mutated);
+            let object_bytes = mutated
+                .canonical_bytes()
+                .expect("encode canonical typed object mutation");
+            let object_hash = mutated
+                .object_hash()
+                .expect("address canonical typed object mutation");
+            let object_path = scratch_objects.join(format!("{object_hash}.json"));
+            std::fs::write(&object_path, &object_bytes)
+                .expect("write coherently addressed typed object mutation");
+
+            let mut run_manifest: crate::artifact::RunManifest =
+                serde_json::from_slice(&original_case_bytes)
+                    .expect("decode scratch target run manifest");
+            run_manifest.object_hash.clone_from(&object_hash);
+            std::fs::write(
+                &target_case_path,
+                serde_json::to_vec(&run_manifest).expect("encode updated target run manifest"),
+            )
+            .expect("write updated target run manifest");
+
+            let mut mutated_report = report.clone();
+            mutated_report.cases[target_ordinal].artifact_hash = Some(object_hash);
+            std::fs::write(
+                &report_path,
+                mutated_report
+                    .canonical_bytes()
+                    .expect("encode coherently referenced campaign report"),
+            )
+            .expect("write coherently referenced campaign report");
+
+            let error = store
+                .load_verified_campaign(&report.run_id)
+                .expect_err("semantic replay must reject canonical typed mutation");
+            std::fs::write(&target_case_path, &original_case_bytes)
+                .expect("restore target run manifest");
+            std::fs::write(&report_path, &original_report_bytes).expect("restore campaign report");
+            store
+                .load_verified_campaign(&report.run_id)
+                .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
+            assert!(
+                matches!(
+                    &error,
+                    GauntletError::InvalidCampaign { .. }
+                        | GauntletError::InvalidContract { .. }
+                        | GauntletError::InvalidObservation { .. }
+                        | GauntletError::InvalidPreparedArtifact { .. }
+                ),
+                "{label} must reach semantic contract or replay validation, got: {error}"
+            );
+            let error_text = error.to_string();
+            assert!(
+                !error_text.contains("content address")
+                    && !error_text.contains("run manifest")
+                    && !error_text.contains("noncanonical"),
+                "{label} was rejected before semantic contract or replay validation: {error_text}"
+            );
+        }
+
+        let foreign_hash = report
+            .cases
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, result)| {
+                (ordinal != target_ordinal)
+                    .then(|| result.artifact_hash.clone())
+                    .flatten()
+            })
+            .expect("live Core V3 campaign has another valid immutable object");
+        let mut run_manifest: crate::artifact::RunManifest =
+            serde_json::from_slice(&original_case_bytes)
+                .expect("decode scratch target run manifest for ordinal swap");
+        run_manifest.object_hash.clone_from(&foreign_hash);
+        std::fs::write(
+            &target_case_path,
+            serde_json::to_vec(&run_manifest).expect("encode ordinal-swapped run manifest"),
+        )
+        .expect("write ordinal-swapped run manifest");
+        let mut swapped_report = report.clone();
+        swapped_report.cases[target_ordinal].artifact_hash = Some(foreign_hash);
+        std::fs::write(
+            &report_path,
+            swapped_report
+                .canonical_bytes()
+                .expect("encode ordinal-swapped campaign report"),
+        )
+        .expect("write ordinal-swapped campaign report");
+        let error = store.load_verified_campaign(&report.run_id).expect_err(
+            "campaign evidence validator must reject a valid object at the wrong ordinal",
+        );
+        std::fs::write(&target_case_path, &original_case_bytes)
+            .expect("restore target run manifest after ordinal swap");
+        std::fs::write(&report_path, &original_report_bytes)
+            .expect("restore campaign report after ordinal swap");
+        store
+            .load_verified_campaign(&report.run_id)
+            .unwrap_or_else(|error| panic!("restored campaign failed after ordinal swap: {error}"));
+        assert!(
+            matches!(&error, GauntletError::InvalidCampaign { .. })
+                && error
+                    .to_string()
+                    .contains("campaign case result does not match its immutable artifact"),
+            "valid but ordinal-mismatched object must reach campaign evidence validation: {error}"
+        );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn live_pr_artifact_root(fallback: &std::path::Path, profile: &str) -> std::path::PathBuf {
         let root = std::env::var_os("GAUNTLET_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from)
@@ -8991,6 +10549,189 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
+    fn harvested_14_score_bits_preserve_ranked_and_counted_orders() {
+        let fixture = make_scalar_g1a_regression_fixture();
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject =
+            crate::engine::QuillSubject::in_memory(config, "harvested-14-score-regression", false)
+                .expect("fresh scalar Quill subject");
+        let mut oracle =
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+                .expect("fresh scalar G1a Tantivy oracle");
+        let semantic_contract = SemanticContract::scalar_g1a();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            DifferentialCampaignEngine::begin_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Quill corpus");
+            DifferentialCampaignEngine::begin_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Tantivy corpus");
+            for batch in fixture.documents.chunks(5) {
+                DifferentialCampaignEngine::index_batch(&mut subject, &cx, batch)
+                    .await
+                    .expect("index Quill batch");
+                DifferentialCampaignEngine::index_batch(&mut oracle, &cx, batch)
+                    .await
+                    .expect("index Tantivy batch");
+            }
+            DifferentialCampaignEngine::commit_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Quill corpus");
+            DifferentialCampaignEngine::commit_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Tantivy corpus");
+
+            const TARGET: &str = "test-cooking-015";
+            const FULL_QUERY: &str = "how to sear a steak properly";
+            let mut term_scores = Vec::new();
+            for query in ["how", "to", "sear", "a", "steak", "properly"] {
+                let quill = subject
+                    .index()
+                    .expect("committed Quill index")
+                    .search_paginated(&cx, query, 100, 0, false)
+                    .expect("search ranked Quill");
+                let tantivy = oracle
+                    .index()
+                    .search_doc_ids(&cx, query, 100)
+                    .expect("search ranked Tantivy");
+                let quill_score = quill
+                    .hits
+                    .iter()
+                    .find(|hit| hit.document_id == TARGET)
+                    .map(|hit| hit.score);
+                let tantivy_score = tantivy
+                    .iter()
+                    .find(|hit| hit.doc_id.as_str() == TARGET)
+                    .map(|hit| hit.bm25_score);
+                eprintln!(
+                    "harvested-14 query={query:?} quill={:?} tantivy={:?}",
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits)
+                );
+                assert_eq!(
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits),
+                    "single-term score drift for {query:?}"
+                );
+                if let Some(score) = quill_score {
+                    term_scores.push((query, score));
+                }
+            }
+            let parse_order_sum = term_scores
+                .iter()
+                .fold(0.0_f32, |sum, (_, score)| sum + score);
+            eprintln!(
+                "harvested-14 term_scores={:?} parse_order_sum={:#010x}",
+                term_scores
+                    .iter()
+                    .map(|(term, score)| (*term, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                parse_order_sum.to_bits()
+            );
+
+            let quill_ranked = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, false)
+                .expect("search ranked Quill aggregate");
+            let tantivy_ranked = oracle
+                .index()
+                .search_doc_ids(&cx, FULL_QUERY, 100)
+                .expect("search ranked Tantivy aggregate");
+            let quill_ranked_score = quill_ranked
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("ranked Quill aggregate contains target")
+                .score;
+            let tantivy_ranked_score = tantivy_ranked
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("ranked Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                tantivy_ranked_score.to_bits(),
+                "ranked aggregate must preserve Tantivy TopDocs f32 accumulation order"
+            );
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                0x4005_5fc7,
+                "fixture must keep exercising the ranked TopDocs order"
+            );
+            assert_eq!(
+                parse_order_sum.to_bits(),
+                quill_ranked_score.to_bits(),
+                "ranked root must retain analyzed term order as children exhaust"
+            );
+
+            let quill_counted = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, true)
+                .expect("search counted Quill aggregate");
+            let tantivy_counted = oracle
+                .index()
+                .search_doc_ids_counted(&cx, FULL_QUERY, 100)
+                .expect("search counted Tantivy aggregate");
+            let quill_counted_score = quill_counted
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("counted Quill aggregate contains target")
+                .score;
+            let tantivy_counted_score = tantivy_counted
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("counted Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                tantivy_counted_score.to_bits(),
+                "counted aggregate must preserve Tantivy exhaustive f32 accumulation order"
+            );
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                0x4005_5fc8,
+                "fixture must keep exercising the exhaustive swap-remove order"
+            );
+            assert_ne!(
+                quill_ranked_score.to_bits(),
+                quill_counted_score.to_bits(),
+                "fixture must distinguish Tantivy's ranked and counted collector contracts"
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
     fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "default");
@@ -9000,9 +10741,158 @@ mod tests {
                 .expect("live default-profile campaign must complete and pass");
             assert!(
                 report.passed,
-                "default profile is green: {:?}",
-                report.mismatches
+                "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
+                report.mismatches, report.lexical_mismatches, report.lexical_coverage, report.cases,
             );
+            assert!(report.lexical_mismatches.is_empty());
+            assert!(report.cases.iter().all(|case| {
+                matches!(
+                    &case.lexical_contract,
+                    CampaignLexicalCaseSummary::CoreLexicalV3 {
+                        status: LexicalComparisonStatus::Equivalent,
+                        mismatch_count: 0,
+                        ..
+                    }
+                )
+            }));
+            let CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible: true,
+            } = &report.lexical_coverage
+            else {
+                panic!("default live campaign must have admissible core lexical v3 coverage");
+            };
+            for (engine, coverage) in [("subject", subject), ("oracle", oracle)] {
+                assert!(
+                    coverage.full_search.empty > 0,
+                    "{engine} must exercise an empty ordinary search"
+                );
+                assert!(
+                    coverage.fusion_candidates.empty > 0,
+                    "{engine} must exercise an empty candidate search"
+                );
+                if coverage.metadata_deferred_cases > 0 {
+                    for (shape, probe) in [
+                        (
+                            "all lexical winners",
+                            &coverage.all_lexical_winners_hydration,
+                        ),
+                        (
+                            "strict hybrid winners",
+                            &coverage.strict_hybrid_winners_hydration,
+                        ),
+                        ("mixed winners", &coverage.mixed_winners_hydration),
+                    ] {
+                        assert!(
+                            probe.restoration > 0,
+                            "{engine} must exercise deferred metadata restoration for {shape}"
+                        );
+                    }
+                }
+            }
+
+            const KNOWN_MISS_QUERY: &str = "flurbnozzlezyphraxicqvktmps";
+            let selected_queries = report.selected_queries().expect("selected default queries");
+            let known_miss = selected_queries
+                .into_iter()
+                .find(|query| query.query == KNOWN_MISS_QUERY)
+                .expect("the frozen default suite must contain its known-miss query");
+            let known_miss_result = report
+                .cases
+                .iter()
+                .find(|result| result.case_id == known_miss.id)
+                .expect("known-miss result follows the selected query manifest");
+            let known_miss_object = load_campaign_case_object(&root, known_miss_result);
+            assert!(
+                known_miss_object.comparison.subject.hits.is_empty()
+                    && known_miss_object.comparison.oracle.hits.is_empty(),
+                "known-miss rich rank envelopes must both be empty"
+            );
+            for (engine, observation) in [
+                ("subject", &known_miss_object.comparison.subject),
+                ("oracle", &known_miss_object.comparison.oracle),
+            ] {
+                assert_eq!(
+                    observation.match_count,
+                    crate::comparator::CountState::Value(0),
+                    "known-miss {engine} rich rank envelope must report an exact zero match count"
+                );
+            }
+            let ArtifactLexicalContractEvidence::CoreLexicalV3 {
+                comparison: known_miss_lexical,
+            } = &known_miss_object.lexical_contract
+            else {
+                panic!("known-miss artifact must carry core lexical v3 evidence");
+            };
+            for bundle in [&known_miss_lexical.subject, &known_miss_lexical.oracle] {
+                for outcome in [
+                    &bundle.full_search().outcome,
+                    &bundle.fusion_candidates().outcome,
+                ] {
+                    assert!(
+                        matches!(
+                            outcome,
+                            crate::comparator::LexicalObservationOutcome::Success {
+                                hits,
+                                returned_count: 0,
+                                empty_shape: crate::comparator::LexicalEmptyShape::Empty,
+                                ..
+                            } if hits.is_empty()
+                        ),
+                        "known-miss ordinary search and candidate lanes must be explicit empty successes"
+                    );
+                }
+            }
+
+            let mut exercised_persisted_metadata_tamper = false;
+            for case in &report.cases {
+                let hash = case
+                    .artifact_hash
+                    .as_deref()
+                    .expect("passing core lexical case has an artifact");
+                let bytes = std::fs::read(root.join("objects").join(format!("{hash}.json")))
+                    .expect("read immutable core lexical artifact");
+                let object: ArtifactObject =
+                    serde_json::from_slice(&bytes).expect("decode core lexical artifact");
+                object.validate().expect("untampered artifact validates");
+                let mut tampered = object;
+                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                    &mut tampered.lexical_contract
+                else {
+                    panic!("default live artifact must carry core lexical v3 evidence");
+                };
+                let crate::comparator::LexicalObservationOutcome::Success { hits, .. } =
+                    &mut comparison.subject.full_search.outcome
+                else {
+                    continue;
+                };
+                let Some(hit) = hits.first_mut() else {
+                    continue;
+                };
+                hit.metadata = if matches!(
+                    &hit.metadata,
+                    crate::comparator::SensitiveValueObservation::Absent
+                ) {
+                    crate::comparator::SensitiveValueObservation::PresentEmpty {
+                        sha256: sha256_text("{}"),
+                        byte_len: 2,
+                    }
+                } else {
+                    crate::comparator::SensitiveValueObservation::Absent
+                };
+                assert!(
+                    tampered.validate().is_err(),
+                    "persisted metadata presence tamper must fail replay"
+                );
+                exercised_persisted_metadata_tamper = true;
+                break;
+            }
+            assert!(
+                exercised_persisted_metadata_tamper,
+                "live campaign must persist at least one metadata-bearing lexical hit"
+            );
+
             let provenance = report
                 .provenance
                 .as_ref()
@@ -9051,6 +10941,7 @@ mod tests {
                 .expect("verified reload accepts the completed campaign");
             assert_eq!(reloaded, report);
             assert_eq!(reloaded.provenance, report.provenance);
+            assert_persisted_core_object_mutation_matrix_fails(&root, &report);
         });
     }
 
