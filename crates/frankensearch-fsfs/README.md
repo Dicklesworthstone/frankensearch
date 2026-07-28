@@ -8,14 +8,21 @@ Standalone `fsfs` CLI and runtime for two-tier hybrid local search.
 
 The crate is split into a library (`src/lib.rs`) for reusable runtime, configuration, and adapter logic, and a binary (`src/main.rs`) for the `fsfs` CLI entrypoint.
 
-## Build Prerequisite
+## Build Profiles
 
-The default `embedded-models` feature packages exact, pinned Potion and MiniLM
-artifacts. From the workspace root, provision their verified source files
-before a default-feature build:
+The default feature set is model-free: ordinary builds and crates.io packaging
+do not require Potion or MiniLM artifacts at compile time. It retains model
+acquisition and verification commands, but it cannot execute Model2Vec or
+FastEmbed. `fsfs download-models` can prepare verified build inputs; it cannot
+add a backend that was not compiled into the binary.
+
+Full release binaries explicitly select `embedded-models`. From the workspace
+root, provision and verify the exact, pinned source files before building that
+profile:
 
 ```bash
 scripts/rch-ensure-deps.sh --models-only
+cargo build -p frankensearch-fsfs --no-default-features --features embedded-models
 ```
 
 Use `scripts/rch-ensure-deps.sh --all-workers --models-only` to prepare every

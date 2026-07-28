@@ -28,6 +28,34 @@ Release artifacts MUST be produced for exactly these targets:
 
 Linux MUSL targets MUST be built with `cargo-zigbuild`; macOS targets MUST be built with Cargo target builds.
 
+## Model Feature and Build-Input Boundary
+
+The `frankensearch-fsfs` crate default feature set MUST be model-free. Normal
+workspace checks, source builds, crates.io packaging, dry runs, and publication
+MUST NOT require local Potion or MiniLM artifacts.
+
+The model-free profile enables model acquisition and verification, but MUST NOT
+compile or advertise Model2Vec or FastEmbed execution. Downloading model files
+alone MUST NOT be presented as enabling semantic execution in an already-built
+model-free binary. Explicit semantic requests MUST fail closed until the
+operator installs a full release binary or builds with
+`--no-default-features --features embedded-models`. An explicitly authorized
+hybrid lexical fallback MAY return lexical results, but MUST report zero
+admitted semantic scores and stable degradation/recovery metadata.
+
+The full GitHub release lane is the explicit exception:
+
+- `release-build` MUST provision the revision-pinned model inputs with
+  `scripts/rch-ensure-deps.sh --models-only`.
+- It MUST verify the provisioned byte lengths and SHA-256 digests with
+  `scripts/rch-ensure-deps.sh --models-only --check` before compilation.
+- It MUST build with `--no-default-features --features embedded-models`.
+- Cargo build scripts MUST remain network-free; network admission belongs to
+  the release provisioning step.
+
+The `release-build-lite` lane, including every Linux MUSL target, MUST retain
+`--no-default-features` and MUST NOT provision or enable embedded models.
+
 ## Artifact Contract
 
 Each release target MUST publish:
@@ -606,4 +634,11 @@ When `publish-crates` is enabled in CI:
 
 ```bash
 scripts/check_fsfs_packaging_release_install_contract.sh --mode all
+```
+
+CI can enforce only the dependency-free model boundary without installing the
+JSON Schema CLI:
+
+```bash
+scripts/check_fsfs_packaging_release_install_contract.sh --mode model-features
 ```

@@ -84,19 +84,6 @@ jobs:
           shared-key: workspace-${{ matrix.os }}-nightly
           cache-targets: true
 
-      - name: Cache verified bundled model inputs
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/frankensearch/models
-          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
-
-      - name: Provision verified bundled model inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          scripts/rch-ensure-deps.sh --models-only
-          scripts/rch-ensure-deps.sh --models-only --check
-
       - name: Resolve validation profile
         id: validation_profile
         shell: bash
@@ -143,11 +130,32 @@ jobs:
           path: ${{ runner.temp }}/frankensearch-crates-publish-plan.json
           if-no-files-found: error
 
-      - name: cargo check
+      - name: Validate fsfs model feature and release contract
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: scripts/check_fsfs_packaging_release_install_contract.sh --mode model-features
+
+      - name: cargo check (workspace model-free defaults)
         run: cargo check --workspace --all-targets
 
-      - name: cargo check (fsfs lite -- no embedded models)
+      - name: cargo check (fsfs explicit model-free lane)
         run: cargo check -p frankensearch-fsfs --no-default-features
+
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
+
+      - name: Provision verified bundled model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: cargo check (fsfs explicit embedded-models lane)
+        run: cargo check -p frankensearch-fsfs --no-default-features --features embedded-models
 
       - name: Pre-flip lexical feature graph guard (bd-quill-e7.4)
         if: matrix.os == 'ubuntu-latest'
@@ -887,7 +895,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    # NOTE: Full builds (with embedded-models / fastembed) require ort/ONNX Runtime,
+    # NOTE: Full builds explicitly enable embedded-models / fastembed and require
+    # verified model inputs plus ort/ONNX Runtime,
     # which only provides prebuilt binaries for aarch64-apple-darwin, x86_64-pc-windows-msvc,
     # and x86_64-unknown-linux-gnu. Linux musl and x86_64-apple-darwin are only available
     # as lite builds (--no-default-features) — see release-build-lite job below.
@@ -945,14 +954,27 @@ jobs:
           shared-key: release-${{ matrix.target }}-nightly
           cache-targets: true
 
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
 
-      - name: Build fsfs release binary
+      - name: Provision verified bundled model inputs
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p frankensearch-fsfs --release --target "${{ matrix.target }}"
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build fsfs release binary (embedded models)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p frankensearch-fsfs --release --target "${{ matrix.target }}" --no-default-features --features embedded-models
 
       - name: Package archive + checksum
         shell: bash

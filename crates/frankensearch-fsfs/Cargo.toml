@@ -10,7 +10,7 @@ keywords = ["search", "cli", "semantic", "bm25", "hybrid"]
 categories = ["command-line-utilities", "text-processing", "development-tools"]
 
 [features]
-default = ["embedded-models"]
+default = []
 embedded-models = ["frankensearch-embed/bundled-default-models", "frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
 vendored-openssl = ["openssl"]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
