@@ -1734,6 +1734,50 @@ fn prepared_qg6_streams(
                 RankClass::RankExact | RankClass::TieOrder
             )
         {
+            let first_rank = report
+                .first_divergence
+                .as_deref()
+                .and_then(|pointer| pointer.rsplit('/').next())
+                .and_then(|index| index.parse::<usize>().ok());
+            let subject_hit = first_rank.and_then(|index| report.subject.hits.get(index));
+            let oracle_hit = first_rank.and_then(|index| report.oracle.hits.get(index));
+            let hashed_doc_id = |hit: Option<&RankedHit>| {
+                hit.map(|hit| lower_hex(&Sha256::digest(hit.doc_id.as_bytes())))
+                    .unwrap_or_else(|| "absent".to_owned())
+            };
+            let subject_in_cutoff = subject_hit.is_some_and(|hit| {
+                report
+                    .oracle
+                    .cutoff_tie_group
+                    .iter()
+                    .any(|candidate| candidate.doc_id == hit.doc_id)
+            });
+            let oracle_in_cutoff = oracle_hit.is_some_and(|hit| {
+                report
+                    .oracle
+                    .cutoff_tie_group
+                    .iter()
+                    .any(|candidate| candidate.doc_id == hit.doc_id)
+            });
+            eprintln!(
+                "[qg6-parity-diagnostic] status={:?} rank={:?} first_rank={:?} \
+                 subject_doc_sha256={} subject_score_bits={:?} oracle_doc_sha256={} \
+                 oracle_score_bits={:?} cutoff_group_len={} cutoff_complete={} \
+                 subject_in_cutoff={} oracle_in_cutoff={} count_equal={} doc_count_equal={}",
+                report.status,
+                report.rank_class,
+                first_rank,
+                hashed_doc_id(subject_hit),
+                subject_hit.map(|hit| hit.score_bits),
+                hashed_doc_id(oracle_hit),
+                oracle_hit.map(|hit| hit.score_bits),
+                report.oracle.cutoff_tie_group.len(),
+                report.oracle.cutoff_tie_complete,
+                subject_in_cutoff,
+                oracle_in_cutoff,
+                report.subject.match_count == report.oracle.match_count,
+                report.subject.doc_count == report.oracle.doc_count,
+            );
             return Err(format!(
                 "cross-engine result parity failed: status={:?} rank={:?} first={:?}",
                 report.status, report.rank_class, report.first_divergence
