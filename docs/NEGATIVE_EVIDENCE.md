@@ -17175,3 +17175,57 @@ candidate A/A to pass before interpretation, then reproduce immediately with
 the same CPU, worker, ELF, and maintenance window. If the bound A/A still
 fails, stop this worker route and move QG-2 to a distinct eligible machine or
 a counted scheduler mechanism; never relax a null law or gate on CV.
+
+### 2026-07-28 — QG-2 topology controls expose cross-invocation warm-state drift (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+All attempts used clean revision
+`b083751e2198519c15beed3bac939e21c63783c4`, self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`,
+the same eligible Threadripper PRO 5995WX host, the actual linked Tantivy
+0.26.1 incumbent, literal maintenance-process exclusion, and same-invocation
+A/A controls. CV is provenance only.
+
+The one-logical-CPU diagnostic first produced two individually valid 10-pair
+invocations. Candidate and rerun Quill/Tantivy ratios were
+`0.437435 [0.428744, 0.446829]` and
+`0.425449 [0.407935, 0.445484]`; their log-median delta `0.027783` exceeded
+the fixed `0.019803` reproduction law. Increasing that diagnostic to 30 pairs
+did not repair the harness: candidate was valid at
+`0.414360 [0.407927, 0.422438]`, while the rerun was `INVALID-NULL` because
+its A/A order effect `0.053760` exceeded `0.048790`. This CPU-2 route is
+non-normative because it reports only one available CPU and constrains
+Tantivy's background merger as well as the declared single indexing thread.
+
+The topology-correct retry confined the invocation to two complete Zen 3 CCDs:
+physical cores 0–15 and their SMT siblings 64–79. This is a declared
+16-physical-core, 32-logical-CPU slice that satisfies the manifest's `>=16C`
+x86 reference class without package-wide migration. Both 30-pair A/A controls
+were valid. Candidate measured
+`0.340396 [0.327939, 0.346609]`; immediate rerun measured
+`0.351193 [0.346379, 0.357399]`. Their log-median delta `0.031226` still
+exceeded `0.019803`, so neither can establish a baseline even though both are
+unambiguous target misses.
+
+**Decision: INVALID-REPRODUCTION / NO QG-2 CLAIM.** The six evidence JSON
+SHA-256 values, in attempt order, are
+`706b08274c1a8a137c8bd4d245f80834b85002948e40edfeb73e300ff6fc273b`,
+`277baf01616079e5354440eedca1095b14e066cc320cc4739be598a27ba29be5`,
+`4cc6e59e1bec9aa4bf6dbdc59a58db598e10561f9a59cd187778e542cd6099c7`,
+`9e4bd427e015658b1c581856fbd2221dd12a328299f6f613a575404862f05a3e`,
+`f3c9a28fd3f01805a384c09a15a8f097f4080ba8f991b7026ab71f3ad1b1199a`,
+and
+`066778b68d0f45edd4114c2b513a432e69121d2a328d690c5012f40b95b897b6`.
+Artifacts are retained under their corresponding
+`.bench-history/attempts/2026-07-28/QG-2/qg2-{candidate,rerun}-trj-b083-*`
+directories.
+
+**Retry predicate:** stop resampling the `b083751e` harness. First make the
+pre-measurement warm-state contract explicit and evidence-bound: allow a
+declared warmup-round count, require at least one excluded warmup, and persist
+the selected count in each evidence policy. Build a new self-hashing exact ELF,
+then run one candidate and immediate reproduction on the same 16-core CCD
+slice with the same warmup count. Require both A/A controls and the 2%
+reproduction law before activation; never promote the one-CPU diagnostics,
+relax a threshold, select a favorable prior pair, or gate on CV.
