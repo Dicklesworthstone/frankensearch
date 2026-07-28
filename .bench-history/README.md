@@ -6,6 +6,11 @@ one normative Quill performance gate. A baseline may advance only when
 Every Allow also writes a dated sibling. History files are retained—automation
 does not delete older evidence under the repository's Rule 1.
 
+Full, sealed runs that do not earn promotion live under
+`attempts/<date>/QG-<n>/<run-id>/`. These attempts are durable measurement
+evidence, but they are not baselines and never replace either a promoted
+`*.latest.json` file or an unmeasured bootstrap placeholder.
+
 The committed `*.unmeasured.latest.json` files are explicit bootstrap
 placeholders, not performance evidence. They contain no cells, have
 `laws_attested=false`, and force PR regression alarms to `Quarantine`. Once a

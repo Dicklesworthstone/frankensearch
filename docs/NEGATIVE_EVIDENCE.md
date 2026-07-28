@@ -16467,3 +16467,45 @@ decisive cells so compile + measurement fit inside the 1800s window, capture
 `xlarge` and `tokenize_only`, and emit a complete `QG-1.json`. Only then flip
 `activated = true`. Do not raise the global `build_timeout_sec`; that file is
 shared by 11 repos and lengthening leases starves the Lane M measurement window.
+
+### 2026-07-28 — QG-2 MISS (gate inactive): single-thread Quill indexing reaches 0.1087x Tantivy 0.26.1 (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT.** This is a competitive gate measurement, not a
+self-speedup. The actual legacy incumbent was Tantivy 0.26.1, linked through
+the `tantivy-oracle` feature and asserted at runtime as Tantivy index format v7.
+Both arms indexed the exact `bulk/medium/1/positions_on` fixture with commit in
+scope, side-by-side in one invocation.
+
+The strict-remote 80-pair run used clean revision
+`9fc478e5fed15f3fd4b9079b42d42ca53acf66c2`, `release-perf`, Cargo.lock SHA-256
+`b1ebda6f16c6b7f21853ad183ae8cac1278ab05cb65e2f52eef993920841064e`,
+and executing ELF SHA-256
+`d32f54eef6028f0ad8b0fb3714fb51f53432e3dd1bc2a6c92dc3fc100590c5d6`
+on `ovh-a`. The full-scale fixture contained 50,000 documents. Corpus
+generation remained outside the timed scope.
+
+| gate target | Quill median | Tantivy median | Quill/Tantivy paired median [95% CI] | Tantivy/Tantivy A/A median [95% CI] | verdict |
+|---|---:|---:|---:|---:|---|
+| >=1.5x | 22,186.53 docs/s | 200,495.69 docs/s | **0.108698** [0.107024, 0.111538] | 0.993436 [0.980159, 1.019927] | **MISS** |
+
+The A/A interval contains 1.0 and passes every predeclared null-center,
+null-width, order, drift, and log-MAD law. The repaired evidence loader
+recomputed the raw paired samples and marked the cell `valid`,
+`eligible_for_decision`, and the complete gate `measured_provisional`.
+Raw CV is retained only as provenance; the decision is the paired median CI
+against the same-invocation null floor and the 1.5x target.
+
+**Decision: MISS; retain `activated = false`.** The target is missed by 13.8x
+relative to the required threshold, so this failed run cannot become a
+performance baseline. Its sealed four-file receipt is retained at
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-r1-20260728T0711Z/`;
+the evidence artifact seal is
+`4ef4c95d965e16866f16ac47ddde09e8dae625b27c50548e9c48c2b5c1700fc0`.
+
+**Retry predicate:** do not rerun the unchanged single-thread writer. Reopen
+QG-2 only after a profile on this exact shipping-default fixture names a frame
+or counted mechanism with enough Amdahl headroom to close the 13.8x target
+gap, and a candidate reduces whole-operation cycles or instructions per
+document by at least 10x without changing indexed bytes or query results.
+Then repeat the full same-ELF, same-invocation A/A+A/B median-CI gate against
+Tantivy 0.26.1.

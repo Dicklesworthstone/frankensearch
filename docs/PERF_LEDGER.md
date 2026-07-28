@@ -7182,3 +7182,25 @@ KEEP gate failed. Shipping therefore retains
 retained E4.4 pruning path. Full command, binary SHA-256, p5–p95 provenance,
 absolute timings, invalid-harness attempts, and the concrete retry predicate
 are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-2 MISS: single-thread indexing is 0.1087x Tantivy 0.26.1 (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+One strict-remote full-scale invocation at clean revision
+`9fc478e5fed15f3fd4b9079b42d42ca53acf66c2` interleaved 80 Quill/Tantivy A/B
+pairs and 80 Tantivy/Tantivy A/A pairs on
+`bulk/medium/1/positions_on`. Executing ELF SHA-256 was
+`d32f54eef6028f0ad8b0fb3714fb51f53432e3dd1bc2a6c92dc3fc100590c5d6`.
+
+Quill measured 22,186.53 docs/s and Tantivy measured 200,495.69 docs/s. The
+paired Quill/Tantivy median was **0.108698** with 95% CI
+**[0.107024, 0.111538]**; the same-invocation A/A median was **0.993436** with
+95% CI **[0.980159, 1.019927]**. The evidence cell is valid and eligible for a
+decision, but it misses the >=1.5x target. QG-2 therefore remains inactive and
+the sealed run is retained as an attempt, not promoted as a baseline.
+
+Do not rerun the unchanged path. Retry only after an exact-fixture profile and
+counted mechanism demonstrate enough Amdahl headroom to close the 13.8x target
+gap plus at least a 10x reduction in whole-operation cycles or instructions
+per document with indexed-byte and query-result parity. Full artifacts and
+seal are recorded in `docs/NEGATIVE_EVIDENCE.md`.
