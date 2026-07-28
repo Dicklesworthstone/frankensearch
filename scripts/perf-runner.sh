@@ -187,8 +187,10 @@ else
     RUNNER="nohup"
     command -v setsid >/dev/null 2>&1 && RUNNER="setsid nohup"
     # shellcheck disable=SC2086
+    # </dev/null is load-bearing: without it the child inherits sshd's stdin
+    # on macOS (no setsid there) and a remote kickoff hangs until build end.
     $RUNNER bash -c '"$@" > "$0/run.log" 2>&1; echo $? > "$0/exit-status"' \
-        "$RUN_DIR" "${CMD[@]}" > /dev/null 2>&1 &
+        "$RUN_DIR" "${CMD[@]}" > /dev/null 2>&1 < /dev/null &
     PID=$!
     echo "$PID" > "$RUN_DIR/runner.pid"
     echo "detached:   pid $PID"
