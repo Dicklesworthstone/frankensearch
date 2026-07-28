@@ -2728,7 +2728,7 @@ impl<'a> ReferenceScorer<'a> {
         Self::boolean_with_mode(clauses, BooleanMode::Scored, false)
     }
 
-    /// Lower a ranked root Boolean through Tantivy's frequency-term TopDocs
+    /// Lower a ranked root Boolean through Tantivy's frequency-term `TopDocs`
     /// accumulation order when the final scorer shape permits it.
     ///
     /// This is deliberately root-only: nested unions and counted collectors
@@ -3861,7 +3861,7 @@ struct CompetitiveCandidates {
 
 struct BufferedUnionScorer<'a> {
     active: Vec<ReferenceScorer<'a>>,
-    /// Ranked TopDocs over a direct frequency-term root follows Tantivy's
+    /// Ranked `TopDocs` over a direct frequency-term root follows Tantivy's
     /// specialized term-union traversal. That path repeatedly scores the
     /// scorers on the current minimum document, swap-removes exhausted
     /// scorers, and stably re-sorts survivors by their next document. The
@@ -4068,7 +4068,7 @@ impl<'a> BufferedUnionScorer<'a> {
     }
 
     /// Fill one exhaustive window in the same evolving scorer order as
-    /// Tantivy's direct frequency-term BlockWAND specialization while its
+    /// Tantivy's direct frequency-term `BlockWAND` specialization while its
     /// threshold is `Score::MIN`.
     ///
     /// Tantivy initially performs a stable sort by current document. At each
