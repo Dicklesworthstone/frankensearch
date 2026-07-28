@@ -1,0 +1,22 @@
+{
+  "schema": "frankensearch.perf-runner.v1",
+  "machine_class": "m4-macos",
+  "label": "first-fingerprint",
+  "calibrate_aa": 0,
+  "timestamp_utc": "20260728T182056Z",
+  "hostname": "Mac-mini-max",
+  "os": "Darwin",
+  "git_rev": "f5581f907420e97d1b5cb27c684d76cf91bb2d30",
+  "dirty_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "rustc": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
+  "cargo": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)",
+  "governor": "n/a",
+  "smt": "n/a",
+  "thermal_pressure": "Note: No thermal warning level has been recorded Note: No performance warning level has been recorded Note: No CPU power status has been recorded ",
+  "page_size": "16384",
+  "cargo_target_dir": "/Volumes/USB_NVME/cargo-target",
+  "quill_perf_scale": "unset",
+  "quill_perf_fixture": "unset",
+  "rayon_num_threads": "unset",
+  "command": "true "
+}
