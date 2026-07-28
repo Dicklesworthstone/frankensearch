@@ -7357,3 +7357,32 @@ scratch with at least 120 GiB free, so the measurement is not subject to the
 remote-build job lifetime. Require all three density cells, valid
 same-invocation Tantivy/Tantivy A/A controls, a sealed candidate, and an
 immediate same-ELF reproduction before evaluating the 5x target.
+
+## 2026-07-28 — QG-3 INVALID-NULL: physical Zen3 route became contaminated (`bd-h6eh`, FoggySquirrel)
+
+The prescribed worker-family switch completed all five QG-3 cells on physical
+16-thread Zen3 host `fmd` from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+The invocation used the actual Tantivy 0.26.1 incumbent, a Tantivy/Tantivy A/A
+control, persistent scratch with 183 GiB free, and 10 paired blocks per cell.
+
+Only the initial-ingest null admitted. The other four cells failed the
+predeclared null laws: both in-process cells exceeded the A/A median-CI width
+limit, while the fresh-process cells also exposed dispersion, order, or drift
+failures. Host load rose from `0.52` to `9.97` during the run. Apparent
+in-process and fresh-process update-to-searchable ratios of `2.047944
+[1.709623, 2.242787]` and `1.927117 [1.813852, 2.127288]` are therefore not
+gate numbers.
+
+No QG-3 PASS or MISS follows. The sealed invalid artifact is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final-20260728T1344Z/`
+with seal
+`fbec09ce49313d68c04534fa9f59ded3788a97d330b023f0d7379237ae0b3c9f`.
+
+This physical-host route satisfies the prior retry predicate but refutes its
+noise assumption. Switch veins again: retry on the quiet 32-core Zen3
+reference host with the same exact ELF and persistent scratch, and require all
+five same-invocation A/A controls to admit before starting a reproduction or
+evaluating the 4x target. Do not resample `fmd`, weaken a null law, or gate on
+CV.

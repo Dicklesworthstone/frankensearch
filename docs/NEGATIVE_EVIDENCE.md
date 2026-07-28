@@ -16750,3 +16750,34 @@ current ELF directly rather than inside a long-lived remote-build job, retain
 the same-invocation A/A and Quill/Tantivy arms, and require all three density
 cells plus a sealed candidate and immediate same-ELF reproduction before
 evaluating the 5x target.
+
+### 2026-07-28 — QG-3 physical Zen3 candidate fails four of five null controls (`bd-h6eh`, FoggySquirrel)
+
+The required worker-family switch ran all five QG-3 cells on physical
+16-thread Zen3 host `fmd` with revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+10 paired blocks, persistent scratch, the actual Tantivy 0.26.1 incumbent, and
+a Tantivy/Tantivy A/A in the same invocation.
+
+The initial-ingest cell admitted, but all four update cells were
+`INVALID-NULL`. The in-process update-throughput A/A failed CI width; the
+in-process freshness A/A failed CI width and order effect; both fresh-process
+nulls failed CI width plus additional dispersion, order, or drift laws. The
+host load increased from `0.52` to `9.97`, so the large apparent A/B effects
+cannot be separated from the route's noise. In particular, apparent
+update-to-searchable ratios `2.047944 [1.709623, 2.242787]` in-process and
+`1.927117 [1.813852, 2.127288]` fresh-process are not gate numbers.
+
+**Decision: INVALID-NULL / NO CLAIM.** The artifact and raw paired samples are
+retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final-20260728T1344Z/`;
+evidence seal
+`fbec09ce49313d68c04534fa9f59ded3788a97d330b023f0d7379237ae0b3c9f`.
+
+**Retry predicate:** the physical `fmd` vein is now closed. Switch to the quiet
+32-core Zen3 reference host, preserve this exact ELF and persistent scratch,
+and run a new candidate at the 10-pair minimum. Start an immediate
+same-window reproduction only if every required A/A passes center, CI width,
+log-MAD, order-effect, and drift; otherwise switch route again. Never replace
+those laws with CV.
