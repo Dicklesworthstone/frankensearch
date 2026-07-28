@@ -147,7 +147,8 @@ pub use recovery_plan::{
     ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
     RecoveryContractError, RecoveryPlan, RecoveryPlanSchemaVersion, RecoveryPolicy,
     RecoveryRequest, RequestMode, Retryability, SemanticProvenance, SemanticReadiness,
-    SemanticResponseContract, VerifiedSemanticProvenance, plan,
+    SemanticResponseContract, TrustedRecoveryContext, UntrustedRecoveryPlan,
+    VerifiedSemanticProvenance, plan,
 };
 pub use repair::{
     CorruptionEvent, CorruptionPolicy, DegradedReason, DetectionMethod, RepairAttempt,
