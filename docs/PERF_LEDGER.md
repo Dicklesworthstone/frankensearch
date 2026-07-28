@@ -7338,3 +7338,22 @@ After three VPS/noise failures, switch veins. Retry only on a quiet physical
 persistent scratch with at least 120 GiB free, and 10 pairs per cell. Require
 all five A/A controls and an immediate same-ELF reproduction to admit before
 evaluating the 4x target; never weaken the log-MAD law or gate on CV.
+
+## 2026-07-28 — QG-5 EXECUTION FAILURE: 8-vCPU route was SIGKILLed before sealing (`bd-h6eh`, FoggySquirrel)
+
+The full three-cell 1M-document compaction candidate
+`qg5-candidate-r1-20260728T0810Z` ran on `vmi1264463` from revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and exact executing ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+The strict-remote invocation remained active for `16,181,625 ms` before the
+remote process received `SIGKILL` and exited 137. It emitted no complete cell,
+gate artifact, or evidence seal. Post-failure kernel logs exposed no OOM
+record, so the kill source is not inferred.
+
+No QG-5 ratio or PASS/MISS follows from this execution failure. Retry only by
+switching away from the 8-vCPU/29-GiB VPS route: run the exact current ELF
+directly on a quiet certified host with at least 60 GiB RAM and persistent
+scratch with at least 120 GiB free, so the measurement is not subject to the
+remote-build job lifetime. Require all three density cells, valid
+same-invocation Tantivy/Tantivy A/A controls, a sealed candidate, and an
+immediate same-ELF reproduction before evaluating the 5x target.

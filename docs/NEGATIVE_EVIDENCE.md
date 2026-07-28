@@ -16728,3 +16728,25 @@ place `QUILL_PERF_SCRATCH_DIR` on a persistent filesystem with at least
 80-pair VPS run. A candidate and immediate same-ELF reproduction must each
 admit all five A/A controls before any target comparison; do not relax the
 log-MAD or substitute CV.
+
+### 2026-07-28 — QG-5 full compaction route was SIGKILLed before artifact sealing (`bd-h6eh`, FoggySquirrel)
+
+The full three-density 1M-document compaction run
+`qg5-candidate-r1-20260728T0810Z` used revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd`, exact executing ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`,
+and the actual Tantivy 0.26.1 incumbent plus Tantivy/Tantivy A/A in the same
+invocation on 8-vCPU worker `vmi1264463`. After `16,181,625 ms`, the remote
+process received `SIGKILL` and exited 137 before emitting a complete cell or
+sealed artifact. Immediate kernel-log inspection found no OOM record, so this
+row does not speculate about the kill source.
+
+**Decision: INVALID-EXECUTION / NO CLAIM.** No partial or apparent ratio is a
+QG-5 number.
+
+**Retry predicate:** switch veins to a quiet certified host with at least
+60 GiB RAM and persistent scratch with at least 120 GiB free. Run the exact
+current ELF directly rather than inside a long-lived remote-build job, retain
+the same-invocation A/A and Quill/Tantivy arms, and require all three density
+cells plus a sealed candidate and immediate same-ELF reproduction before
+evaluating the 5x target.
