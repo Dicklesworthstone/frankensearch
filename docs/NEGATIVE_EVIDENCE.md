@@ -17135,3 +17135,43 @@ and a quiet-host receipt, then run one new candidate and immediate same-ELF
 reproduction inside that maintenance-free window. Require both A/A controls
 and the 2% reproduction law to admit before activating QG-2; never use this
 overlapped attempt or CV as a decision.
+
+### 2026-07-28 — QG-2 clean-window A/A exposes single-thread scheduler dispersion (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Candidate `qg2-candidate-trj-b083-quiet-20260728T1927Z` executed clean
+revision `b083751e2198519c15beed3bac939e21c63783c4` from self-reporting exact
+ELF SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+on the eligible Threadripper PRO 5995WX host. Literal user-service fields were
+`ActiveState=failed, SubState=failed` after the maintenance job timed out, no
+prune process remained, the next timer was 29 minutes away, `/data` had 655 GB
+free, and load averages were `0.87, 1.50, 1.42`. Candidate and incumbent ran
+side-by-side in the same invocation.
+
+The gate estimator rejected its same-invocation A/A control at median
+Tantivy/Tantivy **1.029141**, ratio CI **[0.917539, 1.090104]**. Its log-MAD
+`0.069117` exceeded `0.048790`, and its order effect `0.098890` exceeded
+`0.048790`; CV is provenance only. One nominally identical arm fell to
+133,955.51 docs/s while the remaining A/A arms were 157,558.01–196,723.06
+docs/s. The apparent Quill/Tantivy ratio
+`0.337959 [0.328160, 0.359203]` is therefore not a QG-2 number. Thirty-three
+counted Tantivy lifecycle joins took 7,540,300–16,156,975 ns (median
+9,424,857 ns), with no segment-count change; sidecar SHA-256 is
+`174eeff3aa27c5b0b8ab8ff42018be6f20559f11ba2b62a666f0da629567ca8f`.
+
+**Decision: INVALID-NULL / NO CLAIM.** Evidence JSON SHA-256
+`b754d0bfc79a1a60ad4ef966aeacf35e23d595b201c4721a2a1c9e710d09dbc5`
+with embedded artifact SHA-256
+`2058baaee8ae508f58ec64cc06d7ad4ab63cf8f3de7223bbcf32ad082180b61e`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-quiet-20260728T1927Z/`.
+
+**Retry predicate:** do not blind-resample the unbound Threadripper route.
+For the single-thread gate, bind the complete exact-ELF invocation to one
+declared logical CPU and record the resulting affinity alongside the same
+literal service/process, timer, disk, and load receipts. Require the bound
+candidate A/A to pass before interpretation, then reproduce immediately with
+the same CPU, worker, ELF, and maintenance window. If the bound A/A still
+fails, stop this worker route and move QG-2 to a distinct eligible machine or
+a counted scheduler mechanism; never relax a null law or gate on CV.
