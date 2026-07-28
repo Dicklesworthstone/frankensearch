@@ -13,7 +13,7 @@ autobenches = false
 [features]
 default = []
 ann = ["dep:hnsw_rs", "dep:serde_json"]
-hnsw-patch-ab = ["ann", "dep:hnsw_rs_034", "dep:sha2"]
+hnsw-patch-ab = ["ann", "dep:hnsw_rs_034"]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
 bench-internals = ["frankensearch-core/bench-internals"]
 
@@ -28,7 +28,7 @@ rayon = { workspace = true }
 ahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 same-file = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"

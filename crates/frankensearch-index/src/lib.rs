@@ -58,16 +58,24 @@ pub mod two_tier;
 pub mod wal;
 pub mod warmup;
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
 use frankensearch_core::config::ZeroSignalState;
+use frankensearch_core::generation::{
+    ArtifactGenerationIdentityV1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingArtifactIdentityV1,
+    EmbeddingProjectionV1, EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    FrozenEmbeddingIdentityBundleV1, HashControlProfileV1, QuantizationFormat,
+    VECTOR_STORAGE_IDENTITY_SCHEMA_V1, VectorStorageIdentityV1,
+};
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
 use memmap2::MmapMut;
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use tracing::debug;
 
@@ -113,6 +121,41 @@ pub const FSVI_MAGIC: [u8; 4] = *b"FSVI";
 /// Supported FSVI format version.
 pub const FSVI_VERSION: u16 = 1;
 
+/// Identity-complete immutable FSVI format version.
+pub const FSVI_V2_VERSION: u16 = 2;
+
+/// Schema for the identity-binding envelope inside an FSVI v2 header.
+pub const FSVI_V2_IDENTITY_BINDING_SCHEMA: u16 = 1;
+
+const FSVI_V2_FIXED_PREFIX_BYTES: usize = 332;
+const FSVI_V2_MIN_HEADER_BYTES: usize = FSVI_V2_FIXED_PREFIX_BYTES + 4;
+const FSVI_V2_MAX_CANONICAL_IDENTITY_BYTES: usize = 1024 * 1024;
+const FSVI_V2_MAX_HEADER_BYTES: usize =
+    3 * FSVI_V2_MAX_CANONICAL_IDENTITY_BYTES + FSVI_V2_MIN_HEADER_BYTES;
+const FSVI_V1_MAX_HEADER_BYTES: usize = 4 + 2 + 2 + 65_535 + 2 + 65_535 + 4 + 1 + 3 + 8 + 8 + 4;
+const SHA256_BYTES: usize = 32;
+#[cfg(test)]
+const FSVI_V2_BUNDLE_FINGERPRINT_OFFSET: usize = 76;
+#[cfg(test)]
+const FSVI_V2_SPACE_FINGERPRINT_OFFSET: usize = 108;
+#[cfg(test)]
+const FSVI_V2_PRODUCER_FINGERPRINT_OFFSET: usize = 140;
+#[cfg(test)]
+const FSVI_V2_INPUT_FINGERPRINT_OFFSET: usize = 172;
+#[cfg(test)]
+const FSVI_V2_STORAGE_FINGERPRINT_OFFSET: usize = 204;
+#[cfg(test)]
+const FSVI_V2_GENERATION_FINGERPRINT_OFFSET: usize = 236;
+#[cfg(test)]
+const FSVI_V2_DOCSET_DIGEST_OFFSET: usize = 268;
+#[cfg(test)]
+const FSVI_V2_VECTOR_DIGEST_OFFSET: usize = 300;
+const EMBEDDING_BUNDLE_CANONICAL_DOMAIN: &[u8] = b"frankensearch.embedding-bundle.v1";
+const EMBEDDING_SPACE_CANONICAL_DOMAIN: &[u8] = b"frankensearch.embedding-space.v1";
+const VECTOR_STORAGE_CANONICAL_DOMAIN: &[u8] = b"frankensearch.vector-storage.v1";
+const ORDERED_DOCSET_DIGEST_DOMAIN: &[u8] = b"frankensearch.fsvi-v2.ordered-live-docset.v1";
+const VECTOR_CONTENT_DIGEST_DOMAIN: &[u8] = b"frankensearch.fsvi-v2.vector-content.v1";
+
 const RECORD_SIZE_BYTES: usize = 16;
 const VECTOR_ALIGN_BYTES: u64 = 64;
 const RECORD_FLAG_TOMBSTONE: u16 = 0x0001;
@@ -148,9 +191,323 @@ impl Quantization {
     }
 }
 
+/// Exact caller-owned identity required to write or admit one FSVI v2 artifact.
+///
+/// Construction validates the complete frozen embedding identity, requires
+/// canonical `fsvi-v2` little-endian storage, and binds a full-width immutable
+/// generation. Human-readable model names and vector dimensions are never
+/// sufficient to construct this value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FsviV2IdentityBinding {
+    generation: ArtifactGenerationIdentityV1,
+    frozen_identity: FrozenEmbeddingIdentityBundleV1,
+    space_canonical_bytes: Vec<u8>,
+    storage_canonical_bytes: Vec<u8>,
+    bundle_fingerprint: [u8; SHA256_BYTES],
+    space_fingerprint: [u8; SHA256_BYTES],
+    producer_fingerprint: [u8; SHA256_BYTES],
+    input_fingerprint: [u8; SHA256_BYTES],
+    storage_fingerprint: [u8; SHA256_BYTES],
+    generation_fingerprint: [u8; SHA256_BYTES],
+    dimension: usize,
+    quantization: Quantization,
+}
+
+impl fmt::Debug for FsviV2IdentityBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FsviV2IdentityBinding")
+            .field("generation", &self.generation)
+            .field("dimension", &self.dimension)
+            .field("quantization", &self.quantization)
+            .field(
+                "bundle_fingerprint",
+                &fingerprint_hex(&self.bundle_fingerprint),
+            )
+            .field(
+                "canonical_bundle_bytes",
+                &self.frozen_identity.canonical_bytes.len(),
+            )
+            .field("canonical_space_bytes", &self.space_canonical_bytes.len())
+            .field(
+                "canonical_storage_bytes",
+                &self.storage_canonical_bytes.len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsviV2IdentityBinding {
+    /// Validate and freeze an exact FSVI v2 generation/storage binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the generation or frozen
+    /// identity is invalid, storage is not exactly `fsvi-v2` little-endian,
+    /// quantization is not F32/F16, or canonical identity bytes exceed the
+    /// bounded header allowance.
+    pub fn new(
+        generation: ArtifactGenerationIdentityV1,
+        frozen_identity: FrozenEmbeddingIdentityBundleV1,
+    ) -> SearchResult<Self> {
+        generation.validate()?;
+        frozen_identity.validate()?;
+        let storage = &frozen_identity.identity.storage;
+        if storage.format != "fsvi-v2" {
+            return Err(fsvi_v2_config_error(
+                "storage.format",
+                "must be exactly fsvi-v2",
+            ));
+        }
+        if storage.endianness != "little-endian" {
+            return Err(fsvi_v2_config_error(
+                "storage.endianness",
+                "must be exactly little-endian",
+            ));
+        }
+        let quantization = quantization_from_identity(storage.quantization)?;
+        let dimension = usize::try_from(storage.dimension)
+            .map_err(|_| fsvi_v2_config_error("storage.dimension", "must fit in usize"))?;
+        let space_canonical_bytes = frozen_identity.identity.space.canonical_bytes();
+        let storage_canonical_bytes = storage.canonical_bytes();
+        for (field, bytes) in [
+            (
+                "identity.canonical_bytes",
+                frozen_identity.canonical_bytes.as_slice(),
+            ),
+            ("space.canonical_bytes", space_canonical_bytes.as_slice()),
+            (
+                "storage.canonical_bytes",
+                storage_canonical_bytes.as_slice(),
+            ),
+        ] {
+            if bytes.is_empty() || bytes.len() > FSVI_V2_MAX_CANONICAL_IDENTITY_BYTES {
+                return Err(fsvi_v2_config_error(
+                    field,
+                    "must be non-empty and no larger than 1 MiB",
+                ));
+            }
+        }
+
+        let bundle_fingerprint =
+            decode_sha256_fingerprint("identity.fingerprint", &frozen_identity.fingerprint)?;
+        let space_fingerprint = decode_sha256_fingerprint(
+            "space.fingerprint",
+            &frozen_identity.identity.space.fingerprint(),
+        )?;
+        let producer_fingerprint = decode_sha256_fingerprint(
+            "producer.fingerprint",
+            &frozen_identity.identity.producer.fingerprint(),
+        )?;
+        let input_fingerprint = decode_sha256_fingerprint(
+            "input.fingerprint",
+            &frozen_identity.identity.input.fingerprint(),
+        )?;
+        let storage_fingerprint =
+            decode_sha256_fingerprint("storage.fingerprint", &storage.fingerprint())?;
+        let generation_fingerprint =
+            decode_sha256_fingerprint("generation.fingerprint", &generation.fingerprint())?;
+
+        Ok(Self {
+            generation,
+            frozen_identity,
+            space_canonical_bytes,
+            storage_canonical_bytes,
+            bundle_fingerprint,
+            space_fingerprint,
+            producer_fingerprint,
+            input_fingerprint,
+            storage_fingerprint,
+            generation_fingerprint,
+            dimension,
+            quantization,
+        })
+    }
+
+    /// Immutable artifact generation bound to this writer/reader.
+    #[must_use]
+    pub const fn generation(&self) -> ArtifactGenerationIdentityV1 {
+        self.generation
+    }
+
+    /// Complete validated frozen embedding identity.
+    #[must_use]
+    pub const fn frozen_identity(&self) -> &FrozenEmbeddingIdentityBundleV1 {
+        &self.frozen_identity
+    }
+
+    /// Stored vector dimension.
+    #[must_use]
+    pub const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Stored vector quantization.
+    #[must_use]
+    pub const fn quantization(&self) -> Quantization {
+        self.quantization
+    }
+}
+
+/// Identity and content bindings decoded from an FSVI v2 header.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FsviV2IdentityMetadata {
+    /// Full-width immutable artifact generation.
+    pub generation: ArtifactGenerationIdentityV1,
+    /// Exact canonical bytes of the complete embedding identity bundle.
+    pub identity_bundle_canonical_bytes: Vec<u8>,
+    /// Exact canonical bytes of the mathematical embedding-space identity.
+    pub space_identity_canonical_bytes: Vec<u8>,
+    /// Exact canonical bytes of the physical storage identity.
+    pub storage_identity_canonical_bytes: Vec<u8>,
+    /// SHA-256 of the complete identity bundle canonical bytes.
+    pub identity_bundle_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the mathematical embedding space.
+    pub space_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the embedding producer attestation.
+    pub producer_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the outer embedding input contract.
+    pub input_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the physical vector storage identity.
+    pub storage_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the canonical full-width generation identity.
+    pub generation_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the ordered live document identifiers.
+    pub ordered_live_docset_digest: [u8; SHA256_BYTES],
+    /// SHA-256 of the exact persisted vector slab bytes and shape.
+    pub vector_content_digest: [u8; SHA256_BYTES],
+    /// Exact byte length of the complete v2 header, including CRC.
+    pub header_size: usize,
+}
+
+impl fmt::Debug for FsviV2IdentityMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FsviV2IdentityMetadata")
+            .field("generation", &self.generation)
+            .field(
+                "identity_bundle_fingerprint",
+                &fingerprint_hex(&self.identity_bundle_fingerprint),
+            )
+            .field(
+                "space_fingerprint",
+                &fingerprint_hex(&self.space_fingerprint),
+            )
+            .field(
+                "storage_fingerprint",
+                &fingerprint_hex(&self.storage_fingerprint),
+            )
+            .field(
+                "ordered_live_docset_digest",
+                &fingerprint_hex(&self.ordered_live_docset_digest),
+            )
+            .field(
+                "vector_content_digest",
+                &fingerprint_hex(&self.vector_content_digest),
+            )
+            .field("header_size", &self.header_size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a recognized artifact must be rebuilt rather than adopted or relabeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsviReindexReason {
+    /// FSVI v1 carries no complete embedding/storage/generation identity.
+    LegacyUnidentified,
+    /// Persisted embedding identity differs from the caller's exact identity.
+    IdentityMismatch,
+    /// Persisted immutable generation differs from the caller's generation.
+    GenerationMismatch,
+    /// Persisted physical storage contract differs from the caller's contract.
+    StorageMismatch,
+}
+
+/// Typed, actionable outcome for a recognized artifact that cannot be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsviReindexRequired {
+    /// Machine-matchable reason.
+    pub reason: FsviReindexReason,
+    /// Format version found in the artifact.
+    pub found_version: u16,
+    /// Bounded diagnostic that never suggests relabeling/adoption.
+    pub detail: String,
+}
+
+/// Typed outcome for an artifact produced by a newer FSVI schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsviUpgradeRequired {
+    /// Newer format version found in the artifact.
+    pub found_version: u16,
+    /// Newest format version this build can inspect and admit.
+    pub supported_version: u16,
+}
+
+/// Non-mutating format inspection result.
+///
+/// Structural corruption remains [`SearchError::IndexCorrupted`], so callers
+/// cannot confuse damaged bytes with either a source reindex or software
+/// upgrade action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsviInspection {
+    /// Identity-complete v2 header; full content admission still recomputes
+    /// docset/vector digests in [`VectorIndex::open_admitted_v2`].
+    V2IdentityComplete(Box<VectorMetadata>),
+    /// Recognized legacy bytes that must be rebuilt from source.
+    ReindexRequired(FsviReindexRequired),
+    /// A newer schema that requires newer reader software.
+    UpgradeRequired(FsviUpgradeRequired),
+}
+
+/// Error returned by exact FSVI v2 admission.
+#[derive(Debug)]
+pub enum FsviAdmissionError {
+    /// Recognized bytes require a source reindex.
+    ReindexRequired(FsviReindexRequired),
+    /// Newer bytes require newer reader software.
+    UpgradeRequired(FsviUpgradeRequired),
+    /// I/O, not-found, or actual corruption from the index layer.
+    Index(SearchError),
+}
+
+impl fmt::Display for FsviAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReindexRequired(required) => write!(
+                formatter,
+                "FSVI source reindex required ({:?}): {}",
+                required.reason, required.detail
+            ),
+            Self::UpgradeRequired(required) => write!(
+                formatter,
+                "FSVI reader upgrade required: found v{}, supported through v{}",
+                required.found_version, required.supported_version
+            ),
+            Self::Index(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for FsviAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Index(error) => Some(error),
+            Self::ReindexRequired(_) | Self::UpgradeRequired(_) => None,
+        }
+    }
+}
+
+impl From<SearchError> for FsviAdmissionError {
+    fn from(error: SearchError) -> Self {
+        Self::Index(error)
+    }
+}
+
 /// Parsed metadata from an FSVI file header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorMetadata {
+    /// On-disk FSVI format version.
+    pub fsvi_version: u16,
     /// Stable embedder id used to build the index.
     pub embedder_id: String,
     /// Model revision identifier (e.g. pinned commit hash).
@@ -165,6 +522,8 @@ pub struct VectorMetadata {
     pub record_count: usize,
     /// Byte offset to the aligned vector slab.
     pub vectors_offset: u64,
+    /// Complete v2 identity/content bindings, absent for legacy v1 bytes.
+    pub identity_v2: Option<FsviV2IdentityMetadata>,
 }
 
 /// Statistics returned by [`VectorIndex::vacuum`].
@@ -216,6 +575,198 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
+    /// Inspect an FSVI header without adopting, relabeling, or mutating it.
+    ///
+    /// Valid v1 bytes are always reported as
+    /// [`FsviInspection::ReindexRequired`] with
+    /// [`FsviReindexReason::LegacyUnidentified`]. A future schema is
+    /// [`FsviInspection::UpgradeRequired`]. Bad magic, truncation, malformed
+    /// identity material, or CRC drift remains actual
+    /// [`SearchError::IndexCorrupted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns index-not-found/I/O errors or actual structural corruption.
+    pub fn inspect(path: &Path) -> SearchResult<FsviInspection> {
+        let (version, header) = read_header_for_inspection(path)?;
+        match version {
+            FSVI_VERSION => {
+                let _ = parse_header(path, &header)?;
+                Ok(FsviInspection::ReindexRequired(FsviReindexRequired {
+                    reason: FsviReindexReason::LegacyUnidentified,
+                    found_version: FSVI_VERSION,
+                    detail: "FSVI v1 has no complete embedding-space, storage, content, or full-width generation identity; rebuild from source into a separate v2 generation"
+                        .to_owned(),
+                }))
+            }
+            FSVI_V2_VERSION => {
+                let (metadata, _) = parse_v2_header(path, &header)?;
+                Ok(FsviInspection::V2IdentityComplete(Box::new(metadata)))
+            }
+            found if found > FSVI_V2_VERSION => {
+                Ok(FsviInspection::UpgradeRequired(FsviUpgradeRequired {
+                    found_version: found,
+                    supported_version: FSVI_V2_VERSION,
+                }))
+            }
+            found => Err(index_corrupted(
+                path,
+                format!("unsupported historical FSVI schema version {found}"),
+            )),
+        }
+    }
+
+    /// Open and fully admit one immutable identity-complete FSVI v2 artifact.
+    ///
+    /// Admission re-reads the header after inspection, compares the exact
+    /// caller-owned generation and complete canonical identity bytes, validates
+    /// storage/dimension/quantization, verifies every record/string-table
+    /// invariant, recomputes ordered-docset and vector-content SHA-256 digests,
+    /// rejects trailing bytes, and refuses any live WAL sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed source-reindex or reader-upgrade outcomes for recognized
+    /// incompatible formats. I/O and actual corruption are wrapped in
+    /// [`FsviAdmissionError::Index`].
+    #[allow(clippy::too_many_lines)]
+    pub fn open_admitted_v2(
+        path: &Path,
+        expected: &FsviV2IdentityBinding,
+    ) -> Result<Self, FsviAdmissionError> {
+        match Self::inspect(path)? {
+            FsviInspection::ReindexRequired(required) => {
+                return Err(FsviAdmissionError::ReindexRequired(required));
+            }
+            FsviInspection::UpgradeRequired(required) => {
+                return Err(FsviAdmissionError::UpgradeRequired(required));
+            }
+            FsviInspection::V2IdentityComplete(_) => {}
+        }
+
+        // Admission owns an immutable byte snapshot. A file-backed mutable map
+        // would require write permission and would make later external file
+        // mutation violate memmap's safety contract. Reading into an anonymous
+        // map keeps the existing VectorIndex storage shape without retaining
+        // any mapping to a replaceable path.
+        let mut file = File::open(path).map_err(SearchError::Io)?;
+        const V2_PREFIX_BYTES: usize = 10;
+        let mut prefix = [0_u8; V2_PREFIX_BYTES];
+        read_exact_v2_file(path, &mut file, &mut prefix, "v2 fixed prefix")?;
+        if prefix[..4] != FSVI_MAGIC {
+            return Err(index_corrupted(path, "v2 snapshot has invalid magic bytes").into());
+        }
+        let snapshot_version =
+            u16::from_le_bytes(prefix[4..6].try_into().expect("fixed v2 version field"));
+        if snapshot_version != FSVI_V2_VERSION {
+            return Err(SearchError::IndexVersionMismatch {
+                expected: FSVI_V2_VERSION,
+                found: snapshot_version,
+            }
+            .into());
+        }
+        let staged_header_len = usize::try_from(u32::from_le_bytes(
+            prefix[6..10]
+                .try_into()
+                .expect("fixed v2 header-size field"),
+        ))
+        .map_err(|_| index_corrupted(path, "v2 header_size does not fit in usize"))?;
+        validate_v2_header_size(path, staged_header_len)?;
+        let mut staged_header = vec![0_u8; staged_header_len];
+        staged_header[..V2_PREFIX_BYTES].copy_from_slice(&prefix);
+        read_exact_v2_file(
+            path,
+            &mut file,
+            &mut staged_header[V2_PREFIX_BYTES..],
+            "complete v2 header",
+        )?;
+        let (staged_metadata, parsed_header_len) = parse_v2_header(path, &staged_header)?;
+        if parsed_header_len != staged_header_len {
+            return Err(
+                index_corrupted(path, "v2 staged header length changed during parsing").into(),
+            );
+        }
+        validate_expected_v2_binding(path, &staged_metadata, expected)?;
+        let file_len = usize::try_from(file.metadata().map_err(SearchError::Io)?.len())
+            .map_err(|_| index_corrupted(path, "v2 file length does not fit in usize"))?;
+        validate_v2_layout_len(path, &staged_metadata, staged_header_len, file_len)?;
+
+        file.seek(SeekFrom::Start(0)).map_err(SearchError::Io)?;
+        let mut data = MmapMut::map_anon(file_len).map_err(SearchError::Io)?;
+        read_exact_v2_file(path, &mut file, &mut data, "complete v2 snapshot")?;
+        let mut unexpected_tail = [0_u8; 1];
+        if file.read(&mut unexpected_tail).map_err(SearchError::Io)? != 0 {
+            return Err(index_corrupted(
+                path,
+                "v2 file length changed while the admitted snapshot was being read",
+            )
+            .into());
+        }
+        let (metadata, header_len) = parse_v2_header(path, &data)?;
+        if metadata != staged_metadata || header_len != staged_header_len {
+            return Err(index_corrupted(
+                path,
+                "v2 header changed while the admitted snapshot was being read",
+            )
+            .into());
+        }
+        validate_expected_v2_binding(path, &metadata, expected)?;
+
+        let (records_offset, strings_offset, vectors_offset) =
+            validate_v2_layout_len(path, &metadata, header_len, data.len())?;
+
+        validate_v2_records_and_content(
+            path,
+            &data,
+            &metadata,
+            records_offset,
+            strings_offset,
+            vectors_offset,
+        )?;
+        let wal_path = wal::wal_path_for(path);
+        match fs::symlink_metadata(&wal_path) {
+            Ok(_) => {
+                return Err(index_corrupted(
+                    path,
+                    format!(
+                        "identity-complete FSVI v2 admission requires a compact artifact with no live WAL sidecar at {}",
+                        wal_path.display()
+                    ),
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SearchError::Io(error).into()),
+        }
+
+        let warm_up_config = WarmUpConfig::from_env();
+        if !matches!(warm_up_config.strategy, WarmUpStrategy::None) {
+            let warm_up = warmup::warm_up_bytes(&data, header_len, &warm_up_config, None);
+            debug!(
+                target: "frankensearch.warmup",
+                path = %path.display(),
+                strategy = %warm_up.strategy_name,
+                pages_touched = warm_up.pages_touched,
+                bytes_touched = warm_up.bytes_touched,
+                budget_exhausted = warm_up.budget_exhausted,
+                "identity-admitted v2 index warm-up complete"
+            );
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            data,
+            metadata,
+            records_offset,
+            strings_offset,
+            vectors_offset,
+            wal_entries: Vec::new(),
+            wal_config: WalConfig::default(),
+            vectors_i8: OnceLock::new(),
+            vectors_nibbles: OnceLock::new(),
+        })
+    }
+
     /// Open an existing FSVI index from disk.
     ///
     /// # Errors
@@ -371,6 +922,44 @@ impl VectorIndex {
         Self::create_with_revision(path, embedder_id, "", dimension, Quantization::F16)
     }
 
+    /// Create an immutable identity-complete FSVI v2 writer.
+    ///
+    /// Unlike the legacy v1 constructors, this API cannot be called with a
+    /// display name, empty revision, or dimension-only compatibility claim.
+    /// The exact validated identity and full-width generation are required
+    /// before any writer is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] if the binding is invalid.
+    pub fn create_v2(
+        path: &Path,
+        binding: FsviV2IdentityBinding,
+    ) -> SearchResult<VectorIndexWriter> {
+        let embedder_id = binding
+            .frozen_identity
+            .identity
+            .space
+            .logical_model_id
+            .clone();
+        let embedder_revision = binding
+            .frozen_identity
+            .identity
+            .space
+            .immutable_revision
+            .clone();
+        Ok(VectorIndexWriter {
+            path: path.to_path_buf(),
+            embedder_id,
+            embedder_revision,
+            dimension: binding.dimension,
+            quantization: binding.quantization,
+            compaction_gen: 0,
+            records: Vec::new(),
+            identity_v2: Some(binding),
+        })
+    }
+
     /// Replace any existing index generation with a durable empty F16 index.
     ///
     /// Unlike calling [`Self::create`] directly, this first removes and
@@ -474,6 +1063,7 @@ impl VectorIndex {
             quantization,
             compaction_gen: 1,
             records: Vec::new(),
+            identity_v2: None,
         })
     }
 
@@ -511,6 +1101,18 @@ impl VectorIndex {
     #[must_use]
     pub const fn metadata(&self) -> &VectorMetadata {
         &self.metadata
+    }
+
+    /// Complete v2 identity/content metadata, absent for legacy v1 bytes.
+    #[must_use]
+    pub const fn identity_v2(&self) -> Option<&FsviV2IdentityMetadata> {
+        self.metadata.identity_v2.as_ref()
+    }
+
+    /// Whether this index was opened through exact FSVI v2 admission.
+    #[must_use]
+    pub const fn is_identity_admitted_v2(&self) -> bool {
+        self.metadata.fsvi_version == FSVI_V2_VERSION && self.metadata.identity_v2.is_some()
     }
 
     // ─── WAL / Incremental Update API ───────────────────────────────────
@@ -596,6 +1198,7 @@ impl VectorIndex {
     ///
     /// Returns the first IO/corruption error encountered while updating flags.
     pub fn soft_delete_batch(&mut self, doc_ids: &[&str]) -> SearchResult<usize> {
+        self.ensure_legacy_mutation_format("soft_delete_batch")?;
         let mut deleted = 0usize;
         let mut wal_changed = false;
 
@@ -766,6 +1369,7 @@ impl VectorIndex {
     /// Returns `SearchError::Io` for filesystem failures and
     /// `SearchError::IndexCorrupted` for malformed data.
     pub fn vacuum(&mut self) -> SearchResult<VacuumStats> {
+        self.ensure_legacy_mutation_format("vacuum")?;
         let start = Instant::now();
         let records_before = self.record_count();
         let bytes_before = self.data.len();
@@ -847,6 +1451,7 @@ impl VectorIndex {
         &mut self,
         entries: &[(String, Vec<f32>)],
     ) -> SearchResult<()> {
+        self.ensure_legacy_mutation_format("append_batch")?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -988,6 +1593,7 @@ impl VectorIndex {
     /// `SearchError::InvalidConfig` for encoding issues.
     #[allow(clippy::cast_precision_loss)]
     pub fn compact(&mut self) -> SearchResult<CompactionStats> {
+        self.ensure_legacy_mutation_format("compact")?;
         let start = Instant::now();
         let main_before = self.record_count();
         let wal_count = self.wal_entries.len();
@@ -1124,6 +1730,7 @@ impl VectorIndex {
 
     #[allow(clippy::too_many_lines)]
     fn rewrite_index(&mut self, sources: &[MergeSource], new_gen: u8) -> SearchResult<()> {
+        self.ensure_legacy_mutation_format("rewrite_index")?;
         let record_count = sources.len();
         let records_bytes = record_count.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
             SearchError::InvalidConfig {
@@ -1693,6 +2300,7 @@ impl VectorIndex {
     }
 
     fn rewrite_wal_sidecar(&self) -> SearchResult<()> {
+        self.ensure_legacy_mutation_format("rewrite_wal_sidecar")?;
         let wal_path = wal::wal_path_for(&self.path);
         if self.wal_entries.is_empty() {
             wal::remove_wal(&wal_path)?;
@@ -1771,6 +2379,18 @@ impl VectorIndex {
             )
             .ok_or_else(|| index_corrupted(&self.path, "vector offset overflow"))
     }
+
+    fn ensure_legacy_mutation_format(&self, operation: &str) -> SearchResult<()> {
+        if self.metadata.fsvi_version != FSVI_V2_VERSION {
+            return Ok(());
+        }
+        Err(SearchError::InvalidConfig {
+            field: "fsvi_v2.mutation".to_owned(),
+            value: operation.to_owned(),
+            reason: "identity-complete FSVI v2 artifacts are immutable in this admission slice; rebuild and publish a separate generation rather than mutating content or attaching a legacy WAL"
+                .to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1796,6 +2416,7 @@ pub struct VectorIndexWriter {
     quantization: Quantization,
     compaction_gen: u8,
     records: Vec<PendingRecord>,
+    identity_v2: Option<FsviV2IdentityBinding>,
 }
 
 impl VectorIndexWriter {
@@ -1912,6 +2533,28 @@ impl VectorIndexWriter {
                 .cmp(&right.doc_id_hash)
                 .then(left.doc_id.cmp(&right.doc_id))
         });
+        if self.identity_v2.is_some() {
+            if self.records.iter().any(|record| record.doc_id.is_empty()) {
+                return Err(SearchError::InvalidConfig {
+                    field: "doc_id".to_owned(),
+                    value: "<empty>".to_owned(),
+                    reason: "identity-complete FSVI v2 document ids must not be empty".to_owned(),
+                });
+            }
+            if self
+                .records
+                .windows(2)
+                .any(|pair| pair[0].doc_id == pair[1].doc_id)
+            {
+                return Err(SearchError::InvalidConfig {
+                    field: "doc_id".to_owned(),
+                    value: "<duplicate>".to_owned(),
+                    reason:
+                        "identity-complete FSVI v2 requires one unique live record per document id"
+                            .to_owned(),
+                });
+            }
+        }
 
         let record_count = self.records.len();
         let records_bytes = record_count.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
@@ -1960,24 +2603,26 @@ impl VectorIndexWriter {
                 reason: "string table length does not fit in u64".to_owned(),
             })?;
 
-        let provisional_header = build_header_prefix(
-            &self.embedder_id,
-            &self.embedder_revision,
-            self.dimension,
-            self.quantization,
-            self.compaction_gen,
-            record_count,
-            0,
-        )?;
-        let header_len =
-            provisional_header
-                .len()
-                .checked_add(4)
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "header".to_owned(),
-                    value: provisional_header.len().to_string(),
-                    reason: "header length overflow".to_owned(),
-                })?;
+        let header_len = if let Some(binding) = &self.identity_v2 {
+            fsvi_v2_header_len(binding)?
+        } else {
+            build_header_prefix(
+                &self.embedder_id,
+                &self.embedder_revision,
+                self.dimension,
+                self.quantization,
+                self.compaction_gen,
+                record_count,
+                0,
+            )?
+            .len()
+            .checked_add(4)
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "header".to_owned(),
+                value: "overflow".to_owned(),
+                reason: "header length overflow".to_owned(),
+            })?
+        };
         let header_len_u64 = u64::try_from(header_len).map_err(|_| SearchError::InvalidConfig {
             field: "header".to_owned(),
             value: header_len.to_string(),
@@ -2007,17 +2652,26 @@ impl VectorIndexWriter {
                 reason: "padding length does not fit in usize".to_owned(),
             })?;
 
-        let mut header_prefix = build_header_prefix(
-            &self.embedder_id,
-            &self.embedder_revision,
-            self.dimension,
-            self.quantization,
-            self.compaction_gen,
-            record_count,
-            vectors_offset,
-        )?;
-        let header_crc = crc32(&header_prefix);
-        header_prefix.extend_from_slice(&header_crc.to_le_bytes());
+        let legacy_header = if self.identity_v2.is_none() {
+            let mut header = build_header_prefix(
+                &self.embedder_id,
+                &self.embedder_revision,
+                self.dimension,
+                self.quantization,
+                self.compaction_gen,
+                record_count,
+                vectors_offset,
+            )?;
+            let header_crc = crc32(&header);
+            header.extend_from_slice(&header_crc.to_le_bytes());
+            Some(header)
+        } else {
+            None
+        };
+        let ordered_docset_digest = self
+            .identity_v2
+            .as_ref()
+            .map(|_| ordered_docset_digest(&self.records));
 
         let tmp_path = temporary_output_path(&self.path);
         let result = (|| -> SearchResult<()> {
@@ -2026,10 +2680,15 @@ impl VectorIndexWriter {
                 .truncate(true)
                 .write(true)
                 .open(&tmp_path)?;
+            let vector_content_digest;
             {
                 let mut writer = BufWriter::with_capacity(256 * 1024, &mut file);
 
-                writer.write_all(&header_prefix)?;
+                if let Some(header) = &legacy_header {
+                    writer.write_all(header)?;
+                } else {
+                    writer.write_all(&vec![0_u8; header_len])?;
+                }
                 for entry in &record_entries {
                     writer.write_all(&entry.doc_id_hash.to_le_bytes())?;
                     writer.write_all(&entry.doc_id_offset.to_le_bytes())?;
@@ -2040,11 +2699,66 @@ impl VectorIndexWriter {
                 if padding_len > 0 {
                     writer.write_all(&vec![0_u8; padding_len])?;
                 }
-                write_vector_slab(&mut writer, &self.records, self.quantization)?;
+                vector_content_digest = if self.identity_v2.is_some() {
+                    Some(write_vector_slab_v2(
+                        &mut writer,
+                        &self.records,
+                        self.dimension,
+                        self.quantization,
+                    )?)
+                } else {
+                    write_vector_slab(&mut writer, &self.records, self.quantization)?;
+                    None
+                };
                 writer.flush()?;
             }
 
+            if let Some(binding) = &self.identity_v2 {
+                let docset_digest = ordered_docset_digest.ok_or_else(|| {
+                    fsvi_v2_config_error(
+                        "ordered_live_docset_digest",
+                        "v2 writer did not compute its docset digest",
+                    )
+                })?;
+                let vector_digest = vector_content_digest.ok_or_else(|| {
+                    fsvi_v2_config_error(
+                        "vector_content_digest",
+                        "v2 writer did not compute its vector digest",
+                    )
+                })?;
+                let header = build_v2_header(
+                    binding,
+                    record_count,
+                    vectors_offset,
+                    docset_digest,
+                    vector_digest,
+                )?;
+                if header.len() != header_len {
+                    return Err(SearchError::InvalidConfig {
+                        field: "fsvi_v2.header_size".to_owned(),
+                        value: header.len().to_string(),
+                        reason: format!("expected precomputed header size {header_len}"),
+                    });
+                }
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&header)?;
+            }
             file.sync_all()?;
+            if self.identity_v2.is_some() {
+                let wal_path = wal::wal_path_for(&self.path);
+                match fs::symlink_metadata(&wal_path) {
+                    Ok(_) => {
+                        return Err(SearchError::InvalidConfig {
+                            field: "fsvi_v2.wal_sidecar".to_owned(),
+                            value: wal_path.display().to_string(),
+                            reason: "identity-complete v2 publication refuses a target with any existing WAL sidecar"
+                                .to_owned(),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(SearchError::Io(error)),
+                }
+            }
             fs::rename(&tmp_path, &self.path)?;
             sync_parent_directory(&self.path)?;
             Ok(())
@@ -2156,6 +2870,7 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
 
     Ok((
         VectorMetadata {
+            fsvi_version: FSVI_VERSION,
             embedder_id,
             embedder_revision,
             dimension,
@@ -2163,9 +2878,1224 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
             compaction_gen,
             record_count,
             vectors_offset,
+            identity_v2: None,
         },
         cursor,
     ))
+}
+
+fn read_header_for_inspection(path: &Path) -> SearchResult<(u16, Vec<u8>)> {
+    if !path.exists() {
+        return Err(SearchError::IndexNotFound {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut file = File::open(path).map_err(SearchError::Io)?;
+    let file_len = file.metadata().map_err(SearchError::Io)?.len();
+    let mut prefix = [0_u8; 6];
+    read_exact_index_bytes(path, &mut file, &mut prefix, "magic and version")?;
+    if prefix[..4] != FSVI_MAGIC {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "bad magic bytes: expected {FSVI_MAGIC:?}, found {:?}",
+                &prefix[..4]
+            ),
+        ));
+    }
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    match version {
+        FSVI_VERSION => {
+            let bounded_len = usize::try_from(file_len)
+                .unwrap_or(usize::MAX)
+                .min(FSVI_V1_MAX_HEADER_BYTES);
+            file.seek(SeekFrom::Start(0)).map_err(SearchError::Io)?;
+            let mut header = Vec::with_capacity(bounded_len);
+            file.take(u64::try_from(bounded_len).unwrap_or(u64::MAX))
+                .read_to_end(&mut header)
+                .map_err(SearchError::Io)?;
+            Ok((version, header))
+        }
+        FSVI_V2_VERSION => {
+            let mut encoded_size = [0_u8; 4];
+            read_exact_index_bytes(path, &mut file, &mut encoded_size, "v2 header_size")?;
+            let header_size = usize::try_from(u32::from_le_bytes(encoded_size))
+                .map_err(|_| index_corrupted(path, "v2 header_size does not fit in usize"))?;
+            validate_v2_header_size(path, header_size)?;
+            if u64::try_from(header_size).is_ok_and(|size| size > file_len) {
+                return Err(index_corrupted(
+                    path,
+                    format!(
+                        "v2 header is truncated: declared {header_size} bytes, file has {file_len}"
+                    ),
+                ));
+            }
+            file.seek(SeekFrom::Start(0)).map_err(SearchError::Io)?;
+            let mut header = vec![0_u8; header_size];
+            read_exact_index_bytes(path, &mut file, &mut header, "v2 header")?;
+            Ok((version, header))
+        }
+        _ => Ok((version, prefix.to_vec())),
+    }
+}
+
+fn read_exact_index_bytes(
+    path: &Path,
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+    field: &str,
+) -> SearchResult<()> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            index_corrupted(path, format!("{field} is truncated"))
+        } else {
+            SearchError::Io(error)
+        }
+    })
+}
+
+fn validate_v2_header_size(path: &Path, header_size: usize) -> SearchResult<()> {
+    if !(FSVI_V2_MIN_HEADER_BYTES..=FSVI_V2_MAX_HEADER_BYTES).contains(&header_size) {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 header_size {header_size} is outside [{FSVI_V2_MIN_HEADER_BYTES}, {FSVI_V2_MAX_HEADER_BYTES}]"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize)> {
+    let mut cursor = 0usize;
+    let magic = read_array::<4>(path, data, &mut cursor, "magic")?;
+    if magic != FSVI_MAGIC {
+        return Err(index_corrupted(
+            path,
+            format!("bad magic bytes: expected {FSVI_MAGIC:?}, found {magic:?}"),
+        ));
+    }
+    let version = u16::from_le_bytes(read_array::<2>(path, data, &mut cursor, "version")?);
+    if version != FSVI_V2_VERSION {
+        return Err(SearchError::IndexVersionMismatch {
+            expected: FSVI_V2_VERSION,
+            found: version,
+        });
+    }
+    let header_size = usize::try_from(u32::from_le_bytes(read_array::<4>(
+        path,
+        data,
+        &mut cursor,
+        "header_size",
+    )?))
+    .map_err(|_| index_corrupted(path, "v2 header_size does not fit in usize"))?;
+    validate_v2_header_size(path, header_size)?;
+    if header_size > data.len() {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 header is truncated: declared {header_size} bytes, have {}",
+                data.len()
+            ),
+        ));
+    }
+    let header = &data[..header_size];
+
+    let binding_schema = u16::from_le_bytes(read_array::<2>(
+        path,
+        header,
+        &mut cursor,
+        "identity_binding_schema",
+    )?);
+    if binding_schema != FSVI_V2_IDENTITY_BINDING_SCHEMA {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "unsupported v2 identity binding schema {binding_schema}; expected {FSVI_V2_IDENTITY_BINDING_SCHEMA}"
+            ),
+        ));
+    }
+    let quantization = Quantization::from_wire(
+        read_array::<1>(path, header, &mut cursor, "quantization")?[0],
+        path,
+    )?;
+    let flags = read_array::<1>(path, header, &mut cursor, "header_flags")?[0];
+    let reserved = u16::from_le_bytes(read_array::<2>(path, header, &mut cursor, "reserved")?);
+    if flags != 0 || reserved != 0 {
+        return Err(index_corrupted(
+            path,
+            "v2 header flags and reserved fields must be zero",
+        ));
+    }
+    let dimension_u32 =
+        u32::from_le_bytes(read_array::<4>(path, header, &mut cursor, "dimension")?);
+    let dimension = usize::try_from(dimension_u32)
+        .map_err(|_| index_corrupted(path, "dimension does not fit in usize"))?;
+    if dimension == 0 {
+        return Err(index_corrupted(path, "dimension must be greater than zero"));
+    }
+    let record_count_u64 =
+        u64::from_le_bytes(read_array::<8>(path, header, &mut cursor, "record_count")?);
+    let record_count = usize::try_from(record_count_u64)
+        .map_err(|_| index_corrupted(path, "record_count does not fit in usize"))?;
+    let vectors_offset = u64::from_le_bytes(read_array::<8>(
+        path,
+        header,
+        &mut cursor,
+        "vectors_offset",
+    )?);
+
+    let generation_schema = u16::from_le_bytes(read_array::<2>(
+        path,
+        header,
+        &mut cursor,
+        "generation_schema",
+    )?);
+    let generation_reserved = u16::from_le_bytes(read_array::<2>(
+        path,
+        header,
+        &mut cursor,
+        "generation_reserved",
+    )?);
+    if generation_reserved != 0 {
+        return Err(index_corrupted(
+            path,
+            "v2 generation reserved field must be zero",
+        ));
+    }
+    let generation_sequence = u64::from_le_bytes(read_array::<8>(
+        path,
+        header,
+        &mut cursor,
+        "generation_sequence",
+    )?);
+    let generation_nonce = read_array::<16>(path, header, &mut cursor, "generation_nonce")?;
+    let generation = ArtifactGenerationIdentityV1 {
+        schema_version: generation_schema,
+        sequence: generation_sequence,
+        nonce: generation_nonce,
+    };
+    generation.validate().map_err(|error| {
+        index_corrupted(path, format!("v2 artifact generation is invalid: {error}"))
+    })?;
+
+    let bundle_len = usize::try_from(u32::from_le_bytes(read_array::<4>(
+        path,
+        header,
+        &mut cursor,
+        "identity_bundle_len",
+    )?))
+    .map_err(|_| index_corrupted(path, "identity_bundle_len does not fit in usize"))?;
+    let space_len = usize::try_from(u32::from_le_bytes(read_array::<4>(
+        path,
+        header,
+        &mut cursor,
+        "space_identity_len",
+    )?))
+    .map_err(|_| index_corrupted(path, "space_identity_len does not fit in usize"))?;
+    let storage_len = usize::try_from(u32::from_le_bytes(read_array::<4>(
+        path,
+        header,
+        &mut cursor,
+        "storage_identity_len",
+    )?))
+    .map_err(|_| index_corrupted(path, "storage_identity_len does not fit in usize"))?;
+    for (field, len) in [
+        ("identity_bundle_len", bundle_len),
+        ("space_identity_len", space_len),
+        ("storage_identity_len", storage_len),
+    ] {
+        if len == 0 || len > FSVI_V2_MAX_CANONICAL_IDENTITY_BYTES {
+            return Err(index_corrupted(
+                path,
+                format!("{field} must be non-zero and no larger than 1 MiB"),
+            ));
+        }
+    }
+
+    let identity_bundle_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "identity_bundle_fingerprint")?;
+    let space_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "space_fingerprint")?;
+    let producer_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "producer_fingerprint")?;
+    let input_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "input_fingerprint")?;
+    let storage_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "storage_fingerprint")?;
+    let generation_fingerprint =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "generation_fingerprint")?;
+    let ordered_live_docset_digest =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "ordered_live_docset_digest")?;
+    let vector_content_digest =
+        read_array::<SHA256_BYTES>(path, header, &mut cursor, "vector_content_digest")?;
+    for (field, fingerprint) in [
+        ("identity_bundle_fingerprint", identity_bundle_fingerprint),
+        ("space_fingerprint", space_fingerprint),
+        ("producer_fingerprint", producer_fingerprint),
+        ("input_fingerprint", input_fingerprint),
+        ("storage_fingerprint", storage_fingerprint),
+        ("generation_fingerprint", generation_fingerprint),
+        ("ordered_live_docset_digest", ordered_live_docset_digest),
+        ("vector_content_digest", vector_content_digest),
+    ] {
+        if fingerprint == [0; SHA256_BYTES] {
+            return Err(index_corrupted(
+                path,
+                format!("v2 {field} must not be all zero"),
+            ));
+        }
+    }
+    if cursor != FSVI_V2_FIXED_PREFIX_BYTES {
+        return Err(index_corrupted(
+            path,
+            "internal v2 fixed header layout disagreement",
+        ));
+    }
+
+    let identity_bundle_canonical_bytes =
+        read_slice(path, header, &mut cursor, bundle_len, "identity_bundle")?.to_vec();
+    let space_identity_canonical_bytes =
+        read_slice(path, header, &mut cursor, space_len, "space_identity")?.to_vec();
+    let storage_identity_canonical_bytes =
+        read_slice(path, header, &mut cursor, storage_len, "storage_identity")?.to_vec();
+    let crc_offset = header_size
+        .checked_sub(4)
+        .ok_or_else(|| index_corrupted(path, "v2 CRC offset underflow"))?;
+    if cursor != crc_offset {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 canonical identity lengths end at byte {cursor}, expected CRC at {crc_offset}"
+            ),
+        ));
+    }
+    let expected_crc =
+        u32::from_le_bytes(read_array::<4>(path, header, &mut cursor, "header_crc32")?);
+    let actual_crc = crc32(&header[..crc_offset]);
+    if actual_crc != expected_crc {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 header CRC mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+            ),
+        ));
+    }
+
+    validate_canonical_fingerprint(
+        path,
+        "identity bundle",
+        &identity_bundle_canonical_bytes,
+        identity_bundle_fingerprint,
+    )?;
+    validate_canonical_fingerprint(
+        path,
+        "embedding space",
+        &space_identity_canonical_bytes,
+        space_fingerprint,
+    )?;
+    validate_canonical_fingerprint(
+        path,
+        "vector storage",
+        &storage_identity_canonical_bytes,
+        storage_fingerprint,
+    )?;
+    validate_canonical_fingerprint(
+        path,
+        "artifact generation",
+        &generation.canonical_bytes(),
+        generation_fingerprint,
+    )?;
+    let bundle_components =
+        parse_bundle_component_fingerprints(path, &identity_bundle_canonical_bytes)?;
+    if bundle_components
+        != [
+            space_fingerprint,
+            producer_fingerprint,
+            input_fingerprint,
+            storage_fingerprint,
+        ]
+    {
+        return Err(index_corrupted(
+            path,
+            "v2 complete identity bundle does not bind the stored component fingerprints",
+        ));
+    }
+    let (embedder_id, embedder_revision, space_normalization) = parse_complete_space_identity(
+        path,
+        &space_identity_canonical_bytes,
+        dimension_u32,
+        input_fingerprint,
+    )?;
+    let storage_normalization = validate_storage_identity_bytes(
+        path,
+        &storage_identity_canonical_bytes,
+        dimension_u32,
+        quantization,
+    )?;
+    if storage_normalization != space_normalization {
+        return Err(index_corrupted(
+            path,
+            "v2 storage normalization disagrees with the embedding-space output normalization",
+        ));
+    }
+
+    Ok((
+        VectorMetadata {
+            fsvi_version: FSVI_V2_VERSION,
+            embedder_id,
+            embedder_revision,
+            dimension,
+            quantization,
+            compaction_gen: 0,
+            record_count,
+            vectors_offset,
+            identity_v2: Some(FsviV2IdentityMetadata {
+                generation,
+                identity_bundle_canonical_bytes,
+                space_identity_canonical_bytes,
+                storage_identity_canonical_bytes,
+                identity_bundle_fingerprint,
+                space_fingerprint,
+                producer_fingerprint,
+                input_fingerprint,
+                storage_fingerprint,
+                generation_fingerprint,
+                ordered_live_docset_digest,
+                vector_content_digest,
+                header_size,
+            }),
+        },
+        header_size,
+    ))
+}
+
+fn validate_canonical_fingerprint(
+    path: &Path,
+    field: &str,
+    canonical_bytes: &[u8],
+    expected: [u8; SHA256_BYTES],
+) -> SearchResult<()> {
+    let actual = sha256_bytes(canonical_bytes);
+    if actual != expected {
+        return Err(index_corrupted(
+            path,
+            format!("v2 {field} canonical bytes disagree with their SHA-256 fingerprint"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_bundle_component_fingerprints(
+    path: &Path,
+    bytes: &[u8],
+) -> SearchResult<[[u8; SHA256_BYTES]; 4]> {
+    let mut cursor = 0usize;
+    let domain = read_canonical_bytes(path, bytes, &mut cursor, "bundle.domain")?;
+    if domain != EMBEDDING_BUNDLE_CANONICAL_DOMAIN {
+        return Err(index_corrupted(
+            path,
+            "v2 identity bundle canonical domain is invalid",
+        ));
+    }
+    let mut fingerprints = [[0_u8; SHA256_BYTES]; 4];
+    for (index, field) in ["space", "producer", "input", "storage"]
+        .into_iter()
+        .enumerate()
+    {
+        let value = read_canonical_text(
+            path,
+            bytes,
+            &mut cursor,
+            &format!("bundle.{field}_fingerprint"),
+        )?;
+        fingerprints[index] = decode_sha256_fingerprint_from_index(path, field, value)?;
+    }
+    if cursor != bytes.len() {
+        return Err(index_corrupted(
+            path,
+            "v2 identity bundle canonical bytes contain a trailing suffix",
+        ));
+    }
+    Ok(fingerprints)
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_complete_space_identity(
+    path: &Path,
+    bytes: &[u8],
+    expected_dimension: u32,
+    expected_input_fingerprint: [u8; SHA256_BYTES],
+) -> SearchResult<(String, String, String)> {
+    let mut cursor = 0usize;
+    let domain = read_canonical_bytes(path, bytes, &mut cursor, "space.domain")?;
+    if domain != EMBEDDING_SPACE_CANONICAL_DOMAIN {
+        return Err(index_corrupted(
+            path,
+            "v2 embedding-space canonical domain is invalid",
+        ));
+    }
+    let schema = read_canonical_u16(path, bytes, &mut cursor, "space.schema")?;
+    if schema != EMBEDDING_SPACE_IDENTITY_SCHEMA_V1 {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 embedding-space schema {schema} is unsupported; expected {EMBEDDING_SPACE_IDENTITY_SCHEMA_V1}"
+            ),
+        ));
+    }
+    let model_id =
+        read_canonical_text(path, bytes, &mut cursor, "space.logical_model_id")?.to_owned();
+    let revision =
+        read_canonical_text(path, bytes, &mut cursor, "space.immutable_revision")?.to_owned();
+    let kind = match read_canonical_u8(path, bytes, &mut cursor, "space.kind")? {
+        1 => EmbeddingSpaceKindV1::Semantic,
+        2 => EmbeddingSpaceKindV1::HashControl,
+        found => {
+            return Err(index_corrupted(
+                path,
+                format!("v2 embedding-space kind tag {found} is invalid"),
+            ));
+        }
+    };
+    let artifact_manifest_fingerprint = read_canonical_text(
+        path,
+        bytes,
+        &mut cursor,
+        "space.artifact_manifest_fingerprint",
+    )?
+    .to_owned();
+    let artifact_count_u64 = read_canonical_u64(path, bytes, &mut cursor, "space.artifact_count")?;
+    let artifact_count = usize::try_from(artifact_count_u64)
+        .map_err(|_| index_corrupted(path, "v2 artifact count does not fit in usize"))?;
+    let minimum_artifact_bytes = 24usize;
+    let maximum_artifact_count = bytes
+        .len()
+        .saturating_sub(cursor)
+        .checked_div(minimum_artifact_bytes)
+        .unwrap_or(0);
+    if artifact_count > maximum_artifact_count {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 artifact count {artifact_count} cannot fit in the remaining canonical bytes"
+            ),
+        ));
+    }
+    let mut artifacts = Vec::new();
+    for index in 0..artifact_count {
+        artifacts.push(EmbeddingArtifactIdentityV1 {
+            role: read_canonical_text(
+                path,
+                bytes,
+                &mut cursor,
+                &format!("space.artifacts[{index}].role"),
+            )?
+            .to_owned(),
+            sha256: read_canonical_text(
+                path,
+                bytes,
+                &mut cursor,
+                &format!("space.artifacts[{index}].sha256"),
+            )?
+            .to_owned(),
+            size: read_canonical_u64(
+                path,
+                bytes,
+                &mut cursor,
+                &format!("space.artifacts[{index}].size"),
+            )?,
+        });
+    }
+
+    let tokenizer_fingerprint =
+        read_canonical_text(path, bytes, &mut cursor, "space.tokenizer_fingerprint")?.to_owned();
+    let vocabulary_fingerprint =
+        read_canonical_text(path, bytes, &mut cursor, "space.vocabulary_fingerprint")?.to_owned();
+    let model_config_fingerprint =
+        read_canonical_text(path, bytes, &mut cursor, "space.model_config_fingerprint")?.to_owned();
+    let model_preprocessing =
+        read_canonical_text(path, bytes, &mut cursor, "space.model_preprocessing")?.to_owned();
+    let sequence_policy =
+        read_canonical_text(path, bytes, &mut cursor, "space.sequence_policy")?.to_owned();
+    let query_instruction =
+        read_canonical_text(path, bytes, &mut cursor, "space.query_instruction")?.to_owned();
+    let document_instruction =
+        read_canonical_text(path, bytes, &mut cursor, "space.document_instruction")?.to_owned();
+    let pooling = read_canonical_text(path, bytes, &mut cursor, "space.pooling")?.to_owned();
+    let output_normalization =
+        read_canonical_text(path, bytes, &mut cursor, "space.output_normalization")?.to_owned();
+    let dimension = read_canonical_u32(path, bytes, &mut cursor, "space.dimension")?;
+    let input_contract_fingerprint =
+        read_canonical_text(path, bytes, &mut cursor, "space.input_contract_fingerprint")?
+            .to_owned();
+
+    let hash_control =
+        match read_canonical_u8(path, bytes, &mut cursor, "space.hash_control.option")? {
+            0 => None,
+            1 => Some(HashControlProfileV1 {
+                algorithm: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.algorithm",
+                )?
+                .to_owned(),
+                algorithm_revision: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.algorithm_revision",
+                )?
+                .to_owned(),
+                seed: read_canonical_u64(path, bytes, &mut cursor, "space.hash_control.seed")?,
+                feature_rules: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.feature_rules",
+                )?
+                .to_owned(),
+                tokenization_rules: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.tokenization_rules",
+                )?
+                .to_owned(),
+                signing_rules: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.signing_rules",
+                )?
+                .to_owned(),
+                normalization_rules: read_canonical_text(
+                    path,
+                    bytes,
+                    &mut cursor,
+                    "space.hash_control.normalization_rules",
+                )?
+                .to_owned(),
+            }),
+            found => {
+                return Err(index_corrupted(
+                    path,
+                    format!("v2 hash-control option tag {found} is invalid"),
+                ));
+            }
+        };
+    let projection = match read_canonical_u8(path, bytes, &mut cursor, "space.projection.option")? {
+        0 => None,
+        1 => Some(EmbeddingProjectionV1 {
+            parent_space_fingerprint: read_canonical_text(
+                path,
+                bytes,
+                &mut cursor,
+                "space.projection.parent_space_fingerprint",
+            )?
+            .to_owned(),
+            source_dimension: read_canonical_u32(
+                path,
+                bytes,
+                &mut cursor,
+                "space.projection.source_dimension",
+            )?,
+            output_dimension: read_canonical_u32(
+                path,
+                bytes,
+                &mut cursor,
+                "space.projection.output_dimension",
+            )?,
+            projection_rule: read_canonical_text(
+                path,
+                bytes,
+                &mut cursor,
+                "space.projection.projection_rule",
+            )?
+            .to_owned(),
+            renormalization_rule: read_canonical_text(
+                path,
+                bytes,
+                &mut cursor,
+                "space.projection.renormalization_rule",
+            )?
+            .to_owned(),
+        }),
+        found => {
+            return Err(index_corrupted(
+                path,
+                format!("v2 projection option tag {found} is invalid"),
+            ));
+        }
+    };
+    if cursor != bytes.len() {
+        return Err(index_corrupted(
+            path,
+            "v2 embedding-space canonical bytes contain a trailing suffix",
+        ));
+    }
+
+    let identity = EmbeddingSpaceIdentityV1 {
+        schema_version: schema,
+        logical_model_id: model_id,
+        immutable_revision: revision,
+        kind,
+        artifact_manifest_fingerprint,
+        artifacts,
+        tokenizer_fingerprint,
+        vocabulary_fingerprint,
+        model_config_fingerprint,
+        model_preprocessing,
+        sequence_policy,
+        query_instruction,
+        document_instruction,
+        pooling,
+        output_normalization,
+        dimension,
+        input_contract_fingerprint,
+        hash_control,
+        projection,
+    };
+    identity.validate().map_err(|error| {
+        index_corrupted(
+            path,
+            format!("v2 embedding-space identity is incomplete or invalid: {error}"),
+        )
+    })?;
+    if identity.dimension != expected_dimension {
+        return Err(index_corrupted(
+            path,
+            "v2 embedding-space dimension disagrees with the fixed header",
+        ));
+    }
+    let persisted_input_fingerprint = decode_sha256_fingerprint_from_index(
+        path,
+        "space.input_contract",
+        &identity.input_contract_fingerprint,
+    )?;
+    if persisted_input_fingerprint != expected_input_fingerprint {
+        return Err(index_corrupted(
+            path,
+            "v2 embedding-space input contract disagrees with the complete identity bundle",
+        ));
+    }
+    if identity.canonical_bytes() != bytes {
+        return Err(index_corrupted(
+            path,
+            "v2 embedding-space bytes are not the exact canonical encoding",
+        ));
+    }
+    let model_id = identity.logical_model_id;
+    let revision = identity.immutable_revision;
+    let output_normalization = identity.output_normalization;
+    Ok((model_id, revision, output_normalization))
+}
+
+fn validate_storage_identity_bytes(
+    path: &Path,
+    bytes: &[u8],
+    expected_dimension: u32,
+    expected_quantization: Quantization,
+) -> SearchResult<String> {
+    let mut cursor = 0usize;
+    let domain = read_canonical_bytes(path, bytes, &mut cursor, "storage.domain")?;
+    if domain != VECTOR_STORAGE_CANONICAL_DOMAIN {
+        return Err(index_corrupted(
+            path,
+            "v2 vector-storage canonical domain is invalid",
+        ));
+    }
+    let schema = read_canonical_u16(path, bytes, &mut cursor, "storage.schema")?;
+    if schema != VECTOR_STORAGE_IDENTITY_SCHEMA_V1 {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 vector-storage schema {schema} is unsupported; expected {VECTOR_STORAGE_IDENTITY_SCHEMA_V1}"
+            ),
+        ));
+    }
+    let format = read_canonical_text(path, bytes, &mut cursor, "storage.format")?;
+    if format != "fsvi-v2" {
+        return Err(index_corrupted(
+            path,
+            "v2 storage identity must name exactly fsvi-v2",
+        ));
+    }
+    let quantization = read_canonical_u8(path, bytes, &mut cursor, "storage.quantization")?;
+    let (expected_quantization_wire, quantization_format) = match expected_quantization {
+        Quantization::F32 => (1, QuantizationFormat::F32),
+        Quantization::F16 => (2, QuantizationFormat::F16),
+    };
+    if quantization != expected_quantization_wire {
+        return Err(index_corrupted(
+            path,
+            "v2 storage identity quantization disagrees with the fixed header",
+        ));
+    }
+    let endianness = read_canonical_text(path, bytes, &mut cursor, "storage.endianness")?;
+    if endianness != "little-endian" {
+        return Err(index_corrupted(
+            path,
+            "v2 storage identity must be canonical little-endian",
+        ));
+    }
+    let normalization =
+        read_canonical_text(path, bytes, &mut cursor, "storage.vector_normalization")?;
+    let normalization = normalization.to_owned();
+    let dimension = read_canonical_u32(path, bytes, &mut cursor, "storage.dimension")?;
+    if dimension != expected_dimension {
+        return Err(index_corrupted(
+            path,
+            "v2 storage identity dimension disagrees with the fixed header",
+        ));
+    }
+    if cursor != bytes.len() {
+        return Err(index_corrupted(
+            path,
+            "v2 storage identity canonical bytes contain a trailing suffix",
+        ));
+    }
+    let identity = VectorStorageIdentityV1 {
+        schema_version: schema,
+        format: format.to_owned(),
+        quantization: quantization_format,
+        endianness: endianness.to_owned(),
+        vector_normalization: normalization,
+        dimension,
+    };
+    identity.validate().map_err(|error| {
+        index_corrupted(
+            path,
+            format!("v2 vector-storage identity is incomplete or invalid: {error}"),
+        )
+    })?;
+    if identity.canonical_bytes() != bytes {
+        return Err(index_corrupted(
+            path,
+            "v2 vector-storage bytes are not the exact canonical encoding",
+        ));
+    }
+    Ok(identity.vector_normalization)
+}
+
+fn read_canonical_bytes<'a>(
+    path: &Path,
+    data: &'a [u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<&'a [u8]> {
+    let len_u64 = u64::from_be_bytes(read_array::<8>(
+        path,
+        data,
+        cursor,
+        &format!("{field}.len"),
+    )?);
+    let len = usize::try_from(len_u64)
+        .map_err(|_| index_corrupted(path, format!("{field} length does not fit in usize")))?;
+    read_slice(path, data, cursor, len, field)
+}
+
+fn read_canonical_text<'a>(
+    path: &Path,
+    data: &'a [u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<&'a str> {
+    let bytes = read_canonical_bytes(path, data, cursor, field)?;
+    std::str::from_utf8(bytes)
+        .map_err(|error| index_corrupted(path, format!("{field} is not UTF-8: {error}")))
+}
+
+fn read_canonical_u8(
+    path: &Path,
+    data: &[u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<u8> {
+    Ok(read_array::<1>(path, data, cursor, field)?[0])
+}
+
+fn read_canonical_u16(
+    path: &Path,
+    data: &[u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<u16> {
+    Ok(u16::from_be_bytes(read_array::<2>(
+        path, data, cursor, field,
+    )?))
+}
+
+fn read_canonical_u32(
+    path: &Path,
+    data: &[u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<u32> {
+    Ok(u32::from_be_bytes(read_array::<4>(
+        path, data, cursor, field,
+    )?))
+}
+
+fn read_canonical_u64(
+    path: &Path,
+    data: &[u8],
+    cursor: &mut usize,
+    field: &str,
+) -> SearchResult<u64> {
+    Ok(u64::from_be_bytes(read_array::<8>(
+        path, data, cursor, field,
+    )?))
+}
+
+fn validate_expected_v2_binding(
+    path: &Path,
+    metadata: &VectorMetadata,
+    expected: &FsviV2IdentityBinding,
+) -> Result<(), FsviAdmissionError> {
+    let Some(actual) = metadata.identity_v2.as_ref() else {
+        return Err(index_corrupted(path, "v2 metadata omitted identity bindings").into());
+    };
+    if actual.generation != expected.generation
+        || actual.generation_fingerprint != expected.generation_fingerprint
+    {
+        return Err(FsviAdmissionError::ReindexRequired(
+            FsviReindexRequired {
+                reason: FsviReindexReason::GenerationMismatch,
+                found_version: FSVI_V2_VERSION,
+                detail: "persisted full-width artifact generation differs from the caller-owned generation; rebuild or select the exact published generation"
+                    .to_owned(),
+            },
+        ));
+    }
+    let persisted_storage_bytes = &actual.storage_identity_canonical_bytes;
+    let expected_storage_bytes = &expected.storage_canonical_bytes;
+    let storage_mismatch = metadata.dimension != expected.dimension
+        || metadata.quantization != expected.quantization
+        || persisted_storage_bytes != expected_storage_bytes
+        || actual.storage_fingerprint != expected.storage_fingerprint;
+    if storage_mismatch {
+        return Err(FsviAdmissionError::ReindexRequired(
+            FsviReindexRequired {
+                reason: FsviReindexReason::StorageMismatch,
+                found_version: FSVI_V2_VERSION,
+                detail: "persisted storage, dimension, or quantization differs from the caller-owned storage identity; source reindex is required"
+                    .to_owned(),
+            },
+        ));
+    }
+    if actual.identity_bundle_canonical_bytes != expected.frozen_identity.canonical_bytes
+        || actual.space_identity_canonical_bytes != expected.space_canonical_bytes
+        || actual.identity_bundle_fingerprint != expected.bundle_fingerprint
+        || actual.space_fingerprint != expected.space_fingerprint
+        || actual.producer_fingerprint != expected.producer_fingerprint
+        || actual.input_fingerprint != expected.input_fingerprint
+    {
+        return Err(FsviAdmissionError::ReindexRequired(
+            FsviReindexRequired {
+                reason: FsviReindexReason::IdentityMismatch,
+                found_version: FSVI_V2_VERSION,
+                detail: "persisted canonical embedding identity differs from the caller-owned identity; same names or dimensions must never be adopted or relabeled"
+                    .to_owned(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn read_exact_v2_file(
+    path: &Path,
+    file: &mut File,
+    destination: &mut [u8],
+    field: &str,
+) -> SearchResult<()> {
+    file.read_exact(destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            index_corrupted(path, format!("{field} is truncated"))
+        } else {
+            SearchError::Io(error)
+        }
+    })
+}
+
+fn validate_v2_layout_len(
+    path: &Path,
+    metadata: &VectorMetadata,
+    header_len: usize,
+    actual_len: usize,
+) -> SearchResult<(usize, usize, usize)> {
+    let records_bytes = metadata
+        .record_count
+        .checked_mul(RECORD_SIZE_BYTES)
+        .ok_or_else(|| index_corrupted(path, "record table size overflow"))?;
+    let records_offset = header_len;
+    let strings_offset = records_offset
+        .checked_add(records_bytes)
+        .ok_or_else(|| index_corrupted(path, "record table offset overflow"))?;
+    let vectors_offset = usize::try_from(metadata.vectors_offset)
+        .map_err(|_| index_corrupted(path, "vectors_offset does not fit in usize"))?;
+    if metadata.vectors_offset % VECTOR_ALIGN_BYTES != 0 {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 vectors_offset must be {VECTOR_ALIGN_BYTES}-byte aligned, found {}",
+                metadata.vectors_offset
+            ),
+        ));
+    }
+    if vectors_offset < strings_offset {
+        return Err(index_corrupted(
+            path,
+            "vectors_offset points inside the record table/string table region",
+        ));
+    }
+    let vector_bytes = metadata
+        .record_count
+        .checked_mul(metadata.dimension)
+        .and_then(|count| count.checked_mul(metadata.quantization.bytes_per_element()))
+        .ok_or_else(|| index_corrupted(path, "vector slab size overflow"))?;
+    let required_len = vectors_offset
+        .checked_add(vector_bytes)
+        .ok_or_else(|| index_corrupted(path, "vector slab end overflow"))?;
+    if actual_len != required_len {
+        return Err(index_corrupted(
+            path,
+            format!(
+                "v2 file length must exactly match the bound layout: found {actual_len}, expected {required_len}"
+            ),
+        ));
+    }
+    Ok((records_offset, strings_offset, vectors_offset))
+}
+
+fn validate_v2_records_and_content(
+    path: &Path,
+    data: &[u8],
+    metadata: &VectorMetadata,
+    records_offset: usize,
+    strings_offset: usize,
+    vectors_offset: usize,
+) -> SearchResult<()> {
+    let identity = metadata
+        .identity_v2
+        .as_ref()
+        .ok_or_else(|| index_corrupted(path, "v2 metadata omitted identity bindings"))?;
+    let mut docset_hasher = Sha256::new();
+    update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+    docset_hasher.update(
+        u64::try_from(metadata.record_count)
+            .map_err(|_| index_corrupted(path, "record_count does not fit in u64"))?
+            .to_be_bytes(),
+    );
+    let mut expected_string_offset = 0usize;
+    let mut previous: Option<(u64, &str)> = None;
+    for index in 0..metadata.record_count {
+        let offset =
+            records_offset
+                .checked_add(index.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
+                    index_corrupted(path, "record offset multiplication overflow")
+                })?)
+                .ok_or_else(|| index_corrupted(path, "record offset overflow"))?;
+        let end = offset
+            .checked_add(RECORD_SIZE_BYTES)
+            .ok_or_else(|| index_corrupted(path, "record end overflow"))?;
+        if end > strings_offset || end > data.len() {
+            return Err(index_corrupted(
+                path,
+                "v2 record table extends beyond its bound region",
+            ));
+        }
+        let record = &data[offset..end];
+        let doc_id_hash = u64::from_le_bytes(
+            record[..8]
+                .try_into()
+                .map_err(|_| index_corrupted(path, "v2 record hash is truncated"))?,
+        );
+        let doc_id_offset = usize::try_from(u32::from_le_bytes(
+            record[8..12]
+                .try_into()
+                .map_err(|_| index_corrupted(path, "v2 doc_id_offset is truncated"))?,
+        ))
+        .map_err(|_| index_corrupted(path, "v2 doc_id_offset does not fit in usize"))?;
+        let doc_id_len = usize::from(u16::from_le_bytes(
+            record[12..14]
+                .try_into()
+                .map_err(|_| index_corrupted(path, "v2 doc_id_len is truncated"))?,
+        ));
+        let flags = u16::from_le_bytes(
+            record[14..16]
+                .try_into()
+                .map_err(|_| index_corrupted(path, "v2 record flags are truncated"))?,
+        );
+        if flags != 0 {
+            return Err(index_corrupted(
+                path,
+                "admitted FSVI v2 must be compact with zero record flags",
+            ));
+        }
+        if doc_id_offset != expected_string_offset {
+            return Err(index_corrupted(
+                path,
+                "v2 document strings must be contiguous in record order",
+            ));
+        }
+        if doc_id_len == 0 {
+            return Err(index_corrupted(path, "v2 document ids must not be empty"));
+        }
+        let doc_start = strings_offset
+            .checked_add(doc_id_offset)
+            .ok_or_else(|| index_corrupted(path, "v2 document id start overflow"))?;
+        let doc_end = doc_start
+            .checked_add(doc_id_len)
+            .ok_or_else(|| index_corrupted(path, "v2 document id end overflow"))?;
+        if doc_end > vectors_offset || doc_end > data.len() {
+            return Err(index_corrupted(
+                path,
+                "v2 document id extends beyond the bound string table",
+            ));
+        }
+        let doc_id = std::str::from_utf8(&data[doc_start..doc_end]).map_err(|error| {
+            index_corrupted(
+                path,
+                format!("v2 document id at record {index} is not UTF-8: {error}"),
+            )
+        })?;
+        if fnv1a_hash(doc_id.as_bytes()) != doc_id_hash {
+            return Err(index_corrupted(
+                path,
+                format!("v2 document hash mismatch at record {index}"),
+            ));
+        }
+        if previous.is_some_and(|prior| prior >= (doc_id_hash, doc_id)) {
+            return Err(index_corrupted(
+                path,
+                "v2 records must be strictly sorted with unique document ids",
+            ));
+        }
+        previous = Some((doc_id_hash, doc_id));
+        expected_string_offset = expected_string_offset
+            .checked_add(doc_id_len)
+            .ok_or_else(|| index_corrupted(path, "v2 string table length overflow"))?;
+        docset_hasher.update(
+            u64::try_from(doc_id_len)
+                .map_err(|_| index_corrupted(path, "v2 doc_id length does not fit in u64"))?
+                .to_be_bytes(),
+        );
+        docset_hasher.update(doc_id.as_bytes());
+    }
+    let string_end = strings_offset
+        .checked_add(expected_string_offset)
+        .ok_or_else(|| index_corrupted(path, "v2 string table end overflow"))?;
+    if string_end > vectors_offset {
+        return Err(index_corrupted(
+            path,
+            "v2 string table overlaps the vector slab",
+        ));
+    }
+    if data[string_end..vectors_offset]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(index_corrupted(
+            path,
+            "v2 alignment padding must be all zero",
+        ));
+    }
+    let observed_docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+    if observed_docset_digest != identity.ordered_live_docset_digest {
+        return Err(index_corrupted(
+            path,
+            "v2 ordered live-docset digest mismatch",
+        ));
+    }
+    let observed_vector_digest = vector_content_digest_from_bytes(
+        metadata.record_count,
+        metadata.dimension,
+        metadata.quantization,
+        &data[vectors_offset..],
+    )?;
+    if observed_vector_digest != identity.vector_content_digest {
+        return Err(index_corrupted(path, "v2 vector-content digest mismatch"));
+    }
+    Ok(())
+}
+
+fn fsvi_v2_header_len(binding: &FsviV2IdentityBinding) -> SearchResult<usize> {
+    FSVI_V2_FIXED_PREFIX_BYTES
+        .checked_add(binding.frozen_identity.canonical_bytes.len())
+        .and_then(|length| length.checked_add(binding.space_canonical_bytes.len()))
+        .and_then(|length| length.checked_add(binding.storage_canonical_bytes.len()))
+        .and_then(|length| length.checked_add(4))
+        .filter(|length| *length <= FSVI_V2_MAX_HEADER_BYTES)
+        .ok_or_else(|| {
+            fsvi_v2_config_error(
+                "header_size",
+                "canonical identity payloads overflow the bounded v2 header",
+            )
+        })
+}
+
+fn build_v2_header(
+    binding: &FsviV2IdentityBinding,
+    record_count: usize,
+    vectors_offset: u64,
+    ordered_docset_digest: [u8; SHA256_BYTES],
+    vector_content_digest: [u8; SHA256_BYTES],
+) -> SearchResult<Vec<u8>> {
+    let header_len = fsvi_v2_header_len(binding)?;
+    let header_size_u32 = u32::try_from(header_len)
+        .map_err(|_| fsvi_v2_config_error("header_size", "must fit in the v2 u32 header field"))?;
+    let dimension_u32 = u32::try_from(binding.dimension)
+        .map_err(|_| fsvi_v2_config_error("dimension", "must fit in u32"))?;
+    let record_count_u64 = u64::try_from(record_count)
+        .map_err(|_| fsvi_v2_config_error("record_count", "must fit in u64"))?;
+    let bundle_len = u32::try_from(binding.frozen_identity.canonical_bytes.len())
+        .map_err(|_| fsvi_v2_config_error("identity_bundle_len", "must fit in u32"))?;
+    let space_len = u32::try_from(binding.space_canonical_bytes.len())
+        .map_err(|_| fsvi_v2_config_error("space_identity_len", "must fit in u32"))?;
+    let storage_len = u32::try_from(binding.storage_canonical_bytes.len())
+        .map_err(|_| fsvi_v2_config_error("storage_identity_len", "must fit in u32"))?;
+
+    let mut header = Vec::with_capacity(header_len);
+    header.extend_from_slice(&FSVI_MAGIC);
+    header.extend_from_slice(&FSVI_V2_VERSION.to_le_bytes());
+    header.extend_from_slice(&header_size_u32.to_le_bytes());
+    header.extend_from_slice(&FSVI_V2_IDENTITY_BINDING_SCHEMA.to_le_bytes());
+    header.push(binding.quantization as u8);
+    header.push(0);
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header.extend_from_slice(&dimension_u32.to_le_bytes());
+    header.extend_from_slice(&record_count_u64.to_le_bytes());
+    header.extend_from_slice(&vectors_offset.to_le_bytes());
+    header.extend_from_slice(&binding.generation.schema_version.to_le_bytes());
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header.extend_from_slice(&binding.generation.sequence.to_le_bytes());
+    header.extend_from_slice(&binding.generation.nonce);
+    header.extend_from_slice(&bundle_len.to_le_bytes());
+    header.extend_from_slice(&space_len.to_le_bytes());
+    header.extend_from_slice(&storage_len.to_le_bytes());
+    header.extend_from_slice(&binding.bundle_fingerprint);
+    header.extend_from_slice(&binding.space_fingerprint);
+    header.extend_from_slice(&binding.producer_fingerprint);
+    header.extend_from_slice(&binding.input_fingerprint);
+    header.extend_from_slice(&binding.storage_fingerprint);
+    header.extend_from_slice(&binding.generation_fingerprint);
+    header.extend_from_slice(&ordered_docset_digest);
+    header.extend_from_slice(&vector_content_digest);
+    header.extend_from_slice(&binding.frozen_identity.canonical_bytes);
+    header.extend_from_slice(&binding.space_canonical_bytes);
+    header.extend_from_slice(&binding.storage_canonical_bytes);
+    let crc = crc32(&header);
+    header.extend_from_slice(&crc.to_le_bytes());
+    if header.len() != header_len {
+        return Err(fsvi_v2_config_error(
+            "header_size",
+            "encoded bytes disagree with the precomputed v2 header size",
+        ));
+    }
+    Ok(header)
 }
 
 fn read_array<const N: usize>(
@@ -2270,6 +4200,196 @@ fn validate_header_string(value: &str, field: &str) -> SearchResult<()> {
         reason: "value length must fit in u16".to_owned(),
     })?;
     Ok(())
+}
+
+fn quantization_from_identity(quantization: QuantizationFormat) -> SearchResult<Quantization> {
+    match quantization {
+        QuantizationFormat::F32 => Ok(Quantization::F32),
+        QuantizationFormat::F16 => Ok(Quantization::F16),
+        QuantizationFormat::Int8 | QuantizationFormat::Int4 => Err(fsvi_v2_config_error(
+            "storage.quantization",
+            "FSVI v2 vector slabs currently support only F32 or F16",
+        )),
+    }
+}
+
+fn fsvi_v2_config_error(field: &str, reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("fsvi_v2.{field}"),
+        value: "redacted".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; SHA256_BYTES] {
+    Sha256::digest(bytes).into()
+}
+
+fn fingerprint_hex(fingerprint: &[u8; SHA256_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(SHA256_BYTES * 2);
+    for byte in fingerprint {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_sha256_fingerprint(field: &str, value: &str) -> SearchResult<[u8; SHA256_BYTES]> {
+    if value.len() != SHA256_BYTES * 2 {
+        return Err(fsvi_v2_config_error(
+            field,
+            "must be a lowercase 64-character SHA-256 fingerprint",
+        ));
+    }
+    let mut decoded = [0_u8; SHA256_BYTES];
+    for (output, pair) in decoded.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        let high = decode_lower_hex_nibble(pair[0]).ok_or_else(|| {
+            fsvi_v2_config_error(
+                field,
+                "must be a lowercase 64-character SHA-256 fingerprint",
+            )
+        })?;
+        let low = decode_lower_hex_nibble(pair[1]).ok_or_else(|| {
+            fsvi_v2_config_error(
+                field,
+                "must be a lowercase 64-character SHA-256 fingerprint",
+            )
+        })?;
+        *output = (high << 4) | low;
+    }
+    Ok(decoded)
+}
+
+fn decode_sha256_fingerprint_from_index(
+    path: &Path,
+    field: &str,
+    value: &str,
+) -> SearchResult<[u8; SHA256_BYTES]> {
+    decode_sha256_fingerprint(field, value).map_err(|_| {
+        index_corrupted(
+            path,
+            format!("v2 {field} fingerprint is not lowercase SHA-256"),
+        )
+    })
+}
+
+const fn decode_lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn update_digest_domain(hasher: &mut Sha256, domain: &[u8]) {
+    hasher.update(
+        u64::try_from(domain.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(domain);
+}
+
+fn ordered_docset_digest(records: &[PendingRecord]) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    update_digest_domain(&mut hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+    hasher.update(
+        u64::try_from(records.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for record in records {
+        hasher.update(
+            u64::try_from(record.doc_id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(record.doc_id.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn vector_content_hasher(
+    record_count: usize,
+    dimension: usize,
+    quantization: Quantization,
+) -> SearchResult<Sha256> {
+    let mut hasher = Sha256::new();
+    update_digest_domain(&mut hasher, VECTOR_CONTENT_DIGEST_DOMAIN);
+    hasher.update(
+        u64::try_from(record_count)
+            .map_err(|_| fsvi_v2_config_error("record_count", "must fit in u64"))?
+            .to_be_bytes(),
+    );
+    hasher.update(
+        u64::try_from(dimension)
+            .map_err(|_| fsvi_v2_config_error("dimension", "must fit in u64"))?
+            .to_be_bytes(),
+    );
+    hasher.update([quantization as u8]);
+    Ok(hasher)
+}
+
+fn write_vector_slab_v2<W: Write>(
+    writer: &mut W,
+    records: &[PendingRecord],
+    dimension: usize,
+    quantization: Quantization,
+) -> SearchResult<[u8; SHA256_BYTES]> {
+    let mut hasher = vector_content_hasher(records.len(), dimension, quantization)?;
+    let element_bytes = quantization.bytes_per_element();
+    let record_bytes = dimension
+        .checked_mul(element_bytes)
+        .ok_or_else(|| fsvi_v2_config_error("vector_slab", "record byte length overflow"))?;
+    let mut encoded = Vec::with_capacity(record_bytes);
+    match quantization {
+        Quantization::F16 => {
+            let mut scratch = Vec::<f16>::with_capacity(dimension);
+            for record in records {
+                scratch.clear();
+                crate::simd::encode_f32_to_f16_extend(&record.embedding, &mut scratch);
+                encoded.clear();
+                for value in &scratch {
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                hasher.update(&encoded);
+                writer.write_all(&encoded)?;
+            }
+        }
+        Quantization::F32 => {
+            for record in records {
+                encoded.clear();
+                for value in &record.embedding {
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                hasher.update(&encoded);
+                writer.write_all(&encoded)?;
+            }
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn vector_content_digest_from_bytes(
+    record_count: usize,
+    dimension: usize,
+    quantization: Quantization,
+    vector_bytes: &[u8],
+) -> SearchResult<[u8; SHA256_BYTES]> {
+    let expected_len = record_count
+        .checked_mul(dimension)
+        .and_then(|count| count.checked_mul(quantization.bytes_per_element()))
+        .ok_or_else(|| fsvi_v2_config_error("vector_slab", "byte length overflow"))?;
+    if vector_bytes.len() != expected_len {
+        return Err(fsvi_v2_config_error(
+            "vector_slab",
+            "bytes disagree with the declared shape",
+        ));
+    }
+    let mut hasher = vector_content_hasher(record_count, dimension, quantization)?;
+    hasher.update(vector_bytes);
+    Ok(hasher.finalize().into())
 }
 
 fn write_vector_slab<W: Write>(
@@ -2430,6 +4550,599 @@ mod tests {
 
     fn sample_vector(base: f32, dim: usize) -> Vec<f32> {
         vec![base; dim]
+    }
+
+    fn fsvi_v2_binding(
+        model_id: &str,
+        dimension: u32,
+        quantization: Quantization,
+        sequence: u64,
+        nonce_byte: u8,
+    ) -> FsviV2IdentityBinding {
+        let mut identity =
+            frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                model_id, dimension,
+            );
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = match quantization {
+            Quantization::F32 => QuantizationFormat::F32,
+            Quantization::F16 => QuantizationFormat::F16,
+        };
+        identity.storage.endianness = "little-endian".to_owned();
+        let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce_byte; 16])
+            .expect("valid test generation");
+        FsviV2IdentityBinding::new(
+            generation,
+            identity.freeze().expect("valid frozen test identity"),
+        )
+        .expect("valid FSVI v2 binding")
+    }
+
+    fn semantic_fsvi_v2_binding(
+        model_id: &str,
+        dimension: u32,
+        sequence: u64,
+        nonce_byte: u8,
+    ) -> FsviV2IdentityBinding {
+        let mut identity =
+            frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                model_id, dimension,
+            );
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "1".repeat(64);
+        identity.space.artifacts = vec![
+            EmbeddingArtifactIdentityV1 {
+                role: "weights".to_owned(),
+                sha256: "2".repeat(64),
+                size: 20,
+            },
+            EmbeddingArtifactIdentityV1 {
+                role: "tokenizer".to_owned(),
+                sha256: "3".repeat(64),
+                size: 10,
+            },
+        ];
+        identity.space.tokenizer_fingerprint = "3".repeat(64);
+        identity.space.vocabulary_fingerprint = "4".repeat(64);
+        identity.space.model_config_fingerprint = "5".repeat(64);
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".to_owned();
+        let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce_byte; 16])
+            .expect("valid semantic test generation");
+        FsviV2IdentityBinding::new(
+            generation,
+            identity.freeze().expect("valid semantic test identity"),
+        )
+        .expect("valid semantic FSVI v2 binding")
+    }
+
+    fn refresh_v2_header_crc(bytes: &mut [u8]) {
+        let header_size = usize::try_from(u32::from_le_bytes(
+            bytes[6..10].try_into().expect("header-size field"),
+        ))
+        .expect("header size fits usize");
+        let crc_offset = header_size.checked_sub(4).expect("CRC offset");
+        let crc = crc32(&bytes[..crc_offset]);
+        bytes[crc_offset..header_size].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn assert_inspection_corrupted(path: &Path) {
+        assert!(
+            matches!(
+                VectorIndex::inspect(path),
+                Err(SearchError::IndexCorrupted { .. })
+            ),
+            "expected typed inspection to reject corrupted bytes at {}",
+            path.display()
+        );
+    }
+
+    fn assert_admission_corrupted(path: &Path, binding: &FsviV2IdentityBinding) {
+        assert!(
+            matches!(
+                VectorIndex::open_admitted_v2(path, binding),
+                Err(FsviAdmissionError::Index(
+                    SearchError::IndexCorrupted { .. }
+                ))
+            ),
+            "expected admitted open to reject corrupted bytes at {}",
+            path.display()
+        );
+    }
+
+    fn write_v2_fixture(
+        name: &str,
+        binding: FsviV2IdentityBinding,
+    ) -> (PathBuf, FsviV2IdentityBinding) {
+        let path = temp_index_path(name);
+        let expected = binding.clone();
+        let mut writer = VectorIndex::create_v2(&path, binding).expect("create v2 writer");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write beta");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write alpha");
+        writer.finish().expect("finish v2 fixture");
+        (path, expected)
+    }
+
+    #[test]
+    fn fsvi_v2_round_trip_inspects_and_admits_exact_identity() {
+        let binding = fsvi_v2_binding("v2-round-trip", 4, Quantization::F16, u64::MAX, 0xa5);
+        let (path, expected) = write_v2_fixture("v2-round-trip", binding);
+
+        let inspected = VectorIndex::inspect(&path).expect("inspect v2");
+        assert!(matches!(&inspected, FsviInspection::V2IdentityComplete(_)));
+        let FsviInspection::V2IdentityComplete(metadata) = inspected else {
+            return;
+        };
+        assert_eq!(metadata.fsvi_version, FSVI_V2_VERSION);
+        assert_eq!(metadata.dimension, 4);
+        assert_eq!(metadata.quantization, Quantization::F16);
+        assert_eq!(metadata.record_count, 2);
+        assert_eq!(
+            metadata
+                .identity_v2
+                .as_ref()
+                .expect("v2 identity metadata")
+                .generation,
+            expected.generation()
+        );
+        assert_eq!(expected.generation().sequence, u64::MAX);
+        assert_eq!(metadata.vectors_offset % VECTOR_ALIGN_BYTES, 0);
+
+        let mut index =
+            VectorIndex::open_admitted_v2(&path, &expected).expect("exact admission succeeds");
+        assert!(index.is_identity_admitted_v2());
+        assert_eq!(index.record_count(), 2);
+        assert_eq!(index.embedder_id(), "v2-round-trip");
+        assert_eq!(index.embedder_revision(), "explicit-test-v1");
+        let identity = index.identity_v2().expect("admitted identity");
+        assert_ne!(identity.identity_bundle_fingerprint, [0; SHA256_BYTES]);
+        assert_ne!(identity.ordered_live_docset_digest, [0; SHA256_BYTES]);
+        assert_ne!(identity.vector_content_digest, [0; SHA256_BYTES]);
+
+        let alpha = index
+            .find_index_by_doc_hash(fnv1a_hash(b"doc-alpha"))
+            .expect("find alpha");
+        assert_eq!(index.doc_id_at(alpha).expect("alpha id"), "doc-alpha");
+        let vector = index.vector_at_f32(alpha).expect("alpha vector");
+        assert!((vector[0] - 1.0).abs() < 0.002);
+
+        let mutation = index.append("forbidden", &[0.0, 0.0, 1.0, 0.0]);
+        assert!(matches!(
+            mutation,
+            Err(SearchError::InvalidConfig { field, .. }) if field == "fsvi_v2.mutation"
+        ));
+        assert!(!wal::wal_path_for(&path).exists());
+    }
+
+    #[test]
+    fn fsvi_v2_empty_artifact_is_identity_bound_and_admissible() {
+        let path = temp_index_path("v2-empty");
+        let binding = fsvi_v2_binding("v2-empty", 4, Quantization::F32, 0, 0x11);
+        VectorIndex::create_v2(&path, binding.clone())
+            .expect("create empty v2")
+            .finish()
+            .expect("finish empty v2");
+
+        let index =
+            VectorIndex::open_admitted_v2(&path, &binding).expect("admit empty v2 artifact");
+        assert_eq!(index.record_count(), 0);
+        let identity = index.identity_v2().expect("empty identity metadata");
+        assert_ne!(identity.ordered_live_docset_digest, [0; SHA256_BYTES]);
+        assert_ne!(identity.vector_content_digest, [0; SHA256_BYTES]);
+        assert_eq!(
+            usize::try_from(index.metadata().vectors_offset).expect("offset fits"),
+            usize::try_from(fs::metadata(&path).expect("empty artifact metadata").len())
+                .expect("file length fits")
+        );
+    }
+
+    #[test]
+    fn fsvi_v2_inspection_distinguishes_reindex_upgrade_and_corruption() {
+        let legacy_path = temp_index_path("v2-inspect-legacy");
+        VectorIndex::create(&legacy_path, "legacy-display-name", 4)
+            .expect("legacy writer")
+            .finish()
+            .expect("legacy finish");
+        assert!(matches!(
+            VectorIndex::inspect(&legacy_path),
+            Ok(FsviInspection::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::LegacyUnidentified,
+                found_version: FSVI_VERSION,
+                ..
+            }))
+        ));
+        let expected = fsvi_v2_binding("v2-inspect", 4, Quantization::F16, 1, 0x22);
+        assert!(matches!(
+            VectorIndex::open_admitted_v2(&legacy_path, &expected),
+            Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::LegacyUnidentified,
+                ..
+            }))
+        ));
+
+        let future_path = temp_index_path("v2-inspect-future");
+        let mut future = Vec::from(FSVI_MAGIC);
+        future.extend_from_slice(&(FSVI_V2_VERSION + 1).to_le_bytes());
+        fs::write(&future_path, future).expect("write future prefix");
+        assert!(matches!(
+            VectorIndex::inspect(&future_path),
+            Ok(FsviInspection::UpgradeRequired(FsviUpgradeRequired {
+                found_version,
+                supported_version: FSVI_V2_VERSION,
+            })) if found_version == FSVI_V2_VERSION + 1
+        ));
+        assert!(matches!(
+            VectorIndex::open_admitted_v2(&future_path, &expected),
+            Err(FsviAdmissionError::UpgradeRequired(FsviUpgradeRequired {
+                found_version,
+                ..
+            })) if found_version == FSVI_V2_VERSION + 1
+        ));
+
+        let corrupt_path = temp_index_path("v2-inspect-corrupt");
+        fs::write(&corrupt_path, b"FSV").expect("write truncated prefix");
+        assert_inspection_corrupted(&corrupt_path);
+    }
+
+    #[test]
+    fn fsvi_v2_admission_requires_exact_generation_storage_and_identity() {
+        let binding = fsvi_v2_binding("v2-exact", 4, Quantization::F16, 7, 0x33);
+        let (path, expected) = write_v2_fixture("v2-exact", binding);
+
+        let wrong_generation = fsvi_v2_binding("v2-exact", 4, Quantization::F16, 8, 0x34);
+        assert!(matches!(
+            VectorIndex::open_admitted_v2(&path, &wrong_generation),
+            Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::GenerationMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_storage = fsvi_v2_binding("v2-exact", 4, Quantization::F32, 7, 0x33);
+        assert!(matches!(
+            VectorIndex::open_admitted_v2(&path, &wrong_storage),
+            Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::StorageMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_identity = fsvi_v2_binding(
+            "same-dimension-different-space",
+            4,
+            Quantization::F16,
+            7,
+            0x33,
+        );
+        assert!(matches!(
+            VectorIndex::open_admitted_v2(&path, &wrong_identity),
+            Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
+                reason: FsviReindexReason::IdentityMismatch,
+                ..
+            }))
+        ));
+
+        VectorIndex::open_admitted_v2(&path, &expected).expect("control admission");
+    }
+
+    #[test]
+    fn fsvi_v2_header_mutation_matrix_fails_closed() {
+        let binding = fsvi_v2_binding("v2-header-matrix", 4, Quantization::F16, 9, 0x44);
+        let (source_path, _) = write_v2_fixture("v2-header-matrix-source", binding);
+        let source = fs::read(&source_path).expect("read source v2");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        assert!(header_size > FSVI_V2_FIXED_PREFIX_BYTES + 4);
+
+        let fixed_mutations = [
+            ("binding-schema", 10usize),
+            ("quantization", 12),
+            ("header-flags", 13),
+            ("dimension", 16),
+            ("generation-schema", 36),
+            ("generation-reserved", 38),
+            ("generation-sequence", 40),
+            ("generation-nonce", 48),
+            ("bundle-fingerprint", FSVI_V2_BUNDLE_FINGERPRINT_OFFSET),
+            ("space-fingerprint", FSVI_V2_SPACE_FINGERPRINT_OFFSET),
+            ("producer-fingerprint", FSVI_V2_PRODUCER_FINGERPRINT_OFFSET),
+            ("input-fingerprint", FSVI_V2_INPUT_FINGERPRINT_OFFSET),
+            ("storage-fingerprint", FSVI_V2_STORAGE_FINGERPRINT_OFFSET),
+            (
+                "generation-fingerprint",
+                FSVI_V2_GENERATION_FINGERPRINT_OFFSET,
+            ),
+        ];
+        for (name, offset) in fixed_mutations {
+            let path = temp_index_path(&format!("v2-header-{name}"));
+            let mut mutated = source.clone();
+            mutated[offset] ^= 0x01;
+            refresh_v2_header_crc(&mut mutated);
+            fs::write(&path, mutated).expect("write header mutation");
+            assert_inspection_corrupted(&path);
+        }
+
+        let canonical_path = temp_index_path("v2-header-canonical");
+        let mut canonical_mutation = source;
+        canonical_mutation[FSVI_V2_FIXED_PREFIX_BYTES] ^= 0x01;
+        refresh_v2_header_crc(&mut canonical_mutation);
+        fs::write(&canonical_path, canonical_mutation).expect("write canonical mutation");
+        assert_inspection_corrupted(&canonical_path);
+    }
+
+    #[test]
+    fn fsvi_v2_complete_space_parser_rejects_suffix_and_dimension_drift() {
+        let binding = fsvi_v2_binding("v2-complete-space", 4, Quantization::F16, 9, 0x45);
+        let path = temp_index_path("v2-complete-space");
+
+        let mut suffixed = binding.space_canonical_bytes.clone();
+        suffixed.push(0);
+        assert!(matches!(
+            parse_complete_space_identity(&path, &suffixed, 4, binding.input_fingerprint,),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+
+        let mut wrong_dimension = binding.frozen_identity.identity.space.clone();
+        wrong_dimension.dimension = 5;
+        assert!(matches!(
+            parse_complete_space_identity(
+                &path,
+                &wrong_dimension.canonical_bytes(),
+                4,
+                binding.input_fingerprint,
+            ),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn fsvi_v2_complete_space_parser_round_trips_semantic_and_projection_branches() {
+        let path = temp_index_path("v2-complete-space-semantic");
+        let semantic = semantic_fsvi_v2_binding("semantic-space", 8, 9, 0x46);
+        let parsed = parse_complete_space_identity(
+            &path,
+            &semantic.space_canonical_bytes,
+            8,
+            semantic.input_fingerprint,
+        )
+        .expect("complete semantic identity parses");
+        assert_eq!(parsed.0, "semantic-space");
+        assert_eq!(parsed.1, "explicit-test-v1");
+        assert_eq!(
+            parsed.2,
+            semantic.frozen_identity.identity.space.output_normalization
+        );
+
+        let projected_identity = semantic
+            .frozen_identity
+            .identity
+            .derive_projection(4, "first-four-components", "l2-after-projection")
+            .expect("derive semantic projection");
+        let projected = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(10, [0x47; 16]).expect("valid projected generation"),
+            projected_identity
+                .freeze()
+                .expect("freeze projected identity"),
+        )
+        .expect("valid projected FSVI v2 binding");
+        let parsed = parse_complete_space_identity(
+            &path,
+            &projected.space_canonical_bytes,
+            4,
+            projected.input_fingerprint,
+        )
+        .expect("complete projected identity parses");
+        assert_eq!(parsed.0, "semantic-space");
+        assert_eq!(parsed.2, "l2-after-projection");
+    }
+
+    #[test]
+    fn fsvi_v2_content_mutation_matrix_fails_admission() {
+        let binding = fsvi_v2_binding("v2-content-matrix", 4, Quantization::F16, 10, 0x55);
+        let (source_path, expected) = write_v2_fixture("v2-content-matrix-source", binding);
+        let source = fs::read(&source_path).expect("read source v2");
+        let inspected = VectorIndex::inspect(&source_path).expect("inspect source");
+        assert!(matches!(&inspected, FsviInspection::V2IdentityComplete(_)));
+        let FsviInspection::V2IdentityComplete(metadata) = inspected else {
+            return;
+        };
+        let identity = metadata.identity_v2.as_ref().expect("v2 metadata");
+        let header_size = identity.header_size;
+        let vectors_offset =
+            usize::try_from(metadata.vectors_offset).expect("vector offset fits usize");
+        let strings_offset = header_size + metadata.record_count * RECORD_SIZE_BYTES;
+        let string_bytes = "doc-alpha".len() + "doc-beta".len();
+        let padding_offset = strings_offset + string_bytes;
+        assert!(
+            padding_offset < vectors_offset,
+            "fixture must include padding"
+        );
+
+        let content_mutations = [
+            ("record-flags", header_size + 14),
+            ("document-id", strings_offset),
+            ("alignment-padding", padding_offset),
+            ("vector-slab", vectors_offset),
+        ];
+        for (name, offset) in content_mutations {
+            let path = temp_index_path(&format!("v2-content-{name}"));
+            let mut mutated = source.clone();
+            mutated[offset] ^= 0x01;
+            fs::write(&path, mutated).expect("write content mutation");
+            assert_admission_corrupted(&path, &expected);
+        }
+
+        for (name, offset) in [
+            ("docset-digest", FSVI_V2_DOCSET_DIGEST_OFFSET),
+            ("vector-digest", FSVI_V2_VECTOR_DIGEST_OFFSET),
+        ] {
+            let path = temp_index_path(&format!("v2-content-{name}"));
+            let mut mutated = source.clone();
+            mutated[offset] ^= 0x01;
+            refresh_v2_header_crc(&mut mutated);
+            fs::write(&path, mutated).expect("write digest mutation");
+            assert_admission_corrupted(&path, &expected);
+        }
+
+        let trailing_path = temp_index_path("v2-content-trailing");
+        let mut trailing = source.clone();
+        trailing.push(0);
+        fs::write(&trailing_path, trailing).expect("write trailing byte");
+        assert_admission_corrupted(&trailing_path, &expected);
+
+        let truncated_path = temp_index_path("v2-content-truncated");
+        fs::write(&truncated_path, &source[..source.len() - 1]).expect("write truncated vector");
+        assert_admission_corrupted(&truncated_path, &expected);
+
+        let unaligned_path = temp_index_path("v2-content-unaligned-vector-slab");
+        let mut unaligned = source.clone();
+        let unaligned_vectors_offset = vectors_offset
+            .checked_sub(1)
+            .expect("fixture vector offset has alignment padding");
+        assert!(
+            unaligned_vectors_offset >= padding_offset,
+            "fixture must retain a valid string table when one padding byte is removed"
+        );
+        unaligned.remove(unaligned_vectors_offset);
+        unaligned[28..36].copy_from_slice(
+            &u64::try_from(unaligned_vectors_offset)
+                .expect("unaligned vector offset fits u64")
+                .to_le_bytes(),
+        );
+        refresh_v2_header_crc(&mut unaligned);
+        fs::write(&unaligned_path, unaligned).expect("write unaligned vector slab");
+        assert_admission_corrupted(&unaligned_path, &expected);
+
+        let wal_path = wal::wal_path_for(&source_path);
+        fs::write(&wal_path, b"live-sidecar").expect("write live WAL sidecar");
+        assert_admission_corrupted(&source_path, &expected);
+    }
+
+    #[test]
+    fn fsvi_v2_writer_refuses_to_publish_beside_an_existing_wal() {
+        let path = temp_index_path("v2-writer-existing-wal");
+        let binding = fsvi_v2_binding("v2-writer-existing-wal", 4, Quantization::F16, 11, 0x65);
+        let mut writer = VectorIndex::create_v2(&path, binding).expect("create v2 writer");
+        writer
+            .write_record("doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write record");
+        let wal_path = wal::wal_path_for(&path);
+        fs::write(&wal_path, b"stale-wal").expect("write stale WAL");
+
+        let error = writer
+            .finish()
+            .expect_err("v2 publication must refuse every existing WAL sidecar");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { ref field, .. } if field == "fsvi_v2.wal_sidecar"
+        ));
+        assert!(
+            !path.exists(),
+            "a rejected v2 generation must not publish its target"
+        );
+        assert!(
+            wal_path.exists(),
+            "refusal must preserve the pre-existing WAL for operator recovery"
+        );
+    }
+
+    #[test]
+    fn fsvi_v2_writer_rejects_ambiguous_records_and_invalid_bindings() {
+        let duplicate_path = temp_index_path("v2-duplicate");
+        let binding = fsvi_v2_binding("v2-writer-guard", 4, Quantization::F16, 11, 0x66);
+        let mut duplicate =
+            VectorIndex::create_v2(&duplicate_path, binding).expect("duplicate writer");
+        duplicate
+            .write_record("same", &[1.0, 0.0, 0.0, 0.0])
+            .expect("first duplicate");
+        duplicate
+            .write_record("same", &[0.0, 1.0, 0.0, 0.0])
+            .expect("second duplicate");
+        assert!(matches!(
+            duplicate.finish(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "doc_id"
+        ));
+
+        let empty_path = temp_index_path("v2-empty-doc-id");
+        let binding = fsvi_v2_binding("v2-writer-guard", 4, Quantization::F16, 12, 0x67);
+        let mut empty = VectorIndex::create_v2(&empty_path, binding).expect("empty-id writer");
+        empty
+            .write_record("", &[1.0, 0.0, 0.0, 0.0])
+            .expect("record is rejected atomically at finish");
+        assert!(matches!(
+            empty.finish(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "doc_id"
+        ));
+
+        let mut wrong_format =
+            frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                "wrong-format",
+                4,
+            );
+        wrong_format.storage.format = "fsvi-v1".to_owned();
+        wrong_format.storage.quantization = QuantizationFormat::F16;
+        wrong_format.storage.endianness = "little-endian".to_owned();
+        let generation =
+            ArtifactGenerationIdentityV1::new(1, [0x70; 16]).expect("valid generation");
+        assert!(
+            FsviV2IdentityBinding::new(
+                generation,
+                wrong_format
+                    .freeze()
+                    .expect("valid non-v2 storage identity")
+            )
+            .is_err()
+        );
+
+        let mut unsupported =
+            frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                "unsupported-quantization",
+                4,
+            );
+        unsupported.storage.format = "fsvi-v2".to_owned();
+        unsupported.storage.quantization = QuantizationFormat::Int8;
+        unsupported.storage.endianness = "little-endian".to_owned();
+        assert!(
+            FsviV2IdentityBinding::new(
+                generation,
+                unsupported
+                    .freeze()
+                    .expect("valid but unsupported storage identity")
+            )
+            .is_err()
+        );
+
+        let mut frozen =
+            frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                "noncanonical",
+                4,
+            );
+        frozen.storage.format = "fsvi-v2".to_owned();
+        frozen.storage.quantization = QuantizationFormat::F16;
+        frozen.storage.endianness = "little-endian".to_owned();
+        let mut frozen = frozen.freeze().expect("valid frozen identity");
+        frozen.canonical_bytes.push(0);
+        assert!(FsviV2IdentityBinding::new(generation, frozen).is_err());
+
+        let invalid_generation = ArtifactGenerationIdentityV1 {
+            schema_version: 1,
+            sequence: 1,
+            nonce: [0; 16],
+        };
+        let valid_binding = fsvi_v2_binding("v2-generation-guard", 4, Quantization::F16, 1, 0x77);
+        assert!(
+            FsviV2IdentityBinding::new(invalid_generation, valid_binding.frozen_identity().clone())
+                .is_err()
+        );
     }
 
     #[test]
@@ -3688,6 +6401,7 @@ mod tests {
     #[test]
     fn vector_metadata_clone_eq() {
         let meta = VectorMetadata {
+            fsvi_version: FSVI_VERSION,
             embedder_id: "test".to_owned(),
             embedder_revision: "v1".to_owned(),
             dimension: 256,
@@ -3695,6 +6409,7 @@ mod tests {
             compaction_gen: 0,
             record_count: 100,
             vectors_offset: 1024,
+            identity_v2: None,
         };
         let cloned = meta.clone();
         assert_eq!(meta, cloned);
