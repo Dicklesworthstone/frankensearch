@@ -16781,3 +16781,32 @@ and run a new candidate at the 10-pair minimum. Start an immediate
 same-window reproduction only if every required A/A passes center, CI width,
 log-MAD, order-effect, and drift; otherwise switch route again. Never replace
 those laws with CV.
+
+### 2026-07-28 — QG-5 declared-scratch bypass makes the physical-host route invalid (`bd-h6eh`, FoggySquirrel)
+
+Direct candidate `qg5-candidate-final-20260728T1405Z` ran exact ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`
+on physical 16-thread Zen3 host `fmd`. The process environment declared
+`QUILL_PERF_SCRATCH_DIR=/data/tmp/qg-activation-foggysquirrel-20260728/scratch`,
+but `lsof -p 1649987` showed the live 1M-document Quill fixture under
+`/tmp/qg5-quill-*/`. `df` and `findmnt` identified `/tmp` as a 32 GiB tmpfs,
+not the persistent 120-GiB-minimum filesystem asserted by the retry contract.
+Source inspection established the cause: both compaction arms called
+`tempfile::Builder::tempdir()` directly instead of the harness's declared
+scratch-root helper.
+
+**Decision: INVALID-HARNESS / NO CLAIM.** The process was allowed to finish,
+but any apparent ratios it emits remain non-evidence because the timed storage
+surface and the recorded scratch provenance disagree.
+
+The source fix routes both Quill and Tantivy QG-5 temporary directories through
+`tempdir_in(scratch_root())`.
+
+**Retry predicate:** build a new exact self-reporting ELF containing that fix,
+then run on the quiet 32-core reference host with
+`QUILL_PERF_SCRATCH_DIR` on a persistent filesystem with at least 120 GiB free.
+During the first live sample, confirm an open
+`qg5-{quill,tantivy}-*` directory is a descendant of the declared root. Admit
+only a complete three-density candidate whose A/A controls all pass, followed
+immediately by a same-ELF reproduction that also passes every null and
+reproduction law; never promote this `f9ab…` route.

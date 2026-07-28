@@ -7386,3 +7386,28 @@ reference host with the same exact ELF and persistent scratch, and require all
 five same-invocation A/A controls to admit before starting a reproduction or
 evaluating the 4x target. Do not resample `fmd`, weaken a null law, or gate on
 CV.
+
+## 2026-07-28 — QG-5 INVALID-HARNESS: declared persistent scratch was not used (`bd-h6eh`, FoggySquirrel)
+
+A live pre-admission audit of direct physical-host candidate
+`qg5-candidate-final-20260728T1405Z` found that exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`
+reported
+`QUILL_PERF_SCRATCH_DIR=/data/tmp/qg-activation-foggysquirrel-20260728/scratch`,
+but its open 1M-document Quill fixture was actually
+`/tmp/qg5-quill-*/seg-*.fslx`. `findmnt -T /tmp` identified that location as a
+32 GiB tmpfs. Static adjudication confirmed that both QG-5 arms used
+`tempfile::Builder::tempdir()` and bypassed the declared scratch helper.
+
+No QG-5 ratio or PASS/MISS follows from this route, even if the already-running
+invocation later seals an artifact: its storage provenance does not describe
+the filesystem that carried the measured fixtures. The invocation was left to
+finish rather than terminated mid-write.
+
+The harness now creates both QG-5 arm directories with
+`tempdir_in(scratch_root())`. Retry only from a newly built, self-hashing exact
+ELF on the quiet 32-core reference host, with the declared scratch root on a
+persistent filesystem with at least 120 GiB free. Before admitting the
+candidate, verify from the live process that an open `qg5-{quill,tantivy}-*`
+fixture is below that exact root; then require all three A/A controls and an
+immediate same-ELF reproduction before evaluating the 5x target.

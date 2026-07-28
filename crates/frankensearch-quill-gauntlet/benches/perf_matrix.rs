@@ -634,13 +634,26 @@ fn search_doc_ids<E: LexicalRead>(context: &BenchContext, index: &E, query: &str
     })
 }
 
-fn scratch_path(label: &str) -> PathBuf {
+fn scratch_root() -> PathBuf {
     let root = std::env::var_os("QUILL_PERF_SCRATCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("frankensearch-quill-perf"));
     std::fs::create_dir_all(&root).expect("QG scratch root");
+    root
+}
+
+fn scratch_path(label: &str) -> PathBuf {
+    let root = scratch_root();
     let sequence = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     root.join(format!("{label}-{}-{sequence}", std::process::id()))
+}
+
+fn scratch_tempdir(prefix: &str) -> tempfile::TempDir {
+    let root = scratch_root();
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(&root)
+        .expect("create QG fixture directory under declared scratch root")
 }
 
 fn measure_quill_fresh_process(
@@ -782,10 +795,7 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
         .div_ceil(segments);
     let elapsed = match arm {
         EngineArm::Quill => {
-            let directory = tempfile::Builder::new()
-                .prefix("qg5-quill-")
-                .tempdir()
-                .expect("QG-5 Quill durable fixture directory");
+            let directory = scratch_tempdir("qg5-quill-");
             let index = context
                 .runtime
                 .block_on(QuillIndex::create(
@@ -837,10 +847,7 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
             elapsed
         }
         EngineArm::Tantivy => {
-            let directory = tempfile::Builder::new()
-                .prefix("qg5-tantivy-")
-                .tempdir()
-                .expect("QG-5 Tantivy durable fixture directory");
+            let directory = scratch_tempdir("qg5-tantivy-");
             let index = tantivy_create(directory.path(), spec);
             context.runtime.block_on(async {
                 index
