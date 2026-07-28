@@ -237,6 +237,27 @@ impl DecisionState {
     }
 }
 
+fn finish_evaluation(
+    gate: PerfGate,
+    mode: PerfRatchetMode,
+    gate_activated: bool,
+    state: DecisionState,
+    comparisons: Vec<PerfCellComparison>,
+    evidence: Vec<PerfEvidenceFile>,
+) -> PerfRatchetEvaluation {
+    PerfRatchetEvaluation {
+        schema_version: PERF_RATCHET_SCHEMA_VERSION.to_owned(),
+        gate,
+        mode,
+        gate_activated,
+        decision: state.decision(),
+        reasons: state.reasons,
+        comparisons,
+        evidence,
+        history_updates: Vec::new(),
+    }
+}
+
 /// Evaluate a candidate against the committed pass-over-pass baseline.
 #[must_use]
 pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEvaluation {
@@ -250,21 +271,36 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         &mut state,
     );
     validate_paired_evidence(gate, &candidate_cells, "candidate", &mut state);
-    match request.candidate_evidence {
-        Some(evidence) => validate_current_evidence(
-            evidence,
-            request.candidate,
-            &candidate_cells,
-            request.expected_manifest_sha256,
-            "candidate",
-            &mut state,
-        ),
-        None if request.require_current_evidence => state.quarantine(
-            "perf.ratchet.missing_current_candidate_evidence",
-            "promotion requires a hash-sealed current-schema candidate evidence artifact",
-        ),
-        None => {}
-    }
+    let candidate_evidence = match request.candidate_evidence {
+        Some(evidence) => {
+            if !validate_current_evidence(
+                evidence,
+                request.candidate,
+                &candidate_cells,
+                request.expected_manifest_sha256,
+                "candidate",
+                &mut state,
+            ) {
+                return finish_evaluation(
+                    gate,
+                    request.mode,
+                    request.gate_activated,
+                    state,
+                    Vec::new(),
+                    request.evidence,
+                );
+            }
+            Some(evidence)
+        }
+        None if request.require_current_evidence => {
+            state.quarantine(
+                "perf.ratchet.missing_current_candidate_evidence",
+                "promotion requires a hash-sealed current-schema candidate evidence artifact",
+            );
+            None
+        }
+        None => None,
+    };
 
     if request.mode == PerfRatchetMode::Promotion {
         validate_complete_gate(gate, &candidate_cells, request.gate_activated, &mut state);
@@ -311,23 +347,57 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
                 &mut state,
             );
             validate_paired_evidence(gate, &rerun_cells, "rerun", &mut state);
-            match request.rerun_evidence {
-                Some(evidence) => validate_current_evidence(
-                    evidence,
+            if !rerun.laws_attested {
+                state.quarantine(
+                    "perf.ratchet.rerun_laws_not_attested",
+                    "promotion requires the same-revision rerun to attest every standing law",
+                );
+            }
+            let rerun_evidence = match request.rerun_evidence {
+                Some(evidence) => {
+                    if !validate_current_evidence(
+                        evidence,
+                        rerun,
+                        &rerun_cells,
+                        request.expected_manifest_sha256,
+                        "rerun",
+                        &mut state,
+                    ) {
+                        return finish_evaluation(
+                            gate,
+                            request.mode,
+                            request.gate_activated,
+                            state,
+                            comparisons,
+                            request.evidence,
+                        );
+                    }
+                    Some(evidence)
+                }
+                None if request.require_current_evidence => {
+                    state.quarantine(
+                        "perf.ratchet.missing_current_rerun_evidence",
+                        "promotion requires a hash-sealed current-schema rerun evidence artifact",
+                    );
+                    None
+                }
+                None => None,
+            };
+            if candidate_is_complete(gate, &rerun_cells) {
+                // Promotion requires both independent passes to satisfy every
+                // gate target. Reproduction tolerance cannot substitute for
+                // independently clearing a threshold; QG-6 additionally
+                // consumes the rerun's hierarchical CI/null-margin evidence.
+                evaluate_gate_targets(
                     rerun,
                     &rerun_cells,
-                    request.expected_manifest_sha256,
-                    "rerun",
+                    rerun_evidence,
+                    request.gate_activated,
                     &mut state,
-                ),
-                None if request.require_current_evidence => state.quarantine(
-                    "perf.ratchet.missing_current_rerun_evidence",
-                    "promotion requires a hash-sealed current-schema rerun evidence artifact",
-                ),
-                None => {}
+                );
             }
             if let (Some(candidate_evidence), Some(rerun_evidence)) =
-                (request.candidate_evidence, request.rerun_evidence)
+                (candidate_evidence, rerun_evidence)
             {
                 compare_current_evidence_reproduction(
                     candidate_evidence,
@@ -361,6 +431,7 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         evaluate_gate_targets(
             request.candidate,
             &candidate_cells,
+            candidate_evidence,
             request.gate_activated,
             &mut state,
         );
@@ -375,17 +446,14 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
         }
     }
 
-    PerfRatchetEvaluation {
-        schema_version: PERF_RATCHET_SCHEMA_VERSION.to_owned(),
+    finish_evaluation(
         gate,
-        mode: request.mode,
-        gate_activated: request.gate_activated,
-        decision: state.decision(),
-        reasons: state.reasons,
+        request.mode,
+        request.gate_activated,
+        state,
         comparisons,
-        evidence: request.evidence,
-        history_updates: Vec::new(),
-    }
+        request.evidence,
+    )
 }
 
 fn validate_artifact<'a>(
@@ -513,12 +581,27 @@ fn validate_current_evidence(
     expected_manifest_sha256: &str,
     role: &str,
     state: &mut DecisionState,
-) {
-    if !is_lower_hex_sha256(&evidence.artifact_sha256) {
-        state.fatal(
-            "perf.ratchet.current_evidence_unsealed",
-            format!("{role} current-schema evidence lacks a lowercase SHA-256 content seal"),
-        );
+) -> bool {
+    if let Err(error) = evidence.verify_integrity() {
+        let (code, message) = if is_lower_hex_sha256(&evidence.artifact_sha256) {
+            (
+                "perf.ratchet.current_evidence_integrity_failed",
+                format!(
+                    "{role} current-schema evidence failed in-memory integrity verification: \
+                     {error}"
+                ),
+            )
+        } else {
+            (
+                "perf.ratchet.current_evidence_unsealed",
+                format!(
+                    "{role} current-schema evidence lacks a valid lowercase SHA-256 content seal: \
+                     {error}"
+                ),
+            )
+        };
+        state.fatal(code, message);
+        return false;
     }
     if evidence.gate != legacy.gate {
         state.fatal(
@@ -677,6 +760,7 @@ fn validate_current_evidence(
             ),
         );
     }
+    true
 }
 
 fn validate_current_evidence_cell(
@@ -688,12 +772,18 @@ fn validate_current_evidence_cell(
     state: &mut DecisionState,
 ) {
     match &cell.body {
-        EvidenceCellBody::Paired { paired, .. } => {
+        EvidenceCellBody::Paired {
+            paired,
+            hierarchical,
+            hierarchical_null,
+            ..
+        } => {
             let provenance = &paired.provenance;
             let scope_matches = paired.scope.unit == cell.spec.unit;
             let provenance_matches = provenance.run_id == evidence.provenance.run_id
                 && provenance.executable_sha256 == evidence.provenance.build.executable_sha256
                 && provenance.corpus_sha256 == evidence.provenance.corpus.corpus_sha256
+                && provenance.input_identity == cell.spec.input_identity
                 && provenance.worker_id == evidence.provenance.machine.fingerprint
                 && provenance.build_profile == evidence.provenance.build.build_profile;
             if !scope_matches || !provenance_matches {
@@ -702,6 +792,17 @@ fn validate_current_evidence_cell(
                     format!(
                         "{role} cell {} does not share the artifact's operation unit and sealed \
                          execution provenance",
+                        cell.cell_id
+                    ),
+                );
+            }
+            if cell.spec.gate == PerfGate::Qg6
+                && (hierarchical.is_none() || hierarchical_null.is_none())
+            {
+                state.fatal(
+                    "perf.ratchet.qg6_hierarchical_evidence_missing",
+                    format!(
+                        "{role} QG-6 cell {} lacks a verified hierarchical effect or null estimate",
                         cell.cell_id
                     ),
                 );
@@ -887,7 +988,7 @@ fn compare_current_evidence_reproduction(
     if candidate.provenance.corpus != rerun.provenance.corpus {
         state.quarantine(
             "perf.ratchet.current_rerun_corpus_mismatch",
-            "candidate and rerun current evidence must share corpus and query identities",
+            "candidate and rerun current evidence must share invocation-level corpus provenance",
         );
     }
 
@@ -931,6 +1032,10 @@ fn compare_current_evidence_reproduction(
             );
             continue;
         };
+        if candidate.gate == PerfGate::Qg6 {
+            compare_qg6_hierarchical_reproduction(cell, other, candidate_pair, rerun_pair, state);
+            continue;
+        }
         match candidate_pair.reproduces_within(rerun_pair) {
             Ok(true) => {}
             Ok(false) => state.quarantine(
@@ -948,6 +1053,86 @@ fn compare_current_evidence_reproduction(
                     cell.cell_id
                 ),
             ),
+        }
+    }
+}
+
+fn compare_qg6_hierarchical_reproduction(
+    candidate_cell: &crate::EvidenceCell,
+    rerun_cell: &crate::EvidenceCell,
+    candidate_pair: &crate::PairedExperimentResult,
+    rerun_pair: &crate::PairedExperimentResult,
+    state: &mut DecisionState,
+) {
+    let (
+        EvidenceCellBody::Paired {
+            hierarchical: Some(candidate),
+            hierarchical_null: Some(candidate_null),
+            ..
+        },
+        EvidenceCellBody::Paired {
+            hierarchical: Some(rerun),
+            hierarchical_null: Some(rerun_null),
+            ..
+        },
+    ) = (&candidate_cell.body, &rerun_cell.body)
+    else {
+        state.quarantine(
+            "perf.ratchet.qg6_hierarchical_reproduction_missing",
+            format!(
+                "QG-6 reproduction requires hierarchical estimates for {}",
+                candidate_cell.cell_id
+            ),
+        );
+        return;
+    };
+    let same_grouping = |left: &crate::HierarchicalLatencyEstimate,
+                         right: &crate::HierarchicalLatencyEstimate| {
+        left.schema_version == right.schema_version
+            && left.group_count == right.group_count
+            && left
+                .groups
+                .iter()
+                .map(|group| (group.group_id, group.pair_count))
+                .eq(right
+                    .groups
+                    .iter()
+                    .map(|group| (group.group_id, group.pair_count)))
+    };
+    let compatible = same_grouping(candidate, rerun)
+        && same_grouping(candidate_null, rerun_null)
+        && candidate_cell.cell_id == rerun_cell.cell_id
+        && candidate_cell.spec == rerun_cell.spec
+        && candidate_pair.config == rerun_pair.config
+        && candidate_pair.scope == rerun_pair.scope
+        && candidate_pair
+            .provenance
+            .same_reproduction_context(&rerun_pair.provenance);
+    if !compatible {
+        state.quarantine(
+            "perf.ratchet.qg6_hierarchical_reproduction_incompatible",
+            format!(
+                "QG-6 candidate and rerun hierarchical inputs differ for {}",
+                candidate_cell.cell_id
+            ),
+        );
+        return;
+    }
+    for (label, candidate, rerun) in [
+        ("A/B effect", candidate, rerun),
+        ("A/A null", candidate_null, rerun_null),
+    ] {
+        let delta =
+            (candidate.median_of_group_medians_log - rerun.median_of_group_medians_log).abs();
+        if delta > candidate_pair.config.max_reproduction_delta_log {
+            state.quarantine(
+                "perf.ratchet.qg6_hierarchical_reproduction_failed",
+                format!(
+                    "QG-6 hierarchical {label} candidate and rerun differ by {delta:.6} \
+                     log-ratio for {}",
+                    candidate_cell.cell_id
+                ),
+            );
         }
     }
 }
@@ -990,6 +1175,12 @@ fn validate_paired_evidence(
             );
             continue;
         };
+        if gate == PerfGate::Qg6 {
+            // QG-6 is a two-stage per-query estimand. Its flat legacy rows are
+            // compatibility projections only; both A/B and A/A admission are
+            // taken from the recomputable current-schema hierarchy.
+            continue;
+        }
         if !validate_null_control(null, role, state) {
             continue;
         }
@@ -997,29 +1188,6 @@ fn validate_paired_evidence(
         let null_floor = (null.distribution.median_ci95_low - 1.0)
             .abs()
             .max((null.distribution.median_ci95_high - 1.0).abs());
-        if gate == PerfGate::Qg6 {
-            let equivalence_half_width = 0.10;
-            let floor_fits = PERF_NULL_MARGIN_MULTIPLIER * null_floor <= equivalence_half_width;
-            let claim_fits = claim.distribution.median_ci95_low >= 1.0 - equivalence_half_width
-                && claim.distribution.median_ci95_high <= 1.0 + equivalence_half_width;
-            if !floor_fits || !claim_fits {
-                state.quarantine(
-                    "perf.ratchet.inconclusive_equivalence",
-                    format!(
-                        "{role} {}/{} cannot establish ±10% equivalence: A/B median CI \
-                         [{:.6}, {:.6}], A/A median CI [{:.6}, {:.6}], required null margin {:.1}x",
-                        key.fixture,
-                        key.metric,
-                        claim.distribution.median_ci95_low,
-                        claim.distribution.median_ci95_high,
-                        null.distribution.median_ci95_low,
-                        null.distribution.median_ci95_high,
-                        PERF_NULL_MARGIN_MULTIPLIER,
-                    ),
-                );
-            }
-            continue;
-        }
 
         let effect = (claim.distribution.p50 - 1.0).abs();
         let outside_null = claim.distribution.p50 < null.distribution.median_ci95_low
@@ -1207,6 +1375,13 @@ fn compare_baseline(
             );
             continue;
         };
+        if candidate.gate == PerfGate::Qg6
+            && matches!(key.engine.as_str(), "paired_ab" | "paired_null")
+        {
+            // QG-6's flat paired rows are compatibility projections. Current
+            // hierarchical evidence owns effect and null inference.
+            continue;
+        }
         if key.engine == "paired_null" {
             let _ = validate_null_control(current, "candidate", state);
             continue;
@@ -1322,6 +1497,15 @@ fn compare_reproduction(
         );
     }
     for (key, first) in candidate_cells {
+        if candidate.gate == PerfGate::Qg6
+            && matches!(key.engine.as_str(), "paired_ab" | "paired_null")
+        {
+            // The verified current-schema two-stage estimates are the only
+            // QG-6 effect and null reproduction inputs. Flat compatibility
+            // projections are retained for legacy consumers, never for this
+            // decision.
+            continue;
+        }
         let Some(second) = rerun_cells.get(key) else {
             state.quarantine(
                 "perf.ratchet.rerun_missing_cell",
@@ -1568,6 +1752,7 @@ impl GateTargetEvaluator<'_, '_> {
 fn evaluate_gate_targets(
     artifact: &PerfGateArtifact,
     cells: &BTreeMap<CellKey, &PerfCellResult>,
+    current_evidence: Option<&PerfEvidenceArtifact>,
     activated: bool,
     state: &mut DecisionState,
 ) {
@@ -1583,7 +1768,7 @@ fn evaluate_gate_targets(
         PerfGate::Qg3 => evaluate_qg3(&mut target),
         PerfGate::Qg4 => evaluate_qg4(&mut target),
         PerfGate::Qg5 => evaluate_qg5(&mut target),
-        PerfGate::Qg6 => evaluate_qg6(&mut target),
+        PerfGate::Qg6 => evaluate_qg6(&mut target, current_evidence),
         PerfGate::Qg7 => evaluate_qg7(&mut target),
         PerfGate::Qg8 => evaluate_qg8(&mut target),
         PerfGate::Qg9 => evaluate_qg9(&mut target),
@@ -1727,7 +1912,10 @@ fn evaluate_qg5(target: &mut GateTargetEvaluator<'_, '_>) {
     }
 }
 
-fn evaluate_qg6(target: &mut GateTargetEvaluator<'_, '_>) {
+fn evaluate_qg6(
+    target: &mut GateTargetEvaluator<'_, '_>,
+    current_evidence: Option<&PerfEvidenceArtifact>,
+) {
     let fixtures = target
         .cells
         .keys()
@@ -1735,17 +1923,42 @@ fn evaluate_qg6(target: &mut GateTargetEvaluator<'_, '_>) {
         .map(|key| key.fixture.clone())
         .collect::<Vec<_>>();
     for fixture in fixtures {
-        if let Some((ci_low, ci_high)) =
-            target.median_ci95(&fixture, "latency_ms_quill_over_tantivy", "paired_ab")
-        {
+        let hierarchical =
+            current_evidence.and_then(|artifact| exact_qg6_hierarchical_cell(artifact, &fixture));
+        if let Some((effect, null)) = hierarchical {
+            let ci_low = effect.ci95_low_ratio;
+            let ci_high = effect.ci95_high_ratio;
             target.target_interval_ci(
                 ci_low,
                 ci_high,
                 0.90,
                 1.10,
                 format!(
-                    "QG-6 {fixture} median-ratio CI [{ci_low:.6}, {ci_high:.6}] is not contained \
-                     in [0.90, 1.10]"
+                    "QG-6 {fixture} hierarchical median-ratio CI \
+                    [{ci_low:.6}, {ci_high:.6}] is not contained in [0.90, 1.10]"
+                ),
+            );
+            let null_floor = (null.ci95_low_ratio - 1.0)
+                .abs()
+                .max((null.ci95_high_ratio - 1.0).abs());
+            let null_contains_identity = null.ci95_low_ratio <= 1.0 && 1.0 <= null.ci95_high_ratio;
+            if !null_contains_identity || PERF_NULL_MARGIN_MULTIPLIER * null_floor > 0.10 {
+                target.state.quarantine(
+                    "perf.ratchet.inconclusive_equivalence",
+                    format!(
+                        "QG-6 {fixture} cannot establish ±10% equivalence: hierarchical A/A \
+                         median-ratio CI [{:.6}, {:.6}] fails identity containment or the required \
+                         {:.1}x null margin",
+                        null.ci95_low_ratio, null.ci95_high_ratio, PERF_NULL_MARGIN_MULTIPLIER,
+                    ),
+                );
+            }
+        } else {
+            target.state.quarantine(
+                "perf.ratchet.qg6_hierarchical_evidence_missing",
+                format!(
+                    "QG-6 {fixture} requires a verified two-stage hierarchical estimate; flat \
+                     threshold projections are not decision inputs"
                 ),
             );
         }
@@ -1760,6 +1973,46 @@ fn evaluate_qg6(target: &mut GateTargetEvaluator<'_, '_>) {
                 ),
             );
         }
+    }
+}
+
+fn exact_qg6_hierarchical_cell<'a>(
+    artifact: &'a PerfEvidenceArtifact,
+    fixture: &str,
+) -> Option<(
+    &'a crate::HierarchicalLatencyEstimate,
+    &'a crate::HierarchicalLatencyEstimate,
+)> {
+    let expected_cell_id = format!("{}/{fixture}/latency_ms", PerfGate::Qg6);
+    let mut exact = artifact.cells.iter().filter(|cell| {
+        cell.cell_id == expected_cell_id
+            && cell.spec.gate == PerfGate::Qg6
+            && cell.spec.fixture == fixture
+            && cell.spec.metric == "latency_ms"
+            && cell.spec.unit == "ms"
+            && cell.spec.role == EvidenceRole::Required
+            && cell
+                .spec
+                .input_identity
+                .as_ref()
+                .is_some_and(|identity| identity.validate().is_ok())
+    });
+    let cell = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    match &cell.body {
+        EvidenceCellBody::Paired {
+            paired,
+            hierarchical: Some(estimate),
+            hierarchical_null: Some(null),
+            ..
+        } if paired.provenance.corpus_sha256 == artifact.provenance.corpus.corpus_sha256
+            && paired.provenance.input_identity == cell.spec.input_identity =>
+        {
+            Some((estimate, null))
+        }
+        _ => None,
     }
 }
 
@@ -1839,6 +2092,7 @@ fn evaluate_qg10(target: &mut GateTargetEvaluator<'_, '_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::PerfInputIdentity;
     use crate::{
         BuildIdentity, CorpusIdentity, DistributionSummary, EvidenceCell, EvidenceCellSpec,
         EvidencePolicy, EvidenceProvenance, MachineIdentity, PairedEstimatorConfig,
@@ -1846,6 +2100,25 @@ mod tests {
         PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
         estimate_paired_experiment, seeded_balanced_pair_order,
     };
+    use sha2::{Digest, Sha256};
+
+    fn seal_evidence(evidence: &mut PerfEvidenceArtifact) {
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut unsealed = evidence.clone();
+        unsealed.artifact_sha256.clear();
+        let canonical =
+            serde_json::to_string_pretty(&unsealed).expect("serialize unsealed evidence");
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut seal = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            seal.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            seal.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+        }
+        evidence.artifact_sha256 = seal;
+        evidence
+            .verify_integrity()
+            .expect("test evidence must be integrity-valid after sealing");
+    }
 
     fn distribution(value: f64) -> DistributionSummary {
         DistributionSummary {
@@ -1923,6 +2196,7 @@ mod tests {
             run_id: run_id.to_owned(),
             executable_sha256: "c".repeat(64),
             corpus_sha256: "a".repeat(64),
+            input_identity: None,
             worker_id: "linux-x86_64-test".to_owned(),
             build_profile: "release-perf".to_owned(),
         };
@@ -1977,6 +2251,7 @@ mod tests {
                 metric: "docs_per_second".to_owned(),
                 unit: "docs/s".to_owned(),
                 role: EvidenceRole::Required,
+                input_identity: None,
                 cold_cache: None,
             },
             paired,
@@ -2076,11 +2351,274 @@ mod tests {
             vec![cell],
         )
         .expect("evidence artifact");
-        // The executable path loads and verifies the real seal. This synthetic
-        // in-memory unit fixture supplies a shape-valid seal so the pure
-        // reconciliation logic can be tested independently of filesystem I/O.
-        evidence.artifact_sha256 = "d".repeat(64);
+        seal_evidence(&mut evidence);
         (artifact, evidence)
+    }
+
+    fn qg6_current_pair(
+        run_id: &str,
+        group_ratios: [[f64; 3]; 4],
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        qg6_current_pair_with_null(run_id, group_ratios, [[1.0; 3]; 4])
+    }
+
+    fn qg6_current_pair_with_null(
+        run_id: &str,
+        effect_group_ratios: [[f64; 3]; 4],
+        null_group_ratios: [[f64; 3]; 4],
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        let fixture = "query/identifier/k10/medium";
+        let scope = PerfOperationScope {
+            operation_id: "qg6.prepared_query".to_owned(),
+            version: 1,
+            semantics: PerfMetricSemantics::GaugeLowerIsBetter,
+            unit: "ms".to_owned(),
+        };
+        let input_identity = PerfInputIdentity {
+            prepared_corpus_sha256: "0".repeat(64),
+            query_manifest_sha256: "1".repeat(64),
+            config_contract_sha256: "2".repeat(64),
+            query_group_count: crate::QG6_QUERY_GROUPS,
+            query_group_ids: crate::QG6_QUERY_GROUP_IDS.to_vec(),
+        };
+        let sample_provenance = PerfSampleProvenance {
+            run_id: run_id.to_owned(),
+            executable_sha256: "c".repeat(64),
+            corpus_sha256: "a".repeat(64),
+            input_identity: Some(input_identity.clone()),
+            worker_id: "linux-x86_64-test".to_owned(),
+            build_profile: "release-perf".to_owned(),
+        };
+        let order = seeded_balanced_pair_order(12, 0x5156_0006).expect("balanced QG-6 pair order");
+        let stream = |group_ratios: &[[f64; 3]; 4], sample_base: u64| {
+            let mut samples = Vec::with_capacity(24);
+            let mut ordinal = 0_usize;
+            for (group_index, ratios) in group_ratios.iter().enumerate() {
+                for ratio in ratios {
+                    let block_id = u64::try_from(ordinal).expect("QG-6 block");
+                    let first_start = block_id * 1_000;
+                    let second_start = first_start + 200;
+                    let control_first = order[ordinal] == PerfSampleArm::Control;
+                    let control = if *ratio > 1.15 { 1.0 } else { 100.0 };
+                    let treatment = control * *ratio;
+                    for (offset, arm, value, is_first) in [
+                        (0_u64, PerfSampleArm::Control, control, control_first),
+                        (1_u64, PerfSampleArm::Treatment, treatment, !control_first),
+                    ] {
+                        let started_ns = if is_first { first_start } else { second_start };
+                        samples.push(PerfRawSample {
+                            block_id,
+                            sample_id: sample_base + block_id * 2 + offset,
+                            arm,
+                            order: if is_first {
+                                PerfSampleOrder::First
+                            } else {
+                                PerfSampleOrder::Second
+                            },
+                            phase: PerfSamplePhase::Measurement,
+                            scope: scope.clone(),
+                            provenance: sample_provenance.clone(),
+                            started_ns,
+                            ended_ns: started_ns + 100,
+                            work_units: None,
+                            byte_count: None,
+                            observed_value: Some(value),
+                            group_id: Some(u64::try_from(group_index).expect("QG-6 group")),
+                        });
+                    }
+                    ordinal += 1;
+                }
+            }
+            samples
+        };
+        let effect_samples = stream(&effect_group_ratios, 0);
+        let null_samples = stream(&null_group_ratios, 100_000);
+        let paired = estimate_paired_experiment(
+            &effect_samples,
+            &null_samples,
+            &PairedEstimatorConfig::predeclared(0x5156_0006),
+        )
+        .expect("QG-6 paired evidence");
+        let cell = EvidenceCell::evaluate(
+            EvidenceCellSpec {
+                gate: PerfGate::Qg6,
+                fixture: fixture.to_owned(),
+                metric: "latency_ms".to_owned(),
+                unit: "ms".to_owned(),
+                role: EvidenceRole::Required,
+                input_identity: Some(input_identity),
+                cold_cache: None,
+            },
+            paired,
+            &EvidencePolicy::predeclared(),
+        )
+        .expect("QG-6 evidence cell");
+        let paired = match &cell.body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        let artifact = PerfGateArtifact {
+            schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg6,
+            bench_elf_sha256: "c".repeat(64),
+            machine_fingerprint: "linux-x86_64-test".to_owned(),
+            git_rev: "new".to_owned(),
+            run_window: "test-window".to_owned(),
+            run_id: run_id.to_owned(),
+            corpus_manifest_hash: "a".repeat(64),
+            manifest_sha256: "b".repeat(64),
+            cells: vec![
+                PerfCellResult {
+                    fixture: fixture.to_owned(),
+                    metric: "latency_ms".to_owned(),
+                    engine: "quill".to_owned(),
+                    unit: "ms".to_owned(),
+                    distribution: paired.effect.treatment.clone(),
+                },
+                PerfCellResult {
+                    fixture: fixture.to_owned(),
+                    metric: "latency_ms".to_owned(),
+                    engine: "tantivy".to_owned(),
+                    unit: "ms".to_owned(),
+                    distribution: paired.effect.control.clone(),
+                },
+                PerfCellResult {
+                    fixture: fixture.to_owned(),
+                    metric: "latency_ms_quill_over_tantivy".to_owned(),
+                    engine: "paired_ab".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: projected_ratio_distribution(&paired.effect_samples)
+                        .expect("QG-6 effect projection"),
+                },
+                PerfCellResult {
+                    fixture: fixture.to_owned(),
+                    metric: "latency_ms_tantivy_over_tantivy".to_owned(),
+                    engine: "paired_null".to_owned(),
+                    unit: "ratio".to_owned(),
+                    distribution: projected_ratio_distribution(&paired.null_samples)
+                        .expect("QG-6 null projection"),
+                },
+            ],
+            laws_attested: true,
+        };
+        let mut evidence = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            EvidencePolicy::predeclared(),
+            EvidenceProvenance {
+                run_id: run_id.to_owned(),
+                run_window: "test-window".to_owned(),
+                manifest_sha256: "b".repeat(64),
+                build: BuildIdentity {
+                    executable_sha256: "c".repeat(64),
+                    git_revision: "new".to_owned(),
+                    git_dirty: false,
+                    worktree_state_sha256: None,
+                    cargo_lock_sha256: Some("e".repeat(64)),
+                    rustc_version: "rustc test".to_owned(),
+                    target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+                    build_profile: "release-perf".to_owned(),
+                    cargo_features: vec!["perf-harness".to_owned()],
+                },
+                machine: MachineIdentity {
+                    fingerprint: "linux-x86_64-test".to_owned(),
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    logical_cpus: 8,
+                    cpu_governor: None,
+                    load_average_start: None,
+                    load_average_end: None,
+                },
+                peak_rss: PeakRssEvidence {
+                    method: "unsupported".to_owned(),
+                    bytes: None,
+                },
+                corpus: CorpusIdentity {
+                    corpus_sha256: "a".repeat(64),
+                    query_set_sha256: Some("1".repeat(64)),
+                    qrels_sha256: None,
+                    document_count: 100_000,
+                    content_bytes: None,
+                    generator_seed: 42,
+                    generator_revision: "test-v1".to_owned(),
+                },
+            },
+            vec![cell],
+        )
+        .expect("QG-6 evidence artifact");
+        seal_evidence(&mut evidence);
+        (artifact, evidence)
+    }
+
+    fn qg6_complete_pair(
+        run_id: &str,
+        group_ratios: [[f64; 3]; 4],
+    ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        let (mut artifact, template_evidence) = qg6_current_pair(run_id, group_ratios);
+        let template_rows = artifact.cells.clone();
+        let template_cell = template_evidence.cells[0].clone();
+        let mut rows = Vec::new();
+        let mut cells = Vec::new();
+        for spec in PerfMatrixSpec::complete().for_gate(PerfGate::Qg6) {
+            for template in &template_rows {
+                let mut row = template.clone();
+                row.fixture.clone_from(&spec.fixture);
+                rows.push(row);
+            }
+            let mut cell = template_cell.clone();
+            cell.spec.fixture.clone_from(&spec.fixture);
+            cell.cell_id = format!("{}/{}/{}", PerfGate::Qg6, spec.fixture, spec.metric);
+            cells.push(cell);
+        }
+        artifact.cells = rows;
+        let mut evidence = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            template_evidence.policy,
+            template_evidence.provenance,
+            cells,
+        )
+        .expect("complete QG-6 evidence");
+        seal_evidence(&mut evidence);
+        (artifact, evidence)
+    }
+
+    fn mutate_qg6_prepared_input(
+        evidence: &mut PerfEvidenceArtifact,
+        field: &str,
+        replacement: &str,
+    ) {
+        let cell = evidence.cells.first().expect("QG-6 evidence cell");
+        let EvidenceCellBody::Paired { paired, .. } = &cell.body else {
+            unreachable!("QG-6 must be paired");
+        };
+        let mut identity = cell
+            .spec
+            .input_identity
+            .clone()
+            .expect("QG-6 prepared-input identity");
+        match field {
+            "prepared_corpus_sha256" => {
+                identity.prepared_corpus_sha256 = replacement.to_owned();
+            }
+            "query_manifest_sha256" => {
+                identity.query_manifest_sha256 = replacement.to_owned();
+            }
+            "config_contract_sha256" => {
+                identity.config_contract_sha256 = replacement.to_owned();
+            }
+            _ => unreachable!("enumerated identity field"),
+        }
+        let mut effect_samples = paired.effect_samples.clone();
+        let mut null_samples = paired.null_samples.clone();
+        for sample in effect_samples.iter_mut().chain(&mut null_samples) {
+            sample.provenance.input_identity = Some(identity.clone());
+        }
+        let rebuilt_pair =
+            estimate_paired_experiment(&effect_samples, &null_samples, &paired.config)
+                .expect("coherent mutated QG-6 paired evidence");
+        let mut rebuilt_spec = cell.spec.clone();
+        rebuilt_spec.input_identity = Some(identity);
+        evidence.cells[0] = EvidenceCell::evaluate(rebuilt_spec, rebuilt_pair, &evidence.policy)
+            .expect("coherent mutated QG-6 cell");
     }
 
     fn evaluate(
@@ -2156,6 +2694,29 @@ mod tests {
     }
 
     #[test]
+    fn promotion_requires_law_attestation_on_the_rerun() {
+        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let candidate = qg2_artifact("new", 161.0, 100.0);
+        let mut rerun = qg2_artifact("new", 160.5, 100.0);
+        assert!(candidate.laws_attested);
+        rerun.laws_attested = false;
+
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.rerun_laws_not_attested"
+                && reason.message.contains("same-revision rerun")
+        }));
+    }
+
+    #[test]
     fn current_evidence_reconciles_with_threshold_projection_and_rerun() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let (candidate, candidate_evidence) = qg2_current_pair("new", "candidate", 161.0, 100.0);
@@ -2168,6 +2729,75 @@ mod tests {
             Some(&rerun_evidence),
         );
         assert_eq!(result.decision, PerfGateDecision::Allow);
+    }
+
+    #[test]
+    fn post_seal_current_evidence_mutation_blocks_before_target_evaluation() {
+        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let (candidate, mut candidate_evidence) =
+            qg2_current_pair("new", "candidate", 161.0, 100.0);
+        let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
+        let retained_seal = candidate_evidence.artifact_sha256.clone();
+        let EvidenceCellBody::Paired { paired, .. } = &mut candidate_evidence.cells[0].body else {
+            unreachable!("QG-2 evidence must be paired");
+        };
+        paired.effect.treatment.p50 += 1.0;
+        assert_eq!(candidate_evidence.artifact_sha256, retained_seal);
+
+        let result = evaluate_with_current(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            Some(&candidate_evidence),
+            Some(&rerun_evidence),
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.current_evidence_integrity_failed"
+                && reason.message.contains("hash seal")
+        }));
+        assert!(
+            result.comparisons.is_empty(),
+            "integrity failure must short-circuit before baseline or target evaluation"
+        );
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.code.starts_with("perf.ratchet.gate_target_")),
+            "integrity failure must not reach gate target evaluation"
+        );
+    }
+
+    #[test]
+    fn qg2_promotion_requires_rerun_target_to_pass_independently() {
+        let baseline = qg2_artifact("old", 152.0, 100.0);
+        let candidate = qg2_artifact("new", 152.0, 100.0);
+        let rerun = qg2_artifact("new", 149.0, 100.0);
+
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("QG-2")
+                && reason.message.contains("does not clear 1.5")
+        }));
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.reproduction_failed"),
+            "the adversarial rerun must remain inside generic reproduction tolerance: {:?}",
+            result.reasons
+        );
     }
 
     #[test]
@@ -2212,6 +2842,575 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.code == "perf.ratchet.current_evidence_identity_mismatch")
+        );
+    }
+
+    #[test]
+    fn qg6_query_config_identity_stays_separate_from_shared_corpus_provenance() {
+        let ratios = [[0.95; 3]; 4];
+        let (artifact, evidence) = qg6_current_pair("candidate", ratios);
+        let mut state = DecisionState::default();
+        let legacy_cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        validate_current_evidence_cell(
+            &evidence.cells[0],
+            &evidence,
+            &legacy_cells,
+            true,
+            "candidate",
+            &mut state,
+        );
+        assert!(!state.fatal);
+        assert!(
+            !state
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.current_evidence_scope_mismatch")
+        );
+        let paired = match &evidence.cells[0].body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        assert_eq!(
+            paired.provenance.corpus_sha256,
+            evidence.provenance.corpus.corpus_sha256
+        );
+        assert_eq!(
+            paired.provenance.input_identity,
+            evidence.cells[0].spec.input_identity
+        );
+
+        let mut corrupted = evidence.clone();
+        let EvidenceCellBody::Paired { paired, .. } = &mut corrupted.cells[0].body else {
+            unreachable!("QG-6 must be paired");
+        };
+        paired.provenance.corpus_sha256 = "9".repeat(64);
+        let mut corrupted_state = DecisionState::default();
+        validate_current_evidence_cell(
+            &corrupted.cells[0],
+            &corrupted,
+            &legacy_cells,
+            true,
+            "candidate",
+            &mut corrupted_state,
+        );
+        assert!(corrupted_state.fatal);
+        assert!(
+            corrupted_state
+                .reasons
+                .iter()
+                .any(|reason| { reason.code == "perf.ratchet.current_evidence_scope_mismatch" })
+        );
+    }
+
+    #[test]
+    fn qg6_reproduction_rejects_each_prepared_input_identity_change_independently() {
+        let ratios = [[0.95; 3]; 4];
+        let (_, candidate) = qg6_current_pair("candidate", ratios);
+        for (field, replacement) in [
+            ("prepared_corpus_sha256", "3".repeat(64)),
+            ("query_manifest_sha256", "4".repeat(64)),
+            ("config_contract_sha256", "5".repeat(64)),
+        ] {
+            let (_, mut rerun) = qg6_current_pair("rerun", ratios);
+            mutate_qg6_prepared_input(&mut rerun, field, &replacement);
+            let mut state = DecisionState::default();
+            compare_current_evidence_reproduction(&candidate, &rerun, &mut state);
+            assert!(
+                state.reasons.iter().any(|reason| {
+                    reason.code == "perf.ratchet.qg6_hierarchical_reproduction_incompatible"
+                }),
+                "{field} changed independently without invalidating hierarchical reproduction: {:?}",
+                state.reasons
+            );
+        }
+    }
+
+    #[test]
+    fn qg6_promotion_requires_rerun_hierarchical_ci_to_pass_independently() {
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
+        let (rerun, rerun_evidence) =
+            qg6_complete_pair("rerun", [[0.80; 3], [1.0; 3], [1.0; 3], [1.25; 3]]);
+        let mut baseline = candidate.clone();
+        baseline.run_id = "baseline".to_owned();
+        baseline.git_rev = "old".to_owned();
+
+        let candidate_hierarchy =
+            exact_qg6_hierarchical_cell(&candidate_evidence, "query/identifier/k10/100k")
+                .expect("candidate hierarchy")
+                .0;
+        let rerun_hierarchy =
+            exact_qg6_hierarchical_cell(&rerun_evidence, "query/identifier/k10/100k")
+                .expect("rerun hierarchy")
+                .0;
+        assert!(
+            (candidate_hierarchy.median_of_group_medians_log
+                - rerun_hierarchy.median_of_group_medians_log)
+                .abs()
+                < 1.0e-12,
+            "fixture must reproduce at the hierarchical point estimate"
+        );
+        assert!(
+            rerun_hierarchy.ci95_low_ratio < 0.90 || rerun_hierarchy.ci95_high_ratio > 1.10,
+            "rerun fixture must violate the hierarchical target only through interval width"
+        );
+
+        let result = evaluate_with_current(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            Some(&candidate_evidence),
+            Some(&rerun_evidence),
+        );
+        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+                && reason.message.contains("hierarchical")
+        }));
+        assert!(!result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+                && reason.message.contains("A/B effect")
+        }));
+    }
+
+    #[test]
+    fn qg6_promotion_requires_rerun_absolute_p99_to_pass_independently() {
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", [[1.0; 3]; 4]);
+        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[1.01; 3]; 4]);
+        let mut baseline = candidate.clone();
+        baseline.run_id = "baseline".to_owned();
+        baseline.git_rev = "old".to_owned();
+
+        let result = evaluate_with_current(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            Some(&candidate_evidence),
+            Some(&rerun_evidence),
+        );
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("Quill p99")
+                && reason.message.contains("exceeds oracle")
+        }));
+        assert!(!result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+                || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+        }));
+    }
+
+    #[test]
+    fn qg6_gate_uses_hierarchical_ci_when_flat_projection_would_false_pass() {
+        let ratios = [[0.91; 3], [0.91; 3], [0.91; 3], [1.20; 3]];
+        let (artifact, evidence) = qg6_current_pair("candidate", ratios);
+        let flat = artifact
+            .cells
+            .iter()
+            .find(|cell| cell.engine == "paired_ab")
+            .expect("flat compatibility projection");
+        assert!(
+            flat.distribution.median_ci95_low >= 0.90 && flat.distribution.median_ci95_high <= 1.10,
+            "fixture must demonstrate the former flat-CI false pass: {:?}",
+            flat.distribution
+        );
+        let EvidenceCellBody::Paired {
+            hierarchical: Some(hierarchical),
+            ..
+        } = &evidence.cells[0].body
+        else {
+            unreachable!("QG-6 must carry a hierarchical estimate");
+        };
+        assert!(
+            hierarchical.ci95_high_ratio > 1.10,
+            "hierarchical CI must expose between-query uncertainty"
+        );
+
+        let mut state = DecisionState::default();
+        let cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        let mut target = GateTargetEvaluator {
+            artifact: &artifact,
+            cells: &cells,
+            activated: true,
+            state: &mut state,
+        };
+        evaluate_qg6(&mut target, Some(&evidence));
+        assert!(state.quarantined);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+                && reason.message.contains("hierarchical")
+        }));
+    }
+
+    #[test]
+    fn qg6_hierarchical_equivalence_is_not_vetoed_by_flat_effect_claim_logic() {
+        let ratios = [[1.0; 3]; 4];
+        let (artifact, evidence) = qg6_current_pair("candidate", ratios);
+        let flat_effect = artifact
+            .cells
+            .iter()
+            .find(|cell| cell.engine == "paired_ab")
+            .expect("flat A/B compatibility projection");
+        let flat_null = artifact
+            .cells
+            .iter()
+            .find(|cell| cell.engine == "paired_null")
+            .expect("flat A/A compatibility projection");
+        assert!(
+            flat_null.distribution.median_ci95_low <= flat_effect.distribution.p50
+                && flat_effect.distribution.p50 <= flat_null.distribution.median_ci95_high,
+            "the generic flat effect-claim rule must be inconclusive for this equivalence fixture"
+        );
+
+        let mut state = DecisionState::default();
+        let cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        validate_paired_evidence(PerfGate::Qg6, &cells, "candidate", &mut state);
+        let mut target = GateTargetEvaluator {
+            artifact: &artifact,
+            cells: &cells,
+            activated: true,
+            state: &mut state,
+        };
+        evaluate_qg6(&mut target, Some(&evidence));
+        assert!(
+            !state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.inconclusive_paired_claim"
+                    || reason.code == "perf.ratchet.gate_target_missed"
+                    || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+            }),
+            "flat claim logic vetoed a decision-valid hierarchical equivalence result: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg6_null_admission_uses_hierarchy_when_flat_projection_would_false_pass() {
+        let effect_ratios = [[0.95; 3]; 4];
+        let null_ratios = [
+            [1.0, 1.0, 1.0],
+            [1.08, 1.08, 1.0],
+            [1.08, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        let (artifact, evidence) =
+            qg6_current_pair_with_null("candidate", effect_ratios, null_ratios);
+        let flat = artifact
+            .cells
+            .iter()
+            .find(|cell| cell.engine == "paired_null")
+            .expect("flat A/A compatibility projection");
+        assert!(
+            flat.distribution.median_ci95_low >= 0.95
+                && flat.distribution.median_ci95_high <= 1.05
+                && flat.distribution.median_ci95_low <= 1.0
+                && 1.0 <= flat.distribution.median_ci95_high,
+            "fixture must demonstrate the former flat A/A false pass: {:?}",
+            flat.distribution
+        );
+        let EvidenceCellBody::Paired {
+            hierarchical_null: Some(hierarchical_null),
+            ..
+        } = &evidence.cells[0].body
+        else {
+            unreachable!("QG-6 must carry a hierarchical A/A estimate");
+        };
+        assert!(
+            (hierarchical_null.ci95_low_ratio - 1.0)
+                .abs()
+                .max((hierarchical_null.ci95_high_ratio - 1.0).abs())
+                > 0.05,
+            "hierarchical A/A CI must expose between-query uncertainty"
+        );
+
+        let mut state = DecisionState::default();
+        let cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        let mut target = GateTargetEvaluator {
+            artifact: &artifact,
+            cells: &cells,
+            activated: true,
+            state: &mut state,
+        };
+        evaluate_qg6(&mut target, Some(&evidence));
+        assert!(state.quarantined);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.inconclusive_equivalence"
+                && reason.message.contains("hierarchical A/A")
+        }));
+    }
+
+    #[test]
+    fn qg6_gate_never_borrows_hierarchy_from_an_unrelated_same_fixture_cell() {
+        let ratios = [[0.95; 3]; 4];
+        let (artifact, mut evidence) = qg6_current_pair("candidate", ratios);
+        let mut unrelated = evidence.cells[0].clone();
+        unrelated.spec.unit = "ns".to_owned();
+        unrelated.spec.role = EvidenceRole::Diagnostic;
+        let EvidenceCellBody::Paired {
+            hierarchical: Some(estimate),
+            ..
+        } = &mut unrelated.body
+        else {
+            unreachable!("QG-6 must carry a hierarchical estimate");
+        };
+        estimate.ci95_low_ratio = 2.0;
+        estimate.ci95_high_ratio = 2.0;
+        evidence.cells.insert(0, unrelated);
+
+        let mut state = DecisionState::default();
+        let cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        let mut target = GateTargetEvaluator {
+            artifact: &artifact,
+            cells: &cells,
+            activated: true,
+            state: &mut state,
+        };
+        evaluate_qg6(&mut target, Some(&evidence));
+        assert!(
+            !state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.gate_target_missed"
+                    || reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+            }),
+            "an unrelated same-fixture cell influenced the QG-6 target: {:?}",
+            state.reasons
+        );
+
+        evidence.cells.pop();
+        let mut missing_state = DecisionState::default();
+        let missing_cells = validate_artifact(
+            &artifact,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut missing_state,
+        );
+        let mut missing_target = GateTargetEvaluator {
+            artifact: &artifact,
+            cells: &missing_cells,
+            activated: true,
+            state: &mut missing_state,
+        };
+        evaluate_qg6(&mut missing_target, Some(&evidence));
+        assert!(
+            missing_state
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.qg6_hierarchical_evidence_missing")
+        );
+    }
+
+    #[test]
+    fn qg6_reproduction_uses_hierarchical_grouping_not_equal_flat_multisets() {
+        let candidate_groups = [
+            [0.95, 0.95, 0.95],
+            [0.95, 0.95, 0.95],
+            [0.95, 1.10, 1.10],
+            [1.10, 1.10, 1.10],
+        ];
+        let rerun_groups = [
+            [0.95, 0.95, 1.10],
+            [0.95, 0.95, 1.10],
+            [0.95, 0.95, 1.10],
+            [0.95, 1.10, 1.10],
+        ];
+        let (_, candidate) = qg6_current_pair("candidate", candidate_groups);
+        let (_, rerun) = qg6_current_pair("rerun", rerun_groups);
+        let candidate_pair = match &candidate.cells[0].body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        let rerun_pair = match &rerun.cells[0].body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        assert!(
+            candidate_pair
+                .reproduces_within(rerun_pair)
+                .expect("flat reproduction compatibility"),
+            "fixture must reproduce under the former flat estimator"
+        );
+
+        let mut state = DecisionState::default();
+        compare_current_evidence_reproduction(&candidate, &rerun, &mut state);
+        assert!(state.quarantined);
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+            })
+        );
+    }
+
+    #[test]
+    fn qg6_null_reproduction_uses_hierarchical_grouping_not_equal_flat_multisets() {
+        let candidate_null_groups = [
+            [0.95, 0.95, 0.95],
+            [0.95, 0.95, 0.95],
+            [0.95, 1.10, 1.10],
+            [1.10, 1.10, 1.10],
+        ];
+        let rerun_null_groups = [
+            [0.95, 0.95, 1.10],
+            [0.95, 0.95, 1.10],
+            [0.95, 0.95, 1.10],
+            [0.95, 1.10, 1.10],
+        ];
+        let (_, candidate) =
+            qg6_current_pair_with_null("candidate", [[0.95; 3]; 4], candidate_null_groups);
+        let (_, rerun) = qg6_current_pair_with_null("rerun", [[0.95; 3]; 4], rerun_null_groups);
+        let candidate_pair = match &candidate.cells[0].body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        let rerun_pair = match &rerun.cells[0].body {
+            EvidenceCellBody::Paired { paired, .. } => paired,
+            EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+        };
+        assert_eq!(
+            projected_ratio_distribution(&candidate_pair.null_samples),
+            projected_ratio_distribution(&rerun_pair.null_samples),
+            "fixture must have identical legacy flat A/A projections"
+        );
+
+        let mut state = DecisionState::default();
+        compare_current_evidence_reproduction(&candidate, &rerun, &mut state);
+        assert!(state.quarantined);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.qg6_hierarchical_reproduction_failed"
+                && reason.message.contains("A/A null")
+        }));
+    }
+
+    #[test]
+    fn qg6_legacy_flat_null_projection_never_vetoes_reproduction() {
+        let ratios = [[0.95; 3]; 4];
+        let (candidate, _) = qg6_current_pair("candidate", ratios);
+        let (mut rerun, _) = qg6_current_pair("rerun", ratios);
+        let flat_null = rerun
+            .cells
+            .iter_mut()
+            .find(|cell| cell.engine == "paired_null")
+            .expect("flat A/A compatibility projection");
+        flat_null.distribution.p50 = 1.50;
+        flat_null.distribution.median_ci95_low = 1.49;
+        flat_null.distribution.median_ci95_high = 1.51;
+
+        let mut state = DecisionState::default();
+        let candidate_cells = validate_artifact(
+            &candidate,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        let rerun_cells =
+            validate_artifact(&rerun, PerfGate::Qg6, &"b".repeat(64), "rerun", &mut state);
+        compare_reproduction(
+            &candidate,
+            &rerun,
+            &candidate_cells,
+            &rerun_cells,
+            &mut state,
+        );
+        assert!(
+            !state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.reproduction_failed"
+                    && reason.message.contains("paired_null")
+            }),
+            "flat A/A projection leaked into QG-6 reproduction: {:?}",
+            state.reasons
+        );
+    }
+
+    #[test]
+    fn qg6_legacy_flat_paired_projections_never_veto_baseline_comparison() {
+        let ratios = [[0.95; 3]; 4];
+        let (baseline, _) = qg6_current_pair("baseline", ratios);
+        let (mut candidate, _) = qg6_current_pair("candidate", ratios);
+        for cell in &mut candidate.cells {
+            match cell.engine.as_str() {
+                "paired_ab" => {
+                    cell.distribution.p50 = 2.0;
+                    cell.distribution.median_ci95_low = 1.9;
+                    cell.distribution.median_ci95_high = 2.1;
+                }
+                "paired_null" => {
+                    cell.distribution.p50 = 1.5;
+                    cell.distribution.median_ci95_low = 1.4;
+                    cell.distribution.median_ci95_high = 1.6;
+                }
+                _ => {}
+            }
+        }
+
+        let mut state = DecisionState::default();
+        let baseline_cells = validate_artifact(
+            &baseline,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "baseline",
+            &mut state,
+        );
+        let candidate_cells = validate_artifact(
+            &candidate,
+            PerfGate::Qg6,
+            &"b".repeat(64),
+            "candidate",
+            &mut state,
+        );
+        let mut comparisons = Vec::new();
+        compare_baseline(
+            &baseline,
+            &candidate,
+            &baseline_cells,
+            &candidate_cells,
+            PerfRatchetMode::Promotion,
+            &mut comparisons,
+            &mut state,
+        );
+        assert!(
+            !state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.invalid_null_control"
+                    || (matches!(
+                        reason.code.as_str(),
+                        "perf.ratchet.regression_detected" | "perf.ratchet.inconclusive_regression"
+                    ) && reason.message.contains("paired_ab"))
+            }),
+            "flat QG-6 paired projections leaked into baseline decisions: {:?}",
+            state.reasons
+        );
+        assert!(
+            comparisons
+                .iter()
+                .all(|comparison| comparison.engine != "paired_ab"),
+            "flat QG-6 effect projection leaked into comparison output"
         );
     }
 
@@ -2310,7 +3509,9 @@ mod tests {
     fn same_revision_reproduction_mismatch_quarantines() {
         let baseline = qg2_artifact("old", 160.0, 100.0);
         let candidate = qg2_artifact("new", 160.0, 100.0);
-        let rerun = qg2_artifact("new", 145.0, 100.0);
+        // Keep the rerun independently above QG-2's 1.5x target while
+        // exceeding the predeclared 5% reproduction tolerance.
+        let rerun = qg2_artifact("new", 151.0, 100.0);
         let result = evaluate(
             &baseline,
             &candidate,

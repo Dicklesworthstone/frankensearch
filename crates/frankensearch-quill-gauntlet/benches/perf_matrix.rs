@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
 use frankensearch_core::bench_support::print_bench_elf_sha256;
-use frankensearch_core::{IndexableDocument, LexicalSearch};
+use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
 use frankensearch_lexical::TantivyIndex;
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
@@ -36,12 +36,13 @@ use frankensearch_quill_gauntlet::{
     EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity,
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence,
     PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample,
-    PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
-    PositionMode, Qg6ArmRole, Qg6Comparison, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder,
-    Qg6SearchResult, Qg6SelectionScope, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
-    seeded_balanced_pair_order, validate_matrix,
+    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
+    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
+    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
+    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, estimate_paired_experiment,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, seeded_balanced_pair_order,
+    validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -277,7 +278,7 @@ fn tantivy_create(path: &Path, spec: &PerfCellSpec) -> TantivyIndex {
     .expect("create pinned on-disk Tantivy oracle")
 }
 
-fn preflight_index<E: LexicalSearch>(
+fn preflight_index<E: LexicalRead + LexicalWrite>(
     context: &BenchContext,
     index: &E,
     documents: &[IndexableDocument],
@@ -384,7 +385,7 @@ fn preflight_indexing_fixtures(
     }
 }
 
-fn index_batches<E: LexicalSearch>(
+fn index_batches<E: LexicalWrite>(
     context: &BenchContext,
     index: &E,
     corpus: &SyntheticCorpus,
@@ -410,7 +411,7 @@ fn index_batches_observed<E, F>(
     mut observe_batch: F,
 ) -> Duration
 where
-    E: LexicalSearch,
+    E: LexicalWrite,
     F: FnMut(u64),
 {
     let mut measured = Duration::ZERO;
@@ -436,7 +437,7 @@ where
     measured
 }
 
-fn commit<E: LexicalSearch>(context: &BenchContext, index: &E) -> Duration {
+fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     let timer = Instant::now();
     context.runtime.block_on(async {
         index.commit(&context.cx).await.expect("QG commit");
@@ -578,7 +579,7 @@ fn update_probe(corpus: &SyntheticCorpus, update_count: u64, generation: u64) ->
     (format!("qgupdateg{generation}d{ordinal}"), expected_doc_id)
 }
 
-fn assert_exact_visibility<E: LexicalSearch>(
+fn assert_exact_visibility<E: LexicalRead>(
     context: &BenchContext,
     index: &E,
     query: &str,
@@ -593,7 +594,7 @@ fn assert_exact_visibility<E: LexicalSearch>(
     black_box(doc_ids);
 }
 
-fn assert_absent<E: LexicalSearch>(context: &BenchContext, index: &E, query: &str) {
+fn assert_absent<E: LexicalRead>(context: &BenchContext, index: &E, query: &str) {
     let doc_ids = search_doc_ids(context, index, query);
     assert!(
         doc_ids.is_empty(),
@@ -602,7 +603,7 @@ fn assert_absent<E: LexicalSearch>(context: &BenchContext, index: &E, query: &st
     black_box(doc_ids);
 }
 
-fn search_doc_ids<E: LexicalSearch>(context: &BenchContext, index: &E, query: &str) -> Vec<String> {
+fn search_doc_ids<E: LexicalRead>(context: &BenchContext, index: &E, query: &str) -> Vec<String> {
     context.runtime.block_on(async {
         index
             .search(&context.cx, query, 3)
@@ -887,7 +888,7 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
     elapsed.as_secs_f64() * 1_000.0
 }
 
-fn validate_compaction_outcome<E: LexicalSearch>(
+fn validate_compaction_outcome<E: LexicalRead>(
     context: &BenchContext,
     index: &E,
     corpus: &SyntheticCorpus,
@@ -943,11 +944,6 @@ fn stage_deletes(
         start = end;
     }
 }
-
-/// Per-class query groups for hierarchical latency evidence. The first entry
-/// of each class is the legacy single-query text, so flat consumers keep the
-/// exact workload they always measured.
-const QG6_QUERY_GROUPS: usize = 4;
 
 fn query_texts(query_class: PerfQueryClass) -> &'static [&'static str; QG6_QUERY_GROUPS] {
     match query_class {
@@ -1471,7 +1467,7 @@ fn prepared_qg6_streams(
     evidence: &EvidenceContext,
     scope: &PerfOperationScope,
     cell_seed: u64,
-) -> (Vec<PerfRawSample>, Vec<PerfRawSample>) {
+) -> (Vec<PerfRawSample>, Vec<PerfRawSample>, PerfInputIdentity) {
     let count = context
         .scale
         .document_count(spec.document_count.expect("query corpus count"));
@@ -1558,13 +1554,15 @@ fn prepared_qg6_streams(
     for sample in &measurement.samples {
         result_receipt_hasher.update(sample.result_sha256.as_bytes());
     }
-    let mut sample_identity_hasher = Sha256::new();
-    sample_identity_hasher.update(b"frankensearch/qg6/sample-input/v1\0");
-    sample_identity_hasher.update(measurement.identity.corpus_sha256.as_bytes());
-    sample_identity_hasher.update(measurement.identity.query_manifest_sha256.as_bytes());
-    sample_identity_hasher.update(measurement.identity.config_contract_sha256.as_bytes());
+    let input_identity = PerfInputIdentity {
+        prepared_corpus_sha256: measurement.identity.corpus_sha256.clone(),
+        query_manifest_sha256: measurement.identity.query_manifest_sha256.clone(),
+        config_contract_sha256: measurement.identity.config_contract_sha256.clone(),
+        query_group_count: QG6_QUERY_GROUPS,
+        query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+    };
     let mut sample_provenance = evidence.sample_provenance.clone();
-    sample_provenance.corpus_sha256 = lower_hex(&sample_identity_hasher.finalize());
+    sample_provenance.input_identity = Some(input_identity.clone());
     eprintln!(
         "[qg6-prepared] fixture={} corpus_sha256={} query_manifest_sha256={} \
          config_contract_sha256={} schedule_seed={} warmup_rounds={} rounds_per_query={} \
@@ -1576,7 +1574,7 @@ fn prepared_qg6_streams(
         measurement.schedule_seed,
         measurement.warmup_rounds,
         measurement.rounds_per_query,
-        sample_provenance.corpus_sha256,
+        input_identity.fingerprint_sha256(),
         lower_hex(&result_receipt_hasher.finalize()),
         serde_json::to_string(&measurement.lifecycle).expect("serialize QG-6 lifecycle"),
     );
@@ -1590,7 +1588,7 @@ fn prepared_qg6_streams(
             Qg6Comparison::Effect => effect_samples.push(sample),
         }
     }
-    (null_samples, effect_samples)
+    (null_samples, effect_samples, input_identity)
 }
 
 struct CellCollection {
@@ -1622,6 +1620,7 @@ fn collect_cell(
                 metric: spec.metric.clone(),
                 unit: unit(spec).to_owned(),
                 role: EvidenceRole::Diagnostic,
+                input_identity: None,
                 cold_cache: None,
             },
             samples,
@@ -1642,8 +1641,10 @@ fn collect_cell(
     // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
     // four-arm runner so setup is impossible inside timed samples and null/
     // effect blocks are interleaved.
-    let (null_samples, effect_samples) = if spec.gate == PerfGate::Qg6 {
-        prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed)
+    let (null_samples, effect_samples, input_identity) = if spec.gate == PerfGate::Qg6 {
+        let (null, effect, input_identity) =
+            prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
+        (null, effect, Some(input_identity))
     } else {
         let null = paired_raw_stream(
             context,
@@ -1679,7 +1680,7 @@ fn collect_cell(
                 query_override: None,
             },
         );
-        (null, effect)
+        (null, effect, None)
     };
 
     let quill_distribution =
@@ -1729,6 +1730,7 @@ fn collect_cell(
             } else {
                 EvidenceRole::Required
             },
+            input_identity,
             cold_cache,
         },
         experiment,
@@ -2089,6 +2091,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             run_id: run_id.clone(),
             executable_sha256: bench_elf_sha256.to_owned(),
             corpus_sha256: corpus_hash.clone(),
+            input_identity: None,
             worker_id: machine_fingerprint(),
             build_profile: build_profile.clone(),
         },

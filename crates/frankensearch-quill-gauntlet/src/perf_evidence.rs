@@ -19,7 +19,7 @@
 //! and [`PerfEvidenceArtifact::ratchet_admissible`] refuses to let them
 //! establish or move any baseline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -32,7 +32,8 @@ use thiserror::Error;
 use crate::perf::{
     DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PairedClaimState, PairedEstimatorConfig,
     PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult, PerfGate, PerfGateArtifact,
-    PerfRawSample, median_sorted, percentile, splitmix64, validate_paired_blocks,
+    PerfInputIdentity, PerfRawSample, median_sorted, percentile, splitmix64,
+    validate_paired_blocks,
 };
 
 /// Version of the evidence artifact emitted by this module.
@@ -454,7 +455,9 @@ pub struct ColdCacheEvidence {
 pub struct CorpusIdentity {
     /// SHA-256 over the corpus manifest.
     pub corpus_sha256: String,
-    /// SHA-256 over the query set, when the gate uses one.
+    /// SHA-256 over the invocation-wide query universe, when the gate uses
+    /// one. A prepared cell's exact ordered manifest is separately sealed in
+    /// [`PerfInputIdentity::query_manifest_sha256`].
     pub query_set_sha256: Option<String>,
     /// SHA-256 over relevance judgments, when the gate uses them.
     pub qrels_sha256: Option<String>,
@@ -746,6 +749,10 @@ pub struct EvidenceCellSpec {
     pub unit: String,
     /// Whether the gate decision folds this cell in.
     pub role: EvidenceRole,
+    /// Separate exact prepared-corpus, ordered-query, and semantic-configuration
+    /// hashes. QG-6 requires this identity; flat gates leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_identity: Option<PerfInputIdentity>,
     /// Cache-state proof, required for cold-open cells.
     pub cold_cache: Option<ColdCacheEvidence>,
 }
@@ -759,9 +766,14 @@ pub enum EvidenceCellBody {
         /// Complete replayable paired result, including both-engine absolute
         /// distributions and the bounded raw samples they recompute from.
         paired: Box<PairedExperimentResult>,
-        /// Two-stage estimate for hierarchical latency cells.
+        /// Two-stage A/B effect estimate for hierarchical latency cells.
         hierarchical: Option<HierarchicalLatencyEstimate>,
-        /// Same-scope absolute-versus-paired reconciliation.
+        /// Two-stage same-invocation A/A null estimate for hierarchical latency
+        /// cells. A hierarchical effect can never borrow a flat null inference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hierarchical_null: Option<HierarchicalLatencyEstimate>,
+        /// Same-scope absolute-versus-paired reconciliation. This is a
+        /// diagnostic projection for QG-6, whose inference is hierarchical.
         reconciliation: AbsoluteRelativeReconciliation,
     },
     /// Direct facts outside noisy timing A/A, such as dependency counts.
@@ -790,14 +802,46 @@ pub struct EvidenceCell {
     pub reasons: Vec<EvidenceReason>,
 }
 
+/// Flat-estimator findings that are diagnostics only for QG-6.
+///
+/// QG-6's inferential unit is the query, so its effect and null center,
+/// interval, and dispersion come from the two-stage hierarchy. Everything
+/// outside this explicit allowlist remains a fail-closed paired-stream
+/// structural/design finding.
+fn qg6_flat_inference_only(code: &str) -> bool {
+    matches!(
+        code,
+        "paired.null_center_invalid"
+            | "paired.null_too_wide"
+            | "paired.null_dispersion"
+            | "paired.absolute_direction_conflict"
+    )
+}
+
+fn hierarchical_groups_match_input(
+    estimate: &HierarchicalLatencyEstimate,
+    identity: &PerfInputIdentity,
+) -> bool {
+    estimate.group_count == identity.query_group_count
+        && estimate.groups.len() == identity.query_group_count
+        && estimate
+            .groups
+            .iter()
+            .map(|group| group.group_id)
+            .eq(identity.query_group_ids.iter().copied())
+}
+
 impl EvidenceCell {
     /// Evaluate one paired measurement into a decision-grade cell.
     ///
-    /// The status derivation is deterministic and ordered: an invalid A/A
-    /// null yields [`EvidenceDecisionStatus::InvalidNull`]; any other paired
-    /// invalidity, estimand precondition failure, reconciliation conflict, or
-    /// undersampling yields [`EvidenceDecisionStatus::NoDecision`]; otherwise
-    /// the cell is [`EvidenceDecisionStatus::MeasuredProvisional`].
+    /// The status derivation is deterministic and ordered. Flat gates map an
+    /// invalid A/A null to [`EvidenceDecisionStatus::InvalidNull`] and retain
+    /// their paired-estimator inference. QG-6 instead derives inference from
+    /// its hierarchical A/B and A/A estimates while preserving paired-stream
+    /// structural/design failures. Any remaining invalidity, estimand
+    /// precondition failure, reconciliation conflict, or undersampling yields
+    /// [`EvidenceDecisionStatus::NoDecision`]; otherwise the cell is
+    /// [`EvidenceDecisionStatus::MeasuredProvisional`].
     ///
     /// # Errors
     ///
@@ -820,7 +864,34 @@ impl EvidenceCell {
         let estimand = required_estimand(spec.gate);
         let mut reasons = Vec::new();
 
-        if paired.status != PairedEvidenceStatus::Valid {
+        match (spec.gate, spec.input_identity.as_ref()) {
+            (PerfGate::Qg6, Some(identity)) => {
+                identity.validate()?;
+                if paired.provenance.input_identity.as_ref() != Some(identity) {
+                    return Err(EvidenceArtifactError::InconsistentArtifact {
+                        reason: "QG-6 cell input identity does not match its raw-sample provenance"
+                            .to_owned(),
+                    });
+                }
+            }
+            (PerfGate::Qg6, None) => {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason:
+                        "QG-6 evidence requires separate exact prepared-corpus, ordered-query, \
+                             and configuration identity"
+                            .to_owned(),
+                });
+            }
+            (_, Some(_)) => {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "exact prepared-input identity is only valid for QG-6".to_owned(),
+                });
+            }
+            (_, None) => {}
+        }
+
+        let hierarchical_gate = estimand == EvidenceEstimand::HierarchicalLatency;
+        if !hierarchical_gate && paired.status != PairedEvidenceStatus::Valid {
             reasons.push(EvidenceReason::new(
                 "evidence.paired_invalid",
                 format!(
@@ -831,21 +902,87 @@ impl EvidenceCell {
                 EvidenceSeverity::NoClaim,
             ));
         }
+        if hierarchical_gate {
+            for diagnostic in paired
+                .reasons
+                .iter()
+                .filter(|reason| !qg6_flat_inference_only(reason.code.as_str()))
+            {
+                reasons.push(EvidenceReason::new(
+                    "evidence.qg6_paired_design_invalid",
+                    format!(
+                        "QG-6 paired stream failed structural/design check {}: {}",
+                        diagnostic.code, diagnostic.message
+                    ),
+                    EvidenceSeverity::NoClaim,
+                ));
+            }
+        }
 
-        let hierarchical = if estimand == EvidenceEstimand::HierarchicalLatency {
-            match estimate_hierarchical_latency(&paired.effect_samples, &paired.config, policy) {
-                Ok(estimate) => Some(estimate),
-                Err(error) => {
+        let (hierarchical, hierarchical_null) = if hierarchical_gate {
+            let effect =
+                match estimate_hierarchical_latency(&paired.effect_samples, &paired.config, policy)
+                {
+                    Ok(estimate) => Some(estimate),
+                    Err(error) => {
+                        reasons.push(EvidenceReason::new(
+                            "evidence.hierarchical_effect_unavailable",
+                            format!("hierarchical A/B latency estimand failed: {error}"),
+                            EvidenceSeverity::NoClaim,
+                        ));
+                        None
+                    }
+                };
+            let null =
+                match estimate_hierarchical_latency(&paired.null_samples, &paired.config, policy) {
+                    Ok(estimate) => Some(estimate),
+                    Err(error) => {
+                        reasons.push(EvidenceReason::new(
+                            "evidence.hierarchical_null_unavailable",
+                            format!("hierarchical A/A latency estimand failed: {error}"),
+                            EvidenceSeverity::NoClaim,
+                        ));
+                        None
+                    }
+                };
+            if let Some(null) = null.as_ref() {
+                let max_ci_distance = null.ci95_low_log.abs().max(null.ci95_high_log.abs());
+                if !(null.ci95_low_log <= 0.0 && 0.0 <= null.ci95_high_log)
+                    || null.median_of_group_medians_log.abs() > paired.config.max_null_center_log
+                    || max_ci_distance > paired.config.max_null_ci_half_width_log
+                {
                     reasons.push(EvidenceReason::new(
-                        "evidence.hierarchical_unavailable",
-                        format!("hierarchical latency estimand failed: {error}"),
+                        "evidence.hierarchical_null_invalid",
+                        format!(
+                            "hierarchical A/A center {:.6} with log-CI [{:.6}, {:.6}] exceeds \
+                                 the predeclared null bounds",
+                            null.median_of_group_medians_log, null.ci95_low_log, null.ci95_high_log
+                        ),
                         EvidenceSeverity::NoClaim,
                     ));
-                    None
                 }
             }
+            if let Some(identity) = spec.input_identity.as_ref() {
+                for (label, estimate) in
+                    [("A/B effect", effect.as_ref()), ("A/A null", null.as_ref())]
+                {
+                    if estimate.is_some_and(|estimate| {
+                        !hierarchical_groups_match_input(estimate, identity)
+                    }) {
+                        reasons.push(EvidenceReason::new(
+                            "evidence.qg6_query_groups_incomplete",
+                            format!(
+                                "hierarchical {label} groups do not exactly match the prepared \
+                                 ordered query-group identity"
+                            ),
+                            EvidenceSeverity::NoClaim,
+                        ));
+                    }
+                }
+            }
+            (effect, null)
         } else {
-            None
+            (None, None)
         };
 
         if estimand == EvidenceEstimand::ColdOpen
@@ -862,24 +999,26 @@ impl EvidenceCell {
         }
 
         let reconciliation = AbsoluteRelativeReconciliation::from_effect(&paired.effect, policy);
-        if !reconciliation.direction_agrees {
-            reasons.push(EvidenceReason::new(
-                "evidence.absolute_relative_direction_conflict",
-                format!(
-                    "paired ratio {:.6} and marginal ratio {:.6} disagree in direction",
-                    reconciliation.paired_median_ratio, reconciliation.marginal_median_ratio
-                ),
-                EvidenceSeverity::NoClaim,
-            ));
-        } else if !reconciliation.within_tolerance {
-            reasons.push(EvidenceReason::new(
-                "evidence.absolute_relative_magnitude_divergence",
-                format!(
-                    "paired/marginal log divergence {:.6} exceeds tolerance {:.6}",
-                    reconciliation.abs_log_delta, policy.reconciliation_tolerance_log
-                ),
-                EvidenceSeverity::NoClaim,
-            ));
+        if !hierarchical_gate {
+            if !reconciliation.direction_agrees {
+                reasons.push(EvidenceReason::new(
+                    "evidence.absolute_relative_direction_conflict",
+                    format!(
+                        "paired ratio {:.6} and marginal ratio {:.6} disagree in direction",
+                        reconciliation.paired_median_ratio, reconciliation.marginal_median_ratio
+                    ),
+                    EvidenceSeverity::NoClaim,
+                ));
+            } else if !reconciliation.within_tolerance {
+                reasons.push(EvidenceReason::new(
+                    "evidence.absolute_relative_magnitude_divergence",
+                    format!(
+                        "paired/marginal log divergence {:.6} exceeds tolerance {:.6}",
+                        reconciliation.abs_log_delta, policy.reconciliation_tolerance_log
+                    ),
+                    EvidenceSeverity::NoClaim,
+                ));
+            }
         }
 
         if !(paired.effect.control.sampled_for_activation()
@@ -896,9 +1035,9 @@ impl EvidenceCell {
         }
 
         reasons.truncate(EVIDENCE_MAX_REASONS);
-        let status = if paired.status == PairedEvidenceStatus::InvalidNull {
+        let status = if !hierarchical_gate && paired.status == PairedEvidenceStatus::InvalidNull {
             EvidenceDecisionStatus::InvalidNull
-        } else if paired.status != PairedEvidenceStatus::Valid
+        } else if (!hierarchical_gate && paired.status != PairedEvidenceStatus::Valid)
             || reasons
                 .iter()
                 .any(|reason| reason.severity >= EvidenceSeverity::NoClaim)
@@ -915,6 +1054,7 @@ impl EvidenceCell {
             body: EvidenceCellBody::Paired {
                 paired: Box::new(paired),
                 hierarchical,
+                hierarchical_null,
                 reconciliation,
             },
             status,
@@ -939,6 +1079,11 @@ impl EvidenceCell {
         if estimand != EvidenceEstimand::DependencyFacts {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: format!("gate {} does not admit a facts cell", spec.gate),
+            });
+        }
+        if spec.input_identity.is_some() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "dependency facts cannot carry exact prepared-input identity".to_owned(),
             });
         }
         if spec.role != EvidenceRole::Diagnostic && raw_values.len() < 2 {
@@ -975,6 +1120,16 @@ impl EvidenceCell {
     #[must_use]
     pub fn claim_eligible(&self) -> bool {
         match &self.body {
+            EvidenceCellBody::Paired {
+                paired: _,
+                hierarchical,
+                hierarchical_null,
+                ..
+            } if self.spec.gate == PerfGate::Qg6 => {
+                self.status == EvidenceDecisionStatus::MeasuredProvisional
+                    && hierarchical.is_some()
+                    && hierarchical_null.is_some()
+            }
             EvidenceCellBody::Paired { paired, .. } => {
                 self.status == EvidenceDecisionStatus::MeasuredProvisional
                     && paired.claim_state == PairedClaimState::EligibleForDecision
@@ -1052,6 +1207,15 @@ pub struct PerfEvidenceArtifact {
     pub gate_status: EvidenceDecisionStatus,
     /// Promotion decision recorded by a downstream validator, if any.
     pub gate_decision: Option<EvidenceDecisionStatus>,
+    /// Invocation-level reason this otherwise valid evidence must not support
+    /// a claim, such as selecting only part of a normative gate.
+    ///
+    /// This is stored separately from [`Self::reasons`] because `reasons` is a
+    /// derived fold. Keeping the input explicit makes a partial-run artifact
+    /// recomputable by [`Self::load_verified`] instead of manufacturing a gate
+    /// status that cannot be derived from its persisted sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_no_claim: Option<EvidenceReason>,
     /// Gate-level reasons in fixed fold order.
     pub reasons: Vec<EvidenceReason>,
     /// SHA-256 over the canonical JSON with this field empty.
@@ -1059,6 +1223,43 @@ pub struct PerfEvidenceArtifact {
 }
 
 impl PerfEvidenceArtifact {
+    fn validate_cell_set(
+        gate: PerfGate,
+        cells: &[EvidenceCell],
+    ) -> Result<(), EvidenceArtifactError> {
+        if cells.is_empty() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "an evidence artifact requires at least one cell".to_owned(),
+            });
+        }
+        let mut cell_ids = BTreeSet::new();
+        for cell in cells {
+            if cell.spec.gate != gate {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "cell {} belongs to gate {}, not {gate}",
+                        cell.cell_id, cell.spec.gate
+                    ),
+                });
+            }
+            let expected_id = format!("{gate}/{}/{}", cell.spec.fixture, cell.spec.metric);
+            if cell.cell_id != expected_id {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "cell ID {:?} does not match its canonical identity {:?}",
+                        cell.cell_id, expected_id
+                    ),
+                });
+            }
+            if !cell_ids.insert(cell.cell_id.as_str()) {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!("evidence artifact repeats cell {}", cell.cell_id),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Assemble and fold one gate's evidence.
     ///
     /// # Errors
@@ -1073,22 +1274,9 @@ impl PerfEvidenceArtifact {
     ) -> Result<Self, EvidenceArtifactError> {
         policy.validate()?;
         provenance.validate()?;
-        if cells.is_empty() {
-            return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: "an evidence artifact requires at least one cell".to_owned(),
-            });
-        }
-        for cell in &cells {
-            if cell.spec.gate != gate {
-                return Err(EvidenceArtifactError::InconsistentArtifact {
-                    reason: format!(
-                        "cell {} belongs to gate {}, not {gate}",
-                        cell.cell_id, cell.spec.gate
-                    ),
-                });
-            }
-        }
-        let (gate_status, reasons) = Self::fold(&cells);
+        Self::validate_cell_set(gate, &cells)?;
+        let admission_no_claim = None;
+        let (gate_status, reasons) = Self::fold(&cells, admission_no_claim.as_ref());
         Ok(Self {
             schema_version: PERF_EVIDENCE_SCHEMA_VERSION.to_owned(),
             gate,
@@ -1097,13 +1285,17 @@ impl PerfEvidenceArtifact {
             cells,
             gate_status,
             gate_decision: None,
+            admission_no_claim,
             reasons,
             artifact_sha256: String::new(),
         })
     }
 
     /// Deterministic severity-precedence fold of required cells.
-    fn fold(cells: &[EvidenceCell]) -> (EvidenceDecisionStatus, Vec<EvidenceReason>) {
+    fn fold(
+        cells: &[EvidenceCell],
+        admission_no_claim: Option<&EvidenceReason>,
+    ) -> (EvidenceDecisionStatus, Vec<EvidenceReason>) {
         let mut reasons = Vec::new();
         let mut any_invalid_null = false;
         let mut any_no_decision = false;
@@ -1132,6 +1324,10 @@ impl PerfEvidenceArtifact {
                 }
                 _ => {}
             }
+        }
+        if let Some(reason) = admission_no_claim {
+            any_no_decision = true;
+            reasons.push(reason.clone());
         }
         if !any_required {
             reasons.push(EvidenceReason::new(
@@ -1169,16 +1365,14 @@ impl PerfEvidenceArtifact {
     /// The measured cells and raw samples remain durable, but the artifact
     /// cannot establish a ratchet or accept a downstream gate decision.
     pub fn force_no_claim(&mut self, code: &str, message: impl Into<String>) {
-        if self.gate_status != EvidenceDecisionStatus::InvalidNull {
-            self.gate_status = EvidenceDecisionStatus::NoDecision;
-        }
-        self.gate_decision = None;
-        self.reasons.push(EvidenceReason::new(
+        self.admission_no_claim = Some(EvidenceReason::new(
             code,
             message,
             EvidenceSeverity::NoClaim,
         ));
-        self.reasons.truncate(EVIDENCE_MAX_REASONS);
+        self.gate_decision = None;
+        (self.gate_status, self.reasons) =
+            Self::fold(&self.cells, self.admission_no_claim.as_ref());
         self.artifact_sha256.clear();
     }
 
@@ -1226,6 +1420,76 @@ impl PerfEvidenceArtifact {
         let mut sealed = unsealed;
         sealed.artifact_sha256 = lower_hex(&digest);
         Ok(serde_json::to_string_pretty(&sealed)?)
+    }
+
+    /// Verify this in-memory artifact's seal and every derived invariant.
+    ///
+    /// This is the in-memory counterpart to [`Self::load_verified`]. Public
+    /// consumers that retain a loaded artifact and later pass it to another
+    /// decision API must be able to detect post-load mutation instead of
+    /// trusting the syntax of a stale `artifact_sha256` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for a stale schema,
+    /// broken content seal, invalid policy or provenance, malformed cell set,
+    /// non-recomputable cell or gate fold, or inadmissible recorded decision.
+    pub fn verify_integrity(&self) -> Result<(), EvidenceArtifactError> {
+        if self.schema_version != PERF_EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceArtifactError::SchemaMismatch {
+                found: self.schema_version.clone(),
+            });
+        }
+        let mut unsealed = self.clone();
+        unsealed.artifact_sha256 = String::new();
+        let recomputed = lower_hex(&Sha256::digest(
+            serde_json::to_string_pretty(&unsealed)?.as_bytes(),
+        ));
+        if recomputed != self.artifact_sha256 {
+            return Err(EvidenceArtifactError::HashMismatch);
+        }
+        self.policy.validate()?;
+        self.provenance.validate()?;
+        Self::validate_cell_set(self.gate, &self.cells)?;
+        if let Some(reason) = self.admission_no_claim.as_ref()
+            && (reason.severity != EvidenceSeverity::NoClaim
+                || reason.code.trim().is_empty()
+                || reason.code.len() > EVIDENCE_MAX_REASON_MESSAGE_BYTES
+                || reason.message.len() > EVIDENCE_MAX_REASON_MESSAGE_BYTES)
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "admission no-claim input must be bounded and have no-claim severity"
+                    .to_owned(),
+            });
+        }
+        for cell in &self.cells {
+            cell.verify_recomputed(&self.policy)?;
+        }
+        let (expected_status, expected_reasons) =
+            Self::fold(&self.cells, self.admission_no_claim.as_ref());
+        if expected_status != self.gate_status || expected_reasons != self.reasons {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "gate fold does not recompute from the stored cells".to_owned(),
+            });
+        }
+        if let Some(decision) = self.gate_decision {
+            if !matches!(
+                decision,
+                EvidenceDecisionStatus::Allow
+                    | EvidenceDecisionStatus::Quarantine
+                    | EvidenceDecisionStatus::Block
+            ) {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!("{decision} is not a promotion decision"),
+                });
+            }
+            if !self.ratchet_admissible() {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "a promotion decision is recorded on non-eligible evidence".to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Render the operator table for this artifact.
@@ -1359,29 +1623,7 @@ impl PerfEvidenceArtifact {
             });
         }
         let artifact: Self = serde_json::from_str(&contents)?;
-        let mut unsealed = artifact.clone();
-        unsealed.artifact_sha256 = String::new();
-        let recomputed = lower_hex(&Sha256::digest(
-            serde_json::to_string_pretty(&unsealed)?.as_bytes(),
-        ));
-        if recomputed != artifact.artifact_sha256 {
-            return Err(EvidenceArtifactError::HashMismatch);
-        }
-        artifact.provenance.validate()?;
-        for cell in &artifact.cells {
-            cell.verify_recomputed(&artifact.policy)?;
-        }
-        let (expected_status, expected_reasons) = Self::fold(&artifact.cells);
-        if expected_status != artifact.gate_status || expected_reasons != artifact.reasons {
-            return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: "gate fold does not recompute from the stored cells".to_owned(),
-            });
-        }
-        if artifact.gate_decision.is_some() && !artifact.ratchet_admissible() {
-            return Err(EvidenceArtifactError::InconsistentArtifact {
-                reason: "a promotion decision is recorded on non-eligible evidence".to_owned(),
-            });
-        }
+        artifact.verify_integrity()?;
         Ok(artifact)
     }
 }
@@ -1526,8 +1768,8 @@ mod tests {
     use super::*;
     use crate::perf::{
         PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfSampleArm, PerfSampleOrder,
-        PerfSamplePhase, PerfSampleProvenance, estimate_paired_experiment,
-        seeded_balanced_pair_order,
+        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
+        estimate_paired_experiment, seeded_balanced_pair_order,
     };
 
     const CANARY: &str = "CANARY_DOCUMENT_TEXT_MUST_NEVER_PERSIST";
@@ -1546,6 +1788,7 @@ mod tests {
             run_id: run_id.to_owned(),
             executable_sha256: "a".repeat(64),
             corpus_sha256: "b".repeat(64),
+            input_identity: None,
             worker_id: "test-worker".to_owned(),
             build_profile: "test".to_owned(),
         }
@@ -1640,6 +1883,40 @@ mod tests {
         samples
     }
 
+    fn grouped_gauge_stream(
+        pairs: &[(u64, f64, f64)],
+        sample_id_base: u64,
+        force_control_first: Option<bool>,
+    ) -> Vec<PerfRawSample> {
+        let scope = scope();
+        let provenance = sample_provenance("run-a");
+        let order = seeded_balanced_pair_order(pairs.len(), 0x00c0_ffee).expect("order");
+        let mut samples = Vec::with_capacity(pairs.len() * 2);
+        for (index, ((group_id, control, treatment), first_arm)) in
+            pairs.iter().zip(order).enumerate()
+        {
+            let block_id = u64::try_from(index).expect("block index");
+            push_gauge_block(
+                &mut samples,
+                &scope,
+                &provenance,
+                block_id,
+                sample_id_base + block_id * 2,
+                *control,
+                *treatment,
+                force_control_first.unwrap_or(first_arm == PerfSampleArm::Control),
+                Some(*group_id),
+            );
+        }
+        samples
+    }
+
+    fn attach_input_identity(samples: &mut [PerfRawSample], identity: Option<&PerfInputIdentity>) {
+        for sample in samples {
+            sample.provenance.input_identity = identity.cloned();
+        }
+    }
+
     fn quiet_null_pairs(count: usize) -> Vec<(f64, f64)> {
         (0..count)
             .map(|index| {
@@ -1715,6 +1992,13 @@ mod tests {
             metric: "latency_ms".to_owned(),
             unit: "ms".to_owned(),
             role,
+            input_identity: (gate == PerfGate::Qg6).then(|| PerfInputIdentity {
+                prepared_corpus_sha256: "a".repeat(64),
+                query_manifest_sha256: "c".repeat(64),
+                config_contract_sha256: "f".repeat(64),
+                query_group_count: QG6_QUERY_GROUPS,
+                query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+            }),
             cold_cache: None,
         }
     }
@@ -1736,6 +2020,23 @@ mod tests {
             vec![provisional_cell()],
         )
         .expect("provisional artifact")
+    }
+
+    fn qg6_artifact() -> PerfEvidenceArtifact {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let input_identity = spec.input_identity.clone();
+        let mut effect = hierarchical_stream_with_ratio(1.02, 0);
+        let mut null = hierarchical_stream_with_ratio(1.0, 10_000);
+        for sample in effect.iter_mut().chain(&mut null) {
+            sample.provenance.input_identity = input_identity.clone();
+        }
+        let paired =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
+        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let mut provenance = evidence_provenance();
+        provenance.corpus.query_set_sha256 = Some("d".repeat(64));
+        PerfEvidenceArtifact::assemble(PerfGate::Qg6, policy(), provenance, vec![cell])
+            .expect("QG-6 artifact")
     }
 
     #[test]
@@ -1878,9 +2179,13 @@ mod tests {
     }
 
     fn hierarchical_stream() -> Vec<PerfRawSample> {
+        hierarchical_stream_with_ratio(1.10, 0)
+    }
+
+    fn hierarchical_stream_with_ratio(ratio: f64, sample_id_base: u64) -> Vec<PerfRawSample> {
         let mut samples = Vec::new();
         let group_scales = [1.0, 10.0, 100.0, 1_000.0];
-        let mut sample_id = 0_u64;
+        let mut sample_id = sample_id_base;
         for (group_index, scale) in group_scales.iter().enumerate() {
             let group = u64::try_from(group_index).expect("group index");
             let jitter = 0.005 * (group_index as f64 + 1.0);
@@ -1888,7 +2193,7 @@ mod tests {
                 .map(|block| {
                     let wobble = if block % 2 == 0 { jitter } else { -jitter };
                     let control = scale * (1.0 + wobble);
-                    (control, control * 1.10)
+                    (control, control * ratio)
                 })
                 .collect::<Vec<_>>();
             let block_base = group * 100;
@@ -1941,14 +2246,361 @@ mod tests {
     fn latency_gate_without_groups_is_no_decision() {
         let mut spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         spec.metric = "latency_ms".to_owned();
-        let cell = EvidenceCell::evaluate(spec, valid_experiment(1.10), &policy()).expect("cell");
+        let input_identity = spec.input_identity.clone();
+        let mut effect = gauge_stream(&effect_pairs(12, 1.10), 0, 0, None);
+        let mut null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
+        for sample in effect.iter_mut().chain(&mut null) {
+            sample.provenance.input_identity = input_identity.clone();
+        }
+        let experiment =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 estimate");
+        let cell = EvidenceCell::evaluate(spec, experiment, &policy()).expect("cell");
         assert_eq!(cell.estimand, EvidenceEstimand::HierarchicalLatency);
         assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
         assert!(
             cell.reasons
                 .iter()
-                .any(|reason| reason.code == "evidence.hierarchical_unavailable")
+                .any(|reason| reason.code == "evidence.hierarchical_effect_unavailable")
         );
+        assert!(
+            cell.reasons
+                .iter()
+                .any(|reason| reason.code == "evidence.hierarchical_null_unavailable")
+        );
+    }
+
+    #[test]
+    fn qg6_rejects_each_prepared_input_identity_mismatch_independently() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let expected_identity = spec.input_identity.clone();
+        let mut effect = gauge_stream(&effect_pairs(12, 1.02), 0, 0, None);
+        let mut null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
+        for sample in effect.iter_mut().chain(&mut null) {
+            sample.provenance.input_identity = expected_identity.clone();
+        }
+        let experiment =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 estimate");
+
+        for field in [
+            "prepared_corpus_sha256",
+            "query_manifest_sha256",
+            "config_contract_sha256",
+        ] {
+            let mut corrupted = experiment.clone();
+            let identity = corrupted
+                .provenance
+                .input_identity
+                .as_mut()
+                .expect("QG-6 prepared-input identity");
+            match field {
+                "prepared_corpus_sha256" => identity.prepared_corpus_sha256 = "0".repeat(64),
+                "query_manifest_sha256" => identity.query_manifest_sha256 = "1".repeat(64),
+                "config_contract_sha256" => identity.config_contract_sha256 = "2".repeat(64),
+                _ => unreachable!("enumerated identity field"),
+            }
+            let error = EvidenceCell::evaluate(spec.clone(), corrupted, &policy())
+                .expect_err("one independently changed prepared input must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    EvidenceArtifactError::InconsistentArtifact { ref reason }
+                        if reason.contains("input identity")
+                ),
+                "{field} mismatch returned {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qg6_verified_roundtrip_distinguishes_query_universe_from_exact_cell_manifest() {
+        let artifact = qg6_artifact();
+        let exact_query_manifest = artifact.cells[0]
+            .spec
+            .input_identity
+            .as_ref()
+            .expect("QG-6 input identity")
+            .query_manifest_sha256
+            .clone();
+        let selection_query_universe = artifact
+            .provenance
+            .corpus
+            .query_set_sha256
+            .clone()
+            .expect("selection query universe");
+        assert_ne!(
+            selection_query_universe, exact_query_manifest,
+            "selection-wide query-universe provenance must not masquerade as one cell's ordered \
+             query manifest"
+        );
+
+        let directory = tempfile::tempdir().expect("QG-6 artifact directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("persist QG-6 artifact");
+        let verified =
+            PerfEvidenceArtifact::load_verified(&paths.json).expect("verify QG-6 artifact");
+        assert_eq!(
+            verified.cells[0].spec.input_identity,
+            match &verified.cells[0].body {
+                EvidenceCellBody::Paired { paired, .. } => {
+                    paired.provenance.input_identity.clone()
+                }
+                EvidenceCellBody::Facts { .. } => unreachable!("QG-6 must be paired"),
+            }
+        );
+    }
+
+    #[test]
+    fn qg6_verified_load_rejects_sealed_cell_identity_divergence() {
+        let mut artifact = qg6_artifact();
+        artifact.cells[0]
+            .spec
+            .input_identity
+            .as_mut()
+            .expect("QG-6 input identity")
+            .query_manifest_sha256 = "9".repeat(64);
+        let directory = tempfile::tempdir().expect("QG-6 artifact directory");
+        let path = directory.path().join("qg6-sealed-mismatch.json");
+        fs::write(
+            &path,
+            artifact.sealed_json().expect("seal mismatched artifact"),
+        )
+        .expect("persist sealed mismatch");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+    }
+
+    #[test]
+    fn qg6_verified_load_recomputes_hierarchical_null_from_raw_groups() {
+        let mut artifact = qg6_artifact();
+        let EvidenceCellBody::Paired {
+            hierarchical_null: Some(null),
+            ..
+        } = &mut artifact.cells[0].body
+        else {
+            unreachable!("QG-6 must carry hierarchical A/A evidence");
+        };
+        null.median_of_group_medians_log = 1.25_f64.ln();
+        null.treatment_over_control = 1.25;
+        let directory = tempfile::tempdir().expect("QG-6 artifact directory");
+        let path = directory.path().join("qg6-sealed-null-mismatch.json");
+        fs::write(
+            &path,
+            artifact.sealed_json().expect("seal mismatched artifact"),
+        )
+        .expect("persist sealed mismatch");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+    }
+
+    #[test]
+    fn qg6_partial_query_group_removal_cannot_remain_claim_eligible() {
+        let original = qg6_artifact();
+        let original_cell = &original.cells[0];
+        let EvidenceCellBody::Paired { paired, .. } = &original_cell.body else {
+            unreachable!("QG-6 must carry paired evidence");
+        };
+        let retain_first_half = |sample: &&PerfRawSample| sample.group_id.is_some_and(|id| id < 2);
+        let effect = paired
+            .effect_samples
+            .iter()
+            .filter(retain_first_half)
+            .cloned()
+            .collect::<Vec<_>>();
+        let null = paired
+            .null_samples
+            .iter()
+            .filter(retain_first_half)
+            .cloned()
+            .collect::<Vec<_>>();
+        let partial_pair = estimate_paired_experiment(&effect, &null, &paired.config)
+            .expect("two retained groups still satisfy the generic hierarchical minimum");
+        let partial_cell =
+            EvidenceCell::evaluate(original_cell.spec.clone(), partial_pair, &original.policy)
+                .expect("partial-group QG-6 cell remains durable");
+        assert_eq!(partial_cell.status, EvidenceDecisionStatus::NoDecision);
+        assert!(!partial_cell.claim_eligible());
+        assert!(partial_cell.reasons.iter().any(|reason| {
+            reason.code == "evidence.qg6_query_groups_incomplete"
+                && reason
+                    .message
+                    .contains("prepared ordered query-group identity")
+        }));
+
+        let partial = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            original.policy,
+            original.provenance,
+            vec![partial_cell],
+        )
+        .expect("partial-group artifact remains durable");
+        let directory = tempfile::tempdir().expect("partial-group artifact directory");
+        let paths = partial
+            .write_atomic(directory.path())
+            .expect("seal partial-group artifact");
+        let verified = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("partial-group artifact must recompute");
+        assert!(!verified.ratchet_admissible());
+    }
+
+    #[test]
+    fn qg6_hierarchical_null_can_admit_when_flat_null_inference_is_invalid() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let identity = spec.input_identity.clone();
+        let effect_pairs = (0_u64..4)
+            .flat_map(|group_id| [(group_id, 100.0, 98.0); 3])
+            .collect::<Vec<_>>();
+        let mut null_pairs = Vec::new();
+        for group_id in 0_u64..4 {
+            null_pairs.extend((0..25).map(|_| (group_id, 100.0, 80.0)));
+            null_pairs.extend((0..49).map(|_| (group_id, 100.0, 100.0)));
+            null_pairs.extend((0..26).map(|_| (group_id, 100.0, 125.0)));
+        }
+        let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
+        let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        attach_input_identity(&mut effect, identity.as_ref());
+        attach_input_identity(&mut null, identity.as_ref());
+
+        let paired =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
+        assert_eq!(paired.status, PairedEvidenceStatus::InvalidNull);
+        assert_eq!(paired.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            paired
+                .reasons
+                .iter()
+                .all(|reason| qg6_flat_inference_only(&reason.code)),
+            "fixture accidentally carries a structural/design failure: {:?}",
+            paired.reasons
+        );
+
+        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let EvidenceCellBody::Paired {
+            hierarchical_null: Some(null),
+            ..
+        } = &cell.body
+        else {
+            unreachable!("QG-6 must carry hierarchical null evidence");
+        };
+        assert!((null.treatment_over_control - 1.0).abs() < 1.0e-12);
+        assert!(null.ci95_low_ratio >= 0.95 && null.ci95_high_ratio <= 1.05);
+        assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
+        assert!(cell.claim_eligible());
+
+        let artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            policy(),
+            evidence_provenance(),
+            vec![cell],
+        )
+        .expect("QG-6 artifact");
+        assert!(artifact.ratchet_admissible());
+        let directory = tempfile::tempdir().expect("QG-6 hierarchy-native artifact directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("seal hierarchy-native QG-6 artifact");
+        let verified = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("hierarchy-native QG-6 artifact must recompute");
+        assert!(verified.ratchet_admissible());
+    }
+
+    #[test]
+    fn qg6_hierarchy_can_admit_despite_flat_marginal_direction_conflict() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let identity = spec.input_identity.clone();
+        let mut effect_pairs = Vec::new();
+        let mut null_pairs = Vec::new();
+        for group_id in 0_u64..4 {
+            effect_pairs.extend((0..31).map(|_| (group_id, 1_000.0, 950.0)));
+            effect_pairs.extend((0..31).map(|_| (group_id, 10_000.0, 9_500.0)));
+            effect_pairs.extend((0..38).map(|_| (group_id, 1.0, 100_000.0)));
+            null_pairs.extend([(group_id, 100.0, 100.0); 3]);
+        }
+        let mut effect = grouped_gauge_stream(&effect_pairs, 0, None);
+        let mut null = grouped_gauge_stream(&null_pairs, 10_000, None);
+        attach_input_identity(&mut effect, identity.as_ref());
+        attach_input_identity(&mut null, identity.as_ref());
+
+        let paired =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
+        assert_eq!(paired.status, PairedEvidenceStatus::ContradictorySummaries);
+        assert_eq!(paired.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            paired
+                .reasons
+                .iter()
+                .all(|reason| qg6_flat_inference_only(&reason.code))
+        );
+
+        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        let EvidenceCellBody::Paired {
+            hierarchical: Some(effect),
+            reconciliation,
+            ..
+        } = &cell.body
+        else {
+            unreachable!("QG-6 must carry hierarchical effect evidence");
+        };
+        assert!(effect.ci95_low_ratio >= 0.90 && effect.ci95_high_ratio <= 1.10);
+        assert!(
+            !reconciliation.direction_agrees,
+            "fixture must preserve the flat marginal conflict as a diagnostic"
+        );
+        assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
+        assert!(cell.claim_eligible());
+        assert!(!cell.reasons.iter().any(|reason| {
+            reason.code == "evidence.absolute_relative_direction_conflict"
+                || reason.code == "evidence.paired_invalid"
+        }));
+
+        let artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            policy(),
+            evidence_provenance(),
+            vec![cell],
+        )
+        .expect("QG-6 artifact");
+        assert!(artifact.ratchet_admissible());
+    }
+
+    #[test]
+    fn qg6_paired_stream_structural_invalidity_still_blocks_admission() {
+        let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
+        let identity = spec.input_identity.clone();
+        let effect_pairs = (0_u64..4)
+            .flat_map(|group_id| [(group_id, 100.0, 98.0); 3])
+            .collect::<Vec<_>>();
+        let null_pairs = (0_u64..4)
+            .flat_map(|group_id| [(group_id, 100.0, 100.0); 3])
+            .collect::<Vec<_>>();
+        let mut effect = grouped_gauge_stream(&effect_pairs, 0, Some(true));
+        let mut null = grouped_gauge_stream(&null_pairs, 10_000, Some(true));
+        attach_input_identity(&mut effect, identity.as_ref());
+        attach_input_identity(&mut null, identity.as_ref());
+
+        let paired =
+            estimate_paired_experiment(&effect, &null, &config()).expect("QG-6 paired estimate");
+        assert!(
+            paired
+                .reasons
+                .iter()
+                .any(|reason| !qg6_flat_inference_only(&reason.code))
+        );
+        let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
+        assert_eq!(cell.status, EvidenceDecisionStatus::NoDecision);
+        assert!(!cell.claim_eligible());
+        assert!(cell.reasons.iter().any(|reason| {
+            reason.code == "evidence.qg6_paired_design_invalid"
+                && (reason.message.contains("paired.null_order_imbalance")
+                    || reason.message.contains("paired.null_order_unobserved")
+                    || reason.message.contains("paired.effect_order_imbalance"))
+        }));
     }
 
     #[test]
@@ -2026,6 +2678,34 @@ mod tests {
             artifact.apply_gate_decision(EvidenceDecisionStatus::Allow),
             Err(EvidenceArtifactError::NotClaimEligible)
         ));
+
+        let directory = tempfile::tempdir().expect("partial evidence directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("persist partial no-claim evidence");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("partial no-claim evidence must remain structurally verifiable");
+        assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert!(!reloaded.ratchet_admissible());
+        assert_eq!(
+            reloaded
+                .admission_no_claim
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("evidence.incomplete_gate_selection")
+        );
+
+        let contents = fs::read_to_string(&paths.json).expect("read partial evidence");
+        let tampered = contents.replace(
+            "fixture-filtered pre-admission run",
+            "full-gate admission run",
+        );
+        assert_ne!(contents, tampered, "selection-scope tamper target");
+        fs::write(&paths.json, tampered).expect("tamper selection scope");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&paths.json),
+            Err(EvidenceArtifactError::HashMismatch)
+        ));
     }
 
     #[test]
@@ -2097,6 +2777,67 @@ mod tests {
         assert!(matches!(
             PerfEvidenceArtifact::load_verified(&paths.json),
             Err(EvidenceArtifactError::HashMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_load_reapplies_cell_set_invariants_after_resealing() {
+        let directory = tempfile::tempdir().expect("cell-set artifact directory");
+
+        let mut wrong_gate = provisional_artifact();
+        wrong_gate.gate = PerfGate::Qg2;
+        let wrong_gate_path = directory.path().join("wrong-gate.json");
+        fs::write(
+            &wrong_gate_path,
+            wrong_gate
+                .sealed_json()
+                .expect("reseal wrong-gate artifact"),
+        )
+        .expect("persist wrong-gate artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&wrong_gate_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+
+        let mut empty = provisional_artifact();
+        empty.cells.clear();
+        let empty_path = directory.path().join("empty.json");
+        fs::write(
+            &empty_path,
+            empty.sealed_json().expect("reseal empty artifact"),
+        )
+        .expect("persist empty artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&empty_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+
+        let mut duplicate = provisional_artifact();
+        duplicate.cells.push(duplicate.cells[0].clone());
+        let duplicate_path = directory.path().join("duplicate.json");
+        fs::write(
+            &duplicate_path,
+            duplicate.sealed_json().expect("reseal duplicate artifact"),
+        )
+        .expect("persist duplicate artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&duplicate_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
+        ));
+
+        let mut noncanonical = provisional_artifact();
+        noncanonical.cells[0].cell_id = "forged/cell/id".to_owned();
+        let noncanonical_path = directory.path().join("noncanonical-id.json");
+        fs::write(
+            &noncanonical_path,
+            noncanonical
+                .sealed_json()
+                .expect("reseal noncanonical-cell artifact"),
+        )
+        .expect("persist noncanonical-cell artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&noncanonical_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { .. })
         ));
     }
 
