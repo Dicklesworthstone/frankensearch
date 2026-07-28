@@ -16509,3 +16509,75 @@ gap, and a candidate reduces whole-operation cycles or instructions per
 document by at least 10x without changing indexed bytes or query results.
 Then repeat the full same-ELF, same-invocation A/A+A/B median-CI gate against
 Tantivy 0.26.1.
+
+### 2026-07-28 — QG-2 reproduction hold: the valid rerun misses the predeclared 2% agreement bound (`bd-h6eh`, FoggySquirrel)
+
+The independent 80-pair rerun preserved the candidate's exact provenance:
+revision `9fc478e5fed15f3fd4b9079b42d42ca53acf66c2`, executing ELF SHA-256
+`d32f54eef6028f0ad8b0fb3714fb51f53432e3dd1bc2a6c92dc3fc100590c5d6`,
+`ovh-a`, `release-perf`, and run window
+`qg-activation-20260728-9fc478e5-ovha`. It again ran Quill and the actual
+Tantivy 0.26.1 incumbent side-by-side with a Tantivy/Tantivy null in the same
+invocation.
+
+| run | Quill/Tantivy paired median [95% CI] | Tantivy/Tantivy A/A median [95% CI] | cell status |
+|---|---:|---:|---|
+| candidate r1 | 0.108698 [0.107024, 0.111538] | 0.993436 [0.980159, 1.019927] | valid |
+| rerun r2 | 0.112106 [0.110907, 0.114173] | 1.001282 [0.992489, 1.011084] | valid |
+
+The candidate paired-log center was `-2.2191798674`; the rerun center was
+`-2.1883110065`. Their absolute delta, **0.0308688609**, exceeds the embedded
+`max_reproduction_delta_log = 0.0198026273`. The rerun's evidence artifact seal
+is `6138b07c0e2da7d241a9def38bb88473d5958cd6f01879009c426a0e3069f9c6`,
+and its four-file receipt is retained at
+`.bench-history/attempts/2026-07-28/QG-2/qg2-rerun-r2-20260728T0914Z/`.
+
+**Decision: REPRODUCTION HOLD, not a new performance verdict.** Both runs
+independently support a large QG-2 target MISS, but this pair cannot be promoted
+as the real ratchet baseline because it violates its own reproduction law.
+
+**Retry predicate:** produce a new candidate/rerun pair from one exact ELF on
+one quiet worker, keep both same-invocation A/A controls valid, and require the
+paired-log centers to differ by at most `0.0198026273`. This evidence-only
+rerun does not reopen the unchanged indexing lever; a performance retry still
+requires the profile and counted-mechanism predicate in the preceding entry.
+
+### 2026-07-28 — QG-3 invalid-null attempts: watch-mode ratios are undecidable (`bd-h6eh`, FoggySquirrel)
+
+The first complete diagnostic used 10 pairs on `vmi1149989`; the second used
+the full 80 pairs on `vmi1152480`. Both ran revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` from exact executable SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+Both matrices included an independent Tantivy/Tantivy A/A for every
+Quill/Tantivy A/B cell in the same invocation. Both evidence artifacts returned
+`invalid_null` for every required cell.
+
+The 80-pair attempt is the decisive harness diagnosis:
+
+| cell | apparent Quill/Tantivy ratio [95% CI] | A/A median [95% CI] | A/A log-MAD | status |
+|---|---:|---:|---:|---|
+| initial docs/s | 0.205838 [0.195676, 0.222151] | 1.012894 [0.975462, 1.049584] | 0.117303 | INVALID |
+| in-process updates/s | 0.399770 [0.374212, 0.417265] | 1.011143 [0.959452, 1.038177] | 0.133159 | INVALID |
+| in-process update-to-searchable | 2.524324 [2.305033, 2.587909] | 0.969363 [0.910086, 1.026274] | 0.148052 | INVALID |
+| fresh-process updates/s | 0.448327 [0.433300, 0.473236] | 0.982197 [0.958432, 1.050541] | 0.132798 | INVALID |
+| fresh-process update-to-searchable | 2.076067 [1.971735, 2.174318] | 1.007165 [0.973520, 1.037097] | 0.153406 | INVALID |
+
+Every A/A log-MAD exceeds the predeclared `0.048790` ceiling. The in-process
+updates/s cell also failed drift; the in-process visibility cell failed order
+effect and drift. The apparent ratios are provenance only and cannot support
+either PASS or MISS. Evidence seals are
+`25c2a4cc1d551b3f6dc9eadad44ffd123d3739afee56a0c58d524d169288a42c`
+(10-pair diagnostic) and
+`bd69c1b2db9d070cf12d1ddd66d155dc4d912a34a5219c7eb5fb69c9ea5d2b2f`
+(80-pair full run).
+
+**Decision: INVALID-NULL / NO CLAIM.** Artifacts are retained at
+`.bench-history/attempts/2026-07-28/QG-3/`; QG-3 remains unmeasured until a
+complete valid matrix exists.
+
+**Retry predicate:** rerun on a quiet worker with the same exact-ELF,
+same-invocation A/A+A/B protocol. Require all five required cells to satisfy
+the null center, CI-width, log-MAD, order-balance, order-effect, and drift laws
+before comparing any median CI with the 4x target. After three invalid-noise
+attempts on one worker family, switch to a different worker family rather than
+relaxing the null law.

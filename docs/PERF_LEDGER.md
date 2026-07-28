@@ -7204,3 +7204,41 @@ counted mechanism demonstrate enough Amdahl headroom to close the 13.8x target
 gap plus at least a 10x reduction in whole-operation cycles or instructions
 per document with indexed-byte and query-result parity. Full artifacts and
 seal are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-2 REPRODUCTION HOLD: valid rerun exceeds the predeclared 2% delta (`bd-h6eh`, FoggySquirrel)
+
+The required independent rerun used the same clean revision, exact ELF
+SHA-256, `ovh-a` worker, run window, full-scale fixture, and 80-pair protocol as
+the QG-2 candidate. Its Quill/Tantivy paired median was **0.112106** with 95%
+CI **[0.110907, 0.114173]** and its Tantivy/Tantivy A/A median was **1.001282**
+with 95% CI **[0.992489, 1.011084]**. The cell itself is valid, with evidence
+seal `6138b07c0e2da7d241a9def38bb88473d5958cd6f01879009c426a0e3069f9c6`.
+
+The candidate and rerun paired-log centers differ by **0.030869**, exceeding
+the artifact's predeclared `max_reproduction_delta_log = 0.019803`. This does
+not reverse the QG-2 MISS, but it prevents promotion of that pair as the real
+baseline. Gate activation remains pending a reproducible pair.
+
+This is a reproduction retry, not permission to reopen the unchanged indexing
+lever. Retry only with a new candidate/rerun pair from one exact ELF on one
+quiet worker and accept it only when both A/A controls are valid and the paired
+log centers satisfy the predeclared 2% reproduction bound. The performance
+lever itself retains the profile-plus-counted-mechanism retry predicate above.
+
+## 2026-07-28 — QG-3 INVALID-NULL: two complete watch-mode attempts make no claim (`bd-h6eh`, FoggySquirrel)
+
+Two same-invocation Tantivy-oracle matrices were preserved rather than promoted:
+a 10-pair diagnostic run on `vmi1149989` and an 80-pair full run on
+`vmi1152480`. Both used revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and exact ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+Every required QG-3 cell was `invalid_null`; the 80-pair run's A/A log-MAD
+ranged from **0.117303** to **0.153406**, above the predeclared **0.048790**
+limit. Its apparent update-to-searchable ratios of **2.524324** in-process and
+**2.076067** fresh-process are therefore not gate numbers.
+
+No QG-3 PASS or MISS follows from these attempts. Retry only on a quiet worker
+with the same-invocation A/A+A/B protocol; require every required cell to pass
+the null center, CI-width, dispersion, order, and drift laws before comparing
+the median CI with the 4x target. The preserved attempts are detailed in
+`docs/NEGATIVE_EVIDENCE.md`.
