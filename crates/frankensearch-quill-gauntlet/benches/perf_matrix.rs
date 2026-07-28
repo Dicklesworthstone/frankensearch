@@ -321,7 +321,7 @@ fn emit_tantivy_lifecycle_receipt(
         "join_elapsed_ns": receipt.join_elapsed_ns,
         "indexing_workers_joined": true,
         "merge_worker_joined": true,
-        "writer_rearmed": true,
+        "writer_rearmed": receipt.writer_rearmed,
     });
     LIFECYCLE_RECEIPTS
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -379,6 +379,18 @@ fn fence_tantivy_lifecycle(
         .expect("join Tantivy benchmark workers and rearm writer");
     emit_tantivy_lifecycle_receipt(spec, phase, &receipt);
     (index, Duration::from_nanos(receipt.join_elapsed_ns))
+}
+
+fn finish_tantivy_lifecycle(index: TantivyIndex, spec: &PerfCellSpec, phase: &str) -> Duration {
+    let receipt = index
+        .benchmark_join_workers()
+        .expect("join Tantivy benchmark workers without rearming");
+    assert!(
+        !receipt.writer_rearmed,
+        "terminal Tantivy lifecycle fence unexpectedly rearmed a writer"
+    );
+    emit_tantivy_lifecycle_receipt(spec, phase, &receipt);
+    Duration::from_nanos(receipt.join_elapsed_ns)
 }
 
 fn preflight_index<E: LexicalRead + LexicalWrite>(
@@ -564,8 +576,7 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
             let index = tantivy_in_memory(spec);
             let mut elapsed =
                 index_batches(context, &index, &corpus, count, None) + commit(context, &index);
-            let (_index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_work");
-            elapsed += join_elapsed;
+            elapsed += finish_tantivy_lifecycle(index, spec, "measured_work");
             elapsed
         }
     };

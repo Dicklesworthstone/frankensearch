@@ -671,9 +671,10 @@ pub fn default_tokenizer_for_bench() -> TextAnalyzer {
 /// Counted receipt for a benchmark-only Tantivy writer lifecycle fence.
 ///
 /// `wait_merging_threads` consumes Tantivy's writer after joining its indexing
-/// and segment-updater workers. The benchmark immediately rearms the same
-/// index with the pinned writer configuration, so setup maintenance cannot
-/// leak into a later timed sample.
+/// and segment-updater workers. Warm/update fixtures may rearm the same index
+/// with the pinned writer configuration, while terminal bulk measurements
+/// deliberately stop after the join so they do not construct and immediately
+/// discard an unused replacement writer.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -684,6 +685,8 @@ pub struct BenchmarkWriterJoinReceipt {
     pub searchable_segments_after: usize,
     /// Time spent inside Tantivy's worker/merge join, excluding writer rearm.
     pub join_elapsed_ns: u64,
+    /// Whether a replacement writer was successfully constructed after joining.
+    pub writer_rearmed: bool,
 }
 
 /// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
@@ -986,6 +989,65 @@ impl TantivyIndex {
             ord_table,
             path,
         } = self;
+        let mut receipt = Self::benchmark_join_writer(&index, writer)?;
+        let writer = index
+            .writer_with_num_threads(writer_threads, writer_heap_bytes)
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+        receipt.writer_rearmed = true;
+        Ok((
+            Self {
+                index,
+                fields,
+                reader,
+                writer: Mutex::new(writer),
+                doc_count,
+                ord_table,
+                path,
+            },
+            receipt,
+        ))
+    }
+
+    /// Join every indexing and merge worker without constructing another writer.
+    ///
+    /// This is the terminal lifecycle fence for one-shot bulk measurements. It
+    /// consumes the benchmark index, waits for every incumbent background
+    /// worker, and returns only the counted receipt. Callers that will perform
+    /// subsequent writes must use [`Self::benchmark_join_workers_and_rearm`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a poisoned writer-mutex, Tantivy worker/merge, or segment
+    /// metadata error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_join_workers(self) -> SearchResult<BenchmarkWriterJoinReceipt> {
+        let Self {
+            index,
+            fields,
+            reader,
+            writer,
+            doc_count,
+            ord_table,
+            path,
+        } = self;
+        let receipt = Self::benchmark_join_writer(&index, writer)?;
+        // Keep the same reader, ordinal, and accounting owners alive across the
+        // join as the rearm path. Dropping them first could release pinned
+        // segment/search state and make the terminal benchmark lifecycle a
+        // materially different incumbent workload.
+        drop((fields, reader, doc_count, ord_table, path));
+        Ok(receipt)
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn benchmark_join_writer(
+        index: &Index,
+        writer: Mutex<IndexWriter>,
+    ) -> SearchResult<BenchmarkWriterJoinReceipt> {
         let searchable_segments_before = index
             .searchable_segment_ids()
             .map_err(|error| SearchError::SubsystemError {
@@ -1011,29 +1073,12 @@ impl TantivyIndex {
                 source: Box::new(error),
             })?
             .len();
-        let writer = index
-            .writer_with_num_threads(writer_threads, writer_heap_bytes)
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "tantivy",
-                source: Box::new(error),
-            })?;
-        let receipt = BenchmarkWriterJoinReceipt {
+        Ok(BenchmarkWriterJoinReceipt {
             searchable_segments_before,
             searchable_segments_after,
             join_elapsed_ns,
-        };
-        Ok((
-            Self {
-                index,
-                fields,
-                reader,
-                writer: Mutex::new(writer),
-                doc_count,
-                ord_table,
-                path,
-            },
-            receipt,
-        ))
+            writer_rearmed: false,
+        })
     }
 
     /// Disable automatic segment merging for a force-merge benchmark setup.
@@ -2730,6 +2775,7 @@ mod tests {
                 .expect("join workers and rearm writer");
             assert!(receipt.searchable_segments_before > 0);
             assert!(receipt.searchable_segments_after > 0);
+            assert!(receipt.writer_rearmed);
             assert_eq!(
                 idx.search(&cx, "lifecycle", 10)
                     .await
@@ -2752,6 +2798,31 @@ mod tests {
                     .len(),
                 1
             );
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn benchmark_writer_join_terminal_does_not_rearm() {
+        let idx = TantivyIndex::in_memory_with_benchmark_config(50_000_000, 1, true)
+            .expect("create benchmark oracle");
+        run_with_cx(|cx| async move {
+            idx.index_document(
+                &cx,
+                &IndexableDocument::new("terminal-join", "one shot bulk fixture"),
+            )
+            .await
+            .expect("index terminal-fence document");
+            idx.commit(&cx)
+                .await
+                .expect("commit terminal-fence document");
+
+            let receipt = idx
+                .benchmark_join_workers()
+                .expect("join workers without rearming");
+            assert!(receipt.searchable_segments_before > 0);
+            assert!(receipt.searchable_segments_after > 0);
+            assert!(!receipt.writer_rearmed);
         });
     }
 
