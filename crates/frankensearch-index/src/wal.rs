@@ -31,7 +31,12 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher as Crc32Hasher;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{
+    SearchError, SearchResult,
+    generation::{
+        ArtifactGenerationIdentityV1, FrozenEmbeddingIdentityBundleV1, QuantizationFormat,
+    },
+};
 use half::f16;
 use tracing::{debug, warn};
 
@@ -44,6 +49,22 @@ const WAL_VERSION: u16 = 1;
 const BATCH_MAGIC: [u8; 4] = *b"FWB1";
 /// Minimum WAL file size (header only).
 const WAL_HEADER_SIZE: usize = 20;
+
+/// Version of the WAL header that binds an exact FSVI v2 generation and
+/// embedding identity.
+pub const IDENTITY_BOUND_WAL_VERSION: u16 = 2;
+/// Fixed byte length of an identity-bound WAL v2 header.
+pub const IDENTITY_BOUND_WAL_HEADER_SIZE: usize = 208;
+
+const IDENTITY_BOUND_WAL_HEADER_SIZE_U16: u16 = 208;
+const SHA256_FINGERPRINT_BYTES: usize = 32;
+const IDENTITY_BUNDLE_FINGERPRINT_OFFSET: usize = 44;
+const SPACE_FINGERPRINT_OFFSET: usize =
+    IDENTITY_BUNDLE_FINGERPRINT_OFFSET + SHA256_FINGERPRINT_BYTES;
+const PRODUCER_FINGERPRINT_OFFSET: usize = SPACE_FINGERPRINT_OFFSET + SHA256_FINGERPRINT_BYTES;
+const INPUT_FINGERPRINT_OFFSET: usize = PRODUCER_FINGERPRINT_OFFSET + SHA256_FINGERPRINT_BYTES;
+const STORAGE_FINGERPRINT_OFFSET: usize = INPUT_FINGERPRINT_OFFSET + SHA256_FINGERPRINT_BYTES;
+const IDENTITY_BOUND_WAL_CRC_OFFSET: usize = STORAGE_FINGERPRINT_OFFSET + SHA256_FINGERPRINT_BYTES;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -91,6 +112,394 @@ pub struct CompactionStats {
     pub total_records_after: usize,
     /// Time taken in milliseconds.
     pub elapsed_ms: f64,
+}
+
+/// Parsed, validated identity header for a version-2 WAL.
+///
+/// The header duplicates the storage dimension and quantization so a reader
+/// can reject incompatible payload bytes before parsing batches. Component
+/// fingerprints are retained separately from the complete bundle fingerprint
+/// to make an exact mismatch diagnosable without trusting display labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalIdentityHeaderV2 {
+    generation: ArtifactGenerationIdentityV1,
+    dimension: u32,
+    quantization: Quantization,
+    identity_bundle_fingerprint: [u8; SHA256_FINGERPRINT_BYTES],
+    space_fingerprint: [u8; SHA256_FINGERPRINT_BYTES],
+    producer_fingerprint: [u8; SHA256_FINGERPRINT_BYTES],
+    input_fingerprint: [u8; SHA256_FINGERPRINT_BYTES],
+    storage_fingerprint: [u8; SHA256_FINGERPRINT_BYTES],
+}
+
+impl WalIdentityHeaderV2 {
+    /// Decode and structurally validate the fixed header prefix.
+    ///
+    /// Additional WAL batch bytes after the fixed header are intentionally
+    /// ignored. Exact compatibility with an expected artifact is established
+    /// by [`WalIdentityBindingV2::validate_header`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] for a truncated header, unknown
+    /// version, non-zero reserved byte, invalid generation, unsupported
+    /// quantization, zero fingerprint, or CRC mismatch.
+    pub fn decode(data: &[u8], path: &Path) -> SearchResult<Self> {
+        if data.len() < IDENTITY_BOUND_WAL_HEADER_SIZE {
+            return Err(wal_corrupted(
+                path,
+                format!(
+                    "identity-bound WAL header truncated: expected at least \
+                     {IDENTITY_BOUND_WAL_HEADER_SIZE} bytes, got {}",
+                    data.len()
+                ),
+            ));
+        }
+        if data[..4] != WAL_MAGIC {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL has bad magic bytes",
+            ));
+        }
+
+        let version = u16::from_le_bytes([data[4], data[5]]);
+        if version != IDENTITY_BOUND_WAL_VERSION {
+            return Err(wal_corrupted(
+                path,
+                format!(
+                    "identity-bound WAL version mismatch: expected \
+                     {IDENTITY_BOUND_WAL_VERSION}, got {version}"
+                ),
+            ));
+        }
+        let header_size = u16::from_le_bytes([data[6], data[7]]);
+        if header_size != IDENTITY_BOUND_WAL_HEADER_SIZE_U16 {
+            return Err(wal_corrupted(
+                path,
+                format!(
+                    "identity-bound WAL header size mismatch: expected \
+                     {IDENTITY_BOUND_WAL_HEADER_SIZE_U16}, got {header_size}"
+                ),
+            ));
+        }
+        if data[13..16] != [0; 3] || data[18..20] != [0; 2] {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL reserved bytes must be zero",
+            ));
+        }
+
+        let stored_crc = u32::from_le_bytes([
+            data[IDENTITY_BOUND_WAL_CRC_OFFSET],
+            data[IDENTITY_BOUND_WAL_CRC_OFFSET + 1],
+            data[IDENTITY_BOUND_WAL_CRC_OFFSET + 2],
+            data[IDENTITY_BOUND_WAL_CRC_OFFSET + 3],
+        ]);
+        let computed_crc = crc32_of(&data[..IDENTITY_BOUND_WAL_CRC_OFFSET]);
+        if stored_crc != computed_crc {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL header CRC mismatch",
+            ));
+        }
+
+        let dimension = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        if dimension == 0 {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL dimension must be greater than zero",
+            ));
+        }
+        let quantization = Quantization::from_wire(data[12], path)?;
+        let generation = ArtifactGenerationIdentityV1 {
+            schema_version: u16::from_le_bytes([data[16], data[17]]),
+            sequence: u64::from_le_bytes([
+                data[20], data[21], data[22], data[23], data[24], data[25], data[26], data[27],
+            ]),
+            nonce: copy_array::<16>(&data[28..44], path, "artifact generation nonce")?,
+        };
+        if let Err(error) = generation.validate() {
+            return Err(wal_corrupted(
+                path,
+                format!("identity-bound WAL artifact generation is invalid: {error}"),
+            ));
+        }
+
+        let header = Self {
+            generation,
+            dimension,
+            quantization,
+            identity_bundle_fingerprint: copy_array(
+                &data[IDENTITY_BUNDLE_FINGERPRINT_OFFSET..SPACE_FINGERPRINT_OFFSET],
+                path,
+                "embedding identity bundle fingerprint",
+            )?,
+            space_fingerprint: copy_array(
+                &data[SPACE_FINGERPRINT_OFFSET..PRODUCER_FINGERPRINT_OFFSET],
+                path,
+                "embedding space fingerprint",
+            )?,
+            producer_fingerprint: copy_array(
+                &data[PRODUCER_FINGERPRINT_OFFSET..INPUT_FINGERPRINT_OFFSET],
+                path,
+                "embedding producer fingerprint",
+            )?,
+            input_fingerprint: copy_array(
+                &data[INPUT_FINGERPRINT_OFFSET..STORAGE_FINGERPRINT_OFFSET],
+                path,
+                "embedding input fingerprint",
+            )?,
+            storage_fingerprint: copy_array(
+                &data[STORAGE_FINGERPRINT_OFFSET..IDENTITY_BOUND_WAL_CRC_OFFSET],
+                path,
+                "vector storage fingerprint",
+            )?,
+        };
+        header.validate_fingerprints(path)?;
+        Ok(header)
+    }
+
+    /// Encode this validated header to its fixed-width representation.
+    #[must_use]
+    pub fn encode(&self) -> [u8; IDENTITY_BOUND_WAL_HEADER_SIZE] {
+        let mut bytes = [0; IDENTITY_BOUND_WAL_HEADER_SIZE];
+        bytes[..4].copy_from_slice(&WAL_MAGIC);
+        bytes[4..6].copy_from_slice(&IDENTITY_BOUND_WAL_VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&IDENTITY_BOUND_WAL_HEADER_SIZE_U16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.dimension.to_le_bytes());
+        bytes[12] = quantization_to_wire(self.quantization);
+        bytes[16..18].copy_from_slice(&self.generation.schema_version.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.generation.sequence.to_le_bytes());
+        bytes[28..44].copy_from_slice(&self.generation.nonce);
+        bytes[IDENTITY_BUNDLE_FINGERPRINT_OFFSET..SPACE_FINGERPRINT_OFFSET]
+            .copy_from_slice(&self.identity_bundle_fingerprint);
+        bytes[SPACE_FINGERPRINT_OFFSET..PRODUCER_FINGERPRINT_OFFSET]
+            .copy_from_slice(&self.space_fingerprint);
+        bytes[PRODUCER_FINGERPRINT_OFFSET..INPUT_FINGERPRINT_OFFSET]
+            .copy_from_slice(&self.producer_fingerprint);
+        bytes[INPUT_FINGERPRINT_OFFSET..STORAGE_FINGERPRINT_OFFSET]
+            .copy_from_slice(&self.input_fingerprint);
+        bytes[STORAGE_FINGERPRINT_OFFSET..IDENTITY_BOUND_WAL_CRC_OFFSET]
+            .copy_from_slice(&self.storage_fingerprint);
+        let crc = crc32_of(&bytes[..IDENTITY_BOUND_WAL_CRC_OFFSET]);
+        bytes[IDENTITY_BOUND_WAL_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    /// Exact immutable generation bound to this WAL.
+    #[must_use]
+    pub const fn generation(&self) -> ArtifactGenerationIdentityV1 {
+        self.generation
+    }
+
+    /// Stored vector dimension.
+    #[must_use]
+    pub const fn dimension(&self) -> u32 {
+        self.dimension
+    }
+
+    /// Stored vector quantization.
+    #[must_use]
+    pub const fn quantization(&self) -> Quantization {
+        self.quantization
+    }
+
+    /// SHA-256 of the complete frozen embedding identity bundle.
+    #[must_use]
+    pub const fn identity_bundle_fingerprint(&self) -> &[u8; SHA256_FINGERPRINT_BYTES] {
+        &self.identity_bundle_fingerprint
+    }
+
+    /// SHA-256 of the mathematical embedding-space identity.
+    #[must_use]
+    pub const fn space_fingerprint(&self) -> &[u8; SHA256_FINGERPRINT_BYTES] {
+        &self.space_fingerprint
+    }
+
+    /// SHA-256 of the embedding-producer attestation.
+    #[must_use]
+    pub const fn producer_fingerprint(&self) -> &[u8; SHA256_FINGERPRINT_BYTES] {
+        &self.producer_fingerprint
+    }
+
+    /// SHA-256 of the outer embedding-input contract.
+    #[must_use]
+    pub const fn input_fingerprint(&self) -> &[u8; SHA256_FINGERPRINT_BYTES] {
+        &self.input_fingerprint
+    }
+
+    /// SHA-256 of the physical vector-storage identity.
+    #[must_use]
+    pub const fn storage_fingerprint(&self) -> &[u8; SHA256_FINGERPRINT_BYTES] {
+        &self.storage_fingerprint
+    }
+
+    fn validate_fingerprints(&self, path: &Path) -> SearchResult<()> {
+        for (field, fingerprint) in [
+            (
+                "embedding identity bundle fingerprint",
+                &self.identity_bundle_fingerprint,
+            ),
+            ("embedding space fingerprint", &self.space_fingerprint),
+            ("embedding producer fingerprint", &self.producer_fingerprint),
+            ("embedding input fingerprint", &self.input_fingerprint),
+            ("vector storage fingerprint", &self.storage_fingerprint),
+        ] {
+            if *fingerprint == [0; SHA256_FINGERPRINT_BYTES] {
+                return Err(wal_corrupted(
+                    path,
+                    format!("identity-bound WAL {field} must not be all zero"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact generation and embedding-identity contract expected by an FSVI v2
+/// WAL reader or writer.
+///
+/// Construction validates the full frozen identity bundle and requires the
+/// physical storage contract to name `fsvi-v2`. A binding can emit the
+/// canonical fixed header and reject any persisted component drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalIdentityBindingV2 {
+    expected: WalIdentityHeaderV2,
+}
+
+impl WalIdentityBindingV2 {
+    /// Build an exact identity binding for one FSVI v2 artifact generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the generation or frozen
+    /// identity is invalid, the storage format is not exactly `fsvi-v2`, or
+    /// the quantization cannot be represented by the FSVI slab format.
+    pub fn new(
+        generation: ArtifactGenerationIdentityV1,
+        identity: &FrozenEmbeddingIdentityBundleV1,
+    ) -> SearchResult<Self> {
+        generation.validate()?;
+        identity.validate()?;
+        if identity.identity.storage.format != "fsvi-v2" {
+            return Err(wal_identity_config_error(
+                "storage.format",
+                "must be exactly fsvi-v2 for an identity-bound WAL",
+            ));
+        }
+        let quantization = match identity.identity.storage.quantization {
+            QuantizationFormat::F32 => Quantization::F32,
+            QuantizationFormat::F16 => Quantization::F16,
+            QuantizationFormat::Int8 | QuantizationFormat::Int4 => {
+                return Err(wal_identity_config_error(
+                    "storage.quantization",
+                    "is not supported by the FSVI v2 slab",
+                ));
+            }
+        };
+        let expected = WalIdentityHeaderV2 {
+            generation,
+            dimension: identity.identity.storage.dimension,
+            quantization,
+            identity_bundle_fingerprint: decode_sha256_fingerprint(
+                "frozen_bundle.fingerprint",
+                &identity.fingerprint,
+            )?,
+            space_fingerprint: decode_sha256_fingerprint(
+                "space.fingerprint",
+                &identity.identity.space.fingerprint(),
+            )?,
+            producer_fingerprint: decode_sha256_fingerprint(
+                "producer.fingerprint",
+                &identity.identity.producer.fingerprint(),
+            )?,
+            input_fingerprint: decode_sha256_fingerprint(
+                "input.fingerprint",
+                &identity.identity.input.fingerprint(),
+            )?,
+            storage_fingerprint: decode_sha256_fingerprint(
+                "storage.fingerprint",
+                &identity.identity.storage.fingerprint(),
+            )?,
+        };
+        Ok(Self { expected })
+    }
+
+    /// Expected parsed header.
+    #[must_use]
+    pub const fn expected_header(&self) -> &WalIdentityHeaderV2 {
+        &self.expected
+    }
+
+    /// Canonical fixed-width WAL header for this exact binding.
+    #[must_use]
+    pub fn encode_header(&self) -> [u8; IDENTITY_BOUND_WAL_HEADER_SIZE] {
+        self.expected.encode()
+    }
+
+    /// Validate a persisted WAL header against every expected identity field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] when the header itself is
+    /// malformed or any generation, dimension, quantization, or component
+    /// fingerprint differs.
+    pub fn validate_header(&self, data: &[u8], path: &Path) -> SearchResult<()> {
+        let actual = WalIdentityHeaderV2::decode(data, path)?;
+        if actual.generation != self.expected.generation {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL artifact generation mismatch",
+            ));
+        }
+        if actual.dimension != self.expected.dimension {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL storage dimension mismatch",
+            ));
+        }
+        if actual.quantization != self.expected.quantization {
+            return Err(wal_corrupted(
+                path,
+                "identity-bound WAL storage quantization mismatch",
+            ));
+        }
+        for (field, actual, expected) in [
+            (
+                "embedding identity bundle fingerprint",
+                actual.identity_bundle_fingerprint,
+                self.expected.identity_bundle_fingerprint,
+            ),
+            (
+                "embedding space fingerprint",
+                actual.space_fingerprint,
+                self.expected.space_fingerprint,
+            ),
+            (
+                "embedding producer fingerprint",
+                actual.producer_fingerprint,
+                self.expected.producer_fingerprint,
+            ),
+            (
+                "embedding input fingerprint",
+                actual.input_fingerprint,
+                self.expected.input_fingerprint,
+            ),
+            (
+                "vector storage fingerprint",
+                actual.storage_fingerprint,
+                self.expected.storage_fingerprint,
+            ),
+        ] {
+            if actual != expected {
+                return Err(wal_corrupted(
+                    path,
+                    format!("identity-bound WAL {field} mismatch"),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ─── Index tagging ──────────────────────────────────────────────────────────
@@ -489,6 +898,64 @@ fn crc32_of(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+const fn quantization_to_wire(quantization: Quantization) -> u8 {
+    match quantization {
+        Quantization::F32 => 0,
+        Quantization::F16 => 1,
+    }
+}
+
+fn copy_array<const N: usize>(bytes: &[u8], path: &Path, field: &str) -> SearchResult<[u8; N]> {
+    bytes
+        .try_into()
+        .map_err(|_| wal_corrupted(path, format!("identity-bound WAL {field} is truncated")))
+}
+
+fn decode_sha256_fingerprint(field: &str, fingerprint: &str) -> SearchResult<[u8; 32]> {
+    if fingerprint.len() != 64 {
+        return Err(wal_identity_config_error(
+            field,
+            "must be a 64-character lowercase SHA-256 fingerprint",
+        ));
+    }
+    let mut decoded = [0; 32];
+    for (output, pair) in decoded
+        .iter_mut()
+        .zip(fingerprint.as_bytes().as_chunks::<2>().0)
+    {
+        let high = decode_lower_hex_nibble(pair[0]).ok_or_else(|| {
+            wal_identity_config_error(
+                field,
+                "must be a 64-character lowercase SHA-256 fingerprint",
+            )
+        })?;
+        let low = decode_lower_hex_nibble(pair[1]).ok_or_else(|| {
+            wal_identity_config_error(
+                field,
+                "must be a 64-character lowercase SHA-256 fingerprint",
+            )
+        })?;
+        *output = (high << 4) | low;
+    }
+    Ok(decoded)
+}
+
+const fn decode_lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn wal_identity_config_error(field: &str, reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("wal_identity_v2.{field}"),
+        value: "redacted".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 fn wal_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
     SearchError::IndexCorrupted {
         path: path.to_path_buf(),
@@ -501,6 +968,7 @@ fn wal_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_core::generation::EmbeddingIdentityBundleV1;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_wal_path(name: &str) -> PathBuf {
@@ -520,6 +988,228 @@ mod tests {
             doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
             embedding: vec![base; dim],
         }
+    }
+
+    fn identity_binding_v2(
+        dimension: u32,
+        quantization: QuantizationFormat,
+    ) -> WalIdentityBindingV2 {
+        let mut identity =
+            EmbeddingIdentityBundleV1::explicit_test_model("wal-identity-v2", dimension);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = quantization;
+        identity.storage.endianness = "little-endian".to_owned();
+        let frozen = identity.freeze().expect("valid FSVI v2 identity");
+        let generation =
+            ArtifactGenerationIdentityV1::new(u64::MAX, [0xa5; 16]).expect("valid generation");
+        WalIdentityBindingV2::new(generation, &frozen).expect("valid WAL identity binding")
+    }
+
+    fn refresh_identity_header_crc(bytes: &mut [u8; IDENTITY_BOUND_WAL_HEADER_SIZE]) {
+        let crc = crc32_of(&bytes[..IDENTITY_BOUND_WAL_CRC_OFFSET]);
+        bytes[IDENTITY_BOUND_WAL_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn identity_bound_header_round_trips_full_width_generation() {
+        let path = Path::new("/test/identity-bound.fsvi.wal");
+        let binding = identity_binding_v2(37, QuantizationFormat::F16);
+        let encoded = binding.encode_header();
+        let decoded = WalIdentityHeaderV2::decode(&encoded, path).expect("decode v2 header");
+
+        binding
+            .validate_header(&encoded, path)
+            .expect("exact identity binding");
+        assert_eq!(decoded.generation().sequence, u64::MAX);
+        assert_eq!(decoded.generation().nonce, [0xa5; 16]);
+        assert_eq!(decoded.dimension(), 37);
+        assert_eq!(decoded.quantization(), Quantization::F16);
+        assert_ne!(
+            *decoded.identity_bundle_fingerprint(),
+            [0; SHA256_FINGERPRINT_BYTES]
+        );
+        assert_ne!(*decoded.space_fingerprint(), [0; SHA256_FINGERPRINT_BYTES]);
+        assert_ne!(
+            *decoded.producer_fingerprint(),
+            [0; SHA256_FINGERPRINT_BYTES]
+        );
+        assert_ne!(*decoded.input_fingerprint(), [0; SHA256_FINGERPRINT_BYTES]);
+        assert_ne!(
+            *decoded.storage_fingerprint(),
+            [0; SHA256_FINGERPRINT_BYTES]
+        );
+        assert_eq!(decoded.encode(), encoded);
+    }
+
+    #[test]
+    fn identity_bound_header_rejects_every_component_fingerprint_drift() {
+        let path = Path::new("/test/identity-bound-fingerprint.fsvi.wal");
+        let binding = identity_binding_v2(8, QuantizationFormat::F16);
+        let original = binding.encode_header();
+
+        for (field, offset) in [
+            (
+                "embedding identity bundle fingerprint",
+                IDENTITY_BUNDLE_FINGERPRINT_OFFSET,
+            ),
+            ("embedding space fingerprint", SPACE_FINGERPRINT_OFFSET),
+            (
+                "embedding producer fingerprint",
+                PRODUCER_FINGERPRINT_OFFSET,
+            ),
+            ("embedding input fingerprint", INPUT_FINGERPRINT_OFFSET),
+            ("vector storage fingerprint", STORAGE_FINGERPRINT_OFFSET),
+        ] {
+            let mut drifted = original;
+            drifted[offset] ^= 1;
+            refresh_identity_header_crc(&mut drifted);
+            let error = binding
+                .validate_header(&drifted, path)
+                .expect_err("fingerprint drift must fail closed");
+            assert!(
+                error.to_string().contains(field),
+                "expected {field} diagnostic, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_bound_header_rejects_generation_dimension_and_quantization_drift() {
+        let path = Path::new("/test/identity-bound-storage.fsvi.wal");
+        let binding = identity_binding_v2(8, QuantizationFormat::F16);
+        let original = binding.encode_header();
+
+        let mut sequence_drift = original;
+        sequence_drift[20] ^= 1;
+        refresh_identity_header_crc(&mut sequence_drift);
+        assert!(
+            binding
+                .validate_header(&sequence_drift, path)
+                .expect_err("generation sequence drift")
+                .to_string()
+                .contains("artifact generation mismatch")
+        );
+
+        let mut nonce_drift = original;
+        nonce_drift[28] ^= 1;
+        refresh_identity_header_crc(&mut nonce_drift);
+        assert!(
+            binding
+                .validate_header(&nonce_drift, path)
+                .expect_err("generation nonce drift")
+                .to_string()
+                .contains("artifact generation mismatch")
+        );
+
+        let mut schema_drift = original;
+        schema_drift[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        refresh_identity_header_crc(&mut schema_drift);
+        assert!(
+            binding
+                .validate_header(&schema_drift, path)
+                .expect_err("generation schema drift")
+                .to_string()
+                .contains("artifact generation is invalid")
+        );
+
+        let mut dimension_drift = original;
+        dimension_drift[8..12].copy_from_slice(&9_u32.to_le_bytes());
+        refresh_identity_header_crc(&mut dimension_drift);
+        assert!(
+            binding
+                .validate_header(&dimension_drift, path)
+                .expect_err("dimension drift")
+                .to_string()
+                .contains("storage dimension mismatch")
+        );
+
+        let mut quantization_drift = original;
+        quantization_drift[12] = quantization_to_wire(Quantization::F32);
+        refresh_identity_header_crc(&mut quantization_drift);
+        assert!(
+            binding
+                .validate_header(&quantization_drift, path)
+                .expect_err("quantization drift")
+                .to_string()
+                .contains("storage quantization mismatch")
+        );
+    }
+
+    #[test]
+    fn identity_bound_header_rejects_structural_corruption() {
+        let path = Path::new("/test/identity-bound-corrupt.fsvi.wal");
+        let binding = identity_binding_v2(8, QuantizationFormat::F16);
+        let original = binding.encode_header();
+
+        let mut bad_version = original;
+        bad_version[4..6].copy_from_slice(&99_u16.to_le_bytes());
+        assert!(WalIdentityHeaderV2::decode(&bad_version, path).is_err());
+
+        let mut bad_size = original;
+        bad_size[6..8].copy_from_slice(&207_u16.to_le_bytes());
+        assert!(WalIdentityHeaderV2::decode(&bad_size, path).is_err());
+
+        let mut reserved = original;
+        reserved[13] = 1;
+        refresh_identity_header_crc(&mut reserved);
+        assert!(
+            WalIdentityHeaderV2::decode(&reserved, path)
+                .expect_err("reserved bytes")
+                .to_string()
+                .contains("reserved")
+        );
+
+        let mut bad_crc = original;
+        bad_crc[IDENTITY_BOUND_WAL_CRC_OFFSET] ^= 1;
+        assert!(
+            WalIdentityHeaderV2::decode(&bad_crc, path)
+                .expect_err("CRC drift")
+                .to_string()
+                .contains("CRC")
+        );
+
+        let mut zero_fingerprint = original;
+        zero_fingerprint[IDENTITY_BUNDLE_FINGERPRINT_OFFSET..SPACE_FINGERPRINT_OFFSET].fill(0);
+        refresh_identity_header_crc(&mut zero_fingerprint);
+        assert!(
+            WalIdentityHeaderV2::decode(&zero_fingerprint, path)
+                .expect_err("zero fingerprint")
+                .to_string()
+                .contains("must not be all zero")
+        );
+
+        assert!(
+            WalIdentityHeaderV2::decode(&original[..IDENTITY_BOUND_WAL_HEADER_SIZE - 1], path)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_binding_requires_exact_supported_fsvi_v2_storage() {
+        let generation = ArtifactGenerationIdentityV1::new(1, [1; 16]).expect("valid generation");
+        let mut legacy = EmbeddingIdentityBundleV1::explicit_test_model("wal-legacy", 8);
+        legacy.storage.format = "fsvi-v1".to_owned();
+        legacy.storage.quantization = QuantizationFormat::F16;
+        legacy.storage.endianness = "little-endian".to_owned();
+        let legacy = legacy.freeze().expect("valid legacy identity");
+        assert!(
+            WalIdentityBindingV2::new(generation, &legacy)
+                .expect_err("legacy storage must not bind")
+                .to_string()
+                .contains("storage.format")
+        );
+
+        let mut unsupported = EmbeddingIdentityBundleV1::explicit_test_model("wal-unsupported", 8);
+        unsupported.storage.format = "fsvi-v2".to_owned();
+        unsupported.storage.quantization = QuantizationFormat::Int8;
+        unsupported.storage.endianness = "little-endian".to_owned();
+        let unsupported = unsupported.freeze().expect("valid unsupported identity");
+        assert!(
+            WalIdentityBindingV2::new(generation, &unsupported)
+                .expect_err("unsupported quantization must not bind")
+                .to_string()
+                .contains("storage.quantization")
+        );
     }
 
     #[test]

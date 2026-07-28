@@ -71,8 +71,87 @@ pub const EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1: u16 = 1;
 pub const EMBEDDING_INPUT_CONTRACT_SCHEMA_V1: u16 = 1;
 /// Current schema for vector-storage identities.
 pub const VECTOR_STORAGE_IDENTITY_SCHEMA_V1: u16 = 1;
+/// Current schema for immutable artifact-generation identities.
+pub const ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1: u16 = 1;
 
 const MAX_IDENTITY_FIELD_BYTES: usize = 4_096;
+
+/// Immutable identity of one published artifact generation.
+///
+/// `sequence` is a full-width monotone counter within one publication lineage;
+/// it replaces the wrap-prone `u8` compaction generation in FSVI v1. The
+/// caller-supplied 128-bit nonce distinguishes independently built generations
+/// that happen to use the same sequence number. The nonce is identity material,
+/// not a credential.
+///
+/// Equality is exact. Neither the sequence nor the nonce alone is a sufficient
+/// generation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactGenerationIdentityV1 {
+    /// [`ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Monotone generation sequence within the publisher's lineage.
+    pub sequence: u64,
+    /// Unique identity material for this build/publication attempt.
+    pub nonce: [u8; 16],
+}
+
+impl ArtifactGenerationIdentityV1 {
+    /// Construct and validate one artifact-generation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the nonce is all zeroes.
+    pub fn new(sequence: u64, nonce: [u8; 16]) -> Result<Self, SearchError> {
+        let identity = Self {
+            schema_version: ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1,
+            sequence,
+            nonce,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Validate the schema and reject the reserved all-zero nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] for an unknown schema or an
+    /// all-zero nonce.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        validate_schema(
+            "artifact_generation.schema_version",
+            self.schema_version,
+            ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1,
+        )?;
+        if self.nonce == [0; 16] {
+            return Err(identity_error(
+                "artifact_generation.nonce",
+                "redacted-zero-nonce",
+                "must contain unique non-zero generation identity material",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical domain-separated bytes used by persisted FSVI and WAL
+    /// bindings.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.artifact-generation-identity.v1");
+        encoder.u16(self.schema_version);
+        encoder.u64(self.sequence);
+        encoder.bytes(&self.nonce);
+        encoder.finish()
+    }
+
+    /// Lowercase SHA-256 of [`Self::canonical_bytes`].
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        sha256_hex(&self.canonical_bytes())
+    }
+}
 
 /// One immutable, role-tagged artifact participating in a vector space.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1888,6 +1967,61 @@ mod tests {
         identity.producer.space_fingerprint = identity.space.fingerprint();
         identity.validate().expect("sample semantic identity");
         identity
+    }
+
+    #[test]
+    fn artifact_generation_identity_is_full_width_and_round_trips() {
+        let identity =
+            ArtifactGenerationIdentityV1::new(u64::MAX, [0xa5; 16]).expect("valid generation");
+        identity.validate().expect("generation validates");
+
+        let encoded = serde_json::to_vec(&identity).expect("serialize generation");
+        let decoded: ArtifactGenerationIdentityV1 =
+            serde_json::from_slice(&encoded).expect("deserialize generation");
+
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.sequence, u64::MAX);
+        assert_eq!(decoded.fingerprint().len(), 64);
+        assert_eq!(decoded.fingerprint(), identity.fingerprint());
+    }
+
+    #[test]
+    fn artifact_generation_identity_rejects_reserved_or_unknown_values() {
+        assert!(ArtifactGenerationIdentityV1::new(0, [0; 16]).is_err());
+
+        let mut unknown_schema =
+            ArtifactGenerationIdentityV1::new(0, [1; 16]).expect("valid generation");
+        unknown_schema.schema_version = ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1 + 1;
+        assert!(unknown_schema.validate().is_err());
+
+        let injected = serde_json::json!({
+            "schema_version": ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1,
+            "sequence": 7,
+            "nonce": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "unexpected": "field"
+        });
+        assert!(
+            serde_json::from_value::<ArtifactGenerationIdentityV1>(injected).is_err(),
+            "unknown generation fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn every_artifact_generation_field_changes_the_fingerprint() {
+        let base = ArtifactGenerationIdentityV1::new(7, [1; 16]).expect("valid base generation");
+
+        let mut changed_sequence = base;
+        changed_sequence.sequence += 1;
+        assert_ne!(base.fingerprint(), changed_sequence.fingerprint());
+
+        let mut changed_nonce = base;
+        changed_nonce.nonce[15] ^= 1;
+        assert_ne!(base.fingerprint(), changed_nonce.fingerprint());
+
+        let mut changed_schema = base;
+        changed_schema.schema_version += 1;
+        assert_ne!(base.fingerprint(), changed_schema.fingerprint());
+        assert!(changed_schema.validate().is_err());
     }
 
     #[test]
