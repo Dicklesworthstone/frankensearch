@@ -7733,3 +7733,69 @@ exact ELF contract on the same 16-core slice with five excluded warmups and
 30 paired blocks; require both A/A nulls and immediate same-ELF reproduction
 to admit before evaluating whether the ratio clears 1.5x. CV remains
 provenance only.
+
+## 2026-07-28 — QG-2 corrected terminal-lifecycle fairness audit: FAIR configuration, INVALID evidence (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+The corrected harness at clean revision
+`ebd9175725ef9d97fd02d794394209b4719f8ce7` passed the required comparison
+audit item by item:
+
+- **Analyzer — FAIR.** Tantivy's `FrankensearchTokenizer` is the fused
+  equivalent of `SimpleTokenizer` plus `LowerCaser`: Unicode-alphanumeric
+  token boundaries and lowercase normalization, with no stemming or stopword
+  removal. The shipping Quill SWAR analyzer has the same semantics. The
+  release-profile oracle parity suite passed all three lane-edge, shipping-
+  incumbent, and 4,000-case randomized corpus tests.
+- **Schema — FAIR.** Both arms used `frankensearch-default-v1`: stored string
+  `id`; stored, indexed `content` and `title` with frequencies and positions;
+  stored-only `metadata`; and stored fast-u64 `ord`. Runtime ordered-hit
+  preflight passed for both arms with positions enabled.
+- **Commit policy and durability — FAIR.** Each 50,000-document timed engine
+  operation remained below Quill's one-second automatic publication interval,
+  so each arm performed one explicit terminal commit. Both indexes were
+  in-memory and issued no durability syscalls. Tantivy's timed arm included
+  commit, reader reload, and terminal indexing/merge-worker join. The corrected
+  terminal API did not create a replacement writer: every one of 735 lifecycle
+  receipts across the five attempts recorded `writer_rearmed=false`.
+- **Heap budget — FAIR.** Both single-thread writers received the same
+  50,000,000-byte total heap budget.
+- **Corpus, order, and batch size — FAIR.** Both arms consumed the same 50,000
+  documents in the same ordinal order and 5,000-document generated batches
+  from seed `0x5155494c4c504552`; corpus SHA-256
+  `31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8`.
+  Corpus generation was outside the engine interval.
+- **Build profile — FAIR.** Both arms were linked into and run from the same
+  `release-perf` ELF (opt-level 3, ThinLTO, one codegen unit), SHA-256
+  `fab920d0bb28b2c2302700d5523461380a064a4acd43750dc3aa50fbeeef0c1d`,
+  with runtime-linked Tantivy 0.26.1. The same invocation supplied the A/A
+  control.
+
+The fair configuration did **not** produce a promotable corrected magnitude.
+The first 30-pair candidate was `INVALID-NULL` because null log-MAD
+`0.068650` exceeded `0.048790`. A second candidate and immediate rerun each
+had valid A/A controls and measured Quill/Tantivy **0.342848 [0.332870,
+0.352168]** and **0.355719 [0.347940, 0.364383]**, but their log-ratio delta
+`0.036853` exceeded the fixed `0.019803` reproduction law. A 60-pair
+candidate measured **0.348789 [0.344656, 0.355771]** with a valid A/A;
+its immediate 60-pair rerun was `INVALID-NULL` because null log-MAD
+`0.051362` exceeded `0.048790`. These magnitudes are diagnostic only.
+
+**Decision: FAIR CONFIGURATION / INVALID-NULL + INVALID-REPRODUCTION / NO
+QG-2 CLAIM.** QG-2 remains inactive and the quarantined pre-fix baseline is
+not replaced. Evidence JSON SHA-256 values, in attempt order, are
+`6f3ba52bd787c3694bb1d5e185fbe6d8c781a6bb8871be25e11298c27fd58d0e`,
+`27f48f7301ee288b55ec54d0f8a54f04d546b7e1879de4a1db0c35ccc9a9a933`,
+`dfe2ea6de49a4cef6047938c536f4b70774212c85a7235abfca4aba56070fe03`,
+`37e5325a2fc4c04692fa92ff264253eabc412939836f1c06fa787ba06094a3a1`,
+and
+`d99aa3551b71c08652af85a261cf4fe75af128d7533ff846c94432d32dcc0488`.
+Artifacts are retained under the corresponding
+`.bench-history/attempts/2026-07-28/QG-2/qg2-terminal-*` directories.
+
+Retry only on a distinct eligible machine/topology, or after a counted
+mechanism explains and removes the Tantivy A/A dispersion. Preserve the exact
+terminal-lifecycle API and all six fairness pins, then require a valid A/A
+candidate, an immediate valid A/A rerun, and at most `0.019803` log-ratio
+delta. Do not resample the unchanged Threadripper route, weaken a null law, or
+use CV as the gate.

@@ -17249,3 +17249,63 @@ Retry only after a profile-attributed change, using the same exact-ELF,
 five-warmup, 30-block contract and immediate reproduction on the same slice;
 both A/A controls and the reproduction law must admit before scoring the
 target. Do not gate on CV.
+
+### 2026-07-28 — QG-2 corrected terminal lifecycle is fair but still not admissible (`bd-h6eh`, FoggySquirrel)
+
+The clean `ebd9175725ef9d97fd02d794394209b4719f8ce7` harness removed the
+terminal replacement-writer churn that invalidated the prior claimed
+baseline. The fairness adjudication passed all six required surfaces:
+
+1. analyzer semantics are Unicode-alphanumeric split plus lowercase on both
+   arms, with three release-profile oracle parity tests passing;
+2. both schemas are `frankensearch-default-v1` with identical field options
+   and positions;
+3. both in-memory arms perform one explicit terminal commit and no durability
+   syscall, while the Tantivy interval includes reload and the terminal join;
+4. both writers receive 50,000,000 bytes of heap;
+5. both arms consume the identical seeded 50,000-document corpus in the same
+   order and batch shape, corpus SHA-256
+   `31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8`;
+6. both arms run from the same self-reporting `release-perf` ELF, SHA-256
+   `fab920d0bb28b2c2302700d5523461380a064a4acd43750dc3aa50fbeeef0c1d`,
+   linked to Tantivy 0.26.1.
+
+All 735 counted Tantivy lifecycle receipts reported terminal worker joins and
+`writer_rearmed=false`. This corrects the execution boundary, but it does not
+rescue an inadmissible estimator.
+
+The five corrected attempts ended as follows:
+
+- 30-pair candidate 1: `INVALID-NULL`; apparent ratio
+  `0.351468 [0.345020, 0.361292]`, null log-MAD
+  `0.068650 > 0.048790`.
+- 30-pair candidate 2: valid A/A; ratio
+  `0.342848 [0.332870, 0.352168]`.
+- immediate 30-pair rerun 2: valid A/A; ratio
+  `0.355719 [0.347940, 0.364383]`; candidate/rerun log delta
+  `0.036853 > 0.019803`, so the pair is `INVALID-REPRODUCTION`.
+- 60-pair candidate 3: valid A/A; ratio
+  `0.348789 [0.344656, 0.355771]`.
+- immediate 60-pair rerun 3: `INVALID-NULL`; apparent ratio
+  `0.345033 [0.337280, 0.351354]`, null log-MAD
+  `0.051362 > 0.048790`.
+
+**Decision: INVALID-NULL + INVALID-REPRODUCTION / NO CLAIM.** The diagnostic
+magnitudes cluster far below the 1.5x target but are not a certified QG-2
+number. QG-2 stays inactive, and no corrected baseline replaces the
+quarantined pre-fix file. Evidence JSON SHA-256 values are
+`6f3ba52bd787c3694bb1d5e185fbe6d8c781a6bb8871be25e11298c27fd58d0e`,
+`27f48f7301ee288b55ec54d0f8a54f04d546b7e1879de4a1db0c35ccc9a9a933`,
+`dfe2ea6de49a4cef6047938c536f4b70774212c85a7235abfca4aba56070fe03`,
+`37e5325a2fc4c04692fa92ff264253eabc412939836f1c06fa787ba06094a3a1`,
+and
+`d99aa3551b71c08652af85a261cf4fe75af128d7533ff846c94432d32dcc0488`;
+the corresponding artifacts are under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-terminal-*`.
+
+Retry only on a distinct eligible machine/topology, or after a counted
+mechanism explains and removes the Tantivy A/A dispersion. Preserve the exact
+terminal lifecycle and every fairness pin; require valid A/A controls in both
+candidate and immediate rerun plus at most `0.019803` log-ratio delta. Do not
+blind-resample the unchanged Threadripper route, weaken a null law, select a
+favorable pair, or gate on CV.
