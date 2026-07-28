@@ -1745,6 +1745,64 @@ fn prepared_qg6_streams(
                 hit.map(|hit| lower_hex(&Sha256::digest(hit.doc_id.as_bytes())))
                     .unwrap_or_else(|| "absent".to_owned())
             };
+            let subject_rank_in_oracle = subject_hit.and_then(|hit| {
+                report
+                    .oracle
+                    .hits
+                    .iter()
+                    .position(|candidate| candidate.doc_id == hit.doc_id)
+            });
+            let oracle_rank_in_subject = oracle_hit.and_then(|hit| {
+                report
+                    .subject
+                    .hits
+                    .iter()
+                    .position(|candidate| candidate.doc_id == hit.doc_id)
+            });
+            let score_group_bounds =
+                |hits: &[RankedHit], index: Option<usize>| -> Option<(usize, usize)> {
+                    let index = index?;
+                    let score_bits = hits.get(index)?.score_bits;
+                    let start = hits[..index]
+                        .iter()
+                        .rposition(|hit| hit.score_bits != score_bits)
+                        .map_or(0, |position| position + 1);
+                    let end = hits[index + 1..]
+                        .iter()
+                        .position(|hit| hit.score_bits != score_bits)
+                        .map_or(hits.len(), |position| index + 1 + position);
+                    Some((start, end))
+                };
+            let subject_group = score_group_bounds(&report.subject.hits, first_rank);
+            let oracle_group = score_group_bounds(&report.oracle.hits, first_rank);
+            let subject_map = report
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<BTreeMap<_, _>>();
+            let oracle_map = report
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<BTreeMap<_, _>>();
+            let subject_only = subject_map
+                .keys()
+                .filter(|doc_id| !oracle_map.contains_key(**doc_id))
+                .count();
+            let oracle_only = oracle_map
+                .keys()
+                .filter(|doc_id| !subject_map.contains_key(**doc_id))
+                .count();
+            let common_score_mismatches = subject_map
+                .iter()
+                .filter(|(doc_id, score_bits)| {
+                    oracle_map
+                        .get(**doc_id)
+                        .is_some_and(|oracle_bits| oracle_bits != *score_bits)
+                })
+                .count();
             let subject_in_cutoff = subject_hit.is_some_and(|hit| {
                 report
                     .oracle
@@ -1763,7 +1821,10 @@ fn prepared_qg6_streams(
                 "[qg6-parity-diagnostic] status={:?} rank={:?} first_rank={:?} \
                  subject_doc_sha256={} subject_score_bits={:?} oracle_doc_sha256={} \
                  oracle_score_bits={:?} cutoff_group_len={} cutoff_complete={} \
-                 subject_in_cutoff={} oracle_in_cutoff={} count_equal={} doc_count_equal={}",
+                 subject_in_cutoff={} oracle_in_cutoff={} subject_rank_in_oracle={:?} \
+                 oracle_rank_in_subject={:?} subject_group={:?} oracle_group={:?} \
+                 topk_map_equal={} subject_only={} oracle_only={} common_score_mismatches={} \
+                 count_equal={} doc_count_equal={}",
                 report.status,
                 report.rank_class,
                 first_rank,
@@ -1775,6 +1836,14 @@ fn prepared_qg6_streams(
                 report.oracle.cutoff_tie_complete,
                 subject_in_cutoff,
                 oracle_in_cutoff,
+                subject_rank_in_oracle,
+                oracle_rank_in_subject,
+                subject_group,
+                oracle_group,
+                subject_map == oracle_map,
+                subject_only,
+                oracle_only,
+                common_score_mismatches,
                 report.subject.match_count == report.oracle.match_count,
                 report.subject.doc_count == report.oracle.doc_count,
             );
