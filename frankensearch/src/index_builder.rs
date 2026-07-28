@@ -733,17 +733,15 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    entries
-        .filter_map(Result::ok)
-        .fold(0u64, |acc, entry| {
-            let path = entry.path();
-            let size = if path.is_dir() {
-                dir_size_bytes(&path)
-            } else {
-                file_size_bytes(&path)
-            };
-            acc.saturating_add(size)
-        })
+    entries.filter_map(Result::ok).fold(0u64, |acc, entry| {
+        let path = entry.path();
+        let size = if path.is_dir() {
+            dir_size_bytes(&path)
+        } else {
+            file_size_bytes(&path)
+        };
+        acc.saturating_add(size)
+    })
 }
 
 /// The opened arms of a hybrid index directory (bd-8nqz.3).
@@ -804,18 +802,14 @@ pub async fn open_hybrid(
 }
 
 #[cfg(feature = "quill")]
-async fn open_lexical_reader(
-    cx: &Cx,
-    dir: &Path,
-) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
+async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
     // bd-8nqz.2: dispatch on the inspected layout instead of blindly opening
     // the root — a blue-green root opens its ACTIVE engine dir, a foreign or
     // damaged layout is a typed error, and inspection never adopts/publishes.
-    let layout =
-        inspect_lexical_layout(dir).map_err(|source| SearchError::SubsystemError {
-            subsystem: "facade.lexical.layout",
-            source: Box::new(source),
-        })?;
+    let layout = inspect_lexical_layout(dir).map_err(|source| SearchError::SubsystemError {
+        subsystem: "facade.lexical.layout",
+        source: Box::new(source),
+    })?;
     let target = match layout {
         LexicalLayout::Empty => return Ok(None),
         LexicalLayout::DirectQuill => dir.to_path_buf(),
@@ -840,10 +834,7 @@ async fn open_lexical_reader(
 }
 
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
-async fn open_lexical_reader(
-    _cx: &Cx,
-    dir: &Path,
-) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
+async fn open_lexical_reader(_cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
     let index = TantivyIndex::open(dir)?;
     Ok(Some(Arc::new(index)))
 }
@@ -1444,7 +1435,10 @@ mod tests {
             assert_eq!(receipt.indexed, 3);
             assert!(receipt.errors.is_empty());
             assert!(receipt.published);
-            assert!(stats.size_bytes.lexical > 0, "lexical bytes must be visible");
+            assert!(
+                stats.size_bytes.lexical > 0,
+                "lexical bytes must be visible"
+            );
             assert_eq!(
                 stats.size_bytes.total,
                 stats.size_bytes.vector_fast
@@ -1842,10 +1836,9 @@ mod tests {
             // The clean document AFTER the rejected duplicate survived — the
             // reconcile-commit recovery keeps one bad document from voiding
             // the rest of the arm.
-            let lexical =
-                QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
-                    .await
-                    .unwrap();
+            let lexical = QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                .await
+                .unwrap();
             let gamma_ids = lexical
                 .search_doc_ids(&cx, "gamma", 10)
                 .unwrap()

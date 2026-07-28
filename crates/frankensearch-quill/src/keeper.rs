@@ -18212,7 +18212,10 @@ mod tests {
         let missing = tempdir()?;
         let missing_root = missing.path().join("absent");
         assert_eq!(inspect_lexical_layout(&missing_root)?, LexicalLayout::Empty);
-        assert!(!missing_root.exists(), "inspection must not create the root");
+        assert!(
+            !missing_root.exists(),
+            "inspection must not create the root"
+        );
 
         // Bare dir → Empty, no CURRENT appears.
         let bare = tempdir()?;
