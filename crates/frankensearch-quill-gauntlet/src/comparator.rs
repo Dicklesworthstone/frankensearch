@@ -5397,6 +5397,7 @@ fn classify_rank(
     let pointer = first_rank_pointer(&subject.hits, &oracle.hits);
     if is_exact_tie_reorder(&subject.hits, &oracle.hits)
         || is_proven_cutoff_tie_substitution(subject, oracle)
+        || is_proven_mixed_tie_equivalence(subject, oracle)
     {
         return (
             RankClass::TieOrder,
@@ -5565,6 +5566,89 @@ fn is_proven_boundary_tie_substitution(
         }
     }
     saw_difference
+}
+
+/// Prove the composition of native-order changes inside complete score groups
+/// and a membership substitution at a complete page boundary.
+///
+/// The simpler proofs above intentionally handle one shape at a time: an
+/// internal reorder requires identical top-k membership, while a boundary
+/// substitution requires every differing rank to belong to that boundary.
+/// A real page can contain both. This proof remains fail-closed by requiring
+/// identical score bits at every rank, identical per-document scores for every
+/// common document, and complete oracle boundary membership for every document
+/// that appears on only one side.
+fn is_proven_mixed_tie_equivalence(
+    subject: &EngineObservation,
+    oracle: &EngineObservation,
+) -> bool {
+    if subject.hits.len() != oracle.hits.len() || subject.hits.is_empty() {
+        return false;
+    }
+    if subject
+        .hits
+        .iter()
+        .zip(&oracle.hits)
+        .any(|(subject_hit, oracle_hit)| {
+            !scores_exact(subject_hit.score_bits, oracle_hit.score_bits)
+        })
+    {
+        return false;
+    }
+
+    let Some(subject_scores) = score_map(&subject.hits) else {
+        return false;
+    };
+    let Some(oracle_scores) = score_map(&oracle.hits) else {
+        return false;
+    };
+    if subject_scores.iter().any(|(doc_id, score_bits)| {
+        oracle_scores
+            .get(doc_id)
+            .is_some_and(|oracle_bits| !scores_exact(*score_bits, *oracle_bits))
+    }) {
+        return false;
+    }
+
+    let leading = oracle.hits.first().and_then(|boundary| {
+        complete_boundary_group(
+            &oracle.offset_tie_group,
+            oracle.offset_tie_complete,
+            boundary.score_bits,
+        )
+    });
+    let trailing = oracle.hits.last().and_then(|boundary| {
+        complete_boundary_group(
+            &oracle.cutoff_tie_group,
+            oracle.cutoff_tie_complete,
+            boundary.score_bits,
+        )
+    });
+    let explained_by_boundary = |hit: &RankedHit| {
+        [leading.as_ref(), trailing.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|(score_bits, docs)| {
+                scores_exact(hit.score_bits, *score_bits) && docs.contains(hit.doc_id.as_str())
+            })
+    };
+
+    let subject_only = subject
+        .hits
+        .iter()
+        .filter(|hit| !oracle_scores.contains_key(hit.doc_id.as_str()))
+        .collect::<Vec<_>>();
+    let oracle_only = oracle
+        .hits
+        .iter()
+        .filter(|hit| !subject_scores.contains_key(hit.doc_id.as_str()))
+        .collect::<Vec<_>>();
+    !subject_only.is_empty()
+        && subject_only.len() == oracle_only.len()
+        && subject_only
+            .into_iter()
+            .chain(oracle_only)
+            .all(explained_by_boundary)
 }
 
 fn is_score_epsilon_equivalent(subject: &[RankedHit], oracle: &[RankedHit], epsilon: f32) -> bool {
@@ -7174,6 +7258,56 @@ mod tests {
             .expect("incomplete tie evidence fails closed");
         assert_eq!(failed.rank_class, RankClass::RankMismatch);
         assert_eq!(failed.status, ComparisonStatus::Failed);
+    }
+
+    #[test]
+    fn mixed_internal_reorder_and_cutoff_substitution_is_tie_order() {
+        let mut subject = observation(vec![
+            quill_hit("a", 5.0, 1),
+            quill_hit("c", 4.0, 2),
+            quill_hit("b", 4.0, 3),
+            quill_hit("e", 3.0, 4),
+        ]);
+        subject.match_count = CountState::Value(5);
+        let mut oracle = observation(vec![
+            tantivy_hit("a", 5.0, 1),
+            tantivy_hit("b", 4.0, 2),
+            tantivy_hit("c", 4.0, 3),
+            tantivy_hit("d", 3.0, 4),
+        ]);
+        oracle.match_count = CountState::Value(5);
+        oracle.cutoff_tie_group = vec![tantivy_hit("d", 3.0, 4), tantivy_hit("e", 3.0, 5)];
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("composed exact-tie proof");
+
+        assert_eq!(report.rank_class, RankClass::TieOrder);
+        assert_eq!(report.status, ComparisonStatus::Classified);
+    }
+
+    #[test]
+    fn mixed_tie_proof_rejects_unexplained_cutoff_member() {
+        let mut subject = observation(vec![
+            quill_hit("a", 5.0, 1),
+            quill_hit("c", 4.0, 2),
+            quill_hit("b", 4.0, 3),
+            quill_hit("x", 3.0, 4),
+        ]);
+        subject.match_count = CountState::Value(5);
+        let mut oracle = observation(vec![
+            tantivy_hit("a", 5.0, 1),
+            tantivy_hit("b", 4.0, 2),
+            tantivy_hit("c", 4.0, 3),
+            tantivy_hit("d", 3.0, 4),
+        ]);
+        oracle.match_count = CountState::Value(5);
+        oracle.cutoff_tie_group = vec![tantivy_hit("d", 3.0, 4), tantivy_hit("e", 3.0, 5)];
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("unexplained cutoff member fails closed");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
     }
 
     #[test]
