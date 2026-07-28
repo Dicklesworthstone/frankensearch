@@ -5674,10 +5674,18 @@ mod tests {
         );
     }
 
-    fn assert_admission_corrupted(path: &Path, binding: &FsviV2IdentityBinding) {
+    fn admit_owned_v2_fixture(
+        path: &Path,
+        binding: &FsviV2IdentityBinding,
+    ) -> Result<ValidatedFsviBytes, FsviAdmissionError> {
+        let bytes = fs::read(path).map_err(SearchError::Io)?;
+        ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), binding)
+    }
+
+    fn assert_owned_admission_corrupted(path: &Path, binding: &FsviV2IdentityBinding) {
         assert!(
             matches!(
-                VectorIndex::open_admitted_v2(path, binding),
+                admit_owned_v2_fixture(path, binding),
                 Err(FsviAdmissionError::Index(
                     SearchError::IndexCorrupted { .. }
                 ))
@@ -5700,6 +5708,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
         let mut names: Vec<_> = fs::read_dir(path)
             .expect("read private fixture directory")
@@ -5775,9 +5784,9 @@ mod tests {
         assert_eq!(metadata.vectors_offset % VECTOR_ALIGN_BYTES, 0);
 
         let mut index =
-            VectorIndex::open_admitted_v2(&path, &expected).expect("exact admission succeeds");
+            admit_owned_v2_fixture(&path, &expected).expect("exact owned admission succeeds");
         assert!(index.is_identity_admitted_v2());
-        assert!(index.published_wal_absent());
+        assert!(!index.published_wal_absent());
         assert!(index.owner_and_search_share_allocation());
         assert_eq!(index.record_count(), 2);
         assert_eq!(index.embedder_id(), "v2-round-trip");
@@ -5861,8 +5870,7 @@ mod tests {
             .finish()
             .expect("finish empty v2");
 
-        let index =
-            VectorIndex::open_admitted_v2(&path, &binding).expect("admit empty v2 artifact");
+        let index = admit_owned_v2_fixture(&path, &binding).expect("admit empty owned v2 artifact");
         assert_eq!(index.record_count(), 0);
         let identity = index.identity_v2();
         assert_ne!(identity.ordered_live_docset_digest, [0; SHA256_BYTES]);
@@ -5874,6 +5882,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn sealed_owner_survives_path_replacement_and_exact_reopen_rejects_new_bytes() {
         let directory = tempfile::tempdir().expect("private publication directory");
@@ -5985,8 +5994,8 @@ mod tests {
             writer.finish().expect("identity finish");
         }
 
-        let owner_a = ValidatedFsviBytes::open_published(&path_a, &binding_a).expect("owner a");
-        let owner_b = ValidatedFsviBytes::open_published(&path_b, &binding_b).expect("owner b");
+        let owner_a = admit_owned_v2_fixture(&path_a, &binding_a).expect("owner a");
+        let owner_b = admit_owned_v2_fixture(&path_b, &binding_b).expect("owner b");
         assert_eq!(owner_a.embedder_id(), owner_b.embedder_id());
         assert_eq!(owner_a.embedder_revision(), owner_b.embedder_revision());
         assert_eq!(owner_a.dimension(), owner_b.dimension());
@@ -5996,14 +6005,14 @@ mod tests {
         );
         assert_ne!(owner_a.witness(), owner_b.witness());
         assert!(matches!(
-            ValidatedFsviBytes::open_published(&path_a, &binding_b),
+            admit_owned_v2_fixture(&path_a, &binding_b),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::IdentityMismatch,
                 ..
             }))
         ));
         assert!(matches!(
-            ValidatedFsviBytes::open_published(&path_b, &binding_a),
+            admit_owned_v2_fixture(&path_b, &binding_a),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::IdentityMismatch,
                 ..
@@ -6024,7 +6033,7 @@ mod tests {
             .expect("live row");
         writer.finish().expect("finish tombstone fixture");
 
-        let owner = ValidatedFsviBytes::open_published(&path, &binding).expect("tombstone owner");
+        let owner = admit_owned_v2_fixture(&path, &binding).expect("tombstone owner");
         assert_eq!(owner.record_count(), 2);
         assert_eq!(owner.live_count(), 1);
         assert_eq!(owner.tombstone_count(), 1);
@@ -6065,7 +6074,7 @@ mod tests {
     fn all_live_docset_digest_remains_byte_compatible_with_xomn_formula() {
         let binding = fsvi_v2_binding("v2-all-live-compatible", 4, Quantization::F16, 24, 0x84);
         let (path, expected) = write_v2_fixture("v2-all-live-compatible", binding);
-        let owner = ValidatedFsviBytes::open_published(&path, &expected).expect("all-live owner");
+        let owner = admit_owned_v2_fixture(&path, &expected).expect("all-live owner");
         let mut prior_formula = Sha256::new();
         update_digest_domain(&mut prior_formula, ORDERED_DOCSET_DIGEST_DOMAIN);
         prior_formula.update(
@@ -6103,12 +6112,24 @@ mod tests {
             .expect("unicode id");
         writer.finish().expect("finish boundary fixture");
 
-        let owner = ValidatedFsviBytes::open_published(&path, &binding).expect("boundary owner");
+        let owner = admit_owned_v2_fixture(&path, &binding).expect("boundary owner");
         let ids: std::collections::HashSet<String> = (0..owner.record_count())
             .map(|index| owner.doc_id_at(index).expect("boundary id").to_owned())
             .collect();
         assert!(ids.contains(&boundary_id));
         assert!(ids.contains(unicode_id));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn published_open_fails_closed_when_noatime_is_unsupported() {
+        let binding = fsvi_v2_binding("v2-noatime-unsupported", 4, Quantization::F16, 26, 0x86);
+        let (path, expected) = write_v2_fixture("v2-noatime-unsupported", binding);
+
+        assert_snapshot_rejection(
+            VectorIndex::open_admitted_v2(&path, &expected),
+            FsviSnapshotRejectionReason::NoAtimeUnsupported,
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -6164,7 +6185,7 @@ mod tests {
         assert!(owner.published_wal_absent());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn published_open_rejects_symlink_hardlink_and_nonregular_paths() {
         use std::os::unix::fs::symlink;
@@ -6281,6 +6302,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn published_open_rejects_every_wal_shape_without_mutating_it() {
         for shape in ["empty", "valid", "corrupt", "truncated"] {
@@ -6390,7 +6412,7 @@ mod tests {
         ));
         let expected = fsvi_v2_binding("v2-inspect", 4, Quantization::F16, 1, 0x22);
         assert!(matches!(
-            VectorIndex::open_admitted_v2(&legacy_path, &expected),
+            admit_owned_v2_fixture(&legacy_path, &expected),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::LegacyUnidentified,
                 ..
@@ -6409,7 +6431,7 @@ mod tests {
             })) if found_version == FSVI_V2_VERSION + 1
         ));
         assert!(matches!(
-            VectorIndex::open_admitted_v2(&future_path, &expected),
+            admit_owned_v2_fixture(&future_path, &expected),
             Err(FsviAdmissionError::UpgradeRequired(FsviUpgradeRequired {
                 found_version,
                 ..
@@ -6428,7 +6450,7 @@ mod tests {
 
         let wrong_generation = fsvi_v2_binding("v2-exact", 4, Quantization::F16, 8, 0x34);
         assert!(matches!(
-            VectorIndex::open_admitted_v2(&path, &wrong_generation),
+            admit_owned_v2_fixture(&path, &wrong_generation),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::GenerationMismatch,
                 ..
@@ -6437,7 +6459,7 @@ mod tests {
 
         let wrong_storage = fsvi_v2_binding("v2-exact", 4, Quantization::F32, 7, 0x33);
         assert!(matches!(
-            VectorIndex::open_admitted_v2(&path, &wrong_storage),
+            admit_owned_v2_fixture(&path, &wrong_storage),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::StorageMismatch,
                 ..
@@ -6452,14 +6474,14 @@ mod tests {
             0x33,
         );
         assert!(matches!(
-            VectorIndex::open_admitted_v2(&path, &wrong_identity),
+            admit_owned_v2_fixture(&path, &wrong_identity),
             Err(FsviAdmissionError::ReindexRequired(FsviReindexRequired {
                 reason: FsviReindexReason::IdentityMismatch,
                 ..
             }))
         ));
 
-        VectorIndex::open_admitted_v2(&path, &expected).expect("control admission");
+        admit_owned_v2_fixture(&path, &expected).expect("control admission");
     }
 
     #[test]
@@ -6608,7 +6630,7 @@ mod tests {
             let mut mutated = source.clone();
             mutated[offset] ^= 0x01;
             fs::write(&path, mutated).expect("write content mutation");
-            assert_admission_corrupted(&path, &expected);
+            assert_owned_admission_corrupted(&path, &expected);
         }
 
         for (name, offset) in [
@@ -6620,18 +6642,18 @@ mod tests {
             mutated[offset] ^= 0x01;
             refresh_v2_header_crc(&mut mutated);
             fs::write(&path, mutated).expect("write digest mutation");
-            assert_admission_corrupted(&path, &expected);
+            assert_owned_admission_corrupted(&path, &expected);
         }
 
         let trailing_path = temp_index_path("v2-content-trailing");
         let mut trailing = source.clone();
         trailing.push(0);
         fs::write(&trailing_path, trailing).expect("write trailing byte");
-        assert_admission_corrupted(&trailing_path, &expected);
+        assert_owned_admission_corrupted(&trailing_path, &expected);
 
         let truncated_path = temp_index_path("v2-content-truncated");
         fs::write(&truncated_path, &source[..source.len() - 1]).expect("write truncated vector");
-        assert_admission_corrupted(&truncated_path, &expected);
+        assert_owned_admission_corrupted(&truncated_path, &expected);
 
         let unaligned_path = temp_index_path("v2-content-unaligned-vector-slab");
         let mut unaligned = source.clone();
@@ -6650,19 +6672,22 @@ mod tests {
         );
         refresh_v2_header_crc(&mut unaligned);
         fs::write(&unaligned_path, unaligned).expect("write unaligned vector slab");
-        assert_admission_corrupted(&unaligned_path, &expected);
+        assert_owned_admission_corrupted(&unaligned_path, &expected);
 
-        let wal_path = wal::wal_path_for(&source_path);
-        fs::write(&wal_path, b"live-sidecar").expect("write live WAL sidecar");
-        let sidecar_before = fs::read(&wal_path).expect("read sidecar before rejection");
-        assert_snapshot_rejection(
-            VectorIndex::open_admitted_v2(&source_path, &expected),
-            FsviSnapshotRejectionReason::PublishedWalPresent,
-        );
-        assert_eq!(
-            fs::read(&wal_path).expect("read preserved sidecar"),
-            sidecar_before
-        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let wal_path = wal::wal_path_for(&source_path);
+            fs::write(&wal_path, b"live-sidecar").expect("write live WAL sidecar");
+            let sidecar_before = fs::read(&wal_path).expect("read sidecar before rejection");
+            assert_snapshot_rejection(
+                VectorIndex::open_admitted_v2(&source_path, &expected),
+                FsviSnapshotRejectionReason::PublishedWalPresent,
+            );
+            assert_eq!(
+                fs::read(&wal_path).expect("read preserved sidecar"),
+                sidecar_before
+            );
+        }
     }
 
     #[test]
