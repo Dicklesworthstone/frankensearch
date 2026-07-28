@@ -26,7 +26,7 @@ use tracing::instrument;
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::traits::LexicalRead;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
 #[cfg(all(feature = "durability", feature = "quill"))]
@@ -751,7 +751,7 @@ pub struct HybridIndexParts {
     pub vectors: Arc<TwoTierIndex>,
     /// Active lexical reader for `<dir>/lexical`, when one exists and a
     /// lexical backend is compiled in.
-    pub lexical: Option<Arc<dyn LexicalSearch>>,
+    pub lexical: Option<Arc<dyn LexicalRead>>,
 }
 
 impl std::fmt::Debug for HybridIndexParts {
@@ -802,7 +802,7 @@ pub async fn open_hybrid(
 }
 
 #[cfg(feature = "quill")]
-async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
+async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
     // bd-8nqz.2: dispatch on the inspected layout instead of blindly opening
     // the root — a blue-green root opens its ACTIVE engine dir, a foreign or
     // damaged layout is a typed error, and inspection never adopts/publishes.
@@ -834,16 +834,13 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
 }
 
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
-async fn open_lexical_reader(_cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
+async fn open_lexical_reader(_cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
     let index = TantivyIndex::open(dir)?;
     Ok(Some(Arc::new(index)))
 }
 
 #[cfg(not(any(feature = "lexical", feature = "quill")))]
-async fn open_lexical_reader(
-    _cx: &Cx,
-    _dir: &Path,
-) -> SearchResult<Option<Arc<dyn LexicalSearch>>> {
+async fn open_lexical_reader(_cx: &Cx, _dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
     Ok(None)
 }
 
@@ -1030,8 +1027,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    #[cfg(all(feature = "lexical", not(feature = "quill")))]
-    use frankensearch_core::traits::LexicalSearch;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
