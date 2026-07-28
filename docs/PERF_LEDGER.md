@@ -7579,3 +7579,52 @@ Retry only by running and immediately reproducing all 20 normative QG-6
 fixtures from this exact ELF on one quiet reference host. Every semantic
 receipt, A/A control, and reproduction law must pass before evaluating the
 per-class ±10% target; CV remains provenance only.
+
+## 2026-07-28 — QG-3 INVALID-NULL: eligible 5995WX rerun finds a warm-fixture lifecycle leak (`bd-h6eh`, FoggySquirrel)
+
+Candidate `qg3-candidate-threadripper5995-f9ab-20260728T1727Z` completed the
+full five-cell QG-3 matrix on an eligible Threadripper PRO 5995WX host with 128
+logical CPUs, `performance` governor, and a quiet `0.63` / `2.04` start/end
+load receipt. The run used clean revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+the actual linked Tantivy 0.26.1 incumbent, 10 paired blocks, and
+same-invocation A/A controls.
+
+All five controls failed at least one predeclared law:
+
+- initial docs/s: order effect `-0.078757` and drift `-0.068135`;
+- in-process updates/s: CI half-width `0.423731` and log-MAD `0.057952`;
+- in-process latency: CI half-width `0.133028`;
+- fresh-process updates/s: center `0.019591`, log-CI
+  `[0.001755, 0.065349]`;
+- fresh-process latency: drift `-0.053829`.
+
+Accordingly, the apparent Quill/Tantivy ratios—`0.321504
+[0.302387, 0.343013]` initial docs/s, `0.521828
+[0.489604, 0.542868]` in-process updates/s, `2.063031
+[2.016110, 2.149795]` in-process latency, `0.587486
+[0.573602, 0.593036]` fresh-process updates/s, and `1.712895
+[1.684956, 1.762627]` fresh-process latency—are non-claims.
+
+The eligible, quiet-host result refutes the preceding host/governor retry
+hypothesis. Raw A/A samples instead expose large, repeatable Tantivy outliers.
+The measured path commits a newly built warm corpus and immediately starts its
+update clock without joining Tantivy background merges spawned by setup, so
+unobserved setup maintenance can contaminate either member of a null pair.
+
+**Decision: INVALID-NULL / NO CLAIM.** The evidence JSON SHA-256 is
+`16c3dd51dd89c8237dad49bb86b604ca73e4c8deded6ba9dcc1d5cbb3165af65`;
+the sealed artifact SHA-256 is
+`333ce31ece9ebfbf9e45a550c15521fbc5ea3cd50136e7fb0cc556c452194470`.
+Artifacts are retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-threadripper5995-f9ab-20260728T1727Z/`.
+There is no QG-3 PASS/MISS.
+
+Retry only after the harness joins every warm-fixture background operation
+before starting the update timer while keeping maintenance caused by the
+measured update inside the metric. Require a counted segment/merge lifecycle
+receipt for that boundary, a newly built self-hashing exact ELF, all five valid
+A/A controls on an eligible quiet host, and one immediate same-ELF
+reproduction. Do not resample either current Threadripper route, weaken a null
+law, or use CV as the gate.

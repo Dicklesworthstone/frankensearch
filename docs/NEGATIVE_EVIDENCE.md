@@ -16994,3 +16994,55 @@ Require every semantic receipt and same-invocation A/A control to pass, then
 run one immediate same-window reproduction from the same ELF. Promote only the
 complete reproducible pair; never promote this filtered artifact or gate on
 CV.
+
+### 2026-07-28 — QG-3 eligible-host rerun exposes unfenced warm-fixture merges (`bd-h6eh`, FoggySquirrel)
+
+Full candidate
+`qg3-candidate-threadripper5995-f9ab-20260728T1727Z` ran all five QG-3
+cells on an eligible Threadripper PRO 5995WX host with 128 logical CPUs,
+`performance` governor, and load average `0.63` at start / `2.04` at end.
+It used exact clean revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+the linked Tantivy 0.26.1 incumbent, 10 paired blocks, and same-invocation
+Tantivy/Tantivy A/A controls.
+
+Every required cell was `INVALID-NULL`:
+
+- initial ingest: A/A order effect `-0.078757` and drift `-0.068135` exceeded
+  the predeclared `0.048790` bounds;
+- in-process updates/s: A/A CI half-width `0.423731` exceeded `0.095310` and
+  log-MAD `0.057952` exceeded `0.048790`;
+- in-process update-to-searchable: A/A CI half-width `0.133028` exceeded
+  `0.095310`;
+- fresh-process updates/s: A/A center `0.019591` with log-CI
+  `[0.001755, 0.065349]` excluded identity;
+- fresh-process update-to-searchable: A/A drift `-0.053829` exceeded
+  `0.048790`.
+
+The apparent Quill/Tantivy ratios—initial docs/s `0.321504
+[0.302387, 0.343013]`, in-process updates/s `0.521828
+[0.489604, 0.542868]`, in-process latency `2.063031
+[2.016110, 2.149795]`, fresh-process updates/s `0.587486
+[0.573602, 0.593036]`, and fresh-process latency `1.712895
+[1.684956, 1.762627]`—are non-claims. The A/A samples show deterministic
+Tantivy outliers while the machine receipt remains quiet. Manual source
+adjudication found that each sample commits the warm corpus and immediately
+starts the timed update while Tantivy's background segment updater may still
+be merging that setup corpus.
+
+**Decision: INVALID-NULL / NO CLAIM.** Evidence JSON SHA-256
+`16c3dd51dd89c8237dad49bb86b604ca73e4c8deded6ba9dcc1d5cbb3165af65`
+and sealed artifact SHA-256
+`333ce31ece9ebfbf9e45a550c15521fbc5ea3cd50136e7fb0cc556c452194470`
+are retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-threadripper5995-f9ab-20260728T1727Z/`.
+No QG-3 PASS or MISS follows.
+
+**Retry predicate:** do not resample either Threadripper host. First repair the
+warm-fixture lifecycle so all background work created by setup is joined before
+the update clock starts, while maintenance caused by the measured update
+remains inside the declared metric. Emit a counted segment/merge lifecycle
+receipt proving that boundary, build a new self-hashing exact ELF, and rerun all
+five cells on an eligible quiet host. Admit only if every A/A null passes, then
+run one immediate same-ELF reproduction; never weaken a null law or gate on CV.
