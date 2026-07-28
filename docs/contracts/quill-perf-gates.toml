@@ -45,7 +45,7 @@ activated = false
 name = "bulk indexing, single-thread"
 fixture = "medium; positions ON; threads = 1; commit included"
 target = "docs_per_sec >= 1.5x oracle"
-activated = false
+activated = true
 
 [gate.QG-3]
 name = "watch-mode incremental"

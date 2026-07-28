@@ -7710,3 +7710,26 @@ service is neither `activating` nor `start`, with the next timer deadline and
 quiet load recorded. Then run a fresh candidate plus immediate same-ELF
 reproduction; both A/A controls and the 2% reproduction bound must admit before
 activation. CV remains provenance only.
+
+## 2026-07-28 — QG-2 ACTIVATED / MISS: warm-state single-thread incumbent comparison (`bd-h6eh`, FoggySquirrel)
+
+Candidate and immediate same-ELF reproduction ran side-by-side against the
+linked Tantivy 0.26.1 incumbent on the eligible Threadripper PRO 5995WX,
+bound to physical cores 0–15 and SMT siblings 64–79. Exact ELF SHA-256:
+`a23ff78e42c12cb71a269800250c492a03da56e43472225ac07420dc8afccaa1`.
+Both runs used five excluded warmup rounds, 30 paired blocks, identical
+window/configuration, and admissible same-invocation A/A controls.
+
+Measured Quill/Tantivy docs/s ratios were **0.349777 [0.344699, 0.356242]**
+(candidate) and **0.345546 [0.341425, 0.351114]** (reproduction). The QG-2
+target is 1.5x, so this is an honest **MISS**. The bootstrap ratchet accepted
+the complete reproducible measurement and activated QG-2 while preserving the
+MISS verdict. Baseline: `.bench-history/QG-2.trj-zen3-16c.latest.json`.
+Evidence SHA-256 values are `6936ae195a7b939083a9f5fc9b81db1ee306619182ba8820a0c99a7fb32ae0d1`
+and `876f20b8be76eaec69b34d9fb97bfd5da85e84462c5d8f0a1080f1173ad09ffb`.
+
+Retry predicate: after a profile-attributed Quill change, rerun the same
+exact ELF contract on the same 16-core slice with five excluded warmups and
+30 paired blocks; require both A/A nulls and immediate same-ELF reproduction
+to admit before evaluating whether the ratio clears 1.5x. CV remains
+provenance only.

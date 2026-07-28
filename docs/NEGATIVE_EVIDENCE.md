@@ -17229,3 +17229,23 @@ then run one candidate and immediate reproduction on the same 16-core CCD
 slice with the same warmup count. Require both A/A controls and the 2%
 reproduction law before activation; never promote the one-CPU diagnostics,
 relax a threshold, select a favorable prior pair, or gate on CV.
+
+### 2026-07-28 — QG-2 target MISS is now a certified baseline (`bd-h6eh`, FoggySquirrel)
+
+The warm-state retry closed the prior reproduction defect. Candidate and
+immediate rerun used the same self-reporting ELF
+`a23ff78e42c12cb71a269800250c492a03da56e43472225ac07420dc8afccaa1`, the
+linked Tantivy 0.26.1 incumbent, five excluded warmup rounds, 30 paired
+blocks, and the same 16-physical-core Threadripper slice. The same-invocation
+A/A controls were admissible in both invocations: **1.014546 [0.981241,
+1.025487]** and
+**1.019110 [0.982464, 1.046989]**. Quill/Tantivy docs/s was
+**0.349777 [0.344699, 0.356242]** and **0.345546 [0.341425, 0.351114]**.
+The required 1.5x threshold is not met: **MISS**. This is a valid baseline,
+not a competitive claim. The promoted baseline is
+`.bench-history/QG-2.trj-zen3-16c.latest.json`.
+
+Retry only after a profile-attributed change, using the same exact-ELF,
+five-warmup, 30-block contract and immediate reproduction on the same slice;
+both A/A controls and the reproduction law must admit before scoring the
+target. Do not gate on CV.
