@@ -1359,6 +1359,49 @@ impl LexicalSearch for ShadowLexical {
     }
 }
 
+// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
+// impl above; bodies move here when `LexicalSearch` is removed. The default
+// eager `search_candidates` is deliberate: the serving backend may defer
+// metadata, and an eager batch built from full `search` results is the only
+// shape that stays correct without threading the serving backend's private
+// hydration context through the shadow comparison.
+impl crate::traits::LexicalRead for ShadowLexical {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        LexicalSearch::search(self, cx, query, limit)
+    }
+
+    fn doc_count(&self) -> usize {
+        LexicalSearch::doc_count(self)
+    }
+}
+
+impl crate::traits::LexicalWrite for ShadowLexical {
+    fn index_document<'a>(
+        &'a self,
+        cx: &'a Cx,
+        doc: &'a IndexableDocument,
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_document(self, cx, doc)
+    }
+
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_documents(self, cx, docs)
+    }
+
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
+        LexicalSearch::commit(self, cx)
+    }
+}
+
 fn ranked_hits(results: &[ScoredResult]) -> Vec<ShadowRankedHit> {
     results
         .iter()
