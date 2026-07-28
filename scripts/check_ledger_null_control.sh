@@ -24,6 +24,7 @@ CANDIDATE=""
 SURFACE=""
 LEDGER_OVERRIDE=""
 SELF_CHECK_FIXTURE=""
+SELF_CHECK_ADDED_HEADING_LINE=""
 
 usage() {
   cat <<'USAGE'
@@ -227,7 +228,11 @@ diff_stream() {
       # No hunks are needed in report mode; awk checks every entry.
       ;;
     selfcheck)
-      # Synthetic self-check entries are all considered newly added.
+      # Most synthetic self-check entries are all considered newly added.
+      # A selected heading can instead model a new row after an existing row.
+      if [[ -n "${SELF_CHECK_ADDED_HEADING_LINE}" ]]; then
+        printf '@@ -0,0 +%s @@\n' "${SELF_CHECK_ADDED_HEADING_LINE}"
+      fi
       ;;
   esac
 }
@@ -260,7 +265,9 @@ lint_one() {
   local requested="$1"
   resolve_ledger "${requested}"
 
-  awk -v mode="${MODE}" -v ledger="${LEDGER_REL}" '
+  awk -v mode="${MODE}" \
+      -v ledger="${LEDGER_REL}" \
+      -v selfcheck_added_heading="${SELF_CHECK_ADDED_HEADING_LINE}" '
     function has_hex64(line,    fields, n, i) {
       n = split(line, fields, /[^[:xdigit:]]+/)
       for (i = 1; i <= n; i++) {
@@ -337,13 +344,23 @@ coefficient of variation[_ -]*gate/ ||
         cv_verdict = 1
       }
     }
+    function reset_entry_state() {
+      header = ""; evidence = ""; decision_lines = ""
+      numeric_null = 0; same_invocation = 0
+      counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
+      side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
+      actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
+    }
     function flush(    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
-      new_entry = (mode == "all" || mode == "selfcheck" || added[start_line])
+      new_entry = (mode == "all" ||
+                   (mode == "selfcheck" && selfcheck_added_heading == "") ||
+                   added[start_line])
       if (!new_entry) {
-        header = ""; evidence = ""; return
+        reset_entry_state()
+        return
       }
 
       checked++
@@ -424,11 +441,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
         }
       }
 
-      header = ""; evidence = ""; decision_lines = ""
-      numeric_null = 0; same_invocation = 0
-      counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
-      side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
-      actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
+      reset_entry_state()
     }
 
     FNR == NR {
@@ -537,6 +550,7 @@ run_selfcheck_case() {
 
   SELF_CHECK_TOTAL=$((SELF_CHECK_TOTAL + 1))
   SELF_CHECK_FIXTURE="${fixture}"
+  SELF_CHECK_ADDED_HEADING_LINE="${5:-}"
   if output="$(lint_one "${ledger}" 2>&1)"; then
     rc=0
   else
@@ -549,6 +563,7 @@ run_selfcheck_case() {
     return 1
   fi
   SELF_CHECK_PASSED=$((SELF_CHECK_PASSED + 1))
+  SELF_CHECK_ADDED_HEADING_LINE=""
   echo "[ledger-selfcheck] PASS ${ledger} ${label}: exit ${rc}"
 }
 
@@ -559,6 +574,7 @@ run_selfcheck_suite() {
 
   run_selfcheck_case "VOID-NONULL reject is blocked" 2 "${ledger}" $'### 2099-01-01 — REJECT: synthetic no-null row\nA/B median ratio: 1.001\nDecision: reject as no improvement.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "CV-only reject is blocked" 2 "${ledger}" $'### 2099-01-02 — REJECT / INVALID-CV: synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nA/B median CI: 0.980 [0.950, 1.020]\nDecision: reject because arm CV exceeded 5%.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "existing CV verdict does not contaminate a new row" 0 "${ledger}" $'### 2099-01-02 — REJECT / INVALID-CV: existing synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nDecision: reject because arm CV exceeded 5%.\n### 2099-01-03 — REJECT: new null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 4 || SELF_CHECK_FAILED=1
   run_selfcheck_case "null-floor reject is admitted" 0 "${ledger}" $'### 2099-01-03 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nA/B median CI: 1.001 [0.990, 1.010]\nDecision: no-ship because the effect remains inside the A/A null floor.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "counted-mechanism reject is admitted" 0 "${ledger}" $'### 2099-01-04 — REJECT: synthetic counted-mechanism row\nInstructions count unchanged: baseline 100, candidate 100.\nDecision: reject because the counted mechanism removed no work.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "KEEP without ELF SHA is blocked" 2 "${ledger}" $'### 2099-01-05 — KEEP: synthetic unbound binary\nComparison class: SELF-SPEEDUP\nA/B median CI: 0.900 [0.880, 0.920].' || SELF_CHECK_FAILED=1
