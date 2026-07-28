@@ -1164,6 +1164,24 @@ impl PerfEvidenceArtifact {
                 .all(EvidenceCell::claim_eligible)
     }
 
+    /// Fail closed when an invocation selected only part of a normative gate.
+    ///
+    /// The measured cells and raw samples remain durable, but the artifact
+    /// cannot establish a ratchet or accept a downstream gate decision.
+    pub fn force_no_claim(&mut self, code: &str, message: impl Into<String>) {
+        if self.gate_status != EvidenceDecisionStatus::InvalidNull {
+            self.gate_status = EvidenceDecisionStatus::NoDecision;
+        }
+        self.gate_decision = None;
+        self.reasons.push(EvidenceReason::new(
+            code,
+            message,
+            EvidenceSeverity::NoClaim,
+        ));
+        self.reasons.truncate(EVIDENCE_MAX_REASONS);
+        self.artifact_sha256.clear();
+    }
+
     /// Record a downstream promotion decision.
     ///
     /// # Errors
@@ -1984,6 +2002,30 @@ mod tests {
                 .any(|reason| reason.code == "evidence.gate_without_required_cells")
         );
         assert!(!artifact.ratchet_admissible());
+    }
+
+    #[test]
+    fn qg6_incomplete_gate_selection_is_durable_but_forced_to_no_claim() {
+        let mut artifact = provisional_artifact();
+        assert!(artifact.ratchet_admissible());
+
+        artifact.force_no_claim(
+            "evidence.incomplete_gate_selection",
+            "fixture-filtered pre-admission run",
+        );
+
+        assert_eq!(artifact.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert!(!artifact.ratchet_admissible());
+        assert!(
+            artifact
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "evidence.incomplete_gate_selection")
+        );
+        assert!(matches!(
+            artifact.apply_gate_decision(EvidenceDecisionStatus::Allow),
+            Err(EvidenceArtifactError::NotClaimEligible)
+        ));
     }
 
     #[test]

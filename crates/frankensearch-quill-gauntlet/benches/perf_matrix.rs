@@ -38,9 +38,10 @@ use frankensearch_quill_gauntlet::{
     PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample,
     PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
-    PositionMode, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, estimate_paired_experiment,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, seeded_balanced_pair_order,
-    validate_matrix,
+    PositionMode, Qg6ArmRole, Qg6Comparison, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder,
+    Qg6SearchResult, Qg6SelectionScope, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
+    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
+    seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -164,6 +165,16 @@ impl EngineArm {
     }
 }
 
+enum PreparedQueryArm {
+    Quill(Box<QuillIndex>),
+    Tantivy(Box<TantivyIndex>),
+}
+
+enum PreparedQueryResult {
+    Quill(Vec<frankensearch_quill::QuillHit>),
+    Tantivy(Vec<frankensearch_lexical::LexicalIdHit>),
+}
+
 struct BenchContext {
     runtime: Runtime,
     cx: Cx,
@@ -211,6 +222,10 @@ fn generated_batch(
             if let Some(generation) = update_generation {
                 generated.content.push_str(" quill update generation ");
                 generated.content.push_str(&generation.to_string());
+                generated.content.push_str(" qgupdateg");
+                generated.content.push_str(&generation.to_string());
+                generated.content.push('d');
+                generated.content.push_str(&ordinal.to_string());
             }
             generated.into()
         })
@@ -286,12 +301,13 @@ fn preflight_index<E: LexicalSearch>(
     })
 }
 
-/// Construct and query every selected QG-1 matrix cell before collecting any
+/// Construct and query every selected QG-1/QG-2 indexing cell before collecting
 /// timing samples. This is deliberately driven by the validated normative
 /// matrix rather than a second handwritten fixture list, so a newly added
-/// position/schema cell cannot reach release measurement without first
-/// proving that both engines can serve its position-independent query.
-fn preflight_qg1_fixtures(
+/// position/schema cell cannot reach release measurement without first proving
+/// that both engines indexed the same documents and serve the same ordered
+/// result.
+fn preflight_indexing_fixtures(
     context: &BenchContext,
     matrix: &PerfMatrixSpec,
     selected: &[PerfCellSpec],
@@ -309,10 +325,14 @@ fn preflight_qg1_fixtures(
         "qg-preflight-single".to_owned(),
     ];
 
-    for spec in selected.iter().filter(|spec| spec.gate == PerfGate::Qg1) {
+    for spec in selected
+        .iter()
+        .filter(|spec| matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg2))
+    {
         assert!(
             matrix.cells.contains(spec),
-            "selected QG-1 fixture is absent from the normative matrix: {}",
+            "selected {} fixture is absent from the normative matrix: {}",
+            spec.gate,
             spec.fixture
         );
         if spec.metric == "tokenize_docs_per_second" {
@@ -371,6 +391,28 @@ fn index_batches<E: LexicalSearch>(
     document_count: u64,
     update_generation: Option<u64>,
 ) -> Duration {
+    index_batches_observed(
+        context,
+        index,
+        corpus,
+        document_count,
+        update_generation,
+        |_| {},
+    )
+}
+
+fn index_batches_observed<E, F>(
+    context: &BenchContext,
+    index: &E,
+    corpus: &SyntheticCorpus,
+    document_count: u64,
+    update_generation: Option<u64>,
+    mut observe_batch: F,
+) -> Duration
+where
+    E: LexicalSearch,
+    F: FnMut(u64),
+{
     let mut measured = Duration::ZERO;
     let batch_documents = context.scale.batch_documents();
     let mut start = 0_u64;
@@ -387,7 +429,9 @@ fn index_batches<E: LexicalSearch>(
                 .expect("QG index batch");
         });
         measured += timer.elapsed();
-        start = start.saturating_add(u64::try_from(count).expect("batch count fits u64"));
+        let count = u64::try_from(count).expect("batch count fits u64");
+        observe_batch(count);
+        start = start.saturating_add(count);
     }
     measured
 }
@@ -477,6 +521,7 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
         .document_count(spec.document_count.expect("watch update count"));
     let corpus = corpus_for(warm_count);
     let topology = spec.topology.expect("watch topology");
+    let (probe_query, expected_doc_id) = update_probe(&corpus, update_count, 1);
     let elapsed = match (arm, topology) {
         (EngineArm::Quill, PerfTopology::InProcess) => {
             let index = quill_in_memory(spec);
@@ -485,11 +530,7 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
             let mut elapsed = index_batches(context, &index, &corpus, update_count, Some(1));
             elapsed += commit(context, &index);
             let timer = Instant::now();
-            black_box(
-                index
-                    .search_doc_ids(&context.cx, "term00001", 10)
-                    .expect("in-process Quill visibility"),
-            );
+            assert_exact_visibility(context, &index, &probe_query, &expected_doc_id);
             elapsed + timer.elapsed()
         }
         (EngineArm::Tantivy, PerfTopology::InProcess) => {
@@ -499,25 +540,78 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
             let mut elapsed = index_batches(context, &index, &corpus, update_count, Some(1));
             elapsed += commit(context, &index);
             let timer = Instant::now();
-            black_box(
-                index
-                    .search_doc_ids(&context.cx, "term00001", 10)
-                    .expect("in-process Tantivy visibility"),
-            );
+            assert_exact_visibility(context, &index, &probe_query, &expected_doc_id);
             elapsed + timer.elapsed()
         }
-        (EngineArm::Quill, PerfTopology::FreshProcess) => {
-            measure_quill_fresh_process(context, spec, &corpus, warm_count, update_count)
-        }
-        (EngineArm::Tantivy, PerfTopology::FreshProcess) => {
-            measure_tantivy_fresh_process(context, spec, &corpus, warm_count, update_count)
-        }
+        (EngineArm::Quill, PerfTopology::FreshProcess) => measure_quill_fresh_process(
+            context,
+            spec,
+            &corpus,
+            warm_count,
+            update_count,
+            &probe_query,
+            &expected_doc_id,
+        ),
+        (EngineArm::Tantivy, PerfTopology::FreshProcess) => measure_tantivy_fresh_process(
+            context,
+            spec,
+            &corpus,
+            warm_count,
+            update_count,
+            &probe_query,
+            &expected_doc_id,
+        ),
     };
     if spec.metric == "updates_per_second" {
         update_count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
     } else {
         elapsed.as_secs_f64() * 1_000.0
     }
+}
+
+fn update_probe(corpus: &SyntheticCorpus, update_count: u64, generation: u64) -> (String, String) {
+    let ordinal = update_count.saturating_sub(1);
+    let expected_doc_id = corpus
+        .document_at(ordinal % corpus.len())
+        .expect("QG-3 visibility probe document")
+        .id;
+    (format!("qgupdateg{generation}d{ordinal}"), expected_doc_id)
+}
+
+fn assert_exact_visibility<E: LexicalSearch>(
+    context: &BenchContext,
+    index: &E,
+    query: &str,
+    expected_doc_id: &str,
+) {
+    let doc_ids = search_doc_ids(context, index, query);
+    assert_eq!(
+        doc_ids,
+        [expected_doc_id.to_owned()],
+        "visibility fence accepted stale, missing, or ambiguous state"
+    );
+    black_box(doc_ids);
+}
+
+fn assert_absent<E: LexicalSearch>(context: &BenchContext, index: &E, query: &str) {
+    let doc_ids = search_doc_ids(context, index, query);
+    assert!(
+        doc_ids.is_empty(),
+        "deleted QG fixture document remained query-visible: {doc_ids:?}"
+    );
+    black_box(doc_ids);
+}
+
+fn search_doc_ids<E: LexicalSearch>(context: &BenchContext, index: &E, query: &str) -> Vec<String> {
+    context.runtime.block_on(async {
+        index
+            .search(&context.cx, query, 3)
+            .await
+            .expect("QG exact-version visibility query")
+            .into_iter()
+            .map(|result| result.doc_id.into())
+            .collect::<Vec<String>>()
+    })
 }
 
 fn scratch_path(label: &str) -> PathBuf {
@@ -535,6 +629,8 @@ fn measure_quill_fresh_process(
     corpus: &SyntheticCorpus,
     warm_count: u64,
     update_count: u64,
+    probe_query: &str,
+    expected_doc_id: &str,
 ) -> Duration {
     let path = scratch_path("qg3-quill");
     let index =
@@ -547,7 +643,7 @@ fn measure_quill_fresh_process(
     let mut elapsed = index_batches(context, &index, corpus, update_count, Some(1));
     elapsed += commit(context, &index);
     drop(index);
-    elapsed + fresh_process_search(&path, spec, EngineArm::Quill)
+    elapsed + fresh_process_search(&path, spec, EngineArm::Quill, probe_query, expected_doc_id)
 }
 
 fn measure_tantivy_fresh_process(
@@ -556,6 +652,8 @@ fn measure_tantivy_fresh_process(
     corpus: &SyntheticCorpus,
     warm_count: u64,
     update_count: u64,
+    probe_query: &str,
+    expected_doc_id: &str,
 ) -> Duration {
     let path = scratch_path("qg3-tantivy");
     let index = tantivy_create(&path, spec);
@@ -564,15 +662,30 @@ fn measure_tantivy_fresh_process(
     let mut elapsed = index_batches(context, &index, corpus, update_count, Some(1));
     elapsed += commit(context, &index);
     drop(index);
-    elapsed + fresh_process_search(&path, spec, EngineArm::Tantivy)
+    elapsed
+        + fresh_process_search(
+            &path,
+            spec,
+            EngineArm::Tantivy,
+            probe_query,
+            expected_doc_id,
+        )
 }
 
-fn fresh_process_search(path: &Path, spec: &PerfCellSpec, arm: EngineArm) -> Duration {
+fn fresh_process_search(
+    path: &Path,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    probe_query: &str,
+    expected_doc_id: &str,
+) -> Duration {
     let timer = Instant::now();
     let output = Command::new(std::env::current_exe().expect("QG benchmark executable"))
         .env("QUILL_PERF_CHILD_MODE", "search")
         .env("QUILL_PERF_CHILD_ENGINE", arm.label())
         .env("QUILL_PERF_CHILD_PATH", path)
+        .env("QUILL_PERF_CHILD_QUERY", probe_query)
+        .env("QUILL_PERF_CHILD_EXPECTED_DOC_ID", expected_doc_id)
         .env(
             "QUILL_PERF_CHILD_HEAP",
             spec.writer_heap_bytes.unwrap_or(50_000_000).to_string(),
@@ -649,7 +762,18 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
         .div_ceil(segments);
     let elapsed = match arm {
         EngineArm::Quill => {
-            let index = quill_in_memory(spec);
+            let directory = tempfile::Builder::new()
+                .prefix("qg5-quill-")
+                .tempdir()
+                .expect("QG-5 Quill durable fixture directory");
+            let index = context
+                .runtime
+                .block_on(QuillIndex::create(
+                    &context.cx,
+                    directory.path(),
+                    quill_config(spec),
+                ))
+                .expect("QG-5 create durable Quill fixture");
             for segment in 0..segments {
                 let start =
                     u64::try_from(segment.saturating_mul(docs_per_segment)).expect("segment start");
@@ -658,7 +782,7 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                 }
                 let segment_count = usize::try_from((count - start).min(docs_per_segment as u64))
                     .expect("segment count");
-                let documents = generated_batch(&corpus, start, segment_count, None);
+                let documents = generated_batch(&corpus, start, segment_count, Some(5));
                 context.runtime.block_on(async {
                     index
                         .index_documents(&context.cx, &documents)
@@ -678,10 +802,26 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                         .expect("Quill full compaction"),
                 );
             });
-            timer.elapsed()
+            let elapsed = timer.elapsed();
+            validate_compaction_outcome(context, &index, &corpus, count);
+            drop(index);
+            let reopened = context
+                .runtime
+                .block_on(QuillIndex::open(
+                    &context.cx,
+                    directory.path(),
+                    quill_config(spec),
+                ))
+                .expect("reopen compacted Quill fixture");
+            validate_compaction_outcome(context, &reopened, &corpus, count);
+            elapsed
         }
         EngineArm::Tantivy => {
-            let index = tantivy_in_memory(spec);
+            let directory = tempfile::Builder::new()
+                .prefix("qg5-tantivy-")
+                .tempdir()
+                .expect("QG-5 Tantivy durable fixture directory");
+            let index = tantivy_create(directory.path(), spec);
             context.runtime.block_on(async {
                 index
                     .benchmark_disable_auto_merge(&context.cx)
@@ -696,7 +836,7 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                 }
                 let segment_count = usize::try_from((count - start).min(docs_per_segment as u64))
                     .expect("segment count");
-                let documents = generated_batch(&corpus, start, segment_count, None);
+                let documents = generated_batch(&corpus, start, segment_count, Some(5));
                 context.runtime.block_on(async {
                     index
                         .index_documents(&context.cx, &documents)
@@ -730,10 +870,42 @@ fn compaction_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm
                     .await
                     .expect("Tantivy force merge");
             });
-            timer.elapsed()
+            let elapsed = timer.elapsed();
+            validate_compaction_outcome(context, &index, &corpus, count);
+            drop(index);
+            let reopened = TantivyIndex::open_with_benchmark_config(
+                directory.path(),
+                spec.writer_heap_bytes.unwrap_or(50_000_000),
+                spec.threads.unwrap_or(1),
+                spec.positions.unwrap_or(PositionMode::On).enabled(),
+            )
+            .expect("reopen compacted Tantivy fixture");
+            validate_compaction_outcome(context, &reopened, &corpus, count);
+            elapsed
         }
     };
     elapsed.as_secs_f64() * 1_000.0
+}
+
+fn validate_compaction_outcome<E: LexicalSearch>(
+    context: &BenchContext,
+    index: &E,
+    corpus: &SyntheticCorpus,
+    count: u64,
+) {
+    let deleted_ordinal = 0_u64;
+    let live_ordinal = count.saturating_sub(1);
+    let live_doc_id = corpus
+        .document_at(live_ordinal)
+        .expect("QG-5 live probe document")
+        .id;
+    assert_absent(context, index, &format!("qgupdateg5d{deleted_ordinal}"));
+    assert_exact_visibility(
+        context,
+        index,
+        &format!("qgupdateg5d{live_ordinal}"),
+        &live_doc_id,
+    );
 }
 
 fn stage_deletes(
@@ -744,21 +916,31 @@ fn stage_deletes(
     density: u8,
 ) {
     let deleted = count.saturating_mul(u64::from(density)) / 100;
-    for ordinal in 0..deleted {
-        let source = ordinal.saturating_mul(count / deleted.max(1));
-        let id = corpus
-            .document_at(source.min(count.saturating_sub(1)))
-            .expect("Quill deleted document")
-            .id;
+    const DELETE_BATCH: u64 = 10_000;
+    let mut start = 0_u64;
+    while start < deleted {
+        let end = (start + DELETE_BATCH).min(deleted);
+        let ids = (start..end)
+            .map(|ordinal| {
+                let source = ordinal.saturating_mul(count / deleted.max(1));
+                corpus
+                    .document_at(source.min(count.saturating_sub(1)))
+                    .expect("Quill deleted document")
+                    .id
+            })
+            .collect::<Vec<_>>();
+        let id_refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
         context.runtime.block_on(async {
-            assert!(
+            assert_eq!(
                 index
-                    .delete_document(&context.cx, &id)
+                    .delete_documents(&context.cx, &id_refs)
                     .await
-                    .expect("stage Quill tombstone"),
-                "Quill compaction tombstone must target a live document"
+                    .expect("stage Quill tombstones"),
+                id_refs.len(),
+                "every QG-5 tombstone must target a live document"
             );
         });
+        start = end;
     }
 }
 
@@ -1213,6 +1395,204 @@ fn values_checksum(samples: &[PerfRawSample]) -> u64 {
     checksum
 }
 
+fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/qg6/semantic-config/v1\0");
+    hasher.update([u8::from(
+        spec.positions.unwrap_or(PositionMode::On).enabled(),
+    )]);
+    hasher.update(spec.threads.unwrap_or(1).to_le_bytes());
+    hasher.update(spec.writer_heap_bytes.unwrap_or(50_000_000).to_le_bytes());
+    hasher.update(spec.k.expect("QG-6 k").to_le_bytes());
+    hasher.update(b"frankensearch-default-lexical-schema-and-parser-v1");
+    lower_hex(&hasher.finalize())
+}
+
+fn qg6_query_specs(spec: &PerfCellSpec) -> Vec<Qg6QuerySpec> {
+    let query_class = spec.query_class.expect("QG-6 query class");
+    query_texts(query_class)
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            Qg6QuerySpec::new(
+                format!("{query_class:?}-{index}").to_ascii_lowercase(),
+                *text,
+            )
+            .expect("bounded QG-6 query")
+        })
+        .collect()
+}
+
+fn qg6_raw_sample(
+    sample: &frankensearch_quill_gauntlet::Qg6TimedSample,
+    provenance: &PerfSampleProvenance,
+    scope: &PerfOperationScope,
+) -> PerfRawSample {
+    debug_assert!(matches!(
+        (sample.comparison, sample.arm),
+        (
+            Qg6Comparison::Null,
+            Qg6ArmRole::NullLeft | Qg6ArmRole::NullRight
+        ) | (
+            Qg6Comparison::Effect,
+            Qg6ArmRole::EffectControl | Qg6ArmRole::EffectTreatment
+        )
+    ));
+    let arm = match sample.arm {
+        Qg6ArmRole::NullLeft | Qg6ArmRole::EffectControl => PerfSampleArm::Control,
+        Qg6ArmRole::NullRight | Qg6ArmRole::EffectTreatment => PerfSampleArm::Treatment,
+    };
+    let order = match sample.order {
+        Qg6SampleOrder::First => PerfSampleOrder::First,
+        Qg6SampleOrder::Second => PerfSampleOrder::Second,
+    };
+    let elapsed_ns = sample.ended_ns.saturating_sub(sample.started_ns).max(1);
+    PerfRawSample {
+        block_id: sample.block_id,
+        sample_id: sample.sample_id,
+        arm,
+        order,
+        phase: PerfSamplePhase::Measurement,
+        scope: scope.clone(),
+        provenance: provenance.clone(),
+        started_ns: sample.started_ns,
+        ended_ns: sample.ended_ns,
+        work_units: None,
+        byte_count: None,
+        observed_value: Some(elapsed_ns as f64 / 1_000_000.0),
+        group_id: Some(u64::try_from(sample.query_index).expect("QG-6 query index")),
+    }
+}
+
+fn prepared_qg6_streams(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    runs: usize,
+    evidence: &EvidenceContext,
+    scope: &PerfOperationScope,
+    cell_seed: u64,
+) -> (Vec<PerfRawSample>, Vec<PerfRawSample>) {
+    let count = context
+        .scale
+        .document_count(spec.document_count.expect("query corpus count"));
+    let corpus = corpus_for(count);
+    let corpus_sha256 = corpus
+        .manifest()
+        .expect("QG-6 exact corpus manifest")
+        .content_sha256;
+    let queries = qg6_query_specs(spec);
+    let prepared = Qg6PreparedExperiment::prepare_with(
+        corpus_sha256,
+        qg6_config_contract_sha256(spec),
+        count,
+        spec.k.expect("QG-6 k"),
+        queries,
+        |role, identity, setup| {
+            if role == Qg6ArmRole::EffectTreatment {
+                let index = quill_in_memory(spec);
+                let _ = index_batches_observed(
+                    context,
+                    &index,
+                    &corpus,
+                    identity.document_count,
+                    None,
+                    |batch| setup.record_population_batch(batch),
+                );
+                let _ = commit(context, &index);
+                setup.record_commit();
+                Ok(PreparedQueryArm::Quill(Box::new(index)))
+            } else {
+                let index = tantivy_in_memory(spec);
+                let _ = index_batches_observed(
+                    context,
+                    &index,
+                    &corpus,
+                    identity.document_count,
+                    None,
+                    |batch| setup.record_population_batch(batch),
+                );
+                let _ = commit(context, &index);
+                setup.record_commit();
+                Ok(PreparedQueryArm::Tantivy(Box::new(index)))
+            }
+        },
+    )
+    .expect("prepare four independent QG-6 arms");
+    let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| match arm {
+        PreparedQueryArm::Quill(index) => index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map(PreparedQueryResult::Quill)
+            .map_err(|error| error.to_string()),
+        PreparedQueryArm::Tantivy(index) => index
+            .search_doc_ids(&context.cx, query.text(), k)
+            .map(PreparedQueryResult::Tantivy)
+            .map_err(|error| error.to_string()),
+    };
+    let mut normalize = |result| {
+        let ordered_doc_ids = match result {
+            PreparedQueryResult::Quill(hits) => {
+                hits.into_iter().map(|hit| hit.document_id).collect()
+            }
+            PreparedQueryResult::Tantivy(hits) => {
+                hits.into_iter().map(|hit| hit.doc_id.to_string()).collect()
+            }
+        };
+        Qg6SearchResult::from_ordered_doc_ids(ordered_doc_ids)
+    };
+    let validated = prepared
+        .validate_exact_parity_with(&mut search, &mut normalize)
+        .expect("QG-6 exact ordered preflight parity");
+    let rounds_per_query = runs
+        .div_ceil(QG6_QUERY_GROUPS)
+        .max(evidence.policy.min_group_pairs);
+    let measurement = validated
+        .measure_with_normalizer(
+            evidence.policy.warmup_rounds,
+            rounds_per_query,
+            cell_seed,
+            &mut search,
+            &mut normalize,
+        )
+        .expect("prepared QG-6 measurement");
+    let mut result_receipt_hasher = Sha256::new();
+    for sample in &measurement.samples {
+        result_receipt_hasher.update(sample.result_sha256.as_bytes());
+    }
+    let mut sample_identity_hasher = Sha256::new();
+    sample_identity_hasher.update(b"frankensearch/qg6/sample-input/v1\0");
+    sample_identity_hasher.update(measurement.identity.corpus_sha256.as_bytes());
+    sample_identity_hasher.update(measurement.identity.query_manifest_sha256.as_bytes());
+    sample_identity_hasher.update(measurement.identity.config_contract_sha256.as_bytes());
+    let mut sample_provenance = evidence.sample_provenance.clone();
+    sample_provenance.corpus_sha256 = lower_hex(&sample_identity_hasher.finalize());
+    eprintln!(
+        "[qg6-prepared] fixture={} corpus_sha256={} query_manifest_sha256={} \
+         config_contract_sha256={} schedule_seed={} warmup_rounds={} rounds_per_query={} \
+         sample_input_sha256={} result_receipt_sha256={} lifecycle={}",
+        spec.fixture,
+        measurement.identity.corpus_sha256,
+        measurement.identity.query_manifest_sha256,
+        measurement.identity.config_contract_sha256,
+        measurement.schedule_seed,
+        measurement.warmup_rounds,
+        measurement.rounds_per_query,
+        sample_provenance.corpus_sha256,
+        lower_hex(&result_receipt_hasher.finalize()),
+        serde_json::to_string(&measurement.lifecycle).expect("serialize QG-6 lifecycle"),
+    );
+    let mut null_samples = Vec::new();
+    let mut effect_samples = Vec::new();
+    for sample in measurement.samples {
+        let comparison = sample.comparison;
+        let sample = qg6_raw_sample(&sample, &sample_provenance, scope);
+        match comparison {
+            Qg6Comparison::Null => null_samples.push(sample),
+            Qg6Comparison::Effect => effect_samples.push(sample),
+        }
+    }
+    (null_samples, effect_samples)
+}
+
 struct CellCollection {
     results: Vec<PerfCellResult>,
     evidence: Option<EvidenceCell>,
@@ -1258,54 +1638,12 @@ fn collect_cell(
     let origin = Instant::now();
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
 
-    // Contract order is deliberate: establish this invocation's A/A floor
-    // through the exact paired routine, then measure the Quill/Tantivy claim.
+    // Every non-query gate establishes its A/A floor through the exact paired
+    // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
+    // four-arm runner so setup is impossible inside timed samples and null/
+    // effect blocks are interleaved.
     let (null_samples, effect_samples) = if spec.gate == PerfGate::Qg6 {
-        let per_group = runs
-            .div_ceil(QG6_QUERY_GROUPS)
-            .max(evidence.policy.min_group_pairs);
-        let queries = query_texts(spec.query_class.expect("query class"));
-        let mut null_samples = Vec::new();
-        let mut effect_samples = Vec::new();
-        for (group_index, query) in queries.iter().enumerate() {
-            let group = u64::try_from(group_index).expect("group index");
-            let group_seed = cell_seed ^ group.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            null_samples.extend(paired_raw_stream(
-                context,
-                spec,
-                evidence,
-                &scope,
-                origin,
-                &StreamPlan {
-                    control: EngineArm::Tantivy,
-                    treatment: EngineArm::Tantivy,
-                    rounds: per_group,
-                    seed: group_seed ^ 0xaa,
-                    block_id_base: group * 10_000,
-                    sample_id_base: 1_000_000 + group * 10_000,
-                    group_id: Some(group),
-                    query_override: Some(query),
-                },
-            ));
-            effect_samples.extend(paired_raw_stream(
-                context,
-                spec,
-                evidence,
-                &scope,
-                origin,
-                &StreamPlan {
-                    control: EngineArm::Tantivy,
-                    treatment: EngineArm::Quill,
-                    rounds: per_group,
-                    seed: group_seed,
-                    block_id_base: group * 10_000,
-                    sample_id_base: group * 10_000,
-                    group_id: Some(group),
-                    query_override: Some(query),
-                },
-            ));
-        }
-        (null_samples, effect_samples)
+        prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed)
     } else {
         let null = paired_raw_stream(
             context,
@@ -1466,6 +1804,22 @@ fn selected_cells(matrix: &PerfMatrixSpec, scale: MatrixScale) -> Vec<PerfCellSp
     selected
 }
 
+fn gate_selection_complete(
+    matrix: &PerfMatrixSpec,
+    selected: &[PerfCellSpec],
+    gate: PerfGate,
+) -> bool {
+    let normative = matrix.for_gate(gate).len();
+    let selected = selected.iter().filter(|cell| cell.gate == gate).count();
+    if gate == PerfGate::Qg6 {
+        return matches!(
+            Qg6SelectionScope::from_cell_counts(selected, normative),
+            Ok(Qg6SelectionScope::CompleteGate)
+        );
+    }
+    normative != 0 && selected == normative
+}
+
 fn git_revision(scale: MatrixScale) -> String {
     if let Ok(revision) = std::env::var("QUILL_PERF_GIT_REV")
         && !revision.trim().is_empty()
@@ -1517,15 +1871,25 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn build_profile_label() -> &'static str {
-    if cfg!(debug_assertions) {
-        "dev"
-    } else {
-        "release"
+fn build_profile_label(scale: MatrixScale) -> String {
+    match std::env::var("QUILL_PERF_BUILD_PROFILE") {
+        Ok(profile) if !profile.trim().is_empty() => profile,
+        Ok(_) => panic!("QUILL_PERF_BUILD_PROFILE must not be empty"),
+        Err(error) => {
+            assert!(
+                !scale.is_full(),
+                "full QG evidence requires QUILL_PERF_BUILD_PROFILE: {error}"
+            );
+            if cfg!(debug_assertions) {
+                "dev-unspecified".to_owned()
+            } else {
+                "release-unspecified".to_owned()
+            }
+        }
     }
 }
 
-fn build_identity(bench_elf_sha256: &str, revision: &str) -> BuildIdentity {
+fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -> BuildIdentity {
     let porcelain = Command::new("git")
         .args(["status", "--porcelain"])
         .output()
@@ -1551,14 +1915,25 @@ fn build_identity(bench_elf_sha256: &str, revision: &str) -> BuildIdentity {
     let cargo_lock_sha256 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
         .ok()
         .map(|bytes| lower_hex(&Sha256::digest(&bytes)));
-    let rustc_version = Command::new("rustc")
-        .arg("--version")
+    let rustc_verbose = Command::new("rustc")
+        .arg("-vV")
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|version| version.trim().to_owned())
         .unwrap_or_else(|| "unavailable".to_owned());
+    let rustc_version = rustc_verbose
+        .lines()
+        .next()
+        .unwrap_or("unavailable")
+        .to_owned();
+    let target_triple = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map_or_else(
+            || format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            str::to_owned,
+        );
     BuildIdentity {
         executable_sha256: bench_elf_sha256.to_owned(),
         git_revision: revision.to_owned(),
@@ -1566,8 +1941,8 @@ fn build_identity(bench_elf_sha256: &str, revision: &str) -> BuildIdentity {
         worktree_state_sha256,
         cargo_lock_sha256,
         rustc_version,
-        target_triple: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-        build_profile: build_profile_label().to_owned(),
+        target_triple,
+        build_profile: build_profile.to_owned(),
         cargo_features: vec!["perf-harness".to_owned(), "tantivy-oracle".to_owned()],
     }
 }
@@ -1639,7 +2014,14 @@ fn metric_duration(context: &BenchContext, spec: &PerfCellSpec, value: f64) -> D
 }
 
 fn register_criterion_cell(c: &mut Criterion, context: &BenchContext, spec: &PerfCellSpec) {
-    if matches!(spec.gate, PerfGate::Qg7 | PerfGate::Qg10) {
+    // Full-scale invocations already collect and persist the normative paired
+    // blocks above. Registering a second Criterion timing scope would repeat
+    // the workload after the decision artifact is sealed, without retaining
+    // those samples or their A/A control. Keep Criterion's presentation lane
+    // for smoke runs only.
+    if context.scale.is_full()
+        || matches!(spec.gate, PerfGate::Qg6 | PerfGate::Qg7 | PerfGate::Qg10)
+    {
         return;
     }
     let mut group = c.benchmark_group(format!("quill_perf/{}/{}", spec.gate, spec.fixture));
@@ -1667,11 +2049,12 @@ fn output_dir() -> PathBuf {
 
 fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let scale = MatrixScale::from_env();
+    let build_profile = build_profile_label(scale);
     let context = BenchContext::new(scale);
     let matrix = PerfMatrixSpec::complete();
     validate_matrix(&matrix).expect("normative QG matrix");
     let selected = selected_cells(&matrix, scale);
-    preflight_qg1_fixtures(&context, &matrix, &selected);
+    preflight_indexing_fixtures(&context, &matrix, &selected);
     let configured_runs = std::env::var("QUILL_PERF_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1707,7 +2090,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             executable_sha256: bench_elf_sha256.to_owned(),
             corpus_sha256: corpus_hash.clone(),
             worker_id: machine_fingerprint(),
-            build_profile: build_profile_label().to_owned(),
+            build_profile: build_profile.clone(),
         },
     };
     let mut machine = MachineIdentity::capture();
@@ -1731,19 +2114,26 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         run_id: run_id.clone(),
         run_window: run_window.clone(),
         manifest_sha256: manifest_hash.clone(),
-        build: build_identity(bench_elf_sha256, &revision),
+        build: build_identity(bench_elf_sha256, &revision, &build_profile),
         machine,
         peak_rss: PeakRssEvidence::capture(),
         corpus: corpus_identity(&context, &selected, &corpus_hash),
     };
     for (gate, cells) in evidence_by_gate {
-        let artifact = PerfEvidenceArtifact::assemble(
+        let mut artifact = PerfEvidenceArtifact::assemble(
             gate,
             evidence_context.policy.clone(),
             provenance.clone(),
             cells,
         )
         .expect("assemble QG evidence artifact");
+        if !gate_selection_complete(&matrix, &selected, gate) {
+            artifact.force_no_claim(
+                "evidence.incomplete_gate_selection",
+                "the invocation selected only part of the normative gate; durable pre-admission \
+                 evidence cannot support a publication or ratchet claim",
+            );
+        }
         let paths = artifact
             .write_atomic(&output_dir)
             .expect("write QG evidence artifact");
@@ -1767,7 +2157,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             corpus_manifest_hash: corpus_hash.clone(),
             manifest_sha256: manifest_hash.clone(),
             cells,
-            laws_attested: scale.is_full(),
+            laws_attested: scale.is_full() && gate_selection_complete(&matrix, &selected, gate),
         };
         let (json, table) = artifact.write_to(&output_dir).expect("write QG artifacts");
         eprintln!("{}", artifact.human_table());
@@ -1818,8 +2208,11 @@ fn run_search_child() {
     let heap = child_env::<usize>("QUILL_PERF_CHILD_HEAP");
     let threads = child_env::<usize>("QUILL_PERF_CHILD_THREADS");
     let positions = child_env::<bool>("QUILL_PERF_CHILD_POSITIONS");
+    let query = std::env::var("QUILL_PERF_CHILD_QUERY").expect("missing QG-3 child query");
+    let expected_doc_id =
+        std::env::var("QUILL_PERF_CHILD_EXPECTED_DOC_ID").expect("missing QG-3 expected doc ID");
     let context = BenchContext::new(MatrixScale::from_env());
-    let hit_count = match arm {
+    let doc_ids = match arm {
         EngineArm::Quill => {
             let index = context
                 .runtime
@@ -1829,20 +2222,36 @@ fn run_search_child() {
                     pinned_quill_config(heap, threads),
                 ))
                 .expect("fresh-process Quill open");
-            index
-                .search_doc_ids(&context.cx, "term00001", 10)
-                .expect("fresh-process Quill query")
-                .len()
+            context.runtime.block_on(async {
+                index
+                    .search(&context.cx, &query, 3)
+                    .await
+                    .expect("fresh-process Quill query")
+                    .into_iter()
+                    .map(|result| result.doc_id.into())
+                    .collect::<Vec<String>>()
+            })
         }
         EngineArm::Tantivy => {
-            TantivyIndex::open_with_benchmark_config(&path, heap, threads, positions)
-                .expect("fresh-process Tantivy open")
-                .search_doc_ids(&context.cx, "term00001", 10)
-                .expect("fresh-process Tantivy query")
-                .len()
+            let index = TantivyIndex::open_with_benchmark_config(&path, heap, threads, positions)
+                .expect("fresh-process Tantivy open");
+            context.runtime.block_on(async {
+                index
+                    .search(&context.cx, &query, 3)
+                    .await
+                    .expect("fresh-process Tantivy query")
+                    .into_iter()
+                    .map(|result| result.doc_id.into())
+                    .collect::<Vec<String>>()
+            })
         }
     };
-    println!("quill-perf-child\t{hit_count}");
+    assert_eq!(
+        doc_ids,
+        [expected_doc_id],
+        "fresh-process QG-3 visibility fence accepted stale, missing, or ambiguous state"
+    );
+    println!("quill-perf-child\t{}", doc_ids.len());
 }
 
 fn run_memory_child() {

@@ -4594,6 +4594,26 @@ impl QuillIndex {
         writer.delete_document(cx, document_id).await
     }
 
+    /// Delete a bounded batch of live document IDs and publish one successor
+    /// snapshot.
+    ///
+    /// IDs that are already absent are ignored. Publishing once for the batch
+    /// keeps bulk tombstone setup from paying one durable MANIFEST transition
+    /// per ID while preserving the same atomic visibility boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed writer-lock, cancellation, identity-resolution, or
+    /// successor-publication failures.
+    pub async fn delete_documents(
+        &self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<usize, QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "delete documents writer lock").await?;
+        writer.delete_documents(cx, document_ids).await
+    }
+
     /// Delete every live document and publish an empty successor snapshot.
     ///
     /// # Errors
@@ -9088,6 +9108,7 @@ mod tests {
                 &[
                     IndexableDocument::new("first", "alpha"),
                     IndexableDocument::new("second", "beta"),
+                    IndexableDocument::new("third", "gamma"),
                 ],
             )
             .await
@@ -9095,6 +9116,21 @@ mod tests {
             LexicalSearch::commit(&index, &cx)
                 .await
                 .expect("commit repopulated backend");
+            assert_eq!(
+                index
+                    .delete_documents(&cx, &["first", "missing", "second"])
+                    .await
+                    .expect("delete bounded document batch"),
+                2
+            );
+            assert_eq!(index.doc_count(), 1);
+            assert_eq!(
+                LexicalSearch::search(&index, &cx, "gamma", 10)
+                    .await
+                    .expect("search batch-delete survivor")
+                    .len(),
+                1
+            );
             index.delete_all(&cx).await.expect("delete all documents");
             assert_eq!(index.doc_count(), 0);
 

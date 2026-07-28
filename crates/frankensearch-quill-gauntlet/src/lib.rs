@@ -16,6 +16,7 @@ mod generator;
 mod perf;
 mod perf_evidence;
 mod perf_ratchet;
+mod qg6_prepared;
 mod runner;
 mod version_contract;
 
@@ -96,6 +97,13 @@ pub use perf_ratchet::{
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
     evaluate_perf_ratchet,
+};
+pub use qg6_prepared::{
+    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6HarnessError,
+    Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase, Qg6PreparedExperiment,
+    Qg6QuerySpec, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionClaim,
+    Qg6SelectionScope, Qg6SetupRecorder, Qg6TimedSample, Qg6ValidatedExperiment,
+    seeded_interleaved_four_arm_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,

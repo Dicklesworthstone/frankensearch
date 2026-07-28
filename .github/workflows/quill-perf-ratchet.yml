@@ -82,6 +82,7 @@ jobs:
         shell: bash
         env:
           QUILL_PERF_GATE: ${{ matrix.gate }}
+          QUILL_PERF_BUILD_PROFILE: release-perf
           QUILL_PERF_GIT_REV: ${{ github.sha }}
           QUILL_PERF_RUNS: "10"
           QUILL_PERF_SCALE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
@@ -117,7 +118,9 @@ jobs:
             --manifest docs/contracts/quill-perf-gates.toml
             --baseline "${history}"
             --candidate "ci_artifacts/quill-perf/candidate/${QG_GATE}.json"
+            --candidate-evidence "ci_artifacts/quill-perf/candidate/${QG_GATE}.evidence.json"
             --rerun "ci_artifacts/quill-perf/rerun/${QG_GATE}.json"
+            --rerun-evidence "ci_artifacts/quill-perf/rerun/${QG_GATE}.evidence.json"
             --output "ci_artifacts/quill-perf/${QG_GATE}.ratchet.json"
             --mode "${QG_MODE}"
           )

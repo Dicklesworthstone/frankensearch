@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
 use crate::{
-    EvidenceCellBody, EvidenceRole, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PerfCellResult,
-    PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec,
+    DistributionSummary, EvidenceCellBody, EvidenceRole, PERF_ARTIFACT_SCHEMA_VERSION,
+    PERF_MIN_RUNS, PerfCellResult, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
+    PerfMatrixSpec,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
@@ -1440,7 +1441,12 @@ struct GateTargetEvaluator<'a, 'b> {
 }
 
 impl GateTargetEvaluator<'_, '_> {
-    fn value(&mut self, fixture: &str, metric: &str, engine: &str) -> Option<f64> {
+    fn summary(
+        &mut self,
+        fixture: &str,
+        metric: &str,
+        engine: &str,
+    ) -> Option<DistributionSummary> {
         let key = self
             .cells
             .keys()
@@ -1456,45 +1462,27 @@ impl GateTargetEvaluator<'_, '_> {
             );
             return None;
         };
-        self.cells.get(&key).map(|cell| cell.distribution.p50)
+        self.cells.get(&key).map(|cell| cell.distribution.clone())
+    }
+
+    fn value(&mut self, fixture: &str, metric: &str, engine: &str) -> Option<f64> {
+        self.summary(fixture, metric, engine)
+            .map(|summary| summary.p50)
+    }
+
+    fn median_ci95(&mut self, fixture: &str, metric: &str, engine: &str) -> Option<(f64, f64)> {
+        self.summary(fixture, metric, engine)
+            .map(|summary| (summary.median_ci95_low, summary.median_ci95_high))
     }
 
     fn p95(&mut self, fixture: &str, metric: &str, engine: &str) -> Option<f64> {
-        let key = self
-            .cells
-            .keys()
-            .find(|key| key.fixture == fixture && key.metric == metric && key.engine == engine)
-            .cloned();
-        let Some(key) = key else {
-            self.state.quarantine(
-                "perf.ratchet.target_cell_missing",
-                format!(
-                    "{} target requires {fixture}/{metric}/{engine}",
-                    self.artifact.gate
-                ),
-            );
-            return None;
-        };
-        self.cells.get(&key).map(|cell| cell.distribution.p95)
+        self.summary(fixture, metric, engine)
+            .map(|summary| summary.p95)
     }
 
     fn p99(&mut self, fixture: &str, metric: &str, engine: &str) -> Option<f64> {
-        let key = self
-            .cells
-            .keys()
-            .find(|key| key.fixture == fixture && key.metric == metric && key.engine == engine)
-            .cloned();
-        let Some(key) = key else {
-            self.state.quarantine(
-                "perf.ratchet.target_cell_missing",
-                format!(
-                    "{} target requires {fixture}/{metric}/{engine}",
-                    self.artifact.gate
-                ),
-            );
-            return None;
-        };
-        self.cells.get(&key).map(|cell| cell.distribution.p99)
+        self.summary(fixture, metric, engine)
+            .map(|summary| summary.p99)
     }
 
     fn target(&mut self, passed: bool, message: impl Into<String>) {
@@ -1506,6 +1494,73 @@ impl GateTargetEvaluator<'_, '_> {
         } else {
             self.state
                 .quarantine("perf.ratchet.provisional_target_missed", message);
+        }
+    }
+
+    fn target_higher_ci(
+        &mut self,
+        ci_low: f64,
+        ci_high: f64,
+        threshold: f64,
+        message: impl Into<String>,
+    ) {
+        if ci_low >= threshold {
+            return;
+        }
+        let message = message.into();
+        if ci_high < threshold {
+            self.target(false, message);
+        } else {
+            self.state.quarantine(
+                "perf.ratchet.gate_target_ci_inconclusive",
+                format!("{message}; the median CI crosses {threshold:.6}"),
+            );
+        }
+    }
+
+    fn target_lower_ci(
+        &mut self,
+        ci_low: f64,
+        ci_high: f64,
+        threshold: f64,
+        message: impl Into<String>,
+    ) {
+        if ci_high <= threshold {
+            return;
+        }
+        let message = message.into();
+        if ci_low > threshold {
+            self.target(false, message);
+        } else {
+            self.state.quarantine(
+                "perf.ratchet.gate_target_ci_inconclusive",
+                format!("{message}; the median CI crosses {threshold:.6}"),
+            );
+        }
+    }
+
+    fn target_interval_ci(
+        &mut self,
+        ci_low: f64,
+        ci_high: f64,
+        allowed_low: f64,
+        allowed_high: f64,
+        message: impl Into<String>,
+    ) {
+        if ci_low >= allowed_low && ci_high <= allowed_high {
+            return;
+        }
+        let message = message.into();
+        if ci_high < allowed_low || ci_low > allowed_high {
+            self.target(false, message);
+        } else {
+            self.state.quarantine(
+                "perf.ratchet.gate_target_ci_inconclusive",
+                format!(
+                    "{message}; the median CI overlaps but is not contained in \
+                     [{allowed_low:.6}, {allowed_high:.6}]"
+                ),
+            );
         }
     }
 }
@@ -1539,28 +1594,36 @@ fn evaluate_gate_targets(
 fn evaluate_qg1(target: &mut GateTargetEvaluator<'_, '_>) {
     for corpus in ["medium", "xlarge"] {
         let fixture = format!("bulk/{corpus}/8/positions_on");
-        if let Some(ratio) =
-            target.value(&fixture, "docs_per_second_quill_over_tantivy", "paired_ab")
+        if let Some((ci_low, ci_high)) =
+            target.median_ci95(&fixture, "docs_per_second_quill_over_tantivy", "paired_ab")
         {
-            target.target(
-                ratio >= 3.0,
-                format!("QG-1 {fixture} ratio {ratio:.6} is below 3.0"),
+            target.target_higher_ci(
+                ci_low,
+                ci_high,
+                3.0,
+                format!(
+                    "QG-1 {fixture} median-ratio CI [{ci_low:.6}, {ci_high:.6}] does not clear 3.0"
+                ),
             );
         }
         let tokenize_fixture = format!("tokenize_only/{corpus}");
-        if let (Some(index), Some(tokenize)) = (
-            target.value(&fixture, "docs_per_second", "quill"),
-            target.value(
+        if let (Some((index_low, index_high)), Some((tokenize_low, tokenize_high))) = (
+            target.median_ci95(&fixture, "docs_per_second", "quill"),
+            target.median_ci95(
                 &tokenize_fixture,
                 "tokenize_docs_per_second",
                 "quill_tokenizer",
             ),
         ) {
-            let ceiling_ratio = index / tokenize.max(f64::MIN_POSITIVE);
-            target.target(
-                ceiling_ratio >= 0.60,
+            let ceiling_low = index_low / tokenize_high.max(f64::MIN_POSITIVE);
+            let ceiling_high = index_high / tokenize_low.max(f64::MIN_POSITIVE);
+            target.target_higher_ci(
+                ceiling_low,
+                ceiling_high,
+                0.60,
                 format!(
-                    "QG-1 {corpus} indexing/tokenize ceiling ratio {ceiling_ratio:.6} is below 0.60"
+                    "QG-1 {corpus} indexing/tokenize ratio CI \
+                     [{ceiling_low:.6}, {ceiling_high:.6}] does not clear 0.60"
                 ),
             );
         }
@@ -1568,31 +1631,49 @@ fn evaluate_qg1(target: &mut GateTargetEvaluator<'_, '_>) {
 }
 
 fn evaluate_qg2(target: &mut GateTargetEvaluator<'_, '_>) {
-    if let Some(ratio) = target.value(
+    if let Some((ci_low, ci_high)) = target.median_ci95(
         "bulk/medium/1/positions_on",
         "docs_per_second_quill_over_tantivy",
         "paired_ab",
     ) {
-        target.target(
-            ratio >= 1.5,
-            format!("QG-2 single-thread ratio {ratio:.6} is below 1.5"),
+        target.target_higher_ci(
+            ci_low,
+            ci_high,
+            1.5,
+            format!(
+                "QG-2 single-thread median-ratio CI [{ci_low:.6}, {ci_high:.6}] does not clear 1.5"
+            ),
         );
     }
 }
 
 fn evaluate_qg3(target: &mut GateTargetEvaluator<'_, '_>) {
-    if let Some(initial) = target.value("watch/medium/initial", "docs_per_second", "quill") {
-        target.target(
-            initial >= 20_000.0,
-            format!("QG-3 initial throughput {initial:.3} docs/s is below 20000"),
+    if let Some((initial_low, initial_high)) =
+        target.median_ci95("watch/medium/initial", "docs_per_second", "quill")
+    {
+        target.target_higher_ci(
+            initial_low,
+            initial_high,
+            20_000.0,
+            format!(
+                "QG-3 initial throughput median CI [{initial_low:.3}, {initial_high:.3}] docs/s \
+                 does not clear 20000"
+            ),
         );
     }
     for topology in ["inprocess", "freshprocess"] {
         let fixture = format!("watch/medium/5000/{topology}");
-        if let Some(updates) = target.value(&fixture, "updates_per_second", "quill") {
-            target.target(
-                updates >= 5_000.0,
-                format!("QG-3 {topology} throughput {updates:.3} updates/s is below 5000"),
+        if let Some((updates_low, updates_high)) =
+            target.median_ci95(&fixture, "updates_per_second", "quill")
+        {
+            target.target_higher_ci(
+                updates_low,
+                updates_high,
+                5_000.0,
+                format!(
+                    "QG-3 {topology} throughput median CI \
+                     [{updates_low:.3}, {updates_high:.3}] updates/s does not clear 5000"
+                ),
             );
         }
         if let Some(p95) = target.p95(&fixture, "update_to_searchable_ms", "quill") {
@@ -1602,14 +1683,19 @@ fn evaluate_qg3(target: &mut GateTargetEvaluator<'_, '_>) {
             );
         }
     }
-    if let Some(ratio) = target.value(
+    if let Some((ci_low, ci_high)) = target.median_ci95(
         "watch/medium/5000/inprocess",
         "update_to_searchable_ms_quill_over_tantivy",
         "paired_ab",
     ) {
-        target.target(
-            ratio <= 0.25,
-            format!("QG-3 in-process visibility ratio {ratio:.6} exceeds 0.25"),
+        target.target_lower_ci(
+            ci_low,
+            ci_high,
+            0.25,
+            format!(
+                "QG-3 in-process visibility median-ratio CI [{ci_low:.6}, {ci_high:.6}] does not \
+                 clear the <=0.25 target"
+            ),
         );
     }
 }
@@ -1624,14 +1710,19 @@ fn evaluate_qg4(target: &mut GateTargetEvaluator<'_, '_>) {
 }
 
 fn evaluate_qg5(target: &mut GateTargetEvaluator<'_, '_>) {
-    if let Some(ratio) = target.value(
+    if let Some((ci_low, ci_high)) = target.median_ci95(
         "compaction/xlarge/20pct",
         "wall_clock_ms_quill_over_tantivy",
         "paired_ab",
     ) {
-        target.target(
-            ratio <= 0.20,
-            format!("QG-5 20% compaction ratio {ratio:.6} exceeds 0.20"),
+        target.target_lower_ci(
+            ci_low,
+            ci_high,
+            0.20,
+            format!(
+                "QG-5 20% compaction median-ratio CI [{ci_low:.6}, {ci_high:.6}] does not clear \
+                 the <=0.20 target"
+            ),
         );
     }
 }
@@ -1644,10 +1735,18 @@ fn evaluate_qg6(target: &mut GateTargetEvaluator<'_, '_>) {
         .map(|key| key.fixture.clone())
         .collect::<Vec<_>>();
     for fixture in fixtures {
-        if let Some(ratio) = target.value(&fixture, "latency_ms_quill_over_tantivy", "paired_ab") {
-            target.target(
-                (0.90..=1.10).contains(&ratio),
-                format!("QG-6 {fixture} p50 ratio {ratio:.6} is outside [0.90, 1.10]"),
+        if let Some((ci_low, ci_high)) =
+            target.median_ci95(&fixture, "latency_ms_quill_over_tantivy", "paired_ab")
+        {
+            target.target_interval_ci(
+                ci_low,
+                ci_high,
+                0.90,
+                1.10,
+                format!(
+                    "QG-6 {fixture} median-ratio CI [{ci_low:.6}, {ci_high:.6}] is not contained \
+                     in [0.90, 1.10]"
+                ),
             );
         }
         if let (Some(quill_p99), Some(oracle_p99)) = (
@@ -2156,6 +2255,54 @@ mod tests {
         assert!(result.reasons.iter().all(|reason| {
             reason.code != "perf.ratchet.insufficient_samples"
                 && reason.code != "perf.ratchet.inconclusive_paired_claim"
+        }));
+    }
+
+    #[test]
+    fn target_point_estimate_is_inconclusive_when_median_ci_crosses_threshold() {
+        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let mut candidate = qg2_artifact("new", 160.0, 100.0);
+        candidate.cells[2].distribution.median_ci95_low = 1.49;
+        candidate.cells[2].distribution.median_ci95_high = 1.71;
+        let mut rerun = candidate.clone();
+        rerun.run_id = "rerun".to_owned();
+
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_ci_inconclusive"
+                && reason.message.contains("[1.490000, 1.710000]")
+        }));
+    }
+
+    #[test]
+    fn target_miss_blocks_only_when_entire_median_ci_fails_threshold() {
+        let baseline = qg2_artifact("old", 160.0, 100.0);
+        let mut candidate = qg2_artifact("new", 140.0, 100.0);
+        candidate.cells[2].distribution.median_ci95_low = 1.31;
+        candidate.cells[2].distribution.median_ci95_high = 1.49;
+        let mut rerun = candidate.clone();
+        rerun.run_id = "rerun".to_owned();
+
+        let result = evaluate(
+            &baseline,
+            &candidate,
+            Some(&rerun),
+            true,
+            PerfRatchetMode::Promotion,
+        );
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("[1.310000, 1.490000]")
         }));
     }
 
