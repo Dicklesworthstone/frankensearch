@@ -16960,3 +16960,37 @@ cells on a quiet reference host; require every same-invocation A/A control and
 an immediate same-ELF reproduction before activation. Never admit a changed
 membership set, count mismatch, score delta above `0.0001`, or reorder across
 distinct oracle epsilon components.
+
+### 2026-07-28 — QG-6 bounded semantic preflight passes; filtered timing remains non-promotable (`bd-h6eh`, FoggySquirrel)
+
+Filtered diagnostic
+`qg6-natural-k100-preflight-d72f3f83-20260728T1705Z` used exact source
+revision `d72f3f837da14d5e508c5d99d7e3240c92b0fee0`, self-reported executing
+ELF SHA-256
+`5f1af4d9e1770ee31ba0ed1b998d58e682c1aa26bef0a57252e16ab63b2e08e9`
+(76,686,280 bytes), and the linked Tantivy 0.26.1 incumbent. The four
+independently populated semantic-preflight arms agreed on exact top-100
+membership and exact match/document counts. Queries `naturallanguage-{0,1,3}`
+were bit-exact; `naturallanguage-2` was admitted only by the sealed
+`OracleSegmentGeometry` score-epsilon policy for the reviewed one-ULP
+difference.
+
+The filtered same-invocation control was valid: Tantivy/Tantivy median
+**1.000704**, 95% CI **[0.998719, 1.002890]**. The diagnostic Quill/Tantivy
+latency ratio was **110.703751**, 95% CI
+**[106.930043, 113.676243]** (98.953 ms versus 0.903 ms p50). Because the run
+selected only `query/naturallanguage/k100/100k`, its artifact correctly records
+`laws_attested=false`; this ratio is routing evidence, not a QG-6 PASS/MISS.
+
+**Decision: HOLD — VALID FILTERED DIAGNOSTIC / NO GATE DECISION.** Evidence is
+retained under
+`.bench-history/attempts/2026-07-28/QG-6/qg6-natural-k100-preflight-d72f3f83-20260728T1705Z/`;
+the evidence JSON SHA-256 is
+`79c928e5b108f7deb8a284d54fa09593b3b217daf8d85734d53a2544e94071d1`.
+
+**Retry predicate:** use this exact ELF to run all 20 normative QG-6 fixtures
+at the 10-pair minimum on one quiet reference host, with no fixture filter.
+Require every semantic receipt and same-invocation A/A control to pass, then
+run one immediate same-window reproduction from the same ELF. Promote only the
+complete reproducible pair; never promote this filtered artifact or gate on
+CV.

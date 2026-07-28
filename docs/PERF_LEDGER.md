@@ -7553,3 +7553,29 @@ and reproduce the complete 20-cell QG-6 matrix on a quiet reference host.
 Reject any changed membership, count mismatch, score delta above `0.0001`, or
 cross-component reorder; all same-invocation A/A controls and reproduction
 laws remain unchanged.
+
+## 2026-07-28 — QG-6 FILTERED DIAGNOSTIC: semantic repair passes; no gate decision (`bd-h6eh`, FoggySquirrel)
+
+Filtered run `qg6-natural-k100-preflight-d72f3f83-20260728T1705Z` executed
+clean revision `d72f3f837da14d5e508c5d99d7e3240c92b0fee0` from exact ELF
+SHA-256
+`5f1af4d9e1770ee31ba0ed1b998d58e682c1aa26bef0a57252e16ab63b2e08e9`
+against the linked Tantivy 0.26.1 incumbent. All four independently populated
+semantic arms preserved exact membership and counts. Three queries were
+bit-exact; the reviewed one-ULP `naturallanguage-2` case printed an
+artifact-bound `OracleSegmentGeometry` receipt and remained inside the
+contract-pinned `0.0001` score bound.
+
+The same-invocation A/A control admitted at **1.000704
+[0.998719, 1.002890]**. The filtered Quill/Tantivy p50 latency ratio was
+**110.703751 [106.930043, 113.676243]** (98.953 ms versus 0.903 ms), but this
+is not a gate number: only `query/naturallanguage/k100/100k` ran, so the
+artifact correctly records `laws_attested=false`. The evidence is retained at
+`.bench-history/attempts/2026-07-28/QG-6/qg6-natural-k100-preflight-d72f3f83-20260728T1705Z/`
+with evidence JSON SHA-256
+`79c928e5b108f7deb8a284d54fa09593b3b217daf8d85734d53a2544e94071d1`.
+
+Retry only by running and immediately reproducing all 20 normative QG-6
+fixtures from this exact ELF on one quiet reference host. Every semantic
+receipt, A/A control, and reproduction law must pass before evaluating the
+per-class ±10% target; CV remains provenance only.
