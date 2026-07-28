@@ -24,7 +24,7 @@ use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::e2e_artifact::reason_codes;
 use frankensearch_core::error::SearchError;
 use frankensearch_core::traits::{Embedder, LexicalRead, ModelCategory, SearchFuture};
-use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult, SearchPhase};
+use frankensearch_core::types::{ScoreSource, ScoredResult, SearchPhase};
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
     E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
