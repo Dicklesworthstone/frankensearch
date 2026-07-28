@@ -143,13 +143,28 @@ Retry predicate:   n/a
 
 ### bd-e8h-w2-fsync-audit-ru7jc — commit-path sync-count census (AUDIT)
 Hypothesis:        Quill issues materially more fsync/dirsync per commit than Tantivy on the same fixture.
-Minimal repro:     strace -c both arms, one commit cell.
+Minimal repro:     strace both arms, one commit cell.
 Expected signal:   count table; batching lever filed only if counts differ materially.
 Falsified if:      counts are comparable.
-Invocation:        strace -c (Linux) / fs_usage (macOS) around perf_matrix commit cells.
-Machine classes:   x86-vps-ovh first (READY NOW); macOS lane needs Law-7 attestation.
-Results (inline):  PENDING.
-Retry predicate:   n/a
+Invocation:        strace -f -y -ttt -e trace=fsync,fdatasync,sync_file_range,msync,sync,syncfs,renameat,renameat2 around perf_matrix cells.
+Machine classes:   trj-zen3-64c executed; macOS lane needs Law-7 attestation.
+Results (inline):  QG-2 CENSUS COMPLETE (trj, 2026-07-28, receipts
+                   trj-zen3-64c/20260728T233926Z + 234453Z-wide): across
+                   warmup+10 runs of bulk/medium/1/positions_on, BOTH arms
+                   issued ZERO durability syscalls (fsync/fdatasync/msync/
+                   sync_file_range/syncfs/renameat) — the only 4 fsyncs were
+                   harness artifact publication. Explained by construction:
+                   perf_matrix builds both arms in memory (quill_in_memory /
+                   tantivy_in_memory, perf_matrix.rs:272-283,480). So (a) the
+                   QG-2 pairing is IO-symmetric and fair, (b) the 0.35-0.37x
+                   single-thread deficit is PURE compute/allocation — no IO
+                   lever exists for it, (c) this audit is INAPPLICABLE to
+                   in-memory cells by construction.
+Retry predicate:   re-run the census when an on-disk commit-bearing cell
+                   exists (FoggySquirrel's QG-3 visibility / QG-5 on-disk
+                   compact rework, or any gate whose arms leave
+                   quill_in_memory), and on macOS with F_FULLFSYNC tracing
+                   for Law 7.
 
 ## Banked priors (do NOT re-dig without meeting the retry predicate)
 
