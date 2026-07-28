@@ -21,6 +21,11 @@
 #                      (exports QUILL_PERF_CALIBRATE_AA=1; harness-side
 #                      consumption is bd-quill-e8-hyperopt P0 scope)
 #   --foreground       run attached instead of detached (default: detached)
+#   --allow-rch        permit rch offload for this run (compile-only labels).
+#                      By DEFAULT the runner exports RCH_DISABLE=1 so the
+#                      command executes on THIS machine — a timed window that
+#                      silently offloads to an rch worker measures the wrong
+#                      machine (Law 6). Never pass this for timed runs.
 #   --out <dir>        output root (default: ~/.frankensearch-perf-runs)
 #   -- <command...>    command to run; default:
 #                      cargo bench -p frankensearch-quill-gauntlet
@@ -41,6 +46,7 @@ CLASS=""
 LABEL="run"
 CALIBRATE_AA=0
 FOREGROUND=0
+ALLOW_RCH=0
 OUT_ROOT="${PERF_RUNNER_OUT:-$HOME/.frankensearch-perf-runs}"
 
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -51,6 +57,7 @@ while [ $# -gt 0 ]; do
         --label) LABEL="${2:?--label needs a value}"; shift 2 ;;
         --calibrate-aa) CALIBRATE_AA=1; shift ;;
         --foreground) FOREGROUND=1; shift ;;
+        --allow-rch) ALLOW_RCH=1; shift ;;
         --out) OUT_ROOT="${2:?--out needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
@@ -117,6 +124,18 @@ else
     PAGE_SIZE="$(sysctl -n hw.pagesize 2>/dev/null || echo n/a)"
 fi
 
+# --- local-execution guarantee ------------------------------------------------
+# Some hosts (trj) shim cargo through rch; an offloaded "timed" run would
+# execute on a different machine than the one fingerprinted above. Default to
+# forcing local execution; --allow-rch opts out for compile-only labels.
+if [ "$ALLOW_RCH" -eq 0 ]; then
+    export RCH_DISABLE=1
+    export RCH_MIN_LOCAL_TIME_MS=999999999
+    # trj's cargo is a fail-closed rch wrapper; this is its documented bypass
+    # (execs the real ~/.cargo/bin/cargo). Harmless on hosts without the shim.
+    export RCH_CARGO_WRAPPER_BYPASS=1
+fi
+
 # --- provenance --------------------------------------------------------------
 [ "$CALIBRATE_AA" -eq 1 ] && export QUILL_PERF_CALIBRATE_AA=1
 CMD_STR="$(printf '%q ' "${CMD[@]}")"
@@ -130,6 +149,7 @@ cat > "$RUN_DIR/provenance.json" <<EOF
   "machine_class": "$CLASS",
   "label": "$LABEL",
   "calibrate_aa": $CALIBRATE_AA,
+  "rch_disabled": $([ "$ALLOW_RCH" -eq 0 ] && echo true || echo false),
   "timestamp_utc": "$STAMP",
   "hostname": "$(hostname)",
   "os": "$OS",
