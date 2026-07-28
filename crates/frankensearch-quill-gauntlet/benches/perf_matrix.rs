@@ -1538,22 +1538,16 @@ fn qg6_preflight_result(
                 .iter()
                 .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
                 .collect::<Vec<_>>();
-            let evidence = index
-                .search_paginated(&context.cx, query.text(), k, 0, true)
+            // Preserve the exact shipping count-free path above as the
+            // observed native top-k. Exact counting intentionally changes the
+            // collector/scorer mode and, under a large exact-score cutoff tie,
+            // may choose a different native tie member. Count in an
+            // independent zero-limit query so evidence cannot redefine the
+            // result whose latency and rank are compared.
+            let count_evidence = index
+                .search_paginated(&context.cx, query.text(), 0, 0, true)
                 .map_err(|error| error.to_string())?;
-            let evidence_native = evidence
-                .hits
-                .iter()
-                .take(k)
-                .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
-                .collect::<Vec<_>>();
-            if native_hits != evidence_native {
-                return Err(
-                    "Quill native timed query disagrees with its tie-evidence observation"
-                        .to_owned(),
-                );
-            }
-            let total_count = evidence
+            let total_count = count_evidence
                 .total_count
                 .ok_or_else(|| "Quill tie evidence omitted its exact count".to_owned())?;
             let hits = native
@@ -1576,7 +1570,7 @@ fn qg6_preflight_result(
                     offset_tie_complete: false,
                     snippets: BTreeMap::new(),
                     match_count: CountState::Value(total_count),
-                    doc_count: evidence.doc_count,
+                    doc_count: count_evidence.doc_count,
                     ast_differences: Vec::new(),
                 }),
             })

@@ -16883,3 +16883,42 @@ Use the same exact `f9ab…` ELF and 10-pair minimum, require all five A/A
 controls to admit, and run one immediate same-window reproduction before
 promotion. Do not mutate either host's governor, weaken the null laws, or gate
 on CV.
+
+### 2026-07-28 — QG-6 filtered repair preflight exposes a second collector-shape mismatch (`bd-h6eh`, FoggySquirrel)
+
+Filtered diagnostic `qg6-natural-k100-preflight-20260728T1603Z` executed the
+newly repaired exact ELF SHA-256
+`5085f4769031e40eddefdd1d7b2791c42a63f6f683b588a52984d5a94858804d`
+(76,695,704 bytes), linked to the actual Tantivy 0.26.1 incumbent. It selected
+only `query/naturallanguage/k100/100k`, so it was predeclared incomplete and
+could never become a QG-6 artifact.
+
+The invocation also supplied the mistyped Git identity
+`3ef37beba8c257d13e9ab320e4d80d00a17e5c2e` instead of the ELF's actual source
+revision `3ef37beb9d2057940897fe7891480255fa4c9596`. Before any paired timing
+blocks, preflight then exited 101 on the Quill effect arm with bounded error
+SHA-256
+`0728a6e7101cbcf065ef0de045870718ee3b7bace6b06e1ac302ee5a86e5cb42`
+(68 bytes), which resolves exactly to `Quill native timed query disagrees with
+its tie-evidence observation`.
+
+Manual adjudication found the symmetric version of the Tantivy defect fixed in
+the preceding entry: the shipping Quill result uses the count-free ranked
+collector, while the evidence adapter reran the query with exact counting and
+required that collector's top-k to be byte-identical. Exact counting changes
+the scorer/collector mode and can select a different member of a large
+exact-score cutoff tie. An evidence-only count query is not permitted to
+redefine the native top-k under measurement.
+
+**Decision: INVALID-PROVENANCE + INVALID-EXECUTION / NO CLAIM.** No timing
+sample or A/A control ran and no artifact sealed. The adapter repair now keeps
+hits from the exact count-free shipping query and obtains only `total_count`
+and `doc_count` from an independent zero-limit exact-count query.
+
+**Retry predicate:** build a new self-hashing release-perf ELF containing the
+Quill adapter repair and pass the exact full source revision in
+`QUILL_PERF_GIT_REV`. First rerun the same filtered natural-language `k=100`,
+100k-document semantic preflight and require all four arms to pass before any
+timing. Only then attempt all 20 normative QG-6 cells on a quiet reference
+host; require every same-invocation A/A control plus an immediate same-ELF
+reproduction before activation.

@@ -7488,3 +7488,40 @@ maintenance sweep and the already-prioritized QG-2 pair complete. Preserve the
 exact `f9ab…` ELF and 10-pair minimum; require all five A/A controls to admit,
 then start one immediate same-window reproduction. Do not resample this host,
 change its governor, weaken a null law, or gate on CV.
+
+## 2026-07-28 — QG-6 INVALID-PROVENANCE/EXECUTION: Quill count collector redefined native top-k (`bd-h6eh`, FoggySquirrel)
+
+Filtered diagnostic `qg6-natural-k100-preflight-20260728T1603Z` ran exact ELF
+SHA-256
+`5085f4769031e40eddefdd1d7b2791c42a63f6f683b588a52984d5a94858804d`
+(76,695,704 bytes), with the linked Tantivy 0.26.1 incumbent, on only
+`query/naturallanguage/k100/100k`. The incomplete selection was diagnostic by
+construction and could not support a gate claim.
+
+The command supplied the wrong Git identity
+`3ef37beba8c257d13e9ab320e4d80d00a17e5c2e`; the ELF was actually built from
+`3ef37beb9d2057940897fe7891480255fa4c9596`. Preflight also stopped before any
+paired sample or A/A control with exit 101:
+`AdapterFailure { phase: Preflight, arm: EffectTreatment, query_id:
+"naturallanguage-0", error_sha256:
+"0728a6e7101cbcf065ef0de045870718ee3b7bace6b06e1ac302ee5a86e5cb42",
+error_bytes: 68 }`. That digest is exactly `Quill native timed query disagrees
+with its tie-evidence observation`.
+
+The shipping Quill top-k is count-free, but the evidence adapter had required
+it to equal a second execution with exact counting enabled. Exact counting
+changes the scorer/collector mode and, at a large exact-score cutoff tie, may
+select a different native tie member. This is another harness
+self-consistency defect: the count query may supply count facts, but it may not
+redefine the native result whose latency and rank are compared.
+
+No QG-6 number follows and no artifact sealed. The repair retains the exact
+count-free native hits and runs a separate zero-limit exact-count query solely
+for `total_count` and `doc_count`.
+
+Retry from a newly built exact ELF containing that repair and supply the exact
+full source revision. Require the same filtered natural-language `k=100`,
+100k-document preflight to pass all four independently populated arms before
+timing. A complete gate run still requires all 20 normative cells, every
+same-invocation A/A control, and an immediate same-ELF reproduction on a quiet
+reference host.
