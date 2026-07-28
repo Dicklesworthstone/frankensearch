@@ -52,9 +52,14 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::{
+    error::{SearchError, SearchResult},
+    generation::{ArtifactGenerationIdentityV1, FrozenEmbeddingIdentityBundleV1},
+    sha256_checksum,
+};
+use serde::{Deserialize, Serialize};
 
 const NATIVE_HNSW_MAGIC: [u8; 8] = *b"FSHNSW\0\0";
 /// Current owned native-HNSW graph format.
@@ -63,6 +68,14 @@ const NATIVE_HNSW_HEADER_LEN: usize = 96;
 const NATIVE_HNSW_HEADER_LEN_U64: u64 = 96;
 const NATIVE_HNSW_HEADER_CRC_OFFSET: usize = NATIVE_HNSW_HEADER_LEN - 4;
 const NATIVE_HNSW_NO_ENTRY: u64 = u64::MAX;
+const NATIVE_HNSW_RECEIPT_MAGIC: [u8; 8] = *b"FSHNRC\0\0";
+/// Current schema for native-HNSW-to-FSVI generation receipts.
+pub const NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1: u16 = 1;
+/// Canonical sidecar suffix appended to the complete `.fshnsw` basename.
+pub const NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX: &str = ".receipt";
+const NATIVE_HNSW_MAX_BASENAME_BYTES: usize = 255 - NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX.len();
+const SHA256_HEX_LEN: usize = 64;
+const SHA256_BYTES: usize = 32;
 
 /// A violation of the graph's structural invariants.
 ///
@@ -368,6 +381,781 @@ impl NativeHnswFileMetadata {
     pub const fn header_crc32(self) -> u32 {
         self.header_crc32
     }
+}
+
+/// Canonical persisted identity of native-HNSW construction parameters.
+///
+/// The receipt uses full-width integers so its encoding is independent of the
+/// reader's pointer width. Conversion back to [`HnswParams`] remains checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHnswParamsIdentityV1 {
+    /// Neighbours retained per upper-layer point.
+    pub m: u64,
+    /// Neighbours retained per layer-zero point.
+    pub m0: u64,
+    /// Construction beam width.
+    pub ef_construction: u64,
+    /// Default search beam width.
+    pub ef_search: u64,
+}
+
+impl NativeHnswParamsIdentityV1 {
+    fn from_params(params: HnswParams) -> SearchResult<Self> {
+        Ok(Self {
+            m: usize_to_u64(params.m, "receipt.params.m")?,
+            m0: usize_to_u64(params.m0, "receipt.params.m0")?,
+            ef_construction: usize_to_u64(
+                params.ef_construction,
+                "receipt.params.ef_construction",
+            )?,
+            ef_search: usize_to_u64(params.ef_search, "receipt.params.ef_search")?,
+        })
+    }
+
+    fn to_params(self) -> SearchResult<HnswParams> {
+        let params = HnswParams {
+            m: receipt_usize(self.m, "params.m")?,
+            m0: receipt_usize(self.m0, "params.m0")?,
+            ef_construction: receipt_usize(self.ef_construction, "params.ef_construction")?,
+            ef_search: receipt_usize(self.ef_search, "params.ef_search")?,
+        };
+        params.validate()?;
+        Ok(params)
+    }
+}
+
+/// Cryptographic binding between one owned FSHNSW artifact and one FSVI v2
+/// generation.
+///
+/// The public serde representation rejects unknown fields. The on-disk
+/// sidecar is a separate canonical binary encoding with a SHA-256 body seal;
+/// readers reject alternate encodings and trailing bytes rather than silently
+/// accepting a second representation of the same receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHnswGenerationReceiptV1 {
+    /// [`NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Exact immutable FSVI artifact generation.
+    pub artifact_generation: ArtifactGenerationIdentityV1,
+    /// SHA-256 of the generation's canonical identity bytes.
+    pub artifact_generation_fingerprint: String,
+    /// SHA-256 of the complete frozen embedding identity bundle.
+    pub embedding_identity_fingerprint: String,
+    /// SHA-256 of the mathematical embedding-space identity.
+    pub embedding_space_fingerprint: String,
+    /// SHA-256 of the embedding-producer attestation.
+    pub embedding_producer_fingerprint: String,
+    /// SHA-256 of the outer embedding-input contract.
+    pub embedding_input_fingerprint: String,
+    /// SHA-256 of the physical FSVI v2 storage identity.
+    pub vector_storage_fingerprint: String,
+    /// Canonical UTF-8 basename of the adjacent FSHNSW artifact.
+    pub graph_basename: String,
+    /// Complete FSHNSW file length.
+    pub graph_byte_len: u64,
+    /// SHA-256 of the complete FSHNSW file bytes.
+    pub graph_sha256: String,
+    /// Owned FSHNSW binary format version.
+    pub native_format_version: u32,
+    /// Construction and default-search parameters.
+    pub params: NativeHnswParamsIdentityV1,
+    /// Deterministic level-sampling seed.
+    pub seed: u64,
+    /// Number of graph rows, which must equal the vector-store cardinality.
+    pub point_count: u64,
+    /// Search entry point, absent only for an empty graph.
+    pub entry_point: Option<u32>,
+    /// Highest occupied graph layer.
+    pub max_level: u64,
+    /// CRC-32 of the canonical adjacency payload.
+    pub payload_crc32: u32,
+    /// CRC-32 of the fixed FSHNSW header.
+    pub header_crc32: u32,
+    /// SHA-256 of the semantic topology, independent of file checksums.
+    pub topology_sha256: String,
+    /// SHA-256 of every preceding field in canonical binary order.
+    pub receipt_sha256: String,
+}
+
+/// Expected FSVI v2 generation and frozen embedding identity for a native
+/// HNSW sidecar.
+///
+/// A binding is caller-held trust material. Persisted receipt fields are never
+/// allowed to select or weaken the expected generation or embedding space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeHnswGenerationBindingV1 {
+    artifact_generation: ArtifactGenerationIdentityV1,
+    artifact_generation_fingerprint: String,
+    embedding_identity_fingerprint: String,
+    embedding_space_fingerprint: String,
+    embedding_producer_fingerprint: String,
+    embedding_input_fingerprint: String,
+    vector_storage_fingerprint: String,
+}
+
+impl NativeHnswGenerationBindingV1 {
+    /// Construct an exact FSVI v2 binding from validated identity contracts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when either identity is invalid
+    /// or the frozen storage contract does not name `fsvi-v2`.
+    pub fn new(
+        artifact_generation: ArtifactGenerationIdentityV1,
+        embedding_identity: &FrozenEmbeddingIdentityBundleV1,
+    ) -> SearchResult<Self> {
+        artifact_generation.validate()?;
+        embedding_identity.validate()?;
+        if embedding_identity.identity.storage.format != "fsvi-v2" {
+            return Err(native_hnsw_receipt_config_error(
+                "embedding_identity.storage.format",
+                &embedding_identity.identity.storage.format,
+                "must be exactly fsvi-v2",
+            ));
+        }
+
+        let binding = Self {
+            artifact_generation,
+            artifact_generation_fingerprint: artifact_generation.fingerprint(),
+            embedding_identity_fingerprint: embedding_identity.fingerprint.clone(),
+            embedding_space_fingerprint: embedding_identity.identity.space.fingerprint(),
+            embedding_producer_fingerprint: embedding_identity.identity.producer.fingerprint(),
+            embedding_input_fingerprint: embedding_identity.identity.input.fingerprint(),
+            vector_storage_fingerprint: embedding_identity.identity.storage.fingerprint(),
+        };
+        binding.validate_fingerprints()?;
+        Ok(binding)
+    }
+
+    /// Exact immutable artifact generation expected by this binding.
+    #[must_use]
+    pub const fn artifact_generation(&self) -> ArtifactGenerationIdentityV1 {
+        self.artifact_generation
+    }
+
+    /// Complete frozen embedding-identity fingerprint expected by this binding.
+    #[must_use]
+    pub fn embedding_identity_fingerprint(&self) -> &str {
+        &self.embedding_identity_fingerprint
+    }
+
+    /// Save `graph` atomically, then publish its canonical adjacent receipt.
+    ///
+    /// Both destination paths are preflighted before the graph is touched.
+    /// A crash between the two atomic renames can leave a new graph with a
+    /// missing or stale receipt, but that state fails closed on every load.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same graph errors as [`NativeHnsw::save`], plus
+    /// [`SearchError::InvalidConfig`] for a noncanonical graph path and
+    /// [`SearchError::Io`] for receipt persistence failures.
+    pub fn save(
+        &self,
+        graph: &NativeHnsw,
+        graph_path: &Path,
+    ) -> SearchResult<NativeHnswGenerationReceiptV1> {
+        let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
+        reject_symlink_ancestors(graph_path)?;
+        reject_non_regular_destination(graph_path)?;
+        reject_non_regular_receipt_destination(&receipt_path)?;
+
+        let metadata = graph.save(graph_path)?;
+        let graph_bytes = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
+        if u64::try_from(graph_bytes.len()).ok() != Some(metadata.byte_len()) {
+            return Err(native_hnsw_corrupted(
+                graph_path,
+                "native HNSW file length changed after atomic publication",
+            ));
+        }
+        let mut receipt = NativeHnswGenerationReceiptV1 {
+            schema_version: NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1,
+            artifact_generation: self.artifact_generation,
+            artifact_generation_fingerprint: self.artifact_generation_fingerprint.clone(),
+            embedding_identity_fingerprint: self.embedding_identity_fingerprint.clone(),
+            embedding_space_fingerprint: self.embedding_space_fingerprint.clone(),
+            embedding_producer_fingerprint: self.embedding_producer_fingerprint.clone(),
+            embedding_input_fingerprint: self.embedding_input_fingerprint.clone(),
+            vector_storage_fingerprint: self.vector_storage_fingerprint.clone(),
+            graph_basename: canonical_graph_basename(graph_path)?,
+            graph_byte_len: metadata.byte_len(),
+            graph_sha256: sha256_hex(&graph_bytes),
+            native_format_version: metadata.format_version(),
+            params: NativeHnswParamsIdentityV1::from_params(graph.params())?,
+            seed: graph.seed(),
+            point_count: metadata.point_count(),
+            entry_point: graph.entry_point(),
+            max_level: usize_to_u64(graph.max_level(), "receipt.max_level")?,
+            payload_crc32: metadata.payload_crc32(),
+            header_crc32: metadata.header_crc32(),
+            topology_sha256: graph.topology_sha256()?,
+            receipt_sha256: String::new(),
+        };
+        receipt.seal()?;
+        let encoded = receipt.to_bytes()?;
+        persist_native_hnsw_receipt(&receipt_path, &encoded)?;
+        Ok(receipt)
+    }
+
+    /// Load a graph only after its adjacent receipt proves the exact expected
+    /// FSVI generation, embedding identity, file bytes, and topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexNotFound`] when either artifact is missing,
+    /// [`SearchError::IndexCorrupted`] for malformed, stale, replaced, or
+    /// mismatched receipt/graph material, and [`SearchError::Io`] for other
+    /// filesystem failures.
+    pub fn load<D: VectorDistance>(
+        &self,
+        graph_path: &Path,
+        store: &D,
+    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV1)> {
+        self.load_with_after_first_observation(graph_path, store, || Ok(()))
+    }
+
+    fn load_with_after_first_observation<D: VectorDistance>(
+        &self,
+        graph_path: &Path,
+        store: &D,
+        after_first_observation: impl FnOnce() -> SearchResult<()>,
+    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV1)> {
+        let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
+        reject_symlink_ancestors(graph_path)?;
+        let receipt_bytes =
+            read_regular_file_bytes(&receipt_path, "native HNSW generation receipt")?;
+        let receipt = NativeHnswGenerationReceiptV1::from_bytes(&receipt_bytes, &receipt_path)?;
+        self.validate_receipt_identity(&receipt, graph_path, &receipt_path)?;
+
+        let graph_bytes_before = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
+        Self::validate_graph_bytes(&receipt, graph_path, &graph_bytes_before)?;
+        after_first_observation()?;
+        let (graph, metadata) = NativeHnsw::load_with_metadata(graph_path, store)?;
+        Self::validate_graph_identity(&receipt, graph_path, &graph, metadata)?;
+
+        // A second exact byte observation closes the replacement window
+        // between the cryptographic check and the owned graph parser.
+        let graph_bytes_after = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
+        // ubs:ignore — public artifact bytes are integrity material, not a secret.
+        if graph_bytes_after != graph_bytes_before {
+            return Err(native_hnsw_corrupted(
+                graph_path,
+                "native HNSW artifact changed during receipt verification",
+            ));
+        }
+        Ok((graph, receipt))
+    }
+
+    fn validate_fingerprints(&self) -> SearchResult<()> {
+        for (field, fingerprint) in [
+            (
+                "artifact_generation_fingerprint",
+                &self.artifact_generation_fingerprint,
+            ),
+            (
+                "embedding_identity_fingerprint",
+                &self.embedding_identity_fingerprint,
+            ),
+            (
+                "embedding_space_fingerprint",
+                &self.embedding_space_fingerprint,
+            ),
+            (
+                "embedding_producer_fingerprint",
+                &self.embedding_producer_fingerprint,
+            ),
+            (
+                "embedding_input_fingerprint",
+                &self.embedding_input_fingerprint,
+            ),
+            (
+                "vector_storage_fingerprint",
+                &self.vector_storage_fingerprint,
+            ),
+        ] {
+            validate_sha256_hex(field, fingerprint)?;
+        }
+        Ok(())
+    }
+
+    fn validate_receipt_identity(
+        &self,
+        receipt: &NativeHnswGenerationReceiptV1,
+        graph_path: &Path,
+        receipt_path: &Path,
+    ) -> SearchResult<()> {
+        let mismatch = |field: &str| {
+            native_hnsw_receipt_corrupted(
+                receipt_path,
+                format!("native HNSW receipt {field} mismatch"),
+            )
+        };
+        // ubs:ignore — generation identity is public artifact metadata, not a credential.
+        if receipt.artifact_generation != self.artifact_generation {
+            return Err(mismatch("artifact generation"));
+        }
+        // ubs:ignore — this public SHA-256 is an integrity fingerprint, not a MAC or secret.
+        if receipt.artifact_generation_fingerprint != self.artifact_generation_fingerprint {
+            return Err(mismatch("artifact generation fingerprint"));
+        }
+        for (field, actual, expected) in [
+            (
+                "embedding identity fingerprint",
+                &receipt.embedding_identity_fingerprint,
+                &self.embedding_identity_fingerprint,
+            ),
+            (
+                "embedding space fingerprint",
+                &receipt.embedding_space_fingerprint,
+                &self.embedding_space_fingerprint,
+            ),
+            (
+                "embedding producer fingerprint",
+                &receipt.embedding_producer_fingerprint,
+                &self.embedding_producer_fingerprint,
+            ),
+            (
+                "embedding input fingerprint",
+                &receipt.embedding_input_fingerprint,
+                &self.embedding_input_fingerprint,
+            ),
+            (
+                "vector storage fingerprint",
+                &receipt.vector_storage_fingerprint,
+                &self.vector_storage_fingerprint,
+            ),
+        ] {
+            // ubs:ignore — frozen identity fingerprints are public compatibility metadata.
+            if actual != expected {
+                return Err(mismatch(field));
+            }
+        }
+        if receipt.graph_basename != canonical_graph_basename(graph_path)? {
+            return Err(mismatch("graph basename"));
+        }
+        Ok(())
+    }
+
+    fn validate_graph_bytes(
+        receipt: &NativeHnswGenerationReceiptV1,
+        graph_path: &Path,
+        graph_bytes: &[u8],
+    ) -> SearchResult<()> {
+        let actual_len = u64::try_from(graph_bytes.len()).map_err(|_| {
+            native_hnsw_corrupted(graph_path, "native HNSW file length does not fit u64")
+        })?;
+        if actual_len != receipt.graph_byte_len {
+            return Err(native_hnsw_corrupted(
+                graph_path,
+                "native HNSW file length disagrees with generation receipt",
+            ));
+        }
+        // ubs:ignore — the graph SHA-256 is public integrity metadata, not authentication.
+        if sha256_hex(graph_bytes) != receipt.graph_sha256 {
+            return Err(native_hnsw_corrupted(
+                graph_path,
+                "native HNSW SHA-256 disagrees with generation receipt",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_graph_identity(
+        receipt: &NativeHnswGenerationReceiptV1,
+        graph_path: &Path,
+        graph: &NativeHnsw,
+        metadata: NativeHnswFileMetadata,
+    ) -> SearchResult<()> {
+        let mismatch = |field: &str| {
+            native_hnsw_corrupted(
+                graph_path,
+                format!("native HNSW {field} disagrees with generation receipt"),
+            )
+        };
+        if metadata.format_version() != receipt.native_format_version {
+            return Err(mismatch("format version"));
+        }
+        if metadata.byte_len() != receipt.graph_byte_len {
+            return Err(mismatch("byte length"));
+        }
+        if metadata.point_count() != receipt.point_count {
+            return Err(mismatch("point count"));
+        }
+        if metadata.payload_crc32() != receipt.payload_crc32 {
+            return Err(mismatch("payload CRC"));
+        }
+        if metadata.header_crc32() != receipt.header_crc32 {
+            return Err(mismatch("header CRC"));
+        }
+        if graph.params() != receipt.params.to_params()? {
+            return Err(mismatch("parameter identity"));
+        }
+        if graph.seed() != receipt.seed {
+            return Err(mismatch("level-sampling seed"));
+        }
+        if graph.entry_point() != receipt.entry_point {
+            return Err(mismatch("entry point"));
+        }
+        if usize_to_u64(graph.max_level(), "verified.max_level")? != receipt.max_level {
+            return Err(mismatch("maximum level"));
+        }
+        // ubs:ignore — the topology SHA-256 is public integrity metadata.
+        if graph.topology_sha256()? != receipt.topology_sha256 {
+            return Err(mismatch("topology SHA-256"));
+        }
+        Ok(())
+    }
+}
+
+impl NativeHnswGenerationReceiptV1 {
+    /// Validate every internal schema, digest, cardinality, and topology field.
+    ///
+    /// This does not establish compatibility with caller-held expectations;
+    /// use [`NativeHnswGenerationBindingV1::load`] for admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] for malformed or internally
+    /// inconsistent receipt material.
+    pub fn validate(&self) -> SearchResult<()> {
+        if self.schema_version != NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1 {
+            return Err(native_hnsw_receipt_config_error(
+                "schema_version",
+                &self.schema_version.to_string(),
+                "unsupported native HNSW receipt schema",
+            ));
+        }
+        self.artifact_generation.validate()?;
+        validate_sha256_hex(
+            "artifact_generation_fingerprint",
+            &self.artifact_generation_fingerprint,
+        )?;
+        // ubs:ignore — the generation SHA-256 is public integrity metadata.
+        if self.artifact_generation_fingerprint != self.artifact_generation.fingerprint() {
+            return Err(native_hnsw_receipt_config_error(
+                "artifact_generation_fingerprint",
+                "redacted-digest-mismatch",
+                "does not bind the canonical artifact generation",
+            ));
+        }
+        for (field, fingerprint) in [
+            (
+                "embedding_identity_fingerprint",
+                &self.embedding_identity_fingerprint,
+            ),
+            (
+                "embedding_space_fingerprint",
+                &self.embedding_space_fingerprint,
+            ),
+            (
+                "embedding_producer_fingerprint",
+                &self.embedding_producer_fingerprint,
+            ),
+            (
+                "embedding_input_fingerprint",
+                &self.embedding_input_fingerprint,
+            ),
+            (
+                "vector_storage_fingerprint",
+                &self.vector_storage_fingerprint,
+            ),
+            ("graph_sha256", &self.graph_sha256),
+            ("topology_sha256", &self.topology_sha256),
+            ("receipt_sha256", &self.receipt_sha256),
+        ] {
+            validate_sha256_hex(field, fingerprint)?;
+        }
+        validate_graph_basename(&self.graph_basename)?;
+        if self.graph_byte_len < NATIVE_HNSW_HEADER_LEN_U64 {
+            return Err(native_hnsw_receipt_config_error(
+                "graph_byte_len",
+                &self.graph_byte_len.to_string(),
+                "must include the complete fixed FSHNSW header",
+            ));
+        }
+        if self.native_format_version != NATIVE_HNSW_FORMAT_VERSION {
+            return Err(native_hnsw_receipt_config_error(
+                "native_format_version",
+                &self.native_format_version.to_string(),
+                "unsupported owned FSHNSW format version",
+            ));
+        }
+        let _ = self.params.to_params()?;
+        if self.point_count > u64::from(u32::MAX) {
+            return Err(native_hnsw_receipt_config_error(
+                "point_count",
+                &self.point_count.to_string(),
+                "must fit the native u32 point-id space",
+            ));
+        }
+        if self.max_level >= usize_to_u64(MAX_LEVEL, "max_level_limit")? {
+            return Err(native_hnsw_receipt_config_error(
+                "max_level",
+                &self.max_level.to_string(),
+                "must be below the native HNSW layer bound",
+            ));
+        }
+        match (self.point_count, self.entry_point, self.max_level) {
+            (0, None, 0) => {}
+            (0, Some(_), _) => {
+                return Err(native_hnsw_receipt_config_error(
+                    "entry_point",
+                    "redacted",
+                    "must be absent for an empty graph",
+                ));
+            }
+            (0, None, _) => {
+                return Err(native_hnsw_receipt_config_error(
+                    "max_level",
+                    &self.max_level.to_string(),
+                    "must be zero for an empty graph",
+                ));
+            }
+            (_, None, _) => {
+                return Err(native_hnsw_receipt_config_error(
+                    "entry_point",
+                    "redacted",
+                    "must be present for a non-empty graph",
+                ));
+            }
+            (count, Some(entry), _) if u64::from(entry) >= count => {
+                return Err(native_hnsw_receipt_config_error(
+                    "entry_point",
+                    &entry.to_string(),
+                    "must name a row within point_count",
+                ));
+            }
+            _ => {}
+        }
+        let expected_receipt_sha256 = sha256_hex(&self.canonical_body_bytes()?);
+        // ubs:ignore — the receipt SHA-256 is an unkeyed public integrity seal.
+        if self.receipt_sha256 != expected_receipt_sha256 {
+            return Err(native_hnsw_receipt_config_error(
+                "receipt_sha256",
+                "redacted-digest-mismatch",
+                "does not match the canonical receipt body",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encode this validated receipt to its one canonical binary form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the receipt is invalid.
+    pub fn to_bytes(&self) -> SearchResult<Vec<u8>> {
+        self.validate()?;
+        self.encode_unchecked()
+    }
+
+    /// Decode and validate one canonical binary receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] for truncation, an unknown
+    /// schema, invalid fields, a body-seal mismatch, or noncanonical/trailing
+    /// bytes.
+    pub fn from_bytes(bytes: &[u8], receipt_path: &Path) -> SearchResult<Self> {
+        let receipt = Self::decode_unchecked(bytes, receipt_path)?;
+        receipt.validate().map_err(|error| {
+            native_hnsw_receipt_corrupted(
+                receipt_path,
+                format!("native HNSW generation receipt is invalid: {error}"),
+            )
+        })?;
+        let canonical = receipt.encode_unchecked().map_err(|error| {
+            native_hnsw_receipt_corrupted(
+                receipt_path,
+                format!("native HNSW generation receipt cannot be canonicalized: {error}"),
+            )
+        })?;
+        if canonical != bytes {
+            return Err(native_hnsw_receipt_corrupted(
+                receipt_path,
+                "native HNSW generation receipt is not canonically encoded",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    fn seal(&mut self) -> SearchResult<()> {
+        self.receipt_sha256 = sha256_hex(&self.canonical_body_bytes()?);
+        Ok(())
+    }
+
+    fn canonical_body_bytes(&self) -> SearchResult<Vec<u8>> {
+        let basename = self.graph_basename.as_bytes();
+        let basename_len = u16::try_from(basename.len()).map_err(|_| {
+            native_hnsw_receipt_config_error(
+                "graph_basename",
+                "redacted-oversized",
+                "basename length must fit the canonical u16 field",
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(384 + basename.len());
+        bytes.extend_from_slice(&NATIVE_HNSW_RECEIPT_MAGIC);
+        bytes.extend_from_slice(&self.schema_version.to_be_bytes());
+        bytes.extend_from_slice(&self.artifact_generation.schema_version.to_be_bytes());
+        bytes.extend_from_slice(&self.artifact_generation.sequence.to_be_bytes());
+        bytes.extend_from_slice(&self.artifact_generation.nonce);
+        for fingerprint in [
+            &self.artifact_generation_fingerprint,
+            &self.embedding_identity_fingerprint,
+            &self.embedding_space_fingerprint,
+            &self.embedding_producer_fingerprint,
+            &self.embedding_input_fingerprint,
+            &self.vector_storage_fingerprint,
+        ] {
+            bytes.extend_from_slice(&decode_sha256_hex("receipt fingerprint", fingerprint)?);
+        }
+        bytes.extend_from_slice(&basename_len.to_be_bytes());
+        bytes.extend_from_slice(basename);
+        bytes.extend_from_slice(&self.graph_byte_len.to_be_bytes());
+        bytes.extend_from_slice(&decode_sha256_hex("graph_sha256", &self.graph_sha256)?);
+        bytes.extend_from_slice(&self.native_format_version.to_be_bytes());
+        for value in [
+            self.params.m,
+            self.params.m0,
+            self.params.ef_construction,
+            self.params.ef_search,
+            self.seed,
+            self.point_count,
+            self.entry_point.map_or(NATIVE_HNSW_NO_ENTRY, u64::from),
+            self.max_level,
+        ] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&self.payload_crc32.to_be_bytes());
+        bytes.extend_from_slice(&self.header_crc32.to_be_bytes());
+        bytes.extend_from_slice(&decode_sha256_hex(
+            "topology_sha256",
+            &self.topology_sha256,
+        )?);
+        Ok(bytes)
+    }
+
+    fn encode_unchecked(&self) -> SearchResult<Vec<u8>> {
+        let mut bytes = self.canonical_body_bytes()?;
+        bytes.extend_from_slice(&decode_sha256_hex("receipt_sha256", &self.receipt_sha256)?);
+        Ok(bytes)
+    }
+
+    fn decode_unchecked(bytes: &[u8], receipt_path: &Path) -> SearchResult<Self> {
+        let mut reader = NativeHnswReceiptReader::new(bytes, receipt_path);
+        let magic = reader.take_array::<8>("receipt magic")?;
+        if magic != NATIVE_HNSW_RECEIPT_MAGIC {
+            return Err(native_hnsw_receipt_corrupted(
+                receipt_path,
+                "bad native HNSW generation receipt magic",
+            ));
+        }
+        let schema_version = reader.read_u16("schema version")?;
+        let artifact_generation = ArtifactGenerationIdentityV1 {
+            schema_version: reader.read_u16("artifact generation schema")?,
+            sequence: reader.read_u64("artifact generation sequence")?,
+            nonce: reader.take_array::<16>("artifact generation nonce")?,
+        };
+        let artifact_generation_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("artifact generation fingerprint")?);
+        let embedding_identity_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("embedding identity fingerprint")?);
+        let embedding_space_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("embedding space fingerprint")?);
+        let embedding_producer_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("embedding producer fingerprint")?);
+        let embedding_input_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("embedding input fingerprint")?);
+        let vector_storage_fingerprint =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("vector storage fingerprint")?);
+        let basename_len = usize::from(reader.read_u16("graph basename length")?);
+        if basename_len == 0 || basename_len > NATIVE_HNSW_MAX_BASENAME_BYTES {
+            return Err(native_hnsw_receipt_corrupted(
+                receipt_path,
+                "native HNSW receipt graph basename length is invalid",
+            ));
+        }
+        let graph_basename = std::str::from_utf8(reader.take(basename_len, "graph basename")?)
+            .map_err(|_| {
+                native_hnsw_receipt_corrupted(
+                    receipt_path,
+                    "native HNSW receipt graph basename is not UTF-8",
+                )
+            })?
+            .to_owned();
+        let graph_byte_len = reader.read_u64("graph byte length")?;
+        let graph_sha256 = encode_lower_hex(reader.take_array::<SHA256_BYTES>("graph SHA-256")?);
+        let native_format_version = reader.read_u32("native format version")?;
+        let params = NativeHnswParamsIdentityV1 {
+            m: reader.read_u64("m")?,
+            m0: reader.read_u64("m0")?,
+            ef_construction: reader.read_u64("ef_construction")?,
+            ef_search: reader.read_u64("ef_search")?,
+        };
+        let seed = reader.read_u64("seed")?;
+        let point_count = reader.read_u64("point count")?;
+        let entry_wire = reader.read_u64("entry point")?;
+        let entry_point = if entry_wire == NATIVE_HNSW_NO_ENTRY {
+            None
+        } else {
+            Some(u32::try_from(entry_wire).map_err(|_| {
+                native_hnsw_receipt_corrupted(
+                    receipt_path,
+                    "native HNSW receipt entry point exceeds u32",
+                )
+            })?)
+        };
+        let max_level = reader.read_u64("maximum level")?;
+        let payload_crc32 = reader.read_u32("payload CRC")?;
+        let header_crc32 = reader.read_u32("header CRC")?;
+        let topology_sha256 =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("topology SHA-256")?);
+        let receipt_sha256 =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("receipt SHA-256")?);
+        reader.finish()?;
+
+        Ok(Self {
+            schema_version,
+            artifact_generation,
+            artifact_generation_fingerprint,
+            embedding_identity_fingerprint,
+            embedding_space_fingerprint,
+            embedding_producer_fingerprint,
+            embedding_input_fingerprint,
+            vector_storage_fingerprint,
+            graph_basename,
+            graph_byte_len,
+            graph_sha256,
+            native_format_version,
+            params,
+            seed,
+            point_count,
+            entry_point,
+            max_level,
+            payload_crc32,
+            header_crc32,
+            topology_sha256,
+            receipt_sha256,
+        })
+    }
+}
+
+/// Canonical adjacent receipt path for `graph_path`.
+///
+/// # Errors
+///
+/// Returns [`SearchError::InvalidConfig`] for a non-UTF-8, non-`.fshnsw`,
+/// control-bearing, dot-relative, or otherwise noncanonical graph path.
+pub fn native_hnsw_generation_receipt_path(graph_path: &Path) -> SearchResult<PathBuf> {
+    validate_native_hnsw_graph_path(graph_path)?;
+    let basename = canonical_graph_basename(graph_path)?;
+    let receipt_basename = format!("{basename}{NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX}");
+    Ok(graph_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(receipt_basename))
 }
 
 impl Default for HnswParams {
@@ -980,6 +1768,70 @@ impl NativeHnsw {
     #[must_use]
     pub const fn seed(&self) -> u64 {
         self.sampler.seed
+    }
+
+    /// SHA-256 of the graph's semantic topology and construction identity.
+    ///
+    /// File checksums and byte offsets are intentionally excluded. Point and
+    /// neighbour order remain included because both are search-visible state
+    /// and the owned builder is deterministic for a seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::IndexCorrupted`] when the graph is structurally
+    /// invalid and [`SearchError::InvalidConfig`] when a count cannot be
+    /// represented canonically.
+    pub fn topology_sha256(&self) -> SearchResult<String> {
+        self.verify()
+            .map_err(|defect| native_hnsw_corrupted(Path::new("<memory>"), defect.to_string()))?;
+        let mut bytes = Vec::new();
+        append_canonical_bytes(&mut bytes, b"frankensearch.native-hnsw.topology.v1")?;
+        bytes.extend_from_slice(&NATIVE_HNSW_FORMAT_VERSION.to_be_bytes());
+        for value in [
+            usize_to_u64(self.params.m, "topology.params.m")?,
+            usize_to_u64(self.params.m0, "topology.params.m0")?,
+            usize_to_u64(
+                self.params.ef_construction,
+                "topology.params.ef_construction",
+            )?,
+            usize_to_u64(self.params.ef_search, "topology.params.ef_search")?,
+            self.sampler.seed,
+            usize_to_u64(self.adjacency.len(), "topology.point_count")?,
+            self.entry.map_or(NATIVE_HNSW_NO_ENTRY, u64::from),
+            usize_to_u64(self.max_level, "topology.max_level")?,
+        ] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        for point in &self.adjacency {
+            bytes.extend_from_slice(
+                &u32::try_from(point.layers.len())
+                    .map_err(|_| {
+                        native_hnsw_receipt_config_error(
+                            "topology.layer_count",
+                            &point.layers.len().to_string(),
+                            "must fit the canonical u32 field",
+                        )
+                    })?
+                    .to_be_bytes(),
+            );
+            for neighbours in &point.layers {
+                bytes.extend_from_slice(
+                    &u32::try_from(neighbours.len())
+                        .map_err(|_| {
+                            native_hnsw_receipt_config_error(
+                                "topology.neighbour_count",
+                                &neighbours.len().to_string(),
+                                "must fit the canonical u32 field",
+                            )
+                        })?
+                        .to_be_bytes(),
+                );
+                for neighbour in neighbours {
+                    bytes.extend_from_slice(&neighbour.to_be_bytes());
+                }
+            }
+        }
+        Ok(sha256_hex(&bytes))
     }
 
     /// Persist this graph as an owned, versioned adjacency artifact.
@@ -1948,6 +2800,379 @@ impl NativeHnsw {
     }
 }
 
+struct NativeHnswReceiptReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    path: &'a Path,
+}
+
+impl<'a> NativeHnswReceiptReader<'a> {
+    const fn new(bytes: &'a [u8], path: &'a Path) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            path,
+        }
+    }
+
+    fn take(&mut self, len: usize, field: &str) -> SearchResult<&'a [u8]> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            native_hnsw_receipt_corrupted(
+                self.path,
+                format!("native HNSW receipt offset overflow while reading {field}"),
+            )
+        })?;
+        let value = self.bytes.get(self.offset..end).ok_or_else(|| {
+            native_hnsw_receipt_corrupted(
+                self.path,
+                format!("native HNSW receipt ended while reading {field}"),
+            )
+        })?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn take_array<const N: usize>(&mut self, field: &str) -> SearchResult<[u8; N]> {
+        let mut value = [0_u8; N];
+        value.copy_from_slice(self.take(N, field)?);
+        Ok(value)
+    }
+
+    fn read_u16(&mut self, field: &str) -> SearchResult<u16> {
+        Ok(u16::from_be_bytes(self.take_array(field)?))
+    }
+
+    fn read_u32(&mut self, field: &str) -> SearchResult<u32> {
+        Ok(u32::from_be_bytes(self.take_array(field)?))
+    }
+
+    fn read_u64(&mut self, field: &str) -> SearchResult<u64> {
+        Ok(u64::from_be_bytes(self.take_array(field)?))
+    }
+
+    fn finish(self) -> SearchResult<()> {
+        if self.offset != self.bytes.len() {
+            return Err(native_hnsw_receipt_corrupted(
+                self.path,
+                format!(
+                    "native HNSW generation receipt has {} trailing bytes",
+                    self.bytes.len() - self.offset
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonical_graph_basename(graph_path: &Path) -> SearchResult<String> {
+    let basename = graph_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            native_hnsw_receipt_config_error(
+                "graph_path",
+                "redacted-invalid-basename",
+                "must end in one canonical UTF-8 basename",
+            )
+        })?
+        .to_owned();
+    validate_graph_basename(&basename)?;
+    Ok(basename)
+}
+
+fn validate_graph_basename(basename: &str) -> SearchResult<()> {
+    if basename.is_empty() || basename.len() > NATIVE_HNSW_MAX_BASENAME_BYTES {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_basename",
+            "redacted-invalid-length",
+            "must be non-empty and leave room for the adjacent receipt suffix",
+        ));
+    }
+    if basename.chars().any(char::is_control) {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_basename",
+            "redacted-control-character",
+            "must not contain control characters",
+        ));
+    }
+    let mut components = Path::new(basename).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_basename",
+            "redacted-noncanonical",
+            "must contain exactly one normal path component",
+        ));
+    }
+    if Path::new(basename)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        != Some("fshnsw")
+    {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_basename",
+            basename,
+            "must use the canonical .fshnsw extension",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_hnsw_graph_path(graph_path: &Path) -> SearchResult<()> {
+    if graph_path.as_os_str().is_empty() {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_path",
+            "redacted-empty",
+            "must not be empty",
+        ));
+    }
+    if graph_path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(native_hnsw_receipt_config_error(
+            "graph_path",
+            "redacted-dot-relative",
+            "must not contain '.' or '..' components",
+        ));
+    }
+    let _ = canonical_graph_basename(graph_path)?;
+    Ok(())
+}
+
+fn reject_symlink_ancestors(path: &Path) -> SearchResult<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(SearchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "native HNSW path ancestor '{}' must not be a symbolic link",
+                        current.display()
+                    ),
+                )));
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(SearchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "native HNSW path ancestor '{}' must be a directory",
+                        current.display()
+                    ),
+                )));
+            }
+            // ubs:ignore — this compares a public I/O error enum, not secret material.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SearchError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_regular_file_bytes(path: &Path, kind: &str) -> SearchResult<Vec<u8>> {
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // ubs:ignore — this compares a public I/O error enum, not secret material.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SearchError::IndexNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(SearchError::Io(error)),
+    };
+    if !path_metadata.file_type().is_file() {
+        return Err(SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{kind} '{}' must be a regular file, not a symlink or special file",
+                path.display()
+            ),
+        )));
+    }
+    let mut file = File::open(path).map_err(SearchError::Io)?;
+    let opened_metadata = file.metadata().map_err(SearchError::Io)?;
+    ensure_same_open_file(&path_metadata, &opened_metadata).map_err(SearchError::Io)?;
+    let expected_len = opened_metadata.len();
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::try_from(expected_len).map_err(|_| {
+            SearchError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{kind} '{}' is too large for this platform", path.display()),
+            ))
+        })?)
+        .map_err(|error| {
+            SearchError::Io(std::io::Error::other(format!(
+                "could not allocate {expected_len} bytes for {kind} '{}': {error}",
+                path.display()
+            )))
+        })?;
+    file.read_to_end(&mut bytes).map_err(SearchError::Io)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected_len) {
+        return Err(SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "{kind} '{}' changed length while being read",
+                path.display()
+            ),
+        )));
+    }
+    let final_path_metadata = std::fs::symlink_metadata(path).map_err(SearchError::Io)?;
+    ensure_same_open_file(&final_path_metadata, &opened_metadata).map_err(SearchError::Io)?;
+    Ok(bytes)
+}
+
+fn persist_native_hnsw_receipt(path: &Path, bytes: &[u8]) -> SearchResult<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(SearchError::Io)?;
+    reject_non_regular_receipt_destination(path)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
+    temporary.write_all(bytes).map_err(SearchError::Io)?;
+    temporary.as_file().sync_all().map_err(SearchError::Io)?;
+    temporary.persist(path).map_err(|error| {
+        SearchError::Io(std::io::Error::new(
+            error.error.kind(),
+            format!(
+                "failed to atomically publish native HNSW generation receipt '{}': {}",
+                path.display(),
+                error.error
+            ),
+        ))
+    })?;
+    sync_parent_directory(path)
+}
+
+fn reject_non_regular_receipt_destination(path: &Path) -> SearchResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(SearchError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "native HNSW generation receipt destination '{}' must be a regular file, not a \
+                 symlink or special file",
+                path.display()
+            ),
+        ))),
+        // ubs:ignore — this compares a public I/O error enum, not secret material.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SearchError::Io(error)),
+    }
+}
+
+fn append_canonical_bytes(destination: &mut Vec<u8>, value: &[u8]) -> SearchResult<()> {
+    destination
+        .extend_from_slice(&usize_to_u64(value.len(), "topology.domain_length")?.to_be_bytes());
+    destination.extend_from_slice(value);
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let checksum = sha256_checksum(bytes);
+    checksum
+        .strip_prefix("sha256:")
+        .unwrap_or(checksum.as_str())
+        .to_owned()
+}
+
+fn validate_sha256_hex(field: &str, value: &str) -> SearchResult<()> {
+    if value.len() == SHA256_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(native_hnsw_receipt_config_error(
+        field,
+        "redacted-invalid-sha256",
+        "must be a lowercase 64-character SHA-256 digest",
+    ))
+}
+
+fn decode_sha256_hex(field: &str, value: &str) -> SearchResult<[u8; SHA256_BYTES]> {
+    validate_sha256_hex(field, value)?;
+    let mut decoded = [0_u8; SHA256_BYTES];
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(native_hnsw_receipt_config_error(
+            field,
+            "redacted-invalid-sha256",
+            "must be a lowercase 64-character SHA-256 digest",
+        ));
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        let (Some(high), Some(low)) = (
+            decode_lower_hex_nibble(pair[0]),
+            decode_lower_hex_nibble(pair[1]),
+        ) else {
+            return Err(native_hnsw_receipt_config_error(
+                field,
+                "redacted-invalid-sha256",
+                "must be a lowercase 64-character SHA-256 digest",
+            ));
+        };
+        decoded[index] = (high << 4) | low;
+    }
+    Ok(decoded)
+}
+
+const fn decode_lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn encode_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn native_hnsw_receipt_config_error(field: &str, value: &str, reason: &str) -> SearchError {
+    let bounded_value = if value.len() <= 128 && !value.chars().any(char::is_control) {
+        value.to_owned()
+    } else {
+        "redacted".to_owned()
+    };
+    SearchError::InvalidConfig {
+        field: format!("native_hnsw_receipt.{field}"),
+        value: bounded_value,
+        reason: reason.to_owned(),
+    }
+}
+
+fn native_hnsw_receipt_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
+    SearchError::IndexCorrupted {
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+fn receipt_usize(value: u64, field: &str) -> SearchResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        native_hnsw_receipt_config_error(
+            field,
+            &value.to_string(),
+            "does not fit this platform's usize",
+        )
+    })
+}
+
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -2023,6 +3248,7 @@ fn reject_non_regular_destination(path: &Path) -> SearchResult<()> {
                 path.display()
             ),
         ))),
+        // ubs:ignore — this compares a public I/O error enum, not secret material.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(SearchError::Io(error)),
     }
@@ -2031,6 +3257,7 @@ fn reject_non_regular_destination(path: &Path) -> SearchResult<()> {
 fn open_regular_file(path: &Path) -> SearchResult<File> {
     let path_metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
+        // ubs:ignore — this compares a public I/O error enum, not secret material.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(SearchError::IndexNotFound {
                 path: path.to_path_buf(),
@@ -2101,6 +3328,7 @@ fn sync_parent_directory(path: &Path) -> SearchResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
     use std::cell::Cell;
 
     /// An in-memory store of unit-normalised vectors using cosine distance
@@ -2310,6 +3538,549 @@ mod tests {
             ef_construction: 64,
             ef_search: 64,
         }
+    }
+
+    fn frozen_fsvi_identity(model_id: &str, dimension: u32) -> FrozenEmbeddingIdentityBundleV1 {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".to_owned();
+        identity.freeze().expect("valid frozen FSVI v2 identity")
+    }
+
+    fn generation_binding(
+        sequence: u64,
+        nonce_byte: u8,
+        model_id: &str,
+        dimension: u32,
+    ) -> NativeHnswGenerationBindingV1 {
+        let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce_byte; 16])
+            .expect("valid test generation");
+        NativeHnswGenerationBindingV1::new(generation, &frozen_fsvi_identity(model_id, dimension))
+            .expect("valid native HNSW generation binding")
+    }
+
+    fn write_resealed_receipt(path: &Path, receipt: &mut NativeHnswGenerationReceiptV1) {
+        receipt.seal().expect("seal mutated test receipt");
+        std::fs::write(
+            path,
+            receipt
+                .encode_unchecked()
+                .expect("encode mutated test receipt"),
+        )
+        .expect("write mutated test receipt");
+    }
+
+    // ─── FSVI generation receipts ──────────────────────────────────────
+
+    #[test]
+    fn generation_receipt_round_trip_binds_every_identity_layer_and_is_deterministic() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("graph.fshnsw");
+        let receipt_path = directory.path().join("graph.fshnsw.receipt");
+        let store = TestStore::synthetic(48, 8);
+        let graph = NativeHnsw::build(params(), 0x51de_cafe, &store).expect("build");
+        let binding = generation_binding(u64::MAX, 0xa5, "receipt-round-trip", 8);
+
+        assert_eq!(
+            native_hnsw_generation_receipt_path(&graph_path).expect("canonical receipt path"),
+            receipt_path
+        );
+        let receipt = binding.save(&graph, &graph_path).expect("save binding");
+        receipt.validate().expect("receipt validates");
+        let persisted = std::fs::read(&receipt_path).expect("receipt bytes");
+        let decoded =
+            NativeHnswGenerationReceiptV1::from_bytes(&persisted, &receipt_path).expect("decode");
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.artifact_generation, binding.artifact_generation());
+        assert_eq!(
+            decoded.embedding_identity_fingerprint,
+            binding.embedding_identity_fingerprint()
+        );
+        assert_eq!(
+            decoded.graph_byte_len,
+            std::fs::metadata(&graph_path)
+                .expect("graph metadata")
+                .len()
+        );
+        assert_eq!(
+            decoded.graph_sha256,
+            sha256_hex(&std::fs::read(&graph_path).unwrap())
+        );
+        assert_eq!(decoded.native_format_version, NATIVE_HNSW_FORMAT_VERSION);
+        assert_eq!(
+            decoded.params,
+            NativeHnswParamsIdentityV1::from_params(params()).unwrap()
+        );
+        assert_eq!(decoded.point_count, 48);
+        assert_eq!(decoded.topology_sha256, graph.topology_sha256().unwrap());
+
+        let (loaded, observed) = binding.load(&graph_path, &store).expect("bound load");
+        assert_eq!(observed, receipt);
+        assert_eq!(topology_snapshot(&loaded), topology_snapshot(&graph));
+
+        binding.save(&graph, &graph_path).expect("repeat save");
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("repeat receipt"),
+            persisted,
+            "same graph/generation/identity must have one stable receipt encoding"
+        );
+
+        let mut serde_value = serde_json::to_value(&receipt).expect("serialize receipt");
+        serde_value["future_field"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<NativeHnswGenerationReceiptV1>(serde_value).is_err(),
+            "the public receipt schema must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn generation_binding_requires_valid_fsvi_v2_identity() {
+        let generation = ArtifactGenerationIdentityV1::new(7, [7; 16]).expect("valid generation");
+        let mut legacy = EmbeddingIdentityBundleV1::explicit_test_model("legacy", 8);
+        legacy.storage.format = "fsvi-v1".to_owned();
+        legacy.storage.quantization = QuantizationFormat::F16;
+        legacy.storage.endianness = "little-endian".to_owned();
+        let legacy = legacy.freeze().expect("valid legacy identity");
+        let error = NativeHnswGenerationBindingV1::new(generation, &legacy)
+            .expect_err("legacy storage must not bind");
+        assert!(error.to_string().contains("must be exactly fsvi-v2"));
+
+        let mut forged = frozen_fsvi_identity("forged", 8);
+        forged.fingerprint = "0".repeat(64);
+        assert!(
+            NativeHnswGenerationBindingV1::new(generation, &forged).is_err(),
+            "noncanonical frozen identity must fail before publication"
+        );
+
+        let unknown_generation = ArtifactGenerationIdentityV1 {
+            schema_version: generation.schema_version + 1,
+            ..generation
+        };
+        assert!(
+            NativeHnswGenerationBindingV1::new(
+                unknown_generation,
+                &frozen_fsvi_identity("valid", 8)
+            )
+            .is_err(),
+            "unknown generation schema must fail before publication"
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_missing_truncated_tampered_and_noncanonical_receipts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("graph.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
+        let store = TestStore::synthetic(32, 6);
+        let graph = NativeHnsw::build(params(), 0x99, &store).expect("build");
+        let binding = generation_binding(9, 9, "receipt-corruption", 6);
+
+        graph.save(&graph_path).expect("unbound graph save");
+        let missing = binding
+            .load(&graph_path, &store)
+            .expect_err("missing receipt must fail");
+        assert!(
+            matches!(missing, SearchError::IndexNotFound { ref path } if path == &receipt_path)
+        );
+
+        binding.save(&graph, &graph_path).expect("bound save");
+        let canonical = std::fs::read(&receipt_path).expect("canonical receipt");
+
+        std::fs::write(&receipt_path, &canonical[..canonical.len() - 1]).expect("truncate receipt");
+        assert!(matches!(
+            binding
+                .load(&graph_path, &store)
+                .expect_err("truncated receipt must fail"),
+            SearchError::IndexCorrupted { .. }
+        ));
+
+        let mut body_tamper = canonical.clone();
+        body_tamper[20] ^= 1;
+        std::fs::write(&receipt_path, body_tamper).expect("tamper receipt body");
+        assert!(
+            binding.load(&graph_path, &store).is_err(),
+            "body tamper without a new SHA-256 seal must fail"
+        );
+
+        let mut seal_tamper = canonical.clone();
+        *seal_tamper.last_mut().expect("receipt seal byte") ^= 1;
+        std::fs::write(&receipt_path, seal_tamper).expect("tamper receipt seal");
+        assert!(
+            binding.load(&graph_path, &store).is_err(),
+            "receipt SHA-256 tamper must fail"
+        );
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        std::fs::write(&receipt_path, trailing).expect("append noncanonical byte");
+        let error = binding
+            .load(&graph_path, &store)
+            .expect_err("trailing receipt bytes must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("trailing bytes") || detail.contains("canonically encoded")),
+            "unexpected noncanonical receipt error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_swapped_stale_resealed_and_replaced_graphs() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first_path = directory.path().join("first.fshnsw");
+        let second_path = directory.path().join("second.fshnsw");
+        let first_receipt =
+            native_hnsw_generation_receipt_path(&first_path).expect("first receipt");
+        let second_receipt =
+            native_hnsw_generation_receipt_path(&second_path).expect("second receipt");
+        let store = TestStore::synthetic(40, 6);
+        let first = NativeHnsw::build(params(), 11, &store).expect("first graph");
+        let second = NativeHnsw::build(params(), 29, &store).expect("second graph");
+        let binding = generation_binding(11, 0x11, "swap-stale", 6);
+
+        binding.save(&first, &first_path).expect("save first");
+        binding.save(&second, &second_path).expect("save second");
+        let first_receipt_bytes = std::fs::read(&first_receipt).expect("first receipt bytes");
+        let second_receipt_bytes = std::fs::read(&second_receipt).expect("second receipt bytes");
+        std::fs::write(&first_receipt, &second_receipt_bytes).expect("swap second into first");
+        std::fs::write(&second_receipt, &first_receipt_bytes).expect("swap first into second");
+        assert!(
+            binding.load(&first_path, &store).is_err(),
+            "receipt from a different basename/artifact must fail"
+        );
+        assert!(
+            binding.load(&second_path, &store).is_err(),
+            "the reciprocal receipt swap must also fail"
+        );
+
+        std::fs::write(&first_receipt, &first_receipt_bytes).expect("restore first receipt");
+        second
+            .save(&first_path)
+            .expect("replace graph without receipt");
+        let stale = binding
+            .load(&first_path, &store)
+            .expect_err("stale receipt must fail");
+        assert!(
+            matches!(stale, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("SHA-256") || detail.contains("receipt")),
+            "unexpected stale-receipt error: {stale:?}"
+        );
+
+        binding
+            .save(&first, &first_path)
+            .expect("restore bound first");
+        let mut forged_graph = std::fs::read(&first_path).expect("graph bytes");
+        let (neighbour_offset, owner) =
+            first_persisted_neighbour(&forged_graph).expect("graph edge");
+        put_u32(&mut forged_graph, neighbour_offset, owner);
+        reseal_persisted_checksums(&mut forged_graph);
+        std::fs::write(&first_path, forged_graph).expect("write resealed graph forgery");
+        let resealed = binding
+            .load(&first_path, &store)
+            .expect_err("resealed graph replacement must fail receipt SHA-256");
+        assert!(
+            matches!(resealed, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("SHA-256")),
+            "unexpected resealed graph error: {resealed:?}"
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_replacement_between_hash_and_parse() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("race.fshnsw");
+        let store = TestStore::synthetic(48, 6);
+        let original = NativeHnsw::build(params(), 3, &store).expect("original graph");
+        let replacement = NativeHnsw::build(params(), 5, &store).expect("replacement graph");
+        let binding = generation_binding(3, 3, "replacement-race", 6);
+        binding
+            .save(&original, &graph_path)
+            .expect("save original binding");
+
+        let error = binding
+            .load_with_after_first_observation(&graph_path, &store, || {
+                replacement.save(&graph_path).map(|_| ())
+            })
+            .expect_err("replacement during verification must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "replacement race was not rejected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn every_resealed_receipt_field_is_checked_against_trust_or_graph_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("all-fields.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
+        let store = TestStore::synthetic(48, 8);
+        let graph = NativeHnsw::build(params(), 0xfeed, &store).expect("graph");
+        let binding = generation_binding(77, 0x77, "every-receipt-field", 8);
+        let original = binding.save(&graph, &graph_path).expect("bound save");
+
+        macro_rules! rejects_resealed {
+            ($label:literal, $change:expr) => {{
+                let mut changed = original.clone();
+                ($change)(&mut changed);
+                write_resealed_receipt(&receipt_path, &mut changed);
+                let error = binding
+                    .load(&graph_path, &store)
+                    .expect_err(concat!($label, " drift must fail"));
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::IndexCorrupted { .. } | SearchError::InvalidConfig { .. }
+                    ),
+                    "{} drift returned an unexpected error: {error:?}",
+                    $label
+                );
+            }};
+        }
+
+        rejects_resealed!("receipt schema", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.schema_version += 1;
+        });
+        rejects_resealed!(
+            "generation schema",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.artifact_generation.schema_version += 1;
+                r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
+            }
+        );
+        rejects_resealed!(
+            "generation sequence",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.artifact_generation.sequence += 1;
+                r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
+            }
+        );
+        rejects_resealed!(
+            "generation nonce",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.artifact_generation.nonce[0] ^= 1;
+                r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
+            }
+        );
+        rejects_resealed!(
+            "generation fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.artifact_generation_fingerprint = "0".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "embedding identity fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.embedding_identity_fingerprint = "1".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "embedding space fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.embedding_space_fingerprint = "2".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "embedding producer fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.embedding_producer_fingerprint = "3".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "embedding input fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.embedding_input_fingerprint = "4".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "vector storage fingerprint",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.vector_storage_fingerprint = "5".repeat(64);
+            }
+        );
+        rejects_resealed!("graph basename", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.graph_basename = "other.fshnsw".to_owned();
+        });
+        rejects_resealed!(
+            "graph byte length",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.graph_byte_len += 1;
+            }
+        );
+        rejects_resealed!("graph SHA-256", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.graph_sha256 = "6".repeat(64);
+        });
+        rejects_resealed!(
+            "native format version",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.native_format_version += 1;
+            }
+        );
+        rejects_resealed!("parameter m", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.params.m += 1;
+        });
+        rejects_resealed!("parameter m0", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.params.m0 += 1;
+        });
+        rejects_resealed!(
+            "parameter ef_construction",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.params.ef_construction += 1;
+            }
+        );
+        rejects_resealed!(
+            "parameter ef_search",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.params.ef_search += 1;
+            }
+        );
+        rejects_resealed!("seed", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.seed ^= 1;
+        });
+        rejects_resealed!("point count", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.point_count += 1;
+        });
+        rejects_resealed!("entry point", |r: &mut NativeHnswGenerationReceiptV1| {
+            let count = u32::try_from(r.point_count).expect("test count");
+            r.entry_point = Some((r.entry_point.expect("non-empty graph") + 1) % count);
+        });
+        rejects_resealed!("maximum level", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.max_level = u64::from(r.max_level == 0);
+        });
+        rejects_resealed!("payload CRC", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.payload_crc32 ^= 1;
+        });
+        rejects_resealed!("header CRC", |r: &mut NativeHnswGenerationReceiptV1| {
+            r.header_crc32 ^= 1;
+        });
+        rejects_resealed!(
+            "topology SHA-256",
+            |r: &mut NativeHnswGenerationReceiptV1| {
+                r.topology_sha256 = "7".repeat(64);
+            }
+        );
+
+        let mut receipt_seal_tamper = original.to_bytes().expect("canonical receipt");
+        *receipt_seal_tamper.last_mut().expect("receipt seal byte") ^= 1;
+        std::fs::write(&receipt_path, receipt_seal_tamper).expect("receipt seal tamper");
+        assert!(
+            binding.load(&graph_path, &store).is_err(),
+            "receipt SHA-256 is itself a bound field"
+        );
+
+        std::fs::write(
+            &receipt_path,
+            original.to_bytes().expect("restore original receipt"),
+        )
+        .expect("restore receipt");
+        let wrong_generation = generation_binding(78, 0x78, "every-receipt-field", 8);
+        assert!(
+            wrong_generation.load(&graph_path, &store).is_err(),
+            "caller-held generation drift must fail"
+        );
+        let wrong_identity = generation_binding(77, 0x77, "different-identity", 8);
+        assert!(
+            wrong_identity.load(&graph_path, &store).is_err(),
+            "caller-held frozen identity drift must fail"
+        );
+    }
+
+    #[test]
+    fn receipt_paths_fail_closed_on_malformed_or_nonlocal_names() {
+        for malformed in [
+            Path::new(""),
+            Path::new("./graph.fshnsw"),
+            Path::new("nested/../graph.fshnsw"),
+            Path::new("graph.bin"),
+            Path::new("graph\nforged.fshnsw"),
+        ] {
+            assert!(
+                native_hnsw_generation_receipt_path(malformed).is_err(),
+                "malformed graph path was admitted: {malformed:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = PathBuf::from(std::ffi::OsString::from_vec(
+                b"invalid-\xff.fshnsw".to_vec(),
+            ));
+            assert!(
+                native_hnsw_generation_receipt_path(&invalid).is_err(),
+                "non-UTF-8 basename must not enter the receipt"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_save_and_load_reject_symlinks_special_files_and_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = TestStore::synthetic(16, 4);
+        let graph = NativeHnsw::build(params(), 19, &store).expect("graph");
+        let binding = generation_binding(19, 0x19, "path-hardening", 4);
+
+        let preflight_graph = directory.path().join("preflight.fshnsw");
+        let preflight_receipt =
+            native_hnsw_generation_receipt_path(&preflight_graph).expect("receipt path");
+        let receipt_target = directory.path().join("receipt-target");
+        std::fs::write(&receipt_target, b"sentinel").expect("receipt target");
+        symlink(&receipt_target, &preflight_receipt).expect("receipt symlink");
+        assert!(
+            matches!(
+                binding
+                    .save(&graph, &preflight_graph)
+                    .expect_err("receipt symlink must fail before graph save"),
+                SearchError::Io(_)
+            ),
+            "receipt symlink returned wrong error"
+        );
+        assert!(
+            !preflight_graph.exists(),
+            "receipt preflight failure must not publish the graph"
+        );
+
+        let source_graph = directory.path().join("source.fshnsw");
+        binding.save(&graph, &source_graph).expect("source binding");
+        let source_receipt =
+            native_hnsw_generation_receipt_path(&source_graph).expect("source receipt");
+        let alias_graph = directory.path().join("alias.fshnsw");
+        graph.save(&alias_graph).expect("alias graph bytes");
+        let alias_receipt =
+            native_hnsw_generation_receipt_path(&alias_graph).expect("alias receipt");
+        symlink(&source_receipt, &alias_receipt).expect("load receipt symlink");
+        assert!(matches!(
+            binding
+                .load(&alias_graph, &store)
+                .expect_err("load must reject receipt symlink"),
+            SearchError::Io(_)
+        ));
+
+        let special_graph = directory.path().join("special.fshnsw");
+        let special_receipt =
+            native_hnsw_generation_receipt_path(&special_graph).expect("special receipt");
+        std::fs::create_dir(&special_receipt).expect("special receipt directory");
+        assert!(matches!(
+            binding
+                .save(&graph, &special_graph)
+                .expect_err("special receipt must fail before graph save"),
+            SearchError::Io(_)
+        ));
+        assert!(!special_graph.exists());
+
+        let real_parent = directory.path().join("real-parent");
+        std::fs::create_dir(&real_parent).expect("real parent");
+        let alias_parent = directory.path().join("alias-parent");
+        symlink(&real_parent, &alias_parent).expect("symlink parent");
+        assert!(matches!(
+            binding
+                .save(&graph, &alias_parent.join("graph.fshnsw"))
+                .expect_err("symlinked parent must fail"),
+            SearchError::Io(_)
+        ));
     }
 
     // ─── Owned persistence ──────────────────────────────────────────────
