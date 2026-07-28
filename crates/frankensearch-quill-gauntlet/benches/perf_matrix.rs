@@ -55,7 +55,11 @@ const FULL_BATCH_DOCUMENTS: usize = 5_000;
 const SMOKE_BATCH_DOCUMENTS: usize = 250;
 const FULL_SEGMENTS: usize = 10;
 const SMOKE_SEGMENTS: usize = 4;
-const QG6_TIE_EXPANSION_LIMIT: usize = 100_000;
+// The largest normative QG-6 corpus is 1M documents. Fetching the complete
+// incumbent boundary group is preflight-only and is required to distinguish a
+// true rank mismatch from a native-order substitution inside a large BM25 tie.
+const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
+const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1416,7 +1420,18 @@ fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     hasher.update(spec.writer_heap_bytes.unwrap_or(50_000_000).to_le_bytes());
     hasher.update(spec.k.expect("QG-6 k").to_le_bytes());
     hasher.update(b"frankensearch-default-lexical-schema-and-parser-v1");
-    hasher.update(b"qg6-rank-parity/exact-score-native-tie-envelope-v1");
+    hasher.update(b"qg6-rank-parity/full-corpus-exact-score-native-tie-envelope-v2");
+    hasher.update(
+        u64::try_from(QG6_TIE_EXPANSION_LIMIT)
+            .expect("QG-6 tie expansion fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(b"qg6-query-p50-subsample/v1");
+    hasher.update(
+        u64::try_from(QG6_TIMED_SEARCHES_PER_SAMPLE)
+            .expect("QG-6 timed search count fits u64")
+            .to_le_bytes(),
+    );
     lower_hex(&hasher.finalize())
 }
 
@@ -1441,8 +1456,10 @@ fn qg6_preflight_result(
                     observation: None,
                 });
             }
-            let mut snippet_config = SnippetConfig::default();
-            snippet_config.max_chars = 0;
+            let snippet_config = SnippetConfig {
+                max_chars: 0,
+                ..SnippetConfig::default()
+            };
             let observed = index
                 .oracle_observe_query(
                     &context.cx,
@@ -1598,7 +1615,6 @@ fn qg6_raw_sample(
         Qg6SampleOrder::First => PerfSampleOrder::First,
         Qg6SampleOrder::Second => PerfSampleOrder::Second,
     };
-    let elapsed_ns = sample.ended_ns.saturating_sub(sample.started_ns).max(1);
     PerfRawSample {
         block_id: sample.block_id,
         sample_id: sample.sample_id,
@@ -1609,9 +1625,9 @@ fn qg6_raw_sample(
         provenance: provenance.clone(),
         started_ns: sample.started_ns,
         ended_ns: sample.ended_ns,
-        work_units: None,
+        work_units: Some(sample.subsample_count),
         byte_count: None,
-        observed_value: Some(elapsed_ns as f64 / 1_000_000.0),
+        observed_value: Some(sample.observed_latency_ns as f64 / 1_000_000.0),
         group_id: Some(u64::try_from(sample.query_index).expect("QG-6 query index")),
     }
 }
@@ -1757,9 +1773,10 @@ fn prepared_qg6_streams(
         .div_ceil(QG6_QUERY_GROUPS)
         .max(evidence.policy.min_group_pairs);
     let measurement = validated
-        .measure_with_normalizer(
+        .measure_query_p50_with_normalizer(
             evidence.policy.warmup_rounds,
             rounds_per_query,
+            QG6_TIMED_SEARCHES_PER_SAMPLE,
             cell_seed,
             &mut search,
             &mut normalize,
@@ -1781,6 +1798,7 @@ fn prepared_qg6_streams(
     eprintln!(
         "[qg6-prepared] fixture={} corpus_sha256={} query_manifest_sha256={} \
          config_contract_sha256={} schedule_seed={} warmup_rounds={} rounds_per_query={} \
+         searches_per_sample={} \
          sample_input_sha256={} result_receipt_sha256={} lifecycle={}",
         spec.fixture,
         measurement.identity.corpus_sha256,
@@ -1789,6 +1807,7 @@ fn prepared_qg6_streams(
         measurement.schedule_seed,
         measurement.warmup_rounds,
         measurement.rounds_per_query,
+        measurement.searches_per_sample,
         input_identity.fingerprint_sha256(),
         lower_hex(&result_receipt_hasher.finalize()),
         serde_json::to_string(&measurement.lifecycle).expect("serialize QG-6 lifecycle"),

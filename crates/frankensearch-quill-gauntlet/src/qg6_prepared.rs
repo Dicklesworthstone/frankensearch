@@ -340,7 +340,11 @@ pub struct Qg6TimedSample {
     pub started_ns: u64,
     /// Monotonic end offset relative to the measurement origin.
     pub ended_ns: u64,
-    /// Independently recomputed result digest, outside the timed interval.
+    /// Median latency across the fixed per-arm search subsample.
+    pub observed_latency_ns: u64,
+    /// Number of individually timed searches summarized by this sample.
+    pub subsample_count: u64,
+    /// Digest over every independently recomputed result receipt.
     pub result_sha256: String,
 }
 
@@ -355,6 +359,8 @@ pub struct Qg6Measurement {
     pub warmup_rounds: usize,
     /// Equal timed pair count per comparison and query.
     pub rounds_per_query: usize,
+    /// Equal individually timed searches summarized by each arm sample.
+    pub searches_per_sample: usize,
     /// Interleaved null/effect schedule.
     pub schedule: Vec<Qg6PairBlock>,
     /// Raw per-arm monotonic intervals.
@@ -850,9 +856,43 @@ impl<A> Qg6ValidatedExperiment<A> {
     /// Rejects invalid run counts, adapter failures, post-preflight result
     /// drift, or any lifecycle-count mismatch.
     pub fn measure_with_normalizer<R, F, N>(
+        self,
+        warmup_rounds: usize,
+        rounds_per_query: usize,
+        schedule_seed: u64,
+        search: &mut F,
+        normalize: &mut N,
+    ) -> Result<Qg6Measurement, Qg6HarnessError>
+    where
+        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+        N: FnMut(R) -> Qg6SearchResult,
+    {
+        self.measure_query_p50_with_normalizer(
+            warmup_rounds,
+            rounds_per_query,
+            1,
+            schedule_seed,
+            search,
+            normalize,
+        )
+    }
+
+    /// Run the prepared measurement with a fixed per-arm search subsample.
+    ///
+    /// Every search receives its own monotonic interval and post-interval
+    /// result-stability check. One scheduled arm sample reports the median of
+    /// those individual intervals, preserving the QG-6 p50 estimand while
+    /// making sub-millisecond A/A controls statistically resolvable.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero-sized subsamples in addition to the errors documented by
+    /// [`Self::measure_with_normalizer`].
+    pub fn measure_query_p50_with_normalizer<R, F, N>(
         mut self,
         warmup_rounds: usize,
         rounds_per_query: usize,
+        searches_per_sample: usize,
         schedule_seed: u64,
         search: &mut F,
         normalize: &mut N,
@@ -864,6 +904,12 @@ impl<A> Qg6ValidatedExperiment<A> {
         if warmup_rounds == 0 {
             return Err(Qg6HarnessError::InvalidSpec {
                 reason: "QG-6 prepared measurement requires at least one warmup per arm and query"
+                    .to_owned(),
+            });
+        }
+        if searches_per_sample == 0 {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 prepared measurement requires at least one search per sample"
                     .to_owned(),
             });
         }
@@ -883,33 +929,46 @@ impl<A> Qg6ValidatedExperiment<A> {
                 (Qg6SampleOrder::Second, block.second),
             ] {
                 let started_ns = monotonic_ns(origin);
-                let result = search(
-                    self.prepared.arms.get(role),
-                    black_box(query),
-                    black_box(self.prepared.identity.k),
-                );
+                let mut latencies_ns = Vec::with_capacity(searches_per_sample);
+                let mut result_receipts = Sha256::new();
+                for _ in 0..searches_per_sample {
+                    let search_started_ns = monotonic_ns(origin);
+                    let result = search(
+                        self.prepared.arms.get(role),
+                        black_box(query),
+                        black_box(self.prepared.identity.k),
+                    );
+                    let mut search_ended_ns = monotonic_ns(origin);
+                    if search_ended_ns <= search_started_ns {
+                        search_ended_ns = search_started_ns.saturating_add(1);
+                    }
+                    self.prepared.lifecycle.arm_mut(role).timed_search_calls += 1;
+                    let result = result.map_err(|error| {
+                        adapter_failure(Qg6Phase::Measurement, role, query.id(), &error)
+                    })?;
+                    let observed = observe_result(
+                        normalize(result),
+                        self.prepared.identity.k,
+                        Qg6Phase::Measurement,
+                        role,
+                        query.id(),
+                    )?;
+                    ensure_stable(
+                        Qg6Phase::Measurement,
+                        role,
+                        query.id(),
+                        self.expected_results[block.query_index].get(role),
+                        &observed.receipt,
+                    )?;
+                    latencies_ns.push(search_ended_ns.saturating_sub(search_started_ns).max(1));
+                    result_receipts.update(observed.receipt.ordered_doc_ids_sha256.as_bytes());
+                }
                 let mut ended_ns = monotonic_ns(origin);
                 if ended_ns <= started_ns {
                     ended_ns = started_ns.saturating_add(1);
                 }
-                self.prepared.lifecycle.arm_mut(role).timed_search_calls += 1;
-                let result = result.map_err(|error| {
-                    adapter_failure(Qg6Phase::Measurement, role, query.id(), &error)
-                })?;
-                let observed = observe_result(
-                    normalize(result),
-                    self.prepared.identity.k,
-                    Qg6Phase::Measurement,
-                    role,
-                    query.id(),
-                )?;
-                ensure_stable(
-                    Qg6Phase::Measurement,
-                    role,
-                    query.id(),
-                    self.expected_results[block.query_index].get(role),
-                    &observed.receipt,
-                )?;
+                latencies_ns.sort_unstable();
+                let observed_latency_ns = median_sorted_u64(&latencies_ns);
                 let sample_id = block
                     .block_id
                     .checked_mul(2)
@@ -927,7 +986,9 @@ impl<A> Qg6ValidatedExperiment<A> {
                     order,
                     started_ns,
                     ended_ns,
-                    result_sha256: observed.receipt.ordered_doc_ids_sha256,
+                    observed_latency_ns,
+                    subsample_count: usize_to_u64(searches_per_sample)?,
+                    result_sha256: lower_hex(result_receipts.finalize()),
                 });
             }
         }
@@ -937,12 +998,14 @@ impl<A> Qg6ValidatedExperiment<A> {
             self.prepared.queries.len(),
             warmup_rounds,
             rounds_per_query,
+            searches_per_sample,
         )?;
         Ok(Qg6Measurement {
             identity: self.prepared.identity,
             schedule_seed,
             warmup_rounds,
             rounds_per_query,
+            searches_per_sample,
             schedule,
             samples,
             lifecycle: self.prepared.lifecycle,
@@ -1305,6 +1368,7 @@ fn verify_lifecycle(
     query_count: usize,
     warmup_rounds: usize,
     rounds_per_query: usize,
+    searches_per_sample: usize,
 ) -> Result<(), Qg6HarnessError> {
     let expected_preflight = usize_to_u64(query_count)?;
     let expected_warmups =
@@ -1313,12 +1377,14 @@ fn verify_lifecycle(
                 reason: "warmup call count overflow".to_owned(),
             }
         })?)?;
-    let expected_timed =
-        usize_to_u64(query_count.checked_mul(rounds_per_query).ok_or_else(|| {
-            Qg6HarnessError::LifecycleViolation {
+    let expected_timed = usize_to_u64(
+        query_count
+            .checked_mul(rounds_per_query)
+            .and_then(|count| count.checked_mul(searches_per_sample))
+            .ok_or_else(|| Qg6HarnessError::LifecycleViolation {
                 reason: "timed call count overflow".to_owned(),
-            }
-        })?)?;
+            })?,
+    )?;
     for role in Qg6ArmRole::ALL {
         let arm = lifecycle.arm(role);
         if arm.build_calls != 1
@@ -1340,6 +1406,17 @@ fn verify_lifecycle(
         }
     }
     Ok(())
+}
+
+fn median_sorted_u64(values: &[u64]) -> u64 {
+    debug_assert!(!values.is_empty());
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        let low = values[middle - 1];
+        low + (values[middle] - low) / 2
+    }
 }
 
 fn validate_experiment_inputs(
@@ -1558,6 +1635,13 @@ mod tests {
     }
 
     #[test]
+    fn integer_median_is_exact_for_odd_and_even_subsamples() {
+        assert_eq!(median_sorted_u64(&[1, 3, 9]), 3);
+        assert_eq!(median_sorted_u64(&[2, 4]), 3);
+        assert_eq!(median_sorted_u64(&[u64::MAX - 1, u64::MAX]), u64::MAX - 1);
+    }
+
+    #[test]
     fn exact_parity_and_measurement_produce_complete_lifecycle_receipt() {
         let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             black_box(arm.role);
@@ -1591,6 +1675,51 @@ mod tests {
             assert_eq!(lifecycle.timed_search_calls, 40);
             assert_eq!(lifecycle.timed_setup_calls, 0);
         }
+    }
+
+    #[test]
+    fn p50_subsamples_count_every_search_and_retain_one_sample_per_arm() {
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut search)
+            .expect("exact parity");
+        let measurement = validated
+            .measure_query_p50_with_normalizer(1, 2, 3, 0x5eed, &mut search, &mut |result| result)
+            .expect("p50 subsample measurement");
+
+        assert_eq!(measurement.searches_per_sample, 3);
+        assert_eq!(measurement.samples.len(), 4 * 2 * 4);
+        assert!(
+            measurement
+                .samples
+                .iter()
+                .all(|sample| sample.subsample_count == 3 && sample.observed_latency_ns > 0)
+        );
+        for role in Qg6ArmRole::ALL {
+            assert_eq!(
+                measurement.lifecycle.arm(role).timed_search_calls,
+                4 * 2 * 3
+            );
+        }
+    }
+
+    #[test]
+    fn p50_subsamples_reject_zero_searches() {
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut search)
+            .expect("exact parity");
+        let error = validated
+            .measure_query_p50_with_normalizer(1, 2, 0, 0x5eed, &mut search, &mut |result| result)
+            .expect_err("zero-sized p50 subsample");
+
+        assert!(matches!(error, Qg6HarnessError::InvalidSpec { .. }));
     }
 
     #[test]

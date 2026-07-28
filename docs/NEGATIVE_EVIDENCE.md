@@ -16581,3 +16581,89 @@ the null center, CI-width, log-MAD, order-balance, order-effect, and drift laws
 before comparing any median CI with the 4x target. After three invalid-noise
 attempts on one worker family, switch to a different worker family rather than
 relaxing the null law.
+
+### 2026-07-28 — QG-6 invalid harness attempt: unresolved query noise and an incomplete native-tie envelope make no claim (`bd-h6eh`, FoggySquirrel)
+
+One full-scale prepared-query attempt on quiet worker `vmi1152480` used clean
+revision `d2458e59a76a611bb5c3ffe940ad57dee9d14a70`, `release-perf`, and
+executing ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`.
+Every completed cell constructed four independent indexes before timing,
+compared Quill with the actual Tantivy 0.26.1 incumbent, and included a
+Tantivy/Tantivy A/A in the same invocation.
+
+The first three cells were not admissible:
+
+| cell | apparent Quill/Tantivy latency ratio [95% CI] | Tantivy/Tantivy A/A [95% CI] | status |
+|---|---:|---:|---|
+| identifier, k=10, 100k | 422.232610 [261.868349, 781.785700] | 1.009790 [0.743538, 1.747614] | INVALID |
+| identifier, k=10, 1M | 508.170011 [341.008893, 926.783794] | 1.006899 [0.595198, 1.203728] | INVALID |
+| identifier, k=100, 100k | 223.412070 [123.209011, 583.435964] | 1.026039 [0.498653, 1.345124] | INVALID |
+
+These are provenance-only ratios, not QG-6 numbers. The null intervals expose
+timer-resolution and scheduling noise from treating one sub-millisecond search
+as a complete p50 sample.
+
+The next cell, `query/identifier/k100/1m`, stopped in exact semantic preflight
+at rank 14. The first 14 hits agreed exactly; the first reported divergence was
+inside a BM25 score tie larger than the harness's 100,000-document native-tie
+expansion limit. Because the process stopped before artifact assembly, no
+sealed evidence file exists and neither PASS nor MISS follows from this
+attempt.
+
+**Decision: INVALID-HARNESS / NO CLAIM.** This is a harness diagnosis, not a
+lever verdict.
+
+**Retry predicate:** first require a fixture-filtered
+`query/identifier/k100/1m` pre-admission run from an exact new ELF to pass with
+a complete 1M-document native-tie envelope. The same ELF must summarize a
+fixed count of individually timed searches into each per-query p50 sample,
+count every search in its lifecycle receipt, and produce an admissible
+same-invocation A/A. Only then run and reproduce the complete 20-cell QG-6
+matrix; never relax the null law or substitute raw CV for the median CI.
+
+### 2026-07-28 — QG-2 invalid-null EPYC reroute: the control excludes identity (`bd-h6eh`, FoggySquirrel)
+
+The new full-scale candidate used clean revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70`, exact ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`,
+and 80 A/A plus 80 A/B pairs on quiet 10-vCPU EPYC worker `vmi1152480`.
+The actual Tantivy 0.26.1 incumbent ran side-by-side with Quill in one
+invocation.
+
+The authoritative paired estimator measured a Tantivy/Tantivy A/A center of
+**0.940816** with 95% CI **[0.870175, 0.991807]**. Its log-MAD was
+`0.153567`, its log drift was `0.097864`, and the CI excluded identity. The
+cell therefore failed null center, width, dispersion, and drift laws. The
+apparent Quill/Tantivy ratio of `0.221193` is not a QG-2 number.
+
+**Decision: INVALID-NULL / NO CLAIM.** The sealed artifact is retained at
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-r3-20260728T1049Z/`
+with seal `34ced5275a97dbecf6afa7cd69cc8b0ab0a893ef98c8a3c47ce69265ac1c4534`.
+
+**Retry predicate:** switch away from this 10-vCPU EPYC worker family. Produce
+a new candidate/rerun pair from the exact same ELF on one quiet 16-thread Zen3
+worker, require each run's A/A center, CI width, log-MAD, order effect, and
+drift to pass, and require paired-log reproduction delta at most
+`0.0198026273`. Do not reopen the unchanged indexing lever; its separate
+profile-plus-counted-mechanism predicate remains in the first QG-2 MISS row.
+
+### 2026-07-28 — QG-3 invalid execution: remote `/tmp` filled before artifact sealing (`bd-h6eh`, FoggySquirrel)
+
+A full-scale reroute on `ovh-b` used revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and exact ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+After three cells, Tantivy reported that its writer worker had been killed by
+an I/O error. Immediate host inspection found `/tmp` to be a **16 GiB tmpfs at
+100% usage with zero free bytes**; the persistent root filesystem still had
+97 GiB free. QG-3's fresh-process fixtures had therefore exhausted the selected
+scratch filesystem. The run stopped before assembling or sealing an artifact.
+
+**Decision: INVALID-EXECUTION / NO CLAIM.** The partial printed ratios are not
+gate numbers.
+
+**Retry predicate:** before any QG-3 retry, check the exact filesystem named by
+`QUILL_PERF_SCRATCH_DIR` and require at least 120 GiB free on a persistent
+non-tmpfs volume. Preserve the same exact-ELF, same-invocation A/A+A/B
+protocol, and require a complete sealed five-cell artifact; a writer error,
+partial cell set, or full scratch filesystem remains non-evidence.

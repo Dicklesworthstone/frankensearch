@@ -7242,3 +7242,56 @@ with the same-invocation A/A+A/B protocol; require every required cell to pass
 the null center, CI-width, dispersion, order, and drift laws before comparing
 the median CI with the 4x target. The preserved attempts are detailed in
 `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-6 INVALID-HARNESS: single-search samples and a truncated native-tie envelope make no claim (`bd-h6eh`, FoggySquirrel)
+
+A full-scale prepared-query attempt on `vmi1152480` used clean revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70` and exact executable SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`.
+The first three cells carried same-invocation Tantivy/Tantivy A/A controls, but
+their 95% intervals were respectively `[0.743538, 1.747614]`,
+`[0.595198, 1.203728]`, and `[0.498653, 1.345124]`; none was admissible.
+
+The following `query/identifier/k100/1m` preflight agreed through rank 13 and
+then reported rank 14 inside a BM25 tie larger than the 100,000-document
+native-tie expansion. The run stopped before sealing artifacts. Its apparent
+Quill/Tantivy latency ratios are not gate numbers and support neither PASS nor
+MISS.
+
+Retry only after an exact new ELF (1) proves the complete 1M-document native
+tie at the failing fixture and (2) derives each query p50 from a fixed,
+lifecycle-counted subsample of individually timed searches whose same-run A/A
+passes the predeclared median-CI laws. Then run and reproduce all 20 normative
+QG-6 cells; CV remains provenance only.
+
+## 2026-07-28 — QG-2 INVALID-NULL: quiet 10-vCPU EPYC reroute is not gate evidence (`bd-h6eh`, FoggySquirrel)
+
+An 80-pair candidate on `vmi1152480` used revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70` and exact ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`.
+Its same-invocation Tantivy/Tantivy A/A center was **0.940816** with 95% CI
+**[0.870175, 0.991807]**, log-MAD `0.153567`, and log drift `0.097864`.
+Because the control excludes identity and fails four predeclared null laws,
+the apparent `0.221193` Quill/Tantivy ratio is not a QG-2 number.
+
+The sealed no-claim attempt is retained under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-r3-20260728T1049Z/`.
+Retry only with a candidate/rerun pair from this exact ELF on one quiet
+16-thread Zen3 worker, admitting both A/A controls and requiring paired-log
+reproduction delta at most `0.0198026273`. The performance lever itself remains
+closed until the existing profile-plus-counted-mechanism predicate is met.
+
+## 2026-07-28 — QG-3 EXECUTION FAILURE: 16 GiB remote tmpfs exhausted (`bd-h6eh`, FoggySquirrel)
+
+The `ovh-b` full-scale reroute from revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and ELF
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`
+stopped after three cells when Tantivy's writer worker encountered an I/O
+error. `/tmp` was a 16 GiB tmpfs at 100% usage and zero free bytes, while the
+persistent root filesystem retained 97 GiB. No complete or sealed artifact was
+emitted, so the partial ratios support no decision.
+
+Retry only after the selected `QUILL_PERF_SCRATCH_DIR` is proven to reside on a
+persistent non-tmpfs filesystem with at least 120 GiB free. Require all five
+cells, valid same-run A/A controls, and a sealed artifact; otherwise preserve
+the attempt as execution diagnostics only.
