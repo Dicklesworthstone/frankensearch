@@ -140,6 +140,15 @@ pub use observability_lint::{
     lint_stream,
 };
 pub use parsed_query::ParsedQuery;
+pub use recovery_plan::{
+    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, COMPLETE_COVERAGE_PPM, InteractionPolicy,
+    MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
+    ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,
+    ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
+    RecoveryContractError, RecoveryPlan, RecoveryPlanSchemaVersion, RecoveryPolicy,
+    RecoveryRequest, RequestMode, Retryability, SemanticProvenance, SemanticReadiness,
+    SemanticResponseContract, VerifiedSemanticProvenance, plan,
+};
 pub use repair::{
     CorruptionEvent, CorruptionPolicy, DegradedReason, DetectionMethod, RepairAttempt,
     RepairOrchestrator, RepairOutcome, RepairProvider, ServiceState,
