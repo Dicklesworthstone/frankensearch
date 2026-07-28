@@ -16,16 +16,18 @@
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, runtime::Runtime};
 use criterion::Criterion;
 use frankensearch_core::bench_support::print_bench_elf_sha256;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite};
-use frankensearch_lexical::{SnippetConfig, TantivyIndex};
+use frankensearch_lexical::{BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIndex};
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
@@ -62,6 +64,8 @@ const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_RECEIPTS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 
 const NO_POSITION_FIELDS: [FieldDescriptor; 5] = [
     FieldDescriptor {
@@ -294,6 +298,89 @@ fn tantivy_create(path: &Path, spec: &PerfCellSpec) -> TantivyIndex {
     .expect("create pinned on-disk Tantivy oracle")
 }
 
+fn emit_tantivy_lifecycle_receipt(
+    spec: &PerfCellSpec,
+    phase: &str,
+    receipt: &BenchmarkWriterJoinReceipt,
+) {
+    let sequence = LIFECYCLE_RECEIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let run_id =
+        std::env::var("QUILL_PERF_RUN_ID").unwrap_or_else(|_| "unidentified-run".to_owned());
+    let row = serde_json::json!({
+        "schema_version": "quill-tantivy-lifecycle-v1",
+        "run_id": run_id,
+        "sequence": sequence,
+        "gate": spec.gate.to_string(),
+        "fixture": spec.fixture,
+        "metric": spec.metric,
+        "phase": phase,
+        "writer_threads": spec.threads.unwrap_or(1),
+        "writer_heap_bytes": spec.writer_heap_bytes.unwrap_or(50_000_000),
+        "searchable_segments_before": receipt.searchable_segments_before,
+        "searchable_segments_after": receipt.searchable_segments_after,
+        "join_elapsed_ns": receipt.join_elapsed_ns,
+        "indexing_workers_joined": true,
+        "merge_worker_joined": true,
+        "writer_rearmed": true,
+    });
+    LIFECYCLE_RECEIPTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("lock QG Tantivy lifecycle receipts")
+        .push(row);
+}
+
+fn flush_tantivy_lifecycle_receipts(output_dir: &Path) {
+    let Some(receipts) = LIFECYCLE_RECEIPTS.get() else {
+        return;
+    };
+    let (payload, receipt_count) = {
+        let receipts = receipts
+            .lock()
+            .expect("lock QG Tantivy lifecycle receipts for flush");
+        if receipts.is_empty() {
+            return;
+        }
+        let mut payload = Vec::new();
+        for row in receipts.iter() {
+            serde_json::to_writer(&mut payload, row)
+                .expect("serialize QG Tantivy lifecycle receipt");
+            payload.push(b'\n');
+        }
+        (payload, receipts.len())
+    };
+    std::fs::create_dir_all(output_dir).expect("create QG lifecycle receipt directory");
+    let path = output_dir.join("tantivy-lifecycle.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("open QG Tantivy lifecycle receipt");
+    file.write_all(&payload)
+        .expect("write QG Tantivy lifecycle receipts");
+    eprintln!(
+        "[tantivy-lifecycle] receipts={} sha256={} path={}",
+        receipt_count,
+        lower_hex(&Sha256::digest(&payload)),
+        display_path(&path),
+    );
+}
+
+fn fence_tantivy_lifecycle(
+    index: TantivyIndex,
+    spec: &PerfCellSpec,
+    phase: &str,
+) -> (TantivyIndex, Duration) {
+    let (index, receipt) = index
+        .benchmark_join_workers_and_rearm(
+            spec.writer_heap_bytes.unwrap_or(50_000_000),
+            spec.threads.unwrap_or(1),
+        )
+        .expect("join Tantivy benchmark workers and rearm writer");
+    emit_tantivy_lifecycle_receipt(spec, phase, &receipt);
+    (index, Duration::from_nanos(receipt.join_elapsed_ns))
+}
+
 fn preflight_index<E: LexicalRead + LexicalWrite>(
     context: &BenchContext,
     index: &E,
@@ -475,7 +562,11 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
-            index_batches(context, &index, &corpus, count, None) + commit(context, &index)
+            let mut elapsed =
+                index_batches(context, &index, &corpus, count, None) + commit(context, &index);
+            let (_index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_work");
+            elapsed += join_elapsed;
+            elapsed
         }
     };
     count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
@@ -557,8 +648,11 @@ fn watch_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> 
             let index = tantivy_in_memory(spec);
             let _ = index_batches(context, &index, &corpus, warm_count, None);
             let _ = commit(context, &index);
+            let (index, _) = fence_tantivy_lifecycle(index, spec, "warm_fixture");
             let mut elapsed = index_batches(context, &index, &corpus, update_count, Some(1));
             elapsed += commit(context, &index);
+            let (index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_update");
+            elapsed += join_elapsed;
             let timer = Instant::now();
             assert_exact_visibility(context, &index, &probe_query, &expected_doc_id);
             elapsed + timer.elapsed()
@@ -692,8 +786,11 @@ fn measure_tantivy_fresh_process(
     let index = tantivy_create(&path, spec);
     let _ = index_batches(context, &index, corpus, warm_count, None);
     let _ = commit(context, &index);
+    let (index, _) = fence_tantivy_lifecycle(index, spec, "warm_fixture");
     let mut elapsed = index_batches(context, &index, corpus, update_count, Some(1));
     elapsed += commit(context, &index);
+    let (index, join_elapsed) = fence_tantivy_lifecycle(index, spec, "measured_update");
+    elapsed += join_elapsed;
     drop(index);
     elapsed
         + fresh_process_search(
@@ -2479,6 +2576,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         register_criterion_cell(c, &context, spec);
     }
     machine.finish();
+    flush_tantivy_lifecycle_receipts(&output_dir);
 
     let provenance = EvidenceProvenance {
         run_id: run_id.clone(),

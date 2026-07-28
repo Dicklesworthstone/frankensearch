@@ -668,6 +668,24 @@ pub fn default_tokenizer_for_bench() -> TextAnalyzer {
 
 // ─── TantivyIndex ───────────────────────────────────────────────────────────
 
+/// Counted receipt for a benchmark-only Tantivy writer lifecycle fence.
+///
+/// `wait_merging_threads` consumes Tantivy's writer after joining its indexing
+/// and segment-updater workers. The benchmark immediately rearms the same
+/// index with the pinned writer configuration, so setup maintenance cannot
+/// leak into a later timed sample.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BenchmarkWriterJoinReceipt {
+    /// Searchable segment count immediately before joining the writer.
+    pub searchable_segments_before: usize,
+    /// Searchable segment count after every background worker has joined.
+    pub searchable_segments_after: usize,
+    /// Time spent inside Tantivy's worker/merge join, excluding writer rearm.
+    pub join_elapsed_ns: u64,
+}
+
 /// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
 ///
 /// Thread-safe for concurrent reads. Writes are serialized internally via
@@ -936,6 +954,86 @@ impl TantivyIndex {
             writer_heap_bytes,
             Some(writer_threads),
         )
+    }
+
+    /// Join every indexing and merge worker, then rearm the same benchmark index.
+    ///
+    /// The returned duration measures only Tantivy's
+    /// [`IndexWriter::wait_merging_threads`] call. Constructing the replacement
+    /// writer is excluded because it is harness bookkeeping, not incumbent
+    /// maintenance. Searchable segment counts make the lifecycle boundary
+    /// auditable without relying on timing variance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid writer-thread configuration, poisoned writer mutex,
+    /// Tantivy worker/merge failure, segment metadata failure, or writer
+    /// reconstruction failure.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_join_workers_and_rearm(
+        self,
+        writer_heap_bytes: usize,
+        writer_threads: usize,
+    ) -> SearchResult<(Self, BenchmarkWriterJoinReceipt)> {
+        validate_benchmark_writer_threads(writer_threads)?;
+        let Self {
+            index,
+            fields,
+            reader,
+            writer,
+            doc_count,
+            ord_table,
+            path,
+        } = self;
+        let searchable_segments_before = index
+            .searchable_segment_ids()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?
+            .len();
+        let writer = writer
+            .into_inner()
+            .map_err(|error| Self::map_writer_lock_error("tantivy.benchmark_join", error))?;
+        let timer = std::time::Instant::now();
+        writer
+            .wait_merging_threads()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+        let join_elapsed_ns = u64::try_from(timer.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let searchable_segments_after = index
+            .searchable_segment_ids()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?
+            .len();
+        let writer = index
+            .writer_with_num_threads(writer_threads, writer_heap_bytes)
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+        let receipt = BenchmarkWriterJoinReceipt {
+            searchable_segments_before,
+            searchable_segments_after,
+            join_elapsed_ns,
+        };
+        Ok((
+            Self {
+                index,
+                fields,
+                reader,
+                writer: Mutex::new(writer),
+                doc_count,
+                ord_table,
+                path,
+            },
+            receipt,
+        ))
     }
 
     /// Disable automatic segment merging for a force-merge benchmark setup.
@@ -2610,6 +2708,50 @@ mod tests {
                 .expect("search position-free oracle fixture");
             let ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
             assert_eq!(ids, ["single", "repeated"]);
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn benchmark_writer_join_rearms_without_changing_searchable_state() {
+        let idx = TantivyIndex::in_memory_with_benchmark_config(50_000_000, 1, true)
+            .expect("create benchmark oracle");
+        run_with_cx(|cx| async move {
+            idx.index_document(
+                &cx,
+                &IndexableDocument::new("before-join", "lifecycle fence"),
+            )
+            .await
+            .expect("index pre-fence document");
+            idx.commit(&cx).await.expect("commit pre-fence document");
+
+            let (idx, receipt) = idx
+                .benchmark_join_workers_and_rearm(50_000_000, 1)
+                .expect("join workers and rearm writer");
+            assert!(receipt.searchable_segments_before > 0);
+            assert!(receipt.searchable_segments_after > 0);
+            assert_eq!(
+                idx.search(&cx, "lifecycle", 10)
+                    .await
+                    .expect("search pre-fence document")
+                    .len(),
+                1
+            );
+
+            idx.index_document(
+                &cx,
+                &IndexableDocument::new("after-join", "writer remains usable"),
+            )
+            .await
+            .expect("index post-fence document");
+            idx.commit(&cx).await.expect("commit post-fence document");
+            assert_eq!(
+                idx.search(&cx, "writer", 10)
+                    .await
+                    .expect("search post-fence document")
+                    .len(),
+                1
+            );
         });
     }
 
