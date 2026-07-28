@@ -27,8 +27,8 @@ use frankensearch_core::{
 };
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
 use frankensearch_embed::{
-    ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
-    ModelLifecycle, ModelManifest, ensure_default_semantic_models,
+    ConsentSource, DetectOptions, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder,
+    ModelDownloader, ModelLifecycle, ModelManifest, ensure_default_semantic_models,
 };
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
@@ -11295,13 +11295,14 @@ impl FsfsRuntime {
         }
 
         let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
-            .or_else(|_| EmbedderStack::auto_detect());
+        let options = DetectOptions {
+            offline: Some(self.config.indexing.offline),
+        };
+        let stack = EmbedderStack::auto_detect_with_options(Some(&configured_root), &options);
 
         #[cfg(not(feature = "embedded-models"))]
-        let stack = stack.map_err(|err| {
+        let stack = stack.inspect_err(|_| {
             emit_lite_build_model_hint(&configured_root);
-            err
         });
 
         Ok(stack?.fast_arc())
@@ -11313,13 +11314,14 @@ impl FsfsRuntime {
         }
 
         let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
-            .or_else(|_| EmbedderStack::auto_detect());
+        let options = DetectOptions {
+            offline: Some(self.config.indexing.offline),
+        };
+        let stack = EmbedderStack::auto_detect_with_options(Some(&configured_root), &options);
 
         #[cfg(not(feature = "embedded-models"))]
-        let stack = stack.map_err(|err| {
+        let stack = stack.inspect_err(|_| {
             emit_lite_build_model_hint(&configured_root);
-            err
         });
 
         Ok(stack?.quality_arc())
@@ -13788,7 +13790,9 @@ fn print_cli_help() {
         "  daemon [--daemon-poll-ms <ms>]            Long-running process that auto-compacts when WAL grows"
     );
     println!();
-    println!("Global flags: --verbose/-v --quiet/-q --no-color --format --config");
+    println!(
+        "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
+    );
     println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
 

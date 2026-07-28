@@ -1942,6 +1942,12 @@ fn resolve_remote_intent_online(env: &RemoteIntentEnv) -> SearchResult<Option<Ar
             "explicit remote configuration is present but this build lacks the `api` feature",
         ));
     }
+    if env.openai_key.is_some() || env.gemini_key.is_some() {
+        warn!(
+            "ambient provider key ignored: no frankensearch remote configuration \
+             was supplied and this build lacks the `api` feature"
+        );
+    }
     Ok(None)
 }
 
