@@ -159,8 +159,9 @@ pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, Ti
 pub use asupersync::Cx;
 pub use query_class::QueryClass;
 pub use traits::{
-    Embedder, IdentityBoundEmbedding, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo,
-    ModelTier, NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
+    Embedder, IdentityBoundEmbedding, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
+    LexicalSearch, LexicalWrite, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
+    NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
     SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
     cosine_similarity, l2_normalize, truncate_embedding,
 };

@@ -17,7 +17,8 @@ use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
 use frankensearch_core::{
-    DocId, IndexableDocument, LexicalSearch, ScoreSource, ScoredResult, SearchError, SearchFuture,
+    DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
+    LexicalSearch, LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture,
 };
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
@@ -31,7 +32,7 @@ use crate::argus::{
     DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
     PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
-    TermRecordOption, TermScorer, TopDocsCollector,
+    TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
@@ -3200,6 +3201,20 @@ impl QuillReader {
         limit: usize,
         hydrate_metadata: bool,
     ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        self.scored_results_pinned(cx, query, limit, hydrate_metadata)
+            .map(|(results, _snapshot)| results)
+    }
+
+    /// Score on the currently published snapshot and return that exact
+    /// snapshot `Arc` alongside the results, so callers can pin hydration to
+    /// the generation that produced the scores (bd-8nqz.1).
+    fn scored_results_pinned(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        hydrate_metadata: bool,
+    ) -> Result<(Vec<ScoredResult>, Arc<QuillSearchSnapshot>), QuillIndexError> {
         let published = self.published_snapshot.load();
         let search = self.search_paginated_on(cx, query, limit, 0, false, published.as_ref())?;
         let mut results = Vec::new();
@@ -3224,7 +3239,7 @@ impl QuillReader {
                 metadata,
             });
         }
-        Ok(results)
+        Ok((results, published))
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -4854,6 +4869,186 @@ impl LexicalSearch for QuillIndex {
     }
 }
 
+/// Backend tag carried by Quill hydration contexts (bd-8nqz.1).
+pub const QUILL_LEXICAL_BACKEND: &str = "quill";
+
+/// Shared generation-pinned candidate search for Quill readers (bd-8nqz.1).
+fn quill_search_candidates<'a>(
+    reader: &'a QuillReader,
+    cx: &'a Cx,
+    query: &'a str,
+    limit: usize,
+) -> SearchFuture<'a, LexicalCandidateBatch> {
+    Box::pin(async move {
+        let (results, snapshot) = reader
+            .scored_results_pinned(cx, query, limit, false)
+            .map_err(SearchError::from)?;
+        Ok(LexicalCandidateBatch::deferred(
+            results,
+            LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot)),
+        ))
+    })
+}
+
+/// Shared pinned hydration for Quill readers (bd-8nqz.1): metadata is
+/// materialized from the exact snapshot that scored the batch, never from a
+/// newer published generation.
+fn quill_hydrate_candidates<'a>(
+    cx: &'a Cx,
+    context: Option<&'a LexicalHydrationContext>,
+    results: &'a mut [ScoredResult],
+) -> SearchFuture<'a, ()> {
+    Box::pin(async move {
+        check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
+        let Some(context) = context else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: "deferred Quill candidates require their batch context; \
+                         none was provided"
+                    .into(),
+            });
+        };
+        let Some(snapshot) = context.downcast_ref::<Arc<QuillSearchSnapshot>>() else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: format!(
+                    "hydration context from backend {:?} is not a Quill snapshot pin; \
+                     refusing cross-engine hydration",
+                    context.backend()
+                )
+                .into(),
+            });
+        };
+        for result in results
+            .iter_mut()
+            .filter(|result| result.lexical_score.is_some())
+        {
+            let Some(global_docid) = snapshot
+                .resolve_document_id(result.doc_id.as_str())
+                .map_err(SearchError::from)?
+            else {
+                result.metadata = None;
+                continue;
+            };
+            result.metadata = snapshot
+                .materialize_metadata(global_docid)
+                .map_err(SearchError::from)?;
+        }
+        Ok(())
+    })
+}
+
+impl LexicalRead for QuillIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.reader
+                .scored_results(cx, query, limit, true)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        quill_search_candidates(&self.reader, cx, query, limit)
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        quill_hydrate_candidates(cx, context, results)
+    }
+
+    fn doc_count(&self) -> usize {
+        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    }
+}
+
+impl LexicalWrite for QuillIndex {
+    fn index_document<'a>(
+        &'a self,
+        cx: &'a Cx,
+        doc: &'a IndexableDocument,
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            self.upsert_documents(cx, std::slice::from_ref(doc))
+                .await
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            self.upsert_documents(cx, docs)
+                .await
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            Self::commit(self, cx)
+                .await
+                .map(drop)
+                .map_err(SearchError::from)
+        })
+    }
+}
+
+/// The read-only reader implements ONLY [`LexicalRead`] — no writer lease is
+/// ever acquired on a read-only open (bd-8nqz.1).
+impl LexicalRead for QuillSearchIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.reader
+                .scored_results(cx, query, limit, true)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        quill_search_candidates(&self.reader, cx, query, limit)
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        quill_hydrate_candidates(cx, context, results)
+    }
+
+    fn doc_count(&self) -> usize {
+        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    }
+}
+
 impl From<QuillIndexError> for SearchError {
     fn from(error: QuillIndexError) -> Self {
         match error {
@@ -6240,26 +6435,6 @@ fn query_field_kind(
     query_field_descriptor(schema, field_ord).map(|field| field.kind)
 }
 
-fn term_record_option(
-    schema: SchemaDescriptor,
-    field_ord: u16,
-) -> Result<TermRecordOption, QuillIndexError> {
-    match query_field_kind(schema, field_ord)? {
-        FieldKind::Keyword
-        | FieldKind::Text {
-            positions: false, ..
-        } => Ok(TermRecordOption::Basic),
-        FieldKind::Text {
-            positions: true, ..
-        } => Ok(TermRecordOption::WithFreqsAndPositions),
-        FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
-            Err(QuillIndexError::UnsupportedQuery {
-                detail: format!("term scorer names non-string field {field_ord}"),
-            })
-        }
-    }
-}
-
 fn query_field_descriptor(
     schema: SchemaDescriptor,
     field_ord: u16,
@@ -6858,14 +7033,13 @@ fn lower_leaf_term<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
     let doc_freq = checkpointed_snapshot_doc_freq(checkpoint, snapshot, field_ord, term)?;
-    let record_option = term_record_option(schema, field_ord)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             let (cursor, fieldnorms) =
                 open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
             let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
-            build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
+            build_term_scorer(cursor, fieldnorms, stats, doc_freq, boost)
         }
         QueryLeaf::Delta(delta) => {
             let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
@@ -6875,7 +7049,6 @@ fn lower_leaf_term<'a>(
                 DeltaFieldNorms::new(delta, field_ord),
                 stats,
                 doc_freq,
-                record_option,
                 boost,
             )
         }
@@ -7010,14 +7183,7 @@ fn lower_term(
     let doc_freq = snapshot_doc_freq(snapshot, schema, field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(
-        cursor,
-        norms,
-        stats,
-        doc_freq,
-        term_record_option(schema, field_ord)?,
-        boost,
-    )
+    build_term_scorer(cursor, norms, stats, doc_freq, boost)
 }
 
 fn build_term_scorer<'a, C, F>(
@@ -7025,7 +7191,6 @@ fn build_term_scorer<'a, C, F>(
     fieldnorms: F,
     stats: SnapshotFieldStats,
     snapshot_doc_freq: u64,
-    record_option: TermRecordOption,
     boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError>
 where
@@ -7037,7 +7202,6 @@ where
         fieldnorms,
         Bm25FieldSnapshot::new(stats)?,
         snapshot_doc_freq,
-        record_option,
         boost,
     )?))
 }
@@ -7057,14 +7221,7 @@ fn lower_composite_sealed_term(
     let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(
-        cursor,
-        norms,
-        stats,
-        doc_freq,
-        term_record_option(schema, field_ord)?,
-        boost,
-    )
+    build_term_scorer(cursor, norms, stats, doc_freq, boost)
 }
 
 #[cfg(test)]
@@ -7084,7 +7241,6 @@ fn lower_delta_term<'a>(
         DeltaFieldNorms::new(delta, field_ord),
         stats,
         doc_freq,
-        term_record_option(delta.schema(), field_ord)?,
         boost,
     )
 }
@@ -7832,20 +7988,6 @@ mod tests {
         document_id: &str,
         content: &str,
     ) {
-        let content_has_positions = delta
-            .schema()
-            .fields
-            .iter()
-            .find(|field| field.id == CONTENT_FIELD)
-            .is_some_and(|field| {
-                matches!(
-                    field.kind,
-                    FieldKind::Text {
-                        positions: true,
-                        ..
-                    }
-                )
-            });
         let mut term_positions = BTreeMap::<&str, Vec<u32>>::new();
         for (position, term) in content.split_ascii_whitespace().enumerate() {
             term_positions.entry(term).or_default().push(
@@ -7890,7 +8032,7 @@ mod tests {
                 field_ord: CONTENT_FIELD,
                 term: term.as_bytes(),
                 frequency: u32::try_from(positions.len()).expect("fixture frequency fits u32"),
-                positions: content_has_positions.then_some(positions.as_slice()),
+                positions: Some(positions),
             });
         }
         let ordinal = u64::from(global_docid).to_le_bytes();
@@ -11973,65 +12115,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "bench-internals")]
-    #[test]
-    fn basic_record_option_scores_and_bounds_repeated_delta_occurrences_as_presence() {
-        let keeper = Arc::new(
-            KeeperSnapshot::in_memory(POSITIONLESS_QG_SCHEMA)
-                .expect("genesis positionless Keeper snapshot"),
-        );
-        let generation = keeper.loaded_manifest().manifest.generation;
-        let mut delta =
-            DeltaSegment::new(POSITIONLESS_QG_SCHEMA, 0, usize::MAX).expect("Basic Delta shard");
-        apply_tokenized_delta_document(&mut delta, 0, "repeat", "token token neutral");
-        apply_tokenized_delta_document(&mut delta, 1, "single", "token single neutral");
-        let frozen = Arc::new(delta.freeze(generation));
-        let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
-            .expect("positionless Delta composite snapshot");
-        let stats = composite
-            .bm25_field_stats(CONTENT_FIELD)
-            .expect("positionless Delta content statistics");
-        assert_eq!((stats.total_tokens, stats.doc_count), (6, 2));
-        assert_eq!(
-            composite
-                .bm25_doc_freq(CONTENT_FIELD, b"token")
-                .expect("positionless Delta token document frequency"),
-            2
-        );
-
-        let mut cursor = DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"token")
-            .expect("positionless Delta token cursor");
-        assert_eq!((cursor.doc(), cursor.freq()), (Some(0), Some(1)));
-        assert!(cursor.positions_handle().is_none());
-        assert_eq!(cursor.next().expect("advance Basic Delta cursor"), Some(1));
-        assert_eq!(cursor.freq(), Some(1));
-        assert!(cursor.positions_handle().is_none());
-
-        let average = stats
-            .average_field_length()
-            .expect("non-empty positionless Delta average");
-        let weight = crate::contract::idf(2, 2) * (1.0 + crate::contract::BM25_K1);
-        let bound = cursor
-            .term_score_upper_bound(average, weight, TermRecordOption::Basic)
-            .expect("positionless Delta term bound");
-        let mut scorer = lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"token", 1.0)
-            .expect("positionless Delta term scorer");
-        let repeated_score = scorer.score().expect("score repeated Delta occurrence");
-        assert_eq!(
-            repeated_score.to_bits(),
-            bound.to_bits(),
-            "Delta Basic term bound must use the scorer's effective tf=1"
-        );
-        assert_eq!(scorer.next().expect("advance Basic Delta scorer"), Some(1));
-        let single_score = scorer.score().expect("score single Delta occurrence");
-        assert_eq!(
-            repeated_score.to_bits(),
-            single_score.to_bits(),
-            "Delta Basic postings score document presence, not retained raw frequency"
-        );
-        assert_eq!(scorer.next().expect("exhaust Basic Delta scorer"), None);
-    }
-
     #[test]
     fn delta_and_sealed_term_cursors_have_rank_exact_corpus_parity() {
         run_with_cx(|cx| async move {
@@ -13197,169 +13280,6 @@ mod tests {
             assert!(
                 phrase.hits.iter().any(|hit| hit.document_id == "rust-1"),
                 "the positioned control must exercise a real phrase hit"
-            );
-        });
-    }
-
-    #[cfg(feature = "bench-internals")]
-    #[test]
-    fn positionless_basic_scoring_uses_presence_for_repeated_edge_ngrams() {
-        run_with_cx(|cx| async move {
-            let positioned =
-                QuillIndex::in_memory_with_schema(POSITIONED_QG_SCHEMA, deterministic_config())
-                    .expect("construct the positioned control");
-            let positionless =
-                QuillIndex::in_memory_with_schema(POSITIONLESS_QG_SCHEMA, deterministic_config())
-                    .expect("construct the Basic fixture");
-            assert!(
-                positionless
-                    .search_paginated(&cx, "token", 10, 0, true)
-                    .expect("search empty Basic fixture")
-                    .hits
-                    .is_empty(),
-                "an empty Basic field must have no term hits"
-            );
-            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
-            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
-            assert_eq!(
-                repeated.split_whitespace().count(),
-                single.split_whitespace().count(),
-                "control documents must retain equal field lengths"
-            );
-            let documents = vec![
-                IndexableDocument::new("repeat", repeated).with_title("neutral"),
-                IndexableDocument::new("single", single).with_title("neutral"),
-            ];
-            positioned
-                .index_documents(&cx, &documents)
-                .await
-                .expect("index positioned control documents");
-            positionless
-                .index_documents(&cx, &documents)
-                .await
-                .expect("index Basic fixture documents");
-            let assert_record_semantics = |positioned: &QuillSearchResult,
-                                           positionless: &QuillSearchResult,
-                                           phase: &str| {
-                let score = |result: &QuillSearchResult, document_id: &str| {
-                    result
-                        .hits
-                        .iter()
-                        .find(|hit| hit.document_id == document_id)
-                        .unwrap_or_else(|| panic!("{phase}: missing {document_id} hit"))
-                        .score
-                };
-                let basic_repeat = score(positionless, "repeat");
-                let basic_single = score(positionless, "single");
-                let positioned_repeat = score(positioned, "repeat");
-                let positioned_single = score(positioned, "single");
-
-                assert_eq!(
-                    basic_repeat.to_bits(),
-                    basic_single.to_bits(),
-                    "{phase}: Basic postings score document presence, not retained raw frequency"
-                );
-                assert_eq!(
-                    basic_single.to_bits(),
-                    positioned_single.to_bits(),
-                    "{phase}: a unit frequency is unchanged across record options"
-                );
-                assert!(
-                    positioned_repeat > positioned_single,
-                    "{phase}: frequency-bearing postings retain the repeated edge n-gram boost"
-                );
-            };
-
-            positioned
-                .commit(&cx)
-                .await
-                .expect("publish positioned control");
-            positionless
-                .commit(&cx)
-                .await
-                .expect("publish Basic fixture");
-
-            let positioned = positioned
-                .search_paginated(&cx, "token", 10, 0, true)
-                .expect("search positioned control");
-            let positionless = positionless
-                .search_paginated(&cx, "token", 10, 0, true)
-                .expect("search Basic fixture");
-            assert_record_semantics(&positioned, &positionless, "sealed");
-        });
-    }
-
-    #[cfg(feature = "bench-internals")]
-    #[test]
-    fn positionless_basic_scoring_survives_multiple_segments_and_reopen() {
-        run_with_blocking_cx(|cx| async move {
-            let directory = tempfile::tempdir().expect("temporary Basic scoring directory");
-            let writer = QuillWriterState::create_with_schema(
-                &cx,
-                directory.path(),
-                POSITIONLESS_QG_SCHEMA,
-                deterministic_config(),
-            )
-            .await
-            .expect("create durable Basic writer");
-            let index = QuillIndex::from_writer(writer);
-            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
-            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
-
-            index
-                .index_document(
-                    &cx,
-                    &IndexableDocument::new("repeat", repeated).with_title("neutral"),
-                )
-                .await
-                .expect("index repeated edge n-gram segment");
-            index
-                .commit(&cx)
-                .await
-                .expect("publish first Basic segment");
-            index
-                .index_document(
-                    &cx,
-                    &IndexableDocument::new("single", single).with_title("neutral"),
-                )
-                .await
-                .expect("index single edge n-gram segment");
-            index
-                .commit(&cx)
-                .await
-                .expect("publish second Basic segment");
-            assert_eq!(
-                index.snapshot().segments().len(),
-                2,
-                "fixture must exercise composite scoring across two sealed segments"
-            );
-
-            let before_reopen = index
-                .search_paginated(&cx, "token", 10, 0, true)
-                .expect("search two-segment Basic fixture");
-            assert_eq!(before_reopen.hits.len(), 2);
-            assert_eq!(
-                before_reopen.hits[0].score.to_bits(),
-                before_reopen.hits[1].score.to_bits(),
-                "Basic tf=1 must remain exact across sealed segments"
-            );
-
-            drop(index);
-            let writer = KeeperWriter::open(&cx, directory.path(), POSITIONLESS_QG_SCHEMA)
-                .await
-                .expect("reopen custom-schema Keeper");
-            let reopened = QuillIndex::from_backend(
-                IndexBackend::Durable(writer),
-                POSITIONLESS_QG_SCHEMA,
-                deterministic_config(),
-            )
-            .expect("bind reopened Basic index");
-            let after_reopen = reopened
-                .search_paginated(&cx, "token", 10, 0, true)
-                .expect("search reopened Basic fixture");
-            assert_eq!(
-                after_reopen, before_reopen,
-                "reopen must preserve Basic ids, order, score bits, and exact count"
             );
         });
     }
@@ -14824,6 +14744,105 @@ mod tests {
                 .expect("search reopened durable index");
             assert_eq!(result.total_count, Some(2));
             assert_eq!(result.doc_count, 3);
+        });
+    }
+
+    /// bd-8nqz.1 flagship: a retained candidate batch hydrates from the
+    /// EXACT snapshot that scored it, even after a newer generation commits —
+    /// while the legacy combined-trait path demonstrably reads the newer
+    /// generation (the race the split exists to fix). Also pins the typed
+    /// rejection of missing and foreign hydration contexts.
+    #[test]
+    fn lexical_read_hydration_is_pinned_to_the_scoring_generation() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig::default()).expect("in-memory index");
+            let doc_v1 = IndexableDocument::new("doc-a", "alpha pinned content")
+                .with_metadata("rev", "v1");
+            index
+                .index_documents(&cx, std::slice::from_ref(&doc_v1))
+                .await
+                .expect("index generation N");
+            index.commit(&cx).await.expect("publish generation N");
+
+            // Score on generation N; candidates defer metadata.
+            let batch = LexicalRead::search_candidates(&index, &cx, "pinned", 10)
+                .await
+                .expect("candidates on generation N");
+            assert!(batch.is_deferred(), "Quill candidates must carry a pin");
+            assert_eq!(batch.results().len(), 1);
+            assert!(
+                batch.results()[0].metadata.is_none(),
+                "candidate metadata is deferred until hydration"
+            );
+            let mut legacy_path = batch.results().to_vec();
+
+            // Publish generation N+1 with different metadata for the same doc.
+            let doc_v2 = IndexableDocument::new("doc-a", "alpha pinned content")
+                .with_metadata("rev", "v2");
+            LexicalWrite::index_document(&index, &cx, &doc_v2)
+                .await
+                .expect("upsert generation N+1");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish generation N+1");
+
+            let rev_of = |result: &ScoredResult| -> Option<String> {
+                result.metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .get("rev")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+            };
+
+            // A fresh search observes N+1.
+            let fresh = LexicalRead::search(&index, &cx, "pinned", 10)
+                .await
+                .expect("fresh search on N+1");
+            assert_eq!(rev_of(&fresh[0]).as_deref(), Some("v2"));
+
+            // The retained batch hydrates from its PINNED generation N.
+            let (mut winners, context) = batch.into_parts();
+            LexicalRead::hydrate_candidates(&index, &cx, context.as_ref(), &mut winners)
+                .await
+                .expect("pinned hydration");
+            assert_eq!(
+                rev_of(&winners[0]).as_deref(),
+                Some("v1"),
+                "hydration must read the scoring snapshot, not the newest one"
+            );
+
+            // Differential control: the legacy combined-trait hydration reads
+            // the CURRENT snapshot and returns v2 for the same retained
+            // candidates — the exact generation race.
+            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut legacy_path)
+                .await
+                .expect("legacy hydration");
+            assert_eq!(
+                rev_of(&legacy_path[0]).as_deref(),
+                Some("v2"),
+                "legacy path demonstrates the race the split fixes"
+            );
+
+            // Missing context: typed rejection, never a silent no-op.
+            let missing = LexicalRead::hydrate_candidates(&index, &cx, None, &mut winners)
+                .await
+                .expect_err("deferred hydration without a context must fail");
+            assert!(
+                matches!(missing, SearchError::SubsystemError { subsystem, .. }
+                    if subsystem == "quill.hydration"),
+            );
+
+            // Foreign context: typed rejection of cross-engine mixing.
+            let foreign = LexicalHydrationContext::new("not-quill", Box::new(7_u32));
+            let mixed =
+                LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
+                    .await
+                    .expect_err("foreign hydration context must fail");
+            assert!(
+                matches!(mixed, SearchError::SubsystemError { subsystem, .. }
+                    if subsystem == "quill.hydration"),
+            );
         });
     }
 }

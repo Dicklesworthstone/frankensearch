@@ -39,9 +39,9 @@ pub use grimoire::{
     TermScratch, TermSectionLengths,
 };
 pub use index::{
-    QuillDocumentWitness, QuillHit, QuillIndex, QuillIndexError, QuillSearchIndex,
-    QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit, SnapshotError, SnapshotPublisher,
-    indexable_document_content_hash,
+    QUILL_LEXICAL_BACKEND, QuillDocumentWitness, QuillHit, QuillIndex, QuillIndexError,
+    QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit, SnapshotError,
+    SnapshotPublisher, indexable_document_content_hash,
 };
 #[cfg(feature = "durability")]
 pub use keeper::UnrepairableSegmentPolicy;
