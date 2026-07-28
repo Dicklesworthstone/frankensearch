@@ -10549,6 +10549,189 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
+    fn harvested_14_score_bits_preserve_ranked_and_counted_orders() {
+        let fixture = make_scalar_g1a_regression_fixture();
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject =
+            crate::engine::QuillSubject::in_memory(config, "harvested-14-score-regression", false)
+                .expect("fresh scalar Quill subject");
+        let mut oracle =
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+                .expect("fresh scalar G1a Tantivy oracle");
+        let semantic_contract = SemanticContract::scalar_g1a();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            DifferentialCampaignEngine::begin_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Quill corpus");
+            DifferentialCampaignEngine::begin_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Tantivy corpus");
+            for batch in fixture.documents.chunks(5) {
+                DifferentialCampaignEngine::index_batch(&mut subject, &cx, batch)
+                    .await
+                    .expect("index Quill batch");
+                DifferentialCampaignEngine::index_batch(&mut oracle, &cx, batch)
+                    .await
+                    .expect("index Tantivy batch");
+            }
+            DifferentialCampaignEngine::commit_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Quill corpus");
+            DifferentialCampaignEngine::commit_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Tantivy corpus");
+
+            const TARGET: &str = "test-cooking-015";
+            const FULL_QUERY: &str = "how to sear a steak properly";
+            let mut term_scores = Vec::new();
+            for query in ["how", "to", "sear", "a", "steak", "properly"] {
+                let quill = subject
+                    .index()
+                    .expect("committed Quill index")
+                    .search_paginated(&cx, query, 100, 0, false)
+                    .expect("search ranked Quill");
+                let tantivy = oracle
+                    .index()
+                    .search_doc_ids(&cx, query, 100)
+                    .expect("search ranked Tantivy");
+                let quill_score = quill
+                    .hits
+                    .iter()
+                    .find(|hit| hit.document_id == TARGET)
+                    .map(|hit| hit.score);
+                let tantivy_score = tantivy
+                    .iter()
+                    .find(|hit| hit.doc_id.as_str() == TARGET)
+                    .map(|hit| hit.bm25_score);
+                eprintln!(
+                    "harvested-14 query={query:?} quill={:?} tantivy={:?}",
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits)
+                );
+                assert_eq!(
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits),
+                    "single-term score drift for {query:?}"
+                );
+                if let Some(score) = quill_score {
+                    term_scores.push((query, score));
+                }
+            }
+            let parse_order_sum = term_scores
+                .iter()
+                .fold(0.0_f32, |sum, (_, score)| sum + score);
+            eprintln!(
+                "harvested-14 term_scores={:?} parse_order_sum={:#010x}",
+                term_scores
+                    .iter()
+                    .map(|(term, score)| (*term, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                parse_order_sum.to_bits()
+            );
+
+            let quill_ranked = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, false)
+                .expect("search ranked Quill aggregate");
+            let tantivy_ranked = oracle
+                .index()
+                .search_doc_ids(&cx, FULL_QUERY, 100)
+                .expect("search ranked Tantivy aggregate");
+            let quill_ranked_score = quill_ranked
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("ranked Quill aggregate contains target")
+                .score;
+            let tantivy_ranked_score = tantivy_ranked
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("ranked Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                tantivy_ranked_score.to_bits(),
+                "ranked aggregate must preserve Tantivy TopDocs f32 accumulation order"
+            );
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                0x4005_5fc7,
+                "fixture must keep exercising the ranked TopDocs order"
+            );
+            assert_eq!(
+                parse_order_sum.to_bits(),
+                quill_ranked_score.to_bits(),
+                "ranked root must retain analyzed term order as children exhaust"
+            );
+
+            let quill_counted = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, true)
+                .expect("search counted Quill aggregate");
+            let tantivy_counted = oracle
+                .index()
+                .search_doc_ids_counted(&cx, FULL_QUERY, 100)
+                .expect("search counted Tantivy aggregate");
+            let quill_counted_score = quill_counted
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("counted Quill aggregate contains target")
+                .score;
+            let tantivy_counted_score = tantivy_counted
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("counted Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                tantivy_counted_score.to_bits(),
+                "counted aggregate must preserve Tantivy exhaustive f32 accumulation order"
+            );
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                0x4005_5fc8,
+                "fixture must keep exercising the exhaustive swap-remove order"
+            );
+            assert_ne!(
+                quill_ranked_score.to_bits(),
+                quill_counted_score.to_bits(),
+                "fixture must distinguish Tantivy's ranked and counted collector contracts"
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
     fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "default");
