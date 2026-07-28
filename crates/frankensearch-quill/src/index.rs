@@ -15052,8 +15052,8 @@ mod tests {
     fn lexical_read_hydration_is_pinned_to_the_scoring_generation() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(QuillConfig::default()).expect("in-memory index");
-            let doc_v1 = IndexableDocument::new("doc-a", "alpha pinned content")
-                .with_metadata("rev", "v1");
+            let doc_v1 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v1");
             index
                 .index_documents(&cx, std::slice::from_ref(&doc_v1))
                 .await
@@ -15073,8 +15073,8 @@ mod tests {
             let mut legacy_path = batch.results().to_vec();
 
             // Publish generation N+1 with different metadata for the same doc.
-            let doc_v2 = IndexableDocument::new("doc-a", "alpha pinned content")
-                .with_metadata("rev", "v2");
+            let doc_v2 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v2");
             LexicalWrite::index_document(&index, &cx, &doc_v2)
                 .await
                 .expect("upsert generation N+1");
@@ -15131,10 +15131,9 @@ mod tests {
 
             // Foreign context: typed rejection of cross-engine mixing.
             let foreign = LexicalHydrationContext::new("not-quill", Box::new(7_u32));
-            let mixed =
-                LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
-                    .await
-                    .expect_err("foreign hydration context must fail");
+            let mixed = LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
+                .await
+                .expect_err("foreign hydration context must fail");
             assert!(
                 matches!(mixed, SearchError::SubsystemError { subsystem, .. }
                     if subsystem == "quill.hydration"),
