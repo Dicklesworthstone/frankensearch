@@ -75,7 +75,7 @@ pub use frankensearch_core::config::{ZERO_SIGNAL_SCHEMA_VERSION, ZeroSignalReaso
 #[cfg(feature = "ann")]
 pub use hnsw::{
     AnnFallbackReason, AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH,
-    HNSW_DEFAULT_M, HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
+    HNSW_DEFAULT_M, HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex, HnswLoadDisposition,
 };
 pub use in_memory::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 pub use mrl::{MrlConfig, MrlSearchStats};

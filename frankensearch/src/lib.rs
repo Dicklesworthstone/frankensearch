@@ -324,7 +324,7 @@ pub use frankensearch_index::{
 };
 
 #[cfg(feature = "ann")]
-pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex};
+pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex, HnswLoadDisposition};
 
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
@@ -659,6 +659,12 @@ mod feature_matrix_smoke {
         let index = VectorIndex::open(&path).expect("reopen vector index");
         let ann =
             HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("build ann");
+        let ann_path = dir.path().join("feature-matrix.hnsw");
+        ann.save(&ann_path).expect("save native ann");
+        let (ann, disposition): (HnswIndex, HnswLoadDisposition) =
+            HnswIndex::load_with_disposition(&ann_path, &index)
+                .expect("load native ann through facade");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
         let (hits, stats): (Vec<VectorHit>, AnnSearchStats) = ann
             .knn_search_with_stats(&[1.0, 0.0, 0.0, 0.0], 1, 16)
             .expect("query ann");

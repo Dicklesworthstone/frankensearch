@@ -170,7 +170,8 @@ struct ValidatedHnswGeneration {
 
 /// How an HNSW load obtained its in-memory graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HnswLoadDisposition {
+#[non_exhaustive]
+pub enum HnswLoadDisposition {
     /// The current native graph/data pair was deserialized from disk.
     Native,
     /// Metadata was readable, but the graph had to be rebuilt from the source index.
@@ -328,7 +329,21 @@ impl HnswIndex {
 
     /// Load an ANN index and report whether its graph came from native sidecars
     /// or was rebuilt from `source_index`.
-    pub(crate) fn load_with_disposition(
+    ///
+    /// This is the fail-closed inspection surface for consumers that must
+    /// distinguish the exact persisted ANN artifact from a compatible
+    /// in-memory fallback. Neither outcome writes, replaces, renames, or
+    /// changes permissions on `path`, its native sidecars, or `source_index`.
+    /// Callers that require the selected on-disk graph must accept only
+    /// [`HnswLoadDisposition::Native`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexCorrupted` when metadata is unreadable,
+    /// malformed, dimensionally incompatible, or the source rows cannot be
+    /// decoded. A readable legacy/stale/corrupt native graph is instead
+    /// reported as [`HnswLoadDisposition::Rebuilt`] after an in-memory rebuild.
+    pub fn load_with_disposition(
         path: &Path,
         source_index: &VectorIndex,
     ) -> SearchResult<(Self, HnswLoadDisposition)> {
@@ -2823,6 +2838,77 @@ mod tests {
         VectorIndex::open(path)
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct ImmutableTreeEntry {
+        relative_path: PathBuf,
+        kind: &'static str,
+        len: u64,
+        modified: Option<SystemTime>,
+        readonly: bool,
+        permission_mode: Option<u32>,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    fn snapshot_permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode())
+    }
+
+    #[cfg(not(unix))]
+    fn snapshot_permission_mode(_: &std::fs::Metadata) -> Option<u32> {
+        None
+    }
+
+    fn snapshot_immutable_tree(root: &Path) -> std::io::Result<Vec<ImmutableTreeEntry>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            entries: &mut Vec<ImmutableTreeEntry>,
+        ) -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+            let bytes = file_type
+                .is_file()
+                .then(|| std::fs::read(path))
+                .transpose()?;
+            entries.push(ImmutableTreeEntry {
+                relative_path,
+                kind,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                readonly: metadata.permissions().readonly(),
+                permission_mode: snapshot_permission_mode(&metadata),
+                bytes,
+            });
+            if file_type.is_dir() {
+                let mut children = std::fs::read_dir(path)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                children.sort();
+                for child in children {
+                    visit(root, &child, entries)?;
+                }
+            }
+            Ok(())
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries)?;
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
+    }
+
     fn reject_hnsw_metadata_publish(_: &Path, _: &Path, _: &[u8]) -> SearchResult<()> {
         Err(SearchError::Io(std::io::Error::other(
             "injected metadata publication failure",
@@ -4463,6 +4549,67 @@ mod tests {
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
         assert!((hits[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn public_strict_load_reports_native_without_mutating_selected_artifacts() {
+        let root = temp_path("public-strict-native", "dir");
+        std::fs::create_dir_all(&root).expect("create strict native fixture");
+        let fsvi_path = root.join("selected-source.fsvi");
+        let vectors: Vec<Vec<f32>> = (0..32).map(|i| normalized_vector(i, 16)).collect();
+        let source = write_index(&fsvi_path, &vectors).expect("write source FSVI");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("build ANN");
+        let metadata_path = root.join("selected-ann.hnsw");
+        ann.save(&metadata_path).expect("save selected native ANN");
+        let before = snapshot_immutable_tree(&root).expect("snapshot selected artifacts");
+
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &source).expect("strict native load");
+
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        assert_eq!(loaded.len(), source.live_count());
+        assert_eq!(
+            snapshot_immutable_tree(&root).expect("snapshot after strict native load"),
+            before,
+            "native inspection must preserve bytes, mtimes, permissions, and directory inventory"
+        );
+    }
+
+    #[test]
+    fn public_strict_load_reports_rebuilt_for_stale_source_without_mutation() {
+        let root = temp_path("public-strict-stale", "dir");
+        std::fs::create_dir_all(&root).expect("create strict stale fixture");
+        let original_path = root.join("original-source.fsvi");
+        let original_vectors: Vec<Vec<f32>> = (0..24).map(|i| normalized_vector(i, 12)).collect();
+        let original = write_index(&original_path, &original_vectors).expect("original FSVI");
+        let ann = HnswIndex::build_from_vector_index(&original, HnswConfig::default())
+            .expect("build original ANN");
+        let metadata_path = root.join("selected-ann.hnsw");
+        ann.save(&metadata_path).expect("save selected ANN");
+
+        let replacement_path = root.join("replacement-source.fsvi");
+        let replacement_vectors: Vec<Vec<f32>> =
+            (10_000..10_024).map(|i| normalized_vector(i, 12)).collect();
+        let replacement =
+            write_index(&replacement_path, &replacement_vectors).expect("replacement FSVI");
+        let before = snapshot_immutable_tree(&root).expect("snapshot stale fixture");
+
+        let (loaded, disposition) = HnswIndex::load_with_disposition(&metadata_path, &replacement)
+            .expect("stale sidecar should rebuild in memory");
+
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+        assert_eq!(loaded.len(), replacement.live_count());
+        assert!(
+            loaded
+                .matches_vector_index(&replacement)
+                .expect("rebuilt graph matches replacement")
+        );
+        assert_eq!(
+            snapshot_immutable_tree(&root).expect("snapshot after stale load"),
+            before,
+            "stale detection and in-memory rebuild must preserve every selected artifact"
+        );
     }
 
     #[test]
