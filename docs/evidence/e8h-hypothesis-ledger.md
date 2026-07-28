@@ -51,10 +51,14 @@ Retry predicate:   <filled only on REJECT>
 
 QG-2 cell `bulk/medium/1/positions_on`, warmup 5, 30 paired runs, ELF built at
 `f9c6c57e` (the aarch64 fix commit — this cell was UNRUNNABLE on ARM before it).
-NOTE: this run predates the `ebd91757` terminal-join fairness fix, so its
-Tantivy arm carries the same rearmed-writer construct/drop the trj quarantine
-describes — treat these numbers as quarantine-class diagnostics too; the m4
-rerun on an `ebd91757`+ ELF supersedes them.
+FAIRNESS STATUS (corrected after ancestry verification): the ELF commit
+`f9c6c57e` CONTAINS `ebd91757`'s terminal-join replacement
+(`git merge-base --is-ancestor` verified), so this run executed the FIXED
+Tantivy path — these are the first post-fix cross-engine numbers on any
+class. Caveat that keeps them diagnostic: the run set no QUILL_PERF_RUN_ID,
+so the harness persisted no attempt bundle and there is no
+`writer_rearmed=false` lifecycle receipt on disk — a receipt-bearing rerun
+(RUN_ID set; perf-runner now defaults it) upgrades them.
 
 | arm | p50 docs/s | median CI95 |
 |---|---|---|

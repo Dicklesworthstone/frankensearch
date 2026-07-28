@@ -138,6 +138,11 @@ if [ "$ALLOW_RCH" -eq 0 ]; then
     export RCH_CARGO_WRAPPER_BYPASS=1
 fi
 
+# The QG harness persists attempt bundles (evidence + lifecycle receipts)
+# only when QUILL_PERF_RUN_ID is set; a run without it leaves no on-disk
+# receipt trail. Default it to this run's identity, never override a caller's.
+export QUILL_PERF_RUN_ID="${QUILL_PERF_RUN_ID:-$CLASS-$LABEL-$STAMP}"
+
 # --- provenance --------------------------------------------------------------
 [ "$CALIBRATE_AA" -eq 1 ] && export QUILL_PERF_CALIBRATE_AA=1
 CMD_STR="$(printf '%q ' "${CMD[@]}")"
