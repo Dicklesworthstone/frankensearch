@@ -321,11 +321,6 @@ fn preflight_indexing_fixtures(
         IndexableDocument::new("qg-preflight-single", "term00001 qgpreflight"),
         IndexableDocument::new("qg-preflight-decoy", "term00002 qgpreflight"),
     ];
-    let expected = [
-        "qg-preflight-repeated".to_owned(),
-        "qg-preflight-single".to_owned(),
-    ];
-
     for spec in selected
         .iter()
         .filter(|spec| matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg2))
@@ -354,6 +349,14 @@ fn preflight_indexing_fixtures(
         }
 
         let positions = spec.positions.unwrap_or(PositionMode::On);
+        let expected = if positions.enabled() {
+            ["qg-preflight-repeated", "qg-preflight-single"]
+        } else {
+            // Basic postings canonicalize both term frequencies to one while
+            // retaining field lengths. The shorter single-occurrence document
+            // must therefore outrank the longer repeated-term document.
+            ["qg-preflight-single", "qg-preflight-repeated"]
+        };
         let schema = if positions.enabled() {
             DEFAULT_SCHEMA.name
         } else {

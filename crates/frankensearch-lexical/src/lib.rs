@@ -494,7 +494,7 @@ fn build_schema_with_positions(positions: bool) -> (Schema, SchemaFields) {
     let index_record_option = if positions {
         tantivy::schema::IndexRecordOption::WithFreqsAndPositions
     } else {
-        tantivy::schema::IndexRecordOption::WithFreqs
+        tantivy::schema::IndexRecordOption::Basic
     };
     let content_options = TextOptions::default()
         .set_indexing_options(
@@ -2569,6 +2569,38 @@ mod tests {
     }
 
     // ─── Search tests ───────────────────────────────────────────────────
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn benchmark_schema_without_positions_uses_presence_only_postings() {
+        let idx = TantivyIndex::in_memory_with_benchmark_config(50_000_000, 1, false)
+            .expect("create position-free benchmark oracle");
+        run_with_cx(|cx| async move {
+            idx.index_documents(
+                &cx,
+                &[
+                    IndexableDocument::new(
+                        "repeated",
+                        "term00001 term00001 term00001 term00001 term00001 qgpreflight",
+                    ),
+                    IndexableDocument::new("single", "term00001 qgpreflight"),
+                    IndexableDocument::new("decoy", "term00002 qgpreflight"),
+                ],
+            )
+            .await
+            .expect("index position-free oracle fixture");
+            idx.commit(&cx)
+                .await
+                .expect("commit position-free oracle fixture");
+
+            let hits = idx
+                .search(&cx, "term00001", 2)
+                .await
+                .expect("search position-free oracle fixture");
+            let ids: Vec<_> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+            assert_eq!(ids, ["single", "repeated"]);
+        });
+    }
 
     #[test]
     fn search_empty_query_returns_empty() {
