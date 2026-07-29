@@ -30,10 +30,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::perf::{
-    DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PairedClaimState, PairedEstimatorConfig,
-    PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfRawSample, median_sorted, percentile, splitmix64,
-    validate_paired_blocks,
+    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PairedClaimState,
+    PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfRawSample,
+    median_sorted, percentile, splitmix64, validate_paired_blocks,
 };
 use crate::{MachineClassEvidenceBinding, VerifiedRunnerIdentity};
 
@@ -354,6 +354,9 @@ pub struct MachineIdentity {
     pub arch: String,
     /// Logical CPU count observed by the process.
     pub logical_cpus: usize,
+    /// Host topology, ISA, affinity, and exact thread widths exercised by the
+    /// invocation.
+    pub execution: PerfExecutionProvenance,
     /// CPU frequency governor, when the platform exposes one.
     pub cpu_governor: Option<String>,
     /// One-minute load average at run start, when readable.
@@ -366,12 +369,13 @@ impl MachineIdentity {
     /// Capture the current machine identity. Unavailable probes report
     /// `None` rather than fabricating zeros.
     #[must_use]
-    pub fn capture() -> Self {
+    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
         Self {
             fingerprint: crate::perf::machine_fingerprint(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+            execution: PerfExecutionProvenance::capture(threads_actually_used),
             cpu_governor: fs::read_to_string(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             )
@@ -392,6 +396,7 @@ impl MachineIdentity {
             || self.os.trim().is_empty()
             || self.arch.trim().is_empty()
             || self.logical_cpus == 0
+            || !self.execution.is_complete()
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: "machine identity requires fingerprint, os, arch, and CPUs".to_owned(),
@@ -785,6 +790,12 @@ pub enum EvidenceCellBody {
         /// Complete replayable paired result, including both-engine absolute
         /// distributions and the bounded raw samples they recompute from.
         paired: Box<PairedExperimentResult>,
+        /// The identical A/B stream adjudicated against a same-invocation
+        /// treatment/treatment null. QG-1 uses Tantivy as control and Quill as
+        /// treatment, so this carries the replayable Quill/Quill null while
+        /// `paired.null` carries Tantivy/Tantivy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        treatment_arm_null: Option<Box<PairedExperimentResult>>,
         /// Two-stage A/B effect estimate for hierarchical latency cells.
         hierarchical: Option<HierarchicalLatencyEstimate>,
         /// Two-stage same-invocation A/A null estimate for hierarchical latency
@@ -1072,6 +1083,7 @@ impl EvidenceCell {
             estimand,
             body: EvidenceCellBody::Paired {
                 paired: Box::new(paired),
+                treatment_arm_null: None,
                 hierarchical,
                 hierarchical_null,
                 reconciliation,
@@ -1079,6 +1091,69 @@ impl EvidenceCell {
             status,
             reasons,
         })
+    }
+
+    /// Attach the treatment arm's independently measured same-invocation A/A
+    /// null to an already evaluated A/B cell.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched A/B stream, malformed replay, unbounded retained
+    /// samples, or use on a non-paired cell.
+    pub fn attach_treatment_arm_null(
+        &mut self,
+        treatment_arm_null: PairedExperimentResult,
+        policy: &EvidencePolicy,
+    ) -> Result<(), EvidenceArtifactError> {
+        policy.validate()?;
+        treatment_arm_null.verify_recomputed()?;
+        let EvidenceCellBody::Paired {
+            paired,
+            treatment_arm_null: slot,
+            ..
+        } = &mut self.body
+        else {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "treatment-arm A/A null requires a paired evidence cell".to_owned(),
+            });
+        };
+        if treatment_arm_null.scope != paired.scope
+            || treatment_arm_null.provenance != paired.provenance
+            || treatment_arm_null.config != paired.config
+            || treatment_arm_null.effect != paired.effect
+            || treatment_arm_null.effect_samples != paired.effect_samples
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "treatment-arm A/A null does not share the cell's exact A/B stream"
+                    .to_owned(),
+            });
+        }
+        let retained = paired.effect_samples.len()
+            + paired.null_samples.len()
+            + treatment_arm_null.effect_samples.len()
+            + treatment_arm_null.null_samples.len();
+        if retained > policy.max_raw_samples {
+            return Err(EvidenceArtifactError::UnboundedRawSamples {
+                cell_id: self.cell_id.clone(),
+                count: retained,
+                max: policy.max_raw_samples,
+            });
+        }
+        if treatment_arm_null.status != PairedEvidenceStatus::Valid {
+            self.reasons.push(EvidenceReason::new(
+                "evidence.treatment_arm_null_invalid",
+                format!(
+                    "treatment/treatment estimator status {:?} with {} reason(s)",
+                    treatment_arm_null.status,
+                    treatment_arm_null.reasons.len()
+                ),
+                EvidenceSeverity::NoClaim,
+            ));
+            self.status = EvidenceDecisionStatus::InvalidNull;
+        }
+        *slot = Some(Box::new(treatment_arm_null));
+        self.reasons.truncate(EVIDENCE_MAX_REASONS);
+        Ok(())
     }
 
     /// Build a facts cell for measurements outside noisy timing A/A.
@@ -1149,9 +1224,18 @@ impl EvidenceCell {
                     && hierarchical.is_some()
                     && hierarchical_null.is_some()
             }
-            EvidenceCellBody::Paired { paired, .. } => {
+            EvidenceCellBody::Paired {
+                paired,
+                treatment_arm_null,
+                ..
+            } => {
                 self.status == EvidenceDecisionStatus::MeasuredProvisional
                     && paired.claim_state == PairedClaimState::EligibleForDecision
+                    && (self.spec.gate != PerfGate::Qg1
+                        || treatment_arm_null.as_ref().is_some_and(|null| {
+                            null.status == PairedEvidenceStatus::Valid
+                                && null.claim_state == PairedClaimState::EligibleForDecision
+                        }))
             }
             EvidenceCellBody::Facts { .. } => false,
         }
@@ -1165,9 +1249,18 @@ impl EvidenceCell {
     /// mismatch between stored summaries and their raw sources.
     pub fn verify_recomputed(&self, policy: &EvidencePolicy) -> Result<(), EvidenceArtifactError> {
         match &self.body {
-            EvidenceCellBody::Paired { paired, .. } => {
+            EvidenceCellBody::Paired {
+                paired,
+                treatment_arm_null,
+                ..
+            } => {
                 paired.verify_recomputed()?;
-                let rebuilt = Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
+                let mut rebuilt =
+                    Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
+                if let Some(treatment_arm_null) = treatment_arm_null {
+                    rebuilt
+                        .attach_treatment_arm_null(treatment_arm_null.as_ref().clone(), policy)?;
+                }
                 if rebuilt == *self {
                     Ok(())
                 } else {
@@ -1867,7 +1960,7 @@ pub fn load_legacy_gate_artifact_v3(
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<missing>");
-    if found != PERF_ARTIFACT_SCHEMA_VERSION {
+    if found != LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3 {
         return Err(EvidenceArtifactError::SchemaMismatch {
             found: found.to_owned(),
         });
@@ -2139,6 +2232,13 @@ mod tests {
         estimate_paired_experiment(&effect, &null, &config()).expect("valid experiment")
     }
 
+    fn valid_treatment_arm_null_experiment(ratio: f64) -> PairedExperimentResult {
+        let effect = gauge_stream(&effect_pairs(12, ratio), 0, 0, None);
+        let null = gauge_stream(&quiet_null_pairs(12), 20_000, 20_000, None);
+        estimate_paired_experiment(&effect, &null, &config())
+            .expect("valid treatment-arm null experiment")
+    }
+
     fn policy() -> EvidencePolicy {
         EvidencePolicy::predeclared()
     }
@@ -2169,6 +2269,16 @@ mod tests {
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 logical_cpus: 8,
+                execution: PerfExecutionProvenance {
+                    host_identity: "test-machine".to_owned(),
+                    physical_cores: 4,
+                    logical_threads: 8,
+                    process_available_threads: 8,
+                    threads_actually_used: vec![1],
+                    runtime_detected_isa: vec!["avx2".to_owned()],
+                    cpu_affinity_allowed_list: Some("0-7".to_owned()),
+                    affinity_or_cpuset_cap: None,
+                },
                 cpu_governor: None,
                 load_average_start: Some(0.5),
                 load_average_end: Some(0.6),
@@ -2218,12 +2328,15 @@ mod tests {
     }
 
     fn provisional_cell() -> EvidenceCell {
-        EvidenceCell::evaluate(
+        let mut cell = EvidenceCell::evaluate(
             cell_spec(PerfGate::Qg1, EvidenceRole::Required),
             valid_experiment(1.10),
             &policy(),
         )
-        .expect("provisional cell")
+        .expect("provisional cell");
+        cell.attach_treatment_arm_null(valid_treatment_arm_null_experiment(1.10), &policy())
+            .expect("attach QG-1 treatment-arm null");
+        cell
     }
 
     fn provisional_artifact() -> PerfEvidenceArtifact {
@@ -2318,7 +2431,16 @@ mod tests {
         assert!(cell.claim_eligible());
         assert!(cell.reasons.is_empty());
         match &cell.body {
-            EvidenceCellBody::Paired { reconciliation, .. } => {
+            EvidenceCellBody::Paired {
+                treatment_arm_null,
+                reconciliation,
+                ..
+            } => {
+                assert!(
+                    treatment_arm_null
+                        .as_ref()
+                        .is_some_and(|null| null.status == PairedEvidenceStatus::Valid)
+                );
                 assert!(reconciliation.direction_agrees);
                 assert!(reconciliation.within_tolerance);
             }
@@ -3290,10 +3412,11 @@ mod tests {
     #[test]
     fn old_schema_never_masquerades_and_legacy_load_is_explicit() {
         let legacy = PerfGateArtifact {
-            schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+            schema_version: LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3.to_owned(),
             gate: PerfGate::Qg1,
             bench_elf_sha256: "a".repeat(64),
             machine_fingerprint: "legacy-machine".to_owned(),
+            execution: None,
             git_rev: "deadbeef".to_owned(),
             run_window: "legacy-window".to_owned(),
             run_id: "legacy-run".to_owned(),
@@ -3318,7 +3441,8 @@ mod tests {
 
         assert!(matches!(
             PerfEvidenceArtifact::load_verified(&legacy_path),
-            Err(EvidenceArtifactError::SchemaMismatch { found }) if found == PERF_ARTIFACT_SCHEMA_VERSION
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3
         ));
         let loaded = load_legacy_gate_artifact_v3(&legacy_path).expect("legacy read-only load");
         assert_eq!(loaded, legacy);

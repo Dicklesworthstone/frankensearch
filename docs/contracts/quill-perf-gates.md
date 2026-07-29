@@ -93,9 +93,10 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The v3 QG writer's legacy `paired_ab`/`paired_null` rows are diagnostics only.
+The v4 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
+`paired_null_quill` rows are diagnostics only.
 Decision-grade output is the `quill-perf-evidence-v2` artifact (`bd-uh2f` /
-`bd-uh2f.1`), which the harness now emits beside every v3 artifact from the
+`bd-uh2f.1`), which the harness now emits beside every v4 artifact from the
 exact same raw paired blocks.
 
 ## Evidence artifacts (`quill-perf-evidence-v2`)
@@ -103,12 +104,15 @@ exact same raw paired blocks.
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
 carries: both engines' absolute distributions from the same paired blocks, the
-paired log-ratio effect with a seeded bootstrap CI, the same-invocation A/A
-result, bounded raw samples that every summary recomputes from on load, and a
-same-scope absolute-versus-paired reconciliation. Run provenance records the
+paired log-ratio effect with a seeded bootstrap CI, same-invocation
+Tantivy/Tantivy and Quill/Quill A/A results for QG-1, bounded raw samples that
+every summary recomputes from on load, and a same-scope
+absolute-versus-paired reconciliation. Run provenance records the
 executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
 the exact NUL-separated and NUL-terminated argv SHA-256,
-rustc/target/profile/features, machine identity with governor and load, peak RSS
+rustc/target/profile/features, host identity, host-wide physical cores and
+logical threads, process-available concurrency, exact thread widths exercised,
+runtime-detected ISA, effective affinity/cpuset cap, governor and load, peak RSS
 with its method (`unsupported` is reported honestly, never a zero), and
 corpus/query-set hashes with generator coordinates.
 
@@ -122,6 +126,11 @@ reject duplicate and unknown fields. Loading re-admits the embedded receipt
 against the frozen registry; resealing an artifact cannot legitimize a stale,
 drifted, mixed, incomplete, or tampered identity. An explicit `unverified`
 binding remains durable for diagnosis but is never ratchet-admissible.
+The v4 threshold artifact's execution block is only a compatibility projection:
+promotion requires it to equal the sealed current-evidence execution block and
+to agree with the verified receipt's physical/logical topology, thread budget,
+and effective CPU-set bounds. A caller-supplied execution block is never an
+independent identity authority.
 
 Receipt binding is deliberately two-phase. The live benchmark writes the
 current v2 artifact with an explicit `unverified` binding and the exact
