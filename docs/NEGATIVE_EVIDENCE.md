@@ -17453,3 +17453,47 @@ Tantivy commit-boundary/order/drift failure. Require both A/A controls before
 interpreting any A/B magnitude, and require the full normative matrix plus an
 immediate same-ELF reproduction before activation. Never weaken a null law,
 select a favorable row, or gate on CV.
+
+### 2026-07-29 — Hand-written canonical encoder is no-ship after a contaminated adverse diagnostic (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
+
+**Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
+An experimental `index.rs` overlay on committed candidate
+`37c42ed4a278e6fa50022c3e358db65388802b22` replaced
+`serde_json::to_vec` with a scalar hand-written canonical JSON emitter. The
+index-only diff SHA-256 was
+`77f95402188255bd62a65e98dbc9a262a2420a8197cdd6dc882e11f6fb8101f8`.
+Strict-remote correctness job `j-29952570386546852` passed all 15 selected
+tests, including hostile Unicode and control bytes, every `u8` digit-width
+boundary, metadata insertion-order permutations, canonical byte equality,
+content-hash equality, and complete deterministic FSLX segment identity.
+
+The same-binary timing job `j-29952570386546854` executed ELF SHA-256
+`21d8aa832825fdecf69a95069ab66c15bbdfb676f1e69b4025f3ef3bb35a88e4`
+(51,677,560 bytes) on worker `vmi1227854`. Its raw 41-round, four-inner
+diagnostic reported this same-invocation A/A null: `0.989567 [0.977726,
+1.000756]` for serde/serde. The direct/serde latency ratio was
+`1.133086 [1.123543, 1.140405]`; raw absolutes were 6,084.7 ns/document for
+serde and 6,791.2 ns/document for the direct emitter.
+
+Those timing values are **not admissible**. The job executed from 13:48:09Z
+through 14:02:58Z, while unrelated four-slot job
+`j-29952570386546855` began on the same eight-slot worker at 13:59:32Z.
+The final approximately 203 seconds therefore ran under cross-project CPU,
+memory, and cache contention. The apparent 13.3% regression is retained only
+as an adverse diagnostic; neither its narrow interval nor its apparent null
+can establish a performance verdict.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** Exact
+correctness is insufficient to land an optimization without admissible
+positive evidence. The entire production, test, and benchmark overlay was
+manually removed, and `index.rs` again matches committed source. W2.5 remains
+open for distinct mechanisms.
+
+**Retry predicate:** do not rerun the same scalar per-byte emitter merely to
+seek a favorable sample. Revisit only after a profile or counted allocation
+receipt names a different mechanism, such as block escape scanning or a
+single-pass serializer/hash/IDMAP sink. First repeat the same correctness
+oracles, then run the same-binary A/A plus A/B on a pinned worker with
+exclusive-worker occupancy proven for the complete timed interval. A terminal
+Apple-Silicon or Threadripper campaign claim still requires the separate
+cross-engine contract.

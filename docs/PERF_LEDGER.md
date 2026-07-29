@@ -7951,3 +7951,48 @@ only on a distinct eligible 64C/128T host or after a counted mechanism removes
 the Tantivy commit-boundary/order/drift failure. Activation still requires the
 full gate and immediate same-ELF reproduction; never weaken a null law, select
 a favorable row, or gate on CV.
+
+## 2026-07-29 — W2.5 scalar canonical encoder: INVALID-EXTERNAL-INTERFERENCE / NO-SHIP (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
+
+**Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
+The experimental source base was committed candidate
+`37c42ed4a278e6fa50022c3e358db65388802b22`; its uncommitted, index-only
+overlay had SHA-256
+`77f95402188255bd62a65e98dbc9a262a2420a8197cdd6dc882e11f6fb8101f8`.
+It replaced `serde_json::to_vec` in deterministic IDMAP serialization with a
+scalar direct emitter.
+
+Correctness job `j-29952570386546852` ran strictly remote and passed 15/15
+selected tests: independent golden bytes, hostile Unicode/control content,
+all `u8` digit-width boundaries, metadata insertion-order permutations,
+canonical byte and content-hash equality, and whole FSLX segment byte
+identity.
+
+Timing job `j-29952570386546854` ran exact ELF SHA-256
+`21d8aa832825fdecf69a95069ab66c15bbdfb676f1e69b4025f3ef3bb35a88e4`
+(51,677,560 bytes) on `vmi1227854`. The raw 41-round, four-inner result was:
+
+- serde/serde same-invocation A/A null: `0.989567 [0.977726, 1.000756]`;
+- direct/serde latency median-CI:
+  `1.133086 [1.123543, 1.140405]`;
+- raw medians: serde 6,084.7 ns/document; direct 6,791.2 ns/document.
+
+The entire timing result is **invalid**, including the apparently admissible
+same-binary null. Its execution interval was 13:48:09Z–14:02:58Z. At
+13:59:32Z, unrelated four-slot job `j-29952570386546855` started on the same
+eight-slot worker and overlapped approximately 203 seconds of the measured
+run. This is unbounded cross-project CPU, memory, and cache interference. The
+raw 1.133x slowdown is recorded only as an adverse diagnostic and may not be
+quoted as a decision-valid regression.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** The
+candidate has exact correctness but no admissible positive timing evidence;
+the entire overlay was manually removed and no product change landed. This is
+not a QG activation, baseline, incumbent comparison, or terminal W2.5 verdict.
+
+Retry only for a profile-named, materially different mechanism such as block
+escape scanning or a one-pass serializer/hash/IDMAP sink. Require the same
+byte/hash/whole-segment oracle first, then prove same-binary A/A and A/B with
+exclusive-worker occupancy bound over the complete interval. Terminal W2.5
+claims still require the separate Apple-Silicon and Threadripper cross-engine
+contract.
