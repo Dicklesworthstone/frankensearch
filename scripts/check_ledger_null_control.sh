@@ -31,6 +31,7 @@ Usage:
   scripts/check_ledger_null_control.sh --candidate <lever> --surface <target>
   scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
   scripts/check_ledger_null_control.sh --selfcheck
+  scripts/check_ledger_null_control.sh --leakcheck
   scripts/check_ledger_null_control.sh --install-hook
 
 Options:
@@ -39,7 +40,12 @@ Options:
   --staged            Gate newly added staged rows (default; pre-commit).
   --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
   --all               Mechanical whole-ledger report; never blocks.
-  --selfcheck         Exercise fail-closed synthetic contract cases.
+  --selfcheck         Exercise fail-closed synthetic contract cases
+                      (also runs --leakcheck).
+  --leakcheck         Regression-check per-entry flag leakage across mixed
+                      history (the 79d999ad bug) via a temp-repo staged/since
+                      simulation. LEDGER_LEAKCHECK_TARGET=<path> substitutes
+                      the script under test (RED-proofing old versions).
   --ledger <path>     Override the default ledger set (test/diagnostic use).
   --install-hook      Point this checkout at the tracked .githooks directory.
 
@@ -96,6 +102,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --selfcheck)
       MODE="selfcheck"
+      shift
+      ;;
+    --leakcheck)
+      MODE="leakcheck"
       shift
       ;;
     --ledger)
@@ -626,6 +636,138 @@ run_selfcheck() {
   echo "[ledger-selfcheck] OK: ${SELF_CHECK_PASSED}/${SELF_CHECK_TOTAL} contract cases across both ledgers"
 }
 
+# --- leakcheck: regression coverage for the 79d999ad per-entry flag leak ---
+# Mixed-history topology the ordinary --selfcheck cannot reach (it treats every
+# row as new): HISTORICAL committed entries arm cv_verdict, decision_lines KEEP
+# tokens, and competitive_claim; then ONE new staged row is linted. A correct
+# linter judges the new row on its own text; the pre-79d999ad linter leaked the
+# historical flags onto it and falsely blocked. A positive control (a genuinely
+# non-conformant staged row) proves the harness actually exercises the linter,
+# so a broken harness can never pass vacuously.
+
+cleanup_leakcheck_dir() {
+  # Conservative cleanup matching scripts/install.sh precedent (no rm -rf).
+  local dir="$1"
+  [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* ]] || return 0
+  find "${dir}" -depth -mindepth 1 \( -type f -o -type l \) -delete 2>/dev/null || true
+  find "${dir}" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+  rmdir "${dir}" 2>/dev/null || true
+}
+
+leakcheck_env() {
+  # The pre-commit hook runs with GIT_INDEX_FILE/GIT_DIR/... exported for the
+  # PARENT repo; inherited, they redirect the temp repo's git (and the child
+  # linter's git) at the parent and break the simulation with exit 64.
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
+      -u GIT_COMMON_DIR -u GIT_PREFIX -u GIT_AUTHOR_DATE -u GIT_EDITOR "$@"
+}
+
+run_leakcheck_once() {
+  # $1 = script under test (abs path); $2 = variant: probe | control
+  # Prints the linter output; returns the linter's exit code.
+  local target="$1" variant="$2"
+  local repo
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-leakcheck.XXXXXX")" || return 64
+  LEAKCHECK_LAST_DIR="${repo}"
+
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+
+  cat > "${repo}/docs/PERF_LEDGER.md" <<'LEDGER'
+# PERF_LEDGER (leakcheck synthetic)
+LEDGER
+
+  # Three historical entries, each arming one leaking flag.
+  cat > "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'LEDGER'
+# NEGATIVE_EVIDENCE (leakcheck synthetic history)
+
+### 2098-01-01 — SURVEY synthetic history arming cv_verdict
+The old approach used a cv gate here; retired in favor of median-CI gating.
+
+### 2098-01-02 — synthetic history arming decision_lines KEEP tokens
+Comparison class: SELF-SPEEDUP
+ELF sha256: 0000000000000000000000000000000000000000000000000000000000000000
+Decision: KEEP — landed and shipped.
+
+### 2098-01-03 — SURVEY synthetic history arming competitive_claim
+Recorded as a campaign win at the time; superseded by later evidence.
+LEDGER
+
+  leakcheck_env git -C "${repo}" -c user.name=leakcheck -c user.email=leakcheck@local \
+    add docs/NEGATIVE_EVIDENCE.md docs/PERF_LEDGER.md \
+        scripts/check_ledger_null_control.sh || return 64
+  leakcheck_env git -C "${repo}" -c user.name=leakcheck -c user.email=leakcheck@local \
+    commit -q -m "leakcheck history" || return 64
+
+  if [[ "${variant}" == "probe" ]]; then
+    # Conformant new REJECT row: clean of cv/KEEP/campaign tokens.
+    cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-02-01 — REJECT synthetic leak probe lever
+A/A null: 0.998 ratio, measured in the same invocation as the paired run.
+Decision: REJECT — reverted.
+ROW
+  else
+    # Non-conformant new REJECT row: no null, no counted mechanism.
+    cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-02-02 — REJECT synthetic control lever without evidence
+Decision: REJECT — reverted without recorded evidence.
+ROW
+  fi
+  leakcheck_env git -C "${repo}" -c user.name=leakcheck -c user.email=leakcheck@local \
+    add docs/NEGATIVE_EVIDENCE.md || return 64
+
+  local rc=0
+  leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged || rc=$?
+  return "${rc}"
+}
+
+run_leakcheck() {
+  local target="${LEDGER_LEAKCHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  if [[ ! -f "${target}" ]]; then
+    echo "ERROR: leakcheck target not found: ${target}" >&2
+    return 64
+  fi
+
+  local failed=0 rc dir
+
+  LEAKCHECK_LAST_DIR=""
+  rc=0
+  run_leakcheck_once "${target}" probe > /dev/null 2>&1 || rc=$?
+  dir="${LEAKCHECK_LAST_DIR}"
+  if [[ ${rc} -eq 0 ]]; then
+    echo "[ledger-leakcheck] PASS mixed-history probe: conformant new row admitted despite armed history: exit 0"
+  else
+    echo "[ledger-leakcheck] BLOCKED mixed-history probe: conformant new row was rejected (exit ${rc}) — per-entry flag leak (79d999ad class)" >&2
+    failed=1
+  fi
+  cleanup_leakcheck_dir "${dir}"
+
+  LEAKCHECK_LAST_DIR=""
+  rc=0
+  run_leakcheck_once "${target}" control > /dev/null 2>&1 || rc=$?
+  dir="${LEAKCHECK_LAST_DIR}"
+  if [[ ${rc} -eq 2 ]]; then
+    echo "[ledger-leakcheck] PASS harness control: non-conformant new row is blocked: exit 2"
+  else
+    echo "[ledger-leakcheck] BLOCKED harness control: expected exit 2, got ${rc} — harness is not exercising the linter" >&2
+    failed=1
+  fi
+  cleanup_leakcheck_dir "${dir}"
+
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-leakcheck] BLOCKED: leak regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-leakcheck] OK: 2/2 leak-regression cases"
+}
+
 case "${MODE}" in
   candidate)
     candidate_preflight
@@ -634,7 +776,13 @@ case "${MODE}" in
     install_hook
     ;;
   selfcheck)
-    run_selfcheck
+    LEDGER_GATE_STATUS=0
+    if ! run_selfcheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_leakcheck; then LEDGER_GATE_STATUS=2; fi
+    exit "${LEDGER_GATE_STATUS}"
+    ;;
+  leakcheck)
+    run_leakcheck
     ;;
   staged|since|all)
     lint_ledgers
