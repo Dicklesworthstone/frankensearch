@@ -5,10 +5,10 @@
 discipline, and the paired-estimator/evidence-artifact contracts — nothing in
 this file overrides them).
 **Owning bead:** `bd-quill-e8-hyperopt-*` epic (see § Bead map).
-**Scope:** closing the measured Quill-vs-Tantivy performance deficit on three
-microarchitecture classes — the existing x86 VPS fleet, a 128-core AMD
-Threadripper (`trj`), and Apple Silicon M4/M5 — under the repository's
-existing honesty machinery.
+**Scope:** closing the measured Quill-vs-Tantivy performance deficit across
+the existing x86 VPS fleet, one 64-core/128-thread AMD Threadripper PRO 5995WX
+(`trj`), and independently keyed Apple Silicon M4/M5 classes under the
+repository's existing honesty machinery.
 
 ---
 
@@ -21,18 +21,18 @@ The campaign premise ("Quill ≥ 3.0x Tantivy at bulk indexing") is currently
   0.1066–0.1725x Tantivy docs/s on `bulk/medium/*` — 5.8–9.4x behind, a ~23x
   miss against the ≥3.0x target (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-27,
   `bd-h6eh`).
-- **QG-2 (single-worker indexing, pre-fix quarantined diagnostic):** at timed
-  source `5bb74e76` and activation commit `73444b59`, Quill measured about
-  59,818 docs/s versus Tantivy at about 171,223 docs/s: ratio 0.349775, CI95
-  [0.344698, 0.356240]. The same-worker confirmation measured 0.345546, CI95
-  [0.341425, 0.351114], and both A/A controls were valid. A later lifecycle
-  audit found that the Tantivy arm constructed and dropped an unused
-  replacement writer after its measured worker join. That work was outside
-  `join_elapsed_ns` but could contaminate later paired samples. The raw bundle
-  remains diagnostic provenance, not a current baseline or claim. Commit
-  `ebd91757` installs a terminal join with `writer_rearmed=false`; a fresh
-  candidate plus immediate same-worker reproduction determines the corrected
-  ratio without a predeclared direction.
+- **QG-2 (single-worker indexing), gate inactive / no current claim:** commit
+  `ebd91757` removed the post-join replacement-writer lifecycle defect and the
+  corrected campaign passed the six-arm fairness audit. It still produced no
+  admissible magnitude. Five terminal-lifecycle attempts ended in either
+  invalid A/A dispersion or a candidate/rerun log-ratio delta of `0.036853`
+  against the fixed `0.019803` reproduction law. Their diagnostic ratios
+  cluster near 0.34–0.36x, far below the 1.5x target, but **are not a certified
+  QG-2 number**. The terminal disposition is
+  `INVALID-NULL + INVALID-REPRODUCTION / NO CLAIM`; QG-2 remains inactive and
+  no corrected baseline replaces the quarantined pre-fix file. The five
+  immutable attempt bundles and the exact retry predicate landed in
+  `07718353`.
 - **QG-6 (query latency), smoke scale only:** ~25x slower at 500 docs, with
   Round-0 profiling attributing >83% to immutable TERMDICT reparse/validation
   (`bd-quill-e8-perf-doctrine-x4e4.5`, `bd-quill-gauntlet-qg6-cache-termdict-gwd4`).
@@ -66,23 +66,35 @@ first-class; one lever per change). This campaign adds:
 ## 2. Machine-class matrix
 
 `.bench-history/QG-<n>.<machine-class>.latest.json` already keys baselines by
-machine class; this campaign registers three new classes beside the existing
-fleet:
+machine class. The sole normative class grammar, predicates, receipt fields,
+reason codes, and shared conformance fixtures are in
+[`quill-machine-classes.json`](quill-machine-classes.json); prose in this
+document cannot weaken or override that contract.
 
 | Class ID | Hardware | Campaign role | Mandatory provenance (beyond the evidence-v1 contract) |
 |---|---|---|---|
-| `x86-vps-ovh` | existing rch workers | continuity baseline; CI ratchet | existing (ELF SHA-256, worker id, governor) |
-| `trj-zen3-*` | AMD Threadripper PRO 5995WX ("trj": Zen 3, 64c/128t, NPS1; no AVX-512) | scale-out truth: QG-1 high-thread cells, QG-8 thread scaling, allocator/NUMA attribution | governor=performance pinned; SMT state; NUMA topology dump (`lscpu -e`, `numactl -H`); isolated `CARGO_TARGET_DIR`; exclusive build-slot during timed windows. Class-ID convention `trj-zen3-<width>c` per the first committed baseline (`QG-2.trj-zen3-16c.latest.json`); the earlier `trj-zen-128c` label is superseded — committed baselines own their names. |
-| `m4-macos` | Apple M4 (ARMv9, NEON, 16 KiB pages, P+E cores) | ARM64 latency truth: QG-6/QG-9; P-vs-E scaling curves | `sysctl hw`/`machdep.cpu` dump; thermal pressure sampled around runs; `F_FULLFSYNC` symmetry attestation; page size recorded |
-| `m5-macos` | Apple M5 | same as `m4-macos` + generational-delta lane | same |
+| `x86-vps-ovh` | Existing rch workers; homogeneity not yet proven | Diagnostic continuity only until `bd-9f03f` either proves one class or splits the fleet | Exact worker facts and receipt are retained, but the class is `diagnostic_only` and cannot promote history |
+| `trj-zen3-<N>c` / `trj-zen3-<N>c-smt2` | AMD Threadripper PRO 5995WX, Zen 3, 64 physical cores/128 SMT threads, one NUMA node, no AVX-512 | Scale-out truth: QG-1 high-thread cells, QG-8 scaling, allocator/NUMA attribution | `N` is effective physical-core slice width (1–64), not logical threads. No suffix means one hardware thread/core; SMT-on requires `-smt2`, preventing latest-artifact and null-band collisions. Requested and observed CPU sets, thread budget, NUMA binding, performance governor, exclusive lease, and pre/post fingerprints remain separately bound. `trj-zen-128c` is obsolete provenance only and is rejected for new evidence |
+| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | ARM64 latency truth: QG-6/QG-9; requested P-only versus P+E scaling | Requested pool/scheduler mode and what the OS actually exposes are recorded separately. A P-only request is never described as hard affinity without an observed CPU set. Thermal state, page size, local execution, sealed completion, and arm-symmetric `F_FULLFSYNC` treatment are bound |
+| `m5-macos` | No reachable, fingerprinted M5 host yet | Independent future M5 lane; descriptive M4/M5 delta only | `unavailable` and diagnostic-only until a real named host and immutable fingerprint are registered. No M5 fact or number is inferred from M4, and M5 never blocks non-M5 work |
+
+The registry is a specification plus executable conformance corpus:
+
+| Surface | Normative coverage | Implementation bead |
+|---|---|---|
+| Identity and resolution | Exact/pattern grammar, obsolete/unknown/ambiguous IDs, non-overlap, immutable fingerprint provenance | `bd-guum3` |
+| Receipt admission | Hardware identity plus explicit request/start/end execution snapshots, requested/observed CPU assignment, SMT/NUMA/P-E mode, one cross-language canonical hash contract, durability, sealed completion | `bd-guum3` |
+| Shared tests | 18 MUST and 2 SHOULD requirements; 2 class-lookup, 51 full receipt/admission, and 6 registry-loader vectors, including collision, duplicate-key, legacy-alias, unknown-field, cpuset, SMT-suffix, pre/post drift, derived-hash, destination-key, and tamper cases | `bd-guum3` |
+| Rust evidence and ratchet | Strict loader, receipt-derived class binding, destination-stem enforcement, and no history writes on rejection | `bd-39bqp` |
+| Shell runner | The same registry and vectors, fail-closed preflight/finalization, no CLI relabeling | `bd-e8h-p0-runner-verify-jr6w` |
 
 Rules:
 
 - Candidate and rerun on the same machine, same run window (existing
   promotion contract).
 - Admission is per `(gate, fixture, machine-class, source SHA, executable
-  SHA)`. Onboarding or calibration for one class never blocks diagnostic or
-  activation-eligible work on another class.
+  SHA, execution identity)`. Onboarding or calibration for one class never
+  blocks diagnostic or activation-eligible work on another class.
 - `trj` and the Macs are NOT rch workers. They run via
   `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure),
   which captures the fingerprint, runs detached, and emits the same sealed
@@ -116,12 +128,15 @@ Phase 5  PER-LANE CONVERGENCE + ACTIVATION + RENEGOTIATION
 3. QG-1 retry predicate executed as written: `QUILL_PERF_FIXTURE` narrowed,
    `xlarge` + `tokenize_only` captured, complete `QG-1.json` emitted. The
    global rch timeout is not raised.
-4. Machine-class onboarding: `perf-runner.sh` verified on trj/M4/M5 with
-   fingerprint artifacts committed, then one **A/A-only calibration run per
-   class** (trj at 1/16/64/max threads; M4/M5 P-only and P+E) to fix that
-   class's null tolerances from measured dispersion before activation-eligible
-   A/B runs on that class. Diagnostic A/B runs may execute earlier if labeled
-   non-claim.
+4. Machine-class onboarding: harden the shared runner, then validate it
+   independently on x86 (`bd-9f03f`), trj (`bd-7ihq9`), M4 (`bd-0v8uz`), and
+   M5 when reachable (`bd-swfyn`). Derive A/A-only bands independently for
+   x86 (`bd-jjs6q`), trj (`bd-cpqjb`), M4 (`bd-w7zxm`), and M5
+   (`bd-6wnws`). Threadripper calibration is keyed by 1/16/32/64 physical-core
+   slices plus any explicitly used SMT-on lane; Apple calibration is keyed by
+   requested P-only/P+E mode, pool width, and observable scheduler state.
+   At least two independent live calibrations are required for a band.
+   Diagnostic A/B runs may execute earlier only when labeled non-claim.
    Manifest (`quill-perf-gates.toml`) additions for the new classes are
    coordinated with the manifest's reservation holder — not edited
    unilaterally.
@@ -247,12 +262,12 @@ profile or portable implementation.
 
 ### W2 — Bulk-index single-thread cost (QG-1 and QG-2)
 
-The provisional QG-1 thread=1 cell is 8.9x behind. The quarantined pre-fix
-QG-2 diagnostic suggested a roughly 2.86x deficit after harness evolution,
-but it is not a baseline and must not size a performance claim. The two
-contracts are not interchangeable; both nevertheless justify profiling
-single-worker per-document work. The corrected QG-2 terminal-lifecycle rerun
-described in §0 establishes its usable ratio.
+The provisional QG-1 thread=1 cell is 8.9x behind. Corrected QG-2 diagnostics
+cluster near a roughly 2.8–2.9x deficit, but invalid null/reproduction evidence
+is not a baseline and must not size a performance claim. The two contracts are
+not interchangeable; both nevertheless justify profiling single-worker
+per-document work. A usable QG-2 magnitude exists only after the §0 retry
+predicate passes.
 
 | Lever | Hypothesis | Caution |
 |---|---|---|
@@ -268,8 +283,9 @@ Shard-per-worker indexing into independent segments, then
 problems plus one cheap concat. NUMA/CCD-aware sharding; per-thread arenas;
 sharded interners merged at seal (no global interner Mutex). Deliverables
 include the allocator-contention axis; "a bandwidth ceiling is honest, a lock
-plateau is a bug." On M4/M5: rayon pool P-only vs P+E, published as the two
-required curves.
+plateau is a bug." On M4/M5: rayon pool requested P-only versus P+E,
+published as two separate curves with the scheduling-observability limit
+carried in every receipt.
 
 ### W4 — SIMD/µarch kernels (all classes; safe-code constraint binding)
 

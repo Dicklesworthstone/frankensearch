@@ -1,0 +1,2115 @@
+{
+  "schema_version": "frankensearch.quill-machine-class-registry.v1",
+  "contract_status": "normative",
+  "owner_bead": "bd-guum3",
+  "unknown_field_policy": "reject",
+  "duplicate_key_policy": "reject",
+  "class_id_semantics": {
+    "hardware_class": "The class ID identifies a registered hardware family and, when present, an effective physical-core slice width plus an explicit SMT-on lane suffix. It does not silently encode a thread-pool size, NUMA policy, or Apple P/E execution mode.",
+    "threadripper_pattern": "^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(?:-smt2)?$",
+    "threadripper_width_capture": 1,
+    "threadripper_width_unit": "effective_physical_cores",
+    "threadripper_smt_semantics": "No suffix means one hardware thread per effective physical core. The -smt2 suffix is mandatory when two sibling hardware threads per core are admitted.",
+    "execution_identity": "The class ID binds Threadripper physical width and SMT lane; the receipt independently proves SMT state. Logical CPU set, thread budget, NUMA policy, Apple execution mode, thermal state, durability treatment, and the A/A tolerance key remain separately bound execution identity.",
+    "obsolete_ids": [
+      "trj-zen-128c"
+    ],
+    "cross_class_policy": "Ratios, null bands, and promotion baselines never cross a canonical class ID or execution-identity key."
+  },
+  "receipt_contract": {
+    "schema_version": "frankensearch.perf-runner-completion.v2",
+    "required_sections": [
+      "requested_class_id",
+      "derived_class_id",
+      "registry_sha256",
+      "hardware",
+      "execution",
+      "build",
+      "durability",
+      "completion"
+    ],
+    "required_hardware_fields": [
+      "os",
+      "arch",
+      "cpu_vendor",
+      "cpu_family",
+      "cpu_model",
+      "cpu_stepping",
+      "cpu_model_name",
+      "physical_cores",
+      "logical_cpus",
+      "numa_nodes",
+      "memory_bytes",
+      "page_size_bytes",
+      "performance_cores",
+      "efficiency_cores",
+      "topology_sha256",
+      "fingerprint_sha256"
+    ],
+    "required_execution_fields": [
+      "request",
+      "start",
+      "end",
+      "identity_sha256"
+    ],
+    "required_execution_request_fields": [
+      "requested_logical_cpu_ids",
+      "requested_physical_core_width",
+      "thread_budget",
+      "apple_execution_mode"
+    ],
+    "required_execution_snapshot_fields": [
+      "observed_logical_cpu_ids",
+      "effective_physical_core_ids",
+      "cpu_assignment_observability",
+      "effective_cpuset_sha256",
+      "threads_per_core",
+      "smt_state",
+      "numa_node_ids",
+      "numa_policy",
+      "governor",
+      "thermal_pressure",
+      "exclusive_lease",
+      "exclusive_lease_id",
+      "local_execution",
+      "observed_hardware_fingerprint_sha256",
+      "snapshot_sha256"
+    ],
+    "required_build_fields": [
+      "git_revision",
+      "git_dirty",
+      "worktree_state_sha256",
+      "cargo_lock_sha256",
+      "executable_sha256",
+      "command_sha256"
+    ],
+    "required_durability_fields": [
+      "adjacent",
+      "control_treatment",
+      "candidate_treatment",
+      "symmetric"
+    ],
+    "required_completion_fields": [
+      "verified",
+      "exit_status",
+      "run_log_sha256",
+      "artifact_manifest_sha256",
+      "artifact_digests_verified",
+      "started_at_utc",
+      "finished_at_utc"
+    ],
+    "sha256_fields_are_lowercase_hex": true,
+    "pre_post_identity_must_match": true,
+    "promotion_requires_zero_exit": true
+  },
+  "canonical_hash_contract": {
+    "algorithm": "sha256",
+    "hex_encoding": "lowercase",
+    "canonical_json_subset": "UTF-8 compact JSON with object keys sorted lexicographically, arrays in source order, integers in base-10 without leading zeros, and only ASCII strings, booleans, null, arrays, and objects. The bytes are exactly jq -cS output with its trailing newline removed.",
+    "registry_sha256": "SHA-256 of the exact registry file bytes without rewriting whitespace.",
+    "hardware_fingerprint_sha256": "SHA-256 of canonical JSON for the hardware object with fingerprint_sha256 omitted.",
+    "effective_cpuset_sha256": "SHA-256 of canonical JSON containing observed_logical_cpu_ids, effective_physical_core_ids, cpu_assignment_observability, threads_per_core, and smt_state from one execution snapshot.",
+    "execution_snapshot_sha256": "SHA-256 of canonical JSON for one complete execution snapshot with snapshot_sha256 omitted.",
+    "execution_identity_sha256": "After start/end equivalence is proven, SHA-256 of canonical JSON containing requested_class_id, derived_class_id, execution.request, and the stable execution fields from execution.start except thermal_pressure and snapshot_sha256.",
+    "command_sha256": "SHA-256 over the exact argv byte strings separated and terminated by NUL; shell-joined command text is never hashed as a substitute.",
+    "derived_field_order": [
+      "hardware.fingerprint_sha256 from hardware facts",
+      "execution.start/end.observed_hardware_fingerprint_sha256 from independently recaptured hardware facts",
+      "execution.start/end.effective_cpuset_sha256 from each materialized snapshot",
+      "execution.start/end.snapshot_sha256 from each complete materialized snapshot",
+      "execution.identity_sha256 after start/end equivalence"
+    ],
+    "fixture_materialization_order": [
+      "clone named fact template",
+      "substitute $REGISTRY_SHA256 from exact registry bytes",
+      "apply set, remove, and add_unknown mutations",
+      "derive every field containing a $DERIVE_* placeholder in dependency order",
+      "do not overwrite any derived field explicitly targeted by the vector set mutation",
+      "validate the materialized receipt"
+    ]
+  },
+  "validation_precedence": [
+    "registry syntax, duplicate keys, schema version, and unknown fields",
+    "registry self-consistency, class-rule collision, and source fingerprint provenance",
+    "receipt syntax, duplicate keys, schema version, required fields, and unknown fields",
+    "registry hash and derived-hash integrity",
+    "requested versus derived class identity",
+    "hardware class predicates",
+    "execution request and class-suffix predicates",
+    "start/end snapshot validity and equivalence",
+    "exclusive lease and local execution",
+    "source and executable identity",
+    "durability symmetry",
+    "sealed completion"
+  ],
+  "classes": [
+    {
+      "family": "x86-vps-ovh",
+      "id_kind": "exact",
+      "id": "x86-vps-ovh",
+      "admission_state": "diagnostic_only",
+      "admission_reason": "class-homogeneity-unproven",
+      "hardware_predicates": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "source_fingerprints": [],
+      "notes": "The label remains diagnostic-only until bd-9f03f proves worker homogeneity or splits materially different workers into distinct classes."
+    },
+    {
+      "family": "trj-zen3",
+      "id_kind": "pattern",
+      "id_pattern": "^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(?:-smt2)?$",
+      "width_capture": 1,
+      "admission_state": "registered",
+      "admission_reason": "admitted",
+      "hardware_predicates": {
+        "os": "linux",
+        "arch": "x86_64",
+        "cpu_vendor": "AuthenticAMD",
+        "cpu_family": 25,
+        "cpu_model": 8,
+        "cpu_stepping": 2,
+        "cpu_model_name": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+        "physical_cores": 64,
+        "logical_cpus": 128,
+        "numa_nodes": 1,
+        "page_size_bytes": 4096,
+        "forbidden_cpu_flags": [
+          "avx512f"
+        ]
+      },
+      "execution_predicates": {
+        "effective_physical_cores_equals_width_capture": true,
+        "allowed_threads_per_core": [
+          1,
+          2
+        ],
+        "threads_per_core_from_class_id": {
+          "without_suffix": 1,
+          "-smt2": 2
+        },
+        "request_physical_core_width_equals_width_capture": true,
+        "start_end_logical_cpu_count_equals_physical_times_threads_per_core": true,
+        "request_start_end_cpu_sets_equal": true,
+        "start_end_cpu_assignment_observability": "affinity-enforced",
+        "thread_budget_min": 1,
+        "thread_budget_max": "execution.start.observed_logical_cpu_count",
+        "numa_node_ids": [
+          0
+        ],
+        "numa_policy": "bind:0",
+        "governor": "performance",
+        "request_apple_execution_mode": "not-applicable",
+        "exclusive_lease": true,
+        "local_execution": true
+      },
+      "source_fingerprints": [
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/provenance.json",
+          "sha256": "b9c9966d55756c6bf5d0fdec251bc6642e1b2c5fd7368f6bdc7b567a99009f76"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/lscpu.txt",
+          "sha256": "faf66c070dc33f697eda30dfde3272aab99e7dbbf23f3c4050a1ac0da32929bd"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/numactl-H.txt",
+          "sha256": "44995f49fedfbe5ca565770537d1525366e42e45c55b8572c1567ff4542b8f1d"
+        }
+      ]
+    },
+    {
+      "family": "m4-macos",
+      "id_kind": "exact",
+      "id": "m4-macos",
+      "admission_state": "registered",
+      "admission_reason": "admitted",
+      "hardware_predicates": {
+        "os": "macos",
+        "arch": "aarch64",
+        "cpu_vendor": "Apple",
+        "cpu_model_name": "Apple M4 Pro",
+        "physical_cores": 14,
+        "logical_cpus": 14,
+        "numa_nodes": 1,
+        "memory_bytes": 68719476736,
+        "page_size_bytes": 16384,
+        "performance_cores": 10,
+        "efficiency_cores": 4
+      },
+      "execution_predicates": {
+        "allowed_requested_apple_execution_modes": [
+          "p-only",
+          "p-plus-e"
+        ],
+        "apple_execution_mode_semantics": "requested pool and scheduler policy; never a hard-affinity claim unless requested and observed CPU sets prove it",
+        "allowed_start_end_cpu_assignment_observability": [
+          "unavailable",
+          "scheduler-observed",
+          "affinity-enforced"
+        ],
+        "thread_budget_max_by_mode": {
+          "p-only": 10,
+          "p-plus-e": 14
+        },
+        "allowed_threads_per_core": [
+          1
+        ],
+        "smt_state": "not-applicable",
+        "numa_node_ids": [
+          0
+        ],
+        "numa_policy": "system",
+        "governor": "not-applicable",
+        "exclusive_lease": true,
+        "local_execution": true,
+        "thermal_warning": false
+      },
+      "source_fingerprints": [
+        {
+          "path": "docs/evidence/e8h/fingerprints/m4-macos-20260728/provenance.json",
+          "sha256": "a115f937494dfce6e25c74bdf759f26ee5bc82dd0b5b2d527dca5f39ade59569"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/m4-macos-20260728/sysctl.txt",
+          "sha256": "cd91e4ff2d11cf3d4fdd891b075f602b167ca0fb7c9ed801ece6b1b9f9757a1b"
+        }
+      ]
+    },
+    {
+      "family": "m5-macos",
+      "id_kind": "exact",
+      "id": "m5-macos",
+      "admission_state": "unavailable",
+      "admission_reason": "class-unavailable",
+      "hardware_predicates": {},
+      "source_fingerprints": [],
+      "notes": "No M5 fingerprint may be invented. Registration requires a reachable named host, committed raw fingerprint, and an explicit registry revision."
+    }
+  ],
+  "reason_codes": [
+    "admitted",
+    "class-homogeneity-unproven",
+    "class-unavailable",
+    "unknown-class-id",
+    "obsolete-class-id",
+    "ambiguous-class-id",
+    "duplicate-key",
+    "unknown-field",
+    "missing-field",
+    "hardware-os-mismatch",
+    "hardware-arch-mismatch",
+    "hardware-cpu-vendor-mismatch",
+    "hardware-cpu-family-mismatch",
+    "hardware-cpu-model-mismatch",
+    "hardware-cpu-stepping-mismatch",
+    "hardware-cpu-name-mismatch",
+    "hardware-topology-mismatch",
+    "hardware-numa-mismatch",
+    "hardware-memory-mismatch",
+    "hardware-page-size-mismatch",
+    "hardware-performance-core-mismatch",
+    "hardware-efficiency-core-mismatch",
+    "execution-width-mismatch",
+    "execution-cpuset-invalid",
+    "execution-thread-budget-invalid",
+    "execution-smt-mismatch",
+    "execution-numa-mismatch",
+    "execution-governor-mismatch",
+    "execution-mode-mismatch",
+    "thermal-pressure",
+    "exclusive-lease-missing",
+    "execution-offloaded",
+    "source-dirty",
+    "source-identity-invalid",
+    "durability-asymmetric",
+    "completion-unverified",
+    "completion-failed",
+    "pre-post-identity-drift",
+    "receipt-class-mismatch",
+    "registry-hash-mismatch",
+    "derived-hash-mismatch",
+    "destination-identity-mismatch"
+  ],
+  "requirements": [
+    {
+      "id": "MC-MUST-001",
+      "level": "MUST",
+      "text": "Consumers load this exact versioned registry and reject duplicate keys plus unknown registry or receipt fields."
+    },
+    {
+      "id": "MC-MUST-002",
+      "level": "MUST",
+      "text": "Class resolution is deterministic and rejects unknown, obsolete, or multiply matching IDs."
+    },
+    {
+      "id": "MC-MUST-003",
+      "level": "MUST",
+      "text": "Hardware identity plus explicit execution request, start snapshot, and end snapshot are separately recorded and jointly admitted."
+    },
+    {
+      "id": "MC-MUST-004",
+      "level": "MUST",
+      "text": "Threadripper admission matches the registered 5995WX vendor, family, model, stepping, topology, page size, and NUMA facts."
+    },
+    {
+      "id": "MC-MUST-005",
+      "level": "MUST",
+      "text": "The trj class width equals the unique effective physical-core count; logical CPUs equal physical cores times the recorded threads per core."
+    },
+    {
+      "id": "MC-MUST-006",
+      "level": "MUST",
+      "text": "The Threadripper SMT suffix and recorded SMT state agree; requested and observed CPU sets, assignment observability, thread budget, NUMA policy, and governor remain explicit execution identity."
+    },
+    {
+      "id": "MC-MUST-007",
+      "level": "MUST",
+      "text": "M4 admission matches Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, and 16384-byte pages."
+    },
+    {
+      "id": "MC-MUST-008",
+      "level": "MUST",
+      "text": "Apple P-only and P-plus-E requests are distinct execution identities and thermal warnings reject timed evidence."
+    },
+    {
+      "id": "MC-MUST-009",
+      "level": "MUST",
+      "text": "Provisional and unavailable classes are diagnostic-only and cannot promote history."
+    },
+    {
+      "id": "MC-MUST-010",
+      "level": "MUST",
+      "text": "Timed evidence requires a clean exact source, local execution, and an exclusive measurement lease."
+    },
+    {
+      "id": "MC-MUST-011",
+      "level": "MUST",
+      "text": "Source, Cargo.lock, executable, NUL-delimited command argv, topology, hardware, cpuset, snapshots, and execution identity are hash-bound under one canonical byte contract."
+    },
+    {
+      "id": "MC-MUST-012",
+      "level": "MUST",
+      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment."
+    },
+    {
+      "id": "MC-MUST-013",
+      "level": "MUST",
+      "text": "Only a zero-exit sealed completion with verified log and artifact digests can support promotion."
+    },
+    {
+      "id": "MC-MUST-014",
+      "level": "MUST",
+      "text": "Start and end snapshots carry recomputable hardware and execution facts; identity drift is fail-closed."
+    },
+    {
+      "id": "MC-MUST-015",
+      "level": "MUST",
+      "text": "A requested or CLI machine class is compared with, and cannot relabel, the class derived from verified receipt facts."
+    },
+    {
+      "id": "MC-MUST-016",
+      "level": "MUST",
+      "text": "Baselines, candidates, reruns, A/A bands, and destination stems match canonical class plus execution identity."
+    },
+    {
+      "id": "MC-MUST-017",
+      "level": "MUST",
+      "text": "Every rejection returns one stable reason code and writes no promotion history."
+    },
+    {
+      "id": "MC-MUST-018",
+      "level": "MUST",
+      "text": "Every registered class cites immutable raw fingerprint provenance; missing hardware is never fabricated."
+    },
+    {
+      "id": "MC-SHOULD-001",
+      "level": "SHOULD",
+      "text": "Receipts retain hostname, kernel, microcode, cache topology, and load for diagnosis even when those fields are not class predicates."
+    },
+    {
+      "id": "MC-SHOULD-002",
+      "level": "SHOULD",
+      "text": "Consumers emit bounded structured logs naming requirement ID, class, field, observed value, expected predicate, and reason code."
+    }
+  ],
+  "fact_templates": {
+    "trj-valid-16c-smt2": {
+      "requested_class_id": "trj-zen3-16c-smt2",
+      "derived_class_id": "trj-zen3-16c-smt2",
+      "registry_sha256": "$REGISTRY_SHA256",
+      "hardware": {
+        "os": "linux",
+        "arch": "x86_64",
+        "cpu_vendor": "AuthenticAMD",
+        "cpu_family": 25,
+        "cpu_model": 8,
+        "cpu_stepping": 2,
+        "cpu_model_name": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+        "physical_cores": 64,
+        "logical_cpus": 128,
+        "numa_nodes": 1,
+        "memory_bytes": 536069652480,
+        "page_size_bytes": 4096,
+        "performance_cores": null,
+        "efficiency_cores": null,
+        "topology_sha256": "faf66c070dc33f697eda30dfde3272aab99e7dbbf23f3c4050a1ac0da32929bd",
+        "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
+      },
+      "execution": {
+        "request": {
+          "requested_logical_cpu_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79
+          ],
+          "requested_physical_core_width": 16,
+          "thread_budget": 1,
+          "apple_execution_mode": "not-applicable"
+        },
+        "start": {
+          "observed_logical_cpu_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79
+          ],
+          "effective_physical_core_ids": [
+            "0:0",
+            "0:1",
+            "0:2",
+            "0:3",
+            "0:4",
+            "0:5",
+            "0:6",
+            "0:7",
+            "0:8",
+            "0:9",
+            "0:10",
+            "0:11",
+            "0:12",
+            "0:13",
+            "0:14",
+            "0:15"
+          ],
+          "cpu_assignment_observability": "affinity-enforced",
+          "effective_cpuset_sha256": "$DERIVE_START_CPUSET_SHA256",
+          "threads_per_core": 2,
+          "smt_state": "on",
+          "numa_node_ids": [
+            0
+          ],
+          "numa_policy": "bind:0",
+          "governor": "performance",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "fixture-trj-lease",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
+        },
+        "end": {
+          "observed_logical_cpu_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79
+          ],
+          "effective_physical_core_ids": [
+            "0:0",
+            "0:1",
+            "0:2",
+            "0:3",
+            "0:4",
+            "0:5",
+            "0:6",
+            "0:7",
+            "0:8",
+            "0:9",
+            "0:10",
+            "0:11",
+            "0:12",
+            "0:13",
+            "0:14",
+            "0:15"
+          ],
+          "cpu_assignment_observability": "affinity-enforced",
+          "effective_cpuset_sha256": "$DERIVE_END_CPUSET_SHA256",
+          "threads_per_core": 2,
+          "smt_state": "on",
+          "numa_node_ids": [
+            0
+          ],
+          "numa_policy": "bind:0",
+          "governor": "performance",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "fixture-trj-lease",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
+        },
+        "identity_sha256": "$DERIVE_EXECUTION_IDENTITY_SHA256"
+      },
+      "build": {
+        "git_revision": "ebd9175725ef9d97fd02d794394209b4719f8ce7",
+        "git_dirty": false,
+        "worktree_state_sha256": null,
+        "cargo_lock_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "command_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "durability": {
+        "adjacent": false,
+        "control_treatment": "not-applicable",
+        "candidate_treatment": "not-applicable",
+        "symmetric": true
+      },
+      "completion": {
+        "verified": true,
+        "exit_status": 0,
+        "run_log_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "artifact_digests_verified": true,
+        "started_at_utc": "2026-07-28T23:00:00Z",
+        "finished_at_utc": "2026-07-28T23:10:00Z"
+      }
+    },
+    "m4-valid-p-only": {
+      "requested_class_id": "m4-macos",
+      "derived_class_id": "m4-macos",
+      "registry_sha256": "$REGISTRY_SHA256",
+      "hardware": {
+        "os": "macos",
+        "arch": "aarch64",
+        "cpu_vendor": "Apple",
+        "cpu_family": null,
+        "cpu_model": null,
+        "cpu_stepping": null,
+        "cpu_model_name": "Apple M4 Pro",
+        "physical_cores": 14,
+        "logical_cpus": 14,
+        "numa_nodes": 1,
+        "memory_bytes": 68719476736,
+        "page_size_bytes": 16384,
+        "performance_cores": 10,
+        "efficiency_cores": 4,
+        "topology_sha256": "cd91e4ff2d11cf3d4fdd891b075f602b167ca0fb7c9ed801ece6b1b9f9757a1b",
+        "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
+      },
+      "execution": {
+        "request": {
+          "requested_logical_cpu_ids": [],
+          "requested_physical_core_width": 10,
+          "thread_budget": 10,
+          "apple_execution_mode": "p-only"
+        },
+        "start": {
+          "observed_logical_cpu_ids": [],
+          "effective_physical_core_ids": [],
+          "cpu_assignment_observability": "unavailable",
+          "effective_cpuset_sha256": "$DERIVE_START_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "not-applicable",
+          "numa_node_ids": [
+            0
+          ],
+          "numa_policy": "system",
+          "governor": "not-applicable",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "fixture-m4-lease",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
+        },
+        "end": {
+          "observed_logical_cpu_ids": [],
+          "effective_physical_core_ids": [],
+          "cpu_assignment_observability": "unavailable",
+          "effective_cpuset_sha256": "$DERIVE_END_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "not-applicable",
+          "numa_node_ids": [
+            0
+          ],
+          "numa_policy": "system",
+          "governor": "not-applicable",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "fixture-m4-lease",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
+        },
+        "identity_sha256": "$DERIVE_EXECUTION_IDENTITY_SHA256"
+      },
+      "build": {
+        "git_revision": "f9c6c57e44e07313f88b8a7d11c4df956ff44c24",
+        "git_dirty": false,
+        "worktree_state_sha256": null,
+        "cargo_lock_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "executable_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "command_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+      },
+      "durability": {
+        "adjacent": false,
+        "control_treatment": "not-applicable",
+        "candidate_treatment": "not-applicable",
+        "symmetric": true
+      },
+      "completion": {
+        "verified": true,
+        "exit_status": 0,
+        "run_log_sha256": "abababababababababababababababababababababababababababababababab",
+        "artifact_manifest_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "artifact_digests_verified": true,
+        "started_at_utc": "2026-07-28T23:00:00Z",
+        "finished_at_utc": "2026-07-28T23:10:00Z"
+      }
+    }
+  },
+  "test_vector_mutation_format": {
+    "raw_json": "When non-null, parse these exact bytes instead of a named template; this is used for syntax-level cases such as duplicate receipt keys.",
+    "placeholders": {
+      "$REGISTRY_SHA256": "Substitute the lowercase SHA-256 of the exact registry bytes.",
+      "$DERIVE_HARDWARE_FINGERPRINT_SHA256": "Derive from the materialized hardware object according to canonical_hash_contract.",
+      "$DERIVE_START_CPUSET_SHA256": "Derive from the materialized execution.start CPU-assignment fields.",
+      "$DERIVE_END_CPUSET_SHA256": "Derive from the materialized execution.end CPU-assignment fields.",
+      "$DERIVE_START_SNAPSHOT_SHA256": "Derive from the materialized execution.start object.",
+      "$DERIVE_END_SNAPSHOT_SHA256": "Derive from the materialized execution.end object.",
+      "$DERIVE_EXECUTION_IDENTITY_SHA256": "Derive only after start/end equivalence passes."
+    },
+    "set": "A map from dotted field path to replacement JSON value.",
+    "remove": "A list of dotted field paths removed before validation.",
+    "add_unknown": "A map from dotted field path to a field that strict consumers must reject.",
+    "admission_context": "Optional external ratchet context applied only after receipt validation. destination_basename must equal QG-<n>.<derived_class_id>.latest.json exactly and cannot relabel the receipt."
+  },
+  "test_vector_expected_contract": {
+    "decision": "The terminal admission state: allow, diagnostic_only, reject, or reject_registry.",
+    "class_id": "The canonical derived class on allow/diagnostic_only, otherwise null.",
+    "reason": "Exactly one stable member of reason_codes.",
+    "derived_sha256": "Required for every fully materialized allow vector. Consumers recompute all five values independently and compare these golden digests before treating the shared corpus as self-hosting."
+  },
+  "class_lookup_vectors": [
+    {
+      "id": "MCL-001-x86-provisional",
+      "requested_class_id": "x86-vps-ovh",
+      "covers": [
+        "MC-MUST-009",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "diagnostic_only",
+        "class_id": "x86-vps-ovh",
+        "reason": "class-homogeneity-unproven"
+      }
+    },
+    {
+      "id": "MCL-002-m5-unavailable",
+      "requested_class_id": "m5-macos",
+      "covers": [
+        "MC-MUST-009",
+        "MC-MUST-017",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "diagnostic_only",
+        "class_id": "m5-macos",
+        "reason": "class-unavailable"
+      }
+    }
+  ],
+  "test_vectors": [
+    {
+      "id": "MCV-001-trj-registered",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "destination_basename": "QG-2.trj-zen3-16c-smt2.latest.json"
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-002",
+        "MC-MUST-003",
+        "MC-MUST-004",
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-010",
+        "MC-MUST-011",
+        "MC-MUST-013",
+        "MC-MUST-014",
+        "MC-MUST-015",
+        "MC-MUST-016",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "allow",
+        "class_id": "trj-zen3-16c-smt2",
+        "reason": "admitted",
+        "derived_sha256": {
+          "hardware": "6a311dbff98a6f615682d769f6278728359bcbac52d38419931abf02dee2e246",
+          "start_cpuset": "55d1f64b24dfe9f1f6c0d812469b95001f7831029fe7d45d0ba8b966005a5dbc",
+          "start_snapshot": "fef0a4cc969f08cd680ce2146ee836f44b5c980a2a2a7443851fca22b6d4536d",
+          "end_snapshot": "fef0a4cc969f08cd680ce2146ee836f44b5c980a2a2a7443851fca22b6d4536d",
+          "identity": "44b34012ff88e0df949f55add2383a83edaf2fc333ff73ff0ab1d854fdb072ba"
+        }
+      }
+    },
+    {
+      "id": "MCV-002-m4-registered",
+      "template": "m4-valid-p-only",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-6",
+        "destination_basename": "QG-6.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-003",
+        "MC-MUST-007",
+        "MC-MUST-008",
+        "MC-MUST-010",
+        "MC-MUST-011",
+        "MC-MUST-013",
+        "MC-MUST-014",
+        "MC-MUST-015",
+        "MC-MUST-016",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "allow",
+        "class_id": "m4-macos",
+        "reason": "admitted",
+        "derived_sha256": {
+          "hardware": "955b017942640f1f0eefb058220e0019143c27cc58b0c6dace2b6d11562f5c48",
+          "start_cpuset": "a6bdee49912e0a0c743b36556734c8507ba479b3d58f4cfbf2bc98478213620b",
+          "start_snapshot": "a271df4ac22d068a98e0f8a16fa62356196aa743218de5f7ca7cefdd97986fb4",
+          "end_snapshot": "a271df4ac22d068a98e0f8a16fa62356196aa743218de5f7ca7cefdd97986fb4",
+          "identity": "40524e7711ed0e169093fb91aebfedd0629d72e7e49138ed2213f5a601cdd4ab"
+        }
+      }
+    },
+    {
+      "id": "MCV-005-obsolete-id",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "requested_class_id": "trj-zen-128c",
+        "derived_class_id": "trj-zen-128c"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-002",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "obsolete-class-id"
+      }
+    },
+    {
+      "id": "MCV-006-unknown-id",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "requested_class_id": "generic-linux",
+        "derived_class_id": "generic-linux"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-002",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "unknown-class-id"
+      }
+    },
+    {
+      "id": "MCV-007-unknown-field",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "hardware.magic_cpu": true
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCV-008-missing-field",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "completion.artifact_manifest_sha256"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-013",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-009-trj-wrong-os",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.os": "macos"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-os-mismatch"
+      }
+    },
+    {
+      "id": "MCV-010-trj-wrong-arch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.arch": "aarch64"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-arch-mismatch"
+      }
+    },
+    {
+      "id": "MCV-011-trj-wrong-vendor",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.cpu_vendor": "GenuineIntel"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-vendor-mismatch"
+      }
+    },
+    {
+      "id": "MCV-012-trj-wrong-family",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.cpu_family": 26
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-family-mismatch"
+      }
+    },
+    {
+      "id": "MCV-013-trj-wrong-model",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.cpu_model": 9
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-model-mismatch"
+      }
+    },
+    {
+      "id": "MCV-014-trj-wrong-stepping",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.cpu_stepping": 3
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-stepping-mismatch"
+      }
+    },
+    {
+      "id": "MCV-015-trj-wrong-name",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.cpu_model_name": "AMD EPYC"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-name-mismatch"
+      }
+    },
+    {
+      "id": "MCV-016-trj-wrong-topology",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.physical_cores": 32
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-topology-mismatch"
+      }
+    },
+    {
+      "id": "MCV-017-trj-wrong-numa",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.numa_nodes": 2
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-004",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-numa-mismatch"
+      }
+    },
+    {
+      "id": "MCV-018-trj-width-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "requested_class_id": "trj-zen3-32c-smt2",
+        "derived_class_id": "trj-zen3-32c-smt2",
+        "execution.request.requested_physical_core_width": 32
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-015",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-width-mismatch"
+      }
+    },
+    {
+      "id": "MCV-019-trj-cpuset-duplicate",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.request.requested_logical_cpu_ids": [
+          0,
+          0,
+          64,
+          64
+        ]
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    },
+    {
+      "id": "MCV-020-trj-smt-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.threads_per_core": 1,
+        "execution.end.threads_per_core": 1
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-smt-mismatch"
+      }
+    },
+    {
+      "id": "MCV-021-trj-numa-policy",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.numa_policy": "interleave",
+        "execution.end.numa_policy": "interleave"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-numa-mismatch"
+      }
+    },
+    {
+      "id": "MCV-022-trj-governor",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.governor": "powersave",
+        "execution.end.governor": "powersave"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-governor-mismatch"
+      }
+    },
+    {
+      "id": "MCV-023-m4-wrong-chip",
+      "template": "m4-valid-p-only",
+      "set": {
+        "hardware.cpu_model_name": "Apple M4"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-007",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-cpu-name-mismatch"
+      }
+    },
+    {
+      "id": "MCV-024-m4-wrong-p-cores",
+      "template": "m4-valid-p-only",
+      "set": {
+        "hardware.performance_cores": 8
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-007",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-performance-core-mismatch"
+      }
+    },
+    {
+      "id": "MCV-025-m4-wrong-e-cores",
+      "template": "m4-valid-p-only",
+      "set": {
+        "hardware.efficiency_cores": 6
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-007",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-efficiency-core-mismatch"
+      }
+    },
+    {
+      "id": "MCV-026-m4-wrong-memory",
+      "template": "m4-valid-p-only",
+      "set": {
+        "hardware.memory_bytes": 34359738368
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-007",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-memory-mismatch"
+      }
+    },
+    {
+      "id": "MCV-027-m4-wrong-page-size",
+      "template": "m4-valid-p-only",
+      "set": {
+        "hardware.page_size_bytes": 4096
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-007",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "hardware-page-size-mismatch"
+      }
+    },
+    {
+      "id": "MCV-028-m4-invalid-mode",
+      "template": "m4-valid-p-only",
+      "set": {
+        "execution.request.apple_execution_mode": "efficiency-only"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-008",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-mode-mismatch"
+      }
+    },
+    {
+      "id": "MCV-029-m4-thermal-start",
+      "template": "m4-valid-p-only",
+      "set": {
+        "execution.start.thermal_pressure": true,
+        "execution.end.thermal_pressure": true
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-008",
+        "MC-MUST-014",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "thermal-pressure"
+      }
+    },
+    {
+      "id": "MCV-030-missing-lease",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.exclusive_lease": false,
+        "execution.end.exclusive_lease": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-010",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "exclusive-lease-missing"
+      }
+    },
+    {
+      "id": "MCV-031-offloaded",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.local_execution": false,
+        "execution.end.local_execution": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-010",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-offloaded"
+      }
+    },
+    {
+      "id": "MCV-032-dirty-source",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.git_dirty": true
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-010",
+        "MC-MUST-011",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-dirty"
+      }
+    },
+    {
+      "id": "MCV-033-invalid-source-hash",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.executable_sha256": "not-a-sha256"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-034-durability-asymmetric",
+      "template": "m4-valid-p-only",
+      "set": {
+        "durability.adjacent": true,
+        "durability.control_treatment": "fsync",
+        "durability.candidate_treatment": "fullfsync",
+        "durability.symmetric": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-012",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "durability-asymmetric"
+      }
+    },
+    {
+      "id": "MCV-035-completion-unverified",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "completion.verified": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-013",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "completion-unverified"
+      }
+    },
+    {
+      "id": "MCV-036-completion-failed",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "completion.exit_status": 1
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-013",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "completion-failed"
+      }
+    },
+    {
+      "id": "MCV-037-pre-post-drift",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.end.exclusive_lease_id": "fixture-trj-lease-changed"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-014",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "pre-post-identity-drift"
+      }
+    },
+    {
+      "id": "MCV-038-derived-class-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "derived_class_id": "m4-macos"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-015",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "receipt-class-mismatch"
+      }
+    },
+    {
+      "id": "MCV-039-registry-hash-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "registry_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-011",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "registry-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-040-trj-cpuset-wrong-type",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.request.requested_logical_cpu_ids": "0-15,64-79"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    },
+    {
+      "id": "MCV-041-trj-cpuset-out-of-range",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.request.requested_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          256
+        ]
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    },
+    {
+      "id": "MCV-042-trj-cpuset-width-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.request.requested_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78
+        ]
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-width-mismatch"
+      }
+    },
+    {
+      "id": "MCV-043-trj-requested-observed-cpuset-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.observed_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          80
+        ]
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-014",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    },
+    {
+      "id": "MCV-044-trj-cpuset-unobserved",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.cpu_assignment_observability": "unavailable",
+        "execution.end.cpu_assignment_observability": "unavailable"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    },
+    {
+      "id": "MCV-045-thread-budget-zero",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.request.thread_budget": 0
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-006",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "execution-thread-budget-invalid"
+      }
+    },
+    {
+      "id": "MCV-046-trj-smt-off-registered",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "requested_class_id": "trj-zen3-16c",
+        "derived_class_id": "trj-zen3-16c",
+        "execution.request.requested_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "execution.start.observed_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "execution.end.observed_logical_cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "execution.start.threads_per_core": 1,
+        "execution.end.threads_per_core": 1,
+        "execution.start.smt_state": "off",
+        "execution.end.smt_state": "off"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "destination_basename": "QG-2.trj-zen3-16c.latest.json"
+      },
+      "covers": [
+        "MC-MUST-002",
+        "MC-MUST-003",
+        "MC-MUST-004",
+        "MC-MUST-005",
+        "MC-MUST-006",
+        "MC-MUST-010",
+        "MC-MUST-011",
+        "MC-MUST-013",
+        "MC-MUST-014",
+        "MC-MUST-015",
+        "MC-MUST-016",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "allow",
+        "class_id": "trj-zen3-16c",
+        "reason": "admitted",
+        "derived_sha256": {
+          "hardware": "6a311dbff98a6f615682d769f6278728359bcbac52d38419931abf02dee2e246",
+          "start_cpuset": "f973c2be3391a296d572985a097f3d2c75c8520b80fe16033392c46520600eca",
+          "start_snapshot": "85c085ce1090f361f030e47b241402adc4a7f09484101c39b46d55c9e53a53d2",
+          "end_snapshot": "85c085ce1090f361f030e47b241402adc4a7f09484101c39b46d55c9e53a53d2",
+          "identity": "cfb81298460fcc49cc29e091c3ba44ebeb34fdda051f59486f082472a377ef10"
+        }
+      }
+    },
+    {
+      "id": "MCV-047-hardware-fingerprint-tamper",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "hardware.fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-003",
+        "MC-MUST-011",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "derived-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-048-start-snapshot-hash-tamper",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.start.snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-003",
+        "MC-MUST-011",
+        "MC-MUST-014",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "derived-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-049-execution-identity-hash-tamper",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "execution.identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-016",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "derived-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-050-duplicate-receipt-key",
+      "template": null,
+      "raw_json": "{\"requested_class_id\":\"trj-zen3-16c\",\"requested_class_id\":\"trj-zen3-16c-smt2\"}",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "duplicate-key"
+      }
+    },
+    {
+      "id": "MCV-051-old-flat-execution-alias",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "execution.requested_logical_cpu_ids": []
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-003",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCV-052-reported-class-alias",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "reported_class_id": "trj-zen3-16c-smt2"
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-015",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCV-053-latest-basename-class-collision",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "destination_basename": "QG-2.trj-zen3-16c.latest.json"
+      },
+      "covers": [
+        "MC-MUST-015",
+        "MC-MUST-016",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "destination-identity-mismatch"
+      }
+    }
+  ],
+  "registry_test_vector_mutation_format": {
+    "raw_json": "When non-null, parse these exact bytes instead of mutating the canonical registry; this is used for syntax-level cases such as duplicate keys.",
+    "add_class": "Append one complete class rule to classes before loading the registry.",
+    "set": "A map from dotted registry field path to replacement JSON value.",
+    "remove": "A list of dotted registry field paths removed before loading.",
+    "add_unknown": "A map from dotted registry field path to a field that strict consumers must reject."
+  },
+  "registry_test_vectors": [
+    {
+      "id": "MCR-001-class-rule-collision",
+      "raw_json": null,
+      "add_class": {
+        "family": "collision-fixture",
+        "id_kind": "exact",
+        "id": "trj-zen3-16c-smt2",
+        "admission_state": "registered",
+        "admission_reason": "admitted",
+        "hardware_predicates": {},
+        "source_fingerprints": [
+          {
+            "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/provenance.json",
+            "sha256": "b9c9966d55756c6bf5d0fdec251bc6642e1b2c5fd7368f6bdc7b567a99009f76"
+          }
+        ]
+      },
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-002",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "ambiguous-class-id"
+      }
+    },
+    {
+      "id": "MCR-002-registry-unknown-field",
+      "raw_json": null,
+      "add_class": null,
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "classes.1.magic_predicate": true
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCR-003-registered-class-without-provenance",
+      "raw_json": null,
+      "add_class": null,
+      "set": {
+        "classes.1.source_fingerprints": []
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCR-004-invalid-source-fingerprint-digest",
+      "raw_json": null,
+      "add_class": null,
+      "set": {
+        "classes.2.source_fingerprints.0.sha256": "not-a-sha256"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCR-005-duplicate-top-level-key",
+      "raw_json": "{\"schema_version\":\"frankensearch.quill-machine-class-registry.v1\",\"schema_version\":\"frankensearch.quill-machine-class-registry.v1\"}",
+      "add_class": null,
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "duplicate-key"
+      }
+    },
+    {
+      "id": "MCR-006-source-fingerprint-content-mismatch",
+      "raw_json": null,
+      "add_class": null,
+      "set": {
+        "classes.2.source_fingerprints.0.sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-018"
+      ],
+      "expected": {
+        "decision": "reject_registry",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    }
+  ]
+}
