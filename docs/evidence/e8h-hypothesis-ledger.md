@@ -79,6 +79,23 @@ exact magnitudes await post-`ebd91757` reruns. No cross-class ratio claim.
 (P-core QoS pinning, thermal-window gating, larger run counts) are explicit
 P0.3/P1-m4 scope before any KEEP/Block cites an m4 cell.
 
+**Receipt-bearing rerun (2026-07-29, run receipt m4-macos/20260729T021107Z,
+bundle curated at `.bench-history/attempts/2026-07-29/QG-2/m4-macos-qg2-receipt-w5-r30-20260729T021107Z/`):**
+same invocation through the RUN_ID-defaulting runner; lifecycle receipt shows
+`writer_rearmed:false` ×105 — the terminal-join path, on disk.
+
+| arm | p50 docs/s | median CI95 | cv% |
+|---|---|---|---|
+| quill | 88,051.5 | [86,344.9, 88,934.9] | 4.0 |
+| tantivy | 163,602.2 | [159,398.3, 210,883.0] | 20.1 |
+| paired_ab | 0.5284 | [0.4041, 0.5445] | 18.5 |
+| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — contains 1.0, admissible |
+
+Two-run reading: ab CIs overlap in [0.404, 0.481]; the m4 truth sits in the
+0.40–0.53 band and the dominant uncertainty is the INCUMBENT arm's macOS
+variance (cv 20%, Quill's own arm tight at cv 4%). This is Observation 2
+confirming itself; no single-run m4 ratio may be quoted without its band.
+
 ## Open rows
 
 ### bd-e8h-w1-termdict-snapshot-cache-h0eq — decoded TERMDICT block cache
@@ -140,8 +157,31 @@ Expected signal:   material; quantify from census.
 Falsified if:      realloc/memmove frames <0.1%.
 Invocation:        per bd-6oiq card; then paired A/B.
 Machine classes:   x86-vps-ovh + trj primary.
-Results (inline):  PENDING (blocked on bd-6oiq card).
-Retry predicate:   n/a
+Results (inline):  PROFILE-FIRST GATE SATISFIED, SITE REFINED, LEVER IMPLEMENTED —
+                   A/B PENDING (2026-07-29, ScarletPelican). heaptrack census on the
+                   QG-2 cell (trj, run receipt trj-zen3-64c/20260729T021441Z, trace
+                   w22-heaptrack-v2.zst on trj): 120.6M allocation calls in 116s
+                   (1.04M/s), 22.9M temporaries. The measured churn site is NOT
+                   scribe accumulation — it is the SEAL encode path:
+                   encode_vint_block (quiver.rs:2731 pre-fix) built a fresh Vec per
+                   posting block and grew it push-by-push (463,405
+                   grow_one/grow_amortized calls with 0B retained in the
+                   index-commit -> scribe-seal -> quiver-encode chain), then copied
+                   the payload into the section buffer and freed it. Perf agrees:
+                   slow-path allocator frames (malloc_consolidate, _int_free_chunk,
+                   unlink_chunk) + 4% memmove on the Quill thread, while Tantivy's
+                   top COUNT sites are cheap fast-path token Strings on its own
+                   threads. Lever implemented: exact-size direct-to-output encode —
+                   payload length precomputed via vint_length, header + bytes
+                   written straight into the section buffer, error checks precede
+                   all writes (failure-atomicity preserved), byte layout identical
+                   to append_block. Sibling temp-Vec sites (encode_for_block,
+                   EncodedPositionList::encode_with_limits) deliberately untouched:
+                   one lever per change; they file as follow-up rows after this
+                   lever's A/B.
+Retry predicate:   n/a (active lever; A/B next on trj — quill-arm docs/s
+                   CI-disjoint improvement at the QG-2 cell + parity campaign green
+                   at the same SHA are the KEEP inputs).
 
 ### bd-e8h-w2-seal-checksum-audit-ivh69 — seal-time checksum cost (AUDIT)
 Hypothesis:        Section checksum computation is >5% of QG-1 seal wall-time at medium scale.

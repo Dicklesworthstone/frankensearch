@@ -2732,7 +2732,13 @@ fn encode_vint_block(postings: &[Posting], output: &mut Vec<u8>) -> Result<(), P
     if postings.is_empty() {
         return Ok(());
     }
-    let mut payload = Vec::new();
+    // The payload length is exactly computable from vint widths, so the block
+    // header and bytes go straight into `output` in one reserved extension —
+    // a fresh per-block Vec here grew push-by-push into six-figure realloc
+    // counts per seal. Error checks stay ahead of every write so a failed
+    // block still leaves `output` untouched, and the byte layout matches
+    // `append_block` exactly: [kind][count][payload_len: u16 LE][payload].
+    let mut payload_len = 0_usize;
     let mut previous_doc = 0_u32;
     for (index, posting) in postings.iter().enumerate() {
         let stored_doc = if index == 0 {
@@ -2740,8 +2746,7 @@ fn encode_vint_block(postings: &[Posting], output: &mut Vec<u8>) -> Result<(), P
         } else {
             posting.doc_id - previous_doc - 1
         };
-        write_vint(stored_doc, &mut payload);
-        write_vint(posting.freq, &mut payload);
+        payload_len += vint_length(stored_doc) + vint_length(posting.freq);
         previous_doc = posting.doc_id;
     }
     let posting_count =
@@ -2750,7 +2755,30 @@ fn encode_vint_block(postings: &[Posting], output: &mut Vec<u8>) -> Result<(), P
             kind: VINT_KIND,
             count: u8::MAX,
         })?;
-    append_block(output, PostingBlockKind::Vint, posting_count, &payload)
+    let block_offset = output.len();
+    let payload_len_u16 =
+        u16::try_from(payload_len).map_err(|_| PostingCodecError::PayloadTooLarge {
+            block_offset,
+            length: payload_len,
+        })?;
+    output.reserve(4 + payload_len);
+    output.push(PostingBlockKind::Vint.code());
+    output.push(posting_count);
+    output.extend_from_slice(&payload_len_u16.to_le_bytes());
+    let payload_start = output.len();
+    let mut previous_doc = 0_u32;
+    for (index, posting) in postings.iter().enumerate() {
+        let stored_doc = if index == 0 {
+            posting.doc_id
+        } else {
+            posting.doc_id - previous_doc - 1
+        };
+        write_vint(stored_doc, output);
+        write_vint(posting.freq, output);
+        previous_doc = posting.doc_id;
+    }
+    debug_assert_eq!(output.len() - payload_start, payload_len);
+    Ok(())
 }
 
 fn vint_length(mut value: u32) -> usize {
