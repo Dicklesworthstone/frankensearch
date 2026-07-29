@@ -952,6 +952,11 @@ async fn build_lexical_index(
     data_dir: &Path,
     documents: &[IndexableDocument],
 ) -> SearchResult<LexicalArmReceipt> {
+    // bd-b7pz: the LexicalRead flip (0220d5c5) left this write-side arm
+    // without the trait that provides index_documents/commit; this cfg combo
+    // (lexical without quill) is not built by the default-feature gates.
+    use frankensearch_core::traits::LexicalWrite;
+
     let lexical = TantivyIndex::create(data_dir)?;
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
