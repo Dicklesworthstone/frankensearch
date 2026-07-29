@@ -25,6 +25,39 @@ path = "src/lib.rs"
 name = "fsfs"
 path = "src/main.rs"
 
+# These integration targets execute the production fsfs binary and assert
+# successful semantic indexing/search. Production correctly rejects the hash
+# control embedder, so the suites require the verified bundled-model lane.
+[[test]]
+name = "cli_command_tests"
+path = "tests/cli_command_tests.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "cli_e2e_contract"
+path = "tests/cli_e2e_contract.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "e2e_recall"
+path = "tests/e2e_recall.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "filesystem_chaos"
+path = "tests/filesystem_chaos.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "limit_all_large_corpus_benchmark"
+path = "tests/limit_all_large_corpus_benchmark.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "search_quality_harness"
+path = "tests/search_quality_harness.rs"
+required-features = ["embedded-models"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }

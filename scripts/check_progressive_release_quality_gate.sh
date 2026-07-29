@@ -149,7 +149,7 @@ check_quality() {
   emit_event "quality" "start" "RELEASE_GATE_QUALITY_START"
   (
     cd "$ROOT_DIR"
-    run_cargo test -p frankensearch-fsfs --test search_quality_harness quality_harness_reports_metrics_by_query_slice -- --exact --nocapture
+    run_cargo test -p frankensearch-fsfs --features embedded-models --test search_quality_harness quality_harness_reports_metrics_by_query_slice -- --exact --nocapture
   )
   emit_event "quality" "pass" "RELEASE_GATE_QUALITY_PASS"
 }

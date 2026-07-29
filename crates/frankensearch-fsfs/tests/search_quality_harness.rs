@@ -772,7 +772,7 @@ fn quality_harness_reports_metrics_by_query_slice() {
         relevance_fixture_version: relevance_fixture.version,
         total_queries: query_count,
         replay_command:
-            "cargo test -p frankensearch-fsfs --test search_quality_harness -- --nocapture"
+            "cargo test -p frankensearch-fsfs --features embedded-models --test search_quality_harness -- --nocapture"
                 .to_owned(),
         overall: overall_summary,
         per_slice: per_slice_summary,
@@ -797,7 +797,7 @@ fn quality_harness_reports_metrics_by_query_slice() {
     assert_eq!(roundtrip.per_query.len(), query_count);
     assert_eq!(
         roundtrip.replay_command,
-        "cargo test -p frankensearch-fsfs --test search_quality_harness -- --nocapture"
+        "cargo test -p frankensearch-fsfs --features embedded-models --test search_quality_harness -- --nocapture"
     );
 
     // Verify bootstrap CI fields survive JSON roundtrip.

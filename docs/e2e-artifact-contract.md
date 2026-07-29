@@ -473,7 +473,7 @@ bash replay_command.txt
 - Core contract lane (example):
   - `cargo test -p frankensearch-core -- --nocapture`
 - fsfs CLI contract lane (example):
-  - `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+  - `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture`
 - ops/control-plane lane:
   - Use the exact command from `replay_command.txt`; ops replay must preserve transcript evidence when failing.
 
@@ -483,7 +483,7 @@ The `quality` job in `.github/workflows/ci.yml` enforces the unified artifact co
 
 ### Hard-Fail CI Gates
 
-- `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+- `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture`
   - validates fsfs bundle shape and replay/diagnostic artifacts through shared validators.
 - JSON Schema fixture enforcement:
   - every `schemas/fixtures/e2e-*.json` must validate against `schemas/e2e-artifact-v1.schema.json`

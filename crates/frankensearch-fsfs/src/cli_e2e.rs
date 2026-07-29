@@ -567,7 +567,7 @@ pub fn replay_command_for_scenario(scenario: &CliE2eScenario) -> String {
         "cli_e2e_contract"
     };
     format!(
-        "cargo test -p frankensearch-fsfs --test {test_target} -- --nocapture --exact scenario_{}",
+        "cargo test -p frankensearch-fsfs --features embedded-models --test {test_target} -- --nocapture --exact scenario_{}",
         scenario.id.replace('-', "_")
     )
 }

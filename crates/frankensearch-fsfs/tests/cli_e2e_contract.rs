@@ -215,7 +215,9 @@ fn default_bundle_set_manifests_list_required_artifacts() {
 fn replay_guidance_points_at_exact_scenario_test() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Search);
     let replay = replay_command_for_scenario(&scenario);
-    assert!(replay.contains("cargo test -p frankensearch-fsfs --test cli_e2e_contract"));
+    assert!(replay.contains(
+        "cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract"
+    ));
     assert!(replay.contains("--exact scenario_cli_search_stream"));
 }
 

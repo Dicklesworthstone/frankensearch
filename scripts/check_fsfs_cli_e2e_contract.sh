@@ -47,12 +47,12 @@ run_unit() {
 
 run_integration() {
   echo "[integration] fsfs cli_e2e contract suite"
-  cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+  cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture
 }
 
 run_e2e() {
   echo "[e2e] degraded CLI flow replay contract"
-  cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture --exact scenario_cli_degrade_path
+  cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture --exact scenario_cli_degrade_path
 }
 
 if [[ "$MODE" == "unit" || "$MODE" == "all" ]]; then

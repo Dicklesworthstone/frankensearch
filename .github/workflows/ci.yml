@@ -223,7 +223,7 @@ jobs:
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+        run: cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture
 
       - name: Telemetry adapter dry-run lane smoke
         if: matrix.os == 'ubuntu-latest'
@@ -832,11 +832,11 @@ jobs:
           run_test_suite \
             fsfs-cli-formats \
             "json,jsonl,toon,csv,stream" \
-            cargo test -p frankensearch-fsfs --test cli_command_tests -- --nocapture
+            cargo test -p frankensearch-fsfs --features embedded-models --test cli_command_tests -- --nocapture
           run_test_suite \
             fsfs-cli-e2e \
             "dual-mode,index-search-status" \
-            cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+            cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture
           run_test_suite \
             fsfs-baseline-matrix \
             "quill-e7-lexical,drift-dashboard" \
