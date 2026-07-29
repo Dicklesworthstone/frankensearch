@@ -17654,3 +17654,121 @@ than one observed CPU-active Quill ingest worker. If bytes/document do not
 fall, record the counted mechanism as unchanged and route elsewhere without
 timing; never derive an A/B ratio from separate profiler invocations or gate
 on CV.
+### 2026-07-29 — REJECT seal-path copy/decode elision in segment+quiver encoders (bd-w8dut P2, SandyGrove)
+
+**Hypothesis (from the P1 attribution card
+`docs/evidence/e8h/p1-local-qg2-memmove-attribution-20260729.md`):** two
+seal-path sites — (a) section-assembly copies 1.37% of the quill arm, (b) seal
+posting re-decode 0.56% — are elidable inside
+`crates/frankensearch-quill/src/segment.rs` + `quiver.rs` alone. Lever as
+implemented: (1) `EncodedPostingList::finish_encoding` passed the freshly
+encoded, self-delimiting block bytes straight through in release instead of
+fully re-decoding them for self-validation (debug builds kept the validating
+re-parse; `block_count` derived by construction, one block per
+`encode_posting_block` call); (2) `EncodedSegment::encode_with_limits_impl`
+wrote the header directly at its planned offset in the destination buffer
+instead of staging an intermediate `header_bytes` Vec and copying it.
+
+**Scope finding (why most of site (a) was NOT implementable here):** the
+production seal calls `EncodedSegment::encode` from `scribe.rs:3441` with
+borrowed section buffers; the one copy per section into the file buffer
+(`segment.rs` §encode loop) and the STOREDMETA accumulator→section blob copy
+(`quiver.rs` `encode_accumulator_with_limits`) can only be elided if the scribe
+seal adopts the existing `SegmentAssembler` encode-into-place seam
+(`segment.rs:227`, already used by keeper concat-merge) — a scribe.rs change,
+out of this pass's reserved files. The in-scope elidable share was therefore
+only ~0.6-0.8% of the arm, and the A/B confirmed exactly that.
+
+**Byte-identity proof (cross-ELF):** deterministic probe emitted 8 artifacts —
+a full 10-section DEFAULT_SCHEMA FSLX segment file plus posting streams
+covering VINT partial/BITMAP/FOR/multi-block and the fresh-seal
+POSTINGS+BLOCKMAX pair — under both ELFs; all 8 SHA-256 MATCH, and block
+counts match (1,1,1,1,4;4). The pinned wire oracle
+(`pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads`,
+frozen `fslx-v1-golden.hex`) and the assembler byte-identity test passed on
+the lever build. RED-ability was demonstrated by deliberate mutations: a
+one-byte CRC-window shift went RED in 10 segment tests; `block_count + 1`
+went RED in `posting_concat_is_associative_and_copies_exact_source_bytes`
+(quiver.rs:12788).
+
+**Workload:** QG-2 smoke memory child (`QUILL_PERF_CHILD_MODE=memory`,
+`ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on,
+`QUILL_PERF_SCALE=smoke`), externally wall-timed, taskset-pinned to one core,
+interleaved paired runs, n=16 per arm. Machine class **local-5975wx-32c**
+(diagnostic host, not a certified campaign class; governor powersave —
+relative paired ratios only).
+
+- Baseline ELF sha256: 9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b
+- Lever ELF sha256: e4e4bcae6b567ece66919cc227fbfd6a1dd650097c67a161701060135c170c25
+- Both built from origin/main `3684b147` overlay (lever = overlay + the two
+  edited files), same flags (`-C force-frame-pointers=yes`, release-perf),
+  same isolated target dir.
+
+| arm | median docs/s | p5 | p95 |
+|---|---:|---:|---:|
+| baseline | 38,348 | 37,799 | 38,778 |
+| lever | 38,718 | 37,874 | 39,186 |
+
+Paired ratio lever/baseline (docs/s, >1 = lever faster): **median 1.0071
+[p5 0.9890, p95 1.0247]**, n=16. A/A null: baseline ELF vs itself, interleaved
+in the same invocation series on the same pinned core, median 0.9995
+[p5 0.9894, p95 1.0161], n=16 — the A/B interval sits inside the null band's
+character and straddles 1.0. Arm dispersion (relative spread of per-run
+values, diagnostic only, never decisive): baseline 0.75%, lever 1.32%, A/A
+arms 0.68%/0.59%. The decision below rests solely on the paired-ratio median
+CI versus the A/A null floor.
+
+**Mechanism evidence (the lever DID land mechanically):** same-session
+arm-scoped dwarf profiles (F=1997, ~10-11K samples each, P1 method):
+seal-validation decode frames `decode_vint_payload` 0.27% +
+`PostingList::parse_with_limits` 0.15% + `decode_block_at` 0.10% (= 0.52% of
+the arm, matching the P1 0.56% attribution) present in the baseline profile
+and ABSENT (zero samples) in the lever profile; memmove family
+`__memmove_avx_unaligned_erms` 7.64% → 6.46%, `__memset_avx2_unaligned_erms`
+0.43% → 0.28%. The elided work is real but too small a fraction of the
+multi-second ingest run to clear the noise floor.
+
+**Comparison class: SELF-SPEEDUP** (quill vs quill; no incumbent arm ran; no
+campaign or competitive claim).
+
+**Decision: REJECT / reverted.** Median +0.71% with the confidence interval
+straddling 1.0 is a WASH against the ≥1.03 acceptance bar; both working-tree files
+were restored byte-identical to origin/main (blob `d87f158b` for quiver.rs;
+empty diff for both).
+
+**Retry predicate:** retry only if (a) the scribe seal call site adopts the
+`SegmentAssembler` encode-into-place seam so the remaining ~1.4%
+section-assembly + STOREDMETA blob copies become elidable in the same change
+(that lever spans scribe.rs and needs its lease), or (b) a certified class
+profile attributes >3% of the quill arm to the seal-path
+memmove+decode-under-encode family. Do not re-run this two-file-only variant;
+its addressable share is bounded at ~0.8% by the P1 attribution.
+
+### 2026-07-29 — SURVEY: allocator/THP family on the quill arm is DEAD on local-5975wx-32c (E8-H P3, SandyGrove)
+
+Symmetric env-only matrix on the memory-mode child seam (not the bulk gate
+cell; diagnostic seam only. Facade-level QG-2 remains inactive, and 0.1113
+is superseded pre-current diagnostic evidence retained only through commit
+`351f5c6d`): 7 cells x 10
+rotated rounds, single ELF sha256
+`9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`, core-pinned,
+external wall time. A/A null (glibc quill vs itself, same-invocation series,
+interleaved): 0.9983 [0.8808, 1.0248], admissible.
+
+- quill jemalloc/glibc: 0.9563 [0.9050, 1.1431] — straddles 1.0, no win.
+- quill THP tunable (glibc.malloc.hugetlb=1): 0.9916 [0.8577, 1.2010] — wash.
+- tantivy jemalloc/glibc: 1.0678 [1.0471, 1.1084] — the INCUMBENT arm is the
+  allocator-sensitive one; symmetric allocator changes would widen the gap.
+- mimalloc absent on host; glibc-tunable cell substituted per plan.
+
+Mechanism consistency: P1 card attributed quill memmove as data-copy-shaped
+(~5.2%) with only ~0.45% allocation-growth; allocator substitution moving
+nothing on the quill arm corroborates it. Class-split note: further decouples
+the x86-vs-m4 gap from glibc allocator behavior on the quill side.
+
+Full card: `docs/evidence/e8h/p3-local-qg2-allocator-sensitivity-20260729.md`.
+
+**Retry predicate:** reopen only if (a) a bulk gate-cell allocator A/B on a
+certified class moves the quill arm's median ratio >3% with an admissible
+same-invocation A/A null, or (b) a certified-class arm-scoped profile
+attributes >8% of quill self-time to allocator frames.
