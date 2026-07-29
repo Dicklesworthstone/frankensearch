@@ -251,6 +251,24 @@ impl CliE2eArtifactBundle {
                 "manifest artifact entries do not match the bundle's current payloads".to_owned(),
             );
         }
+
+        let expected_bundle = Self::build(
+            &CliE2eRunConfig {
+                run_id: self.manifest.run_id.clone(),
+                ts: self.manifest.ts.clone(),
+                seed: self.manifest.body.seed,
+                config_hash: self.manifest.body.config_hash.clone(),
+                platform: self.manifest.body.platform.clone(),
+            },
+            &self.scenario,
+            self.manifest.body.exit_status,
+        );
+        if *self != expected_bundle {
+            return Err(
+                "bundle does not match the deterministic artifact derivation for its scenario"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 }
@@ -681,6 +699,40 @@ mod tests {
                 .validate()
                 .expect_err("payload drift must invalidate the sealed manifest"),
             "manifest artifact entries do not match the bundle's current payloads"
+        );
+
+        let mut schema_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        schema_drift.schema_version.push_str("-tampered");
+        assert_eq!(
+            schema_drift
+                .validate()
+                .expect_err("top-level schema drift must fail closed"),
+            "bundle does not match the deterministic artifact derivation for its scenario"
+        );
+
+        let mut scenario_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        scenario_drift
+            .scenario
+            .args
+            .push("--post-seal-mutation".to_owned());
+        assert_eq!(
+            scenario_drift
+                .validate()
+                .expect_err("scenario drift must invalidate its derived artifacts"),
+            "bundle does not match the deterministic artifact derivation for its scenario"
+        );
+
+        let mut replay_body_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        replay_body_drift.replay[0].body.payload =
+            serde_json::json!({"scenario_id": "post-seal-mutation"});
+        assert_eq!(
+            replay_body_drift
+                .validate()
+                .expect_err("replay-body drift must fail closed"),
+            "bundle does not match the deterministic artifact derivation for its scenario"
         );
     }
 
