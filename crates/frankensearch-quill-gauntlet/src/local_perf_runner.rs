@@ -729,16 +729,16 @@ fn pin_directory(path: &Path, close_on_exec: bool) -> Result<PinnedDirectory, Lo
     })
 }
 
-fn checked_directory_identity(handle: &impl AsFd) -> Result<FileIdentity, LocalPerfRunError> {
-    let stat = fstat(handle).map_err(std::io::Error::from)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+fn checked_directory_identity(handle: &File) -> Result<FileIdentity, LocalPerfRunError> {
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() {
         return Err(LocalPerfRunError::Invalid(
             "pinned run root is not a directory".to_owned(),
         ));
     }
     Ok(FileIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
+        device: metadata.dev(),
+        inode: metadata.ino(),
     })
 }
 
@@ -1694,12 +1694,12 @@ fn verify_prepared_build(
     Ok(())
 }
 
-fn checked_benchmark_identity(handle: &impl AsFd) -> Result<FileIdentity, LocalPerfRunError> {
-    let stat = fstat(handle).map_err(std::io::Error::from)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_nlink != 1
-        || stat.st_uid != geteuid().as_raw()
-        || stat.st_mode & 0o111 == 0
+fn checked_benchmark_identity(handle: &File) -> Result<FileIdentity, LocalPerfRunError> {
+    let metadata = handle.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o111 == 0
     {
         return Err(LocalPerfRunError::Invalid(
             "benchmark image must be an effective-user-owned executable regular single-link file"
@@ -1707,8 +1707,8 @@ fn checked_benchmark_identity(handle: &impl AsFd) -> Result<FileIdentity, LocalP
         ));
     }
     Ok(FileIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
+        device: metadata.dev(),
+        inode: metadata.ino(),
     })
 }
 
@@ -2691,6 +2691,15 @@ mod tests {
         let output = root.path().join("output");
         fs::create_dir(&output).expect("create output root");
         let pinned_output = pin_directory(&output, true).expect("pin output root");
+        let output_metadata = fs::symlink_metadata(&output).expect("output metadata");
+        assert_eq!(
+            pinned_output.identity,
+            FileIdentity {
+                device: output_metadata.dev(),
+                inode: output_metadata.ino(),
+            },
+            "held directory and path metadata must use one device/inode representation"
+        );
         let displaced_output = root.path().join("output-displaced");
         fs::rename(&output, &displaced_output).expect("displace output root");
         fs::create_dir(&output).expect("create replacement output root");
@@ -2715,6 +2724,16 @@ mod tests {
             .expect("open held benchmark"),
         );
         let identity = checked_benchmark_identity(&handle).expect("benchmark identity");
+        let executable_metadata =
+            fs::symlink_metadata(&executable).expect("benchmark path metadata");
+        assert_eq!(
+            identity,
+            FileIdentity {
+                device: executable_metadata.dev(),
+                inode: executable_metadata.ino(),
+            },
+            "held benchmark and path metadata must use one device/inode representation"
+        );
         let held_sha = sha256_open_file(&handle).expect("held benchmark digest");
         verify_benchmark_path(&executable, &identity, &target).expect("original benchmark path");
 
