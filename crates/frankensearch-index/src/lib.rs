@@ -5920,7 +5920,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
         let mut names: Vec<_> = fs::read_dir(path)
             .expect("read private fixture directory")
