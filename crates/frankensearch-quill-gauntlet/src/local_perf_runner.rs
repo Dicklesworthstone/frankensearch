@@ -2796,6 +2796,51 @@ mod tests {
     }
 
     #[test]
+    fn lease_inherited_fd_producer_helper() {
+        let Some(lease_path) = std::env::var_os("QUILL_PERF_TEST_INHERITED_LEASE_PRODUCER_PATH")
+        else {
+            return;
+        };
+        let lease_path = PathBuf::from(lease_path);
+        let (lease, _identity) = acquire_family_lease(&lease_path).expect("acquire parent lease");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::lease_inherited_fd_child_helper";
+        let mut child = Command::new(&current_test)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_INHERITED_LEASE_CHILD", "1")
+            .env_remove("QUILL_PERF_TEST_INHERITED_LEASE_PRODUCER_PATH")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn inherited-lease child");
+        let mut child_output = BufReader::new(child.stdout.take().expect("child stdout"));
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                child_output
+                    .read_line(&mut line)
+                    .expect("read inherited child readiness"),
+                0,
+                "child exited before inheriting the lease"
+            );
+            if line.trim() == "inherited-lease-ready" {
+                break;
+            }
+        }
+
+        drop(lease);
+        assert!(
+            acquire_family_lease(&lease_path).is_err(),
+            "contender acquired while inherited noisy-child lease remained open"
+        );
+
+        drop(child.stdin.take());
+        assert!(child.wait().expect("wait for inherited child").success());
+        let (_reacquired, _identity) =
+            acquire_family_lease(&lease_path).expect("lease released after child exit");
+    }
+
+    #[test]
     fn family_lease_excludes_a_second_process_before_work_begins() {
         let directory = tempfile::tempdir().expect("lease test directory");
         let lease_path = directory.path().join("family.lock");
@@ -2845,41 +2890,20 @@ mod tests {
     fn inherited_lease_survives_producer_exit_until_noisy_child_exits() {
         let directory = tempfile::tempdir().expect("lease test directory");
         let lease_path = directory.path().join("inherited-family.lock");
-        let (lease, _identity) = acquire_family_lease(&lease_path).expect("acquire parent lease");
         let current_test = std::env::current_exe().expect("current test executable");
-        let helper_name = "local_perf_runner::tests::lease_inherited_fd_child_helper";
-        let mut child = Command::new(&current_test)
-            .args(["--exact", helper_name, "--nocapture"])
-            .env("QUILL_PERF_TEST_INHERITED_LEASE_CHILD", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn inherited-lease child");
-        let mut child_output = BufReader::new(child.stdout.take().expect("child stdout"));
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                child_output
-                    .read_line(&mut line)
-                    .expect("read inherited child readiness"),
-                0,
-                "child exited before inheriting the lease"
-            );
-            if line.trim() == "inherited-lease-ready" {
-                break;
-            }
-        }
-
-        drop(lease);
+        let helper_name = "local_perf_runner::tests::lease_inherited_fd_producer_helper";
+        // Keep the inheritable lease out of the parallel parent harness so unrelated
+        // sibling test processes cannot extend its open-file-description lifetime.
+        let helper = Command::new(&current_test)
+            .args(["--exact", helper_name, "--nocapture", "--test-threads=1"])
+            .env("QUILL_PERF_TEST_INHERITED_LEASE_PRODUCER_PATH", &lease_path)
+            .stdin(Stdio::null())
+            .status()
+            .expect("run isolated inherited-lease producer");
         assert!(
-            acquire_family_lease(&lease_path).is_err(),
-            "contender acquired while inherited noisy-child lease remained open"
+            helper.success(),
+            "isolated inherited-lease producer failed: {helper}"
         );
-
-        drop(child.stdin.take());
-        assert!(child.wait().expect("wait for inherited child").success());
-        let (_reacquired, _identity) =
-            acquire_family_lease(&lease_path).expect("lease released after child exit");
     }
 
     #[test]
