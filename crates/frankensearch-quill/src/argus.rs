@@ -6013,6 +6013,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bench-internals")]
     fn timed_encoded_grouped_union(
         encoded_doclens: &EncodedDocLenSection,
         encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
@@ -6125,6 +6126,7 @@ mod tests {
         Ok((elapsed_us, hits, stats))
     }
 
+    #[cfg(feature = "bench-internals")]
     fn validate_encoded_pruning_metadata(
         encoded_doclens: &EncodedDocLenSection,
         encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
