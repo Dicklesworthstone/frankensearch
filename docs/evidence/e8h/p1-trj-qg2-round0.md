@@ -75,3 +75,28 @@ Cross-check note: the Tantivy tokenizer adapter
 the process — on the TANTIVY arm. Both engines pay a tokenizer; Quill's
 `analyze` shows only 2.26% — consistent with Quill's cost being downstream of
 tokenization, in per-term/per-doc memory traffic.
+
+## Round-0 closure: this card's method has reached its attribution limit
+
+Two follow-up probes (2026-07-29) establish that process-wide sampling CANNOT
+take this further:
+
+1. **The count-vs-time trap fired live.** The heaptrack-ranked top churn site
+   (encode_vint_block, 463k grow calls, 0B retained) was implemented as a
+   lever and A/B'd to a WASH (receipts under
+   `trj-zen3-64c/20260729T024251Z-lever1-ab`): count-dominant, time-trivial.
+   Standing rule now in the hypothesis ledger: every count-derived row
+   carries a count x ns/op vs wall-time conversion before implementation.
+2. **Caller fragmentation + thread confounding.** Main-thread memmove callers
+   are individually <0.35%; the harness generator (fmt family ~13%, String
+   churn) shares the quill thread and owns an unknown share of the libc
+   frames; the tantivy-thread share includes non-timed background work. The
+   cross-arm arithmetic of a 2.9x-slower quill arm does not close from
+   process-wide numbers.
+
+**Requirement for Round 1 (binding on successors):** arm-scoped attribution —
+a quill-only ingest run (engine-filtered harness child via the
+QUILL_PERF_CHILD_ENGINE seam, or per-timed-window perf enable) so the profile
+contains the quill arm and nothing else. bd-6oiq's QG-1 card should adopt arm
+scoping from the start. Until such a profile exists, no further W2 lever
+implementations from this card's data.
