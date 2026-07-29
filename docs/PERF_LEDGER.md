@@ -8113,3 +8113,43 @@ normative QG-1 matrix and immediate reproduction. A publishable verdict
 requires the actual Tantivy incumbent in the same invocation, both A/A
 controls, bootstrap median-CIs, exact-ELF provenance, sealed concurrency
 witnesses, and `laws_attested: true`.
+
+## 2026-07-29 — METHODOLOGY / VALID-MECHANISM: Quill moves 8.1587x Tantivy copy bytes/document on the source-3684 diagnostic child (`bd-e8h`, FoggySquirrel)
+
+**Evidence class: DIAGNOSTIC MECHANISM, not an incumbent timing or QG
+claim.** Exact ELF SHA-256
+`03308f4b4b74140cc2a9cbcf926cbe29b9c9118e34512af947e70538d88114e0`
+ran an identical 200,000-document, 50,000,000-byte writer-heap,
+requested-threads=1, positions-on child fixture. Separate sequential uprobe
+invocations counted 203,720,623 resolved AVX copy entries and
+41,437,077,594 bytes for Quill, versus 104,016,287 entries and
+5,078,894,209 bytes for pinned Tantivy 0.26.1. That is 1,018.603 versus
+520.081 calls/document, 202.329 versus 24.799 KiB/document, and
+Quill/Tantivy ratios of 1.958545x calls and 8.158681x bytes.
+
+Matching profiles attribute 7.74% dwarf / 7.25% frame-pointer self-time to
+Quill memmove and 5.75% / 5.29% to Tantivy. Quill copy bytes/document rise
+205.63% from 20,000 to 200,000 documents while Tantivy stays flat, supporting
+flush, seal, or publication copy amplification as the next investigation
+route. A five-run balanced powersave audit observed median 4.268922 GHz for
+Quill and 4.029451 GHz for Tantivy; the 5.943% frequency skew favored Quill
+and cannot explain its copy deficit. The diagnostic child also reports about
+0.996 versus 1.815 CPU-equivalents, so it is not single-hardware-thread wall
+timing evidence.
+
+**Decision: VALID-MECHANISM / DIAGNOSTIC ONLY.** There is no A/A control
+because the counters came from separate profiler invocations. Do not infer a
+performance ratio, current-incumbent verdict, QG state, or activation from
+this mechanism receipt. Route the next lever to an already mapped copy site.
+The complete receipt and counter definitions are in
+`docs/evidence/e8h/p1-qg2-cross-engine-memmove-counters-20260729.md`.
+
+**Retry predicate:** after immutable integration, require byte-identical
+index output and repeat the same 200,000-document mechanism probe. The lever
+must materially reduce Quill copy bytes/document before any QG rerun. Then
+run QG-2 with the exact-current ELF, pinned Tantivy in the same invocation,
+both A/A nulls, and bootstrap median-CIs. QG-1 additionally requires more
+than one observed CPU-active Quill ingest worker. If bytes/document do not
+fall, record the counted mechanism as unchanged and route elsewhere without
+timing; never derive an A/B ratio from separate profiler invocations or gate
+on CV.
