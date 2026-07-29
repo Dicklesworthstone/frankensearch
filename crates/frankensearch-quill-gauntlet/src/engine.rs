@@ -4764,7 +4764,7 @@ mod tests {
                             .map(|(doc_id, _score_bits)| doc_id.clone())
                             .collect::<Vec<_>>();
                         doc_ids.sort();
-                        (query_id.clone(), doc_ids, count.clone())
+                        (query_id.clone(), doc_ids, *count)
                     })
                     .collect::<Vec<_>>()
             };
