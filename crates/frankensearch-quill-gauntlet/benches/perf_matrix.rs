@@ -44,8 +44,9 @@ use frankensearch_quill_gauntlet::{
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
     Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
     RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
+    command_sha256_from_argv, compare_observations, estimate_paired_experiment,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
+    seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -2436,6 +2437,11 @@ fn build_profile_label(scale: MatrixScale) -> String {
     }
 }
 
+fn command_sha256() -> String {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    command_sha256_from_argv(arguments.iter().map(|argument| argument.as_encoded_bytes()))
+}
+
 fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -> BuildIdentity {
     let porcelain = Command::new("git")
         .args(["status", "--porcelain"])
@@ -2487,6 +2493,7 @@ fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -
         git_dirty,
         worktree_state_sha256,
         cargo_lock_sha256,
+        command_sha256: command_sha256(),
         rustc_version,
         target_triple,
         build_profile: build_profile.to_owned(),

@@ -29,6 +29,8 @@ other manifest byte still invalidates prior evidence.
 .bench-history/
   QG-<n>.<machine-class>.latest.json     # committed; the ratchet baseline
   QG-<n>.<machine-class>.<date>.json     # retained run window
+  QG-<n>.<machine-class>.latest.evidence.json
+  QG-<n>.<machine-class>.<date>.evidence.json
   QG-<n>.unmeasured.latest.json          # explicit bootstrap quarantine
 ```
 Schema per file: `{schema_version, gate, bench_elf_sha256,
@@ -54,9 +56,12 @@ with a directional 5% pass-over-pass threshold. A movement beyond 5% is
 directional regression; a median movement whose CIs do not decide it is
 `Quarantine`, never a silent keep. MAD and robust z remain diagnostic
 provenance only. Promotion also
-requires a second artifact from the same git revision, machine fingerprint,
-corpus hash, and run window, with a distinct run ID and medians reproducing
-within 5%.
+requires a second artifact from the same git revision, registry-derived machine
+class and execution identity, corpus hash, and run window, with a distinct run
+ID and independently sealed runner receipt. Baseline, candidate, and rerun
+must carry three distinct run IDs, one exact NUL-delimited argv identity, and
+one rustc/target/profile/feature context. Candidate and rerun medians must
+reproduce within 5%.
 
 ## Paired estimator contract
 
@@ -89,11 +94,11 @@ blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
 The v3 QG writer's legacy `paired_ab`/`paired_null` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v1` artifact (`bd-uh2f` /
+Decision-grade output is the `quill-perf-evidence-v2` artifact (`bd-uh2f` /
 `bd-uh2f.1`), which the harness now emits beside every v3 artifact from the
 exact same raw paired blocks.
 
-## Evidence artifacts (`quill-perf-evidence-v1`)
+## Evidence artifacts (`quill-perf-evidence-v2`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
@@ -102,9 +107,31 @@ paired log-ratio effect with a seeded bootstrap CI, the same-invocation A/A
 result, bounded raw samples that every summary recomputes from on load, and a
 same-scope absolute-versus-paired reconciliation. Run provenance records the
 executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
-rustc/target/profile/features, machine identity with governor and load, peak
-RSS with its method (`unsupported` is reported honestly, never a zero), and
+the exact NUL-separated and NUL-terminated argv SHA-256,
+rustc/target/profile/features, machine identity with governor and load, peak RSS
+with its method (`unsupported` is reported honestly, never a zero), and
 corpus/query-set hashes with generator coordinates.
+
+Version 2 additionally binds the exact frozen
+`quill-machine-classes.json` registry identity and canonicalization contract,
+the canonical class derived from strict runner facts, immutable hardware facts,
+the explicit execution request and start/end snapshots, every recomputed
+hardware/cpuset/snapshot/execution hash, and the SHA-256 plus exact bytes of one
+verified sealed runner-completion receipt. The registry and receipt parsers
+reject duplicate and unknown fields. Loading re-admits the embedded receipt
+against the frozen registry; resealing an artifact cannot legitimize a stale,
+drifted, mixed, incomplete, or tampered identity. An explicit `unverified`
+binding remains durable for diagnosis but is never ratchet-admissible.
+
+Receipt binding is deliberately two-phase. The live benchmark writes the
+current v2 artifact with an explicit `unverified` binding and the exact
+NUL-delimited process-argv hash while the child is still running. The runner
+can seal its completion receipt only after that child exits. Promotion
+therefore admits each post-exit receipt, joins it to the corresponding
+baseline/candidate/rerun artifact in memory, recomputes the artifact seal, and
+validates the complete trio before opening any history destination. Only those
+new receipt-bound bytes may be written on `Allow`; the original unverified
+producer bytes remain diagnostic provenance and are never copied into history.
 
 Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
 two-stage hierarchical per-query resampling (QG-6, four query groups per
@@ -125,9 +152,18 @@ files and stale schema versions. Legacy v3 artifacts load only through the
 explicit read-only `load_legacy_gate_artifact_v3`.
 
 Every decision JSON names and SHA-256 hashes the manifest, baseline, candidate,
-and rerun. `Allow` may update the machine-class `latest.json` and write a dated
-sibling; `Block` and `Quarantine` never change history. Older evidence is
-retained rather than automatically deleted under repository Rule 1.
+rerun, all three current-schema evidence artifacts, and all three exact runner
+receipts. Promotion requires one registry-verified execution identity across
+baseline, candidate, and rerun before any mutable history path is opened.
+`--machine-class` is an expected value only: it must equal the class derived
+from every receipt and cannot relabel evidence or select a different latest
+key. `Allow` writes the dated threshold object, dated evidence, latest evidence,
+and finally the legacy latest threshold pointer, with file and directory sync
+at each boundary. `Block`, `Quarantine`, receipt rejection, destination
+mismatch, and legacy/current mixtures leave every history byte unchanged.
+Legacy threshold artifacts remain readable only in explicitly nonpromotable
+regression-alarm mode. Older evidence is retained rather than automatically
+deleted under repository Rule 1.
 
 CI uses the same binary in two lanes:
 

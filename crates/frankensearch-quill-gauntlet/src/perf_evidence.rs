@@ -35,6 +35,7 @@ use crate::perf::{
     PerfInputIdentity, PerfRawSample, median_sorted, percentile, splitmix64,
     validate_paired_blocks,
 };
+use crate::{MachineClassEvidenceBinding, VerifiedRunnerIdentity};
 
 /// Version of the evidence artifact emitted by this module.
 ///
@@ -43,13 +44,28 @@ use crate::perf::{
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v1";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v2";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
 pub const EVIDENCE_MAX_REASONS: usize = 64;
 /// Upper bound on one bounded reason message, in bytes.
 pub const EVIDENCE_MAX_REASON_MESSAGE_BYTES: usize = 240;
+
+/// Hash exact operating-system argv bytes with one NUL separator and a final
+/// NUL terminator, as required by the runner receipt contract.
+///
+/// Operating-system argv entries cannot themselves contain NUL. Accepting
+/// byte slices keeps this helper lossless for non-UTF-8 Unix arguments.
+#[must_use]
+pub fn command_sha256_from_argv<'a>(arguments: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut hasher = Sha256::new();
+    for argument in arguments {
+        hasher.update(argument);
+        hasher.update([0]);
+    }
+    lower_hex(&hasher.finalize())
+}
 
 /// Deterministic severity precedence: `Fatal > Block > Quarantine > NoClaim > Allow`.
 ///
@@ -276,6 +292,8 @@ pub struct BuildIdentity {
     pub worktree_state_sha256: Option<String>,
     /// SHA-256 of the exact `Cargo.lock`, when resolvable.
     pub cargo_lock_sha256: Option<String>,
+    /// SHA-256 of exact NUL-separated, NUL-terminated process argv bytes.
+    pub command_sha256: String,
     /// `rustc --version` of the toolchain that built the binary.
     pub rustc_version: String,
     /// Compilation target triple.
@@ -295,14 +313,15 @@ impl BuildIdentity {
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
         if !hex_ok(&self.executable_sha256)
+            || !hex_ok(&self.command_sha256)
             || self.git_revision.trim().is_empty()
             || self.rustc_version.trim().is_empty()
             || self.target_triple.trim().is_empty()
             || self.build_profile.trim().is_empty()
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "build identity requires an executable SHA-256, git revision, rustc \
-                         version, target triple, and profile"
+                reason: "build identity requires executable and command SHA-256 values, a git \
+                         revision, rustc version, target triple, and profile"
                     .to_owned(),
             });
         }
@@ -1192,6 +1211,7 @@ pub struct EvidenceArtifactPaths {
 
 /// Versioned, hash-sealed, decision-grade gate evidence artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfEvidenceArtifact {
     /// Always [`PERF_EVIDENCE_SCHEMA_VERSION`] for current artifacts.
     pub schema_version: String,
@@ -1201,6 +1221,9 @@ pub struct PerfEvidenceArtifact {
     pub policy: EvidencePolicy,
     /// Complete run provenance.
     pub provenance: EvidenceProvenance,
+    /// Strict runner-receipt machine identity. An explicit unverified binding
+    /// is durable for diagnosis but can never promote.
+    pub machine_class: MachineClassEvidenceBinding,
     /// Decision-grade cells.
     pub cells: Vec<EvidenceCell>,
     /// Deterministic fold of required-cell statuses.
@@ -1282,6 +1305,9 @@ impl PerfEvidenceArtifact {
             gate,
             policy,
             provenance,
+            machine_class: MachineClassEvidenceBinding::unverified(
+                "sealed runner receipt has not been bound",
+            ),
             cells,
             gate_status,
             gate_decision: None,
@@ -1353,11 +1379,162 @@ impl PerfEvidenceArtifact {
     #[must_use]
     pub fn ratchet_admissible(&self) -> bool {
         self.gate_status == EvidenceDecisionStatus::MeasuredProvisional
+            && self.machine_class.identity().is_some()
             && self
                 .cells
                 .iter()
                 .filter(|cell| cell.spec.role == EvidenceRole::Required)
                 .all(EvidenceCell::claim_eligible)
+    }
+
+    /// Bind the exact registry-admitted runner identity before sealing.
+    ///
+    /// Binding invalidates any prior artifact seal and downstream gate
+    /// decision. The stored receipt remains independently re-admitted by
+    /// [`Self::verify_integrity`] on every load.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provenance error if the supplied identity no longer
+    /// re-admits against the frozen registry.
+    pub fn bind_machine_class_identity(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+    ) -> Result<(), EvidenceArtifactError> {
+        identity
+            .verify()
+            .map_err(|error| EvidenceArtifactError::InvalidProvenance {
+                reason: format!("machine-class binding rejected: {error}"),
+            })?;
+        if let Some(existing) = self.machine_class.identity()
+            && existing != &identity
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "evidence already carries a different verified runner receipt; verified \
+                         bindings are immutable"
+                    .to_owned(),
+            });
+        }
+        let context = identity.admission_context();
+        let gate_label = self.gate.label();
+        let expected_destination = format!("{gate_label}.{}.latest.json", identity.class_id());
+        if context.gate != gate_label || context.destination_basename != expected_destination {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: format!(
+                    "machine-class receipt was admitted for gate/destination {}/{} instead of \
+                     {gate_label}/{expected_destination}",
+                    context.gate, context.destination_basename
+                ),
+            });
+        }
+        let build = identity.build().as_object().ok_or_else(|| {
+            EvidenceArtifactError::InvalidProvenance {
+                reason: "verified runner build facts are not an object".to_owned(),
+            }
+        })?;
+        let runner_string = |field: &str| {
+            build
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
+                    reason: format!("verified runner build field {field:?} is not a string"),
+                })
+        };
+        let runner_git_dirty = build
+            .get("git_dirty")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
+                reason: "verified runner build field \"git_dirty\" is not a boolean".to_owned(),
+            })?;
+        let runner_worktree_state = match build.get("worktree_state_sha256") {
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(serde_json::Value::Null) => None,
+            _ => {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: "verified runner worktree-state identity is malformed".to_owned(),
+                });
+            }
+        };
+        let runner_cargo_lock = runner_string("cargo_lock_sha256")?;
+        let evidence_build = &self.provenance.build;
+        let build_matches = evidence_build.git_revision == runner_string("git_revision")?
+            && evidence_build.git_dirty == runner_git_dirty
+            && evidence_build.worktree_state_sha256.as_deref() == runner_worktree_state
+            && evidence_build.cargo_lock_sha256.as_deref() == Some(runner_cargo_lock)
+            && evidence_build.executable_sha256 == runner_string("executable_sha256")?
+            && evidence_build.command_sha256 == runner_string("command_sha256")?;
+        if !build_matches {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "evidence build identity differs from the verified runner receipt"
+                    .to_owned(),
+            });
+        }
+        let hardware = identity.hardware().as_object().ok_or_else(|| {
+            EvidenceArtifactError::InvalidProvenance {
+                reason: "verified runner hardware facts are not an object".to_owned(),
+            }
+        })?;
+        let hardware_string = |field: &str| {
+            hardware
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| EvidenceArtifactError::InvalidProvenance {
+                    reason: format!("verified runner hardware field {field:?} is not a string"),
+                })
+        };
+        let hardware_os = hardware_string("os")?;
+        let hardware_arch = hardware_string("arch")?;
+        let target_matches = match (hardware_os, hardware_arch) {
+            ("linux", "x86_64") => {
+                evidence_build.target_triple.starts_with("x86_64-")
+                    && evidence_build.target_triple.contains("linux")
+            }
+            ("macos", "aarch64") => {
+                evidence_build.target_triple.starts_with("aarch64-")
+                    && evidence_build.target_triple.contains("apple-darwin")
+            }
+            _ => false,
+        };
+        if self.provenance.machine.os != hardware_os
+            || self.provenance.machine.arch != hardware_arch
+            || !target_matches
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "evidence OS/architecture/target differs from verified runner hardware"
+                    .to_owned(),
+            });
+        }
+        self.machine_class = MachineClassEvidenceBinding::verified(identity);
+        self.gate_decision = None;
+        self.artifact_sha256.clear();
+        Ok(())
+    }
+
+    /// Bind one post-exit runner receipt and return the newly sealed artifact.
+    ///
+    /// The benchmark process can persist an explicit unverified diagnostic
+    /// artifact while it is still running, but a completion receipt cannot be
+    /// sealed until that process exits. The ratchet finalization lane uses this
+    /// method to join those two exact objects in memory before evaluating or
+    /// opening any promotion-history destination. The returned bytes are the
+    /// only evidence bytes a successful promotion may persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same provenance errors as
+    /// [`Self::bind_machine_class_identity`], plus serialization or invariant
+    /// errors if the newly bound artifact cannot be verified exactly.
+    pub fn bind_machine_class_identity_and_seal(
+        &mut self,
+        identity: VerifiedRunnerIdentity,
+    ) -> Result<Vec<u8>, EvidenceArtifactError> {
+        self.bind_machine_class_identity(identity)?;
+        self.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(self)?;
+        self.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
+        let sealed = serde_json::to_vec_pretty(self)?;
+        self.verify_integrity()?;
+        Ok(sealed)
     }
 
     /// Fail closed when an invocation selected only part of a normative gate.
@@ -1450,6 +1627,11 @@ impl PerfEvidenceArtifact {
         }
         self.policy.validate()?;
         self.provenance.validate()?;
+        self.machine_class.validate().map_err(|error| {
+            EvidenceArtifactError::InvalidProvenance {
+                reason: format!("machine-class binding rejected: {error}"),
+            }
+        })?;
         Self::validate_cell_set(self.gate, &self.cells)?;
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
@@ -1598,20 +1780,21 @@ impl PerfEvidenceArtifact {
         })
     }
 
-    /// Load one artifact and verify seal, schema, and recomputability.
+    /// Parse exact artifact bytes and verify seal, schema, and recomputability.
     ///
-    /// A truncated or otherwise malformed file, a stale schema version, a
-    /// broken hash seal, or any summary that no longer recomputes from its
-    /// raw samples is a typed error, never a silent acceptance.
+    /// This byte-oriented entry point lets callers hash and retain the same
+    /// object they verified, without a second filesystem read that could race
+    /// a replacement.
     ///
     /// # Errors
     ///
     /// Returns the specific [`EvidenceArtifactError`] for each defect class.
-    pub fn load_verified(path: &Path) -> Result<Self, EvidenceArtifactError> {
-        let contents = fs::read_to_string(path)?;
-        let probe: serde_json::Value =
-            serde_json::from_str(&contents).map_err(|error| EvidenceArtifactError::Malformed {
-                reason: format!("artifact is not valid JSON: {error}"),
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, EvidenceArtifactError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                EvidenceArtifactError::Malformed {
+                    reason: format!("artifact is not strict JSON: {error}"),
+                }
             })?;
         let found = probe
             .get("schema_version")
@@ -1622,9 +1805,29 @@ impl PerfEvidenceArtifact {
                 found: found.to_owned(),
             });
         }
-        let artifact: Self = serde_json::from_str(&contents)?;
+        let artifact: Self = serde_json::from_value(probe.clone())?;
+        if probe != serde_json::to_value(&artifact)? {
+            return Err(EvidenceArtifactError::Malformed {
+                reason: "artifact contains unknown fields or a noncanonical persisted shape"
+                    .to_owned(),
+            });
+        }
         artifact.verify_integrity()?;
         Ok(artifact)
+    }
+
+    /// Load one artifact and verify seal, schema, and recomputability.
+    ///
+    /// A truncated or otherwise malformed file, a stale schema version, a
+    /// broken hash seal, or any summary that no longer recomputes from its
+    /// raw samples is a typed error, never a silent acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`EvidenceArtifactError`] for each defect class.
+    pub fn load_verified(path: &Path) -> Result<Self, EvidenceArtifactError> {
+        let contents = fs::read(path)?;
+        Self::from_verified_slice(&contents)
     }
 }
 
@@ -1713,7 +1916,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v1")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v2")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -1947,6 +2150,7 @@ mod tests {
             git_dirty: false,
             worktree_state_sha256: None,
             cargo_lock_sha256: Some("c".repeat(64)),
+            command_sha256: "f".repeat(64),
             rustc_version: "rustc 1.91.0-nightly".to_owned(),
             target_triple: "x86_64-unknown-linux-gnu".to_owned(),
             build_profile: "test".to_owned(),
@@ -1985,6 +2189,16 @@ mod tests {
         }
     }
 
+    fn admitted_identity(gate: PerfGate) -> VerifiedRunnerIdentity {
+        crate::machine_class_registry::admitted_test_identity_for(
+            gate.label(),
+            "deadbeef",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"f".repeat(64),
+        )
+    }
+
     fn cell_spec(gate: PerfGate, role: EvidenceRole) -> EvidenceCellSpec {
         EvidenceCellSpec {
             gate,
@@ -2013,13 +2227,17 @@ mod tests {
     }
 
     fn provisional_artifact() -> PerfEvidenceArtifact {
-        PerfEvidenceArtifact::assemble(
+        let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
             policy(),
             evidence_provenance(),
             vec![provisional_cell()],
         )
-        .expect("provisional artifact")
+        .expect("provisional artifact");
+        artifact
+            .bind_machine_class_identity(admitted_identity(PerfGate::Qg1))
+            .expect("bind admitted test identity");
+        artifact
     }
 
     fn qg6_artifact() -> PerfEvidenceArtifact {
@@ -2035,8 +2253,13 @@ mod tests {
         let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
         let mut provenance = evidence_provenance();
         provenance.corpus.query_set_sha256 = Some("d".repeat(64));
-        PerfEvidenceArtifact::assemble(PerfGate::Qg6, policy(), provenance, vec![cell])
-            .expect("QG-6 artifact")
+        let mut artifact =
+            PerfEvidenceArtifact::assemble(PerfGate::Qg6, policy(), provenance, vec![cell])
+                .expect("QG-6 artifact");
+        artifact
+            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
+            .expect("bind admitted test identity");
+        artifact
     }
 
     #[test]
@@ -2146,6 +2369,181 @@ mod tests {
             .expect("durable invalid run");
         let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
         assert_eq!(reloaded.gate_status, EvidenceDecisionStatus::InvalidNull);
+    }
+
+    #[test]
+    fn unverified_machine_binding_is_explicit_durable_and_nonpromotable() {
+        let artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            policy(),
+            evidence_provenance(),
+            vec![provisional_cell()],
+        )
+        .expect("unverified evidence artifact");
+        assert!(matches!(
+            &artifact.machine_class,
+            MachineClassEvidenceBinding::Unverified { .. }
+        ));
+        assert!(!artifact.ratchet_admissible());
+
+        let directory = tempfile::tempdir().expect("unverified evidence directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("persist explicit unverified evidence");
+        let reloaded =
+            PerfEvidenceArtifact::load_verified(&paths.json).expect("reload unverified evidence");
+        assert!(matches!(
+            &reloaded.machine_class,
+            MachineClassEvidenceBinding::Unverified { .. }
+        ));
+        assert!(!reloaded.ratchet_admissible());
+    }
+
+    #[test]
+    fn post_exit_binding_returns_exact_verified_receipt_bound_bytes() {
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            policy(),
+            evidence_provenance(),
+            vec![provisional_cell()],
+        )
+        .expect("unverified producer evidence");
+        let bytes = artifact
+            .bind_machine_class_identity_and_seal(admitted_identity(PerfGate::Qg1))
+            .expect("post-exit receipt binding");
+
+        assert_eq!(
+            bytes,
+            serde_json::to_vec_pretty(&artifact).expect("bound artifact JSON")
+        );
+        artifact.verify_integrity().expect("bound artifact seal");
+        assert!(artifact.ratchet_admissible());
+        assert!(artifact.machine_class.identity().is_some_and(|identity| {
+            bytes
+                .windows(identity.receipt_sha256().len())
+                .any(|window| window == identity.receipt_sha256().as_bytes())
+        }));
+    }
+
+    #[test]
+    fn nul_delimited_argv_digest_drift_rejects_post_exit_binding() {
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            policy(),
+            evidence_provenance(),
+            vec![provisional_cell()],
+        )
+        .expect("unverified producer evidence");
+        let drifted_argv_identity = crate::machine_class_registry::admitted_test_identity_for(
+            PerfGate::Qg1.label(),
+            "deadbeef",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"0".repeat(64),
+        );
+
+        assert!(matches!(
+            artifact.bind_machine_class_identity_and_seal(drifted_argv_identity),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("build identity differs")
+        ));
+        assert!(matches!(
+            artifact.machine_class,
+            MachineClassEvidenceBinding::Unverified { .. }
+        ));
+        assert!(artifact.artifact_sha256.is_empty());
+    }
+
+    #[test]
+    fn verified_runner_binding_cannot_be_reassigned_to_another_receipt() {
+        let mut artifact = provisional_artifact();
+        let original = artifact.machine_class.clone();
+        let different_receipt = crate::machine_class_registry::admitted_test_identity_for_run(
+            PerfGate::Qg1.label(),
+            "deadbeef",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"f".repeat(64),
+            "different-completion",
+        );
+
+        assert!(matches!(
+            artifact.bind_machine_class_identity_and_seal(different_receipt),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("verified bindings are immutable")
+        ));
+        assert_eq!(artifact.machine_class, original);
+        assert!(artifact.artifact_sha256.is_empty());
+    }
+
+    #[test]
+    fn command_digest_uses_unambiguous_nul_separation_and_final_terminator() {
+        let digest = command_sha256_from_argv([b"cargo".as_slice(), b"bench".as_slice()]);
+        assert_eq!(digest, lower_hex(&Sha256::digest(b"cargo\0bench\0")));
+        assert_ne!(
+            command_sha256_from_argv([b"ab".as_slice(), b"c".as_slice()]),
+            command_sha256_from_argv([b"a".as_slice(), b"bc".as_slice()])
+        );
+        assert_ne!(
+            command_sha256_from_argv([b"cargo".as_slice(), b"bench".as_slice()]),
+            lower_hex(&Sha256::digest(b"cargo bench"))
+        );
+    }
+
+    #[test]
+    fn outer_reseal_cannot_hide_tampered_embedded_runner_receipt() {
+        let mut artifact = provisional_artifact();
+        let mut binding = serde_json::to_value(&artifact.machine_class).expect("binding JSON");
+        let receipt_json = binding["identity"]["receipt_json"]
+            .as_str()
+            .expect("embedded receipt JSON");
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(receipt_json).expect("parse embedded receipt");
+        receipt["build"]["git_revision"] = serde_json::Value::String("tampered".to_owned());
+        binding["identity"]["receipt_json"] = serde_json::Value::String(
+            serde_json::to_string(&receipt).expect("serialize tampered receipt"),
+        );
+        artifact.machine_class =
+            serde_json::from_value(binding).expect("deserialize tampered binding");
+
+        let directory = tempfile::tempdir().expect("tampered binding directory");
+        let path = directory.path().join("tampered-binding.json");
+        fs::write(
+            &path,
+            artifact
+                .sealed_json()
+                .expect("reseal artifact around tampered binding"),
+        )
+        .expect("persist tampered binding");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::InvalidProvenance { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_unknown_field_cannot_bypass_the_outer_artifact_seal() {
+        let artifact = provisional_artifact();
+        let directory = tempfile::tempdir().expect("unknown-field directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("write artifact");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.json).expect("artifact bytes"))
+                .expect("artifact JSON");
+        value["provenance"]["build"]["unreviewed_identity"] =
+            serde_json::Value::String("must-not-be-ignored".to_owned());
+        fs::write(
+            &paths.json,
+            serde_json::to_vec_pretty(&value).expect("unknown-field JSON"),
+        )
+        .expect("persist unknown-field artifact");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&paths.json),
+            Err(EvidenceArtifactError::Malformed { reason })
+                if reason.contains("unknown fields")
+        ));
     }
 
     #[test]
@@ -2493,13 +2891,16 @@ mod tests {
         assert_eq!(cell.status, EvidenceDecisionStatus::MeasuredProvisional);
         assert!(cell.claim_eligible());
 
-        let artifact = PerfEvidenceArtifact::assemble(
+        let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
             policy(),
             evidence_provenance(),
             vec![cell],
         )
         .expect("QG-6 artifact");
+        artifact
+            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
+            .expect("bind admitted test identity");
         assert!(artifact.ratchet_admissible());
         let directory = tempfile::tempdir().expect("QG-6 hierarchy-native artifact directory");
         let paths = artifact
@@ -2559,13 +2960,16 @@ mod tests {
                 || reason.code == "evidence.paired_invalid"
         }));
 
-        let artifact = PerfEvidenceArtifact::assemble(
+        let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
             policy(),
             evidence_provenance(),
             vec![cell],
         )
         .expect("QG-6 artifact");
+        artifact
+            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
+            .expect("bind admitted test identity");
         assert!(artifact.ratchet_admissible());
     }
 
@@ -2723,8 +3127,12 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0, "atomic write must not leave temp files");
 
-        let written = fs::read_to_string(&paths.json).expect("read json");
+        let written_bytes = fs::read(&paths.json).expect("read exact json bytes");
+        let written = std::str::from_utf8(&written_bytes).expect("written evidence is UTF-8");
+        let reloaded_from_bytes =
+            PerfEvidenceArtifact::from_verified_slice(&written_bytes).expect("verified byte load");
         let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("verified load");
+        assert_eq!(reloaded_from_bytes, reloaded);
         assert_eq!(reloaded.cells, artifact.cells);
         assert_eq!(reloaded.gate_status, artifact.gate_status);
         assert!(!reloaded.artifact_sha256.is_empty());
@@ -2732,7 +3140,7 @@ mod tests {
         let table_on_disk = fs::read_to_string(&paths.table).expect("read table");
         assert_eq!(
             table_on_disk,
-            human_table_from_json(&written).expect("derive")
+            human_table_from_json(written).expect("derive")
         );
         assert_eq!(table_on_disk, reloaded.human_table());
     }
@@ -2848,7 +3256,13 @@ mod tests {
         let paths = artifact.write_atomic(dir.path()).expect("write");
         let contents = fs::read_to_string(&paths.json).expect("read");
 
-        for field in ["provenance", "cells", "policy", "gate_status"] {
+        for field in [
+            "provenance",
+            "machine_class",
+            "cells",
+            "policy",
+            "gate_status",
+        ] {
             let mut value: serde_json::Value = serde_json::from_str(&contents).expect("parse");
             value
                 .as_object_mut()
@@ -2915,6 +3329,47 @@ mod tests {
             load_legacy_gate_artifact_v3(&current_paths.json),
             Err(EvidenceArtifactError::SchemaMismatch { found }) if found == PERF_EVIDENCE_SCHEMA_VERSION
         ));
+    }
+
+    #[test]
+    fn v1_evidence_is_legacy_nonpromotable_and_has_no_upgrade_path() {
+        let mut legacy_v1 = provisional_artifact();
+        legacy_v1.schema_version = "quill-perf-evidence-v1".to_owned();
+        let directory = tempfile::tempdir().expect("legacy v1 directory");
+        let path = directory.path().join("legacy-v1.evidence.json");
+        fs::write(
+            &path,
+            legacy_v1
+                .sealed_json()
+                .expect("seal exact legacy-v1-shaped evidence"),
+        )
+        .expect("persist legacy v1 evidence");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == "quill-perf-evidence-v1"
+        ));
+        assert!(matches!(
+            load_legacy_gate_artifact_v3(&path),
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == "quill-perf-evidence-v1"
+        ));
+    }
+
+    #[test]
+    fn normative_manifest_is_bound_to_the_current_evidence_schema() {
+        let manifest: toml::Value = toml::from_str(include_str!(
+            "../../../docs/contracts/quill-perf-gates.toml"
+        ))
+        .expect("parse normative performance manifest");
+        assert_eq!(
+            manifest
+                .get("evidence")
+                .and_then(|evidence| evidence.get("schema"))
+                .and_then(toml::Value::as_str),
+            Some(PERF_EVIDENCE_SCHEMA_VERSION)
+        );
     }
 
     #[test]

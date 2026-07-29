@@ -13,6 +13,7 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod machine_class_registry;
 mod perf;
 mod perf_evidence;
 mod perf_ratchet;
@@ -74,6 +75,13 @@ pub use generator::{
     SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
+pub use machine_class_registry::{
+    MACHINE_CLASS_REGISTRY_GIT_BLOB, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
+    MACHINE_CLASS_REGISTRY_SHA256, MACHINE_CLASS_REGISTRY_SPEC_COMMIT,
+    MachineClassAdmissionContext, MachineClassCanonicalizationBinding, MachineClassDecision,
+    MachineClassDerivedHashes, MachineClassError, MachineClassEvidenceBinding, MachineClassLookup,
+    MachineClassReason, MachineClassRegistry, VerifiedRunnerIdentity,
+};
 pub use perf::{
     DistributionSummary, PAIRED_ESTIMATOR_SCHEMA_VERSION, PERF_ARTIFACT_SCHEMA_VERSION,
     PERF_MAX_CV_PCT, PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES,
@@ -93,8 +101,8 @@ pub use perf_evidence::{
     EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
     EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION, HierarchicalGroupSummary,
     HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence,
-    PerfEvidenceArtifact, estimate_hierarchical_latency, human_table_from_json,
-    load_legacy_gate_artifact_v3, required_estimand,
+    PerfEvidenceArtifact, command_sha256_from_argv, estimate_hierarchical_latency,
+    human_table_from_json, load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
