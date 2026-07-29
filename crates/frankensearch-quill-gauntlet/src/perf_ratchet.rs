@@ -3203,7 +3203,7 @@ mod tests {
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(execution_provenance()),
-            git_rev: "new".to_owned(),
+            git_rev: "1".repeat(40),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
             corpus_manifest_hash: "a".repeat(64),
@@ -3499,7 +3499,11 @@ mod tests {
             expected_class,
         );
 
-        assert_eq!(result.decision, PerfGateDecision::Allow);
+        assert_eq!(
+            result.decision,
+            PerfGateDecision::Allow,
+            "unexpected verified promotion evaluation: {result:#?}"
+        );
         assert!(
             !result
                 .reasons
