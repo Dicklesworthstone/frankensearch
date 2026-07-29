@@ -10547,7 +10547,9 @@ mod tests {
 
         let mut raw_content_tamper = original_bytes.clone();
         raw_content_tamper.push(b' ');
+        let mut existing_mutation_count = 0;
         assert_stale_address_rejected("raw_content_byte", &raw_content_tamper);
+        existing_mutation_count += 1;
 
         let original_value: serde_json::Value =
             serde_json::from_slice(&original_bytes).expect("object JSON");
@@ -10572,6 +10574,7 @@ mod tests {
                 &format!("missing_lane_{lane}"),
                 &serde_json::to_vec(&missing_lane).expect("encode missing-lane mutation"),
             );
+            existing_mutation_count += 1;
         }
 
         type TypedMutation = fn(&mut ArtifactObject);
@@ -10919,6 +10922,11 @@ mod tests {
                 core_comparison(object).status = LexicalComparisonStatus::Mismatch;
             }),
         ];
+        assert_eq!(
+            typed_mutations.len(),
+            60,
+            "Core V3 must keep one typed mutation for every admitted comparison field family"
+        );
         for &(label, mutate) in typed_mutations {
             let mut mutated = target_object.clone();
             mutate(&mut mutated);
@@ -11044,6 +11052,11 @@ mod tests {
                 value.corpus_seed = Some(value.corpus_seed.map_or(0, |seed| seed ^ 1));
             }),
         ];
+        assert_eq!(
+            provenance_mutations.len(),
+            20,
+            "campaign provenance mutation coverage must remain field-complete"
+        );
         for &(field, mutate) in provenance_mutations {
             let mut mutated_report = report.clone();
             mutate(
@@ -11129,6 +11142,18 @@ mod tests {
                     .to_string()
                     .contains("campaign case result does not match its immutable artifact"),
             "valid but ordinal-mismatched object must reach campaign evidence validation: {error}"
+        );
+        existing_mutation_count += 1;
+        assert_eq!(
+            existing_mutation_count, 8,
+            "the pre-V3 mutation corpus must execute one raw-byte case, six missing-lane cases, \
+             and one wrong-ordinal case"
+        );
+        assert_eq!(
+            existing_mutation_count + typed_mutations.len() + provenance_mutations.len(),
+            88,
+            "the persisted Core V3 replay corpus must execute every pre-V3, typed, and provenance \
+             mutation"
         );
     }
 
