@@ -54,18 +54,13 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
     }
 }
 
-fn stabilize_bundle(bundle: &mut CliE2eArtifactBundle) {
-    "2026-02-14T00:00:00Z".clone_into(&mut bundle.manifest.ts);
-    "01JABCDEF00000000000000000".clone_into(&mut bundle.manifest.run_id);
+fn golden_run_config() -> CliE2eRunConfig {
+    let mut config = CliE2eRunConfig::default();
     // Golden receipts describe the contract fixture, not the host that runs
     // the test. Keep Apple Silicon and non-x86 CI from changing the payload.
-    "linux".clone_into(&mut bundle.manifest.body.platform.os);
-    "x86_64".clone_into(&mut bundle.manifest.body.platform.arch);
-    for event in &mut bundle.events {
-        "2026-02-14T00:00:00Z".clone_into(&mut event.ts);
-    }
-    // We do not freeze replay_command fully if it varies, but we can set it to a stable string
-    bundle.replay_command = format!("frankensearch --seed 42 {}", bundle.scenario.args.join(" "));
+    "linux".clone_into(&mut config.platform.os);
+    "x86_64".clone_into(&mut config.platform.arch);
+    config
 }
 
 fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
@@ -94,8 +89,7 @@ fn assert_manifest_contains_required_artifacts(artifact_files: &[&str]) {
 #[test]
 fn scenario_cli_index_baseline() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Index);
-    let mut bundle =
-        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle = CliE2eArtifactBundle::build(&golden_run_config(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.schema_version, CLI_E2E_SCHEMA_VERSION);
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Index);
@@ -104,15 +98,13 @@ fn scenario_cli_index_baseline() {
         Some("index")
     );
 
-    stabilize_bundle(&mut bundle);
     assert_golden_json("cli_e2e_index_baseline_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_search_stream() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Search);
-    let mut bundle =
-        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle = CliE2eArtifactBundle::build(&golden_run_config(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Search);
     assert!(bundle.scenario.args.contains(&"--stream".to_owned()));
@@ -124,28 +116,24 @@ fn scenario_cli_search_stream() {
             .is_some_and(|code| code.starts_with("e2e.cli."))
     }));
 
-    stabilize_bundle(&mut bundle);
     assert_golden_json("cli_e2e_search_stream_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_explain_hit() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Explain);
-    let mut bundle =
-        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle = CliE2eArtifactBundle::build(&golden_run_config(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Explain);
     assert!(bundle.scenario.args.contains(&"toon".to_owned()));
 
-    stabilize_bundle(&mut bundle);
     assert_golden_json("cli_e2e_explain_hit_v1", &bundle);
 }
 
 #[test]
 fn scenario_cli_degrade_path() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Degrade);
-    let mut bundle =
-        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Fail);
+    let bundle = CliE2eArtifactBundle::build(&golden_run_config(), &scenario, ExitStatus::Fail);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Degrade);
     assert!(
@@ -168,7 +156,6 @@ fn scenario_cli_degrade_path() {
             .contains("--exact scenario_cli_degrade_path")
     );
 
-    stabilize_bundle(&mut bundle);
     assert_golden_json("cli_e2e_degrade_path_v1", &bundle);
 }
 

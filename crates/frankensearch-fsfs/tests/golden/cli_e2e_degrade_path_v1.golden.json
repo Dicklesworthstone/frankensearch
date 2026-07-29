@@ -18,7 +18,7 @@
   "manifest": {
     "v": 1,
     "schema": "e2e-manifest-v1",
-    "run_id": "01JABCDEF00000000000000000",
+    "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
     "ts": "2026-02-14T00:00:00Z",
     "body": {
       "suite": "fsfs",
@@ -190,5 +190,5 @@
       }
     }
   ],
-  "replay_command": "frankensearch --seed 42 search latency fallback lane --profile degraded --format json"
+  "replay_command": "cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture --exact scenario_cli_degrade_path"
 }

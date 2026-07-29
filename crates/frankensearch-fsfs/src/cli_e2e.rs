@@ -13,7 +13,7 @@ use frankensearch_core::{
     E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
     E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity,
     EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
-    Suite, build_artifact_entries, render_artifacts_index, sha256_checksum,
+    Suite, build_artifact_entries, render_artifacts_index, sha256_checksum, validate_envelope,
     validate_event_envelope, validate_manifest_envelope,
 };
 use serde::{Deserialize, Serialize};
@@ -214,16 +214,42 @@ impl CliE2eArtifactBundle {
         }
     }
 
-    /// Validate manifest + event envelope invariants.
+    /// Validate envelope identities and the manifest's payload attestations.
     ///
     /// # Errors
     ///
-    /// Returns a stringified validation error when either the manifest or any
-    /// event envelope violates the unified E2E artifact contract.
+    /// Returns a stringified validation error when an envelope violates the
+    /// unified E2E artifact contract, when bundle envelopes disagree about the
+    /// run identity, or when the manifest does not attest the bundle's current
+    /// event and replay-command payloads.
     pub fn validate(&self) -> Result<(), String> {
         validate_manifest_envelope(&self.manifest).map_err(|err| err.to_string())?;
-        for event in &self.events {
+        for (index, event) in self.events.iter().enumerate() {
             validate_event_envelope(event).map_err(|err| err.to_string())?;
+            if event.run_id != self.manifest.run_id || event.ts != self.manifest.ts {
+                return Err(format!(
+                    "event[{index}] identity does not match manifest: \
+                     expected run_id={} ts={}, found run_id={} ts={}",
+                    self.manifest.run_id, self.manifest.ts, event.run_id, event.ts
+                ));
+            }
+        }
+        for (index, replay) in self.replay.iter().enumerate() {
+            validate_envelope(replay, E2E_SCHEMA_REPLAY).map_err(|err| err.to_string())?;
+            if replay.run_id != self.manifest.run_id || replay.ts != self.manifest.ts {
+                return Err(format!(
+                    "replay[{index}] identity does not match manifest: \
+                     expected run_id={} ts={}, found run_id={} ts={}",
+                    self.manifest.run_id, self.manifest.ts, replay.run_id, replay.ts
+                ));
+            }
+        }
+
+        let expected_artifacts = artifact_entries(&self.replay_command, &self.events);
+        if self.manifest.body.artifacts != expected_artifacts {
+            return Err(
+                "manifest artifact entries do not match the bundle's current payloads".to_owned(),
+            );
         }
         Ok(())
     }
@@ -617,6 +643,45 @@ mod tests {
                 .validate()
                 .expect("bundle must satisfy e2e artifact validators");
         }
+    }
+
+    #[test]
+    fn bundle_validation_rejects_identity_and_payload_drift_after_sealing() {
+        let config = CliE2eRunConfig::default();
+        let scenario = default_cli_e2e_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.kind == CliE2eScenarioKind::Search)
+            .expect("search scenario");
+
+        let mut event_identity_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        "01JABCDEF00000000000000000".clone_into(&mut event_identity_drift.events[0].run_id);
+        assert!(
+            event_identity_drift
+                .validate()
+                .expect_err("event identity drift must fail closed")
+                .contains("event[0] identity does not match manifest")
+        );
+
+        let mut replay_identity_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        "2026-02-15T00:00:00Z".clone_into(&mut replay_identity_drift.replay[0].ts);
+        assert!(
+            replay_identity_drift
+                .validate()
+                .expect_err("replay identity drift must fail closed")
+                .contains("replay[0] identity does not match manifest")
+        );
+
+        let mut payload_drift =
+            super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        payload_drift.replay_command.push_str(" --tampered");
+        assert_eq!(
+            payload_drift
+                .validate()
+                .expect_err("payload drift must invalidate the sealed manifest"),
+            "manifest artifact entries do not match the bundle's current payloads"
+        );
     }
 
     #[test]
