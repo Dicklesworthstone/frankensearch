@@ -179,9 +179,32 @@ Results (inline):  PROFILE-FIRST GATE SATISFIED, SITE REFINED, LEVER IMPLEMENTED
                    EncodedPositionList::encode_with_limits) deliberately untouched:
                    one lever per change; they file as follow-up rows after this
                    lever's A/B.
-Retry predicate:   n/a (active lever; A/B next on trj — quill-arm docs/s
-                   CI-disjoint improvement at the QG-2 cell + parity campaign green
-                   at the same SHA are the KEEP inputs).
+A/B VERDICT:       **WASH — REJECT as a perf lever** (2026-07-29, back-to-back
+                   30-run cells on trj, run receipts lever1-base-5433c45e /
+                   lever1-cand-b8c1465b under
+                   trj-zen3-64c/20260729T024251Z-lever1-ab; both binaries
+                   printed their own ELF SHA; both A/A nulls contain 1.0):
+                   quill 60,361.7 [59,987.3, 60,889.1] docs/s (base) vs
+                   60,375.7 [59,571.3, 61,156.8] (candidate) — fully
+                   overlapping CIs; ab ratio 0.3399 [0.3332, 0.3463] vs
+                   0.3356 [0.3271, 0.3403]. Eliminating 463k temp allocations
+                   per census run produced NO measurable throughput change.
+                   Cause of the misprediction, banked as a prior: heaptrack
+                   ranks by COUNT; ~42k grow calls per run at ~50-100ns each
+                   is single-digit milliseconds against multi-second runs —
+                   far below the 0.1% TIME floor. The 7.6% allocator
+                   self-time in the Round-0 perf card comes from OTHER
+                   allocation traffic still unattributed. The landed change
+                   (b8c1465b) STAYS as an allocation-hygiene refactor:
+                   byte-identical output, tests green, strictly fewer
+                   allocations, measured perf-neutral with receipts — it is
+                   not counted as a campaign win anywhere.
+Retry predicate:   none for this site (settled). The DEFICIT hypothesis
+                   space reopens via a QUILL-ARM-SCOPED time profile
+                   (single-engine child run) to find where the ~2.9x per-doc
+                   time actually goes; every future heaptrack-derived row
+                   must include an estimated-time conversion (count x ns/op
+                   vs run wall time) before implementation.
 
 ### bd-e8h-w2-seal-checksum-audit-ivh69 — seal-time checksum cost (AUDIT)
 Hypothesis:        Section checksum computation is >5% of QG-1 seal wall-time at medium scale.
