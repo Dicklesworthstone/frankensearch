@@ -24346,7 +24346,16 @@ mod tests {
             assert_eq!(payload.models[0].tier, "fast");
             assert!(payload.models[0].cached);
             assert_eq!(payload.models[1].tier, "quality");
-            assert!(payload.models[1].cached);
+            #[cfg(feature = "embedded-models")]
+            {
+                assert!(payload.models[1].cached);
+                assert!(payload.models[1].size_bytes > 0);
+            }
+            #[cfg(not(feature = "embedded-models"))]
+            {
+                assert!(!payload.models[1].cached);
+                assert_eq!(payload.models[1].size_bytes, 0);
+            }
             assert_eq!(
                 payload.runtime.tracked_index_bytes,
                 Some(payload.index.size_bytes)
