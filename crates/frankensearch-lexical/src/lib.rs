@@ -708,6 +708,7 @@ pub struct TantivyIndex {
     ord_table: RwLock<Vec<DocId>>,
     path: Option<PathBuf>,
     /// Exact writer-pool width accepted by Tantivy's benchmark constructor.
+    #[cfg(feature = "bench-internals")]
     benchmark_writer_threads: Option<usize>,
 }
 
@@ -1288,6 +1289,7 @@ impl TantivyIndex {
             doc_count: AtomicUsize::new(doc_count),
             ord_table: RwLock::new(ord_table),
             path,
+            #[cfg(feature = "bench-internals")]
             benchmark_writer_threads: writer_threads,
         })
     }
