@@ -1,5 +1,20 @@
 # QG-1 trj 5995WX full-SMT scaling tranche
 
+## Post-merge correction — diagnostic only
+
+The original adjudication below is **retracted**. Source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates the receipt-bound
+QG-1 concurrency witness landed in `9b23e0d4`. Every cell's sealed
+`QG-1.evidence.json` therefore has `spec.concurrency_witness: null`.
+Requested thread counts and the old runtime pool assertion are not a persisted
+observation of both engines' concurrency, and the current contract explicitly
+forbids treating configuration alone as observed concurrency.
+
+Consequently, all nine rows are diagnostic and **UNSCORED**. The 1- and
+96-thread ratios are not decision-valid MISSes, this tranche establishes no
+width curve, and it makes no QG-1 claim. The original text remains below so
+the erroneous adjudication and its raw evidence stay auditable.
+
 ## Decision
 
 **PARTIAL TARGET-SLICE MISS: two rows scored, seven rows UNSCORED.**

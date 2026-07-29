@@ -7978,12 +7978,15 @@ Timing job `j-29952570386546854` ran exact ELF SHA-256
 - raw medians: serde 6,084.7 ns/document; direct 6,791.2 ns/document.
 
 The entire timing result is **invalid**, including the apparently admissible
-same-binary null. Its execution interval was 13:48:09Z–14:02:58Z. At
-13:59:32Z, unrelated four-slot job `j-29952570386546855` started on the same
-eight-slot worker and overlapped approximately 203 seconds of the measured
-run. This is unbounded cross-project CPU, memory, and cache interference. The
-raw 1.133x slowdown is recorded only as an adverse diagnostic and may not be
-quoted as a decision-valid regression.
+same-binary null. The enclosing RCH job interval was
+13:48:09Z–14:02:58Z, but per-sample occupancy was not bound. Scheduler mail
+records unrelated four-slot job `j-29952570386546855` starting on the same
+worker at 13:59:32Z while the benchmark remained in execute, filling the
+worker to eight of eight slots. RCH history also records earlier job-level
+co-residency with `j-29952570386546853`. Complete-interval isolation is
+therefore unproven, so cross-project CPU, memory, and cache interference
+invalidates the entire invocation. The raw 1.133x slowdown is recorded only
+as an adverse diagnostic and may not be quoted as a decision-valid regression.
 
 **Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** The
 candidate has exact correctness but no admissible positive timing evidence;
@@ -7996,3 +7999,30 @@ byte/hash/whole-segment oracle first, then prove same-binary A/A and A/B with
 exclusive-worker occupancy bound over the complete interval. Terminal W2.5
 claims still require the separate Apple-Silicon and Threadripper cross-engine
 contract.
+
+## 2026-07-29 — CORRECTION: retract QG-1 width-sweep MISS labels; concurrency was not receipt-bound (`bd-h6eh`, YellowSparrow)
+
+The preceding full-SMT sweep row is corrected to **DIAGNOSTIC / UNSCORED**.
+Its clean source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates `9b23e0d4`, the
+change that records and binds QG-1 concurrency observations. Every sealed
+cell artifact has `spec.concurrency_witness: null`.
+
+Requested thread counts, affinity, and the old Quill-side Rayon pool assertion
+do not satisfy the current contract's requirement for persisted Quill and
+Tantivy observations. That contract explicitly says configuration alone is
+never observed concurrency. The 1- and 96-thread A/A controls therefore
+cannot admit their A/B rows.
+
+**Corrected decision: DIAGNOSTIC / UNSCORED / NO QG-1 CLAIM.** Retract the
+previous 1-thread `0.256083 [0.250163, 0.258549]` and 96-thread
+`0.236489 [0.233668, 0.239445]` target-slice MISS labels. Those values and
+the other seven ratios remain raw routing diagnostics only. The evidence does
+not establish a certified width curve, high-thread convergence, or any QG
+activation.
+
+Retry only with source at or after `9b23e0d4`, requiring each QG-1 cell's
+receipt to prove positive Quill and Tantivy observations with
+`min == max == configured width`. Preserve the same exact-ELF, dual-null,
+complete-matrix, and immediate-reproduction laws before interpreting any
+A/B magnitude.

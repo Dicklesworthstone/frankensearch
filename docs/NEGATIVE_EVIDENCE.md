@@ -17475,13 +17475,16 @@ diagnostic reported this same-invocation A/A null: `0.989567 [0.977726,
 `1.133086 [1.123543, 1.140405]`; raw absolutes were 6,084.7 ns/document for
 serde and 6,791.2 ns/document for the direct emitter.
 
-Those timing values are **not admissible**. The job executed from 13:48:09Z
-through 14:02:58Z, while unrelated four-slot job
-`j-29952570386546855` began on the same eight-slot worker at 13:59:32Z.
-The final approximately 203 seconds therefore ran under cross-project CPU,
-memory, and cache contention. The apparent 13.3% regression is retained only
-as an adverse diagnostic; neither its narrow interval nor its apparent null
-can establish a performance verdict.
+Those timing values are **not admissible**. The enclosing RCH job interval was
+13:48:09Z–14:02:58Z, but per-sample worker occupancy was not captured.
+Scheduler mail records unrelated four-slot job `j-29952570386546855`
+starting on the same worker at 13:59:32Z while the benchmark remained in its
+execute phase, filling the worker to eight of eight slots. RCH history also
+shows earlier job-level co-residency with `j-29952570386546853`. Because
+complete-interval isolation is unproven, cross-project CPU, memory, and cache
+interference invalidates the entire timing invocation. The apparent 13.3%
+regression is retained only as an adverse diagnostic; neither its narrow
+interval nor its apparent null can establish a performance verdict.
 
 **Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** Exact
 correctness is insufficient to land an optimization without admissible
@@ -17497,3 +17500,32 @@ oracles, then run the same-binary A/A plus A/B on a pinned worker with
 exclusive-worker occupancy proven for the complete timed interval. A terminal
 Apple-Silicon or Threadripper campaign claim still requires the separate
 cross-engine contract.
+
+### 2026-07-29 — CORRECTION: QG-1 5995WX width sweep lacks observed-concurrency receipts (`bd-h6eh`, YellowSparrow)
+
+The prior 2026-07-29 QG-1 sweep adjudication is retracted. Its clean source
+revision `bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates commit
+`9b23e0d4`, which made QG-1 concurrency observations receipt-bound. Inspection
+of the sealed 1- and 96-thread `QG-1.evidence.json` artifacts, and likewise
+the other seven cells, shows `spec.concurrency_witness: null`.
+
+The run recorded requested widths and executed an old Quill-side Rayon pool
+assertion, but it did not persist the required Quill and Tantivy observations.
+The current gate contract states that a configuration parameter alone is
+never observed concurrency. A valid A/A control cannot repair missing
+admission provenance.
+
+**Corrected decision: DIAGNOSTIC / UNSCORED / NO QG-1 CLAIM.** The previously
+reported 1-thread `0.256083 [0.250163, 0.258549]` and 96-thread
+`0.236489 [0.233668, 0.239445]` ratios are raw diagnostics, not
+decision-valid MISSes. No certified scaling curve or high-thread conclusion
+exists, and QG-1 remains inactive. The original rows and sealed artifacts are
+retained as retracted history; the tranche adjudication carries an explicit
+erratum.
+
+**Retry predicate:** use source at or after `9b23e0d4` and require every
+QG-1 cell to persist positive Quill and Tantivy concurrency observations with
+`min == max ==` the configured width. Only after those witnesses, both
+same-invocation A/A controls, exact-ELF provenance, the complete normative
+matrix, and immediate reproduction admit may any ratio be labeled a MISS or
+used to describe scaling.
