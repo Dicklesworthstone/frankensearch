@@ -7648,7 +7648,7 @@ fn install_recovered_bytes_with_observer(
         path: ready_path.clone(),
         source,
     })?;
-    if ready_stat.st_dev != temporary_metadata.dev()
+    if stat_dev_as_u64(&ready_stat) != temporary_metadata.dev()
         || ready_stat.st_ino != temporary_metadata.ino()
         || ready_stat.st_size != expected_stat_size
     {
@@ -7771,7 +7771,7 @@ fn install_recovered_bytes_with_observer(
         AtFlags::SYMLINK_NOFOLLOW,
     );
     let installed_owned_inode = destination_stat.as_ref().is_ok_and(|stat| {
-        stat.st_dev == temporary_metadata.dev()
+        stat_dev_as_u64(stat) == temporary_metadata.dev()
             && stat.st_ino == temporary_metadata.ino()
             && stat.st_size == expected_stat_size
     });
