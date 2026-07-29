@@ -1,0 +1,11 @@
+2026-07-29T06:19:23-04:00
+threadripperje
+ 06:19:23 up 4 days,  5:35,  5 users,  load average: 3.21, 3.09, 3.03
+Cpus_allowed_list:	0-127
+Mems_allowed_list:	0
+               total        used        free      shared  buff/cache   available
+Mem:           499Gi        25Gi       216Gi       1.7Gi       269Gi       474Gi
+Swap:          127Gi        10Mi       127Gi
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme1n1    3.7T  3.1T  650G  83% /data
+exit_code=0
