@@ -243,6 +243,16 @@ Retry predicate:   re-run the census when an on-disk commit-bearing cell
                    quill_in_memory), and on macOS with F_FULLFSYNC tracing
                    for Law 7.
 
+### bd-s1rc1 — per-commit EncodedSegment full clone
+Hypothesis:        The commit path clones the entire encoded segment (segment.rs:196; ~9.7 MB per commit, 7.2% of ingest bytes); the clone lives 5.46 s (vs 12 ms for the encode-side original) with 68 MB resident at heap max, so two full encoded segments coexist per commit. Eliminating the copy (borrow/Arc/move) cuts allocator bytes and QG-7 peak RSS.
+Minimal repro:     w13 ingest census + lifetime appendix (c7a745cb + amendment), docs/evidence/e8h/w13-ingest-alloc-census-20260728/.
+Expected signal:   ~7% of ingest allocation bytes and ~10 MB peak RSS per active commit; wall-time effect modest (~10 MB memcpy ≈ 1–3 ms/commit); primary axes are allocation traffic + QG-7 RSS, stated honestly.
+Falsified if:      a reading pass shows two consumers genuinely mutate/retain both copies, or removal shows no QG-1/QG-2/QG-7 delta beyond null.
+Invocation:        reading pass over segment.rs/keeper.rs/index.rs commit path first (WAIT on fk04a combined-train integration for index/keeper surfaces); then paired A/B under the QG harness.
+Machine classes:   all; claims per class.
+Results (inline):  PENDING (hypothesis filed from census; no reading pass yet). Not to be mixed with W2.2's chunked-arena lever (msg 5585).
+Retry predicate:   n/a
+
 ## Banked priors (do NOT re-dig without meeting the retry predicate)
 
 | Prior | Verdict | Retry predicate |
