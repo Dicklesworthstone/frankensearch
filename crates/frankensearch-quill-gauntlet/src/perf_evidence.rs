@@ -30,10 +30,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::perf::{
-    DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PairedClaimState, PairedEstimatorConfig,
-    PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfRawSample, median_sorted, percentile, splitmix64,
-    validate_paired_blocks,
+    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PairedClaimState,
+    PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfRawSample,
+    median_sorted, percentile, splitmix64, validate_paired_blocks,
 };
 
 /// Version of the evidence artifact emitted by this module.
@@ -43,7 +43,7 @@ use crate::perf::{
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v1";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v3";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
@@ -335,6 +335,9 @@ pub struct MachineIdentity {
     pub arch: String,
     /// Logical CPU count observed by the process.
     pub logical_cpus: usize,
+    /// Host topology, RAM/NUMA, ISA, affinity, configured widths, untimed
+    /// observed-worker receipts, and dual-engine ELF identities.
+    pub execution: PerfExecutionProvenance,
     /// CPU frequency governor, when the platform exposes one.
     pub cpu_governor: Option<String>,
     /// One-minute load average at run start, when readable.
@@ -347,12 +350,16 @@ impl MachineIdentity {
     /// Capture the current machine identity. Unavailable probes report
     /// `None` rather than fabricating zeros.
     #[must_use]
-    pub fn capture() -> Self {
+    pub fn capture(
+        thread_counts_requested: impl IntoIterator<Item = usize>,
+        bench_elf_sha256: &str,
+    ) -> Self {
         Self {
             fingerprint: crate::perf::machine_fingerprint(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+            execution: PerfExecutionProvenance::capture(thread_counts_requested, bench_elf_sha256),
             cpu_governor: fs::read_to_string(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             )
@@ -373,6 +380,7 @@ impl MachineIdentity {
             || self.os.trim().is_empty()
             || self.arch.trim().is_empty()
             || self.logical_cpus == 0
+            || !self.execution.is_complete()
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: "machine identity requires fingerprint, os, arch, and CPUs".to_owned(),
@@ -526,6 +534,18 @@ impl EvidenceProvenance {
         }
         self.build.validate()?;
         self.machine.validate()?;
+        if self
+            .machine
+            .execution
+            .engine_binaries
+            .iter()
+            .any(|identity| identity.executable_sha256 != self.build.executable_sha256)
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "both statically linked engine identities must bind to the executing ELF"
+                    .to_owned(),
+            });
+        }
         self.peak_rss.validate()?;
         self.corpus.validate()
     }
@@ -766,6 +786,12 @@ pub enum EvidenceCellBody {
         /// Complete replayable paired result, including both-engine absolute
         /// distributions and the bounded raw samples they recompute from.
         paired: Box<PairedExperimentResult>,
+        /// The identical A/B stream adjudicated against a same-invocation
+        /// treatment/treatment null. QG-1 uses Tantivy as control and Quill as
+        /// treatment, so this carries the replayable Quill/Quill null while
+        /// `paired.null` carries Tantivy/Tantivy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        treatment_arm_null: Option<Box<PairedExperimentResult>>,
         /// Two-stage A/B effect estimate for hierarchical latency cells.
         hierarchical: Option<HierarchicalLatencyEstimate>,
         /// Two-stage same-invocation A/A null estimate for hierarchical latency
@@ -1053,6 +1079,7 @@ impl EvidenceCell {
             estimand,
             body: EvidenceCellBody::Paired {
                 paired: Box::new(paired),
+                treatment_arm_null: None,
                 hierarchical,
                 hierarchical_null,
                 reconciliation,
@@ -1060,6 +1087,69 @@ impl EvidenceCell {
             status,
             reasons,
         })
+    }
+
+    /// Attach the treatment arm's independently measured same-invocation A/A
+    /// null to an already evaluated A/B cell.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched A/B stream, malformed replay, unbounded retained
+    /// samples, or use on a non-paired cell.
+    pub fn attach_treatment_arm_null(
+        &mut self,
+        treatment_arm_null: PairedExperimentResult,
+        policy: &EvidencePolicy,
+    ) -> Result<(), EvidenceArtifactError> {
+        policy.validate()?;
+        treatment_arm_null.verify_recomputed()?;
+        let EvidenceCellBody::Paired {
+            paired,
+            treatment_arm_null: slot,
+            ..
+        } = &mut self.body
+        else {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "treatment-arm A/A null requires a paired evidence cell".to_owned(),
+            });
+        };
+        if treatment_arm_null.scope != paired.scope
+            || treatment_arm_null.provenance != paired.provenance
+            || treatment_arm_null.config != paired.config
+            || treatment_arm_null.effect != paired.effect
+            || treatment_arm_null.effect_samples != paired.effect_samples
+        {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "treatment-arm A/A null does not share the cell's exact A/B stream"
+                    .to_owned(),
+            });
+        }
+        let retained = paired.effect_samples.len()
+            + paired.null_samples.len()
+            + treatment_arm_null.effect_samples.len()
+            + treatment_arm_null.null_samples.len();
+        if retained > policy.max_raw_samples {
+            return Err(EvidenceArtifactError::UnboundedRawSamples {
+                cell_id: self.cell_id.clone(),
+                count: retained,
+                max: policy.max_raw_samples,
+            });
+        }
+        if treatment_arm_null.status != PairedEvidenceStatus::Valid {
+            self.reasons.push(EvidenceReason::new(
+                "evidence.treatment_arm_null_invalid",
+                format!(
+                    "treatment/treatment estimator status {:?} with {} reason(s)",
+                    treatment_arm_null.status,
+                    treatment_arm_null.reasons.len()
+                ),
+                EvidenceSeverity::NoClaim,
+            ));
+            self.status = EvidenceDecisionStatus::InvalidNull;
+        }
+        *slot = Some(Box::new(treatment_arm_null));
+        self.reasons.truncate(EVIDENCE_MAX_REASONS);
+        Ok(())
     }
 
     /// Build a facts cell for measurements outside noisy timing A/A.
@@ -1130,9 +1220,18 @@ impl EvidenceCell {
                     && hierarchical.is_some()
                     && hierarchical_null.is_some()
             }
-            EvidenceCellBody::Paired { paired, .. } => {
+            EvidenceCellBody::Paired {
+                paired,
+                treatment_arm_null,
+                ..
+            } => {
                 self.status == EvidenceDecisionStatus::MeasuredProvisional
                     && paired.claim_state == PairedClaimState::EligibleForDecision
+                    && (self.spec.gate != PerfGate::Qg1
+                        || treatment_arm_null.as_ref().is_some_and(|null| {
+                            null.status == PairedEvidenceStatus::Valid
+                                && null.claim_state == PairedClaimState::EligibleForDecision
+                        }))
             }
             EvidenceCellBody::Facts { .. } => false,
         }
@@ -1146,9 +1245,18 @@ impl EvidenceCell {
     /// mismatch between stored summaries and their raw sources.
     pub fn verify_recomputed(&self, policy: &EvidencePolicy) -> Result<(), EvidenceArtifactError> {
         match &self.body {
-            EvidenceCellBody::Paired { paired, .. } => {
+            EvidenceCellBody::Paired {
+                paired,
+                treatment_arm_null,
+                ..
+            } => {
                 paired.verify_recomputed()?;
-                let rebuilt = Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
+                let mut rebuilt =
+                    Self::evaluate(self.spec.clone(), paired.as_ref().clone(), policy)?;
+                if let Some(treatment_arm_null) = treatment_arm_null {
+                    rebuilt
+                        .attach_treatment_arm_null(treatment_arm_null.as_ref().clone(), policy)?;
+                }
                 if rebuilt == *self {
                     Ok(())
                 } else {
@@ -1451,6 +1559,29 @@ impl PerfEvidenceArtifact {
         self.policy.validate()?;
         self.provenance.validate()?;
         Self::validate_cell_set(self.gate, &self.cells)?;
+        if matches!(self.gate, PerfGate::Qg1 | PerfGate::Qg8) {
+            let expected_fixtures = self
+                .cells
+                .iter()
+                .filter(|cell| cell.spec.metric != "tokenize_docs_per_second")
+                .map(|cell| cell.spec.fixture.as_str())
+                .collect::<BTreeSet<_>>();
+            let observed_fixtures = self
+                .provenance
+                .machine
+                .execution
+                .thread_observations
+                .iter()
+                .map(|observation| observation.fixture.as_str())
+                .collect::<BTreeSet<_>>();
+            if expected_fixtures != observed_fixtures {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: "scaling evidence must carry one requested-versus-observed thread \
+                             receipt for every non-tokenizer fixture"
+                        .to_owned(),
+                });
+            }
+        }
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
                 || reason.code.trim().is_empty()
@@ -1506,6 +1637,54 @@ impl PerfEvidenceArtifact {
             self.provenance.run_id,
             self.provenance.run_window,
         );
+        let execution = &self.provenance.machine.execution;
+        let _ = writeln!(
+            table,
+            "host {} | producer_os {} | physical_cores {} | logical_threads {} | ram_bytes {} | \
+             numa_nodes {} | requested_threads {:?} | affinity {}",
+            execution.host_identity,
+            execution.producer_os,
+            execution.physical_cores,
+            execution.logical_threads,
+            execution.ram_bytes,
+            execution.numa_nodes,
+            execution.thread_counts_requested,
+            execution
+                .cpu_affinity_allowed_list
+                .as_deref()
+                .unwrap_or("unavailable"),
+        );
+        for observation in &execution.thread_observations {
+            let _ = writeln!(
+                table,
+                "thread_row {} | requested {} | affinity {} | quill_actual {} | \
+                 quill_cpu_active_new {} | quill_peak_new {} | tantivy_actual {} | \
+                 tantivy_cpu_active_new {} | tantivy_peak_new {}",
+                observation.fixture,
+                observation.thread_count_requested,
+                observation
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                observation.quill.thread_count_actually_used,
+                observation.quill.cpu_active_new_worker_threads,
+                observation.quill.peak_new_worker_threads,
+                observation.tantivy.thread_count_actually_used,
+                observation.tantivy.cpu_active_new_worker_threads,
+                observation.tantivy.peak_new_worker_threads,
+            );
+        }
+        for identity in &execution.engine_binaries {
+            let _ = writeln!(
+                table,
+                "engine {} | role {} | version {} | executable_sha256 {} | scheme {}",
+                identity.engine,
+                identity.role,
+                identity.version,
+                identity.executable_sha256,
+                identity.identity_scheme,
+            );
+        }
         table.push_str(
             "cell | role | estimand | status | control_p50 | treatment_p50 | ratio | \
              ci95_ratio | pairs | reasons\n",
@@ -1664,7 +1843,7 @@ pub fn load_legacy_gate_artifact_v3(
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<missing>");
-    if found != PERF_ARTIFACT_SCHEMA_VERSION {
+    if found != LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3 {
         return Err(EvidenceArtifactError::SchemaMismatch {
             found: found.to_owned(),
         });
@@ -1713,7 +1892,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v1")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v3")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -1767,9 +1946,10 @@ pub enum EvidenceArtifactError {
 mod tests {
     use super::*;
     use crate::perf::{
-        PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfSampleArm, PerfSampleOrder,
-        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
-        estimate_paired_experiment, seeded_balanced_pair_order,
+        PerfCellResult, PerfEngineBinaryIdentity, PerfEngineThreadObservation, PerfMetricSemantics,
+        PerfOperationScope, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+        PerfThreadProvenance, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment,
+        seeded_balanced_pair_order,
     };
 
     const CANARY: &str = "CANARY_DOCUMENT_TEXT_MUST_NEVER_PERSIST";
@@ -1936,6 +2116,13 @@ mod tests {
         estimate_paired_experiment(&effect, &null, &config()).expect("valid experiment")
     }
 
+    fn valid_treatment_arm_null_experiment(ratio: f64) -> PairedExperimentResult {
+        let effect = gauge_stream(&effect_pairs(12, ratio), 0, 0, None);
+        let null = gauge_stream(&quiet_null_pairs(12), 20_000, 20_000, None);
+        estimate_paired_experiment(&effect, &null, &config())
+            .expect("valid treatment-arm null experiment")
+    }
+
     fn policy() -> EvidencePolicy {
         EvidencePolicy::predeclared()
     }
@@ -1965,6 +2152,62 @@ mod tests {
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 logical_cpus: 8,
+                execution: PerfExecutionProvenance {
+                    producer_os: "linux".to_owned(),
+                    host_identity: "test-machine".to_owned(),
+                    physical_cores: 4,
+                    logical_threads: 8,
+                    ram_bytes: 32 * 1024 * 1024 * 1024,
+                    numa_nodes: 1,
+                    process_available_threads: 8,
+                    thread_counts_requested: vec![1],
+                    thread_observations: vec![PerfThreadProvenance {
+                        fixture: "bulk/synthetic/1".to_owned(),
+                        thread_count_requested: 1,
+                        cpu_affinity_allowed_list: Some("0-7".to_owned()),
+                        quill: PerfEngineThreadObservation {
+                            engine: "quill".to_owned(),
+                            runtime_available_parallelism: 8,
+                            process_threads_before_probe: 2,
+                            peak_process_threads: 4,
+                            thread_count_actually_used: 1,
+                            cpu_active_new_worker_threads: 1,
+                            cpu_active_threshold_ns: 1_000_000,
+                            peak_new_worker_threads: 1,
+                            observation_method: "linux-proc-test-v1".to_owned(),
+                        },
+                        tantivy: PerfEngineThreadObservation {
+                            engine: "tantivy".to_owned(),
+                            runtime_available_parallelism: 8,
+                            process_threads_before_probe: 2,
+                            peak_process_threads: 4,
+                            thread_count_actually_used: 1,
+                            cpu_active_new_worker_threads: 1,
+                            cpu_active_threshold_ns: 1_000_000,
+                            peak_new_worker_threads: 1,
+                            observation_method: "linux-proc-test-v1".to_owned(),
+                        },
+                    }],
+                    engine_binaries: vec![
+                        PerfEngineBinaryIdentity {
+                            engine: "quill".to_owned(),
+                            role: "subject".to_owned(),
+                            version: "0.2.1".to_owned(),
+                            executable_sha256: "a".repeat(64),
+                            identity_scheme: "same-static-elf-v1".to_owned(),
+                        },
+                        PerfEngineBinaryIdentity {
+                            engine: "tantivy".to_owned(),
+                            role: "oracle".to_owned(),
+                            version: "0.26.1".to_owned(),
+                            executable_sha256: "a".repeat(64),
+                            identity_scheme: "same-static-elf-v1".to_owned(),
+                        },
+                    ],
+                    runtime_detected_isa: vec!["avx2".to_owned()],
+                    cpu_affinity_allowed_list: Some("0-7".to_owned()),
+                    affinity_or_cpuset_cap: None,
+                },
                 cpu_governor: None,
                 load_average_start: Some(0.5),
                 load_average_end: Some(0.6),
@@ -2004,12 +2247,15 @@ mod tests {
     }
 
     fn provisional_cell() -> EvidenceCell {
-        EvidenceCell::evaluate(
+        let mut cell = EvidenceCell::evaluate(
             cell_spec(PerfGate::Qg1, EvidenceRole::Required),
             valid_experiment(1.10),
             &policy(),
         )
-        .expect("provisional cell")
+        .expect("provisional cell");
+        cell.attach_treatment_arm_null(valid_treatment_arm_null_experiment(1.10), &policy())
+            .expect("attach QG-1 treatment-arm null");
+        cell
     }
 
     fn provisional_artifact() -> PerfEvidenceArtifact {
@@ -2095,7 +2341,16 @@ mod tests {
         assert!(cell.claim_eligible());
         assert!(cell.reasons.is_empty());
         match &cell.body {
-            EvidenceCellBody::Paired { reconciliation, .. } => {
+            EvidenceCellBody::Paired {
+                treatment_arm_null,
+                reconciliation,
+                ..
+            } => {
+                assert!(
+                    treatment_arm_null
+                        .as_ref()
+                        .is_some_and(|null| null.status == PairedEvidenceStatus::Valid)
+                );
                 assert!(reconciliation.direction_agrees);
                 assert!(reconciliation.within_tolerance);
             }
@@ -2876,10 +3131,11 @@ mod tests {
     #[test]
     fn old_schema_never_masquerades_and_legacy_load_is_explicit() {
         let legacy = PerfGateArtifact {
-            schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+            schema_version: LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3.to_owned(),
             gate: PerfGate::Qg1,
             bench_elf_sha256: "a".repeat(64),
             machine_fingerprint: "legacy-machine".to_owned(),
+            execution: None,
             git_rev: "deadbeef".to_owned(),
             run_window: "legacy-window".to_owned(),
             run_id: "legacy-run".to_owned(),
@@ -2904,7 +3160,8 @@ mod tests {
 
         assert!(matches!(
             PerfEvidenceArtifact::load_verified(&legacy_path),
-            Err(EvidenceArtifactError::SchemaMismatch { found }) if found == PERF_ARTIFACT_SCHEMA_VERSION
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3
         ));
         let loaded = load_legacy_gate_artifact_v3(&legacy_path).expect("legacy read-only load");
         assert_eq!(loaded, legacy);

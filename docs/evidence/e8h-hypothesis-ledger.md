@@ -79,6 +79,23 @@ exact magnitudes await post-`ebd91757` reruns. No cross-class ratio claim.
 (P-core QoS pinning, thermal-window gating, larger run counts) are explicit
 P0.3/P1-m4 scope before any KEEP/Block cites an m4 cell.
 
+**Receipt-bearing rerun (2026-07-29, run receipt m4-macos/20260729T021107Z,
+bundle curated at `.bench-history/attempts/2026-07-29/QG-2/m4-macos-qg2-receipt-w5-r30-20260729T021107Z/`):**
+same invocation through the RUN_ID-defaulting runner; lifecycle receipt shows
+`writer_rearmed:false` ×105 — the terminal-join path, on disk.
+
+| arm | p50 docs/s | median CI95 | cv% |
+|---|---|---|---|
+| quill | 88,051.5 | [86,344.9, 88,934.9] | 4.0 |
+| tantivy | 163,602.2 | [159,398.3, 210,883.0] | 20.1 |
+| paired_ab | 0.5284 | [0.4041, 0.5445] | 18.5 |
+| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — contains 1.0, admissible |
+
+Two-run reading: ab CIs overlap in [0.404, 0.481]; the m4 truth sits in the
+0.40–0.53 band and the dominant uncertainty is the INCUMBENT arm's macOS
+variance (cv 20%, Quill's own arm tight at cv 4%). This is Observation 2
+confirming itself; no single-run m4 ratio may be quoted without its band.
+
 ## Open rows
 
 ### bd-e8h-w1-termdict-snapshot-cache-h0eq — decoded TERMDICT block cache
@@ -140,8 +157,54 @@ Expected signal:   material; quantify from census.
 Falsified if:      realloc/memmove frames <0.1%.
 Invocation:        per bd-6oiq card; then paired A/B.
 Machine classes:   x86-vps-ovh + trj primary.
-Results (inline):  PENDING (blocked on bd-6oiq card).
-Retry predicate:   n/a
+Results (inline):  PROFILE-FIRST GATE SATISFIED, SITE REFINED, LEVER IMPLEMENTED —
+                   A/B PENDING (2026-07-29, ScarletPelican). heaptrack census on the
+                   QG-2 cell (trj, run receipt trj-zen3-64c/20260729T021441Z, trace
+                   w22-heaptrack-v2.zst on trj): 120.6M allocation calls in 116s
+                   (1.04M/s), 22.9M temporaries. The measured churn site is NOT
+                   scribe accumulation — it is the SEAL encode path:
+                   encode_vint_block (quiver.rs:2731 pre-fix) built a fresh Vec per
+                   posting block and grew it push-by-push (463,405
+                   grow_one/grow_amortized calls with 0B retained in the
+                   index-commit -> scribe-seal -> quiver-encode chain), then copied
+                   the payload into the section buffer and freed it. Perf agrees:
+                   slow-path allocator frames (malloc_consolidate, _int_free_chunk,
+                   unlink_chunk) + 4% memmove on the Quill thread, while Tantivy's
+                   top COUNT sites are cheap fast-path token Strings on its own
+                   threads. Lever implemented: exact-size direct-to-output encode —
+                   payload length precomputed via vint_length, header + bytes
+                   written straight into the section buffer, error checks precede
+                   all writes (failure-atomicity preserved), byte layout identical
+                   to append_block. Sibling temp-Vec sites (encode_for_block,
+                   EncodedPositionList::encode_with_limits) deliberately untouched:
+                   one lever per change; they file as follow-up rows after this
+                   lever's A/B.
+A/B VERDICT:       **WASH — REJECT as a perf lever** (2026-07-29, back-to-back
+                   30-run cells on trj, run receipts lever1-base-5433c45e /
+                   lever1-cand-b8c1465b under
+                   trj-zen3-64c/20260729T024251Z-lever1-ab; both binaries
+                   printed their own ELF SHA; both A/A nulls contain 1.0):
+                   quill 60,361.7 [59,987.3, 60,889.1] docs/s (base) vs
+                   60,375.7 [59,571.3, 61,156.8] (candidate) — fully
+                   overlapping CIs; ab ratio 0.3399 [0.3332, 0.3463] vs
+                   0.3356 [0.3271, 0.3403]. Eliminating 463k temp allocations
+                   per census run produced NO measurable throughput change.
+                   Cause of the misprediction, banked as a prior: heaptrack
+                   ranks by COUNT; ~42k grow calls per run at ~50-100ns each
+                   is single-digit milliseconds against multi-second runs —
+                   far below the 0.1% TIME floor. The 7.6% allocator
+                   self-time in the Round-0 perf card comes from OTHER
+                   allocation traffic still unattributed. The landed change
+                   (b8c1465b) STAYS as an allocation-hygiene refactor:
+                   byte-identical output, tests green, strictly fewer
+                   allocations, measured perf-neutral with receipts — it is
+                   not counted as a campaign win anywhere.
+Retry predicate:   none for this site (settled). The DEFICIT hypothesis
+                   space reopens via a QUILL-ARM-SCOPED time profile
+                   (single-engine child run) to find where the ~2.9x per-doc
+                   time actually goes; every future heaptrack-derived row
+                   must include an estimated-time conversion (count x ns/op
+                   vs run wall time) before implementation.
 
 ### bd-e8h-w2-seal-checksum-audit-ivh69 — seal-time checksum cost (AUDIT)
 Hypothesis:        Section checksum computation is >5% of QG-1 seal wall-time at medium scale.
@@ -177,6 +240,16 @@ Retry predicate:   re-run the census when an on-disk commit-bearing cell
                    compact rework, or any gate whose arms leave
                    quill_in_memory), and on macOS with F_FULLFSYNC tracing
                    for Law 7.
+
+### bd-s1rc1 — per-commit EncodedSegment full clone
+Hypothesis:        The commit path clones the entire encoded segment (segment.rs:196; ~9.7 MB per commit, 7.2% of ingest bytes); the clone lives 5.46 s (vs 12 ms for the encode-side original) with 68 MB resident at heap max, so two full encoded segments coexist per commit. Eliminating the copy (borrow/Arc/move) cuts allocator bytes and QG-7 peak RSS.
+Minimal repro:     w13 ingest census + lifetime appendix (c7a745cb + amendment), docs/evidence/e8h/w13-ingest-alloc-census-20260728/.
+Expected signal:   ~7% of ingest allocation bytes and ~10 MB peak RSS per active commit; wall-time effect modest (~10 MB memcpy ≈ 1–3 ms/commit); primary axes are allocation traffic + QG-7 RSS, stated honestly.
+Falsified if:      a reading pass shows two consumers genuinely mutate/retain both copies, or removal shows no QG-1/QG-2/QG-7 delta beyond null.
+Invocation:        reading pass over segment.rs/keeper.rs/index.rs commit path first (WAIT on fk04a combined-train integration for index/keeper surfaces); then paired A/B under the QG harness.
+Machine classes:   all; claims per class.
+Results (inline):  PENDING (hypothesis filed from census; no reading pass yet). Not to be mixed with W2.2's chunked-arena lever (msg 5585).
+Retry predicate:   n/a
 
 ## Banked priors (do NOT re-dig without meeting the retry predicate)
 

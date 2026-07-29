@@ -7799,3 +7799,155 @@ terminal-lifecycle API and all six fairness pins, then require a valid A/A
 candidate, an immediate valid A/A rerun, and at most `0.019803` log-ratio
 delta. Do not resample the unchanged Threadripper route, weaken a null law, or
 use CV as the gate.
+
+## 2026-07-28 — QG-1 corrected-cadence target tranche: medium target misses; xlarge null is invalid (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Every attempt ran the incumbent and Quill side-by-side in one invocation from
+clean revision `02372ce9c4bc501bf56e8dfba74f73692398acfd` and the same
+self-reporting `release-perf` ELF, SHA-256
+`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`
+(76,863,272 bytes). Runtime preflight identified Tantivy 0.26.1 / index format
+v7. Both eight-thread writers received the same 120,000,000-byte total heap,
+the same positions-enabled schema and analyzer, and byte-identical seeded
+corpora in the same order and 5,000-document batches. The decisive runs used
+physical cores 0–15, `performance` governor, and `RAYON_NUM_THREADS=8`.
+
+Commit policy is now symmetric. Both arms use the shipping 1,000 ms visibility
+cadence and one terminal commit, in memory. Medium operations stayed below the
+cadence and made zero periodic commits. On the 1,000,000-document xlarge
+fixture, Tantivy made 10–11 periodic commits and Quill made 22–23; the count
+difference follows their different elapsed time, not a policy difference.
+Across the nine attempts below, 498 Tantivy lifecycle receipts all recorded
+eight writer threads, 120,000,000 bytes, joined indexing and merge workers,
+and `writer_rearmed=false`.
+
+The null-calibration sequence was preserved rather than averaged away:
+
+| fixture / execution pin | A/A verdict | Quill/Tantivy median-CI | reading |
+|---|---|---:|---|
+| medium, SMT-eligible cpuset, warmup 1 / pairs 10 | invalid: CI too wide | `0.423925 [0.409020, 0.427619]` | diagnostic |
+| medium rerun, same pin | invalid: width + dispersion + order effect | `0.408081 [0.394410, 0.421535]` | diagnostic |
+| medium, 16 physical cores, warmup 1 / pairs 10 | invalid: center + width + dispersion + order + drift | `0.401922 [0.395089, 0.416259]` | diagnostic |
+| medium, 16 physical cores, warmup 10 / pairs 10 | invalid: width + drift | `0.404418 [0.383978, 0.427316]` | diagnostic |
+| medium, 16 physical cores, warmup 10 / pairs 30 | **valid**: `0.988191 [0.976000, 1.002801]` | **`0.405807 [0.403372, 0.410703]`** | target MISS |
+| immediate medium rerun, same pin | **valid**: `1.009861 [0.970286, 1.031514]` | **`0.414845 [0.409321, 0.418691]`** | target MISS |
+| xlarge, 16 physical cores, warmup 1 / pairs 10 | invalid: log-MAD `0.059332 > 0.048790` | `0.209583 [0.194532, 0.219311]` | diagnostic |
+| predeclared xlarge candidate, same pin | invalid: dispersion + order effect + drift | `0.197288 [0.194559, 0.217702]` | diagnostic |
+| immediate xlarge rerun, same pin | invalid: order effect | `0.206296 [0.198693, 0.213267]` | diagnostic |
+
+The two valid medium invocations independently miss QG-1's 3.0x threshold by
+a wide margin. They are not a promotable reproduction pair: their
+cross-invocation log-median delta is `0.022027`, just above the fixed
+`0.019803` bound. The xlarge magnitude is likewise not a number because its
+same-invocation null failed dispersion. Its artifact completed at 20:57:57
+EDT; the next hourly prune sweep began at 20:58:09, so that attempt did not
+overlap maintenance. The predeclared fresh xlarge pair was retained in full.
+Its A/A controls were `0.978179 [0.928430, 1.061322]` (dispersion, order,
+and drift invalid) and `1.006406 [0.974261, 1.055636]` (order invalid).
+Their diagnostic effect medians also differed by `0.044648` log, above the
+`0.019803` reproduction bound. Both completed before the next maintenance
+sweep.
+
+**Decision: TARGET-SLICE MISS AT MEDIUM / INVALID-REPRODUCTION +
+INVALID-NULL / NO QG-1 PROMOTION.** The normative 34-cell gate was not run,
+every artifact correctly records `laws_attested=false`, QG-1 remains inactive,
+and `.bench-history/QG-1.unmeasured.latest.json` is not replaced. Evidence
+JSON SHA-256 values, in attempt order, are
+`ea12d51a87fcd742b195b09ede2a55a5c148128e0b3c530206e2bb5796d505b7`,
+`96ac39cd3dceddf153fc5ac9e39111ca26338cad774dcc72f904a29d70ea2ef4`,
+`430d41e03391d0c4a0ba72db96b3da63041d220000723589dba0f4ac96e26fd9`,
+`f7218d6fd9783c53e1e22e6d7ca11d53ea6dde64aab45c5fa931760c3dc5385d`,
+`0c64964d80a3b9557ffb2ecabdd5db0b3ea6cdd2433f712b506d959715e454d1`,
+`ed7e597b07553665a1e7c203a9b2ae0237d256f94e11643f76e5958b14cef373`,
+`749b31bd0529dd9702ece070151cfe04eaf8c3b312e63b079936fac5a68ec6ac`,
+`da61921fa4d67672ed4ceabe15d2c9b308c5e99abe972cebfe6c31d236c2fbfb`,
+and
+`a56b1384727d6071da0862e405039c96cf67d6bd5e8bbc3f073769b219bf32a7`.
+Artifacts are retained under
+`.bench-history/attempts/2026-07-28/QG-1/qg1-target-*`.
+
+Stop resampling this xlarge route: its predeclared candidate and immediate
+rerun both failed the A/A contract. A retry requires a materially different
+harness or workload scale that removes the counted 10/11-commit boundary,
+plus a canonical machine receipt, both target corpora, both tokenizer
+denominators, valid candidate and immediate-rerun nulls, and reproduction
+within `0.019803`. Do not select a favorable attempt, weaken a null law, or
+gate on CV.
+
+## 2026-07-28 — QG-1 alternate-host medium slice: diagnostic MISS, invalid null (`bd-h6eh`, FoggySquirrel)
+
+To test host quietness by measurement rather than a subjective pre-filter, the
+same self-reporting ELF (`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`,
+revision `02372ce9c4bc501bf56e8dfba74f73692398acfd`) ran Quill and Tantivy
+interleaved on worker `vmi1264463` (`38.242.209.154`), an 8-CPU AMD EPYC
+host, cpuset `0-7`, with 10 excluded warmups and 30 paired blocks. Recorded
+load was `3.05` to `4.49`; this was deliberately left to the A/A control.
+
+The diagnostic Quill/Tantivy ratio was **`0.431254 [0.394635, 0.455288]`**
+(Quill `20,400.857` docs/s; Tantivy `47,555.318` docs/s), a target MISS
+against `3.0x`. The same-invocation A/A was `0.984157 [0.858930, 1.117099]`
+and invalid on its width; the artifact is `invalid_null`, not a certified
+gate number. Evidence JSON SHA-256 is
+`86626a6d1d45ad3b82815159f0ec6cb5a993cfa0e0573c9404ae8d5d6706e695` and the
+legacy summary SHA-256 is
+`665cf5898b8eb6828fb17079fc30d5ded2cec5aa8aa5fa08a5ff6304406ef406`.
+
+**Decision: diagnostic MISS / UNSCORED because A/A null is invalid.** QG-1
+remains inactive and the partial slice cannot replace its unmeasured
+baseline. Retry only with a predeclared same-host candidate/rerun whose null
+CI admits; do not claim this ratio or gate on CV.
+
+## 2026-07-29 — QG-1 full-SMT xlarge sweep: two target-slice MISS rows, seven UNSCORED (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Quill and Tantivy ran side-by-side at every thread point in one invocation,
+with a Tantivy/Tantivy null, a Quill/Quill null, and the A/B comparison.
+Source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` was clean; the self-reporting
+`release-perf` ELF SHA-256 was
+`a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12`
+(76,985,272 bytes).
+
+The v4 artifacts identify `threadripperje` as a Threadripper PRO 5995WX with
+64 physical cores, 128 logical threads, one NUMA node, 499 GiB RAM, runtime
+AVX2/FMA/BMI2/AES/VAES, process affinity `0-127`, and no cpuset cap. Each row
+records its actual requested thread count: 1, 2, 4, 8, 16, 32, 64, 96, or
+128. The fixture used one million deterministic documents, positions on,
+5,000-document batches, in-memory indexes, one excluded warmup, and ten
+paired blocks. Both arms had the same analyzer/schema, total heap, generated
+documents/order, 1,000 ms visibility cadence, and terminal commit. Quill's
+higher realized periodic-commit count follows its longer elapsed time; all
+counts are retained in the raw logs.
+
+| threads | Quill docs/s | Tantivy docs/s | Quill/Tantivy median-CI | null verdict | target verdict |
+|---:|---:|---:|---:|---|---|
+| 1 | 34,896.923 | 135,684.166 | `0.256083 [0.250163, 0.258549]` | both valid | **MISS** |
+| 2 | 34,543.200 | 165,817.834 | `(0.208493 [0.195344, 0.225094])` | Tantivy dispersion + order + drift | **UNSCORED** |
+| 4 | 35,589.081 | 173,165.385 | `(0.205067 [0.191886, 0.209096])` | Tantivy width + dispersion + drift | **UNSCORED** |
+| 8 | 33,770.710 | 142,833.746 | `(0.237273 [0.231981, 0.245118])` | Tantivy width + order | **UNSCORED** |
+| 16 | 32,791.136 | 136,259.514 | `(0.240605 [0.235825, 0.248195])` | Tantivy width + dispersion | **UNSCORED** |
+| 32 | 25,142.024 | 117,388.872 | `(0.209419 [0.199148, 0.216683])` | Tantivy dispersion | **UNSCORED** |
+| 64 | 28,562.221 | 126,486.750 | `(0.226495 [0.221930, 0.231632])` | Tantivy order + drift | **UNSCORED** |
+| 96 | 26,570.020 | 112,658.279 | `0.236489 [0.233668, 0.239445]` | both valid | **MISS** |
+| 128 | 28,211.911 | 108,901.704 | `(0.254452 [0.248195, 0.263064])` | Tantivy dispersion + order + drift | **UNSCORED** |
+
+Every Quill/Quill null passed. CV is provenance only and decided no row. The
+scoreable ratio does not narrow from one to 96 threads; the raw diagnostic
+endpoints are likewise nearly flat at `0.256083` and `0.254452`. Thus this
+tranche shows no manifested high-thread concat-merge advantage, while seven
+invalid incumbent nulls prevent calling it a certified nine-point curve.
+
+**Decision: PARTIAL TARGET-SLICE MISS / NO QG-1 PROMOTION.** QG-1 remains
+inactive because this was the xlarge positions-on tranche, not the complete
+normative matrix or an immediate reproduction. All 72 raw/evidence/host/
+lifecycle files plus the adjudication are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-5995wx-fullsweep-bb31daa0-r10-20260729T0824Z/`.
+
+Retry the valid 1- and 96-thread rows only after a profile-attributed Quill
+hot-path change, preserving the same topology, corpus, exact-ELF, dual-null,
+and median-CI contract. Do not blind-resample the seven invalid rows: retry
+only on a distinct eligible 64C/128T host or after a counted mechanism removes
+the Tantivy commit-boundary/order/drift failure. Activation still requires the
+full gate and immediate same-ELF reproduction; never weaken a null law, select
+a favorable row, or gate on CV.

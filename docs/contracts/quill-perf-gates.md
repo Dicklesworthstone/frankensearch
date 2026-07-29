@@ -88,23 +88,32 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The v3 QG writer's legacy `paired_ab`/`paired_null` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v1` artifact (`bd-uh2f` /
-`bd-uh2f.1`), which the harness now emits beside every v3 artifact from the
+The v5 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
+`paired_null_quill` rows are diagnostics only.
+Decision-grade output is the `quill-perf-evidence-v3` artifact (`bd-uh2f` /
+`bd-uh2f.1`), which the harness emits beside every v5 artifact from the
 exact same raw paired blocks.
 
-## Evidence artifacts (`quill-perf-evidence-v1`)
+## Evidence artifacts (`quill-perf-evidence-v3`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
 carries: both engines' absolute distributions from the same paired blocks, the
-paired log-ratio effect with a seeded bootstrap CI, the same-invocation A/A
-result, bounded raw samples that every summary recomputes from on load, and a
-same-scope absolute-versus-paired reconciliation. Run provenance records the
+paired log-ratio effect with a seeded bootstrap CI, same-invocation
+Tantivy/Tantivy and Quill/Quill A/A results for QG-1, bounded raw samples that
+every summary recomputes from on load, and a same-scope
+absolute-versus-paired reconciliation. Run provenance records the
 executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
-rustc/target/profile/features, machine identity with governor and load, peak
-RSS with its method (`unsupported` is reported honestly, never a zero), and
-corpus/query-set hashes with generator coordinates.
+rustc/target/profile/features, producer OS and host identity, host-wide physical
+cores, logical threads, RAM and NUMA nodes, process-available concurrency,
+configured thread widths, and an untimed per-arm observation of CPU-active and
+peak newly spawned workers for every scaling row. Each row repeats its
+effective affinity/cpuset mask. Quill and Tantivy each carry an executable
+SHA-256; because both Rust engines are statically linked into the same
+same-invocation benchmark, both identities name the same self-hashed ELF.
+Runtime-detected ISA, governor and load, peak RSS with its method
+(`unsupported` is reported honestly, never a zero), and corpus/query-set hashes
+with generator coordinates complete the receipt.
 
 Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
 two-stage hierarchical per-query resampling (QG-6, four query groups per
