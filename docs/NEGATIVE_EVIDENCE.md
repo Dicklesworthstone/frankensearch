@@ -16557,3 +16557,30 @@ section-assembly + STOREDMETA blob copies become elidable in the same change
 profile attributes >3% of the quill arm to the seal-path
 memmove+decode-under-encode family. Do not re-run this two-file-only variant;
 its addressable share is bounded at ~0.8% by the P1 attribution.
+
+### 2026-07-29 — SURVEY: allocator/THP family on the quill arm is DEAD on local-5975wx-32c (E8-H P3, SandyGrove)
+
+Symmetric env-only matrix on the memory-mode child seam (NOT the bulk gate
+cell — diagnostic seam only; certified QG-2 remains 0.1113): 7 cells x 10
+rotated rounds, single ELF sha256
+`9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`, core-pinned,
+external wall time. A/A null (glibc quill vs itself, same-invocation series,
+interleaved): 0.9983 [0.8808, 1.0248], admissible.
+
+- quill jemalloc/glibc: 0.9563 [0.9050, 1.1431] — straddles 1.0, no win.
+- quill THP tunable (glibc.malloc.hugetlb=1): 0.9916 [0.8577, 1.2010] — wash.
+- tantivy jemalloc/glibc: 1.0678 [1.0471, 1.1084] — the INCUMBENT arm is the
+  allocator-sensitive one; symmetric allocator changes would widen the gap.
+- mimalloc absent on host; glibc-tunable cell substituted per plan.
+
+Mechanism consistency: P1 card attributed quill memmove as data-copy-shaped
+(~5.2%) with only ~0.45% allocation-growth; allocator substitution moving
+nothing on the quill arm corroborates it. Class-split note: further decouples
+the x86-vs-m4 gap from glibc allocator behavior on the quill side.
+
+Full card: `docs/evidence/e8h/p3-local-qg2-allocator-sensitivity-20260729.md`.
+
+**Retry predicate:** reopen only if (a) a bulk gate-cell allocator A/B on a
+certified class moves the quill arm's median ratio >3% with an admissible
+same-invocation A/A null, or (b) a certified-class arm-scoped profile
+attributes >8% of quill self-time to allocator frames.
