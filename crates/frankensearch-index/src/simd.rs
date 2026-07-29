@@ -3259,6 +3259,19 @@ mod tests {
             .collect()
     }
 
+    /// Whether the production dispatcher can select the approximate,
+    /// pair-saturating AVX2 kernel on this test host.
+    fn maddubs_saturating_path_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
     /// CORRECTNESS GATE. On magnitudes where no adjacent-pair `u8·i8` sum can exceed `i16`, the
     /// `vpmaddubs` kernel is **bit-exact** to the scalar dot — proving the domain shift and the
     /// `128·Σq` bias are correct. Bound 90: `u∈[0,218]`, `q∈[-90,90]`, pair-sum ≤ 2·218·90 ≈ 39k
@@ -3316,10 +3329,17 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            any_diff,
-            "uniform ±127 is expected to saturate maddubs; if it no longer does, revisit the recall bound"
-        );
+        if maddubs_saturating_path_available() {
+            assert!(
+                any_diff,
+                "uniform ±127 is expected to saturate the AVX2 maddubs path; if it no longer does, revisit the recall bound"
+            );
+        } else {
+            assert!(
+                !any_diff,
+                "non-AVX2 dispatch must retain the exact generic fallback at the full int8 range"
+            );
+        }
     }
 
     /// CORRECTNESS + ORDERING GATE for the FMA f16 dot (scan lever). FMA is not bit-identical to
@@ -3481,14 +3501,23 @@ mod tests {
         let query_i8 = quantize_query_i8(&query);
         let bias = maddubs_query_bias(&query_i8, dim);
 
-        // Confirm the corpus actually saturates maddubs (else this proves nothing new).
+        // Confirm the corpus actually saturates maddubs when the approximate AVX2 path is active.
+        // On other architectures, the same fixture instead proves that runtime dispatch retains
+        // the exact generic fallback before the common candidate-recall checks below.
         let saturates = (0..n).any(|d| {
             dot_i8_i8_generic(doc_i8[d], &query_i8) != dot_i8_i8_maddubs(doc_i8[d], &query_i8, bias)
         });
-        assert!(
-            saturates,
-            "real quantized corpus must exercise maddubs saturation for this proof to bite"
-        );
+        if maddubs_saturating_path_available() {
+            assert!(
+                saturates,
+                "real quantized corpus must exercise AVX2 maddubs saturation for this proof to bite"
+            );
+        } else {
+            assert!(
+                !saturates,
+                "non-AVX2 dispatch must retain the exact generic fallback on the real corpus"
+            );
+        }
 
         // Pass-1 candidate sets (top k·mult) by exact int8 vs approximate maddubs.
         let cand = k * mult;
