@@ -43,7 +43,7 @@ use crate::perf::{
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v2";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v3";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
@@ -335,8 +335,8 @@ pub struct MachineIdentity {
     pub arch: String,
     /// Logical CPU count observed by the process.
     pub logical_cpus: usize,
-    /// Host topology, ISA, affinity, and exact thread widths exercised by the
-    /// invocation.
+    /// Host topology, RAM/NUMA, ISA, affinity, configured widths, untimed
+    /// observed-worker receipts, and dual-engine ELF identities.
     pub execution: PerfExecutionProvenance,
     /// CPU frequency governor, when the platform exposes one.
     pub cpu_governor: Option<String>,
@@ -350,13 +350,16 @@ impl MachineIdentity {
     /// Capture the current machine identity. Unavailable probes report
     /// `None` rather than fabricating zeros.
     #[must_use]
-    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(
+        thread_counts_requested: impl IntoIterator<Item = usize>,
+        bench_elf_sha256: &str,
+    ) -> Self {
         Self {
             fingerprint: crate::perf::machine_fingerprint(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
-            execution: PerfExecutionProvenance::capture(threads_actually_used),
+            execution: PerfExecutionProvenance::capture(thread_counts_requested, bench_elf_sha256),
             cpu_governor: fs::read_to_string(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             )
@@ -531,6 +534,18 @@ impl EvidenceProvenance {
         }
         self.build.validate()?;
         self.machine.validate()?;
+        if self
+            .machine
+            .execution
+            .engine_binaries
+            .iter()
+            .any(|identity| identity.executable_sha256 != self.build.executable_sha256)
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "both statically linked engine identities must bind to the executing ELF"
+                    .to_owned(),
+            });
+        }
         self.peak_rss.validate()?;
         self.corpus.validate()
     }
@@ -1544,6 +1559,29 @@ impl PerfEvidenceArtifact {
         self.policy.validate()?;
         self.provenance.validate()?;
         Self::validate_cell_set(self.gate, &self.cells)?;
+        if matches!(self.gate, PerfGate::Qg1 | PerfGate::Qg8) {
+            let expected_fixtures = self
+                .cells
+                .iter()
+                .filter(|cell| cell.spec.metric != "tokenize_docs_per_second")
+                .map(|cell| cell.spec.fixture.as_str())
+                .collect::<BTreeSet<_>>();
+            let observed_fixtures = self
+                .provenance
+                .machine
+                .execution
+                .thread_observations
+                .iter()
+                .map(|observation| observation.fixture.as_str())
+                .collect::<BTreeSet<_>>();
+            if expected_fixtures != observed_fixtures {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: "scaling evidence must carry one requested-versus-observed thread \
+                             receipt for every non-tokenizer fixture"
+                        .to_owned(),
+                });
+            }
+        }
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
                 || reason.code.trim().is_empty()
@@ -1599,6 +1637,54 @@ impl PerfEvidenceArtifact {
             self.provenance.run_id,
             self.provenance.run_window,
         );
+        let execution = &self.provenance.machine.execution;
+        let _ = writeln!(
+            table,
+            "host {} | producer_os {} | physical_cores {} | logical_threads {} | ram_bytes {} | \
+             numa_nodes {} | requested_threads {:?} | affinity {}",
+            execution.host_identity,
+            execution.producer_os,
+            execution.physical_cores,
+            execution.logical_threads,
+            execution.ram_bytes,
+            execution.numa_nodes,
+            execution.thread_counts_requested,
+            execution
+                .cpu_affinity_allowed_list
+                .as_deref()
+                .unwrap_or("unavailable"),
+        );
+        for observation in &execution.thread_observations {
+            let _ = writeln!(
+                table,
+                "thread_row {} | requested {} | affinity {} | quill_actual {} | \
+                 quill_cpu_active_new {} | quill_peak_new {} | tantivy_actual {} | \
+                 tantivy_cpu_active_new {} | tantivy_peak_new {}",
+                observation.fixture,
+                observation.thread_count_requested,
+                observation
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                observation.quill.thread_count_actually_used,
+                observation.quill.cpu_active_new_worker_threads,
+                observation.quill.peak_new_worker_threads,
+                observation.tantivy.thread_count_actually_used,
+                observation.tantivy.cpu_active_new_worker_threads,
+                observation.tantivy.peak_new_worker_threads,
+            );
+        }
+        for identity in &execution.engine_binaries {
+            let _ = writeln!(
+                table,
+                "engine {} | role {} | version {} | executable_sha256 {} | scheme {}",
+                identity.engine,
+                identity.role,
+                identity.version,
+                identity.executable_sha256,
+                identity.identity_scheme,
+            );
+        }
         table.push_str(
             "cell | role | estimand | status | control_p50 | treatment_p50 | ratio | \
              ci95_ratio | pairs | reasons\n",
@@ -1806,7 +1892,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v2")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v3")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -1860,9 +1946,10 @@ pub enum EvidenceArtifactError {
 mod tests {
     use super::*;
     use crate::perf::{
-        PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfSampleArm, PerfSampleOrder,
-        PerfSamplePhase, PerfSampleProvenance, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
-        estimate_paired_experiment, seeded_balanced_pair_order,
+        PerfCellResult, PerfEngineBinaryIdentity, PerfEngineThreadObservation, PerfMetricSemantics,
+        PerfOperationScope, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+        PerfThreadProvenance, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment,
+        seeded_balanced_pair_order,
     };
 
     const CANARY: &str = "CANARY_DOCUMENT_TEXT_MUST_NEVER_PERSIST";
@@ -2066,11 +2153,57 @@ mod tests {
                 arch: "x86_64".to_owned(),
                 logical_cpus: 8,
                 execution: PerfExecutionProvenance {
+                    producer_os: "linux".to_owned(),
                     host_identity: "test-machine".to_owned(),
                     physical_cores: 4,
                     logical_threads: 8,
+                    ram_bytes: 32 * 1024 * 1024 * 1024,
+                    numa_nodes: 1,
                     process_available_threads: 8,
-                    threads_actually_used: vec![1],
+                    thread_counts_requested: vec![1],
+                    thread_observations: vec![PerfThreadProvenance {
+                        fixture: "bulk/synthetic/1".to_owned(),
+                        thread_count_requested: 1,
+                        cpu_affinity_allowed_list: Some("0-7".to_owned()),
+                        quill: PerfEngineThreadObservation {
+                            engine: "quill".to_owned(),
+                            runtime_available_parallelism: 8,
+                            process_threads_before_probe: 2,
+                            peak_process_threads: 4,
+                            thread_count_actually_used: 1,
+                            cpu_active_new_worker_threads: 1,
+                            cpu_active_threshold_ns: 1_000_000,
+                            peak_new_worker_threads: 1,
+                            observation_method: "linux-proc-test-v1".to_owned(),
+                        },
+                        tantivy: PerfEngineThreadObservation {
+                            engine: "tantivy".to_owned(),
+                            runtime_available_parallelism: 8,
+                            process_threads_before_probe: 2,
+                            peak_process_threads: 4,
+                            thread_count_actually_used: 1,
+                            cpu_active_new_worker_threads: 1,
+                            cpu_active_threshold_ns: 1_000_000,
+                            peak_new_worker_threads: 1,
+                            observation_method: "linux-proc-test-v1".to_owned(),
+                        },
+                    }],
+                    engine_binaries: vec![
+                        PerfEngineBinaryIdentity {
+                            engine: "quill".to_owned(),
+                            role: "subject".to_owned(),
+                            version: "0.2.1".to_owned(),
+                            executable_sha256: "a".repeat(64),
+                            identity_scheme: "same-static-elf-v1".to_owned(),
+                        },
+                        PerfEngineBinaryIdentity {
+                            engine: "tantivy".to_owned(),
+                            role: "oracle".to_owned(),
+                            version: "0.26.1".to_owned(),
+                            executable_sha256: "a".repeat(64),
+                            identity_scheme: "same-static-elf-v1".to_owned(),
+                        },
+                    ],
                     runtime_detected_isa: vec!["avx2".to_owned()],
                     cpu_affinity_allowed_list: Some("0-7".to_owned()),
                     affinity_or_cpuset_cap: None,

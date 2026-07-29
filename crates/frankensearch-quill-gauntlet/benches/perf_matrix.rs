@@ -17,10 +17,12 @@
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Barrier, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, runtime::Runtime};
@@ -38,14 +40,15 @@ use frankensearch_quill_gauntlet::{
     CountState, DistributionSummary, EngineObservation, EvidenceCell, EvidenceCellSpec,
     EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity, NativeTieKey,
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence,
-    PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
-    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
-    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
-    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
+    PerfCellResult, PerfCellSpec, PerfCorpus, PerfEngineThreadObservation, PerfEvidenceArtifact,
+    PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics,
+    PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder,
+    PerfSamplePhase, PerfSampleProvenance, PerfThreadProvenance, PerfTopology, PositionMode,
+    QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison, Qg6PreparedExperiment,
+    Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope, RankClass, RankedHit,
+    ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, compare_observations,
+    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
+    perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use sha2::{Digest, Sha256};
 
@@ -599,7 +602,12 @@ fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
-fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn bulk_metric_unpooled(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    lifecycle_phase: &str,
+) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
     let corpus = corpus_for(count);
@@ -646,7 +654,7 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     quill_config(spec).max_visibility_lag_ms,
                 );
             }
-            elapsed += finish_tantivy_lifecycle(index, spec, "measured_work");
+            elapsed += finish_tantivy_lifecycle(index, spec, lifecycle_phase);
             elapsed
         }
     };
@@ -654,8 +662,17 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
 }
 
 fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    bulk_metric_with_lifecycle_phase(context, spec, arm, "measured_work")
+}
+
+fn bulk_metric_with_lifecycle_phase(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    lifecycle_phase: &str,
+) -> f64 {
     if !matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) || arm != EngineArm::Quill {
-        return bulk_metric_unpooled(context, spec, arm);
+        return bulk_metric_unpooled(context, spec, arm, lifecycle_phase);
     }
 
     let threads = spec.threads.expect("QG-1/QG-8 thread count");
@@ -669,8 +686,199 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
                 threads,
                 "QG-1/QG-8 Quill cell escaped its pinned Rayon pool"
             );
-            bulk_metric_unpooled(context, spec, arm)
+            bulk_metric_unpooled(context, spec, arm, lifecycle_phase)
         })
+}
+
+#[derive(Clone, Copy)]
+struct ThreadCpuRuntime {
+    initial_ns: Option<u64>,
+    latest_ns: u64,
+}
+
+fn process_thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .ok()
+        .map_or(1, |entries| entries.filter_map(Result::ok).count().max(1))
+}
+
+fn linux_thread_cpu_runtime_ns() -> BTreeMap<u32, u64> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return BTreeMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let tid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let schedstat = std::fs::read_to_string(entry.path().join("schedstat")).ok()?;
+            let runtime_ns = schedstat
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?;
+            Some((tid, runtime_ns))
+        })
+        .collect()
+}
+
+fn linux_current_tid() -> Option<u32> {
+    std::fs::read_link("/proc/thread-self")
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .parse::<u32>()
+        .ok()
+}
+
+fn process_cpu_allowed_list() -> Option<String> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Cpus_allowed_list:")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+}
+
+/// Run one exact fixture outside every decision timing scope and observe the
+/// engine width through per-thread Linux scheduler runtime plus process thread
+/// high-water sampling. The monitor is excluded from both counts.
+fn probe_operation_threads<F>(engine: &str, mut operation: F) -> PerfEngineThreadObservation
+where
+    F: FnMut(),
+{
+    const CPU_ACTIVE_THRESHOLD_NS: u64 = 1_000_000;
+    let runtime_available_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+    let process_threads_before_probe = process_thread_count();
+    let initial = linux_thread_cpu_runtime_ns();
+    let stop = AtomicBool::new(false);
+    let ready = Barrier::new(2);
+
+    let (result, peak_process_threads, monitor_tid, runtimes) = thread::scope(|scope| {
+        let ready_for_monitor = &ready;
+        let stop_for_monitor = &stop;
+        let monitor = scope.spawn(move || {
+            let monitor_tid = linux_current_tid();
+            let mut peak_process_threads = process_threads_before_probe;
+            let mut runtimes = initial
+                .into_iter()
+                .map(|(tid, runtime_ns)| {
+                    (
+                        tid,
+                        ThreadCpuRuntime {
+                            initial_ns: Some(runtime_ns),
+                            latest_ns: runtime_ns,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            ready_for_monitor.wait();
+            loop {
+                let snapshot = linux_thread_cpu_runtime_ns();
+                peak_process_threads = peak_process_threads
+                    .max(snapshot.len())
+                    .max(process_thread_count());
+                for (tid, runtime_ns) in snapshot {
+                    runtimes
+                        .entry(tid)
+                        .and_modify(|runtime| {
+                            runtime.latest_ns = runtime.latest_ns.max(runtime_ns);
+                        })
+                        .or_insert(ThreadCpuRuntime {
+                            initial_ns: None,
+                            latest_ns: runtime_ns,
+                        });
+                }
+                if stop_for_monitor.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            (peak_process_threads, monitor_tid, runtimes)
+        });
+
+        ready.wait();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            operation();
+            black_box(());
+        }));
+        stop.store(true, Ordering::Release);
+        let (peak_process_threads, monitor_tid, runtimes) = monitor
+            .join()
+            .expect("thread observation monitor must not panic");
+        (result, peak_process_threads, monitor_tid, runtimes)
+    });
+    if let Err(payload) = result {
+        resume_unwind(payload);
+    }
+
+    let cpu_active_new_worker_threads = runtimes
+        .iter()
+        .filter(|(tid, runtime)| {
+            Some(**tid) != monitor_tid
+                && runtime.initial_ns.is_none()
+                && runtime.latest_ns >= CPU_ACTIVE_THRESHOLD_NS
+        })
+        .count();
+    let peak_new_worker_threads =
+        peak_process_threads.saturating_sub(process_threads_before_probe.saturating_add(1));
+    PerfEngineThreadObservation {
+        engine: engine.to_owned(),
+        runtime_available_parallelism,
+        process_threads_before_probe,
+        peak_process_threads,
+        thread_count_actually_used: cpu_active_new_worker_threads.max(1),
+        cpu_active_new_worker_threads,
+        cpu_active_threshold_ns: CPU_ACTIVE_THRESHOLD_NS,
+        peak_new_worker_threads,
+        observation_method: if cfg!(target_os = "linux") {
+            "untimed-linux-proc-task-schedstat-1ms-active-plus-thread-high-water-v1".to_owned()
+        } else {
+            "untimed-process-thread-high-water-v1".to_owned()
+        },
+    }
+}
+
+fn probe_cell_thread_provenance(
+    context: &BenchContext,
+    spec: &PerfCellSpec,
+) -> Option<PerfThreadProvenance> {
+    if !matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8)
+        || spec.metric == "tokenize_docs_per_second"
+    {
+        return None;
+    }
+    let quill = probe_operation_threads("quill", || {
+        black_box(bulk_metric_with_lifecycle_phase(
+            context,
+            spec,
+            EngineArm::Quill,
+            "thread_provenance_probe",
+        ));
+    });
+    let tantivy = probe_operation_threads("tantivy", || {
+        black_box(bulk_metric_with_lifecycle_phase(
+            context,
+            spec,
+            EngineArm::Tantivy,
+            "thread_provenance_probe",
+        ));
+    });
+    let observation = PerfThreadProvenance {
+        fixture: spec.fixture.clone(),
+        thread_count_requested: spec.threads.expect("scaling fixture thread count"),
+        cpu_affinity_allowed_list: process_cpu_allowed_list(),
+        quill,
+        tantivy,
+    };
+    eprintln!(
+        "[quill-thread-provenance] {}",
+        serde_json::to_string(&observation).expect("serialize thread provenance")
+    );
+    Some(observation)
 }
 
 fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
@@ -2139,6 +2347,7 @@ fn prepared_qg6_streams(
 struct CellCollection {
     results: Vec<PerfCellResult>,
     evidence: Option<EvidenceCell>,
+    thread_provenance: Option<PerfThreadProvenance>,
 }
 
 fn collect_cell(
@@ -2175,9 +2384,11 @@ fn collect_cell(
         return CellCollection {
             results,
             evidence: Some(cell),
+            thread_provenance: None,
         };
     }
 
+    let thread_provenance = probe_cell_thread_provenance(context, spec);
     let scope = operation_scope(spec);
     let origin = Instant::now();
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
@@ -2390,6 +2601,7 @@ fn collect_cell(
     CellCollection {
         results,
         evidence: Some(cell),
+        thread_provenance,
     }
 }
 
@@ -2727,14 +2939,14 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             build_profile: build_profile.clone(),
         },
     };
-    let mut machine = MachineIdentity::capture(selected.iter().filter_map(|spec| spec.threads));
-    eprintln!(
-        "[quill-perf-execution-provenance] {}",
-        serde_json::to_string(&machine.execution).expect("serialize execution provenance")
+    let mut machine = MachineIdentity::capture(
+        selected.iter().filter_map(|spec| spec.threads),
+        bench_elf_sha256,
     );
 
     let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
     let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
+    let mut thread_observations = Vec::new();
     for spec in &selected {
         let collection = collect_cell(&context, spec, configured_runs, &evidence_context);
         by_gate
@@ -2744,9 +2956,19 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         if let Some(cell) = collection.evidence {
             evidence_by_gate.entry(spec.gate).or_default().push(cell);
         }
+        if let Some(observation) = collection.thread_provenance {
+            thread_observations.push(observation);
+        }
         register_criterion_cell(c, &context, spec);
     }
+    machine
+        .execution
+        .set_thread_observations(thread_observations);
     machine.finish();
+    eprintln!(
+        "[quill-perf-execution-provenance] {}",
+        serde_json::to_string(&machine.execution).expect("serialize execution provenance")
+    );
     flush_tantivy_lifecycle_receipts(&output_dir);
 
     let provenance = EvidenceProvenance {

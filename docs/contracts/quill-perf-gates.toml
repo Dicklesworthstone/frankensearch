@@ -18,11 +18,11 @@ rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (pe
 
 [evidence]
 # Decision-grade artifact layer above the paired estimator (bd-uh2f / bd-uh2f.1).
-schema = "quill-perf-evidence-v2"
+schema = "quill-perf-evidence-v3"
 artifact = "<gate>.evidence.json sealed with an embedded SHA-256 over its own canonical JSON; <gate>.evidence.md derived from the persisted JSON string; atomic tmp+fsync+rename+dirsync writes; load verifies seal, recomputes every estimator from retained raw samples, and rejects truncated or stale-schema files; legacy v3 loads only via the explicit read-only path"
 estimands = "metric-specific, enforced by gate: QG-1/2/3/4/5/8 flat paired log ratio; QG-6 hierarchical two-stage per-query resampling (queries first, then blocks; 4 pinned queries per class); QG-7 process RSS; QG-9 cold open requiring verified cache-state proof (currently NoDecision: in-process reopen does not drop the OS page cache); QG-10 dependency facts outside timing A/A (diagnostic)"
 policy = "reconciliation dead band ln(1.005); absolute-vs-paired tolerance ln(1.25); >=2 hierarchical groups with >=2 pairs each; 1 warmup round outside every decision set; raw-sample cap 20000 per cell"
-provenance = "executing ELF SHA-256; git revision + dirty-state hash; Cargo.lock SHA-256; rustc/target/profile/features; host identity; host-wide physical cores and logical threads; process-available threads; exact thread widths exercised; runtime-detected ISA; effective affinity/cpuset cap; machine fingerprint + governor + load averages; peak RSS with method (unsupported reported as absent, never zero); corpus/query-set hashes + generator seed/revision"
+provenance = "executing ELF SHA-256 bound separately to the statically linked Quill and Tantivy identities; git revision + dirty-state hash; Cargo.lock SHA-256; rustc/target/profile/features; producer OS + host identity; host-wide physical cores, logical threads, RAM, and NUMA nodes; process-available threads; configured thread width plus untimed per-arm observed CPU-active/new-worker high-water counts for every scaling row; runtime-detected ISA; per-row effective affinity/cpuset mask; machine fingerprint + governor + load averages; peak RSS with method (unsupported reported as absent, never zero); corpus/query-set hashes + generator seed/revision"
 ratchet_seam = "invalid runs persist as InvalidNull/NoDecision and are never ratchet-admissible; downstream validators consult ratchet_admissible() and record Allow/Block/Quarantine via apply_gate_decision (bd-quill-e8-perf-doctrine-x4e4.15.1)"
 
 [corpus.tiny]

@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::GauntletError;
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v4";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v5";
 /// Read-only schema identifier for historical gate artifacts that lack
 /// auditable host topology and effective-thread provenance.
 pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
@@ -1755,21 +1755,134 @@ pub fn median_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
+/// One statically linked engine identity carried by same-ELF benchmark
+/// evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfEngineBinaryIdentity {
+    /// Stable engine label.
+    pub engine: String,
+    /// Engine role in the comparison.
+    pub role: String,
+    /// Exact package version linked into the benchmark.
+    pub version: String,
+    /// SHA-256 of the ELF that contains this engine.
+    pub executable_sha256: String,
+    /// Linkage/identity scheme, explicit because both Rust engines share one
+    /// statically linked executable.
+    pub identity_scheme: String,
+}
+
+impl PerfEngineBinaryIdentity {
+    fn is_complete(&self) -> bool {
+        !self.engine.trim().is_empty()
+            && !self.role.trim().is_empty()
+            && !self.version.trim().is_empty()
+            && is_lower_hex_sha256(&self.executable_sha256)
+            && self.identity_scheme == "same-static-elf-v1"
+    }
+}
+
+/// Untimed operating-system observation of one engine arm's effective worker
+/// width.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfEngineThreadObservation {
+    /// Engine arm observed.
+    pub engine: String,
+    /// Runtime concurrency visible to the harness process.
+    pub runtime_available_parallelism: usize,
+    /// Process thread count immediately before the untimed probe.
+    pub process_threads_before_probe: usize,
+    /// Largest process thread count sampled while the operation ran.
+    pub peak_process_threads: usize,
+    /// Effective engine width: CPU-active newly observed workers, with one as
+    /// the serial calling-thread floor.
+    pub thread_count_actually_used: usize,
+    /// Newly observed engine workers whose per-thread CPU counter advanced.
+    pub cpu_active_new_worker_threads: usize,
+    /// Minimum per-thread scheduler runtime required to count a newly spawned
+    /// worker as active rather than merely initialized.
+    pub cpu_active_threshold_ns: u64,
+    /// Peak newly observed engine workers after subtracting pre-existing
+    /// process threads and the monitor thread.
+    pub peak_new_worker_threads: usize,
+    /// Exact observation procedure.
+    pub observation_method: String,
+}
+
+impl PerfEngineThreadObservation {
+    fn is_complete(&self) -> bool {
+        !self.engine.trim().is_empty()
+            && self.runtime_available_parallelism > 0
+            && self.process_threads_before_probe > 0
+            && self.peak_process_threads >= self.process_threads_before_probe
+            && self.thread_count_actually_used > 0
+            && self.thread_count_actually_used >= self.cpu_active_new_worker_threads.max(1)
+            && self.cpu_active_threshold_ns > 0
+            && !self.observation_method.trim().is_empty()
+    }
+}
+
+/// Per-fixture requested-versus-observed thread provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfThreadProvenance {
+    /// Exact matrix fixture observed.
+    pub fixture: String,
+    /// Configured engine thread width for this row.
+    pub thread_count_requested: usize,
+    /// Effective affinity/cpuset mask sampled for this row.
+    pub cpu_affinity_allowed_list: Option<String>,
+    /// Quill observation from an untimed execution of this exact fixture.
+    pub quill: PerfEngineThreadObservation,
+    /// Tantivy observation from an untimed execution of this exact fixture.
+    pub tantivy: PerfEngineThreadObservation,
+}
+
+impl PerfThreadProvenance {
+    /// Whether this row distinguishes configured width from observed activity
+    /// and retains an affinity receipt.
+    #[must_use]
+    pub fn is_complete(&self, producer_os: &str) -> bool {
+        !self.fixture.trim().is_empty()
+            && self.thread_count_requested > 0
+            && self.quill.engine == "quill"
+            && self.tantivy.engine == "tantivy"
+            && self.quill.is_complete()
+            && self.tantivy.is_complete()
+            && (producer_os != "linux"
+                || self
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+    }
+}
+
 /// Auditable host topology and effective execution width for one benchmark
 /// artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfExecutionProvenance {
+    /// Producer operating system. Validation uses this serialized fact rather
+    /// than the reader's current OS.
+    pub producer_os: String,
     /// Stable host name, not merely an architecture family label.
     pub host_identity: String,
     /// Host-wide physical core count.
     pub physical_cores: usize,
     /// Host-wide logical hardware-thread count.
     pub logical_threads: usize,
+    /// Host RAM from the producer's topology interface.
+    pub ram_bytes: u64,
+    /// Host NUMA-node count.
+    pub numa_nodes: usize,
     /// Concurrency available to the benchmark process after scheduler and
     /// cgroup constraints.
     pub process_available_threads: usize,
-    /// Exact thread widths exercised by the cells in this artifact.
-    pub threads_actually_used: Vec<usize>,
+    /// Exact configured thread widths selected by the matrix.
+    pub thread_counts_requested: Vec<usize>,
+    /// Untimed requested-versus-observed receipts, one per scaling fixture.
+    pub thread_observations: Vec<PerfThreadProvenance>,
+    /// Both statically linked engine identities. In a same-binary harness their
+    /// SHA-256 values must equal the benchmark ELF SHA-256.
+    pub engine_binaries: Vec<PerfEngineBinaryIdentity>,
     /// ISA features detected at runtime on the executing host.
     pub runtime_detected_isa: Vec<String>,
     /// Effective Linux `Cpus_allowed_list`, when the platform exposes it.
@@ -1780,12 +1893,19 @@ pub struct PerfExecutionProvenance {
 }
 
 impl PerfExecutionProvenance {
-    /// Capture host-wide topology beside the exact widths selected by this
-    /// invocation.
+    /// Capture host-wide topology beside the configured widths selected by this
+    /// invocation and both same-ELF engine identities.
     #[must_use]
-    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(
+        thread_counts_requested: impl IntoIterator<Item = usize>,
+        bench_elf_sha256: &str,
+    ) -> Self {
         let (physical_cores, logical_threads) = host_cpu_topology()
             .expect("performance evidence requires host physical/logical CPU topology");
+        let ram_bytes =
+            host_ram_bytes().expect("performance evidence requires host RAM provenance");
+        let numa_nodes =
+            host_numa_nodes().expect("performance evidence requires host NUMA provenance");
         let process_available_threads = std::thread::available_parallelism().map_or(1, usize::from);
         let cpu_affinity_allowed_list = linux_cpu_allowed_list();
         let allowed_threads = cpu_affinity_allowed_list
@@ -1809,19 +1929,36 @@ impl PerfExecutionProvenance {
         } else {
             None
         };
-        let mut threads_actually_used = threads_actually_used
+        let mut thread_counts_requested = thread_counts_requested
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        threads_actually_used.retain(|threads| *threads > 0);
+        thread_counts_requested.retain(|threads| *threads > 0);
         let provenance = Self {
+            producer_os: std::env::consts::OS.to_owned(),
             host_identity: host_identity()
                 .expect("performance evidence requires a non-empty host identity"),
             physical_cores,
             logical_threads,
+            ram_bytes,
+            numa_nodes,
             process_available_threads,
-            threads_actually_used,
+            thread_counts_requested,
+            thread_observations: Vec::new(),
+            engine_binaries: [
+                ("quill", "subject", env!("CARGO_PKG_VERSION")),
+                ("tantivy", "oracle", "0.26.1"),
+            ]
+            .into_iter()
+            .map(|(engine, role, version)| PerfEngineBinaryIdentity {
+                engine: engine.to_owned(),
+                role: role.to_owned(),
+                version: version.to_owned(),
+                executable_sha256: bench_elf_sha256.to_owned(),
+                identity_scheme: "same-static-elf-v1".to_owned(),
+            })
+            .collect(),
             runtime_detected_isa: runtime_detected_isa(),
             cpu_affinity_allowed_list,
             affinity_or_cpuset_cap,
@@ -1833,25 +1970,78 @@ impl PerfExecutionProvenance {
         provenance
     }
 
+    /// Attach untimed per-fixture worker observations before the artifact is
+    /// sealed.
+    pub fn set_thread_observations(
+        &mut self,
+        observations: impl IntoIterator<Item = PerfThreadProvenance>,
+    ) {
+        let mut observations = observations.into_iter().collect::<Vec<_>>();
+        observations.sort_unstable_by(|left, right| {
+            left.thread_count_requested
+                .cmp(&right.thread_count_requested)
+                .then_with(|| left.fixture.cmp(&right.fixture))
+        });
+        self.thread_observations = observations;
+    }
+
     /// Whether all fields required to interpret a scaling result are present.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        !self.host_identity.trim().is_empty()
+        !self.producer_os.trim().is_empty()
+            && !self.host_identity.trim().is_empty()
             && self.physical_cores > 0
             && self.logical_threads >= self.physical_cores
+            && self.ram_bytes > 0
+            && self.numa_nodes > 0
             && self.process_available_threads > 0
-            && !self.threads_actually_used.is_empty()
+            && !self.thread_counts_requested.is_empty()
             && self
-                .threads_actually_used
+                .thread_counts_requested
                 .iter()
-                .all(|threads| *threads > 0)
+                .all(|threads| *threads > 0 && *threads <= self.logical_threads)
+            && self
+                .thread_counts_requested
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self.engine_binaries.len() == 2
+            && self
+                .engine_binaries
+                .iter()
+                .all(PerfEngineBinaryIdentity::is_complete)
+            && self
+                .engine_binaries
+                .iter()
+                .map(|identity| identity.engine.as_str())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from(["quill", "tantivy"])
+            && self.thread_observations.iter().all(|observation| {
+                observation.is_complete(&self.producer_os)
+                    && self
+                        .thread_counts_requested
+                        .contains(&observation.thread_count_requested)
+            })
+            && self
+                .thread_observations
+                .iter()
+                .map(|observation| observation.fixture.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.thread_observations.len()
             && !self.runtime_detected_isa.is_empty()
-            && (std::env::consts::OS != "linux"
+            && (self.producer_os != "linux"
                 || self
                     .cpu_affinity_allowed_list
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty()))
     }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn host_identity() -> Option<String> {
@@ -1888,6 +2078,60 @@ fn host_cpu_topology() -> Option<(usize, usize)> {
         let physical = sysctl_usize("hw.physicalcpu")?;
         let logical = sysctl_usize("hw.logicalcpu")?;
         Some((physical, logical))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+fn host_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|contents| parse_linux_memtotal_bytes(&contents))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+fn parse_linux_memtotal_bytes(meminfo: &str) -> Option<u64> {
+    let kibibytes = meminfo.lines().find_map(|line| {
+        let mut fields = line.strip_prefix("MemTotal:")?.split_ascii_whitespace();
+        let amount = fields.next()?.parse::<u64>().ok()?;
+        (fields.next()? == "kB").then_some(amount)
+    })?;
+    kibibytes.checked_mul(1024)
+}
+
+fn host_numa_nodes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let count = fs::read_dir("/sys/devices/system/node")
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("node"))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .count();
+        (count > 0).then_some(count)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(1)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1932,6 +2176,17 @@ fn sysctl_usize(name: &str) -> Option<usize> {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 fn linux_cpu_allowed_list() -> Option<String> {
@@ -2044,7 +2299,7 @@ pub struct PerfGateArtifact {
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required in v4. `None` exists only so the explicit read-only v3 loader
+    /// Required in v5. `None` exists only so the explicit read-only v3 loader
     /// can deserialize historical artifacts without upgrading their claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
@@ -2076,15 +2331,19 @@ impl PerfGateArtifact {
         if let Some(execution) = &self.execution {
             let _ = writeln!(
                 table,
-                "host={} | physical_cores={} | logical_threads={} | \
-                 process_available_threads={} | threads_actually_used={:?} | \
+                "host={} | producer_os={} | physical_cores={} | logical_threads={} | \
+                 ram_bytes={} | numa_nodes={} | process_available_threads={} | \
+                 thread_counts_requested={:?} | \
                  runtime_detected_isa={:?} | cpu_affinity_allowed_list={} | \
                  affinity_or_cpuset_cap={}",
                 execution.host_identity,
+                execution.producer_os,
                 execution.physical_cores,
                 execution.logical_threads,
+                execution.ram_bytes,
+                execution.numa_nodes,
                 execution.process_available_threads,
-                execution.threads_actually_used,
+                execution.thread_counts_requested,
                 execution.runtime_detected_isa,
                 execution
                     .cpu_affinity_allowed_list
@@ -2095,6 +2354,35 @@ impl PerfGateArtifact {
                     .as_deref()
                     .unwrap_or("none"),
             );
+            for observation in &execution.thread_observations {
+                let _ = writeln!(
+                    table,
+                    "fixture={} | requested_threads={} | affinity={} | \
+                     quill_threads_actually_used={} | quill_peak_new_workers={} | \
+                     tantivy_threads_actually_used={} | tantivy_peak_new_workers={}",
+                    observation.fixture,
+                    observation.thread_count_requested,
+                    observation
+                        .cpu_affinity_allowed_list
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                    observation.quill.thread_count_actually_used,
+                    observation.quill.peak_new_worker_threads,
+                    observation.tantivy.thread_count_actually_used,
+                    observation.tantivy.peak_new_worker_threads,
+                );
+            }
+            for identity in &execution.engine_binaries {
+                let _ = writeln!(
+                    table,
+                    "engine={} | role={} | version={} | executable_sha256={} | scheme={}",
+                    identity.engine,
+                    identity.role,
+                    identity.version,
+                    identity.executable_sha256,
+                    identity.identity_scheme,
+                );
+            }
         }
         table.push_str(
             "fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission\n",
@@ -2921,11 +3209,57 @@ mod tests {
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(PerfExecutionProvenance {
+                producer_os: "linux".to_owned(),
                 host_identity: "test-host".to_owned(),
                 physical_cores: 64,
                 logical_threads: 128,
+                ram_bytes: 512 * 1024 * 1024 * 1024,
+                numa_nodes: 1,
                 process_available_threads: 128,
-                threads_actually_used: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
+                thread_counts_requested: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
+                thread_observations: vec![PerfThreadProvenance {
+                    fixture: "bulk/tiny/1/positions_on".to_owned(),
+                    thread_count_requested: 1,
+                    cpu_affinity_allowed_list: Some("0-127".to_owned()),
+                    quill: PerfEngineThreadObservation {
+                        engine: "quill".to_owned(),
+                        runtime_available_parallelism: 128,
+                        process_threads_before_probe: 2,
+                        peak_process_threads: 4,
+                        thread_count_actually_used: 1,
+                        cpu_active_new_worker_threads: 1,
+                        cpu_active_threshold_ns: 1_000_000,
+                        peak_new_worker_threads: 1,
+                        observation_method: "linux-proc-task-schedstat-v1".to_owned(),
+                    },
+                    tantivy: PerfEngineThreadObservation {
+                        engine: "tantivy".to_owned(),
+                        runtime_available_parallelism: 128,
+                        process_threads_before_probe: 2,
+                        peak_process_threads: 4,
+                        thread_count_actually_used: 1,
+                        cpu_active_new_worker_threads: 1,
+                        cpu_active_threshold_ns: 1_000_000,
+                        peak_new_worker_threads: 1,
+                        observation_method: "linux-proc-task-schedstat-v1".to_owned(),
+                    },
+                }],
+                engine_binaries: vec![
+                    PerfEngineBinaryIdentity {
+                        engine: "quill".to_owned(),
+                        role: "subject".to_owned(),
+                        version: "0.2.1".to_owned(),
+                        executable_sha256: "c".repeat(64),
+                        identity_scheme: "same-static-elf-v1".to_owned(),
+                    },
+                    PerfEngineBinaryIdentity {
+                        engine: "tantivy".to_owned(),
+                        role: "oracle".to_owned(),
+                        version: "0.26.1".to_owned(),
+                        executable_sha256: "c".repeat(64),
+                        identity_scheme: "same-static-elf-v1".to_owned(),
+                    },
+                ],
                 runtime_detected_isa: vec!["avx2".to_owned(), "fma".to_owned(), "bmi2".to_owned()],
                 cpu_affinity_allowed_list: Some("0-127".to_owned()),
                 affinity_or_cpuset_cap: None,
@@ -2967,7 +3301,9 @@ mod tests {
         assert!(table.contains("median_ci95"));
         assert!(table.contains("bulk/tiny/1/positions_on"));
         assert!(table.contains("sampled"));
-        assert!(table.contains("threads_actually_used=[1, 2, 4, 8, 16, 32, 64, 96, 128]"));
+        assert!(table.contains("thread_counts_requested=[1, 2, 4, 8, 16, 32, 64, 96, 128]"));
+        assert!(table.contains("quill_threads_actually_used=1"));
+        assert!(table.contains("engine=tantivy"));
     }
 
     #[test]
@@ -2993,6 +3329,10 @@ core id : 1
         assert_eq!(parse_cpu_list_count("0-127"), Some(128));
         assert_eq!(parse_cpu_list_count("0-15,32-47,63"), Some(33));
         assert_eq!(parse_cpu_list_count("4-2"), None);
+        assert_eq!(
+            parse_linux_memtotal_bytes("MemTotal:       523505732 kB\nMemFree: 1 kB\n"),
+            Some(536_069_869_568)
+        );
     }
 
     #[test]

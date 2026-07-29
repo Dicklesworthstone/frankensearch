@@ -523,6 +523,36 @@ fn validate_artifact<'a>(
             ),
         );
     }
+    if !explicit_bootstrap
+        && artifact.execution.as_ref().is_none_or(|execution| {
+            execution.engine_binaries.len() != 2
+                || execution
+                    .engine_binaries
+                    .iter()
+                    .any(|identity| identity.executable_sha256 != artifact.bench_elf_sha256)
+        })
+    {
+        state.fatal(
+            "perf.ratchet.engine_binary_identity_mismatch",
+            format!(
+                "{role} must bind both statically linked engine SHA-256 values to its self-reported benchmark ELF"
+            ),
+        );
+    }
+    if !explicit_bootstrap
+        && matches!(gate, PerfGate::Qg1 | PerfGate::Qg8)
+        && artifact
+            .execution
+            .as_ref()
+            .is_none_or(|execution| execution.thread_observations.is_empty())
+    {
+        state.fatal(
+            "perf.ratchet.missing_observed_thread_provenance",
+            format!(
+                "{role} scaling evidence must distinguish configured widths from untimed observed worker activity"
+            ),
+        );
+    }
 
     let mut cells = BTreeMap::new();
     for cell in &artifact.cells {
@@ -561,6 +591,31 @@ fn validate_artifact<'a>(
                     distribution.median_ci95_low,
                     distribution.median_ci95_high,
                     distribution.p50,
+                ),
+            );
+        }
+    }
+    if !explicit_bootstrap && matches!(gate, PerfGate::Qg1 | PerfGate::Qg8) {
+        let expected_fixtures = artifact
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.engine == "paired_ab" && !cell.metric.starts_with("tokenize_docs_per_second")
+            })
+            .map(|cell| cell.fixture.as_str())
+            .collect::<BTreeSet<_>>();
+        let observed_fixtures = artifact
+            .execution
+            .as_ref()
+            .into_iter()
+            .flat_map(|execution| execution.thread_observations.iter())
+            .map(|observation| observation.fixture.as_str())
+            .collect::<BTreeSet<_>>();
+        if expected_fixtures != observed_fixtures {
+            state.fatal(
+                "perf.ratchet.observed_thread_fixture_mismatch",
+                format!(
+                    "{role} scaling rows and requested-versus-observed thread receipts do not cover the same fixtures"
                 ),
             );
         }
@@ -689,6 +744,14 @@ fn validate_current_evidence(
                 ),
             );
         }
+    }
+    if legacy.execution.as_ref() != Some(&evidence.provenance.machine.execution) {
+        state.quarantine(
+            "perf.ratchet.current_evidence_execution_mismatch",
+            format!(
+                "{role} current evidence execution provenance differs from its threshold projection"
+            ),
+        );
     }
     if evidence.gate_decision.is_some() {
         state.quarantine(
@@ -2202,9 +2265,9 @@ mod tests {
     use crate::{
         BuildIdentity, CorpusIdentity, DistributionSummary, EvidenceCell, EvidenceCellSpec,
         EvidencePolicy, EvidenceProvenance, MachineIdentity, PairedEstimatorConfig,
-        PeakRssEvidence, PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfRawSample,
-        PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-        estimate_paired_experiment, seeded_balanced_pair_order,
+        PeakRssEvidence, PerfCellResult, PerfEngineBinaryIdentity, PerfMetricSemantics,
+        PerfOperationScope, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
+        PerfSampleProvenance, estimate_paired_experiment, seeded_balanced_pair_order,
     };
     use sha2::{Digest, Sha256};
 
@@ -2242,11 +2305,31 @@ mod tests {
 
     fn execution_provenance() -> PerfExecutionProvenance {
         PerfExecutionProvenance {
+            producer_os: "linux".to_owned(),
             host_identity: "test-machine".to_owned(),
             physical_cores: 4,
             logical_threads: 8,
+            ram_bytes: 32 * 1024 * 1024 * 1024,
+            numa_nodes: 1,
             process_available_threads: 8,
-            threads_actually_used: vec![1],
+            thread_counts_requested: vec![1],
+            thread_observations: Vec::new(),
+            engine_binaries: vec![
+                PerfEngineBinaryIdentity {
+                    engine: "quill".to_owned(),
+                    role: "subject".to_owned(),
+                    version: "0.2.1".to_owned(),
+                    executable_sha256: "c".repeat(64),
+                    identity_scheme: "same-static-elf-v1".to_owned(),
+                },
+                PerfEngineBinaryIdentity {
+                    engine: "tantivy".to_owned(),
+                    role: "oracle".to_owned(),
+                    version: "0.26.1".to_owned(),
+                    executable_sha256: "c".repeat(64),
+                    identity_scheme: "same-static-elf-v1".to_owned(),
+                },
+            ],
             runtime_detected_isa: vec!["avx2".to_owned()],
             cpu_affinity_allowed_list: Some("0-7".to_owned()),
             affinity_or_cpuset_cap: None,
@@ -2953,6 +3036,14 @@ mod tests {
             qg2_current_pair("new", "candidate", 161.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 161.0, 100.0);
         candidate.bench_elf_sha256 = "f".repeat(64);
+        for identity in &mut candidate
+            .execution
+            .as_mut()
+            .expect("current artifact execution provenance")
+            .engine_binaries
+        {
+            identity.executable_sha256 = "f".repeat(64);
+        }
         let result = evaluate_with_current(
             &baseline,
             &candidate,
@@ -3664,6 +3755,14 @@ mod tests {
         let mut rerun = candidate.clone();
         rerun.run_id = "rerun".to_owned();
         rerun.bench_elf_sha256 = "d".repeat(64);
+        for identity in &mut rerun
+            .execution
+            .as_mut()
+            .expect("rerun execution provenance")
+            .engine_binaries
+        {
+            identity.executable_sha256 = "d".repeat(64);
+        }
         let result = evaluate(
             &baseline,
             &candidate,
