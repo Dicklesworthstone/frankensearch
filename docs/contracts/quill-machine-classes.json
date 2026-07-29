@@ -287,7 +287,7 @@
         "allowed_requested_apple_execution_modes": [
           "p-plus-e"
         ],
-        "apple_execution_mode_semantics": "p-plus-e means the full 10P+4E scheduler pool. P-only is non-admissible; any ad-hoc P-only measurement is diagnostic-only outside the registered producer until requested and observed CPU sets prove scheduler assignment.",
+        "apple_execution_mode_semantics": "p-plus-e is the legacy protocol label for the scheduler-managed Apple hardware envelope and does not prove P/E residency. Future QG-1/QG-8 admission requires frozen 10- and 14-worker endpoints plus actual scheduler-state observations; worker-pool width and hardware topology alone support only diagnostic P/E attribution unless those observations prove residency. P-only remains non-admissible.",
         "allowed_start_end_cpu_assignment_observability": [
           "unavailable",
           "scheduler-observed",
@@ -415,7 +415,7 @@
     {
       "id": "MC-MUST-008",
       "level": "MUST",
-      "text": "M4 remains a registered hardware and optimization class, but every M4 gate is promotion-unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism. All current M4 measurements are diagnostic-only. Any future Apple promotion contract must also admit only a witnessed scheduler pool, reject thermal warnings, and freeze class-specific matrix endpoints."
+      "text": "M4 remains a registered hardware and optimization class, but every M4 gate is promotion-unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism. All current M4 measurements are diagnostic-only. Any future Apple promotion contract must also freeze scheduler-managed 10- and 14-worker endpoints, bind actual scheduler-state observations, reject thermal warnings, and treat inferred P/E residency as diagnostic unless those observations prove it."
     },
     {
       "id": "MC-MUST-009",

@@ -82,7 +82,7 @@ activated = false
 [gate.QG-8]
 name = "scaling curve (contention honesty)"
 fixture = "bulk indexing threads {1,2,4,8,16,(32 where available)}; both reference machines; oracle curve measured alongside"
-target = "16-thread >= 1.8x own 4-thread on x86 reference; any plateau ATTRIBUTED (allocator contention axis mandatory — e8.4 notes; a bandwidth ceiling is honest, a lock plateau is a bug). Apple Silicon QG-8 is unavailable until a class-specific matrix freezes meaningful 10P and 14P+E endpoints plus a real scheduler witness; no trimmed x86 matrix may activate an Apple claim"
+target = "16-thread >= 1.8x own 4-thread on x86 reference; any plateau ATTRIBUTED (allocator contention axis mandatory — e8.4 notes; a bandwidth ceiling is honest, a lock plateau is a bug). Apple Silicon QG-8 is unavailable until a class-specific matrix freezes scheduler-managed 10- and 14-worker endpoints plus an actual scheduler-state witness; worker-pool width alone never proves P/E residency, and any inferred P/E attribution remains diagnostic unless that witness proves it; no trimmed x86 matrix may activate an Apple claim"
 activated = false
 
 [gate.QG-9]

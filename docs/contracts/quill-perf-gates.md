@@ -288,11 +288,13 @@ CI and registered-host production are deliberately separate lanes:
 Every M4 gate remains promotion-unavailable until a supported `O_EXEC` or
 loaded-image mechanism attests the actual executing image. All current Apple
 measurements are diagnostic-only. A future M4 contract must also freeze
-class-specific 10P and 14P+E endpoints, witness scheduler assignment, and
-retain the durability requirements. QG-3/QG-4/QG-5 remain unavailable on every
-machine class until both benchmark arms emit a non-declarative witness of the
-required symmetric durability treatment (`F_FULLFSYNC` on macOS and the
-registered equivalent on Linux).
+class-specific scheduler-managed 10- and 14-worker endpoints, bind actual
+scheduler-state observations, and retain the durability requirements. Worker
+pool width alone never proves P/E residency; inferred P/E attribution is
+diagnostic unless the scheduler-state witness proves it. QG-3/QG-4/QG-5 remain
+unavailable on every machine class until both benchmark arms emit a
+non-declarative witness of the required symmetric durability treatment
+(`F_FULLFSYNC` on macOS and the registered equivalent on Linux).
 
 ## Topology honesty (QG-3/QG-4)
 
