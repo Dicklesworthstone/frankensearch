@@ -37,23 +37,25 @@
 //!   are capability-blocked in this core-only tranche because current generic
 //!   commands do not provide that binding.
 //!
-//! # Why schema v3
+//! # Why schema v4
 //!
 //! The original v1 foundation represented offline recovery as a blocked
 //! network download, represented request mode without retrieval topology,
 //! and had no producer provenance, response-admission contract, or scoped
 //! acquisition authorization. Correcting those facts changes required wire
 //! fields and reverses the meaning of the offline transition, so decoding the
-//! v2 contract as v1 would be unsafe. V3 additionally binds acquisition
+//! v2 contract as v1 would be unsafe. V3 additionally bound acquisition
 //! consent to the exact model ID, tier, and mathematical space plus the
 //! caller-supplied document count and estimated reindex duration, and refuses
 //! to emit acquisition argv until an executor can consume that entire scope.
-//! It also separates untrusted wire payloads from executable plans and pins
+//! It also separated untrusted wire payloads from executable plans and pinned
 //! recovery-local tier values to lowercase `fast` / `quality` spellings
 //! instead of inheriting the Rust enum's incidental serde representation.
-//! A v2 client cannot safely present, authorize, or validate those newly
-//! required facts, so v3 deliberately fails closed on older payloads instead
-//! of installing a compatibility shim. Every v1/v2 stable
+//! V4 makes every acquisition authorization short-lived, nonce-bound, and
+//! evaluated only against caller-supplied trusted time. A v3 client cannot
+//! safely present or validate those required anti-replay facts, so v4
+//! deliberately fails closed on older payloads instead of installing a
+//! compatibility shim. Every v1/v2/v3 stable
 //! state/action/postcondition/policy code remains unchanged.
 //!
 //! # Stable codes
@@ -140,11 +142,19 @@ impl<T> WireField<Option<T>> {
 }
 
 /// Schema version for serialized [`RecoveryPlan`] payloads.
-pub const RECOVERY_PLAN_SCHEMA_VERSION: &str = "frankensearch.recovery_plan.v3";
+pub const RECOVERY_PLAN_SCHEMA_VERSION: &str = "frankensearch.recovery_plan.v4";
 
 /// Schema version for a scoped [`ModelAcquisitionAuthorization`].
 pub const MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION: &str =
-    "frankensearch.model_acquisition_authorization.v2";
+    "frankensearch.model_acquisition_authorization.v3";
+
+/// Maximum lifetime of one exact model-acquisition authorization.
+///
+/// The planner is clock-free: callers freeze issuance, expiry, and trusted
+/// evaluation time. This bound limits replay exposure but does not claim
+/// single-use semantics; an executor promising single use must additionally
+/// consume nonces atomically.
+pub const MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS: u64 = 15 * 60;
 
 /// One million parts per million: complete semantic document coverage.
 pub const COMPLETE_COVERAGE_PPM: u32 = 1_000_000;
@@ -172,18 +182,18 @@ pub const ARG_MODEL_BUNDLE: &str = "ARG_MODEL_BUNDLE";
 ///
 /// Using a closed enum rather than an arbitrary string makes serde reject
 /// older or unknown schemas before a caller can accidentally execute their
-/// actions with v3 semantics.
+/// actions with v4 semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryPlanSchemaVersion {
-    #[serde(rename = "frankensearch.recovery_plan.v3")]
-    V3,
+    #[serde(rename = "frankensearch.recovery_plan.v4")]
+    V4,
 }
 
 /// Wire discriminator for [`ModelAcquisitionAuthorization`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelAcquisitionAuthorizationSchemaVersion {
-    #[serde(rename = "frankensearch.model_acquisition_authorization.v2")]
-    V2,
+    #[serde(rename = "frankensearch.model_acquisition_authorization.v3")]
+    V3,
 }
 
 /// Verified producer provenance for a semantic-ready lane.
@@ -732,6 +742,13 @@ pub struct ModelAcquisitionAuthorization {
     /// The unit is explicit so renderers never guess. The pure planner does
     /// not derive this value from ambient telemetry or filesystem state.
     pub estimated_reindex_duration_ms: u64,
+    /// Caller-frozen issuance time for this exact authorization.
+    pub issued_at_unix_seconds: u64,
+    /// Caller-frozen exclusive expiry time for this exact authorization.
+    pub expires_at_unix_seconds: u64,
+    /// Caller-generated 128-bit nonce encoded as exactly 32 lowercase
+    /// hexadecimal characters.
+    pub nonce: String,
 }
 
 #[derive(Deserialize)]
@@ -751,6 +768,9 @@ struct ModelAcquisitionAuthorizationWire {
     destination_fingerprint: String,
     document_count: u64,
     estimated_reindex_duration_ms: u64,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    nonce: String,
 }
 
 impl<'de> Deserialize<'de> for ModelAcquisitionAuthorization {
@@ -773,6 +793,9 @@ impl<'de> Deserialize<'de> for ModelAcquisitionAuthorization {
             destination_fingerprint: wire.destination_fingerprint,
             document_count: wire.document_count,
             estimated_reindex_duration_ms: wire.estimated_reindex_duration_ms,
+            issued_at_unix_seconds: wire.issued_at_unix_seconds,
+            expires_at_unix_seconds: wire.expires_at_unix_seconds,
+            nonce: wire.nonce,
         };
         authorization.validate().map_err(serde::de::Error::custom)?;
         Ok(authorization)
@@ -823,6 +846,43 @@ impl ModelAcquisitionAuthorization {
                 validate_network_source_host(host)?;
             }
         }
+        validate_acquisition_authorization_window(
+            self.issued_at_unix_seconds,
+            self.expires_at_unix_seconds,
+        )?;
+        validate_acquisition_authorization_nonce(&self.nonce)?;
+        Ok(())
+    }
+
+    /// Revalidate this authorization against caller-supplied trusted time.
+    ///
+    /// Executors must call this immediately before the first acquisition side
+    /// effect. A prior planning or wire-promotion check does not keep an
+    /// authorization valid after its exclusive expiry boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural validation errors as [`Self::validate`],
+    /// [`RecoveryContractError::AcquisitionAuthorizationNotYetValid`] before
+    /// issuance, or [`RecoveryContractError::AcquisitionAuthorizationExpired`]
+    /// at and after expiry.
+    pub fn validate_at(
+        &self,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<(), RecoveryContractError> {
+        self.validate()?;
+        if evaluation_time_unix_seconds < self.issued_at_unix_seconds {
+            return Err(RecoveryContractError::AcquisitionAuthorizationNotYetValid {
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                evaluation_time_unix_seconds,
+            });
+        }
+        if evaluation_time_unix_seconds >= self.expires_at_unix_seconds {
+            return Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: self.expires_at_unix_seconds,
+                evaluation_time_unix_seconds,
+            });
+        }
         Ok(())
     }
 }
@@ -850,6 +910,14 @@ pub struct ModelAcquisitionTarget {
     /// Caller-computed reindex estimate, explicitly expressed in
     /// milliseconds. The planner never derives or adjusts it.
     pub estimated_reindex_duration_ms: u64,
+    /// Caller-frozen issuance time copied into the exact authorization.
+    pub issued_at_unix_seconds: u64,
+    /// Caller-frozen exclusive expiry time copied into the exact
+    /// authorization.
+    pub expires_at_unix_seconds: u64,
+    /// Caller-generated 128-bit lowercase-hex nonce copied into the exact
+    /// authorization.
+    pub nonce: String,
 }
 
 impl ModelAcquisitionTarget {
@@ -858,7 +926,7 @@ impl ModelAcquisitionTarget {
         network: NetworkPolicy,
     ) -> Result<ModelAcquisitionAuthorization, RecoveryContractError> {
         let authorization = ModelAcquisitionAuthorization {
-            schema_version: ModelAcquisitionAuthorizationSchemaVersion::V2,
+            schema_version: ModelAcquisitionAuthorizationSchemaVersion::V3,
             model_id: self.model_id.clone(),
             model_tier: self.model_tier,
             embedding_space: self.embedding_space.clone(),
@@ -876,10 +944,49 @@ impl ModelAcquisitionTarget {
             destination_fingerprint: self.destination_fingerprint.clone(),
             document_count: self.document_count,
             estimated_reindex_duration_ms: self.estimated_reindex_duration_ms,
+            issued_at_unix_seconds: self.issued_at_unix_seconds,
+            expires_at_unix_seconds: self.expires_at_unix_seconds,
+            nonce: self.nonce.clone(),
         };
         authorization.validate()?;
         Ok(authorization)
     }
+}
+
+fn validate_acquisition_authorization_window(
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+) -> Result<(), RecoveryContractError> {
+    if expires_at_unix_seconds <= issued_at_unix_seconds {
+        return Err(
+            RecoveryContractError::InvalidAcquisitionAuthorizationWindow {
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+            },
+        );
+    }
+    let lifetime_seconds = expires_at_unix_seconds - issued_at_unix_seconds;
+    if lifetime_seconds > MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS {
+        return Err(
+            RecoveryContractError::AcquisitionAuthorizationLifetimeExceeded {
+                lifetime_seconds,
+                max_lifetime_seconds: MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_acquisition_authorization_nonce(nonce: &str) -> Result<(), RecoveryContractError> {
+    let valid_shape = nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let nonzero = nonce.bytes().any(|byte| byte != b'0');
+    if !valid_shape || !nonzero {
+        return Err(RecoveryContractError::InvalidAcquisitionAuthorizationNonce);
+    }
+    Ok(())
 }
 
 fn validate_scope_text(field: &'static str, value: &str) -> Result<(), RecoveryContractError> {
@@ -1003,6 +1110,49 @@ pub enum RecoveryContractError {
     },
     #[error("model acquisition byte budget must be non-zero")]
     ZeroAcquisitionByteBudget,
+    #[error(
+        "model acquisition authorization window is invalid: issued_at={issued_at_unix_seconds}, \
+         expires_at={expires_at_unix_seconds}"
+    )]
+    InvalidAcquisitionAuthorizationWindow {
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+    },
+    #[error(
+        "model acquisition authorization lifetime {lifetime_seconds}s exceeds the \
+         {max_lifetime_seconds}s maximum"
+    )]
+    AcquisitionAuthorizationLifetimeExceeded {
+        lifetime_seconds: u64,
+        max_lifetime_seconds: u64,
+    },
+    #[error(
+        "model acquisition authorization nonce must be a nonzero 128-bit value encoded as \
+         exactly 32 lowercase hexadecimal characters"
+    )]
+    InvalidAcquisitionAuthorizationNonce,
+    #[error(
+        "model acquisition authorization is not yet valid: issued_at={issued_at_unix_seconds}, \
+         evaluated_at={evaluation_time_unix_seconds}"
+    )]
+    AcquisitionAuthorizationNotYetValid {
+        issued_at_unix_seconds: u64,
+        evaluation_time_unix_seconds: u64,
+    },
+    #[error(
+        "model acquisition authorization expired: expires_at={expires_at_unix_seconds}, \
+         evaluated_at={evaluation_time_unix_seconds}"
+    )]
+    AcquisitionAuthorizationExpired {
+        expires_at_unix_seconds: u64,
+        evaluation_time_unix_seconds: u64,
+    },
+    #[error("model acquisition requires an exact supplied authorization before execution")]
+    MissingAcquisitionAuthorization,
+    #[error("model acquisition authorization was supplied when no exact acquisition requires it")]
+    SurplusAcquisitionAuthorization,
+    #[error("model acquisition authorization field `{field}` does not match the required scope")]
+    MismatchedAcquisitionAuthorization { field: &'static str },
     #[error("network model acquisition requires at least one credential-free source host")]
     MissingNetworkSourceHosts,
     #[error(
@@ -1488,6 +1638,7 @@ pub struct TrustedRecoveryContext<'a> {
     request: RecoveryRequest,
     policy: &'a RecoveryPolicy,
     acquisition_target: Option<&'a ModelAcquisitionTarget>,
+    evaluation_time_unix_seconds: u64,
 }
 
 impl<'a> TrustedRecoveryContext<'a> {
@@ -1498,12 +1649,14 @@ impl<'a> TrustedRecoveryContext<'a> {
         request: RecoveryRequest,
         policy: &'a RecoveryPolicy,
         acquisition_target: Option<&'a ModelAcquisitionTarget>,
+        evaluation_time_unix_seconds: u64,
     ) -> Self {
         Self {
             state,
             request,
             policy,
             acquisition_target,
+            evaluation_time_unix_seconds,
         }
     }
 }
@@ -1521,12 +1674,7 @@ impl UntrustedRecoveryPlan {
         self,
         trusted: TrustedRecoveryContext<'_>,
     ) -> Result<RecoveryPlan, RecoveryContractError> {
-        let canonical = plan(
-            trusted.state.clone(),
-            trusted.request,
-            trusted.policy.clone(),
-            trusted.acquisition_target,
-        )?;
+        let canonical = plan(trusted)?;
         validate_wire_against_canonical(&self.wire, &canonical)?;
         Ok(canonical)
     }
@@ -1597,6 +1745,33 @@ impl RecoveryPlan {
     #[must_use]
     pub const fn response_contract(&self) -> Option<&SemanticResponseContract> {
         self.response_contract.as_ref()
+    }
+
+    /// Revalidate acquisition authorization immediately before execution.
+    ///
+    /// Planning and untrusted-wire promotion validate against the trusted time
+    /// supplied for those operations. They do not mint a timeless capability:
+    /// an executor must call this method again at the acquisition boundary
+    /// using independently trusted current time. An interactive plan created
+    /// before consent cannot execute: the caller must re-plan with the freshly
+    /// granted exact authorization in [`RecoveryPolicy::acquisition_authorization`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an authorization structural, scope-binding, not-yet-valid, or
+    /// expiry error when the action is no longer executable at
+    /// `evaluation_time_unix_seconds`.
+    pub fn validate_for_execution_at(
+        &self,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<(), RecoveryContractError> {
+        validate_execution_authorization_binding(
+            self.action
+                .as_ref()
+                .and_then(RecoveryAction::required_authorization),
+            self.policy.acquisition_authorization.as_ref(),
+            evaluation_time_unix_seconds,
+        )
     }
 }
 
@@ -1729,6 +1904,85 @@ fn validate_response_wire(
     Ok(())
 }
 
+fn mismatched_authorization_field(
+    required: &ModelAcquisitionAuthorization,
+    supplied: &ModelAcquisitionAuthorization,
+) -> Option<&'static str> {
+    if required.model_id != supplied.model_id {
+        Some("model_id")
+    } else if required.model_tier != supplied.model_tier {
+        Some("model_tier")
+    } else if required.upstream_revision != supplied.upstream_revision {
+        Some("upstream_revision")
+    } else if required.embedding_space != supplied.embedding_space {
+        Some("embedding_space")
+    } else if required.manifest_fingerprint != supplied.manifest_fingerprint {
+        Some("manifest_fingerprint")
+    } else if required.license_spdx != supplied.license_spdx {
+        Some("license_spdx")
+    } else if required.source != supplied.source {
+        Some("source")
+    } else if required.byte_budget != supplied.byte_budget {
+        Some("byte_budget")
+    } else if required.destination_class != supplied.destination_class {
+        Some("destination_class")
+    } else if required.destination_fingerprint != supplied.destination_fingerprint {
+        Some("destination_fingerprint")
+    } else if required.document_count != supplied.document_count {
+        Some("document_count")
+    } else if required.estimated_reindex_duration_ms != supplied.estimated_reindex_duration_ms {
+        Some("estimated_reindex_duration_ms")
+    } else if required.issued_at_unix_seconds != supplied.issued_at_unix_seconds {
+        Some("issued_at_unix_seconds")
+    } else if required.expires_at_unix_seconds != supplied.expires_at_unix_seconds {
+        Some("expires_at_unix_seconds")
+    } else if required.nonce != supplied.nonce {
+        Some("nonce")
+    } else {
+        None
+    }
+}
+
+fn validate_authorization_binding(
+    required: Option<&ModelAcquisitionAuthorization>,
+    supplied: Option<&ModelAcquisitionAuthorization>,
+    evaluation_time_unix_seconds: u64,
+) -> Result<(), RecoveryContractError> {
+    match (required, supplied) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(RecoveryContractError::SurplusAcquisitionAuthorization),
+        (Some(required), None) => required.validate_at(evaluation_time_unix_seconds),
+        (Some(required), Some(supplied)) => {
+            required.validate_at(evaluation_time_unix_seconds)?;
+            supplied.validate_at(evaluation_time_unix_seconds)?;
+            if let Some(field) = mismatched_authorization_field(required, supplied) {
+                return Err(RecoveryContractError::MismatchedAcquisitionAuthorization { field });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_execution_authorization_binding(
+    required: Option<&ModelAcquisitionAuthorization>,
+    supplied: Option<&ModelAcquisitionAuthorization>,
+    evaluation_time_unix_seconds: u64,
+) -> Result<(), RecoveryContractError> {
+    match (required, supplied) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(RecoveryContractError::SurplusAcquisitionAuthorization),
+        (Some(_), None) => Err(RecoveryContractError::MissingAcquisitionAuthorization),
+        (Some(required), Some(supplied)) => {
+            required.validate_at(evaluation_time_unix_seconds)?;
+            supplied.validate_at(evaluation_time_unix_seconds)?;
+            if let Some(field) = mismatched_authorization_field(required, supplied) {
+                return Err(RecoveryContractError::MismatchedAcquisitionAuthorization { field });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Compute the truthful plan for a readiness state under a request and
 /// policy. Pure and deterministic: identical inputs yield identical plans.
 ///
@@ -1736,13 +1990,19 @@ fn validate_response_wire(
 ///
 /// Rejects ambiguous request topology, invalid partial coverage, hash
 /// requests without hash-control readiness, and malformed acquisition
-/// targets before returning executable recovery metadata.
-pub fn plan(
-    state: SemanticReadiness,
-    request: RecoveryRequest,
-    policy: RecoveryPolicy,
-    acquisition_target: Option<&ModelAcquisitionTarget>,
-) -> Result<RecoveryPlan, RecoveryContractError> {
+/// targets before returning executable recovery metadata. Trusted evaluation
+/// time is mandatory and never read from the serialized plan or ambient
+/// process state.
+pub fn plan(trusted: TrustedRecoveryContext<'_>) -> Result<RecoveryPlan, RecoveryContractError> {
+    let TrustedRecoveryContext {
+        state,
+        request,
+        policy,
+        acquisition_target,
+        evaluation_time_unix_seconds,
+    } = trusted;
+    let state = state.clone();
+    let policy = policy.clone();
     let request = request.validate()?;
     if let Some(authorization) = &policy.acquisition_authorization {
         authorization.validate()?;
@@ -1756,6 +2016,13 @@ pub fn plan(
         request.requested_topology,
         policy.network,
         acquisition_target,
+    )?;
+    validate_authorization_binding(
+        action
+            .as_ref()
+            .and_then(RecoveryAction::required_authorization),
+        policy.acquisition_authorization.as_ref(),
+        evaluation_time_unix_seconds,
     )?;
     let (action, retryability) = match action {
         None => (
@@ -1822,7 +2089,7 @@ pub fn plan(
     let provenance = state.provenance();
 
     Ok(RecoveryPlan {
-        schema_version: RecoveryPlanSchemaVersion::V3,
+        schema_version: RecoveryPlanSchemaVersion::V4,
         state,
         state_code,
         provenance,
@@ -2287,6 +2554,11 @@ mod tests {
         EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
     };
 
+    const TEST_NOW_UNIX_SECONDS: u64 = 2_000_000_000;
+    const TEST_AUTHORIZATION_ISSUED_AT_UNIX_SECONDS: u64 = TEST_NOW_UNIX_SECONDS - 60;
+    const TEST_AUTHORIZATION_EXPIRES_AT_UNIX_SECONDS: u64 = TEST_NOW_UNIX_SECONDS + 600;
+    const TEST_AUTHORIZATION_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
     fn semantic_space() -> EmbeddingSpaceIdentityV1 {
         EmbeddingSpaceIdentityV1 {
             schema_version: EMBEDDING_SPACE_IDENTITY_SCHEMA_V1,
@@ -2329,6 +2601,9 @@ mod tests {
             destination_fingerprint: "b".repeat(64),
             document_count: 12_345,
             estimated_reindex_duration_ms: 98_765,
+            issued_at_unix_seconds: TEST_AUTHORIZATION_ISSUED_AT_UNIX_SECONDS,
+            expires_at_unix_seconds: TEST_AUTHORIZATION_EXPIRES_AT_UNIX_SECONDS,
+            nonce: TEST_AUTHORIZATION_NONCE.to_owned(),
         }
     }
 
@@ -2448,6 +2723,26 @@ mod tests {
         }
     }
 
+    // These test builders deliberately own state and policy so call sites can
+    // pass temporary fixtures without introducing local bindings solely for
+    // borrow lifetimes.
+    #[allow(clippy::needless_pass_by_value)]
+    fn plan(
+        state: SemanticReadiness,
+        request: RecoveryRequest,
+        policy: RecoveryPolicy,
+        acquisition_target: Option<&ModelAcquisitionTarget>,
+    ) -> Result<RecoveryPlan, RecoveryContractError> {
+        super::plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            acquisition_target,
+            TEST_NOW_UNIX_SECONDS,
+        ))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
     fn planned(
         state: SemanticReadiness,
         request: RecoveryRequest,
@@ -2493,6 +2788,7 @@ mod tests {
                 request,
                 policy,
                 acquisition_target,
+                TEST_NOW_UNIX_SECONDS,
             ))
             .map_err(|error| error.to_string())
     }
@@ -2696,6 +2992,15 @@ mod tests {
             assert_eq!(authorization.destination_fingerprint, "b".repeat(64));
             assert_eq!(authorization.document_count, 12_345);
             assert_eq!(authorization.estimated_reindex_duration_ms, 98_765);
+            assert_eq!(
+                authorization.issued_at_unix_seconds,
+                TEST_AUTHORIZATION_ISSUED_AT_UNIX_SECONDS
+            );
+            assert_eq!(
+                authorization.expires_at_unix_seconds,
+                TEST_AUTHORIZATION_EXPIRES_AT_UNIX_SECONDS
+            );
+            assert_eq!(authorization.nonce, TEST_AUTHORIZATION_NONCE);
             assert!(matches!(
                 authorization.source,
                 ModelAcquisitionSource::Network { .. }
@@ -3338,27 +3643,27 @@ mod tests {
             let mut authorization = required.clone();
             authorization.model_id.push_str("-different");
             authorization.embedding_space.logical_model_id = authorization.model_id.clone();
-            mismatches.push(authorization);
+            mismatches.push(("model_id", authorization));
             let mut authorization = required.clone();
             authorization.model_tier = match required.model_tier {
                 ModelTier::Fast => ModelTier::Quality,
                 ModelTier::Quality => ModelTier::Fast,
             };
-            mismatches.push(authorization);
+            mismatches.push(("model_tier", authorization));
             let mut authorization = required.clone();
             authorization.embedding_space.dimension += 1;
-            mismatches.push(authorization);
+            mismatches.push(("embedding_space", authorization));
             let mut authorization = required.clone();
             authorization.manifest_fingerprint = "c".repeat(64);
-            mismatches.push(authorization);
+            mismatches.push(("manifest_fingerprint", authorization));
             let mut authorization = required.clone();
             authorization.upstream_revision.push_str("-different");
             authorization.embedding_space.immutable_revision =
                 authorization.upstream_revision.clone();
-            mismatches.push(authorization);
+            mismatches.push(("upstream_revision", authorization));
             let mut authorization = required.clone();
             authorization.license_spdx = "MIT".to_owned();
-            mismatches.push(authorization);
+            mismatches.push(("license_spdx", authorization));
             let mut authorization = required.clone();
             authorization.source = match network {
                 NetworkPolicy::Allowed => ModelAcquisitionSource::LocalBundle,
@@ -3366,25 +3671,34 @@ mod tests {
                     source_hosts: vec!["models.example.test".to_owned()],
                 },
             };
-            mismatches.push(authorization);
+            mismatches.push(("source", authorization));
             let mut authorization = required.clone();
             authorization.byte_budget += 1;
-            mismatches.push(authorization);
+            mismatches.push(("byte_budget", authorization));
             let mut authorization = required.clone();
             authorization.destination_class = ModelDestinationClass::ExplicitDirectory;
-            mismatches.push(authorization);
+            mismatches.push(("destination_class", authorization));
             let mut authorization = required.clone();
             authorization.destination_fingerprint = "d".repeat(64);
-            mismatches.push(authorization);
+            mismatches.push(("destination_fingerprint", authorization));
             let mut authorization = required.clone();
             authorization.document_count += 1;
-            mismatches.push(authorization);
+            mismatches.push(("document_count", authorization));
             let mut authorization = required.clone();
             authorization.estimated_reindex_duration_ms += 1;
-            mismatches.push(authorization);
+            mismatches.push(("estimated_reindex_duration_ms", authorization));
+            let mut authorization = required.clone();
+            authorization.issued_at_unix_seconds -= 1;
+            mismatches.push(("issued_at_unix_seconds", authorization));
+            let mut authorization = required.clone();
+            authorization.expires_at_unix_seconds += 1;
+            mismatches.push(("expires_at_unix_seconds", authorization));
+            let mut authorization = required.clone();
+            authorization.nonce = "fedcba9876543210fedcba9876543210".to_owned();
+            mismatches.push(("nonce", authorization));
 
-            for authorization in mismatches {
-                let plan = planned(
+            for (field, authorization) in mismatches {
+                let result = plan(
                     missing(ModelTier::Quality),
                     explicit(RetrievalTopology::QualityOnly),
                     RecoveryPolicy {
@@ -3392,17 +3706,251 @@ mod tests {
                         network,
                         acquisition_authorization: Some(authorization),
                     },
+                    Some(&target()),
                 );
-                assert_eq!(plan.retryability, Retryability::BlockedByCapability);
-                let prerequisites = &plan.action.expect("acquisition action").prerequisites;
-                assert!(prerequisites.contains(&"recovery.policy.grant_consent".to_owned()));
-                let capability = match network {
-                    NetworkPolicy::Allowed => "recovery.capability.execute_bound_model_acquisition",
-                    NetworkPolicy::Offline => "recovery.capability.import_model_bundle",
-                };
-                assert!(prerequisites.contains(&capability.to_owned()));
+                assert_eq!(
+                    result,
+                    Err(RecoveryContractError::MismatchedAcquisitionAuthorization { field }),
+                    "scope mismatch must fail closed for {field}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn acquisition_authorization_enforces_window_and_nonce_boundaries() {
+        let authorization = target()
+            .authorization_for(NetworkPolicy::Allowed)
+            .expect("valid authorization fixture");
+
+        for (issued_at_unix_seconds, expires_at_unix_seconds) in [(100, 100), (101, 100)] {
+            let mut invalid = authorization.clone();
+            invalid.issued_at_unix_seconds = issued_at_unix_seconds;
+            invalid.expires_at_unix_seconds = expires_at_unix_seconds;
+            assert_eq!(
+                invalid.validate(),
+                Err(
+                    RecoveryContractError::InvalidAcquisitionAuthorizationWindow {
+                        issued_at_unix_seconds,
+                        expires_at_unix_seconds,
+                    }
+                )
+            );
+        }
+
+        let mut maximum_lifetime = authorization.clone();
+        maximum_lifetime.issued_at_unix_seconds = 1_000;
+        maximum_lifetime.expires_at_unix_seconds =
+            1_000 + MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS;
+        maximum_lifetime
+            .validate()
+            .expect("the maximum authorization lifetime is inclusive");
+
+        let mut excessive_lifetime = maximum_lifetime.clone();
+        excessive_lifetime.expires_at_unix_seconds =
+            excessive_lifetime.expires_at_unix_seconds.saturating_add(1);
+        assert_eq!(
+            excessive_lifetime.validate(),
+            Err(
+                RecoveryContractError::AcquisitionAuthorizationLifetimeExceeded {
+                    lifetime_seconds: MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS + 1,
+                    max_lifetime_seconds: MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS,
+                }
+            )
+        );
+
+        for nonce in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "00000000000000000000000000000000",
+        ] {
+            let mut invalid = authorization.clone();
+            invalid.nonce = nonce.to_owned();
+            assert_eq!(
+                invalid.validate(),
+                Err(RecoveryContractError::InvalidAcquisitionAuthorizationNonce),
+                "invalid nonce unexpectedly admitted: {nonce}"
+            );
+        }
+
+        for nonce in [
+            "00000000000000000000000000000001",
+            "ffffffffffffffffffffffffffffffff",
+        ] {
+            let mut valid = authorization.clone();
+            valid.nonce = nonce.to_owned();
+            valid
+                .validate()
+                .unwrap_or_else(|error| panic!("valid nonce {nonce} rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn acquisition_authorization_uses_trusted_time_and_exclusive_expiry() {
+        let authorization = target()
+            .authorization_for(NetworkPolicy::Allowed)
+            .expect("valid authorization fixture");
+        let before_issuance = authorization.issued_at_unix_seconds.saturating_sub(1);
+
+        assert_eq!(
+            authorization.validate_at(before_issuance),
+            Err(RecoveryContractError::AcquisitionAuthorizationNotYetValid {
+                issued_at_unix_seconds: authorization.issued_at_unix_seconds,
+                evaluation_time_unix_seconds: before_issuance,
+            })
+        );
+        authorization
+            .validate_at(authorization.issued_at_unix_seconds)
+            .expect("authorization is valid at its inclusive issuance boundary");
+        authorization
+            .validate_at(authorization.expires_at_unix_seconds - 1)
+            .expect("authorization is valid immediately before expiry");
+        assert_eq!(
+            authorization.validate_at(authorization.expires_at_unix_seconds),
+            Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: authorization.expires_at_unix_seconds,
+                evaluation_time_unix_seconds: authorization.expires_at_unix_seconds,
+            })
+        );
+    }
+
+    #[test]
+    fn authorization_binding_rejects_surplus_and_stale_scopes() {
+        let required = target()
+            .authorization_for(NetworkPolicy::Allowed)
+            .expect("valid authorization fixture");
+        assert_eq!(
+            validate_authorization_binding(None, Some(&required), TEST_NOW_UNIX_SECONDS),
+            Err(RecoveryContractError::SurplusAcquisitionAuthorization)
+        );
+
+        assert_eq!(
+            validate_authorization_binding(Some(&required), None, required.expires_at_unix_seconds,),
+            Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: required.expires_at_unix_seconds,
+                evaluation_time_unix_seconds: required.expires_at_unix_seconds,
+            })
+        );
+
+        let mut stale_supplied = required.clone();
+        stale_supplied.expires_at_unix_seconds = TEST_NOW_UNIX_SECONDS;
+        assert_eq!(
+            validate_authorization_binding(
+                Some(&required),
+                Some(&stale_supplied),
+                TEST_NOW_UNIX_SECONDS,
+            ),
+            Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: TEST_NOW_UNIX_SECONDS,
+                evaluation_time_unix_seconds: TEST_NOW_UNIX_SECONDS,
+            })
+        );
+    }
+
+    #[test]
+    fn planner_rejects_surplus_authorization_when_no_action_requires_it() {
+        let surplus = target()
+            .authorization_for(NetworkPolicy::Allowed)
+            .expect("valid authorization fixture");
+        let result = plan(
+            SemanticReadiness::Ready {
+                provenance: VerifiedSemanticProvenance::Local,
+            },
+            explicit(RetrievalTopology::FastOnly),
+            RecoveryPolicy {
+                interaction: InteractionPolicy::NonInteractive,
+                network: NetworkPolicy::Allowed,
+                acquisition_authorization: Some(surplus),
+            },
+            None,
+        );
+        assert_eq!(
+            result,
+            Err(RecoveryContractError::SurplusAcquisitionAuthorization)
+        );
+    }
+
+    #[test]
+    fn promotion_and_execution_each_recheck_authorization_expiry() {
+        let state = missing(ModelTier::Quality);
+        let request = explicit(RetrievalTopology::QualityOnly);
+        let acquisition_target = target();
+        let presentation_policy = RecoveryPolicy {
+            interaction: InteractionPolicy::Interactive,
+            network: NetworkPolicy::Allowed,
+            acquisition_authorization: None,
+        };
+        let presentation_plan = super::plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &presentation_policy,
+            Some(&acquisition_target),
+            acquisition_target.expires_at_unix_seconds - 1,
+        ))
+        .expect("interactive presentation plan before authorization");
+        assert_eq!(
+            presentation_plan
+                .validate_for_execution_at(acquisition_target.expires_at_unix_seconds - 1),
+            Err(RecoveryContractError::MissingAcquisitionAuthorization),
+            "a required but ungranted authorization must never pass the execution gate"
+        );
+
+        let exact_authorization = acquisition_target
+            .authorization_for(NetworkPolicy::Allowed)
+            .expect("exact authorization");
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Allowed,
+            acquisition_authorization: Some(exact_authorization),
+        };
+        let canonical = super::plan(TrustedRecoveryContext::new(
+            &state,
+            request,
+            &policy,
+            Some(&acquisition_target),
+            TEST_NOW_UNIX_SECONDS,
+        ))
+        .expect("serialize a currently valid recovery plan");
+        let serialized = serde_json::to_value(canonical).expect("serialize recovery plan");
+        let promoted = serde_json::from_value::<UntrustedRecoveryPlan>(serialized.clone())
+            .expect("decode untrusted recovery plan")
+            .validate_against(TrustedRecoveryContext::new(
+                &state,
+                request,
+                &policy,
+                Some(&acquisition_target),
+                acquisition_target.expires_at_unix_seconds - 1,
+            ))
+            .expect("promotion succeeds immediately before expiry");
+        promoted
+            .validate_for_execution_at(acquisition_target.expires_at_unix_seconds - 1)
+            .expect("exact supplied authorization executes immediately before expiry");
+        assert_eq!(
+            promoted.validate_for_execution_at(acquisition_target.expires_at_unix_seconds),
+            Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: acquisition_target.expires_at_unix_seconds,
+                evaluation_time_unix_seconds: acquisition_target.expires_at_unix_seconds,
+            }),
+            "a previously promoted plan is not a timeless execution capability"
+        );
+
+        let untrusted: UntrustedRecoveryPlan =
+            serde_json::from_value(serialized).expect("decode second untrusted recovery plan");
+        assert_eq!(
+            untrusted.validate_against(TrustedRecoveryContext::new(
+                &state,
+                request,
+                &policy,
+                Some(&acquisition_target),
+                acquisition_target.expires_at_unix_seconds,
+            )),
+            Err(RecoveryContractError::AcquisitionAuthorizationExpired {
+                expires_at_unix_seconds: acquisition_target.expires_at_unix_seconds,
+                evaluation_time_unix_seconds: acquisition_target.expires_at_unix_seconds,
+            })
+        );
     }
 
     #[test]
@@ -3776,10 +4324,18 @@ mod tests {
             decode_and_validate(value, &state, request, &policy, Some(&acquisition_target)).is_err()
         };
 
-        let mut changed = plan_json.clone();
-        changed["schema_version"] =
-            serde_json::Value::String("frankensearch.recovery_plan.v2".to_owned());
-        assert!(rejects(changed));
+        for legacy_version in [
+            "frankensearch.recovery_plan.v1",
+            "frankensearch.recovery_plan.v2",
+            "frankensearch.recovery_plan.v3",
+        ] {
+            let mut changed = plan_json.clone();
+            changed["schema_version"] = serde_json::Value::String(legacy_version.to_owned());
+            assert!(
+                rejects(changed),
+                "legacy plan schema unexpectedly decoded: {legacy_version}"
+            );
+        }
 
         let mut changed = plan_json.clone();
         changed["unknown_contract_field"] = serde_json::Value::Bool(true);
@@ -3855,11 +4411,17 @@ mod tests {
         }
 
         let authorization = plan_json["action"]["required_authorization"].clone();
-        let mut changed = authorization.clone();
-        changed["schema_version"] = serde_json::Value::String(
-            "frankensearch.model_acquisition_authorization.v1".to_owned(),
-        );
-        assert!(serde_json::from_value::<ModelAcquisitionAuthorization>(changed).is_err());
+        for legacy_version in [
+            "frankensearch.model_acquisition_authorization.v1",
+            "frankensearch.model_acquisition_authorization.v2",
+        ] {
+            let mut changed = authorization.clone();
+            changed["schema_version"] = serde_json::Value::String(legacy_version.to_owned());
+            assert!(
+                serde_json::from_value::<ModelAcquisitionAuthorization>(changed).is_err(),
+                "legacy authorization schema unexpectedly decoded: {legacy_version}"
+            );
+        }
 
         let mut changed = authorization.clone();
         changed["model_id"] = serde_json::Value::String(" ".to_owned());
@@ -3869,7 +4431,7 @@ mod tests {
         changed["model_tier"] = serde_json::Value::String("Quality".to_owned());
         assert!(
             serde_json::from_value::<ModelAcquisitionAuthorization>(changed).is_err(),
-            "v3 recovery authorization must not inherit ModelTier's Rust casing"
+            "v4 recovery authorization must not inherit ModelTier's Rust casing"
         );
 
         for required_field in [
@@ -3878,6 +4440,9 @@ mod tests {
             "embedding_space",
             "document_count",
             "estimated_reindex_duration_ms",
+            "issued_at_unix_seconds",
+            "expires_at_unix_seconds",
+            "nonce",
         ] {
             let mut changed = authorization.clone();
             changed
@@ -3887,6 +4452,19 @@ mod tests {
             assert!(
                 serde_json::from_value::<ModelAcquisitionAuthorization>(changed).is_err(),
                 "missing required consent field unexpectedly decoded: {required_field}"
+            );
+        }
+
+        for (field, invalid_value) in [
+            ("issued_at_unix_seconds", serde_json::json!("now")),
+            ("expires_at_unix_seconds", serde_json::Value::Null),
+            ("nonce", serde_json::json!(123_u64)),
+        ] {
+            let mut changed = authorization.clone();
+            changed[field] = invalid_value;
+            assert!(
+                serde_json::from_value::<ModelAcquisitionAuthorization>(changed).is_err(),
+                "wrongly typed authorization field unexpectedly decoded: {field}"
             );
         }
 
@@ -4348,7 +4926,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_v3_requires_every_canonical_null_field_to_be_present() {
+    fn recovery_v4_requires_every_canonical_null_field_to_be_present() {
         let ready = planned(
             SemanticReadiness::Ready {
                 provenance: VerifiedSemanticProvenance::Local,
@@ -4631,7 +5209,7 @@ mod tests {
             },
         );
         let json = serde_json::to_value(&plan).expect("serialize plan");
-        assert_eq!(json["schema_version"], "frankensearch.recovery_plan.v3");
+        assert_eq!(json["schema_version"], "frankensearch.recovery_plan.v4");
         assert_eq!(json["state"]["state"], "model_missing");
         assert_eq!(json["state"]["detail"]["tier"], "quality");
         assert_eq!(json["state_code"], "recovery.state.model_missing");
@@ -4657,7 +5235,7 @@ mod tests {
         );
         assert_eq!(
             json["action"]["required_authorization"]["schema_version"],
-            "frankensearch.model_acquisition_authorization.v2"
+            "frankensearch.model_acquisition_authorization.v3"
         );
         assert_eq!(
             json["action"]["required_authorization"]["model_id"],
@@ -4690,6 +5268,18 @@ mod tests {
         assert_eq!(
             json["action"]["required_authorization"]["estimated_reindex_duration_ms"],
             98_765
+        );
+        assert_eq!(
+            json["action"]["required_authorization"]["issued_at_unix_seconds"],
+            TEST_AUTHORIZATION_ISSUED_AT_UNIX_SECONDS
+        );
+        assert_eq!(
+            json["action"]["required_authorization"]["expires_at_unix_seconds"],
+            TEST_AUTHORIZATION_EXPIRES_AT_UNIX_SECONDS
+        );
+        assert_eq!(
+            json["action"]["required_authorization"]["nonce"],
+            TEST_AUTHORIZATION_NONCE
         );
         assert_eq!(
             json["response_contract"]["requested_topology"]["topology"],

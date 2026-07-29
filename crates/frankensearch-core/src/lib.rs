@@ -142,6 +142,7 @@ pub use observability_lint::{
 pub use parsed_query::ParsedQuery;
 pub use recovery_plan::{
     ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, COMPLETE_COVERAGE_PPM, InteractionPolicy,
+    MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS,
     MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
     ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,
     ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
