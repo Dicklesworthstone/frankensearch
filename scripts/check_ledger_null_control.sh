@@ -337,13 +337,25 @@ coefficient of variation[_ -]*gate/ ||
         cv_verdict = 1
       }
     }
+    function reset_entry() {
+      # Reset EVERY per-entry flag. Both flush exits must use this: the
+      # early-return for non-new entries previously reset only header and
+      # evidence, so flags set by historical rows (cv_verdict, decision_lines,
+      # competitive_claim, ...) leaked into the FIRST new entry and produced
+      # false CV-VERDICT / SELF-SPEEDUP-CLAIM blocks on conformant rows.
+      header = ""; evidence = ""; decision_lines = ""
+      numeric_null = 0; same_invocation = 0
+      counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
+      side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
+      actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
+    }
     function flush(    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
       new_entry = (mode == "all" || mode == "selfcheck" || added[start_line])
       if (!new_entry) {
-        header = ""; evidence = ""; return
+        reset_entry(); return
       }
 
       checked++
@@ -424,11 +436,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
         }
       }
 
-      header = ""; evidence = ""; decision_lines = ""
-      numeric_null = 0; same_invocation = 0
-      counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
-      side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
-      actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
+      reset_entry()
     }
 
     FNR == NR {
