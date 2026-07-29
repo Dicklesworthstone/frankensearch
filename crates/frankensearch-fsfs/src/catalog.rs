@@ -250,7 +250,16 @@ pub fn bootstrap_catalog_schema(conn: &Connection) -> SearchResult<()> {
     conn.execute("BEGIN IMMEDIATE;").map_err(catalog_error)?;
     let result = bootstrap_catalog_schema_inner(conn);
     match result {
-        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(catalog_error),
+        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(|commit_err| {
+            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+                tracing::warn!(
+                    target: "frankensearch.fsfs.catalog",
+                    error = %rollback_err,
+                    "rollback failed after catalog schema bootstrap commit error"
+                );
+            }
+            catalog_error(commit_err)
+        }),
         Err(error) => {
             if let Err(rollback_err) = conn.execute("ROLLBACK;") {
                 tracing::warn!(

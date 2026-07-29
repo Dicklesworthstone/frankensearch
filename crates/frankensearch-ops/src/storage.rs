@@ -2386,11 +2386,26 @@ impl OpsStorage {
         let result = operation(self.connection());
         match result {
             Ok(value) => {
-                self.connection().execute("COMMIT;").map_err(ops_error)?;
+                self.connection().execute("COMMIT;").map_err(|commit_err| {
+                    if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+                        tracing::warn!(
+                            target: "frankensearch.ops.storage",
+                            error = %rollback_err,
+                            "rollback failed after operations storage commit error"
+                        );
+                    }
+                    ops_error(commit_err)
+                })?;
                 Ok(value)
             }
             Err(error) => {
-                let _ignored = self.connection().execute("ROLLBACK;");
+                if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+                    tracing::warn!(
+                        target: "frankensearch.ops.storage",
+                        error = %rollback_err,
+                        "rollback failed after operations storage transaction error"
+                    );
+                }
                 Err(error)
             }
         }

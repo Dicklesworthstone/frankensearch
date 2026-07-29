@@ -318,7 +318,16 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
     conn.execute("BEGIN IMMEDIATE;").map_err(storage_error)?;
     let result = bootstrap_inner(conn);
     match result {
-        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(storage_error),
+        Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(|commit_err| {
+            if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+                tracing::warn!(
+                    target: "frankensearch.storage",
+                    error = %rollback_err,
+                    "rollback failed after schema bootstrap commit error"
+                );
+            }
+            storage_error(commit_err)
+        }),
         Err(error) => {
             if let Err(rollback_err) = conn.execute("ROLLBACK;") {
                 tracing::warn!(
@@ -611,6 +620,10 @@ mod tests {
                             break;
                         }
                         Err(error) => {
+                            assert!(
+                                !conn.in_transaction(),
+                                "failed bootstrap must not leave an active transaction: {error}"
+                            );
                             let message = error.to_string().to_ascii_lowercase();
                             if message.contains("busy") || message.contains("locked") {
                                 last_err = Some(error);
