@@ -108,8 +108,20 @@ Expected signal:   modest; NoClaim is a valid outcome.
 Falsified if:      dhat shows no per-query collector allocs >=0.1%.
 Invocation:        dhat-instrumented QG-6 run, local.
 Machine classes:   all (claims per class).
-Results (inline):  PENDING.
-Retry predicate:   n/a
+Results (inline):  **FALSIFIED → NoClaim** (2026-07-28, MossyPine). Counting-allocator +
+                   symbolized dhat census at 500 and 100k docs, 1,600 measured queries:
+                   collector-owned frames = 0.011% of bytes / 0.27% of blocks; largest
+                   single collector frame 0.0027% bytes. Query-phase allocation is
+                   instead 98.28% grimoire::RestartMeta/BlockMeta vec growth — the
+                   per-term × per-segment × per-query TERMDICT metadata reparse (18 MB
+                   allocated per single-term query at 100k docs; 90 MB for mixed5).
+                   Allocation-axis confirmation of gwd4's >83% self-time attribution;
+                   consistent with the fsync-census finding that the deficit is pure
+                   compute/allocation.
+                   Artifacts: docs/evidence/e8h/w13-collector-alloc-census-20260728/
+                   (ANALYSIS.md, alloc-census.{smoke,hundredk}.json, symbolized dhat).
+Retry predicate:   re-census collectors only if a landed TERMDICT lever drops grimoire
+                   frames below ~10% of query-phase bytes AND QG-6 still misses.
 
 ### bd-e8h-w2-interner-arena-x9s38 — scribe interner hashing + arena
 Hypothesis:        Interner hashing + per-field re-hash + string alloc is a top-3 frame in the QG-1 thread=1 cell.
