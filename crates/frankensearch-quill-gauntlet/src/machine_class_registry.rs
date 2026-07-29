@@ -1733,25 +1733,66 @@ fn prevalidate_cpuset_types(value: &Value) -> Result<(), MachineClassError> {
 }
 
 fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, MachineClassError> {
-    fn check_ascii(value: &Value) -> bool {
+    fn check_canonical_subset(value: &Value) -> bool {
         match value {
             Value::String(value) => value.is_ascii(),
-            Value::Array(values) => values.iter().all(check_ascii),
+            Value::Number(value) => value.is_i64() || value.is_u64(),
+            Value::Array(values) => values.iter().all(check_canonical_subset),
             Value::Object(values) => {
-                values.keys().all(|key| key.is_ascii()) && values.values().all(check_ascii)
+                values.keys().all(|key| key.is_ascii())
+                    && values.values().all(check_canonical_subset)
             }
             _ => true,
         }
     }
-    if !check_ascii(value) {
+    if !check_canonical_subset(value) {
         return Err(MachineClassError::new(
             MachineClassReason::SourceIdentityInvalid,
-            "canonical machine identity JSON must contain only ASCII strings",
+            "canonical machine identity JSON must contain only ASCII strings and integer numbers",
         ));
     }
-    serde_json::to_vec(value).map_err(|error| {
+
+    fn write_value(value: &Value, output: &mut Vec<u8>) -> Result<(), serde_json::Error> {
+        match value {
+            Value::Null => output.extend_from_slice(b"null"),
+            Value::Bool(value) => {
+                output.extend_from_slice(if *value { b"true" } else { b"false" });
+            }
+            Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Value::String(value) => serde_json::to_writer(output, value)?,
+            Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(b',');
+                    }
+                    write_value(value, output)?;
+                }
+                output.push(b']');
+            }
+            Value::Object(values) => {
+                output.push(b'{');
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(b',');
+                    }
+                    serde_json::to_writer(&mut *output, key)?;
+                    output.push(b':');
+                    write_value(&values[key], output)?;
+                }
+                output.push(b'}');
+            }
+        }
+        Ok(())
+    }
+
+    let mut output = Vec::new();
+    write_value(value, &mut output).map_err(|error| {
         MachineClassError::new(MachineClassReason::SourceIdentityInvalid, error.to_string())
-    })
+    })?;
+    Ok(output)
 }
 
 fn hash_value(value: &Value) -> Result<String, MachineClassError> {
@@ -2725,6 +2766,33 @@ mod tests {
                 .unwrap()
                 .len(),
             6
+        );
+    }
+
+    #[test]
+    fn canonical_machine_identity_sorts_every_object_independent_of_insertion_order() {
+        let mut nested_forward = serde_json::Map::new();
+        nested_forward.insert("d".to_owned(), Value::from(4));
+        nested_forward.insert("c".to_owned(), Value::from(3));
+        let mut forward = serde_json::Map::new();
+        forward.insert("b".to_owned(), Value::from(2));
+        forward.insert("a".to_owned(), Value::Object(nested_forward));
+
+        let mut nested_reverse = serde_json::Map::new();
+        nested_reverse.insert("c".to_owned(), Value::from(3));
+        nested_reverse.insert("d".to_owned(), Value::from(4));
+        let mut reverse = serde_json::Map::new();
+        reverse.insert("a".to_owned(), Value::Object(nested_reverse));
+        reverse.insert("b".to_owned(), Value::from(2));
+
+        let expected = br#"{"a":{"c":3,"d":4},"b":2}"#;
+        assert_eq!(
+            canonical_json_bytes(&Value::Object(forward)).expect("forward encoding"),
+            expected
+        );
+        assert_eq!(
+            canonical_json_bytes(&Value::Object(reverse)).expect("reverse encoding"),
+            expected
         );
     }
 
