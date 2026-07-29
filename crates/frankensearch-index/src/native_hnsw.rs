@@ -54,9 +54,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::ValidatedFsviBytes;
 use frankensearch_core::{
     error::{SearchError, SearchResult},
-    generation::{ArtifactGenerationIdentityV1, FrozenEmbeddingIdentityBundleV1},
+    generation::ArtifactGenerationIdentityV1,
     sha256_checksum,
 };
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,7 @@ const NATIVE_HNSW_HEADER_CRC_OFFSET: usize = NATIVE_HNSW_HEADER_LEN - 4;
 const NATIVE_HNSW_NO_ENTRY: u64 = u64::MAX;
 const NATIVE_HNSW_RECEIPT_MAGIC: [u8; 8] = *b"FSHNRC\0\0";
 /// Current schema for native-HNSW-to-FSVI generation receipts.
-pub const NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1: u16 = 1;
+pub const NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2: u16 = 2;
 /// Canonical sidecar suffix appended to the complete `.fshnsw` basename.
 pub const NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX: &str = ".receipt";
 const NATIVE_HNSW_MAX_BASENAME_BYTES: usize = 255 - NATIVE_HNSW_GENERATION_RECEIPT_SUFFIX.len();
@@ -86,7 +87,7 @@ const SHA256_BYTES: usize = 32;
 /// [`SearchError`]: the wiring layer, which knows the sidecar path, maps a
 /// defect into `SearchError::IndexCorrupted`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GraphDefect {
+enum GraphDefect {
     /// The graph and its caller-owned vector store describe different row
     /// counts, so graph ids cannot be interpreted against that store.
     StoreCardinalityMismatch {
@@ -343,7 +344,7 @@ pub struct HnswParams {
 /// are not a cryptographic generation identity; the production wiring layer
 /// binds the complete artifact to its FSVI generation with a SHA-256 receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeHnswFileMetadata {
+struct NativeHnswFileMetadata {
     format_version: u32,
     byte_len: u64,
     point_count: u64,
@@ -354,31 +355,31 @@ pub struct NativeHnswFileMetadata {
 impl NativeHnswFileMetadata {
     /// Binary format version.
     #[must_use]
-    pub const fn format_version(self) -> u32 {
+    const fn format_version(self) -> u32 {
         self.format_version
     }
 
     /// Complete file length.
     #[must_use]
-    pub const fn byte_len(self) -> u64 {
+    const fn byte_len(self) -> u64 {
         self.byte_len
     }
 
     /// Number of graph points encoded in the artifact.
     #[must_use]
-    pub const fn point_count(self) -> u64 {
+    const fn point_count(self) -> u64 {
         self.point_count
     }
 
     /// CRC-32 of the canonical adjacency payload.
     #[must_use]
-    pub const fn payload_crc32(self) -> u32 {
+    const fn payload_crc32(self) -> u32 {
         self.payload_crc32
     }
 
     /// CRC-32 of the fixed header before its checksum field.
     #[must_use]
-    pub const fn header_crc32(self) -> u32 {
+    const fn header_crc32(self) -> u32 {
         self.header_crc32
     }
 }
@@ -434,8 +435,8 @@ impl NativeHnswParamsIdentityV1 {
 /// accepting a second representation of the same receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeHnswGenerationReceiptV1 {
-    /// [`NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1`].
+pub struct NativeHnswGenerationReceiptV2 {
+    /// [`NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2`].
     pub schema_version: u16,
     /// Exact immutable FSVI artifact generation.
     pub artifact_generation: ArtifactGenerationIdentityV1,
@@ -451,6 +452,14 @@ pub struct NativeHnswGenerationReceiptV1 {
     pub embedding_input_fingerprint: String,
     /// SHA-256 of the physical FSVI v2 storage identity.
     pub vector_storage_fingerprint: String,
+    /// SHA-256 of the exact persisted FSVI vector slab and shape.
+    pub vector_content_digest: String,
+    /// SHA-256 of the ordered searchable FSVI document identifiers.
+    pub ordered_live_docset_digest: String,
+    /// SHA-256 of every byte in the admitted immutable FSVI image.
+    pub fsvi_whole_image_sha256: String,
+    /// Exact number of physical FSVI rows, including tombstones.
+    pub fsvi_physical_row_count: u64,
     /// Canonical UTF-8 basename of the adjacent FSHNSW artifact.
     pub graph_basename: String,
     /// Complete FSHNSW file length.
@@ -479,13 +488,14 @@ pub struct NativeHnswGenerationReceiptV1 {
     pub receipt_sha256: String,
 }
 
-/// Expected FSVI v2 generation and frozen embedding identity for a native
-/// HNSW sidecar.
+/// Internal exact-FSVI trust material for an owner-bound native HNSW sidecar.
 ///
-/// A binding is caller-held trust material. Persisted receipt fields are never
-/// allowed to select or weaken the expected generation or embedding space.
+/// This type is deliberately private. Public callers can create, persist,
+/// reopen, and search a receipted graph only through [`ValidatedNativeHnsw`],
+/// whose lifetime and private fields keep the graph paired with the admitted
+/// owner that supplied this trust material.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeHnswGenerationBindingV1 {
+struct NativeHnswGenerationBindingV2 {
     artifact_generation: ArtifactGenerationIdentityV1,
     artifact_generation_fingerprint: String,
     embedding_identity_fingerprint: String,
@@ -493,52 +503,33 @@ pub struct NativeHnswGenerationBindingV1 {
     embedding_producer_fingerprint: String,
     embedding_input_fingerprint: String,
     vector_storage_fingerprint: String,
+    vector_content_digest: String,
+    ordered_live_docset_digest: String,
+    fsvi_whole_image_sha256: String,
+    fsvi_physical_row_count: u64,
 }
 
-impl NativeHnswGenerationBindingV1 {
-    /// Construct an exact FSVI v2 binding from validated identity contracts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError::InvalidConfig`] when either identity is invalid
-    /// or the frozen storage contract does not name `fsvi-v2`.
-    pub fn new(
-        artifact_generation: ArtifactGenerationIdentityV1,
-        embedding_identity: &FrozenEmbeddingIdentityBundleV1,
-    ) -> SearchResult<Self> {
-        artifact_generation.validate()?;
-        embedding_identity.validate()?;
-        if embedding_identity.identity.storage.format != "fsvi-v2" {
-            return Err(native_hnsw_receipt_config_error(
-                "embedding_identity.storage.format",
-                &embedding_identity.identity.storage.format,
-                "must be exactly fsvi-v2",
-            ));
-        }
+impl NativeHnswGenerationBindingV2 {
+    fn from_validated_fsvi(owner: &ValidatedFsviBytes) -> SearchResult<Self> {
+        let identity = owner.identity_v2();
+        let fsvi_physical_row_count =
+            usize_to_u64(owner.record_count(), "binding.fsvi_physical_row_count")?;
 
         let binding = Self {
-            artifact_generation,
-            artifact_generation_fingerprint: artifact_generation.fingerprint(),
-            embedding_identity_fingerprint: embedding_identity.fingerprint.clone(),
-            embedding_space_fingerprint: embedding_identity.identity.space.fingerprint(),
-            embedding_producer_fingerprint: embedding_identity.identity.producer.fingerprint(),
-            embedding_input_fingerprint: embedding_identity.identity.input.fingerprint(),
-            vector_storage_fingerprint: embedding_identity.identity.storage.fingerprint(),
+            artifact_generation: identity.generation,
+            artifact_generation_fingerprint: encode_lower_hex(identity.generation_fingerprint),
+            embedding_identity_fingerprint: encode_lower_hex(identity.identity_bundle_fingerprint),
+            embedding_space_fingerprint: encode_lower_hex(identity.space_fingerprint),
+            embedding_producer_fingerprint: encode_lower_hex(identity.producer_fingerprint),
+            embedding_input_fingerprint: encode_lower_hex(identity.input_fingerprint),
+            vector_storage_fingerprint: encode_lower_hex(identity.storage_fingerprint),
+            vector_content_digest: encode_lower_hex(identity.vector_content_digest),
+            ordered_live_docset_digest: encode_lower_hex(identity.ordered_live_docset_digest),
+            fsvi_whole_image_sha256: encode_lower_hex(owner.witness().whole_image_sha256),
+            fsvi_physical_row_count,
         };
         binding.validate_fingerprints()?;
         Ok(binding)
-    }
-
-    /// Exact immutable artifact generation expected by this binding.
-    #[must_use]
-    pub const fn artifact_generation(&self) -> ArtifactGenerationIdentityV1 {
-        self.artifact_generation
-    }
-
-    /// Complete frozen embedding-identity fingerprint expected by this binding.
-    #[must_use]
-    pub fn embedding_identity_fingerprint(&self) -> &str {
-        &self.embedding_identity_fingerprint
     }
 
     /// Save `graph` atomically, then publish its canonical adjacent receipt.
@@ -552,11 +543,19 @@ impl NativeHnswGenerationBindingV1 {
     /// Returns the same graph errors as [`NativeHnsw::save`], plus
     /// [`SearchError::InvalidConfig`] for a noncanonical graph path and
     /// [`SearchError::Io`] for receipt persistence failures.
-    pub fn save(
+    fn save_bound_graph(
         &self,
         graph: &NativeHnsw,
         graph_path: &Path,
-    ) -> SearchResult<NativeHnswGenerationReceiptV1> {
+    ) -> SearchResult<NativeHnswGenerationReceiptV2> {
+        let graph_point_count = usize_to_u64(graph.len(), "graph.point_count")?;
+        if graph_point_count != self.fsvi_physical_row_count {
+            return Err(native_hnsw_receipt_config_error(
+                "graph.point_count",
+                &graph_point_count.to_string(),
+                "must equal the admitted FSVI physical row count",
+            ));
+        }
         let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
         reject_symlink_ancestors(graph_path)?;
         reject_non_regular_destination(graph_path)?;
@@ -570,8 +569,8 @@ impl NativeHnswGenerationBindingV1 {
                 "native HNSW file length changed after atomic publication",
             ));
         }
-        let mut receipt = NativeHnswGenerationReceiptV1 {
-            schema_version: NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1,
+        let mut receipt = NativeHnswGenerationReceiptV2 {
+            schema_version: NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2,
             artifact_generation: self.artifact_generation,
             artifact_generation_fingerprint: self.artifact_generation_fingerprint.clone(),
             embedding_identity_fingerprint: self.embedding_identity_fingerprint.clone(),
@@ -579,6 +578,10 @@ impl NativeHnswGenerationBindingV1 {
             embedding_producer_fingerprint: self.embedding_producer_fingerprint.clone(),
             embedding_input_fingerprint: self.embedding_input_fingerprint.clone(),
             vector_storage_fingerprint: self.vector_storage_fingerprint.clone(),
+            vector_content_digest: self.vector_content_digest.clone(),
+            ordered_live_docset_digest: self.ordered_live_docset_digest.clone(),
+            fsvi_whole_image_sha256: self.fsvi_whole_image_sha256.clone(),
+            fsvi_physical_row_count: self.fsvi_physical_row_count,
             graph_basename: canonical_graph_basename(graph_path)?,
             graph_byte_len: metadata.byte_len(),
             graph_sha256: sha256_hex(&graph_bytes),
@@ -608,31 +611,39 @@ impl NativeHnswGenerationBindingV1 {
     /// [`SearchError::IndexCorrupted`] for malformed, stale, replaced, or
     /// mismatched receipt/graph material, and [`SearchError::Io`] for other
     /// filesystem failures.
-    pub fn load<D: VectorDistance>(
+    fn load_bound_graph(
         &self,
         graph_path: &Path,
-        store: &D,
-    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV1)> {
-        self.load_with_after_first_observation(graph_path, store, || Ok(()))
+        owner: &ValidatedFsviBytes,
+    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV2)> {
+        self.load_bound_graph_with_after_first_observation(graph_path, owner, || Ok(()))
     }
 
-    fn load_with_after_first_observation<D: VectorDistance>(
+    fn load_bound_graph_with_after_first_observation(
         &self,
         graph_path: &Path,
-        store: &D,
+        owner: &ValidatedFsviBytes,
         after_first_observation: impl FnOnce() -> SearchResult<()>,
-    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV1)> {
+    ) -> SearchResult<(NativeHnsw, NativeHnswGenerationReceiptV2)> {
+        let observed_binding = Self::from_validated_fsvi(owner)?;
+        if observed_binding != *self {
+            return Err(native_hnsw_receipt_config_error(
+                "owner",
+                "redacted-witness-mismatch",
+                "must be the exact admitted FSVI owner that created this binding",
+            ));
+        }
         let receipt_path = native_hnsw_generation_receipt_path(graph_path)?;
         reject_symlink_ancestors(graph_path)?;
         let receipt_bytes =
             read_regular_file_bytes(&receipt_path, "native HNSW generation receipt")?;
-        let receipt = NativeHnswGenerationReceiptV1::from_bytes(&receipt_bytes, &receipt_path)?;
+        let receipt = NativeHnswGenerationReceiptV2::from_bytes(&receipt_bytes, &receipt_path)?;
         self.validate_receipt_identity(&receipt, graph_path, &receipt_path)?;
 
         let graph_bytes_before = read_regular_file_bytes(graph_path, "native HNSW artifact")?;
         Self::validate_graph_bytes(&receipt, graph_path, &graph_bytes_before)?;
         after_first_observation()?;
-        let (graph, metadata) = NativeHnsw::load_with_metadata(graph_path, store)?;
+        let (graph, metadata) = NativeHnsw::load_with_metadata(graph_path, owner)?;
         Self::validate_graph_identity(&receipt, graph_path, &graph, metadata)?;
 
         // A second exact byte observation closes the replacement window
@@ -674,15 +685,29 @@ impl NativeHnswGenerationBindingV1 {
                 "vector_storage_fingerprint",
                 &self.vector_storage_fingerprint,
             ),
+            ("vector_content_digest", &self.vector_content_digest),
+            (
+                "ordered_live_docset_digest",
+                &self.ordered_live_docset_digest,
+            ),
+            ("fsvi_whole_image_sha256", &self.fsvi_whole_image_sha256),
         ] {
             validate_sha256_hex(field, fingerprint)?;
+        }
+        // ubs:ignore — generation fingerprints are public artifact identities.
+        if self.artifact_generation_fingerprint != self.artifact_generation.fingerprint() {
+            return Err(native_hnsw_receipt_config_error(
+                "artifact_generation_fingerprint",
+                "redacted-digest-mismatch",
+                "must match the admitted FSVI generation",
+            ));
         }
         Ok(())
     }
 
     fn validate_receipt_identity(
         &self,
-        receipt: &NativeHnswGenerationReceiptV1,
+        receipt: &NativeHnswGenerationReceiptV2,
         graph_path: &Path,
         receipt_path: &Path,
     ) -> SearchResult<()> {
@@ -726,11 +751,29 @@ impl NativeHnswGenerationBindingV1 {
                 &receipt.vector_storage_fingerprint,
                 &self.vector_storage_fingerprint,
             ),
+            (
+                "vector content digest",
+                &receipt.vector_content_digest,
+                &self.vector_content_digest,
+            ),
+            (
+                "ordered live-docset digest",
+                &receipt.ordered_live_docset_digest,
+                &self.ordered_live_docset_digest,
+            ),
+            (
+                "FSVI whole-image SHA-256",
+                &receipt.fsvi_whole_image_sha256,
+                &self.fsvi_whole_image_sha256,
+            ),
         ] {
             // ubs:ignore — frozen identity fingerprints are public compatibility metadata.
             if actual != expected {
                 return Err(mismatch(field));
             }
+        }
+        if receipt.fsvi_physical_row_count != self.fsvi_physical_row_count {
+            return Err(mismatch("FSVI physical row count"));
         }
         if receipt.graph_basename != canonical_graph_basename(graph_path)? {
             return Err(mismatch("graph basename"));
@@ -739,7 +782,7 @@ impl NativeHnswGenerationBindingV1 {
     }
 
     fn validate_graph_bytes(
-        receipt: &NativeHnswGenerationReceiptV1,
+        receipt: &NativeHnswGenerationReceiptV2,
         graph_path: &Path,
         graph_bytes: &[u8],
     ) -> SearchResult<()> {
@@ -763,7 +806,7 @@ impl NativeHnswGenerationBindingV1 {
     }
 
     fn validate_graph_identity(
-        receipt: &NativeHnswGenerationReceiptV1,
+        receipt: &NativeHnswGenerationReceiptV2,
         graph_path: &Path,
         graph: &NativeHnsw,
         metadata: NativeHnswFileMetadata,
@@ -809,18 +852,258 @@ impl NativeHnswGenerationBindingV1 {
     }
 }
 
-impl NativeHnswGenerationReceiptV1 {
+/// A receipted native HNSW graph that cannot outlive or detach from the exact
+/// admitted FSVI byte owner used for construction or load.
+///
+/// The graph, receipt binding, and owner reference are private. Public callers
+/// cannot extract a receipted graph and reattach it to another same-cardinality
+/// vector store:
+///
+/// ```compile_fail
+/// use frankensearch_index::native_hnsw::NativeHnsw;
+///
+/// fn bypass_receipts() {
+///     let _ = std::mem::size_of::<NativeHnsw>();
+/// }
+/// ```
+///
+/// Even type inference cannot extract the private graph field:
+///
+/// ```compile_fail
+/// use frankensearch_index::native_hnsw::ValidatedNativeHnsw;
+///
+/// fn detach(bound: ValidatedNativeHnsw<'_>) {
+///     let _ = bound.graph;
+/// }
+/// ```
+///
+/// Search likewise accepts no caller-provided store:
+///
+/// ```compile_fail
+/// use frankensearch_index::ValidatedFsviBytes;
+/// use frankensearch_index::native_hnsw::ValidatedNativeHnsw;
+///
+/// fn substitute_store(
+///     bound: &ValidatedNativeHnsw<'_>,
+///     other: &ValidatedFsviBytes,
+///     query: &[f32],
+/// ) {
+///     let _ = bound.search(query, 10, None, other);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ValidatedNativeHnsw<'owner> {
+    owner: &'owner ValidatedFsviBytes,
+    binding: NativeHnswGenerationBindingV2,
+    graph: NativeHnsw,
+}
+
+/// One native-HNSW result resolved through the same admitted FSVI owner used
+/// for graph construction or load.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedNativeHnswHit<'owner> {
+    physical_row: u32,
+    distance: f32,
+    doc_id: &'owner str,
+    flags: crate::FsviRecordFlags,
+}
+
+impl ValidatedNativeHnswHit<'_> {
+    /// Exact physical FSVI row indexed by the graph.
+    #[must_use]
+    pub const fn physical_row(&self) -> u32 {
+        self.physical_row
+    }
+
+    /// Native HNSW distance; smaller values rank nearer.
+    #[must_use]
+    pub const fn distance(&self) -> f32 {
+        self.distance
+    }
+
+    /// Document identifier resolved from the bound admitted owner.
+    #[must_use]
+    pub const fn doc_id(&self) -> &str {
+        self.doc_id
+    }
+
+    /// Validated LIVE/TOMBSTONE state from the same physical owner row.
+    #[must_use]
+    pub const fn flags(&self) -> crate::FsviRecordFlags {
+        self.flags
+    }
+}
+
+impl<'owner> ValidatedNativeHnsw<'owner> {
+    fn binding_for_live_owner(
+        owner: &ValidatedFsviBytes,
+    ) -> SearchResult<NativeHnswGenerationBindingV2> {
+        let tombstone_count = owner.tombstone_count();
+        if tombstone_count != 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "native_hnsw.owner.tombstone_count".to_owned(),
+                value: tombstone_count.to_string(),
+                reason: "owner-bound native HNSW currently admits only all-LIVE FSVI images; \
+                         compact tombstones before ANN admission until tombstone-aware graph \
+                         search can guarantee the requested number of live results"
+                    .to_owned(),
+            });
+        }
+        NativeHnswGenerationBindingV2::from_validated_fsvi(owner)
+    }
+
+    /// Build a graph from every physical row of one admitted FSVI owner.
+    ///
+    /// Tombstoned owners fail closed. Indexing tombstones and filtering only
+    /// the returned ANN window can underfill results and lose live recall, so
+    /// admission requires a compacted all-LIVE image until native graph search
+    /// can guarantee `k` live results directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns identity/cardinality errors from receipt binding construction
+    /// or distance-computation errors from the admitted owner.
+    pub fn build(
+        owner: &'owner ValidatedFsviBytes,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<Self> {
+        let binding = Self::binding_for_live_owner(owner)?;
+        let graph = NativeHnsw::build(params, seed, owner)?;
+        Ok(Self {
+            owner,
+            binding,
+            graph,
+        })
+    }
+
+    /// Load a graph only after its receipt matches the exact admitted owner.
+    ///
+    /// Receipt identity is checked before graph bytes are opened, and graph
+    /// parsing and structural verification use the same borrowed owner.
+    /// Tombstoned owners are rejected before any sidecar is observed; callers
+    /// must compact to an all-LIVE FSVI image before ANN admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns receipt, graph, filesystem, or owner-distance errors without
+    /// falling back to a caller-supplied vector store.
+    pub fn load(
+        owner: &'owner ValidatedFsviBytes,
+        graph_path: &Path,
+    ) -> SearchResult<(Self, NativeHnswGenerationReceiptV2)> {
+        let binding = Self::binding_for_live_owner(owner)?;
+        let (graph, receipt) = binding.load_bound_graph(graph_path, owner)?;
+        Ok((
+            Self {
+                owner,
+                binding,
+                graph,
+            },
+            receipt,
+        ))
+    }
+
+    #[cfg(test)]
+    fn load_with_after_first_observation(
+        owner: &'owner ValidatedFsviBytes,
+        graph_path: &Path,
+        after_first_observation: impl FnOnce() -> SearchResult<()>,
+    ) -> SearchResult<(Self, NativeHnswGenerationReceiptV2)> {
+        let binding = Self::binding_for_live_owner(owner)?;
+        let (graph, receipt) = binding.load_bound_graph_with_after_first_observation(
+            graph_path,
+            owner,
+            after_first_observation,
+        )?;
+        Ok((
+            Self {
+                owner,
+                binding,
+                graph,
+            },
+            receipt,
+        ))
+    }
+
+    /// Atomically publish this owner-built graph and its adjacent receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph, receipt, path-hardening, or filesystem errors. No API
+    /// accepts a replacement graph at this boundary.
+    pub fn save(&self, graph_path: &Path) -> SearchResult<NativeHnswGenerationReceiptV2> {
+        self.binding.save_bound_graph(&self.graph, graph_path)
+    }
+
+    /// Search only against the owner used to build or load this graph.
+    ///
+    /// Every returned row, document id, and record-state flag is resolved from
+    /// that same owner before crossing the public boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph-distance or owner row-resolution errors.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> SearchResult<Vec<ValidatedNativeHnswHit<'owner>>> {
+        let owner: &'owner ValidatedFsviBytes = self.owner;
+        self.graph
+            .search(query, k, ef, owner)?
+            .into_iter()
+            .map(|(physical_row, distance)| {
+                let physical_index =
+                    usize::try_from(physical_row).map_err(|_| SearchError::InvalidConfig {
+                        field: "native_hnsw.physical_row".to_owned(),
+                        value: physical_row.to_string(),
+                        reason: "physical row does not fit usize".to_owned(),
+                    })?;
+                let flags = owner.row(physical_index)?.flags();
+                let doc_id = owner.doc_id_at(physical_index)?;
+                Ok(ValidatedNativeHnswHit {
+                    physical_row,
+                    distance,
+                    doc_id,
+                    flags,
+                })
+            })
+            .collect()
+    }
+
+    /// Number of physical owner rows indexed by this graph.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+
+    /// Whether the bound graph and owner are empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
+    }
+
+    /// Exact admitted FSVI witness paired with this graph.
+    #[must_use]
+    pub const fn owner_witness(&self) -> &'owner crate::FsviV2Witness {
+        self.owner.witness()
+    }
+}
+
+impl NativeHnswGenerationReceiptV2 {
     /// Validate every internal schema, digest, cardinality, and topology field.
     ///
     /// This does not establish compatibility with caller-held expectations;
-    /// use [`NativeHnswGenerationBindingV1::load`] for admission.
+    /// use [`ValidatedNativeHnsw::load`] for admission.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] for malformed or internally
     /// inconsistent receipt material.
     pub fn validate(&self) -> SearchResult<()> {
-        if self.schema_version != NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V1 {
+        if self.schema_version != NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2 {
             return Err(native_hnsw_receipt_config_error(
                 "schema_version",
                 &self.schema_version.to_string(),
@@ -861,6 +1144,12 @@ impl NativeHnswGenerationReceiptV1 {
                 "vector_storage_fingerprint",
                 &self.vector_storage_fingerprint,
             ),
+            ("vector_content_digest", &self.vector_content_digest),
+            (
+                "ordered_live_docset_digest",
+                &self.ordered_live_docset_digest,
+            ),
+            ("fsvi_whole_image_sha256", &self.fsvi_whole_image_sha256),
             ("graph_sha256", &self.graph_sha256),
             ("topology_sha256", &self.topology_sha256),
             ("receipt_sha256", &self.receipt_sha256),
@@ -888,6 +1177,13 @@ impl NativeHnswGenerationReceiptV1 {
                 "point_count",
                 &self.point_count.to_string(),
                 "must fit the native u32 point-id space",
+            ));
+        }
+        if self.fsvi_physical_row_count != self.point_count {
+            return Err(native_hnsw_receipt_config_error(
+                "fsvi_physical_row_count",
+                &self.fsvi_physical_row_count.to_string(),
+                "must equal the native HNSW point count",
             ));
         }
         if self.max_level >= usize_to_u64(MAX_LEVEL, "max_level_limit")? {
@@ -995,7 +1291,7 @@ impl NativeHnswGenerationReceiptV1 {
                 "basename length must fit the canonical u16 field",
             )
         })?;
-        let mut bytes = Vec::with_capacity(384 + basename.len());
+        let mut bytes = Vec::with_capacity(488 + basename.len());
         bytes.extend_from_slice(&NATIVE_HNSW_RECEIPT_MAGIC);
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.artifact_generation.schema_version.to_be_bytes());
@@ -1011,6 +1307,19 @@ impl NativeHnswGenerationReceiptV1 {
         ] {
             bytes.extend_from_slice(&decode_sha256_hex("receipt fingerprint", fingerprint)?);
         }
+        bytes.extend_from_slice(&decode_sha256_hex(
+            "vector_content_digest",
+            &self.vector_content_digest,
+        )?);
+        bytes.extend_from_slice(&decode_sha256_hex(
+            "ordered_live_docset_digest",
+            &self.ordered_live_docset_digest,
+        )?);
+        bytes.extend_from_slice(&decode_sha256_hex(
+            "fsvi_whole_image_sha256",
+            &self.fsvi_whole_image_sha256,
+        )?);
+        bytes.extend_from_slice(&self.fsvi_physical_row_count.to_be_bytes());
         bytes.extend_from_slice(&basename_len.to_be_bytes());
         bytes.extend_from_slice(basename);
         bytes.extend_from_slice(&self.graph_byte_len.to_be_bytes());
@@ -1053,6 +1362,15 @@ impl NativeHnswGenerationReceiptV1 {
             ));
         }
         let schema_version = reader.read_u16("schema version")?;
+        if schema_version != NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2 {
+            return Err(native_hnsw_receipt_corrupted(
+                receipt_path,
+                format!(
+                    "unsupported native HNSW generation receipt schema {schema_version}; expected \
+                     {NATIVE_HNSW_GENERATION_RECEIPT_SCHEMA_V2}"
+                ),
+            ));
+        }
         let artifact_generation = ArtifactGenerationIdentityV1 {
             schema_version: reader.read_u16("artifact generation schema")?,
             sequence: reader.read_u64("artifact generation sequence")?,
@@ -1070,6 +1388,13 @@ impl NativeHnswGenerationReceiptV1 {
             encode_lower_hex(reader.take_array::<SHA256_BYTES>("embedding input fingerprint")?);
         let vector_storage_fingerprint =
             encode_lower_hex(reader.take_array::<SHA256_BYTES>("vector storage fingerprint")?);
+        let vector_content_digest =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("vector content digest")?);
+        let ordered_live_docset_digest =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("ordered live-docset digest")?);
+        let fsvi_whole_image_sha256 =
+            encode_lower_hex(reader.take_array::<SHA256_BYTES>("FSVI whole-image SHA-256")?);
+        let fsvi_physical_row_count = reader.read_u64("FSVI physical row count")?;
         let basename_len = usize::from(reader.read_u16("graph basename length")?);
         if basename_len == 0 || basename_len > NATIVE_HNSW_MAX_BASENAME_BYTES {
             return Err(native_hnsw_receipt_corrupted(
@@ -1125,6 +1450,10 @@ impl NativeHnswGenerationReceiptV1 {
             embedding_producer_fingerprint,
             embedding_input_fingerprint,
             vector_storage_fingerprint,
+            vector_content_digest,
+            ordered_live_docset_digest,
+            fsvi_whole_image_sha256,
+            fsvi_physical_row_count,
             graph_basename,
             graph_byte_len,
             graph_sha256,
@@ -1309,7 +1638,7 @@ impl VisitedSet {
 /// a pure function of insertion order and seed, which is what lets the
 /// regression fixtures below pin exact structural outcomes.
 #[derive(Debug, Clone, Copy)]
-pub struct LevelSampler {
+struct LevelSampler {
     seed: u64,
     level_scale: f64,
 }
@@ -1317,7 +1646,7 @@ pub struct LevelSampler {
 impl LevelSampler {
     /// Create a sampler for the given degree and seed.
     #[must_use]
-    pub fn new(m: usize, seed: u64) -> Self {
+    fn new(m: usize, seed: u64) -> Self {
         // The standard 1/ln(M) scale; guard M == 1, whose ln is zero.
         let level_scale = if m <= 1 { 1.0 } else { 1.0 / (m as f64).ln() };
         Self { seed, level_scale }
@@ -1325,7 +1654,7 @@ impl LevelSampler {
 
     /// Sample the level for `id`, in `0..MAX_LEVEL`.
     #[must_use]
-    pub fn level_for(&self, id: u32) -> usize {
+    fn level_for(&self, id: u32) -> usize {
         // SplitMix64 finalizer over (seed, id): deterministic, well
         // distributed, and independent of insertion order.
         let mut z = self
@@ -1359,7 +1688,7 @@ impl LevelSampler {
 /// store and asks for distances by row id. That keeps a single copy of the
 /// vector data (the FSVI slab) and lets the graph reuse whichever SIMD
 /// kernel the store already selected.
-pub trait VectorDistance {
+trait VectorDistance {
     /// Distance between stored row `id` and `query`. Smaller is nearer.
     ///
     /// # Errors
@@ -1376,10 +1705,31 @@ pub trait VectorDistance {
 
     /// Number of rows available.
     fn len(&self) -> usize;
+}
 
-    /// Whether the store holds no rows.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+impl VectorDistance for ValidatedFsviBytes {
+    fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+        let index = usize::try_from(id).map_err(|_| SearchError::InvalidConfig {
+            field: "native_hnsw.physical_row".to_owned(),
+            value: id.to_string(),
+            reason: "physical row does not fit usize".to_owned(),
+        })?;
+        let vector = self.vector_at_f32(index)?;
+        Ok(1.0 - crate::dot_product_f32_f32(&vector, query)?)
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+        let index = usize::try_from(a).map_err(|_| SearchError::InvalidConfig {
+            field: "native_hnsw.physical_row".to_owned(),
+            value: a.to_string(),
+            reason: "physical row does not fit usize".to_owned(),
+        })?;
+        let left = self.vector_at_f32(index)?;
+        self.distance_to_query(b, &left)
+    }
+
+    fn len(&self) -> usize {
+        self.record_count()
     }
 }
 
@@ -1704,7 +2054,7 @@ impl<'a> NativeHnswPayloadReader<'a> {
 
 /// A navigable small-world graph over rows of a vector store.
 #[derive(Debug, Clone)]
-pub struct NativeHnsw {
+struct NativeHnsw {
     params: HnswParams,
     sampler: LevelSampler,
     adjacency: Vec<Adjacency>,
@@ -1722,7 +2072,7 @@ impl NativeHnsw {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] for degenerate parameters.
-    pub fn new(params: HnswParams, seed: u64) -> SearchResult<Self> {
+    fn new(params: HnswParams, seed: u64) -> SearchResult<Self> {
         params.validate()?;
         Ok(Self {
             sampler: LevelSampler::new(params.m, seed),
@@ -1736,37 +2086,37 @@ impl NativeHnsw {
 
     /// Number of indexed points.
     #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.adjacency.len()
     }
 
     /// Whether the graph indexes no points.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.adjacency.is_empty()
     }
 
     /// The entry point id, if any point has been inserted.
     #[must_use]
-    pub const fn entry_point(&self) -> Option<u32> {
+    const fn entry_point(&self) -> Option<u32> {
         self.entry
     }
 
     /// The current maximum level.
     #[must_use]
-    pub const fn max_level(&self) -> usize {
+    const fn max_level(&self) -> usize {
         self.max_level
     }
 
     /// Construction and search parameters persisted with this graph.
     #[must_use]
-    pub const fn params(&self) -> HnswParams {
+    const fn params(&self) -> HnswParams {
         self.params
     }
 
     /// Deterministic level-sampling seed persisted with this graph.
     #[must_use]
-    pub const fn seed(&self) -> u64 {
+    const fn seed(&self) -> u64 {
         self.sampler.seed
     }
 
@@ -1781,7 +2131,7 @@ impl NativeHnsw {
     /// Returns [`SearchError::IndexCorrupted`] when the graph is structurally
     /// invalid and [`SearchError::InvalidConfig`] when a count cannot be
     /// represented canonically.
-    pub fn topology_sha256(&self) -> SearchResult<String> {
+    fn topology_sha256(&self) -> SearchResult<String> {
         self.verify()
             .map_err(|defect| native_hnsw_corrupted(Path::new("<memory>"), defect.to_string()))?;
         let mut bytes = Vec::new();
@@ -1847,7 +2197,7 @@ impl NativeHnsw {
     /// structural attestation, [`SearchError::InvalidConfig`] when a value
     /// cannot be represented by the format, and [`SearchError::Io`] for
     /// filesystem failures.
-    pub fn save(&self, path: &Path) -> SearchResult<NativeHnswFileMetadata> {
+    fn save(&self, path: &Path) -> SearchResult<NativeHnswFileMetadata> {
         self.verify()
             .map_err(|defect| native_hnsw_corrupted(path, defect.to_string()))?;
 
@@ -1944,7 +2294,8 @@ impl NativeHnsw {
     /// Returns [`SearchError::IndexNotFound`] when `path` is absent,
     /// [`SearchError::IndexCorrupted`] for malformed bytes or a graph/store
     /// mismatch, and [`SearchError::Io`] for other filesystem failures.
-    pub fn load<D: VectorDistance>(path: &Path, store: &D) -> SearchResult<Self> {
+    #[cfg(test)]
+    fn load<D: VectorDistance>(path: &Path, store: &D) -> SearchResult<Self> {
         Self::load_with_metadata(path, store).map(|(graph, _)| graph)
     }
 
@@ -1957,8 +2308,9 @@ impl NativeHnsw {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::load`].
-    pub fn load_with_metadata<D: VectorDistance>(
+    /// Returns not-found, corruption, owner-cardinality, and filesystem
+    /// errors from bounded parsing and structural attestation.
+    fn load_with_metadata<D: VectorDistance>(
         path: &Path,
         store: &D,
     ) -> SearchResult<(Self, NativeHnswFileMetadata)> {
@@ -2116,11 +2468,7 @@ impl NativeHnsw {
     /// # Errors
     ///
     /// Propagates distance-computation failures from `store`.
-    pub fn build<D: VectorDistance>(
-        params: HnswParams,
-        seed: u64,
-        store: &D,
-    ) -> SearchResult<Self> {
+    fn build<D: VectorDistance>(params: HnswParams, seed: u64, store: &D) -> SearchResult<Self> {
         let mut graph = Self::new(params, seed)?;
         let count = u32::try_from(store.len()).map_err(|_| SearchError::InvalidConfig {
             field: "store.len".to_owned(),
@@ -2145,7 +2493,7 @@ impl NativeHnsw {
     ///
     /// Returns [`SearchError::InvalidConfig`] if `id` is not the next row or
     /// the graph is full, and propagates distance-computation failures.
-    pub fn insert<D: VectorDistance>(&mut self, id: u32, store: &D) -> SearchResult<()> {
+    fn insert<D: VectorDistance>(&mut self, id: u32, store: &D) -> SearchResult<()> {
         // Borrow the reusable visited buffer out of `self` so the insert
         // body can hold `&mut self` and the buffer at the same time; it is
         // restored on every path, including the error path.
@@ -2570,16 +2918,6 @@ impl NativeHnsw {
         Ok(())
     }
 
-    /// How many neighbours `id` holds at `layer`.
-    ///
-    /// Exposed for diagnostics and structural attestation: degree
-    /// distribution is the cheapest signal that a graph has degenerated
-    /// (all-to-all, or starved) without running a recall measurement.
-    #[must_use]
-    pub fn neighbour_count(&self, id: u32, layer: usize) -> usize {
-        self.neighbours_at(id, layer).len()
-    }
-
     /// Neighbours of `id` at `layer`, empty if it does not participate.
     fn neighbours_at(&self, id: u32, layer: usize) -> &[u32] {
         self.adjacency
@@ -2596,7 +2934,7 @@ impl NativeHnsw {
     /// # Errors
     ///
     /// Propagates distance-computation failures from `store`.
-    pub fn search<D: VectorDistance>(
+    fn search<D: VectorDistance>(
         &self,
         query: &[f32],
         k: usize,
@@ -2649,7 +2987,7 @@ impl NativeHnsw {
     /// # Errors
     ///
     /// Returns the first [`GraphDefect`] found.
-    pub fn verify(&self) -> Result<(), GraphDefect> {
+    fn verify(&self) -> Result<(), GraphDefect> {
         let count = self.adjacency.len();
 
         if count == 0 {
@@ -2782,7 +3120,7 @@ impl NativeHnsw {
     /// Returns [`GraphDefect::StoreCardinalityMismatch`] before structural
     /// verification when graph ids and store rows do not describe the same
     /// universe; otherwise returns the first defect from [`Self::verify`].
-    pub fn verify_for_store<D: VectorDistance>(&self, store: &D) -> Result<(), GraphDefect> {
+    fn verify_for_store<D: VectorDistance>(&self, store: &D) -> Result<(), GraphDefect> {
         self.verify_store_cardinality(store)?;
         self.verify()
     }
@@ -3328,6 +3666,7 @@ fn sync_parent_directory(path: &Path) -> SearchResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FsviRecordFlags, FsviV2IdentityBinding, VectorIndex, fnv1a_hash};
     use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
     use std::cell::Cell;
 
@@ -3540,27 +3879,95 @@ mod tests {
         }
     }
 
-    fn frozen_fsvi_identity(model_id: &str, dimension: u32) -> FrozenEmbeddingIdentityBundleV1 {
-        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
-        identity.storage.format = "fsvi-v2".to_owned();
-        identity.storage.quantization = QuantizationFormat::F16;
-        identity.storage.endianness = "little-endian".to_owned();
-        identity.freeze().expect("valid frozen FSVI v2 identity")
-    }
-
-    fn generation_binding(
+    fn fsvi_v2_binding(
         sequence: u64,
         nonce_byte: u8,
         model_id: &str,
         dimension: u32,
-    ) -> NativeHnswGenerationBindingV1 {
+    ) -> FsviV2IdentityBinding {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".to_owned();
         let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce_byte; 16])
             .expect("valid test generation");
-        NativeHnswGenerationBindingV1::new(generation, &frozen_fsvi_identity(model_id, dimension))
-            .expect("valid native HNSW generation binding")
+        FsviV2IdentityBinding::new(
+            generation,
+            identity.freeze().expect("valid frozen FSVI v2 identity"),
+        )
+        .expect("valid FSVI v2 identity binding")
     }
 
-    fn write_resealed_receipt(path: &Path, receipt: &mut NativeHnswGenerationReceiptV1) {
+    fn fsvi_rows(count: usize, dimension: usize) -> Vec<(String, Vec<f32>)> {
+        (0..count)
+            .map(|row| {
+                let mut vector = vec![0.0; dimension];
+                vector[row % dimension] = 1.0;
+                (format!("doc-{row:04}"), vector)
+            })
+            .collect()
+    }
+
+    fn admitted_fsvi_owner(
+        directory: &Path,
+        basename: &str,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(String, Vec<f32>)],
+    ) -> ValidatedFsviBytes {
+        let path = directory.join(basename);
+        let mut writer =
+            VectorIndex::create_v2(&path, binding.clone()).expect("create FSVI v2 owner fixture");
+        for (doc_id, vector) in rows {
+            writer
+                .write_record(doc_id, vector)
+                .expect("write FSVI v2 owner row");
+        }
+        writer.finish().expect("finish FSVI v2 owner fixture");
+        ValidatedFsviBytes::open_published(&path, binding).expect("admit FSVI v2 owner fixture")
+    }
+
+    fn admitted_fsvi_owner_with_flags(
+        directory: &Path,
+        basename: &str,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(String, Vec<f32>, FsviRecordFlags)],
+    ) -> ValidatedFsviBytes {
+        let path = directory.join(basename);
+        let mut writer =
+            VectorIndex::create_v2(&path, binding.clone()).expect("create FSVI v2 owner fixture");
+        for (doc_id, vector, flags) in rows {
+            if *flags == FsviRecordFlags::TOMBSTONE {
+                writer
+                    .write_tombstone_record(doc_id, vector)
+                    .expect("write FSVI v2 tombstone row");
+            } else {
+                assert_eq!(*flags, FsviRecordFlags::LIVE);
+                writer
+                    .write_record(doc_id, vector)
+                    .expect("write FSVI v2 live row");
+            }
+        }
+        writer.finish().expect("finish FSVI v2 owner fixture");
+        ValidatedFsviBytes::open_published(&path, binding).expect("admit FSVI v2 owner fixture")
+    }
+
+    fn generation_owner(
+        sequence: u64,
+        nonce_byte: u8,
+        model_id: &str,
+        dimension: u32,
+        physical_row_count: usize,
+    ) -> ValidatedFsviBytes {
+        let directory = tempfile::tempdir().expect("temporary FSVI owner directory");
+        let binding = fsvi_v2_binding(sequence, nonce_byte, model_id, dimension);
+        let rows = fsvi_rows(
+            physical_row_count,
+            usize::try_from(dimension).expect("test dimension fits usize"),
+        );
+        admitted_fsvi_owner(directory.path(), "owner.fsvi", &binding, &rows)
+    }
+
+    fn write_resealed_receipt(path: &Path, receipt: &mut NativeHnswGenerationReceiptV2) {
         receipt.seal().expect("seal mutated test receipt");
         std::fs::write(
             path,
@@ -3578,24 +3985,25 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let graph_path = directory.path().join("graph.fshnsw");
         let receipt_path = directory.path().join("graph.fshnsw.receipt");
-        let store = TestStore::synthetic(48, 8);
-        let graph = NativeHnsw::build(params(), 0x51de_cafe, &store).expect("build");
-        let binding = generation_binding(u64::MAX, 0xa5, "receipt-round-trip", 8);
+        let owner = generation_owner(u64::MAX, 0xa5, "receipt-round-trip", 8, 48);
+        let bound =
+            ValidatedNativeHnsw::build(&owner, params(), 0x51de_cafe).expect("owner-bound build");
+        let binding = &bound.binding;
 
         assert_eq!(
             native_hnsw_generation_receipt_path(&graph_path).expect("canonical receipt path"),
             receipt_path
         );
-        let receipt = binding.save(&graph, &graph_path).expect("save binding");
+        let receipt = bound.save(&graph_path).expect("save owner-bound graph");
         receipt.validate().expect("receipt validates");
         let persisted = std::fs::read(&receipt_path).expect("receipt bytes");
         let decoded =
-            NativeHnswGenerationReceiptV1::from_bytes(&persisted, &receipt_path).expect("decode");
+            NativeHnswGenerationReceiptV2::from_bytes(&persisted, &receipt_path).expect("decode");
         assert_eq!(decoded, receipt);
-        assert_eq!(decoded.artifact_generation, binding.artifact_generation());
+        assert_eq!(decoded.artifact_generation, binding.artifact_generation);
         assert_eq!(
             decoded.embedding_identity_fingerprint,
-            binding.embedding_identity_fingerprint()
+            binding.embedding_identity_fingerprint
         );
         assert_eq!(
             decoded.graph_byte_len,
@@ -3613,13 +4021,45 @@ mod tests {
             NativeHnswParamsIdentityV1::from_params(params()).unwrap()
         );
         assert_eq!(decoded.point_count, 48);
-        assert_eq!(decoded.topology_sha256, graph.topology_sha256().unwrap());
+        assert_eq!(decoded.fsvi_physical_row_count, 48);
+        assert_eq!(decoded.vector_content_digest, binding.vector_content_digest);
+        assert_eq!(
+            decoded.ordered_live_docset_digest,
+            binding.ordered_live_docset_digest
+        );
+        assert_eq!(
+            decoded.fsvi_whole_image_sha256,
+            binding.fsvi_whole_image_sha256
+        );
+        assert_eq!(
+            decoded.fsvi_whole_image_sha256,
+            encode_lower_hex(owner.witness().whole_image_sha256)
+        );
+        assert_eq!(
+            decoded.topology_sha256,
+            bound.graph.topology_sha256().unwrap()
+        );
 
-        let (loaded, observed) = binding.load(&graph_path, &store).expect("bound load");
+        let (loaded, observed) =
+            ValidatedNativeHnsw::load(&owner, &graph_path).expect("owner-bound load");
         assert_eq!(observed, receipt);
-        assert_eq!(topology_snapshot(&loaded), topology_snapshot(&graph));
+        assert_eq!(
+            topology_snapshot(&loaded.graph),
+            topology_snapshot(&bound.graph)
+        );
+        let hits = loaded
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8, None)
+            .expect("owner-bound search");
+        assert!(!hits.is_empty());
+        for hit in hits {
+            let physical_index =
+                usize::try_from(hit.physical_row()).expect("physical row fits usize");
+            let owner_row = owner.row(physical_index).expect("same-owner row");
+            assert_eq!(hit.doc_id(), owner_row.doc_id());
+            assert_eq!(hit.flags(), owner_row.flags());
+        }
 
-        binding.save(&graph, &graph_path).expect("repeat save");
+        bound.save(&graph_path).expect("repeat owner-bound save");
         assert_eq!(
             std::fs::read(&receipt_path).expect("repeat receipt"),
             persisted,
@@ -3629,42 +4069,414 @@ mod tests {
         let mut serde_value = serde_json::to_value(&receipt).expect("serialize receipt");
         serde_value["future_field"] = serde_json::json!(true);
         assert!(
-            serde_json::from_value::<NativeHnswGenerationReceiptV1>(serde_value).is_err(),
+            serde_json::from_value::<NativeHnswGenerationReceiptV2>(serde_value).is_err(),
             "the public receipt schema must reject unknown fields"
         );
     }
 
     #[test]
-    fn generation_binding_requires_valid_fsvi_v2_identity() {
-        let generation = ArtifactGenerationIdentityV1::new(7, [7; 16]).expect("valid generation");
-        let mut legacy = EmbeddingIdentityBundleV1::explicit_test_model("legacy", 8);
-        legacy.storage.format = "fsvi-v1".to_owned();
-        legacy.storage.quantization = QuantizationFormat::F16;
-        legacy.storage.endianness = "little-endian".to_owned();
-        let legacy = legacy.freeze().expect("valid legacy identity");
-        let error = NativeHnswGenerationBindingV1::new(generation, &legacy)
-            .expect_err("legacy storage must not bind");
-        assert!(error.to_string().contains("must be exactly fsvi-v2"));
+    fn generation_binding_is_derived_from_the_admitted_fsvi_owner() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(7, 7, "admitted-owner", 8);
+        let rows = fsvi_rows(9, 8);
+        let owner = admitted_fsvi_owner(directory.path(), "owner.fsvi", &fsvi_binding, &rows);
+        let binding = NativeHnswGenerationBindingV2::from_validated_fsvi(&owner)
+            .expect("derive binding from admitted owner");
+        let identity = owner.identity_v2();
 
-        let mut forged = frozen_fsvi_identity("forged", 8);
-        forged.fingerprint = "0".repeat(64);
-        assert!(
-            NativeHnswGenerationBindingV1::new(generation, &forged).is_err(),
-            "noncanonical frozen identity must fail before publication"
+        assert_eq!(binding.artifact_generation, identity.generation);
+        assert_eq!(
+            binding.embedding_identity_fingerprint,
+            encode_lower_hex(identity.identity_bundle_fingerprint)
+        );
+        assert_eq!(
+            binding.vector_content_digest,
+            encode_lower_hex(identity.vector_content_digest)
+        );
+        assert_eq!(
+            binding.ordered_live_docset_digest,
+            encode_lower_hex(identity.ordered_live_docset_digest)
+        );
+        assert_eq!(
+            binding.fsvi_whole_image_sha256,
+            encode_lower_hex(owner.witness().whole_image_sha256)
+        );
+        assert_eq!(binding.fsvi_physical_row_count, 9);
+    }
+
+    #[test]
+    fn bound_load_rejects_same_identity_and_count_with_different_vectors_before_graph_read() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(31, 0x31, "vector-content-binding", 4);
+        let rows_a = vec![
+            ("doc-alpha".to_owned(), vec![1.0, 0.0, 0.0, 0.0]),
+            ("doc-beta".to_owned(), vec![0.0, 1.0, 0.0, 0.0]),
+            ("doc-gamma".to_owned(), vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let rows_b = vec![
+            ("doc-alpha".to_owned(), vec![0.0, 1.0, 0.0, 0.0]),
+            ("doc-beta".to_owned(), vec![1.0, 0.0, 0.0, 0.0]),
+            ("doc-gamma".to_owned(), vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+        let owner_a =
+            admitted_fsvi_owner(directory.path(), "vectors-a.fsvi", &fsvi_binding, &rows_a);
+        let owner_b =
+            admitted_fsvi_owner(directory.path(), "vectors-b.fsvi", &fsvi_binding, &rows_b);
+        let bound_a =
+            ValidatedNativeHnsw::build(&owner_a, params(), 31).expect("owner-bound graph");
+        let binding_a = &bound_a.binding;
+        let binding_b =
+            NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_b).expect("binding b");
+
+        assert_eq!(binding_a.artifact_generation, binding_b.artifact_generation);
+        assert_eq!(
+            binding_a.embedding_identity_fingerprint,
+            binding_b.embedding_identity_fingerprint
+        );
+        assert_eq!(
+            binding_a.ordered_live_docset_digest,
+            binding_b.ordered_live_docset_digest
+        );
+        assert_eq!(
+            binding_a.fsvi_physical_row_count,
+            binding_b.fsvi_physical_row_count
+        );
+        assert_ne!(
+            binding_a.vector_content_digest,
+            binding_b.vector_content_digest
         );
 
-        let unknown_generation = ArtifactGenerationIdentityV1 {
-            schema_version: generation.schema_version + 1,
-            ..generation
-        };
+        let graph_path = directory.path().join("vectors.fshnsw");
+        bound_a.save(&graph_path).expect("owner-bound save");
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+
+        let error = ValidatedNativeHnsw::load(&owner_b, &graph_path)
+            .expect_err("different vector content must fail");
         assert!(
-            NativeHnswGenerationBindingV1::new(
-                unknown_generation,
-                &frozen_fsvi_identity("valid", 8)
-            )
-            .is_err(),
-            "unknown generation schema must fail before publication"
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("receipt vector content digest mismatch")),
+            "vector mismatch did not fail at receipt identity: {error:?}"
         );
+    }
+
+    #[test]
+    fn bound_load_rejects_same_vectors_and_identity_with_different_ordered_docset_before_graph_read()
+     {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(32, 0x32, "ordered-docset-binding", 4);
+        let shared_vector = vec![1.0, 0.0, 0.0, 0.0];
+        let rows_a = vec![
+            ("doc-alpha".to_owned(), shared_vector.clone()),
+            ("doc-beta".to_owned(), shared_vector.clone()),
+            ("doc-gamma".to_owned(), shared_vector.clone()),
+        ];
+        let rows_b = vec![
+            ("doc-alpha".to_owned(), shared_vector.clone()),
+            ("doc-delta".to_owned(), shared_vector.clone()),
+            ("doc-gamma".to_owned(), shared_vector),
+        ];
+        let owner_a =
+            admitted_fsvi_owner(directory.path(), "docset-a.fsvi", &fsvi_binding, &rows_a);
+        let owner_b =
+            admitted_fsvi_owner(directory.path(), "docset-b.fsvi", &fsvi_binding, &rows_b);
+        let bound_a =
+            ValidatedNativeHnsw::build(&owner_a, params(), 32).expect("owner-bound graph");
+        let binding_a = &bound_a.binding;
+        let binding_b =
+            NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_b).expect("binding b");
+
+        assert_eq!(binding_a.artifact_generation, binding_b.artifact_generation);
+        assert_eq!(
+            binding_a.embedding_identity_fingerprint,
+            binding_b.embedding_identity_fingerprint
+        );
+        assert_eq!(
+            binding_a.vector_content_digest,
+            binding_b.vector_content_digest
+        );
+        assert_eq!(
+            binding_a.fsvi_physical_row_count,
+            binding_b.fsvi_physical_row_count
+        );
+        assert_ne!(
+            binding_a.ordered_live_docset_digest,
+            binding_b.ordered_live_docset_digest
+        );
+
+        let graph_path = directory.path().join("docset.fshnsw");
+        bound_a.save(&graph_path).expect("owner-bound save");
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+
+        let error = ValidatedNativeHnsw::load(&owner_b, &graph_path)
+            .expect_err("different ordered docset must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("receipt ordered live-docset digest mismatch")),
+            "docset mismatch did not fail at receipt identity: {error:?}"
+        );
+    }
+
+    #[test]
+    fn bound_load_rejects_same_vectors_and_live_docset_with_different_tombstone_layout() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(35, 0x35, "tombstone-layout-binding", 4);
+        let live_ids = ["live-alpha", "live-beta"];
+        let smallest_live_hash = live_ids
+            .iter()
+            .map(|doc_id| fnv1a_hash(doc_id.as_bytes()))
+            .min()
+            .expect("live id");
+        let largest_live_hash = live_ids
+            .iter()
+            .map(|doc_id| fnv1a_hash(doc_id.as_bytes()))
+            .max()
+            .expect("live id");
+        let tombstone_before = (0..100_000_u32)
+            .map(|candidate| format!("dead-before-{candidate}"))
+            .find(|doc_id| fnv1a_hash(doc_id.as_bytes()) < smallest_live_hash)
+            .expect("find tombstone id sorting before the live rows");
+        let tombstone_after = (0..100_000_u32)
+            .map(|candidate| format!("dead-after-{candidate}"))
+            .find(|doc_id| fnv1a_hash(doc_id.as_bytes()) > largest_live_hash)
+            .expect("find tombstone id sorting after the live rows");
+        let shared_vector = vec![1.0, 0.0, 0.0, 0.0];
+        let rows_a = vec![
+            (
+                live_ids[0].to_owned(),
+                shared_vector.clone(),
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                live_ids[1].to_owned(),
+                shared_vector.clone(),
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                tombstone_before,
+                shared_vector.clone(),
+                FsviRecordFlags::TOMBSTONE,
+            ),
+        ];
+        let rows_b = vec![
+            (
+                live_ids[0].to_owned(),
+                shared_vector.clone(),
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                live_ids[1].to_owned(),
+                shared_vector.clone(),
+                FsviRecordFlags::LIVE,
+            ),
+            (tombstone_after, shared_vector, FsviRecordFlags::TOMBSTONE),
+        ];
+        let owner_a = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "layout-a.fsvi",
+            &fsvi_binding,
+            &rows_a,
+        );
+        let owner_b = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "layout-b.fsvi",
+            &fsvi_binding,
+            &rows_b,
+        );
+        let binding_a =
+            NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_a).expect("binding a");
+        let binding_b =
+            NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_b).expect("binding b");
+
+        assert_eq!(binding_a.artifact_generation, binding_b.artifact_generation);
+        assert_eq!(
+            binding_a.embedding_identity_fingerprint,
+            binding_b.embedding_identity_fingerprint
+        );
+        assert_eq!(
+            binding_a.vector_content_digest,
+            binding_b.vector_content_digest
+        );
+        assert_eq!(
+            binding_a.ordered_live_docset_digest,
+            binding_b.ordered_live_docset_digest
+        );
+        assert_eq!(
+            binding_a.fsvi_physical_row_count,
+            binding_b.fsvi_physical_row_count
+        );
+        assert_ne!(
+            binding_a.fsvi_whole_image_sha256,
+            binding_b.fsvi_whole_image_sha256
+        );
+        let layout_a: Vec<(String, FsviRecordFlags)> = (0..owner_a.record_count())
+            .map(|index| {
+                let row = owner_a.row(index).expect("owner-a row");
+                (row.doc_id().to_owned(), row.flags())
+            })
+            .collect();
+        let layout_b: Vec<(String, FsviRecordFlags)> = (0..owner_b.record_count())
+            .map(|index| {
+                let row = owner_b.row(index).expect("owner-b row");
+                (row.doc_id().to_owned(), row.flags())
+            })
+            .collect();
+        assert_eq!(layout_a[0].1, FsviRecordFlags::TOMBSTONE);
+        assert_eq!(layout_b[layout_b.len() - 1].1, FsviRecordFlags::TOMBSTONE);
+        assert_ne!(layout_a, layout_b);
+
+        let graph = NativeHnsw::build(params(), 35, &owner_a).expect("internal graph fixture");
+        let graph_path = directory.path().join("layout.fshnsw");
+        binding_a
+            .save_bound_graph(&graph, &graph_path)
+            .expect("internal receipted graph fixture");
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+
+        let error = binding_b
+            .load_bound_graph(&graph_path, &owner_b)
+            .expect_err("different physical tombstone layout must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("receipt FSVI whole-image SHA-256 mismatch")),
+            "tombstone-layout mismatch did not fail at receipt identity: {error:?}"
+        );
+    }
+
+    #[test]
+    fn validated_owner_bound_api_rejects_tombstones_before_build_or_load() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(36, 0x36, "tombstone-admission", 4);
+        let rows = vec![
+            (
+                "live".to_owned(),
+                vec![1.0, 0.0, 0.0, 0.0],
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                "dead".to_owned(),
+                vec![0.0, 1.0, 0.0, 0.0],
+                FsviRecordFlags::TOMBSTONE,
+            ),
+        ];
+        let owner = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "tombstoned.fsvi",
+            &fsvi_binding,
+            &rows,
+        );
+
+        let build_error = ValidatedNativeHnsw::build(&owner, params(), 36)
+            .expect_err("tombstoned owner must not build a public ANN handle");
+        assert!(
+            matches!(
+                build_error,
+                SearchError::InvalidConfig {
+                    ref field,
+                    ref value,
+                    ref reason,
+                } if field == "native_hnsw.owner.tombstone_count"
+                    && value == "1"
+                    && reason.contains("all-LIVE")
+            ),
+            "unexpected tombstone build rejection: {build_error:?}"
+        );
+
+        let binding = NativeHnswGenerationBindingV2::from_validated_fsvi(&owner)
+            .expect("internal tombstone binding fixture");
+        let graph =
+            NativeHnsw::build(params(), 36, &owner).expect("internal tombstone graph fixture");
+        let graph_path = directory.path().join("tombstoned.fshnsw");
+        binding
+            .save_bound_graph(&graph, &graph_path)
+            .expect("internal tombstone receipt fixture");
+        std::fs::write(&graph_path, b"public load must not observe graph bytes")
+            .expect("poison graph after receipt publication");
+
+        let load_error = ValidatedNativeHnsw::load(&owner, &graph_path)
+            .expect_err("tombstoned owner must not load a public ANN handle");
+        assert!(
+            matches!(
+                load_error,
+                SearchError::InvalidConfig {
+                    ref field,
+                    ref value,
+                    ref reason,
+                } if field == "native_hnsw.owner.tombstone_count"
+                    && value == "1"
+                    && reason.contains("all-LIVE")
+            ),
+            "unexpected tombstone load rejection: {load_error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_or_missing_fsvi_identity_is_rejected_before_graph_bytes_are_read() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("legacy.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
+        let owner = generation_owner(33, 0x33, "legacy-rejection", 4, 4);
+        let bound = ValidatedNativeHnsw::build(&owner, params(), 33).expect("owner-bound graph");
+        bound.save(&graph_path).expect("owner-bound save");
+        let canonical = std::fs::read(&receipt_path).expect("canonical receipt");
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+
+        let mut legacy = canonical.clone();
+        legacy[8..10].copy_from_slice(&1u16.to_be_bytes());
+        std::fs::write(&receipt_path, legacy).expect("write schema-v1 receipt");
+        let legacy_error = ValidatedNativeHnsw::load(&owner, &graph_path)
+            .expect_err("schema-v1 receipt must fail");
+        assert!(
+            matches!(legacy_error, SearchError::IndexCorrupted { ref path, ref detail }
+                if path == &receipt_path && detail.contains("schema 1")),
+            "legacy receipt did not fail before graph access: {legacy_error:?}"
+        );
+
+        let identity_prefix_len = 8 + 2 + 2 + 8 + 16 + (6 * SHA256_BYTES);
+        std::fs::write(&receipt_path, &canonical[..identity_prefix_len])
+            .expect("write receipt missing FSVI content identity");
+        let missing_error = ValidatedNativeHnsw::load(&owner, &graph_path)
+            .expect_err("missing FSVI content identity must fail");
+        assert!(
+            matches!(missing_error, SearchError::IndexCorrupted { ref path, ref detail }
+                if path == &receipt_path && detail.contains("vector content digest")),
+            "missing identity did not fail before graph access: {missing_error:?}"
+        );
+
+        let whole_image_prefix_len = identity_prefix_len + (2 * SHA256_BYTES);
+        std::fs::write(&receipt_path, &canonical[..whole_image_prefix_len])
+            .expect("write receipt missing whole-image witness");
+        let missing_whole_image = ValidatedNativeHnsw::load(&owner, &graph_path)
+            .expect_err("missing whole-image witness must fail");
+        assert!(
+            matches!(missing_whole_image, SearchError::IndexCorrupted { ref path, ref detail }
+                if path == &receipt_path && detail.contains("whole-image")),
+            "missing whole-image witness did not fail before graph access: {missing_whole_image:?}"
+        );
+    }
+
+    #[test]
+    fn save_rejects_physical_row_count_mismatch_before_graph_publication() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let graph_path = directory.path().join("count-mismatch.fshnsw");
+        let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
+        let owner = generation_owner(34, 0x34, "count-mismatch", 4, 5);
+        let mut bound =
+            ValidatedNativeHnsw::build(&owner, params(), 34).expect("owner-bound graph");
+        bound.graph.adjacency.pop().expect("test graph row");
+
+        let error = bound
+            .save(&graph_path)
+            .expect_err("physical row count mismatch must fail");
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "native_hnsw_receipt.graph.point_count"),
+            "unexpected count mismatch error: {error:?}"
+        );
+        assert!(!graph_path.exists());
+        assert!(!receipt_path.exists());
     }
 
     #[test]
@@ -3672,25 +4484,22 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let graph_path = directory.path().join("graph.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
-        let store = TestStore::synthetic(32, 6);
-        let graph = NativeHnsw::build(params(), 0x99, &store).expect("build");
-        let binding = generation_binding(9, 9, "receipt-corruption", 6);
+        let owner = generation_owner(9, 9, "receipt-corruption", 6, 32);
+        let bound = ValidatedNativeHnsw::build(&owner, params(), 0x99).expect("owner-bound graph");
 
-        graph.save(&graph_path).expect("unbound graph save");
-        let missing = binding
-            .load(&graph_path, &store)
-            .expect_err("missing receipt must fail");
+        bound.graph.save(&graph_path).expect("unbound graph save");
+        let missing =
+            ValidatedNativeHnsw::load(&owner, &graph_path).expect_err("missing receipt must fail");
         assert!(
             matches!(missing, SearchError::IndexNotFound { ref path } if path == &receipt_path)
         );
 
-        binding.save(&graph, &graph_path).expect("bound save");
+        bound.save(&graph_path).expect("owner-bound save");
         let canonical = std::fs::read(&receipt_path).expect("canonical receipt");
 
         std::fs::write(&receipt_path, &canonical[..canonical.len() - 1]).expect("truncate receipt");
         assert!(matches!(
-            binding
-                .load(&graph_path, &store)
+            ValidatedNativeHnsw::load(&owner, &graph_path)
                 .expect_err("truncated receipt must fail"),
             SearchError::IndexCorrupted { .. }
         ));
@@ -3699,7 +4508,7 @@ mod tests {
         body_tamper[20] ^= 1;
         std::fs::write(&receipt_path, body_tamper).expect("tamper receipt body");
         assert!(
-            binding.load(&graph_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&owner, &graph_path).is_err(),
             "body tamper without a new SHA-256 seal must fail"
         );
 
@@ -3707,15 +4516,14 @@ mod tests {
         *seal_tamper.last_mut().expect("receipt seal byte") ^= 1;
         std::fs::write(&receipt_path, seal_tamper).expect("tamper receipt seal");
         assert!(
-            binding.load(&graph_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&owner, &graph_path).is_err(),
             "receipt SHA-256 tamper must fail"
         );
 
         let mut trailing = canonical;
         trailing.push(0);
         std::fs::write(&receipt_path, trailing).expect("append noncanonical byte");
-        let error = binding
-            .load(&graph_path, &store)
+        let error = ValidatedNativeHnsw::load(&owner, &graph_path)
             .expect_err("trailing receipt bytes must fail");
         assert!(
             matches!(error, SearchError::IndexCorrupted { ref detail, .. }
@@ -3733,50 +4541,48 @@ mod tests {
             native_hnsw_generation_receipt_path(&first_path).expect("first receipt");
         let second_receipt =
             native_hnsw_generation_receipt_path(&second_path).expect("second receipt");
-        let store = TestStore::synthetic(40, 6);
-        let first = NativeHnsw::build(params(), 11, &store).expect("first graph");
-        let second = NativeHnsw::build(params(), 29, &store).expect("second graph");
-        let binding = generation_binding(11, 0x11, "swap-stale", 6);
+        let owner = generation_owner(11, 0x11, "swap-stale", 6, 40);
+        let first =
+            ValidatedNativeHnsw::build(&owner, params(), 11).expect("first owner-bound graph");
+        let second =
+            ValidatedNativeHnsw::build(&owner, params(), 29).expect("second owner-bound graph");
 
-        binding.save(&first, &first_path).expect("save first");
-        binding.save(&second, &second_path).expect("save second");
+        first.save(&first_path).expect("save first");
+        second.save(&second_path).expect("save second");
         let first_receipt_bytes = std::fs::read(&first_receipt).expect("first receipt bytes");
         let second_receipt_bytes = std::fs::read(&second_receipt).expect("second receipt bytes");
         std::fs::write(&first_receipt, &second_receipt_bytes).expect("swap second into first");
         std::fs::write(&second_receipt, &first_receipt_bytes).expect("swap first into second");
         assert!(
-            binding.load(&first_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&owner, &first_path).is_err(),
             "receipt from a different basename/artifact must fail"
         );
         assert!(
-            binding.load(&second_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&owner, &second_path).is_err(),
             "the reciprocal receipt swap must also fail"
         );
 
         std::fs::write(&first_receipt, &first_receipt_bytes).expect("restore first receipt");
         second
+            .graph
             .save(&first_path)
             .expect("replace graph without receipt");
-        let stale = binding
-            .load(&first_path, &store)
-            .expect_err("stale receipt must fail");
+        let stale =
+            ValidatedNativeHnsw::load(&owner, &first_path).expect_err("stale receipt must fail");
         assert!(
             matches!(stale, SearchError::IndexCorrupted { ref detail, .. }
                 if detail.contains("SHA-256") || detail.contains("receipt")),
             "unexpected stale-receipt error: {stale:?}"
         );
 
-        binding
-            .save(&first, &first_path)
-            .expect("restore bound first");
+        first.save(&first_path).expect("restore bound first");
         let mut forged_graph = std::fs::read(&first_path).expect("graph bytes");
-        let (neighbour_offset, owner) =
+        let (neighbour_offset, edge_owner) =
             first_persisted_neighbour(&forged_graph).expect("graph edge");
-        put_u32(&mut forged_graph, neighbour_offset, owner);
+        put_u32(&mut forged_graph, neighbour_offset, edge_owner);
         reseal_persisted_checksums(&mut forged_graph);
         std::fs::write(&first_path, forged_graph).expect("write resealed graph forgery");
-        let resealed = binding
-            .load(&first_path, &store)
+        let resealed = ValidatedNativeHnsw::load(&owner, &first_path)
             .expect_err("resealed graph replacement must fail receipt SHA-256");
         assert!(
             matches!(resealed, SearchError::IndexCorrupted { ref detail, .. }
@@ -3789,17 +4595,16 @@ mod tests {
     fn bound_load_rejects_replacement_between_hash_and_parse() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let graph_path = directory.path().join("race.fshnsw");
-        let store = TestStore::synthetic(48, 6);
-        let original = NativeHnsw::build(params(), 3, &store).expect("original graph");
-        let replacement = NativeHnsw::build(params(), 5, &store).expect("replacement graph");
-        let binding = generation_binding(3, 3, "replacement-race", 6);
-        binding
-            .save(&original, &graph_path)
-            .expect("save original binding");
+        let owner = generation_owner(3, 3, "replacement-race", 6, 48);
+        let original =
+            ValidatedNativeHnsw::build(&owner, params(), 3).expect("original owner-bound graph");
+        let replacement =
+            ValidatedNativeHnsw::build(&owner, params(), 5).expect("replacement owner-bound graph");
+        original.save(&graph_path).expect("save original binding");
 
-        let error = binding
-            .load_with_after_first_observation(&graph_path, &store, || {
-                replacement.save(&graph_path).map(|_| ())
+        let error =
+            ValidatedNativeHnsw::load_with_after_first_observation(&owner, &graph_path, || {
+                replacement.graph.save(&graph_path).map(|_| ())
             })
             .expect_err("replacement during verification must fail");
         assert!(
@@ -3813,18 +4618,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let graph_path = directory.path().join("all-fields.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
-        let store = TestStore::synthetic(48, 8);
-        let graph = NativeHnsw::build(params(), 0xfeed, &store).expect("graph");
-        let binding = generation_binding(77, 0x77, "every-receipt-field", 8);
-        let original = binding.save(&graph, &graph_path).expect("bound save");
+        let owner = generation_owner(77, 0x77, "every-receipt-field", 8, 48);
+        let bound =
+            ValidatedNativeHnsw::build(&owner, params(), 0xfeed).expect("owner-bound graph");
+        let original = bound.save(&graph_path).expect("owner-bound save");
 
         macro_rules! rejects_resealed {
             ($label:literal, $change:expr) => {{
                 let mut changed = original.clone();
                 ($change)(&mut changed);
                 write_resealed_receipt(&receipt_path, &mut changed);
-                let error = binding
-                    .load(&graph_path, &store)
+                let error = ValidatedNativeHnsw::load(&owner, &graph_path)
                     .expect_err(concat!($label, " drift must fail"));
                 assert!(
                     matches!(
@@ -3837,124 +4641,148 @@ mod tests {
             }};
         }
 
-        rejects_resealed!("receipt schema", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("receipt schema", |r: &mut NativeHnswGenerationReceiptV2| {
             r.schema_version += 1;
         });
         rejects_resealed!(
             "generation schema",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.artifact_generation.schema_version += 1;
                 r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
             }
         );
         rejects_resealed!(
             "generation sequence",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.artifact_generation.sequence += 1;
                 r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
             }
         );
         rejects_resealed!(
             "generation nonce",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.artifact_generation.nonce[0] ^= 1;
                 r.artifact_generation_fingerprint = r.artifact_generation.fingerprint();
             }
         );
         rejects_resealed!(
             "generation fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.artifact_generation_fingerprint = "0".repeat(64);
             }
         );
         rejects_resealed!(
             "embedding identity fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.embedding_identity_fingerprint = "1".repeat(64);
             }
         );
         rejects_resealed!(
             "embedding space fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.embedding_space_fingerprint = "2".repeat(64);
             }
         );
         rejects_resealed!(
             "embedding producer fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.embedding_producer_fingerprint = "3".repeat(64);
             }
         );
         rejects_resealed!(
             "embedding input fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.embedding_input_fingerprint = "4".repeat(64);
             }
         );
         rejects_resealed!(
             "vector storage fingerprint",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.vector_storage_fingerprint = "5".repeat(64);
             }
         );
-        rejects_resealed!("graph basename", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!(
+            "vector content digest",
+            |r: &mut NativeHnswGenerationReceiptV2| {
+                r.vector_content_digest = "8".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "ordered live-docset digest",
+            |r: &mut NativeHnswGenerationReceiptV2| {
+                r.ordered_live_docset_digest = "9".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "FSVI whole-image SHA-256",
+            |r: &mut NativeHnswGenerationReceiptV2| {
+                r.fsvi_whole_image_sha256 = "a".repeat(64);
+            }
+        );
+        rejects_resealed!(
+            "FSVI physical row count",
+            |r: &mut NativeHnswGenerationReceiptV2| {
+                r.fsvi_physical_row_count += 1;
+            }
+        );
+        rejects_resealed!("graph basename", |r: &mut NativeHnswGenerationReceiptV2| {
             r.graph_basename = "other.fshnsw".to_owned();
         });
         rejects_resealed!(
             "graph byte length",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.graph_byte_len += 1;
             }
         );
-        rejects_resealed!("graph SHA-256", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("graph SHA-256", |r: &mut NativeHnswGenerationReceiptV2| {
             r.graph_sha256 = "6".repeat(64);
         });
         rejects_resealed!(
             "native format version",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.native_format_version += 1;
             }
         );
-        rejects_resealed!("parameter m", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("parameter m", |r: &mut NativeHnswGenerationReceiptV2| {
             r.params.m += 1;
         });
-        rejects_resealed!("parameter m0", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("parameter m0", |r: &mut NativeHnswGenerationReceiptV2| {
             r.params.m0 += 1;
         });
         rejects_resealed!(
             "parameter ef_construction",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.params.ef_construction += 1;
             }
         );
         rejects_resealed!(
             "parameter ef_search",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.params.ef_search += 1;
             }
         );
-        rejects_resealed!("seed", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("seed", |r: &mut NativeHnswGenerationReceiptV2| {
             r.seed ^= 1;
         });
-        rejects_resealed!("point count", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("point count", |r: &mut NativeHnswGenerationReceiptV2| {
             r.point_count += 1;
         });
-        rejects_resealed!("entry point", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("entry point", |r: &mut NativeHnswGenerationReceiptV2| {
             let count = u32::try_from(r.point_count).expect("test count");
             r.entry_point = Some((r.entry_point.expect("non-empty graph") + 1) % count);
         });
-        rejects_resealed!("maximum level", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("maximum level", |r: &mut NativeHnswGenerationReceiptV2| {
             r.max_level = u64::from(r.max_level == 0);
         });
-        rejects_resealed!("payload CRC", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("payload CRC", |r: &mut NativeHnswGenerationReceiptV2| {
             r.payload_crc32 ^= 1;
         });
-        rejects_resealed!("header CRC", |r: &mut NativeHnswGenerationReceiptV1| {
+        rejects_resealed!("header CRC", |r: &mut NativeHnswGenerationReceiptV2| {
             r.header_crc32 ^= 1;
         });
         rejects_resealed!(
             "topology SHA-256",
-            |r: &mut NativeHnswGenerationReceiptV1| {
+            |r: &mut NativeHnswGenerationReceiptV2| {
                 r.topology_sha256 = "7".repeat(64);
             }
         );
@@ -3963,7 +4791,7 @@ mod tests {
         *receipt_seal_tamper.last_mut().expect("receipt seal byte") ^= 1;
         std::fs::write(&receipt_path, receipt_seal_tamper).expect("receipt seal tamper");
         assert!(
-            binding.load(&graph_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&owner, &graph_path).is_err(),
             "receipt SHA-256 is itself a bound field"
         );
 
@@ -3972,14 +4800,14 @@ mod tests {
             original.to_bytes().expect("restore original receipt"),
         )
         .expect("restore receipt");
-        let wrong_generation = generation_binding(78, 0x78, "every-receipt-field", 8);
+        let wrong_generation = generation_owner(78, 0x78, "every-receipt-field", 8, 48);
         assert!(
-            wrong_generation.load(&graph_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&wrong_generation, &graph_path).is_err(),
             "caller-held generation drift must fail"
         );
-        let wrong_identity = generation_binding(77, 0x77, "different-identity", 8);
+        let wrong_identity = generation_owner(77, 0x77, "different-identity", 8, 48);
         assert!(
-            wrong_identity.load(&graph_path, &store).is_err(),
+            ValidatedNativeHnsw::load(&wrong_identity, &graph_path).is_err(),
             "caller-held frozen identity drift must fail"
         );
     }
@@ -4019,9 +4847,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let store = TestStore::synthetic(16, 4);
-        let graph = NativeHnsw::build(params(), 19, &store).expect("graph");
-        let binding = generation_binding(19, 0x19, "path-hardening", 4);
+        let owner = generation_owner(19, 0x19, "path-hardening", 4, 16);
+        let bound = ValidatedNativeHnsw::build(&owner, params(), 19).expect("owner-bound graph");
 
         let preflight_graph = directory.path().join("preflight.fshnsw");
         let preflight_receipt =
@@ -4031,8 +4858,8 @@ mod tests {
         symlink(&receipt_target, &preflight_receipt).expect("receipt symlink");
         assert!(
             matches!(
-                binding
-                    .save(&graph, &preflight_graph)
+                bound
+                    .save(&preflight_graph)
                     .expect_err("receipt symlink must fail before graph save"),
                 SearchError::Io(_)
             ),
@@ -4044,17 +4871,16 @@ mod tests {
         );
 
         let source_graph = directory.path().join("source.fshnsw");
-        binding.save(&graph, &source_graph).expect("source binding");
+        bound.save(&source_graph).expect("source binding");
         let source_receipt =
             native_hnsw_generation_receipt_path(&source_graph).expect("source receipt");
         let alias_graph = directory.path().join("alias.fshnsw");
-        graph.save(&alias_graph).expect("alias graph bytes");
+        bound.graph.save(&alias_graph).expect("alias graph bytes");
         let alias_receipt =
             native_hnsw_generation_receipt_path(&alias_graph).expect("alias receipt");
         symlink(&source_receipt, &alias_receipt).expect("load receipt symlink");
         assert!(matches!(
-            binding
-                .load(&alias_graph, &store)
+            ValidatedNativeHnsw::load(&owner, &alias_graph)
                 .expect_err("load must reject receipt symlink"),
             SearchError::Io(_)
         ));
@@ -4064,8 +4890,8 @@ mod tests {
             native_hnsw_generation_receipt_path(&special_graph).expect("special receipt");
         std::fs::create_dir(&special_receipt).expect("special receipt directory");
         assert!(matches!(
-            binding
-                .save(&graph, &special_graph)
+            bound
+                .save(&special_graph)
                 .expect_err("special receipt must fail before graph save"),
             SearchError::Io(_)
         ));
@@ -4076,8 +4902,8 @@ mod tests {
         let alias_parent = directory.path().join("alias-parent");
         symlink(&real_parent, &alias_parent).expect("symlink parent");
         assert!(matches!(
-            binding
-                .save(&graph, &alias_parent.join("graph.fshnsw"))
+            bound
+                .save(&alias_parent.join("graph.fshnsw"))
                 .expect_err("symlinked parent must fail"),
             SearchError::Io(_)
         ));
