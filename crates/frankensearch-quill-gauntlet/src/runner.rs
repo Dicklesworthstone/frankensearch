@@ -6340,19 +6340,40 @@ mod tests {
         assert!(close_position(KEEPER_SEAL) < committed_open);
         assert!(close_position(ARGUS_PARSE) < close_position(ARGUS_SCORE));
         assert!(close_position(ARGUS_SCORE) < close_position(ARGUS_COLLECT));
-        assert!(
-            logs.lines().any(|line| {
+        let paginated_queries = logs
+            .lines()
+            .filter(|line| {
                 is_stage_close(line, ARGUS_QUERY)
-                    && line.contains("offset=17")
-                    && line.contains("exact_count=true")
+                    && trace_has_text_field(line, "query_id", "paginated")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(7)
+                    && trace_field_u64(line, "offset") == Some(17)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's paginated collector: {logs}",
+            "live G1a trace did not execute Quill's count-free requested page: {logs}",
         );
         assert!(
-            logs.lines().any(|line| {
-                is_stage_close(line, ARGUS_QUERY) && line.contains("exact_count=false")
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(280)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's count-free collector: {logs}",
+            "live G1a trace did not execute Quill's expanded ranked evidence: {logs}",
+        );
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(0)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=true")
+                    && trace_field_u64(line, "result_count") == Some(0)
+                    && trace_field_u64(line, "total_count").is_some_and(|count| count > 0)
+            }),
+            "live G1a trace did not execute Quill's independent count-only evidence: {logs}",
         );
         let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
             .expect("parse committed E4.10 rank-list golden for trace contract");
