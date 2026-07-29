@@ -5511,6 +5511,7 @@ impl FsfsRuntime {
                 .await?;
             (false, payloads)
         };
+        Self::validate_bound_search_resources(resources, mode)?;
 
         Ok(SearchServeResponse {
             ok: true,
@@ -6160,6 +6161,7 @@ impl FsfsRuntime {
             .await
     }
 
+    #[cfg(test)]
     async fn execute_search_payloads_with_mode(
         &self,
         cx: &Cx,
@@ -6237,7 +6239,6 @@ impl FsfsRuntime {
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPayload>> {
         let mode = SearchExecutionMode::Full;
-        self.validate_current_search_admission(mode)?;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         if !cache_enabled {
             return self
@@ -6246,14 +6247,28 @@ impl FsfsRuntime {
                 )
                 .await;
         }
+        let index_root = self.resolve_status_index_root()?;
+        Self::validate_search_generation_at_root(&index_root, mode)?;
+        let lookup_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
+        Self::validate_search_generation_fingerprint(&index_root, &lookup_fingerprint, mode)?;
         let key = self.search_cache_key(query, limit, mode);
-        match self.try_load_search_payload_cache(&key) {
+        match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 if let Some(sink) = phase_sink.as_deref_mut() {
                     for payload in &payloads {
+                        Self::validate_search_generation_fingerprint(
+                            &index_root,
+                            &lookup_fingerprint,
+                            mode,
+                        )?;
                         sink(payload)?;
                     }
                 }
+                Self::validate_search_generation_fingerprint(
+                    &index_root,
+                    &lookup_fingerprint,
+                    mode,
+                )?;
                 if let Err(error) =
                     self.persist_explain_session_for_cached_payloads(query, &payloads)
                 {
@@ -6273,10 +6288,31 @@ impl FsfsRuntime {
             }
         }
 
-        let payloads = self
-            .execute_search_payloads_with_mode_and_phase_sink(cx, query, limit, mode, phase_sink)
+        let mut resources = self
+            .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
             .await?;
-        if let Err(error) = self.write_search_payload_cache(&key, &payloads) {
+        let execution_fingerprint = resources.generation_fingerprint.clone();
+        let artifacts = self
+            .execute_search_phase_artifacts_with_mode_using_resources(
+                cx,
+                query,
+                limit,
+                mode,
+                &mut resources,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: true,
+                },
+                phase_sink,
+            )
+            .await?;
+        Self::validate_search_generation_fingerprint(&index_root, &execution_fingerprint, mode)?;
+        let payloads = artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect::<Vec<_>>();
+        if let Err(error) = self.write_search_payload_cache(&key, &payloads, &execution_fingerprint)
+        {
             warn!(
                 error = %error,
                 "fsfs search cache write failed; continuing without cache persistence"
@@ -6320,30 +6356,73 @@ impl FsfsRuntime {
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
         let expansion_limit = (limit.saturating_mul(2)).max(20);
-        let mut all_payloads: Vec<SearchPayload> = Vec::new();
+        let mut resources = self
+            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+            .await?;
+        let expansion_fingerprint = resources.generation_fingerprint.clone();
+        let all_payloads = self
+            .execute_expanded_query_variants(
+                cx,
+                &expansion.queries,
+                expansion_limit,
+                &mut resources,
+                &expansion_fingerprint,
+            )
+            .await?;
 
-        for expanded in &expansion.queries {
+        // Fuse all results using cross-query reciprocal rank fusion.
+        let fused_payload =
+            Self::fuse_expanded_payloads(query, &all_payloads, limit, self.config.search.rrf_k);
+        Self::validate_search_generation_fingerprint(
+            &resources.index_root,
+            &expansion_fingerprint,
+            SearchExecutionMode::Full,
+        )?;
+
+        Ok(vec![fused_payload])
+    }
+
+    async fn execute_expanded_query_variants(
+        &self,
+        cx: &Cx,
+        queries: &[query_expansion::ExpandedQuery],
+        expansion_limit: usize,
+        resources: &mut SearchExecutionResources,
+        expansion_fingerprint: &str,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let mut payloads = Vec::new();
+        for expanded in queries {
+            Self::validate_search_generation_fingerprint(
+                &resources.index_root,
+                expansion_fingerprint,
+                SearchExecutionMode::Full,
+            )?;
             info!(
                 strategy = expanded.strategy.label(),
                 query_text = expanded.text,
                 "fsfs expanded query: executing search variant"
             );
             let variant_payloads = self
-                .execute_search_payloads_with_mode(
+                .execute_search_payloads_with_mode_using_resources(
                     cx,
                     &expanded.text,
                     expansion_limit,
                     SearchExecutionMode::Full,
+                    resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
                 )
                 .await?;
-            all_payloads.extend(variant_payloads);
+            Self::validate_search_generation_fingerprint(
+                &resources.index_root,
+                expansion_fingerprint,
+                SearchExecutionMode::Full,
+            )?;
+            payloads.extend(variant_payloads);
         }
-
-        // Fuse all results using cross-query reciprocal rank fusion.
-        let fused_payload =
-            Self::fuse_expanded_payloads(query, &all_payloads, limit, self.config.search.rrf_k);
-
-        Ok(vec![fused_payload])
+        Ok(payloads)
     }
 
     /// Fuse search payloads from multiple expanded queries using RRF.
@@ -6489,6 +6568,7 @@ impl FsfsRuntime {
         Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
     }
 
+    #[cfg(test)]
     fn search_index_fingerprint(&self) -> SearchResult<String> {
         let index_root = self.resolve_status_index_root()?;
         Self::search_index_fingerprint_at_root(&index_root)
@@ -6497,10 +6577,26 @@ impl FsfsRuntime {
     fn search_index_fingerprint_at_root(index_root: &Path) -> SearchResult<String> {
         let mut hasher = Sha256::new();
 
-        if let Some(sentinel) = Self::read_index_sentinel(index_root)? {
-            hasher.update(sentinel.source_hash_hex.as_bytes());
-            hasher.update(sentinel.generated_at_ms.to_le_bytes());
-            hasher.update([u8::from(sentinel.generation_complete)]);
+        for (label, path) in [
+            (CURRENT_FILE_NAME, index_root.join(CURRENT_FILE_NAME)),
+            (
+                "lexical/CURRENT",
+                index_root.join("lexical").join(CURRENT_FILE_NAME),
+            ),
+            (FSFS_SENTINEL_FILE, index_root.join(FSFS_SENTINEL_FILE)),
+        ] {
+            hasher.update(label.as_bytes());
+            match fs::read(path) {
+                Ok(bytes) => {
+                    hasher.update([1]);
+                    hasher.update(bytes.len().to_le_bytes());
+                    hasher.update(bytes);
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    hasher.update([0]);
+                }
+                Err(error) => return Err(SearchError::Io(error)),
+            }
         }
 
         for rel in [
@@ -6512,27 +6608,75 @@ impl FsfsRuntime {
             "lexical",
         ] {
             let path = index_root.join(rel);
-            hasher.update(rel.as_bytes());
-            match fs::metadata(&path) {
-                Ok(metadata) => {
-                    hasher.update([1]);
-                    hasher.update(metadata.len().to_le_bytes());
-                    let modified_ms = metadata.modified().ok().map_or(0, system_time_to_ms);
-                    hasher.update(modified_ms.to_le_bytes());
-                }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    hasher.update([0]);
-                }
-                Err(error) => return Err(SearchError::Io(error)),
+            Self::hash_search_artifact_identity(&mut hasher, rel, &path)?;
+        }
+        let vector_wal_path =
+            frankensearch_index::wal_path_for(&index_root.join(FSFS_VECTOR_INDEX_FILE));
+        Self::hash_search_artifact_identity(&mut hasher, "vector_index_wal", &vector_wal_path)?;
+
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        if let Some(engine_dir) = lexical_layout.engine_dir() {
+            for file_name in ["MANIFEST", "MANIFEST.prev", "meta.json"] {
+                let path = engine_dir.join(file_name);
+                let label = format!("active_lexical/{file_name}");
+                Self::hash_search_artifact_identity(&mut hasher, &label, &path)?;
             }
         }
 
         Ok(sha256_digest_hex(hasher.finalize()))
     }
 
+    fn hash_search_artifact_identity(
+        hasher: &mut Sha256,
+        label: &str,
+        path: &Path,
+    ) -> SearchResult<()> {
+        hasher.update(label.as_bytes());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                hasher.update([0]);
+                return Ok(());
+            }
+            Err(error) => return Err(SearchError::Io(error)),
+        };
+        hasher.update([1]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+            hasher.update(metadata.len().to_le_bytes());
+            hasher.update(metadata.mtime().to_le_bytes());
+            hasher.update(metadata.mtime_nsec().to_le_bytes());
+            hasher.update(metadata.ctime().to_le_bytes());
+            hasher.update(metadata.ctime_nsec().to_le_bytes());
+        }
+
+        #[cfg(not(unix))]
+        {
+            hasher.update(metadata.len().to_le_bytes());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
+            hasher.update(modified.map_or(0, |value| value.as_secs()).to_le_bytes());
+            hasher.update(
+                modified
+                    .map_or(0, |value| value.subsec_nanos())
+                    .to_le_bytes(),
+            );
+        }
+
+        Ok(())
+    }
+
     fn try_load_search_payload_cache(
         &self,
         key: &SearchCacheKey,
+        expected_fingerprint: &str,
     ) -> SearchResult<Option<Vec<SearchPayload>>> {
         let cache_path = self.search_cache_path(key)?;
         let raw = match fs::read_to_string(&cache_path) {
@@ -6550,7 +6694,7 @@ impl FsfsRuntime {
         if record.schema_version != FSFS_SEARCH_CACHE_SCHEMA_VERSION || record.key != *key {
             return Ok(None);
         }
-        if record.index_fingerprint != self.search_index_fingerprint()? {
+        if record.index_fingerprint != expected_fingerprint {
             return Ok(None);
         }
         Ok(Some(record.payloads))
@@ -6560,6 +6704,7 @@ impl FsfsRuntime {
         &self,
         key: &SearchCacheKey,
         payloads: &[SearchPayload],
+        index_fingerprint: &str,
     ) -> SearchResult<()> {
         let cache_path = self.search_cache_path(key)?;
         if let Some(parent) = cache_path.parent() {
@@ -6568,7 +6713,7 @@ impl FsfsRuntime {
 
         let record = SearchCacheRecord {
             schema_version: FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
-            index_fingerprint: self.search_index_fingerprint()?,
+            index_fingerprint: index_fingerprint.to_owned(),
             key: key.clone(),
             payloads: payloads.to_vec(),
         };
@@ -6992,9 +7137,11 @@ impl FsfsRuntime {
                     index_freshness,
                 ),
             };
+            Self::validate_bound_search_resources(resources, mode)?;
             if let Some(sink) = phase_sink.as_deref_mut() {
                 sink(&artifact.payload)?;
             }
+            Self::validate_bound_search_resources(resources, mode)?;
             return Ok(vec![artifact]);
         }
 
@@ -7315,6 +7462,9 @@ impl FsfsRuntime {
                                     .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                                     .collect::<Vec<_>>()
                             }
+                            Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
+                                return Err(error);
+                            }
                             Err(error) if lexical_fallback_authorized => {
                                 Self::record_semantic_lexical_fallback(
                                     resources,
@@ -7394,6 +7544,7 @@ impl FsfsRuntime {
             fused: fused_initial.clone(),
             payload: payload.clone(),
         };
+        Self::validate_bound_search_resources(resources, mode)?;
         if let Some(sink) = phase_sink.as_deref_mut() {
             sink(&initial_artifact.payload)?;
         }
@@ -7473,6 +7624,7 @@ impl FsfsRuntime {
                             fused: fused_refined,
                             payload: refined_payload,
                         };
+                        Self::validate_bound_search_resources(resources, mode)?;
                         if let Some(sink) = phase_sink.as_deref_mut() {
                             sink(&refined_artifact.payload)?;
                         }
@@ -7520,6 +7672,7 @@ impl FsfsRuntime {
                             fused: fused_initial.clone(),
                             payload: failed_payload,
                         };
+                        Self::validate_bound_search_resources(resources, mode)?;
                         if let Some(sink) = phase_sink.as_deref_mut() {
                             sink(&failed_artifact.payload)?;
                         }
@@ -7552,6 +7705,7 @@ impl FsfsRuntime {
                     fused: fused_initial.clone(),
                     payload: failed_payload,
                 };
+                Self::validate_bound_search_resources(resources, mode)?;
                 if let Some(sink) = phase_sink {
                     sink(&failed_artifact.payload)?;
                 }
@@ -7624,6 +7778,7 @@ impl FsfsRuntime {
             "fsfs search rerank phase status"
         );
 
+        Self::validate_bound_search_resources(resources, mode)?;
         Ok(artifacts)
     }
 
@@ -10730,21 +10885,6 @@ impl FsfsRuntime {
             total_canonical_bytes,
             source_hash_hex: source_hash_hex.clone(),
         };
-        self.write_index_sentinel(&index_root, &sentinel)?;
-
-        // Remove checkpoint on successful completion (unless degraded or deferred).
-        let should_persist_checkpoint = !generation_complete;
-        if should_persist_checkpoint {
-            checkpoint.updated_at_ms = pressure_timestamp_ms();
-            checkpoint.artifacts_durable = true;
-            checkpoint.source_hash_hex = source_hash_hex;
-            checkpoint.reason_codes = reason_codes;
-            checkpoint.discovered_files = stats.discovered_files;
-            checkpoint.skipped_files = skipped_files;
-            write_indexing_checkpoint(&index_root, &checkpoint)?;
-        } else {
-            remove_indexing_checkpoint(&index_root)?;
-        }
 
         let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
@@ -10756,6 +10896,41 @@ impl FsfsRuntime {
         let elapsed_ms = total_start.elapsed().as_millis();
 
         let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
+
+        if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.lexical.current",
+                    source: Box::new(source),
+                }
+            })?;
+            info!(
+                event = "fsfs.lexical_current_published",
+                engine = pointer.engine().label(),
+                engine_dir = pointer.dir_name(),
+                index_format_version = pointer.index_format_version(),
+                old_dir_retained = lexical_plan.previous_engine.is_some(),
+                "fsfs published the rebuilt lexical engine"
+            );
+        }
+
+        // CURRENT and every durable artifact must become visible before the
+        // completeness sentinel unlocks this generation. The undurable
+        // checkpoint remains an admission lock across the entire publication
+        // window, so a concurrent search cannot combine the successor vector
+        // generation with the predecessor lexical CURRENT.
+        self.write_index_sentinel(&index_root, &sentinel)?;
+        if generation_complete {
+            remove_indexing_checkpoint(&index_root)?;
+        } else {
+            checkpoint.updated_at_ms = pressure_timestamp_ms();
+            checkpoint.artifacts_durable = true;
+            checkpoint.source_hash_hex = source_hash_hex;
+            checkpoint.reason_codes = reason_codes;
+            checkpoint.discovered_files = stats.discovered_files;
+            checkpoint.skipped_files = skipped_files;
+            write_indexing_checkpoint(&index_root, &checkpoint)?;
+        }
 
         on_progress(&make_snapshot(
             final_stage,
@@ -10779,23 +10954,6 @@ impl FsfsRuntime {
             &degradation_reason,
             &recent_warnings,
         ))?;
-
-        if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
-            publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
-                SearchError::SubsystemError {
-                    subsystem: "fsfs.lexical.current",
-                    source: Box::new(source),
-                }
-            })?;
-            info!(
-                event = "fsfs.lexical_current_published",
-                engine = pointer.engine().label(),
-                engine_dir = pointer.dir_name(),
-                index_format_version = pointer.index_format_version(),
-                old_dir_retained = lexical_plan.previous_engine.is_some(),
-                "fsfs published the rebuilt lexical engine"
-            );
-        }
 
         info!(
             command = ?command,
@@ -11502,18 +11660,44 @@ impl FsfsRuntime {
         index_root: &Path,
         mode: SearchExecutionMode,
     ) -> SearchResult<()> {
-        if let Some(checkpoint) = read_indexing_checkpoint(index_root)? {
-            validate_checkpoint_search_admission(index_root, &checkpoint, mode)?;
-        }
         if let Some(sentinel) = Self::read_index_sentinel(index_root)? {
             validate_sentinel_search_admission(index_root, &sentinel, mode)?;
+        }
+        if let Some(checkpoint) = read_indexing_checkpoint(index_root)? {
+            validate_checkpoint_search_admission(index_root, &checkpoint, mode)?;
         }
         Ok(())
     }
 
-    fn validate_current_search_admission(&self, mode: SearchExecutionMode) -> SearchResult<()> {
-        let index_root = self.resolve_status_index_root()?;
-        Self::validate_search_generation_at_root(&index_root, mode)
+    fn validate_bound_search_resources(
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        Self::validate_search_generation_fingerprint(
+            &resources.index_root,
+            &resources.generation_fingerprint,
+            mode,
+        )
+    }
+
+    fn validate_search_generation_fingerprint(
+        index_root: &Path,
+        expected_fingerprint: &str,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        let current_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
+        if current_fingerprint != expected_fingerprint {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "index generation changed while search results were being computed; retry the request"
+                    .to_owned(),
+            });
+        }
+        if !matches!(mode, SearchExecutionMode::LexicalOnly) {
+            Self::validate_search_generation_at_root(index_root, mode)?;
+        }
+        Ok(())
     }
 
     async fn rebind_search_resources_if_generation_changed(
@@ -11522,13 +11706,21 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<bool> {
-        Self::validate_search_generation_at_root(&resources.index_root, mode)?;
         let current_fingerprint = Self::search_index_fingerprint_at_root(&resources.index_root)?;
         if current_fingerprint == resources.generation_fingerprint {
+            if !matches!(mode, SearchExecutionMode::LexicalOnly) {
+                Self::validate_search_generation_at_root(&resources.index_root, mode)?;
+            }
             return Ok(false);
         }
+        let index_root = resources.index_root.clone();
         *resources = self
-            .prepare_search_execution_resources_with_modes(cx, mode, SearchExecutionMode::Full)
+            .prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                &index_root,
+                mode,
+                SearchExecutionMode::Full,
+            )
             .await?;
         Ok(true)
     }
@@ -11561,11 +11753,27 @@ impl FsfsRuntime {
         resource_mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
         let index_root = self.resolve_status_index_root()?;
-        self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
+        self.prepare_search_execution_resources_at_root_with_modes(
+            cx,
+            &index_root,
+            admission_mode,
+            resource_mode,
+        )
+        .await
+    }
+
+    async fn prepare_search_execution_resources_at_root_with_modes(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        admission_mode: SearchExecutionMode,
+        resource_mode: SearchExecutionMode,
+    ) -> SearchResult<SearchExecutionResources> {
+        self.rebuild_tantivy_lexical_index_if_needed(cx, index_root)
             .await?;
-        Self::validate_search_generation_at_root(&index_root, admission_mode)?;
-        let admitted_generation_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
-        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        Self::validate_search_generation_at_root(index_root, admission_mode)?;
+        let admitted_generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
         let lexical_path = lexical_layout.engine_dir();
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -11577,7 +11785,7 @@ impl FsfsRuntime {
         };
         let lexical_available = lexical_index.is_some();
         let shadow_runtime = lexical_index.as_ref().and_then(|index| {
-            self.prepare_shadow_oracle_observer(&index_root, &lexical_layout, index)
+            self.prepare_shadow_oracle_observer(index_root, &lexical_layout, index)
         });
         let (shadow_observer, shadow_pressure_sampler) = shadow_runtime
             .map_or((None, None), |(observer, sampler)| {
@@ -11622,7 +11830,8 @@ impl FsfsRuntime {
             });
         }
 
-        let generation_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
+        Self::validate_search_generation_at_root(index_root, admission_mode)?;
+        let generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
         if generation_fingerprint != admitted_generation_fingerprint {
             return Err(SearchError::InvalidConfig {
                 field: "cli.index_dir".to_owned(),
@@ -11633,7 +11842,7 @@ impl FsfsRuntime {
         }
 
         Ok(SearchExecutionResources {
-            index_root,
+            index_root: index_root.to_path_buf(),
             generation_fingerprint,
             lexical_index,
             shadow_observer,
@@ -18204,12 +18413,12 @@ mod tests {
         FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsFlushAck, FsfsFlushRequest,
         FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
         IndexStoragePaths, IndexingBatchEmbeddingOutcome, InterfaceMode, LiveIngestPipeline,
-        SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
-        SearchServeRequest, SemanticGateDecisionInput, SemanticRecallDecisionInput,
-        VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
-        degradation_controller_config_for_profile, detect_context_preview_format,
-        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
-        render_status_table,
+        SearchCacheRecord, SearchDashboardState, SearchExecutionFlags, SearchExecutionMode,
+        SearchExecutionResources, SearchServeRequest, SemanticGateDecisionInput,
+        SemanticRecallDecisionInput, VectorIndexWriteAction, VectorPipelineInput,
+        VectorSchedulingTier, degradation_controller_config_for_profile,
+        detect_context_preview_format, is_likely_html_fragment,
+        normalize_html_fragment_for_markdown, read_durable_json, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -18227,6 +18436,7 @@ mod tests {
     use crate::pressure::HostPressureCollector;
     use crate::pressure::{DegradationStage, PressureSignal, PressureState, QueryCapabilityMode};
     use crate::query_execution::{FusedCandidate, LexicalCandidate};
+    use crate::query_expansion;
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
     use crate::stream_protocol::{
@@ -19259,7 +19469,155 @@ mod tests {
     }
 
     #[test]
-    fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
+    fn search_generation_fingerprint_tracks_exact_current_pointer_bytes() {
+        let temp = tempfile::tempdir().expect("index root");
+        let first = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-a1",
+            frankensearch_quill::FSLX_FORMAT_VERSION,
+        )
+        .expect("create first same-width CURRENT pointer");
+        let second = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-b1",
+            frankensearch_quill::FSLX_FORMAT_VERSION,
+        )
+        .expect("create second same-width CURRENT pointer");
+        assert_eq!(
+            first.encode().len(),
+            second.encode().len(),
+            "regression requires a metadata-size-equivalent CURRENT swap"
+        );
+        fs::create_dir_all(temp.path().join(first.dir_name()))
+            .expect("create first root CURRENT engine directory");
+        fs::create_dir_all(temp.path().join(second.dir_name()))
+            .expect("create second root CURRENT engine directory");
+
+        publish_current(temp.path(), &first).expect("publish first CURRENT pointer");
+        let first_fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+            .expect("fingerprint first CURRENT pointer");
+
+        publish_current(temp.path(), &second).expect("publish second CURRENT pointer");
+        let second_fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+            .expect("fingerprint second CURRENT pointer");
+
+        assert_ne!(
+            first_fingerprint, second_fingerprint,
+            "CURRENT content, not size or millisecond mtime alone, must identify the lexical generation"
+        );
+
+        let nested_root = tempfile::tempdir().expect("nested lexical root");
+        let nested_lexical = nested_root.path().join("lexical");
+        fs::create_dir_all(&nested_lexical).expect("create nested lexical directory");
+        fs::create_dir_all(nested_lexical.join(first.dir_name()))
+            .expect("create first nested CURRENT engine directory");
+        fs::create_dir_all(nested_lexical.join(second.dir_name()))
+            .expect("create second nested CURRENT engine directory");
+        publish_current(&nested_lexical, &first).expect("publish first nested CURRENT pointer");
+        let first_nested_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(nested_root.path())
+                .expect("fingerprint first nested CURRENT pointer");
+
+        publish_current(&nested_lexical, &second).expect("publish second nested CURRENT pointer");
+        let second_nested_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(nested_root.path())
+                .expect("fingerprint second nested CURRENT pointer");
+
+        assert_ne!(
+            first_nested_fingerprint, second_nested_fingerprint,
+            "the legacy nested lexical CURRENT location must remain generation-bound"
+        );
+    }
+
+    #[test]
+    fn search_resources_rebind_on_vector_wal_append_and_tombstone() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("index root");
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            let vector = vec![0.125_f32; 384];
+            let mut writer = VectorIndex::create(&vector_path, "hash-384", vector.len())
+                .expect("create vector index");
+            writer
+                .write_record("old.md", &vector)
+                .expect("write main-generation vector");
+            writer.finish().expect("finish main vector generation");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::Full)
+                .await
+                .expect("open initial vector resources");
+            assert_eq!(
+                resources
+                    .vector_index
+                    .as_ref()
+                    .expect("initial vector resource")
+                    .wal_record_count(),
+                0
+            );
+
+            let mut mutator = VectorIndex::open(&vector_path).expect("open WAL mutator");
+            mutator
+                .append("new.md", &vector)
+                .expect("append successor vector through WAL");
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .expect("rebind after WAL append"),
+                "WAL-only append must invalidate retained search resources"
+            );
+            let after_append = resources
+                .vector_index
+                .as_ref()
+                .expect("vector resource after append");
+            assert_eq!(after_append.wal_record_count(), 1);
+            assert!(
+                super::vector_live_doc_ids(after_append)
+                    .expect("read append generation ids")
+                    .contains("new.md")
+            );
+
+            assert!(
+                mutator
+                    .soft_delete("old.md")
+                    .expect("tombstone main vector through WAL")
+            );
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .expect("rebind after WAL tombstone"),
+                "WAL-only tombstone must invalidate retained search resources"
+            );
+            let after_tombstone = resources
+                .vector_index
+                .as_ref()
+                .expect("vector resource after tombstone");
+            let live_ids =
+                super::vector_live_doc_ids(after_tombstone).expect("read tombstone generation ids");
+            assert!(live_ids.contains("new.md"));
+            assert!(!live_ids.contains("old.md"));
+        });
+    }
+
+    #[test]
+    fn expanded_query_variants_reject_cross_generation_fusion() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("index root");
             let lexical_path = temp.path().join("lexical");
@@ -19267,16 +19625,105 @@ mod tests {
             writer
                 .index_document(&cx, &IndexableDocument::new("alpha.md", "alpha token"))
                 .await
+                .expect("stage first expansion witness");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish first expansion witness");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::Full)
+                .await
+                .expect("open expansion resources");
+            let pinned_fingerprint = resources.generation_fingerprint.clone();
+            let first = [query_expansion::ExpandedQuery {
+                text: "alpha".to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Original,
+            }];
+            let first_payloads = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    &first,
+                    20,
+                    &mut resources,
+                    &pinned_fingerprint,
+                )
+                .await
+                .expect("execute first pinned expansion variant");
+            assert!(
+                first_payloads
+                    .iter()
+                    .any(|payload| payload.hits.iter().any(|hit| hit.path == "alpha.md"))
+            );
+
+            writer
+                .index_document(&cx, &IndexableDocument::new("beta.md", "beta token"))
+                .await
+                .expect("stage successor expansion witness");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish successor expansion generation");
+
+            let second = [query_expansion::ExpandedQuery {
+                text: "beta".to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Keyword,
+            }];
+            let error = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    &second,
+                    20,
+                    &mut resources,
+                    &pinned_fingerprint,
+                )
+                .await
+                .expect_err("cross-generation expansion fusion must fail closed");
+            assert!(
+                error.to_string().contains("generation changed"),
+                "expanded search must return retry guidance, got {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
+        run_test_with_cx(|cx| async move {
+            let serving_root = tempfile::tempdir().expect("serving index root");
+            let configured_decoy_root = tempfile::tempdir().expect("configured decoy index root");
+            let lexical_path = serving_root.path().join("lexical");
+            let writer = create_test_quill(&cx, &lexical_path).await;
+            writer
+                .index_document(&cx, &IndexableDocument::new("alpha.md", "alpha token"))
+                .await
                 .expect("stage first document");
             writer.commit(&cx).await.expect("publish first document");
+
+            let decoy = create_test_quill(&cx, &configured_decoy_root.path().join("lexical")).await;
+            decoy
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("decoy.md", "configured decoy token"),
+                )
+                .await
+                .expect("stage configured decoy document");
+            decoy.commit(&cx).await.expect("publish configured decoy");
 
             let reader = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
                 .await
                 .expect("open serve reader");
             let mut resources = SearchExecutionResources {
-                index_root: temp.path().to_path_buf(),
-                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
-                    .expect("serve generation fingerprint"),
+                index_root: serving_root.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(
+                    serving_root.path(),
+                )
+                .expect("serve generation fingerprint"),
                 lexical_index: Some(reader),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -19288,7 +19735,9 @@ mod tests {
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
             };
-            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = configured_decoy_root.path().display().to_string();
+            let runtime = FsfsRuntime::new(config);
             let mut hot_cache = HashMap::new();
             let request = |query: &str| SearchServeRequest {
                 query: query.to_owned(),
@@ -19364,6 +19813,28 @@ mod tests {
                     .payloads
                     .iter()
                     .any(|payload| { payload.hits.iter().any(|hit| hit.path == "beta.md") })
+            );
+            assert_eq!(
+                resources.index_root,
+                serving_root.path(),
+                "rebind must retain the root that produced the admitted resources"
+            );
+            let decoy_result = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("configured decoy token"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("query retained serving root");
+            assert!(
+                decoy_result
+                    .payloads
+                    .iter()
+                    .all(|payload| payload.hits.iter().all(|hit| hit.path != "decoy.md")),
+                "a valid configured decoy root must never replace the retained serving root"
             );
         });
     }
@@ -21457,13 +21928,32 @@ mod tests {
                 target_path: Some(project.clone()),
                 ..CliInput::default()
             });
+            let index_root = project.join(".frankensearch");
+            let mut observed_complete_publication = false;
 
             runtime
-                .run_mode(&cx, InterfaceMode::Cli)
+                .run_one_shot_index_scaffold_with_progress(&cx, CliCommand::Index, |snapshot| {
+                    if snapshot.stage == super::IndexingProgressStage::Completed {
+                        assert!(
+                            index_root.join("lexical").join(CURRENT_FILE_NAME).is_file(),
+                            "Completed must not become observable before lexical CURRENT"
+                        );
+                        FsfsRuntime::validate_search_generation_at_root(
+                            &index_root,
+                            SearchExecutionMode::Full,
+                        )
+                        .expect("Completed callback must observe an admitted full generation");
+                        observed_complete_publication = true;
+                    }
+                    Ok(())
+                })
                 .await
                 .expect("index scaffold command should succeed");
+            assert!(
+                observed_complete_publication,
+                "fresh semantic index must emit one admitted Completed publication"
+            );
 
-            let index_root = project.join(".frankensearch");
             assert!(index_root.join(super::FSFS_SENTINEL_FILE).exists());
             assert!(index_root.join(super::FSFS_VECTOR_MANIFEST_FILE).exists());
             assert!(index_root.join(super::FSFS_LEXICAL_MANIFEST_FILE).exists());
@@ -25763,12 +26253,15 @@ mod tests {
             refined.phase = SearchOutputPhase::Refined;
             refined.hits[0].score = 0.9;
             let payloads = vec![initial, refined];
+            let cache_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint cache generation");
 
             runtime
-                .write_search_payload_cache(&key, &payloads)
+                .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
                 .expect("write cache");
             let cached = runtime
-                .try_load_search_payload_cache(&key)
+                .try_load_search_payload_cache(&key, &cache_fingerprint)
                 .expect("read cache")
                 .expect("cache hit");
             assert_eq!(cached, payloads);
@@ -25792,13 +26285,84 @@ mod tests {
             let vector_dir = index_root.join("vector");
             std::fs::create_dir_all(&vector_dir).expect("create vector dir");
             std::fs::write(vector_dir.join("index.fsvi"), b"mutated").expect("touch vector index");
+            let mutated_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint mutated generation");
 
             let stale = runtime
-                .try_load_search_payload_cache(&key)
+                .try_load_search_payload_cache(&key, &mutated_fingerprint)
                 .expect("cache read after mutation");
             assert!(
                 stale.is_none(),
                 "cache should invalidate after index changes"
+            );
+        });
+    }
+
+    #[test]
+    fn search_payload_cache_cannot_relabel_stale_results_as_the_new_generation() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            std::fs::create_dir_all(&index_root).expect("create index root");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = index_root.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let key = runtime.search_cache_key("stale computation", 10, SearchExecutionMode::Full);
+            let stale_payloads = vec![SearchPayload::new(
+                "stale computation",
+                SearchOutputPhase::Refined,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "generation-a.rs".to_owned(),
+                    score: 0.75,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    in_both_sources: true,
+                }],
+            )];
+            let generation_a = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint generation A");
+
+            let vector_dir = index_root.join("vector");
+            std::fs::create_dir_all(&vector_dir).expect("create vector dir");
+            std::fs::write(vector_dir.join("index.fsvi"), b"generation B")
+                .expect("publish generation B vector artifact");
+            let generation_b = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint generation B");
+            assert_ne!(
+                generation_a, generation_b,
+                "the regression requires two distinct generation fingerprints"
+            );
+
+            runtime
+                .write_search_payload_cache(&key, &stale_payloads, &generation_a)
+                .expect("persist generation A computation after generation B is visible");
+
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &generation_b)
+                    .expect("read cache as generation B")
+                    .is_none(),
+                "a late generation A writer must never poison generation B's cache namespace"
+            );
+            let cache_path = runtime.search_cache_path(&key).expect("resolve cache path");
+            let record: SearchCacheRecord = serde_json::from_slice(
+                &std::fs::read(cache_path).expect("read persisted cache record"),
+            )
+            .expect("decode persisted cache record");
+            assert_eq!(
+                record.index_fingerprint, generation_a,
+                "the cache writer must preserve the execution pin instead of recomputing \
+                 and relabeling stale payloads as the currently visible generation"
             );
         });
     }
@@ -25880,12 +26444,15 @@ mod tests {
                     in_both_sources: false,
                 }],
             )];
+            let cache_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint incomplete generation");
             runtime
-                .write_search_payload_cache(&key, &cached_payloads)
+                .write_search_payload_cache(&key, &cached_payloads, &cache_fingerprint)
                 .expect("seed cache against the incomplete generation fingerprint");
             assert!(
                 runtime
-                    .try_load_search_payload_cache(&key)
+                    .try_load_search_payload_cache(&key, &cache_fingerprint)
                     .expect("read matching cache")
                     .is_some(),
                 "the regression requires an otherwise valid matching cache record"
@@ -25895,11 +26462,15 @@ mod tests {
                 .execute_search_payloads_cached_for_cli(&cx, "cached semantic", 10)
                 .await
                 .expect_err("semantic admission must run before a cache hit can escape");
-            assert!(matches!(
-                error,
-                SearchError::InvalidConfig { field, value, .. }
-                    if field == "semantic.index_generation" && value == "deferred_rows"
-            ));
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "semantic.index_generation" && value == "incomplete"
+                ),
+                "the final sentinel must remain the first semantic admission fence before cache \
+                 lookup: {error:?}"
+            );
         });
     }
 
