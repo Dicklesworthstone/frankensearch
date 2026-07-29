@@ -42,8 +42,8 @@ use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
-    ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths, star_glob_matches,
-    trailing_star_prefix, validate_bound_term, validate_query_term,
+    ByteSpan, TermDictionary, TermDictionaryError, star_glob_matches, trailing_star_prefix,
+    validate_bound_term, validate_query_term,
 };
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
@@ -8181,24 +8181,7 @@ fn open_dictionary(
     segment: &RecoveredSegment,
     schema: SchemaDescriptor,
 ) -> Result<TermDictionary<'_>, QuillIndexError> {
-    let postings = required_section(segment, SectionKind::POSTINGS)?;
-    let positions = segment.section(SectionKind::POSITIONS)?;
-    let blockmax = required_section(segment, SectionKind::BLOCKMAX)?;
-    let dictionary = required_section(segment, SectionKind::TERMDICT)?;
-    Ok(TermDictionary::parse(
-        dictionary,
-        schema,
-        TermSectionLengths {
-            postings: u64::try_from(postings.len())
-                .map_err(|_| invalid_state("POSTINGS length does not fit u64"))?,
-            positions: positions
-                .map(|bytes| u64::try_from(bytes.len()))
-                .transpose()
-                .map_err(|_| invalid_state("POSITIONS length does not fit u64"))?,
-            blockmax: u64::try_from(blockmax.len())
-                .map_err(|_| invalid_state("BLOCKMAX length does not fit u64"))?,
-        },
-    )?)
+    Ok(segment.term_dictionary(schema)?)
 }
 
 fn required_section(
@@ -9704,6 +9687,69 @@ mod tests {
         assert_send_sync::<QuillSearchSnapshot>();
         assert_send_sync::<SnapshotPublisher>();
         assert_send_sync::<QuillIndex>();
+    }
+
+    #[test]
+    fn repeated_doc_frequency_cursor_and_search_calls_reuse_validated_termdict_metadata() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("first", "alpha shared"),
+                        IndexableDocument::new("second", "beta shared"),
+                        IndexableDocument::new("third", "gamma"),
+                    ],
+                )
+                .await
+                .expect("index cache fixture");
+            index.commit(&cx).await.expect("seal cache fixture");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            let segment = &snapshot.segments()[0];
+            let (full_validations_before, borrowed_views_before) =
+                segment.term_dictionary_cache_counts();
+            assert_eq!(full_validations_before, 1);
+
+            assert_eq!(
+                snapshot_doc_freq(&snapshot, DEFAULT_SCHEMA, CONTENT_FIELD, b"shared")
+                    .expect("cached doc frequency"),
+                2
+            );
+            let term_count = usize::try_from(
+                segment
+                    .term_dictionary(DEFAULT_SCHEMA)
+                    .expect("cached cursor dictionary")
+                    .term_count(),
+            )
+            .expect("fixture term count fits usize");
+            let cursor_rows = segment
+                .term_dictionary(DEFAULT_SCHEMA)
+                .expect("cached cursor dictionary")
+                .cursor()
+                .and_then(|cursor| cursor.collect_bounded(term_count))
+                .expect("collect cached cursor");
+            assert!(!cursor_rows.is_empty());
+
+            for _ in 0..32 {
+                let hits = index
+                    .search_doc_ids(&cx, "shared", 10)
+                    .expect("repeat cached search");
+                assert_eq!(hits.len(), 2);
+            }
+            let (full_validations_after, borrowed_views_after) =
+                segment.term_dictionary_cache_counts();
+            assert_eq!(
+                full_validations_after, 1,
+                "no query path may repeat complete TERMDICT validation"
+            );
+            assert!(
+                borrowed_views_after >= borrowed_views_before.saturating_add(35),
+                "doc-frequency, two cursor opens, and 32 searches must use borrowed views"
+            );
+        });
     }
 
     #[test]
@@ -15203,12 +15249,35 @@ mod tests {
                 .collect_docids(&cx, "rust OR python")
                 .expect("collect pre-merge docids");
             let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0001);
+            let source_snapshot = index.snapshot();
+            let source_dictionary_counts = source_snapshot
+                .segments()
+                .iter()
+                .map(RecoveredSegment::term_dictionary_cache_counts)
+                .collect::<Vec<_>>();
 
             index
                 .concat_merge(&cx, &source_ids, output_segment_id, 17)
                 .await
                 .expect("merge the complete in-memory leaf run");
 
+            for (segment, (full_validations_before, borrowed_views_before)) in source_snapshot
+                .segments()
+                .iter()
+                .zip(source_dictionary_counts)
+            {
+                let (full_validations_after, borrowed_views_after) =
+                    segment.term_dictionary_cache_counts();
+                assert_eq!(
+                    full_validations_after, full_validations_before,
+                    "concat must not repeat complete TERMDICT validation"
+                );
+                assert_eq!(
+                    borrowed_views_after,
+                    borrowed_views_before + 1,
+                    "concat must open one cached dictionary view per source segment"
+                );
+            }
             assert_eq!(index.snapshot().segments().len(), 1);
             assert_eq!(
                 index.snapshot().loaded_manifest().manifest.generation,

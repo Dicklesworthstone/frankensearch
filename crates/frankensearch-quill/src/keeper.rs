@@ -14,6 +14,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -30,7 +32,7 @@ use thiserror::Error;
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermInput, TermMetadata,
-    TermSectionLengths,
+    TermSectionLengths, ValidatedTermDictionaryMetadata,
 };
 use crate::quiver::{
     BlockMaxConcatList, DocLenFieldInput, DocLenSection, EncodedBlockMax, EncodedDocLenSection,
@@ -1953,6 +1955,54 @@ fn required_identity_section<'a>(
         })
 }
 
+fn required_section_length(
+    path: &Path,
+    reader: &RecoveredSegmentBacking,
+    kind: SectionKind,
+) -> Result<u64, KeeperError> {
+    reader
+        .section_entries()
+        .iter()
+        .find(|entry| entry.kind == kind)
+        .map(|entry| entry.len)
+        .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: format!("segment is missing required {kind:?} section"),
+        })
+}
+
+fn validate_term_dictionary_metadata(
+    path: &Path,
+    reader: &RecoveredSegmentBacking,
+    schema: SchemaDescriptor,
+) -> Result<ValidatedTermDictionaryMetadata, KeeperError> {
+    let dictionary = reader
+        .section(SectionKind::TERMDICT)
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: "segment is missing required TERMDICT section".to_owned(),
+        })?;
+    let sections = TermSectionLengths {
+        postings: required_section_length(path, reader, SectionKind::POSTINGS)?,
+        positions: reader
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::POSITIONS)
+            .map(|entry| entry.len),
+        blockmax: required_section_length(path, reader, SectionKind::BLOCKMAX)?,
+    };
+    TermDictionary::validate_metadata(dictionary, schema, sections).map_err(|source| {
+        KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        }
+    })
+}
+
 fn first_tombstone_hole(
     tombstones: &TombstoneSet,
     id_map: IdMapSection<'_>,
@@ -2106,6 +2156,22 @@ impl RankPruningCache {
 /// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
 /// pair are checked during open or owned publication. All unrelated payload
 /// hashes remain lazy and are checked on first access.
+#[cfg(test)]
+struct TermDictionaryCacheCounters {
+    full_validations: AtomicU64,
+    borrowed_views: AtomicU64,
+}
+
+#[cfg(test)]
+impl TermDictionaryCacheCounters {
+    const fn new() -> Self {
+        Self {
+            full_validations: AtomicU64::new(0),
+            borrowed_views: AtomicU64::new(0),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RecoveredSegment {
     path: PathBuf,
@@ -2115,6 +2181,9 @@ pub struct RecoveredSegment {
     id_lookup: IdHashLookupPlan,
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
+    term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
+    #[cfg(test)]
+    term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
 }
 
 impl RecoveredSegment {
@@ -2122,8 +2191,14 @@ impl RecoveredSegment {
         path: PathBuf,
         manifest: ManifestSegment,
         reader: SegmentReader<ReadOnlyMappedFile>,
+        schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
-        Self::bind_backing(path, manifest, RecoveredSegmentBacking::Mapped(reader))
+        Self::bind_backing(
+            path,
+            manifest,
+            RecoveredSegmentBacking::Mapped(reader),
+            schema,
+        )
     }
 
     fn bind_owned(
@@ -2139,19 +2214,26 @@ impl RecoveredSegment {
             }
         })?;
         validate_segment_witnesses(&path, &manifest, &reader)?;
-        Self::bind_backing(path, manifest, RecoveredSegmentBacking::Owned(reader))
+        Self::bind_backing(
+            path,
+            manifest,
+            RecoveredSegmentBacking::Owned(reader),
+            schema,
+        )
     }
 
     fn bind_backing(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: RecoveredSegmentBacking,
+        schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
         Self::bind_shared(
             path,
             manifest,
             Arc::new(reader),
             Arc::new(RankPruningCache::new()),
+            schema,
         )
     }
 
@@ -2160,6 +2242,7 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
         rank_pruning_cache: Arc<RankPruningCache>,
+        schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
@@ -2205,6 +2288,14 @@ impl RecoveredSegment {
             }
         })?;
         let live_doc_count = manifest.live_doc_count();
+        #[cfg(test)]
+        let term_dictionary_cache_counters = Arc::new(TermDictionaryCacheCounters::new());
+        let term_dictionary_metadata =
+            Arc::new(validate_term_dictionary_metadata(&path, &reader, schema)?);
+        #[cfg(test)]
+        term_dictionary_cache_counters
+            .full_validations
+            .fetch_add(1, AtomicOrdering::Relaxed);
         Ok(Self {
             path,
             manifest,
@@ -2213,16 +2304,67 @@ impl RecoveredSegment {
             id_lookup,
             live_doc_count,
             rank_pruning_cache,
+            term_dictionary_metadata,
+            #[cfg(test)]
+            term_dictionary_cache_counters,
         })
     }
 
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
+        let schema = self.term_dictionary_metadata.schema();
         Self::bind_shared(
             self.path.clone(),
             manifest,
             Arc::clone(&self.reader),
             Arc::clone(&self.rank_pruning_cache),
+            schema,
+        )
+    }
+
+    pub(crate) fn term_dictionary(
+        &self,
+        schema: SchemaDescriptor,
+    ) -> Result<TermDictionary<'_>, KeeperError> {
+        if schema != self.term_dictionary_metadata.schema() {
+            return Err(KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "query schema disagrees with validated TERMDICT metadata".to_owned(),
+            });
+        }
+        let bytes = self
+            .reader
+            .section(SectionKind::TERMDICT)
+            .map_err(|source| KeeperError::SegmentOpen {
+                path: self.path.clone(),
+                source,
+            })?
+            .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                path: self.path.clone(),
+                detail: "validated TERMDICT section disappeared".to_owned(),
+            })?;
+        let dictionary =
+            TermDictionary::from_validated_metadata(bytes, &self.term_dictionary_metadata)
+                .map_err(|source| KeeperError::SegmentMetadataMismatch {
+                    path: self.path.clone(),
+                    detail: source.to_string(),
+                })?;
+        #[cfg(test)]
+        self.term_dictionary_cache_counters
+            .borrowed_views
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(dictionary)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn term_dictionary_cache_counts(&self) -> (u64, u64) {
+        (
+            self.term_dictionary_cache_counters
+                .full_validations
+                .load(AtomicOrdering::Relaxed),
+            self.term_dictionary_cache_counters
+                .borrowed_views
+                .load(AtomicOrdering::Relaxed),
         )
     }
 
@@ -2500,6 +2642,7 @@ impl KeeperSnapshot {
                 path,
                 manifest_segment.clone(),
                 reader,
+                schema,
             )?);
         }
 
@@ -5042,19 +5185,9 @@ fn open_concat_source<'a>(
         None
     };
     let blockmax = required_concat_section(segment, SectionKind::BLOCKMAX)?;
-    let termdict_bytes = required_concat_section(segment, SectionKind::TERMDICT)?;
-    let termdict = TermDictionary::parse(
-        termdict_bytes,
-        schema,
-        TermSectionLengths {
-            postings: durable_concat_len(postings, "source POSTINGS")?,
-            positions: positions
-                .map(|bytes| durable_concat_len(bytes, "source POSITIONS"))
-                .transpose()?,
-            blockmax: durable_concat_len(blockmax, "source BLOCKMAX")?,
-        },
-    )
-    .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
+    let termdict = segment
+        .term_dictionary(schema)
+        .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
     let term_count = usize::try_from(termdict.term_count()).map_err(|_| {
         ConcatMergeError::ArithmeticOverflow {
             field: "source term count",
@@ -8624,7 +8757,8 @@ fn validate_proposed_manifest_segments(
         }
         #[cfg(not(feature = "durability"))]
         let _ = protection;
-        let _validated_segment = RecoveredSegment::bind(path, manifest_segment.clone(), reader)?;
+        let _validated_segment =
+            RecoveredSegment::bind(path, manifest_segment.clone(), reader, schema)?;
     }
     Ok(())
 }
@@ -12607,6 +12741,7 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
 
     fn tier_test_segment(segment_id: u64, docid_lo: u64, docid_hi: u64) -> ManifestSegment {
         ManifestSegment {
@@ -12971,6 +13106,20 @@ mod tests {
         docid_lo: u64,
         document_ids: &[Option<&str>],
     ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+        encoded_identity_test_segment_with_dictionary(
+            segment_id,
+            docid_lo,
+            document_ids,
+            &EMPTY_TERM_DICTIONARY,
+        )
+    }
+
+    fn encoded_identity_test_segment_with_dictionary(
+        segment_id: u64,
+        docid_lo: u64,
+        document_ids: &[Option<&str>],
+        term_dictionary: &[u8],
+    ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
         let docid_hi = docid_lo
             .checked_add(u64::try_from(document_ids.len())?)
             .ok_or_else(|| QuillError::Invariant {
@@ -13020,10 +13169,10 @@ mod tests {
                 engine_version: CURRENT_ENGINE_VERSION,
             },
             &[
-                SectionInput::new(SectionKind::TERMDICT, b"termdict"),
-                SectionInput::new(SectionKind::POSTINGS, b"postings"),
-                SectionInput::new(SectionKind::POSITIONS, b"positions"),
-                SectionInput::new(SectionKind::BLOCKMAX, b"blockmax"),
+                SectionInput::new(SectionKind::TERMDICT, term_dictionary),
+                SectionInput::new(SectionKind::POSTINGS, &[]),
+                SectionInput::new(SectionKind::POSITIONS, &[]),
+                SectionInput::new(SectionKind::BLOCKMAX, &[]),
                 SectionInput::new(SectionKind::DOCLEN, b"doclen"),
                 SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()),
                 SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()),
@@ -15106,7 +15255,7 @@ mod tests {
         assert_eq!(published.segments()[0].header().segment_id, 0xb01);
         assert_eq!(
             published.segments()[1].section(SectionKind::TERMDICT)?,
-            Some(b"termdict".as_slice())
+            Some(EMPTY_TERM_DICTIONARY.as_slice())
         );
         published.segments()[0].verify()?;
         published.segments()[1].verify()?;
@@ -15125,17 +15274,125 @@ mod tests {
     }
 
     #[test]
-    fn recovered_snapshot_validates_witnesses_and_keeps_section_hashes_lazy() -> TestResult {
+    fn term_dictionary_metadata_is_validated_once_per_bound_segment_and_reused_concurrently()
+    -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xc01, 0, &[Some("cache-a")])?;
+        let second = encoded_identity_test_segment(0xc02, 65_536, &[Some("cache-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 65_537;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+
+        assert_eq!(
+            published.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        assert_eq!(
+            published.segments()[1].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        std::thread::scope(|scope| {
+            let segment = &published.segments()[0];
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        let dictionary = segment
+                            .term_dictionary(DEFAULT_SCHEMA)
+                            .expect("borrow validated TERMDICT metadata");
+                        assert_eq!(dictionary.term_count(), 0);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            published.segments()[0].term_dictionary_cache_counts(),
+            (1, 128)
+        );
+        assert_eq!(
+            published.clone().segments()[0].term_dictionary_cache_counts(),
+            (1, 128),
+            "snapshot clones share the same immutable segment binding"
+        );
+
+        let mut tombstoned = published.next_manifest()?;
+        assert!(tombstoned.segments[0].insert_tombstone(0)?);
+        let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert_eq!(
+            rebound.segments()[0].term_dictionary_cache_counts(),
+            (1, 0),
+            "a new manifest generation receives a fresh validation"
+        );
+        assert_eq!(
+            published.segments()[0].term_dictionary_cache_counts(),
+            (1, 128),
+            "the prior snapshot retains its own cache generation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_candidate_dictionary_fails_before_publication_and_preserves_live_snapshot()
+    -> TestResult {
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let live = encoded_identity_test_segment(0xc11, 0, &[Some("live")])?;
+        let mut first_manifest = genesis.next_manifest()?;
+        first_manifest.docid_high_watermark = 1;
+        first_manifest.segments = vec![manifest_segment(&live, 10)];
+        let published = genesis.publish_owned_segments(&first_manifest, vec![live])?;
+        assert_eq!(published.doc_count(), 1);
+        assert_eq!(
+            published.materialize_document_id(0),
+            Some(DocId::new("live"))
+        );
+
+        let implausible_block_header = 1_u32.to_le_bytes();
+        let invalid = encoded_identity_test_segment_with_dictionary(
+            0xc12,
+            1,
+            &[Some("must-not-publish")],
+            &implausible_block_header,
+        )?;
+        let mut rejected_manifest = published.next_manifest()?;
+        rejected_manifest.docid_high_watermark = 2;
+        rejected_manifest
+            .segments
+            .push(manifest_segment(&invalid, 20));
+        let Err(error) = published.publish_owned_segments(&rejected_manifest, vec![invalid]) else {
+            panic!("malformed TERMDICT must fail before publication");
+        };
+        assert!(matches!(
+            error,
+            KeeperError::SegmentMetadataMismatch { detail, .. }
+                if detail.contains("TERMDICT declares 1 blocks in only 4 bytes")
+        ));
+        assert_eq!(published.doc_count(), 1);
+        assert_eq!(published.segments().len(), 1);
+        assert_eq!(
+            published.materialize_document_id(0),
+            Some(DocId::new("live"))
+        );
+        assert_eq!(published.materialize_document_id(1), None);
+        assert_eq!(
+            published.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_snapshot_eagerly_validates_termdict_and_keeps_unrelated_hashes_lazy() -> TestResult
+    {
         let directory = tempdir()?;
         let encoded = encoded_test_segment(0xabc, 10, 20, 1)?;
-        let postings = encoded
+        let doclen = encoded
             .section_entries()
             .iter()
-            .find(|entry| entry.kind == SectionKind::POSTINGS)
-            .expect("postings entry");
-        let postings_offset = usize::try_from(postings.offset)?;
+            .find(|entry| entry.kind == SectionKind::DOCLEN)
+            .expect("doclen entry");
+        let doclen_offset = usize::try_from(doclen.offset)?;
         let mut bytes = encoded.as_bytes().to_vec();
-        bytes[postings_offset] ^= 0x80;
+        bytes[doclen_offset] ^= 0x80;
         std::fs::write(directory.path().join(canonical_segment_name(0xabc)), bytes)?;
         let segment = ManifestSegment {
             segment_id: 0xabc,
@@ -15155,11 +15412,34 @@ mod tests {
         assert_eq!(directory_bytes(directory.path())?, before);
         assert_eq!(snapshot.segments().len(), 1);
         assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                snapshot.segments()[0]
+                    .term_dictionary(DEFAULT_SCHEMA)?
+                    .term_count(),
+                0
+            );
+        }
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts(),
+            (1, 5)
+        );
+        let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            reopened.segments()[0].term_dictionary_cache_counts(),
+            (1, 0),
+            "each durable reload performs one fresh validation"
+        );
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert_eq!(
             snapshot.segments()[0].section(SectionKind::TERMDICT)?,
-            Some(b"termdict".as_slice())
+            Some(EMPTY_TERM_DICTIONARY.as_slice())
         );
         assert!(matches!(
-            snapshot.segments()[0].section(SectionKind::POSTINGS),
+            snapshot.segments()[0].section(SectionKind::DOCLEN),
             Err(QuillError::IndexCorrupted { .. })
         ));
 
@@ -15174,6 +15454,50 @@ mod tests {
             KeeperSnapshot::open(directory.path(), FSFS_CHUNK_SCHEMA),
             Err(KeeperError::SchemaMismatch { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn term_dictionary_checksum_failure_is_rejected_during_read_only_open() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_test_segment(0xacd, 10, 20, 1)?;
+        let term_dictionary = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::TERMDICT)
+            .expect("TERMDICT entry");
+        let term_dictionary_offset = usize::try_from(term_dictionary.offset)?;
+        let mut bytes = encoded.as_bytes().to_vec();
+        bytes[term_dictionary_offset] ^= 0x80;
+        std::fs::write(directory.path().join(canonical_segment_name(0xacd)), bytes)?;
+        let manifest = durable_test_manifest(
+            1,
+            vec![ManifestSegment {
+                segment_id: 0xacd,
+                seal_seq: 1,
+                file_len: encoded.file_len(),
+                file_xxh3: encoded.file_xxh3(),
+                docid_lo: 10,
+                docid_hi: 20,
+                doc_count: 1,
+                tombstones: TombstoneSet::new(),
+            }],
+        );
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+        let before = directory_bytes(directory.path())?;
+
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentOpen {
+                source: QuillError::IndexCorrupted { detail, .. },
+                ..
+            }) if detail.contains("section 1 checksum mismatch")
+        ));
+        assert_eq!(
+            directory_bytes(directory.path())?,
+            before,
+            "read-only recovery must not mutate after rejecting TERMDICT"
+        );
         Ok(())
     }
 
@@ -15598,7 +15922,7 @@ mod tests {
             for segment in first.segments() {
                 assert_eq!(
                     segment.section(SectionKind::TERMDICT)?,
-                    Some(b"termdict".as_slice()),
+                    Some(EMPTY_TERM_DICTIONARY.as_slice()),
                     "{label}"
                 );
             }
