@@ -555,6 +555,42 @@ where
     measured
 }
 
+fn index_batches_with_visibility_commits<E: LexicalWrite>(
+    context: &BenchContext,
+    index: &E,
+    corpus: &SyntheticCorpus,
+    document_count: u64,
+    commit_cadence: Duration,
+) -> (Duration, usize) {
+    let mut measured = Duration::ZERO;
+    let mut unpublished_since = None;
+    let mut periodic_commits = 0_usize;
+    let batch_documents = context.scale.batch_documents();
+    let mut start = 0_u64;
+    while start < document_count {
+        let remaining = document_count - start;
+        let count =
+            usize::try_from(remaining.min(batch_documents as u64)).expect("bounded batch count");
+        let documents = generated_batch(corpus, start, count, None);
+        let timer = Instant::now();
+        let unpublished_started = *unpublished_since.get_or_insert(timer);
+        context.runtime.block_on(async {
+            index
+                .index_documents(&context.cx, &documents)
+                .await
+                .expect("QG index batch");
+        });
+        measured += timer.elapsed();
+        if unpublished_started.elapsed() >= commit_cadence {
+            measured += commit(context, index);
+            periodic_commits = periodic_commits.saturating_add(1);
+            unpublished_since = None;
+        }
+        start = start.saturating_add(u64::try_from(count).expect("batch count fits u64"));
+    }
+    (measured, periodic_commits)
+}
+
 fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     let timer = Instant::now();
     context.runtime.block_on(async {
@@ -570,12 +606,46 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
     let elapsed = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
-            index_batches(context, &index, &corpus, count, None) + commit(context, &index)
+            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let mut elapsed = index_batches(context, &index, &corpus, count, None);
+            let generation_after = index.snapshot().loaded_manifest().manifest.generation;
+            elapsed += commit(context, &index);
+            if spec.gate == PerfGate::Qg1 {
+                eprintln!(
+                    "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
+                     periodic_commits={} terminal_commit_calls=1 durability=in_memory",
+                    spec.gate,
+                    spec.fixture,
+                    quill_config(spec).max_visibility_lag_ms,
+                    generation_after.saturating_sub(generation_before),
+                );
+            }
+            elapsed
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
-            let mut elapsed =
-                index_batches(context, &index, &corpus, count, None) + commit(context, &index);
+            let (mut elapsed, periodic_commits) = if spec.gate == PerfGate::Qg1 {
+                index_batches_with_visibility_commits(
+                    context,
+                    &index,
+                    &corpus,
+                    count,
+                    Duration::from_millis(quill_config(spec).max_visibility_lag_ms),
+                )
+            } else {
+                (index_batches(context, &index, &corpus, count, None), 0)
+            };
+            elapsed += commit(context, &index);
+            if spec.gate == PerfGate::Qg1 {
+                eprintln!(
+                    "[qg-commit-parity] gate={} fixture={} arm=tantivy cadence_ms={} \
+                     periodic_commits={periodic_commits} terminal_commit_calls=1 \
+                     durability=in_memory",
+                    spec.gate,
+                    spec.fixture,
+                    quill_config(spec).max_visibility_lag_ms,
+                );
+            }
             elapsed += finish_tantivy_lifecycle(index, spec, "measured_work");
             elapsed
         }
