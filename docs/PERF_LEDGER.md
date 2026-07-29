@@ -8026,3 +8026,90 @@ receipt to prove positive Quill and Tantivy observations with
 `min == max == configured width`. Preserve the same exact-ELF, dual-null,
 complete-matrix, and immediate-reproduction laws before interpreting any
 A/B magnitude.
+## 2026-07-29 — REJECT: exclusive QG-1 xlarge sweep proves requested workers do not reach Quill ingest (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+The clean revision `3684b147797c5babdad4a5568e993db40ed90da5` ran Quill
+0.2.1 and Tantivy 0.26.1 side-by-side in each same invocation from the
+self-reporting `release-perf` ELF SHA-256
+`90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a`
+(77,945,432 bytes). The sweep held the exclusive `trj-booking` claim for its
+entire 2026-07-29T16:45:32Z to 21:23:28Z window.
+
+A/A null: `0.998882 [0.975242, 1.036296]` Tantivy/Tantivy and
+`0.997971 [0.980798, 1.010896]` Quill/Quill, same invocation at requested
+1.
+
+The v5 artifacts identify `threadripperje` as a 64-core/128-thread
+Threadripper PRO 5995WX with 499 GiB RAM, one NUMA node, performance
+governor, AVX2/FMA/BMI2/AES/VAES, full `0-127` affinity, and no cpuset cap.
+Every row used the deterministic one-million-document positions-on fixture,
+in-memory durability, one excluded warmup, ten paired blocks, a 1,000 ms
+commit cadence, and one terminal commit. Both A/A nulls and the A/B ran in
+the same invocation. CV decided no row.
+
+| requested | Quill actual active / peak | Tantivy actual active IDs / peak | Quill/Tantivy median-CI | verdict |
+|---:|---:|---:|---:|---|
+| 1 | 1 / 1 | 39 / 8 | `0.257438 [0.250622, 0.262109]` | **MISS** |
+| 2 | 1 / 2 | 85 / 10 | `0.189423 [0.183838, 0.193821]` | **MISS** |
+| 4 | 1 / 4 | 504 / 16 | `(0.219794 [0.214862, 0.221369])` | **UNSCORED**, Tantivy null |
+| 8 | 1 / 8 | 595 / 25 | `(0.249382 [0.231247, 0.252693])` | **UNSCORED**, Quill null |
+| 16 | 1 / 16 | 720 / 39 | `(0.242964 [0.234366, 0.263901])` | **UNSCORED**, Tantivy null |
+| 32 | 1 / 32 | 984 / 75 | `0.218916 [0.209276, 0.227571]` | **MISS** |
+| 64 | 1 / 64 | 1,827 / 141 | `0.219276 [0.217200, 0.226471]` | **MISS** |
+| 96 | 1 / 96 | 2,759 / 193 | `(0.256653 [0.253520, 0.260727])` | **UNSCORED**, Quill null |
+| 128 | 1 / 128 | 3,556 / 264 | `0.249378 [0.236671, 0.258318]` | **MISS** |
+
+For the scoreable endpoints, A/A null:
+`0.998882 [0.975242, 1.036296]` Tantivy/Tantivy and
+`0.997971 [0.980798, 1.010896]` Quill/Quill, same invocation at requested
+1. At requested 128,
+Tantivy/Tantivy `0.982049 [0.951422, 1.013386]` and Quill/Quill
+`0.990940 [0.982398, 1.017325]`, same invocation. The five scoreable rows
+all MISS the `>=3.0x` target. The four invalid-null rows are UNSCORED.
+
+The decisive new provenance field is actual observed work: Quill created up
+to the requested number of workers, but only one new worker crossed the
+1 ms CPU-active threshold on the exact fixture at every width. Quill
+throughput consequently falls from 35,854.674 docs/s at requested 8 to
+27,130.469 docs/s at 128 instead of scaling. Tantivy churns and
+oversubscribes thousands of distinct thread IDs, yet remains 4.0x to 5.3x
+faster in every scoreable row.
+
+**Decision: REJECT / TARGET-SLICE MISS / NO QG-1 PROMOTION.** This partial
+xlarge positions-on slice has `laws_attested=false`; QG-1 remains inactive
+and the unmeasured placeholder remains authoritative. All 72 source
+artifacts plus the adjudication are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-exclusive-fullsweep-3684b147-r10-20260729T1645Z/`.
+
+**Retry predicate:** require a counted mechanism that either reduces Quill
+copy calls/bytes per document on identical input or makes the measured ingest
+hot path use more than one CPU-active worker. Then rerun the same
+exact-ELF/same-invocation Tantivy incumbent, dual-null, bootstrap median-CI,
+topology, corpus, and affinity contract. Do not blind-resample invalid-null
+rows, weaken a null law, choose a favorable width, or gate on CV.
+
+## 2026-07-29 — CORRECTION: exclusive QG-1 sweep is diagnostic/no-claim (`bd-h6eh`, YellowSparrow)
+
+The preceding MISS/negative-verdict adjudication is superseded. All nine
+sealed `QG-1.evidence.json` files have `gate_decision: null` and
+`admission_no_claim.code: evidence.incomplete_gate_selection`. Widths 1, 2,
+32, 64, and 128 report `gate_status: no_decision` and remain
+measured-provisional; widths 4, 8, 16, and 96 report
+`gate_status: invalid_null` and remain UNSCORED. All nine cell manifests have
+`laws_attested: false`.
+
+**Corrected decision: DIAGNOSTIC / NO-CLAIM / NO QG-1 VERDICT.** Retract
+every MISS and target-slice negative-verdict label attached to this tranche.
+It does not certify a scaling curve, activate QG-1, or support promotion. The
+one-CPU-active-Quill-worker observation remains useful mechanism-routing
+evidence only. The tracked tranche is 63 per-width files plus `SWEEP.md`, or
+64 files total; nine ignored `run.log` files caused the earlier local
+filesystem count of 72 source artifacts.
+
+Retry only after a counted change reduces Quill copy calls/bytes per document
+or reaches more than one CPU-active Quill worker, then run the complete
+normative QG-1 matrix and immediate reproduction. A publishable verdict
+requires the actual Tantivy incumbent in the same invocation, both A/A
+controls, bootstrap median-CIs, exact-ELF provenance, sealed concurrency
+witnesses, and `laws_attested: true`.
