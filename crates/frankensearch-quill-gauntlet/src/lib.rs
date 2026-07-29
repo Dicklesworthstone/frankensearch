@@ -77,14 +77,16 @@ pub use generator::{
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use local_perf_runner::{
-    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, run_local_perf_command,
+    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, local_perf_producer_contract_json,
+    run_local_perf_command,
 };
 pub use machine_class_registry::{
-    MACHINE_CLASS_REGISTRY_GIT_BLOB, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
-    MACHINE_CLASS_REGISTRY_SHA256, MACHINE_CLASS_REGISTRY_SPEC_COMMIT,
-    MachineClassAdmissionContext, MachineClassCanonicalizationBinding, MachineClassDecision,
-    MachineClassDerivedHashes, MachineClassError, MachineClassEvidenceBinding, MachineClassLookup,
-    MachineClassReason, MachineClassRegistry, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_GIT_BLOB,
+    MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
+    MACHINE_CLASS_REGISTRY_SPEC_COMMIT, MachineClassAdmissionContext,
+    MachineClassCanonicalizationBinding, MachineClassDecision, MachineClassDerivedHashes,
+    MachineClassError, MachineClassEvidenceBinding, MachineClassLookup, MachineClassReason,
+    MachineClassRegistry, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION, RUNNER_RECEIPT_SCHEMA_VERSION,
     RunnerArtifactManifest, RunnerArtifactManifestBinding, VerifiedRunnerIdentity,
 };
 pub use perf::{

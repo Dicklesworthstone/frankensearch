@@ -19,10 +19,10 @@ use thiserror::Error;
 /// Reviewed commit containing the normative registry.
 pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "9b23e0d4fe680c85caa887bc5f5eeb0a6ded9586";
 /// Exact Git blob of the normative registry.
-pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "65d8f09358372abe6b85b74ab16e8abff8674641";
+pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "f4dee7ba4f88076e6bc020aff6458faf863e063a";
 /// SHA-256 of the exact normative registry file bytes.
 pub const MACHINE_CLASS_REGISTRY_SHA256: &str =
-    "8540840a30c103293ec329d4e834ddb236752c4c1f2e44624b9cae9a8909449c";
+    "222248376442da954768be131af4af028ad0dc4117d6174f88045686089a808b";
 /// Registry schema accepted by this consumer.
 pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
     "frankensearch.quill-machine-class-registry.v1";
@@ -30,6 +30,11 @@ pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
 /// completion receipt.
 pub const RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str =
     "frankensearch.perf-runner-artifact-manifest.v1";
+/// Strict schema carried by every typed runner-completion receipt.
+pub const RUNNER_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-completion.v5";
+/// Build-time and executing-ELF identity required from the typed local
+/// performance producer.
+pub const LOCAL_PERF_PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v3";
 
 const REGISTRY_BYTES: &[u8] = include_bytes!("../../../docs/contracts/quill-machine-classes.json");
 const TRJ_PROVENANCE_BYTES: &[u8] =
@@ -206,7 +211,11 @@ pub struct MachineClassError {
 impl MachineClassError {
     fn new(reason: MachineClassReason, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
-        detail.truncate(240);
+        let mut limit = detail.len().min(240);
+        while !detail.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        detail.truncate(limit);
         Self { reason, detail }
     }
 }
@@ -316,6 +325,36 @@ pub struct VerifiedRunnerIdentity {
     completion: Value,
     artifact_manifest: Option<RunnerArtifactManifestBinding>,
     derived_sha256: MachineClassDerivedHashes,
+}
+
+/// Registry admission facts proven before the measured child is allowed to
+/// spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreSpawnAdmission {
+    admission_context: MachineClassAdmissionContext,
+    canonical_class_id: String,
+    hardware_sha256: String,
+    execution_identity_sha256: String,
+    durability: Value,
+}
+
+impl PreSpawnAdmission {
+    /// Prove that terminal receipt admission retained the exact pre-spawn
+    /// hardware, execution, durability, gate, and class identity.
+    pub fn verify_final(&self, identity: &VerifiedRunnerIdentity) -> Result<(), MachineClassError> {
+        if identity.admission_context != self.admission_context
+            || identity.canonical_class_id != self.canonical_class_id
+            || identity.derived_sha256.hardware != self.hardware_sha256
+            || identity.derived_sha256.identity != self.execution_identity_sha256
+            || identity.durability != self.durability
+        {
+            return Err(MachineClassError::new(
+                MachineClassReason::PrePostIdentityDrift,
+                "final runner admission differs from the pre-spawn registry admission",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Strict post-exit manifest naming the exact artifacts emitted by one run.
@@ -921,6 +960,16 @@ pub struct RunnerExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RunnerProducer {
+    pub(crate) contract_version: String,
+    pub(crate) source_git_revision: String,
+    pub(crate) source_git_dirty: bool,
+    pub(crate) cargo_lock_sha256: String,
+    pub(crate) executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerBuild {
     pub(crate) git_revision: String,
     pub(crate) git_dirty: bool,
@@ -928,6 +977,8 @@ pub struct RunnerBuild {
     pub(crate) cargo_lock_sha256: String,
     pub(crate) executable_sha256: String,
     pub(crate) command_sha256: String,
+    pub(crate) environment_sha256: String,
+    pub(crate) producer: RunnerProducer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -954,6 +1005,7 @@ pub struct RunnerCompletion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerReceipt {
+    pub(crate) schema_version: String,
     pub(crate) requested_class_id: String,
     pub(crate) derived_class_id: String,
     pub(crate) registry_sha256: String,
@@ -1148,6 +1200,13 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_git_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn embedded_source(path: &str) -> Option<&'static [u8]> {
     match path {
         "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/provenance.json" => {
@@ -1248,6 +1307,7 @@ impl MachineClassRegistry {
                 format!("unsupported registry schema {found_schema:?}"),
             ));
         }
+        validate_registry_receipt_contract(&raw)?;
         validate_registry_artifact_manifest_contract(&raw)?;
 
         let classes = required_array(&raw, "classes")?
@@ -1432,6 +1492,82 @@ impl MachineClassRegistry {
         }
     }
 
+    /// Validate the exact hardware/execution envelope before a measured child
+    /// can spawn.
+    ///
+    /// This uses the same registry predicates and precedence as terminal
+    /// receipt admission. Build, completion, and artifact facts intentionally
+    /// remain outside this pre-spawn token because they are validated at the
+    /// final commit boundary.
+    pub(crate) fn preflight(
+        &self,
+        requested_class_id: &str,
+        hardware: RunnerHardware,
+        request: RunnerExecutionRequest,
+        snapshot: RunnerExecutionSnapshot,
+        durability: RunnerDurability,
+        context: &MachineClassAdmissionContext,
+    ) -> Result<PreSpawnAdmission, MachineClassError> {
+        let receipt = RunnerReceipt {
+            schema_version: RUNNER_RECEIPT_SCHEMA_VERSION.to_owned(),
+            requested_class_id: requested_class_id.to_owned(),
+            derived_class_id: requested_class_id.to_owned(),
+            registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+            hardware,
+            execution: RunnerExecution {
+                request,
+                start: snapshot.clone(),
+                end: snapshot,
+                identity_sha256: String::new(),
+            },
+            build: RunnerBuild {
+                git_revision: "0".repeat(40),
+                git_dirty: false,
+                worktree_state_sha256: None,
+                cargo_lock_sha256: "0".repeat(64),
+                executable_sha256: "0".repeat(64),
+                command_sha256: "0".repeat(64),
+                environment_sha256: "0".repeat(64),
+                producer: RunnerProducer {
+                    contract_version: LOCAL_PERF_PRODUCER_CONTRACT_VERSION.to_owned(),
+                    source_git_revision: "0".repeat(40),
+                    source_git_dirty: false,
+                    cargo_lock_sha256: "0".repeat(64),
+                    executable_sha256: "0".repeat(64),
+                },
+            },
+            durability,
+            completion: RunnerCompletion {
+                verified: true,
+                exit_status: 0,
+                run_log_sha256: "0".repeat(64),
+                artifact_manifest_sha256: "0".repeat(64),
+                artifact_digests_verified: true,
+                started_at_utc: "pre-spawn".to_owned(),
+                finished_at_utc: "pre-spawn".to_owned(),
+            },
+        };
+        let sealed = seal_runner_receipt(receipt)?;
+        let receipt = serde_json::from_slice::<RunnerReceipt>(&sealed).map_err(|error| {
+            MachineClassError::new(MachineClassReason::SourceIdentityInvalid, error.to_string())
+        })?;
+        let resolved = self.resolve(&receipt.requested_class_id)?;
+        validate_admission_envelope(&receipt, &resolved)?;
+        validate_durability(&receipt.durability)?;
+        validate_gate_class_policy(&resolved, context)?;
+        validate_destination(context, &receipt.derived_class_id)?;
+        let derived = derive_hashes(&receipt)?;
+        Ok(PreSpawnAdmission {
+            admission_context: context.clone(),
+            canonical_class_id: receipt.derived_class_id,
+            hardware_sha256: derived.hardware,
+            execution_identity_sha256: derived.identity,
+            durability: serde_json::to_value(receipt.durability).map_err(|error| {
+                MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
+            })?,
+        })
+    }
+
     /// Strictly admit exact runner receipt bytes.
     ///
     /// # Errors
@@ -1459,6 +1595,12 @@ impl MachineClassRegistry {
             MachineClassError::new(reason, detail)
         })?;
 
+        if receipt.schema_version != RUNNER_RECEIPT_SCHEMA_VERSION {
+            return Err(MachineClassError::new(
+                MachineClassReason::SourceIdentityInvalid,
+                "runner receipt names an unsupported schema version",
+            ));
+        }
         if receipt.registry_sha256 != MACHINE_CLASS_REGISTRY_SHA256 {
             return Err(MachineClassError::new(
                 MachineClassReason::RegistryHashMismatch,
@@ -1483,44 +1625,7 @@ impl MachineClassRegistry {
         }
 
         let resolved = self.resolve(&receipt.requested_class_id)?;
-        if resolved.rule.admission_state != "registered" {
-            return Err(MachineClassError::new(
-                resolved.rule.admission_reason,
-                format!(
-                    "class {:?} is {}",
-                    receipt.requested_class_id, resolved.rule.admission_state
-                ),
-            ));
-        }
-        if receipt.derived_class_id != receipt.requested_class_id {
-            return Err(MachineClassError::new(
-                MachineClassReason::ReceiptClassMismatch,
-                "requested and derived class IDs differ",
-            ));
-        }
-
-        validate_hardware(&receipt.hardware, resolved.rule)?;
-        validate_execution(&receipt, &resolved)?;
-        if receipt.execution.start != receipt.execution.end {
-            return Err(MachineClassError::new(
-                MachineClassReason::PrePostIdentityDrift,
-                "start and end execution snapshots differ",
-            ));
-        }
-        if !receipt.execution.start.exclusive_lease
-            || receipt.execution.start.exclusive_lease_id.trim().is_empty()
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExclusiveLeaseMissing,
-                "timed evidence requires a named exclusive lease",
-            ));
-        }
-        if !receipt.execution.start.local_execution {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionOffloaded,
-                "timed evidence must execute locally",
-            ));
-        }
+        validate_admission_envelope(&receipt, &resolved)?;
         validate_source_identity(&receipt)?;
         validate_durability(&receipt.durability)?;
         validate_completion(&receipt.completion)?;
@@ -1593,6 +1698,192 @@ impl MachineClassRegistry {
     fn raw(&self) -> &Value {
         &self.raw
     }
+}
+
+fn validate_registry_receipt_contract(registry: &Value) -> Result<(), MachineClassError> {
+    let contract = registry
+        .get("receipt_contract")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::MissingField,
+                "registry receipt_contract must be an object",
+            )
+        })?;
+    let schema_version = contract
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let required_sections = contract_string_array(contract, "required_sections")?;
+    let required_hardware_fields = contract_string_array(contract, "required_hardware_fields")?;
+    let required_execution_fields = contract_string_array(contract, "required_execution_fields")?;
+    let required_execution_request_fields =
+        contract_string_array(contract, "required_execution_request_fields")?;
+    let required_execution_snapshot_fields =
+        contract_string_array(contract, "required_execution_snapshot_fields")?;
+    let required_build_fields = contract_string_array(contract, "required_build_fields")?;
+    let required_producer_fields = contract_string_array(contract, "required_producer_fields")?;
+    let required_durability_fields = contract_string_array(contract, "required_durability_fields")?;
+    let required_completion_fields = contract_string_array(contract, "required_completion_fields")?;
+    let producer_identity = contract
+        .get("producer_identity")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let producer_requirement_present = registry
+        .get("requirements")
+        .and_then(Value::as_array)
+        .is_some_and(|requirements| {
+            requirements.iter().any(|requirement| {
+                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-021")
+                    && requirement.get("level").and_then(Value::as_str) == Some("MUST")
+                    && requirement
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            text.contains("finalizer")
+                                && text.contains("Cargo.lock")
+                                && text.contains("immediate rerun")
+                        })
+            })
+        });
+    if schema_version != RUNNER_RECEIPT_SCHEMA_VERSION
+        || required_sections
+            != [
+                "schema_version",
+                "requested_class_id",
+                "derived_class_id",
+                "registry_sha256",
+                "hardware",
+                "execution",
+                "build",
+                "durability",
+                "completion",
+            ]
+            .map(str::to_owned)
+        || required_hardware_fields
+            != [
+                "os",
+                "arch",
+                "cpu_vendor",
+                "cpu_family",
+                "cpu_model",
+                "cpu_stepping",
+                "cpu_model_name",
+                "physical_cores",
+                "logical_cpus",
+                "numa_nodes",
+                "memory_bytes",
+                "page_size_bytes",
+                "performance_cores",
+                "efficiency_cores",
+                "runtime_detected_isa",
+                "topology_sha256",
+                "fingerprint_sha256",
+            ]
+            .map(str::to_owned)
+        || required_execution_fields
+            != ["request", "start", "end", "identity_sha256"].map(str::to_owned)
+        || required_execution_request_fields
+            != [
+                "requested_logical_cpu_ids",
+                "requested_physical_core_width",
+                "thread_budget",
+                "apple_execution_mode",
+            ]
+            .map(str::to_owned)
+        || required_execution_snapshot_fields
+            != [
+                "observed_logical_cpu_ids",
+                "effective_physical_core_ids",
+                "cpu_assignment_observability",
+                "effective_cpuset_sha256",
+                "threads_per_core",
+                "smt_state",
+                "numa_node_ids",
+                "numa_policy",
+                "governor",
+                "thermal_pressure",
+                "exclusive_lease",
+                "exclusive_lease_id",
+                "local_execution",
+                "observed_hardware_fingerprint_sha256",
+                "snapshot_sha256",
+            ]
+            .map(str::to_owned)
+        || required_build_fields
+            != [
+                "git_revision",
+                "git_dirty",
+                "worktree_state_sha256",
+                "cargo_lock_sha256",
+                "executable_sha256",
+                "command_sha256",
+                "environment_sha256",
+                "producer",
+            ]
+            .map(str::to_owned)
+        || required_producer_fields
+            != [
+                "contract_version",
+                "source_git_revision",
+                "source_git_dirty",
+                "cargo_lock_sha256",
+                "executable_sha256",
+            ]
+            .map(str::to_owned)
+        || required_durability_fields
+            != [
+                "adjacent",
+                "control_treatment",
+                "candidate_treatment",
+                "symmetric",
+            ]
+            .map(str::to_owned)
+        || required_completion_fields
+            != [
+                "verified",
+                "exit_status",
+                "run_log_sha256",
+                "artifact_manifest_sha256",
+                "artifact_digests_verified",
+                "started_at_utc",
+                "finished_at_utc",
+            ]
+            .map(str::to_owned)
+        || producer_identity.trim().is_empty()
+        || !producer_requirement_present
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::SourceIdentityInvalid,
+            "runner receipt contract differs from the compiled strict schema",
+        ));
+    }
+    Ok(())
+}
+
+fn contract_string_array(
+    contract: &Map<String, Value>,
+    field: &str,
+) -> Result<Vec<String>, MachineClassError> {
+    contract
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::MissingField,
+                format!("receipt_contract.{field} must be an array"),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                MachineClassError::new(
+                    MachineClassReason::SourceIdentityInvalid,
+                    format!("receipt_contract.{field} must contain only strings"),
+                )
+            })
+        })
+        .collect()
 }
 
 fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), MachineClassError> {
@@ -2100,6 +2391,35 @@ fn validate_execution(
     let request = &receipt.execution.request;
     let start = &receipt.execution.start;
     let end = &receipt.execution.end;
+    if start.thermal_pressure || end.thermal_pressure {
+        return Err(MachineClassError::new(
+            MachineClassReason::ThermalPressure,
+            "observed thermal pressure invalidates timed evidence",
+        ));
+    }
+    let expected_lease_id = if resolved.trj.is_some() {
+        "trj-zen3-exclusive"
+    } else if resolved.rule.family == "m4-macos" {
+        "m4-macos-exclusive"
+    } else {
+        return Err(MachineClassError::new(
+            MachineClassReason::ExclusiveLeaseMissing,
+            "registered class has no canonical host-family lease identity",
+        ));
+    };
+    if !start.exclusive_lease
+        || !end.exclusive_lease
+        || start.exclusive_lease_id != expected_lease_id
+        || end.exclusive_lease_id != expected_lease_id
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::ExclusiveLeaseMissing,
+            format!(
+                "timed evidence for {} requires canonical lease identity {expected_lease_id:?}",
+                resolved.rule.family
+            ),
+        ));
+    }
     if let Some(trj) = resolved.trj {
         if start.threads_per_core != trj.threads_per_core
             || end.threads_per_core != trj.threads_per_core
@@ -2183,7 +2503,7 @@ fn validate_execution(
             _ => {
                 return Err(MachineClassError::new(
                     MachineClassReason::ExecutionModeMismatch,
-                    "M4 promotion evidence currently admits only p-plus-e; p-only lacks a scheduler-assignment witness",
+                    "M4 hardware-envelope validation recognizes only p-plus-e; every gate remains promotion-unavailable pending actual-executing-image attestation",
                 ));
             }
         };
@@ -2234,14 +2554,52 @@ fn validate_execution(
                 "M4 receipts must use not-applicable governor",
             ));
         }
-        if start.thermal_pressure || end.thermal_pressure {
-            return Err(MachineClassError::new(
-                MachineClassReason::ThermalPressure,
-                "thermal pressure invalidates timed M4 evidence",
-            ));
-        }
     }
     let _ = &resolved.rule.execution_predicates;
+    Ok(())
+}
+
+fn validate_admission_envelope(
+    receipt: &RunnerReceipt,
+    resolved: &ResolvedClass<'_>,
+) -> Result<(), MachineClassError> {
+    if resolved.rule.admission_state != "registered" {
+        return Err(MachineClassError::new(
+            resolved.rule.admission_reason,
+            format!(
+                "class {:?} is {}",
+                receipt.requested_class_id, resolved.rule.admission_state
+            ),
+        ));
+    }
+    if receipt.derived_class_id != receipt.requested_class_id {
+        return Err(MachineClassError::new(
+            MachineClassReason::ReceiptClassMismatch,
+            "requested and derived class IDs differ",
+        ));
+    }
+    validate_hardware(&receipt.hardware, resolved.rule)?;
+    validate_execution(receipt, resolved)?;
+    if receipt.execution.start != receipt.execution.end {
+        return Err(MachineClassError::new(
+            MachineClassReason::PrePostIdentityDrift,
+            "start and end execution snapshots differ",
+        ));
+    }
+    if !receipt.execution.start.exclusive_lease
+        || receipt.execution.start.exclusive_lease_id.trim().is_empty()
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::ExclusiveLeaseMissing,
+            "timed evidence requires a named exclusive lease",
+        ));
+    }
+    if !receipt.execution.start.local_execution {
+        return Err(MachineClassError::new(
+            MachineClassReason::ExecutionOffloaded,
+            "timed evidence must execute locally",
+        ));
+    }
     Ok(())
 }
 
@@ -2249,22 +2607,25 @@ fn validate_gate_class_policy(
     resolved: &ResolvedClass<'_>,
     context: &MachineClassAdmissionContext,
 ) -> Result<(), MachineClassError> {
-    if resolved.rule.family != "m4-macos" {
-        return Ok(());
-    }
-    if matches!(
-        context.gate.as_str(),
-        "QG-1" | "QG-3" | "QG-4" | "QG-5" | "QG-8"
-    ) {
+    if matches!(context.gate.as_str(), "QG-3" | "QG-4" | "QG-5") {
         return Err(MachineClassError::new(
             MachineClassReason::ClassUnavailable,
             format!(
-                "{} is not currently promotion-admissible on M4: scaling gates require class-specific endpoints and durability-adjacent gates require a non-declarative F_FULLFSYNC witness",
-                context.gate,
+                "{} is not promotion-admissible on any class until both arms emit a non-declarative symmetric durability-treatment witness",
+                context.gate
             ),
         ));
     }
-    Ok(())
+    if resolved.rule.family != "m4-macos" {
+        return Ok(());
+    }
+    Err(MachineClassError::new(
+        MachineClassReason::ClassUnavailable,
+        format!(
+            "{} is not promotion-admissible on M4 until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism",
+            context.gate,
+        ),
+    ))
 }
 
 fn validate_cpu_ids(ids: &[u64], logical_cpus: u64) -> Result<(), MachineClassError> {
@@ -2283,21 +2644,27 @@ fn unique_string_count(values: &[String]) -> usize {
 }
 
 fn validate_source_identity(receipt: &RunnerReceipt) -> Result<(), MachineClassError> {
-    if receipt.build.git_dirty {
+    if receipt.build.git_dirty || receipt.build.producer.source_git_dirty {
         return Err(MachineClassError::new(
             MachineClassReason::SourceDirty,
-            "promotion requires an exact clean source tree",
+            "promotion requires clean benchmark and typed-producer source identities",
         ));
     }
     if receipt.build.worktree_state_sha256.is_some()
-        || receipt.build.git_revision.trim().is_empty()
+        || !is_git_revision(&receipt.build.git_revision)
         || !is_sha256(&receipt.build.cargo_lock_sha256)
         || !is_sha256(&receipt.build.executable_sha256)
         || !is_sha256(&receipt.build.command_sha256)
+        || !is_sha256(&receipt.build.environment_sha256)
+        || receipt.build.producer.contract_version != LOCAL_PERF_PRODUCER_CONTRACT_VERSION
+        || !is_git_revision(&receipt.build.producer.source_git_revision)
+        || receipt.build.producer.source_git_revision != receipt.build.git_revision
+        || receipt.build.producer.cargo_lock_sha256 != receipt.build.cargo_lock_sha256
+        || !is_sha256(&receipt.build.producer.executable_sha256)
     {
         return Err(MachineClassError::new(
             MachineClassReason::SourceIdentityInvalid,
-            "build source, Cargo.lock, executable, or command identity is invalid",
+            "benchmark and typed-producer source, Cargo.lock, executable, command, or controlled-environment identities are invalid or disagree",
         ));
     }
     Ok(())
@@ -2365,6 +2732,7 @@ pub fn admitted_test_identity_for_run(
     cargo_lock_sha256: &str,
     executable_sha256: &str,
     command_sha256: &str,
+    environment_sha256: &str,
     run_label: &str,
 ) -> VerifiedRunnerIdentity {
     admitted_test_identity_from_vector_for_run(
@@ -2374,6 +2742,7 @@ pub fn admitted_test_identity_for_run(
         cargo_lock_sha256,
         executable_sha256,
         command_sha256,
+        environment_sha256,
         run_label,
     )
 }
@@ -2386,6 +2755,7 @@ pub fn admitted_test_identity_for_artifacts(
     cargo_lock_sha256: &str,
     executable_sha256: &str,
     command_sha256: &str,
+    environment_sha256: &str,
     run_label: &str,
     run_id: &str,
     run_window: &str,
@@ -2398,6 +2768,7 @@ pub fn admitted_test_identity_for_artifacts(
         cargo_lock_sha256,
         executable_sha256,
         command_sha256,
+        environment_sha256,
         run_label,
     );
     bind_test_identity_to_artifacts(
@@ -2413,30 +2784,153 @@ pub fn admitted_test_identity_for_artifacts(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn admitted_test_identity_from_vector_for_artifacts(
-    vector_id: &str,
+pub fn admitted_test_identity_for_artifacts_with_trj_width(
+    physical_width: u64,
     gate: &str,
     git_revision: &str,
     cargo_lock_sha256: &str,
     executable_sha256: &str,
     command_sha256: &str,
+    environment_sha256: &str,
     run_label: &str,
     run_id: &str,
     run_window: &str,
     threshold_artifact_bytes: &[u8],
     evidence_artifact_bytes: &[u8],
 ) -> VerifiedRunnerIdentity {
-    let bare = admitted_test_identity_from_vector_for_run(
-        vector_id,
+    assert!((1..=64).contains(&physical_width));
+    let bare = admitted_test_identity_for_run(
         gate,
         git_revision,
         cargo_lock_sha256,
         executable_sha256,
         command_sha256,
+        environment_sha256,
         run_label,
     );
+    let mut receipt =
+        serde_json::from_str::<Value>(bare.receipt_json()).expect("test runner receipt JSON");
+    let class_id = format!("trj-zen3-{physical_width}c-smt2");
+    let logical_cpu_ids = (0..physical_width)
+        .chain(64..64 + physical_width)
+        .map(Value::from)
+        .collect::<Vec<_>>();
+    let physical_core_ids = (0..physical_width)
+        .map(|core| Value::String(format!("0:{core}")))
+        .collect::<Vec<_>>();
+    set_path(
+        &mut receipt,
+        "requested_class_id",
+        Value::String(class_id.clone()),
+    );
+    set_path(
+        &mut receipt,
+        "derived_class_id",
+        Value::String(class_id.clone()),
+    );
+    set_path(
+        &mut receipt,
+        "execution.request.requested_logical_cpu_ids",
+        Value::Array(logical_cpu_ids.clone()),
+    );
+    set_path(
+        &mut receipt,
+        "execution.request.requested_physical_core_width",
+        Value::from(physical_width),
+    );
+    for side in ["start", "end"] {
+        set_path(
+            &mut receipt,
+            &format!("execution.{side}.observed_logical_cpu_ids"),
+            Value::Array(logical_cpu_ids.clone()),
+        );
+        set_path(
+            &mut receipt,
+            &format!("execution.{side}.effective_physical_core_ids"),
+            Value::Array(physical_core_ids.clone()),
+        );
+        set_path(
+            &mut receipt,
+            &format!("execution.{side}.effective_cpuset_sha256"),
+            Value::String(format!(
+                "$DERIVE_{}_CPUSET_SHA256",
+                side.to_ascii_uppercase()
+            )),
+        );
+        set_path(
+            &mut receipt,
+            &format!("execution.{side}.snapshot_sha256"),
+            Value::String(format!(
+                "$DERIVE_{}_SNAPSHOT_SHA256",
+                side.to_ascii_uppercase()
+            )),
+        );
+    }
+    set_path(
+        &mut receipt,
+        "execution.identity_sha256",
+        Value::String("$DERIVE_EXECUTION_IDENTITY_SHA256".to_owned()),
+    );
+    derive_receipt_placeholders(&mut receipt);
+    let context = MachineClassAdmissionContext {
+        gate: gate.to_owned(),
+        destination_basename: format!("{gate}.{class_id}.latest.json"),
+    };
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("test runner receipt bytes");
+    let registry = MachineClassRegistry::frozen().expect("frozen registry");
+    let width_bound = registry
+        .admit(&receipt_bytes, &context)
+        .expect("alternate-width TRJ test runner receipt admission");
     bind_test_identity_to_artifacts(
-        &bare,
+        &width_bound,
+        gate,
+        run_id,
+        run_window,
+        format!("runner-log:{run_label}").as_bytes(),
+        threshold_artifact_bytes,
+        evidence_artifact_bytes,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn admitted_test_identity_for_artifacts_with_producer(
+    gate: &str,
+    git_revision: &str,
+    cargo_lock_sha256: &str,
+    executable_sha256: &str,
+    command_sha256: &str,
+    environment_sha256: &str,
+    producer_executable_sha256: &str,
+    run_label: &str,
+    run_id: &str,
+    run_window: &str,
+    threshold_artifact_bytes: &[u8],
+    evidence_artifact_bytes: &[u8],
+) -> VerifiedRunnerIdentity {
+    let bare = admitted_test_identity_for_run(
+        gate,
+        git_revision,
+        cargo_lock_sha256,
+        executable_sha256,
+        command_sha256,
+        environment_sha256,
+        run_label,
+    );
+    let mut receipt =
+        serde_json::from_str::<Value>(bare.receipt_json()).expect("test runner receipt JSON");
+    set_path(
+        &mut receipt,
+        "build.producer.executable_sha256",
+        Value::String(producer_executable_sha256.to_owned()),
+    );
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("test runner receipt bytes");
+    let registry = MachineClassRegistry::frozen().expect("frozen registry");
+    let producer_bound = registry
+        .admit(&receipt_bytes, bare.admission_context())
+        .expect("producer-specific test runner receipt admission");
+    bind_test_identity_to_artifacts(
+        &producer_bound,
         gate,
         run_id,
         run_window,
@@ -2500,6 +2994,7 @@ pub fn admitted_test_identity_from_vector_for_run(
     cargo_lock_sha256: &str,
     executable_sha256: &str,
     command_sha256: &str,
+    environment_sha256: &str,
     run_label: &str,
 ) -> VerifiedRunnerIdentity {
     let registry = MachineClassRegistry::frozen().expect("frozen registry");
@@ -2527,6 +3022,16 @@ pub fn admitted_test_identity_from_vector_for_run(
     );
     set_path(
         &mut receipt,
+        "build.producer.source_git_revision",
+        Value::String(git_revision.to_owned()),
+    );
+    set_path(
+        &mut receipt,
+        "build.producer.cargo_lock_sha256",
+        Value::String(cargo_lock_sha256.to_owned()),
+    );
+    set_path(
+        &mut receipt,
         "build.executable_sha256",
         Value::String(executable_sha256.to_owned()),
     );
@@ -2534,6 +3039,11 @@ pub fn admitted_test_identity_from_vector_for_run(
         &mut receipt,
         "build.command_sha256",
         Value::String(command_sha256.to_owned()),
+    );
+    set_path(
+        &mut receipt,
+        "build.environment_sha256",
+        Value::String(environment_sha256.to_owned()),
     );
     set_path(
         &mut receipt,
@@ -2748,7 +3258,7 @@ mod tests {
         assert_eq!(sha256_hex(REGISTRY_BYTES), MACHINE_CLASS_REGISTRY_SHA256);
         assert_eq!(
             MACHINE_CLASS_REGISTRY_GIT_BLOB,
-            "65d8f09358372abe6b85b74ab16e8abff8674641"
+            "f4dee7ba4f88076e6bc020aff6458faf863e063a"
         );
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
         assert_eq!(registry.raw()["classes"].as_array().unwrap().len(), 4);
@@ -2759,7 +3269,7 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 56);
+        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 71);
         assert_eq!(
             registry.raw()["registry_test_vectors"]
                 .as_array()
@@ -2879,8 +3389,160 @@ mod tests {
                 other => panic!("unexpected receipt decision {other}"),
             }
         }
-        assert_eq!(allow_count, 3);
-        assert_eq!(reject_count, 53);
+        assert_eq!(allow_count, 2);
+        assert_eq!(reject_count, 69);
+    }
+
+    #[test]
+    fn registry_preflight_rejects_hardware_before_spawn_and_binds_final_identity() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let vector = registry.raw()["test_vectors"]
+            .as_array()
+            .expect("receipt vectors")
+            .iter()
+            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-registered"))
+            .expect("registered TRJ vector");
+        let (bytes, context) = materialize_receipt_vector(registry.raw(), vector);
+        let receipt =
+            serde_json::from_slice::<RunnerReceipt>(&bytes).expect("materialized runner receipt");
+        let preflight = registry
+            .preflight(
+                &receipt.requested_class_id,
+                receipt.hardware.clone(),
+                receipt.execution.request.clone(),
+                receipt.execution.start.clone(),
+                receipt.durability.clone(),
+                &context,
+            )
+            .expect("registered pre-spawn envelope");
+        let final_identity = registry
+            .admit(&bytes, &context)
+            .expect("terminal identity admission");
+        preflight
+            .verify_final(&final_identity)
+            .expect("pre-spawn and terminal identities agree");
+
+        let mut wrong_hardware = receipt.hardware;
+        wrong_hardware.cpu_vendor = "GenuineIntel".to_owned();
+        let error = registry
+            .preflight(
+                &receipt.requested_class_id,
+                wrong_hardware,
+                receipt.execution.request,
+                receipt.execution.start,
+                receipt.durability,
+                &context,
+            )
+            .expect_err("wrong hardware must reject before a child can spawn");
+        assert_eq!(error.reason, MachineClassReason::HardwareCpuVendorMismatch);
+    }
+
+    #[test]
+    fn registered_classes_reject_forged_family_lease_identities() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        for vector_id in ["MCV-001-trj-registered", "MCV-002-m4-registered"] {
+            let vector = registry.raw()["test_vectors"]
+                .as_array()
+                .expect("receipt vectors")
+                .iter()
+                .find(|vector| vector["id"].as_str() == Some(vector_id))
+                .expect("registered vector");
+            let (bytes, context) = materialize_receipt_vector(registry.raw(), vector);
+            let mut receipt =
+                serde_json::from_slice::<Value>(&bytes).expect("materialized receipt");
+            for side in ["start", "end"] {
+                set_path(
+                    &mut receipt,
+                    &format!("execution.{side}.exclusive_lease_id"),
+                    Value::String("operator-selected-lease".to_owned()),
+                );
+                set_path(
+                    &mut receipt,
+                    &format!("execution.{side}.snapshot_sha256"),
+                    Value::String(format!(
+                        "$DERIVE_{}_SNAPSHOT_SHA256",
+                        side.to_ascii_uppercase()
+                    )),
+                );
+            }
+            set_path(
+                &mut receipt,
+                "execution.identity_sha256",
+                Value::String("$DERIVE_EXECUTION_IDENTITY_SHA256".to_owned()),
+            );
+            derive_receipt_placeholders(&mut receipt);
+            let forged = serde_json::to_vec(&receipt).expect("forged receipt JSON");
+            let error = registry
+                .admit(&forged, &context)
+                .expect_err("noncanonical family lease must reject");
+            assert_eq!(
+                error.reason,
+                MachineClassReason::ExclusiveLeaseMissing,
+                "{vector_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_admission_rejects_stale_or_substituted_producer_identity_without_writes() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let vector = registry.raw()["test_vectors"]
+            .as_array()
+            .expect("receipt vectors")
+            .iter()
+            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-registered"))
+            .expect("registered vector");
+        let cases = [
+            (
+                "build.producer.contract_version",
+                Value::String("frankensearch.quill-local-perf-producer.v2".to_owned()),
+                MachineClassReason::SourceIdentityInvalid,
+            ),
+            (
+                "build.producer.source_git_revision",
+                Value::String("a".repeat(40)),
+                MachineClassReason::SourceIdentityInvalid,
+            ),
+            (
+                "build.producer.source_git_dirty",
+                Value::Bool(true),
+                MachineClassReason::SourceDirty,
+            ),
+            (
+                "build.producer.cargo_lock_sha256",
+                Value::String("b".repeat(64)),
+                MachineClassReason::SourceIdentityInvalid,
+            ),
+            (
+                "build.producer.executable_sha256",
+                Value::String("arbitrary-executable".to_owned()),
+                MachineClassReason::SourceIdentityInvalid,
+            ),
+        ];
+        for (path, replacement, expected_reason) in cases {
+            let (bytes, context) = materialize_receipt_vector(registry.raw(), vector);
+            let mut receipt =
+                serde_json::from_slice::<Value>(&bytes).expect("materialized receipt");
+            set_path(&mut receipt, path, replacement);
+            let forged = serde_json::to_vec(&receipt).expect("forged receipt JSON");
+            let write_count = Cell::new(0_u64);
+            let error = registry
+                .admit_then(&forged, &context, |_| {
+                    write_count.set(write_count.get() + 1);
+                })
+                .expect_err("forged producer identity must reject");
+            assert_eq!(error.reason, expected_reason, "{path}");
+            assert_eq!(write_count.get(), 0, "{path} wrote on denial");
+        }
+
+        let (bytes, context) = materialize_receipt_vector(registry.raw(), vector);
+        let mut receipt = serde_json::from_slice::<Value>(&bytes).expect("materialized receipt");
+        remove_path(&mut receipt, "build.producer");
+        let missing = serde_json::to_vec(&receipt).expect("receipt without producer");
+        let error = registry
+            .admit(&missing, &context)
+            .expect_err("missing producer identity must reject");
+        assert_eq!(error.reason, MachineClassReason::MissingField);
     }
 
     #[test]
@@ -2982,10 +3644,11 @@ mod tests {
         let evidence = b"exact pre-binding evidence";
         let identity = admitted_test_identity_for_artifacts(
             "QG-2",
-            "deadbeef",
+            &"d".repeat(40),
             &"c".repeat(64),
             &"a".repeat(64),
             &"f".repeat(64),
+            &"2".repeat(64),
             "manifest-tamper",
             "candidate-a",
             "window-a",

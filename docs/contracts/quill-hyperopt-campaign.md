@@ -38,12 +38,13 @@ The campaign premise ("Quill ≥ 3.0x Tantivy at bulk indexing") is currently
   (`bd-quill-e8-perf-doctrine-x4e4.5`, `bd-quill-gauntlet-qg6-cache-termdict-gwd4`).
 
 This campaign therefore does not start from "optimize Quill." It starts from
-"measure every runnable lane, close each attributed deficit one lever at a
-time, and surface infeasible targets as soon as the evidence supports that
-decision." A miss honestly measured and ledgered is a campaign success; a win
-that cannot survive a hostile reading of its own artifacts is a campaign
-failure. An unavailable machine class limits claim scope; it never suppresses
-useful measurements on ready hardware.
+"measure every runnable lane and close each attributed deficit one lever at a
+time." A miss honestly measured and ledgered is useful evidence, but it does
+not lower a target and it never authorizes the Quill flip. The user has fixed
+the terminal policy: Quill replaces Tantivy only after Quill wins the written
+QG targets across the board. A win that cannot survive a hostile reading of
+its own artifacts is a campaign failure. An unavailable machine class limits
+claim scope; it never suppresses useful measurements on ready hardware.
 
 ## 1. Standing laws
 
@@ -76,7 +77,7 @@ document cannot weaken or override that contract.
 |---|---|---|---|
 | `x86-vps-ovh` | Existing rch workers; homogeneity not yet proven | Diagnostic continuity only until `bd-9f03f` either proves one class or splits the fleet | Exact worker facts and receipt are retained, but the class is `diagnostic_only` and cannot promote history |
 | `trj-zen3-<N>c` / `trj-zen3-<N>c-smt2` | AMD Threadripper PRO 5995WX, Zen 3, 64 physical cores/128 SMT threads, one NUMA node, no AVX-512 | Scale-out truth: QG-1 high-thread cells, QG-8 scaling, allocator/NUMA attribution | `N` is effective physical-core slice width (1–64), not logical threads. No suffix means one hardware thread/core; SMT-on requires `-smt2`, preventing latest-artifact and null-band collisions. Requested and observed CPU sets, thread budget, NUMA binding, performance governor, exclusive lease, and pre/post fingerprints remain separately bound. `trj-zen-128c` is obsolete provenance only and is rejected for new evidence |
-| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | Current ARM64 promotion envelope: full-pool P+E QG-2/QG-6/QG-7/QG-9/QG-10. QG-1/QG-8 await class-specific matrices; QG-3/QG-4/QG-5 await real `F_FULLFSYNC` witnesses | P-only is non-admissible; any ad-hoc P-only number is diagnostic-only until the OS assignment can be witnessed. Thermal state, page size, local execution, sealed completion, and applicable durability treatment remain bound |
+| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | Registered ARM64 optimization and diagnostic target; every gate is currently promotion-unavailable until the producer can attest the actual executing image through a supported `O_EXEC` or loaded-image mechanism | All current M4 numbers are diagnostic-only. A future promotion contract must additionally witness scheduler assignment, reject thermal pressure, bind page size/local execution/sealed completion, add class-specific scaling endpoints, and prove applicable durability treatment |
 | `m5-macos` | No reachable, fingerprinted M5 host yet | Independent future M5 lane; descriptive M4/M5 delta only | `unavailable` and diagnostic-only until a real named host and immutable fingerprint are registered. No M5 fact or number is inferred from M4, and M5 never blocks non-M5 work |
 
 The registry is a specification plus executable conformance corpus:
@@ -96,16 +97,20 @@ Rules:
 - Admission is per `(gate, fixture, machine-class, source SHA, executable
   SHA, execution identity)`. Onboarding or calibration for one class never
   blocks diagnostic or activation-eligible work on another class.
-- `trj` and the Macs are NOT rch workers. They run via
-  `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure),
-  which builds the typed finalizer; that producer itself builds and resolves the
-  exact benchmark ELF from the clean source snapshot and owns one continuous
-  lease/probe/child/log/manifest/receipt lifecycle. Detached and
-  foreground modes emit the same finalized layout; neither path writes history.
-- M4 QG-1/QG-8 are deliberately unavailable today: the x86 normative widths
-  exceed the 14-core host and do not contain meaningful 10P/14P+E endpoints.
-  The future class-scoped matrix must add those endpoints and a scheduler
-  witness; trimming the x86 matrix ad hoc can never activate an Apple claim.
+- `trj` and the Macs are NOT rch workers. Promotion-capable TRJ runs use
+  `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure).
+  Its typed producer builds and resolves the exact benchmark ELF from the clean
+  source snapshot and owns one continuous lease/probe/child/log/manifest/receipt
+  lifecycle. Detached and foreground modes emit the same finalized layout;
+  neither path writes history. The script recognizes M4 only to fail closed;
+  Apple profiling remains diagnostic until a supported executing-image
+  attestation design lands.
+- Every M4 gate is deliberately promotion-unavailable today because a
+  read-only `/dev/fd` alias cannot attest or execute the loaded image under the
+  strict contract. A future class-scoped contract must solve that boundary,
+  add meaningful 10P/14P+E scaling endpoints and a scheduler witness, and retain
+  the durability laws; trimming the x86 matrix ad hoc can never activate an
+  Apple claim.
 
 ## 3. Phase plan
 
@@ -115,7 +120,7 @@ Phase 1  PROFILE TRUTH                                     (per gate x class; lo
 Phase 2  HYPOTHESIS LEDGER SEEDING + PRIOR MINING          (mandatory before a production lever)
 Phase 3  INDEPENDENT OPTIMIZATION LOOPS                    (workstreams W1–W5)
 Phase 4  MATH-FAMILY ARTIFACTS                             (bounded to 3 families)
-Phase 5  PER-LANE CONVERGENCE + ACTIVATION + RENEGOTIATION
+Phase 5  PER-LANE CONVERGENCE + ACTIVATION + EVIDENCE REVIEW / NEXT ATTACK
 ```
 
 ### Phase 0 — Lane-local instrument integrity + onboarding
@@ -162,10 +167,10 @@ self-time frames ≥0.1%, triangulated (a lever is actionable only when two
 profilers agree on the frame). QG-1 cards additionally record the
 **tokenize-only honesty denominator** — the measured ceiling that converts
 "optimize indexing" into "close X% of a bounded gap." If a class's ceiling is
-itself below Tantivy's measured throughput, that is renegotiation evidence,
-not an optimization target. `x86-vps-ovh` cards are owned by the in-flight
-pre-admission beads (`bd-6oiq` for QG-1, `x4e4.5.4` for QG-6); the campaign
-adds trj/M4/M5 cards only.
+itself below Tantivy's measured throughput, that evidence forces a new attack
+plan; it does not make the target negotiable. `x86-vps-ovh` cards are owned by
+the in-flight pre-admission beads (`bd-6oiq` for QG-1, `x4e4.5.4` for QG-6);
+the campaign adds trj/M4/M5 cards only.
 
 ### Phase 2 — Hypothesis ledger + prior mining
 
@@ -227,7 +232,7 @@ Explicitly NOT selected (diminishing-returns rule): optimal transport, TDA,
 control-theoretic compaction scheduling — no measured failure signature.
 Each gets a hypothesis-ledger row with the predicate that would revive it.
 
-### Phase 5 — Convergence, activation, renegotiation
+### Phase 5 — Convergence, activation, and evidence review
 
 - A lane converges after one of three auditable outcomes:
   1. it meets its predeclared target and passes independent confirmation;
@@ -239,25 +244,26 @@ Each gets a hypothesis-ledger row with the predicate that would revive it.
 - Gates activate per gate per class exactly per the existing activation
   contract. A complete eligible lane need not wait for unrelated gates or
   hardware. Diagnostic runs remain visible but cannot activate a claim.
-- **Renegotiation checkpoint (non-optional when evidence-triggered):** open the
-  decision as soon as outcome 2 or 3 occurs while the lane remains below its
+- **Round-6 evidence-review checkpoint (non-optional when triggered):** open
+  the review as soon as outcome 2 or 3 occurs while the lane remains below its
   target. Present absolute and relative results, ceilings, old/new Quill causal
   artifacts, the real Tantivy incumbent, null validity, parity, memory and
   durability effects, retained rejects, retry predicates, and unmeasured
-  scopes. Recommend a bounded envelope if justified. `bd-3beo` consumes only
-  an explicitly user-ratified envelope; the decision belongs to the user, not
-  the fleet.
-- Performance proceeds in parallel with the conformance-gated library flip.
-  It becomes a flip blocker only if the user explicitly ratifies a bounded
-  performance safety gate.
+  scopes. The output is the next optimization attack plan. It must not
+  recommend or enact a bounded-envelope target reduction.
+- Performance and conformance proceed in parallel, but both block the library
+  flip. Conformance is necessary and the complete written QG target surface is
+  also necessary: no `AllowWithOptimizationDebt` or slower-but-bounded path is
+  a valid flip trigger.
 
 ## 4. Workstreams
 
 ### W1 — Query fixed-cost elimination (QG-6, QG-9)
 
 Discovery starts on the first calibrated machine with symbolized profiles;
-M4/M5 validation determines ARM64 claim scope but does not delay an x86
-profile or portable implementation.
+M4/M5 diagnostic validation guides ARM64 optimization but cannot support a
+promotion claim until its executing-image boundary is solved; it does not delay
+an x86 profile or portable implementation.
 
 | Lever | Basis | Notes |
 |---|---|---|
@@ -288,9 +294,10 @@ Shard-per-worker indexing into independent segments, then
 problems plus one cheap concat. NUMA/CCD-aware sharding; per-thread arenas;
 sharded interners merged at seal (no global interner Mutex). Deliverables
 include the allocator-contention axis; "a bandwidth ceiling is honest, a lock
-plateau is a bug." On M4, the next contract revision must freeze class-scoped
-10P and 14P+E endpoints plus a real scheduler-assignment witness before QG-1 or
-QG-8 can admit evidence. Until then there is no registered Apple scaling curve.
+plateau is a bug." On M4, the next promotion contract must first attest the
+actual executing image, then freeze class-scoped 10P and 14P+E endpoints plus a
+real scheduler-assignment witness before QG-1 or QG-8 can admit evidence. Until
+then there is no promotion-grade Apple scaling curve.
 
 ### W4 — SIMD/µarch kernels (all classes; safe-code constraint binding)
 
@@ -391,12 +398,15 @@ Epic `bd-quill-e8-hyperopt-*` under the E8 doctrine (not a parallel taxonomy).
 Children: `p0-*` (onboarding/calibration), `p1-*` (per-class profile cards),
 `p2-*` (hypothesis ledger), `w1-*`/`w2-*` (specified levers), `w3-*`/`w4-*`/
 `w5-*`/`math-*` (stubs behind their lane-local profile prerequisites),
-`convergence`, `renegotiation`. `bd-quill-e8-hyperopt-nyps.1` owns the
+`convergence`, `renegotiation`. The historically named `renegotiation` bead is
+now an evidence-review and next-attack-plan checkpoint; it cannot lower a
+target. `bd-quill-e8-hyperopt-nyps.1` owns the
 progressive-admission contract repair and must close before convergence or
-target renegotiation, but it does not block measurements or optimization.
+the evidence-review checkpoint, but it does not block measurements or
+optimization.
 External anchors: `bd-h6eh` (instrument), `gwd4` (W1 base lever), `bd-6oiq` +
-`x4e4.5.4` (x86 profiling cards), `bd-3beo` (consumes the renegotiation
-evidence).
+`x4e4.5.4` (x86 profiling cards), `bd-3beo` (consumes the evidence-review and
+next-attack record).
 
 Lanes: **I** lane-local instrument and calibration (currently
 FoggySquirrel/CobaltWillow's surface), **P** profiling cards, **O** one agent

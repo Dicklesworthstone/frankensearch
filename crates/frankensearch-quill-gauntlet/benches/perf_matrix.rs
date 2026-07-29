@@ -2596,13 +2596,39 @@ fn command_sha256() -> String {
     command_sha256_from_argv(arguments.iter().map(|argument| argument.as_encoded_bytes()))
 }
 
+fn environment_sha256(scale: MatrixScale) -> Option<String> {
+    match std::env::var("QUILL_PERF_ENVIRONMENT_SHA256") {
+        Ok(value)
+            if value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Some(value)
+        }
+        Ok(_) => panic!("QUILL_PERF_ENVIRONMENT_SHA256 must be lowercase SHA-256"),
+        Err(error) => {
+            assert!(
+                !scale.is_full(),
+                "full QG evidence requires QUILL_PERF_ENVIRONMENT_SHA256: {error}"
+            );
+            None
+        }
+    }
+}
+
 fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -> BuildIdentity {
-    let porcelain = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    let typed_producer = std::env::var("QUILL_PERF_TYPED_PRODUCER").as_deref() == Ok("1");
+    let porcelain = if typed_producer {
+        Some(String::new())
+    } else {
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
     let git_dirty = porcelain
         .as_deref()
         .is_some_and(|status| !status.trim().is_empty());
@@ -2622,7 +2648,8 @@ fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -
     let cargo_lock_sha256 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
         .ok()
         .map(|bytes| lower_hex(&Sha256::digest(&bytes)));
-    let rustc_verbose = Command::new("rustc")
+    let rustc = std::env::var_os("QUILL_PERF_RUSTC").unwrap_or_else(|| "rustc".into());
+    let rustc_verbose = Command::new(rustc)
         .arg("-vV")
         .output()
         .ok()
@@ -2648,6 +2675,7 @@ fn build_identity(bench_elf_sha256: &str, revision: &str, build_profile: &str) -
         worktree_state_sha256,
         cargo_lock_sha256,
         command_sha256: command_sha256(),
+        environment_sha256: environment_sha256(MatrixScale::from_env()),
         rustc_version,
         target_triple,
         build_profile: build_profile.to_owned(),

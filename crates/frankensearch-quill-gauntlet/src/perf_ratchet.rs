@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
 use crate::{
@@ -476,6 +477,42 @@ fn validate_machine_class_promotion(request: &PerfRatchetRequest<'_>, state: &mu
         }
         admitted.push((role, external_identity));
     }
+    let candidate_producer = admitted
+        .iter()
+        .find(|(role, _)| *role == "candidate")
+        .and_then(|(_, identity)| identity.build().get("producer"));
+    let rerun_producer = admitted
+        .iter()
+        .find(|(role, _)| *role == "rerun")
+        .and_then(|(_, identity)| identity.build().get("producer"));
+    if let (Some(candidate_producer), Some(rerun_producer)) = (candidate_producer, rerun_producer)
+        && candidate_producer != rerun_producer
+    {
+        state.fatal(
+            "perf.ratchet.candidate_rerun_producer_mismatch",
+            "fresh candidate and immediate rerun must share the exact typed-finalizer contract, \
+             source, Cargo.lock, and executing-ELF identity",
+        );
+    }
+    let candidate_benchmark_executable = admitted
+        .iter()
+        .find(|(role, _)| *role == "candidate")
+        .and_then(|(_, identity)| identity.build().get("executable_sha256"))
+        .and_then(Value::as_str);
+    let rerun_benchmark_executable = admitted
+        .iter()
+        .find(|(role, _)| *role == "rerun")
+        .and_then(|(_, identity)| identity.build().get("executable_sha256"))
+        .and_then(Value::as_str);
+    if let (Some(candidate_benchmark_executable), Some(rerun_benchmark_executable)) =
+        (candidate_benchmark_executable, rerun_benchmark_executable)
+        && candidate_benchmark_executable != rerun_benchmark_executable
+    {
+        state.fatal(
+            "perf.ratchet.candidate_rerun_benchmark_executable_mismatch",
+            "fresh candidate and immediate rerun must execute byte-identical benchmark ELFs",
+        );
+    }
     let expected_admitted = if baseline_is_bootstrap { 2 } else { 3 };
     if admitted.len() == expected_admitted {
         if admitted
@@ -533,10 +570,14 @@ fn validate_machine_class_promotion(request: &PerfRatchetRequest<'_>, state: &mu
             if builds
                 .iter()
                 .any(|build| build.command_sha256 != builds[0].command_sha256)
+                || builds
+                    .iter()
+                    .any(|build| build.environment_sha256 != builds[0].environment_sha256)
             {
                 state.fatal(
                     "perf.ratchet.mixed_command_identity",
-                    "all measured promotion roles must share one exact NUL-delimited argv SHA-256",
+                    "all measured promotion roles must share exact NUL-delimited argv and \
+                     controlled-environment SHA-256 identities",
                 );
             }
             if builds.iter().any(|build| {
@@ -627,18 +668,26 @@ fn validate_execution_projection_binding(
         .iter()
         .copied()
         .max();
-    let (Some(thread_budget), Some(widest_configured)) = (thread_budget, widest_configured) else {
-        state.fatal(
-            "perf.ratchet.execution_projection_thread_budget_mismatch",
-            format!("{role} lacks a verified thread budget or projected exercised width"),
-        );
-        return;
-    };
-    if widest_configured > thread_budget || thread_budget > projected.process_available_threads {
+    let normative_thread_budget = PerfMatrixSpec::complete().max_thread_width(artifact.gate);
+    let (Some(thread_budget), Some(widest_configured), Some(normative_thread_budget)) =
+        (thread_budget, widest_configured, normative_thread_budget)
+    else {
         state.fatal(
             "perf.ratchet.execution_projection_thread_budget_mismatch",
             format!(
-                "{role} configured widths, verified thread budget, and process concurrency disagree"
+                "{role} lacks a verified thread budget, projected exercised width, or frozen gate width"
+            ),
+        );
+        return;
+    };
+    if widest_configured != thread_budget
+        || thread_budget != normative_thread_budget
+        || thread_budget > projected.process_available_threads
+    {
+        state.fatal(
+            "perf.ratchet.execution_projection_thread_budget_mismatch",
+            format!(
+                "{role} configured widths, verified thread budget, frozen gate width, and process concurrency disagree"
             ),
         );
     }
@@ -2745,6 +2794,10 @@ mod tests {
                 .expect("test Cargo.lock digest"),
             &build.executable_sha256,
             &build.command_sha256,
+            build
+                .environment_sha256
+                .as_deref()
+                .expect("test environment digest"),
             run_label,
             &artifact.run_id,
             &artifact.run_window,
@@ -2860,6 +2913,13 @@ mod tests {
         quill: f64,
         oracle: f64,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        let revision = if revision == "new" {
+            "1".repeat(40)
+        } else if revision == "old" {
+            "0".repeat(40)
+        } else {
+            revision.to_owned()
+        };
         let scope = PerfOperationScope {
             operation_id: "qg2.bulk_index".to_owned(),
             version: 1,
@@ -2944,7 +3004,7 @@ mod tests {
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(execution_provenance()),
-            git_rev: revision.to_owned(),
+            git_rev: revision.clone(),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
             corpus_manifest_hash: "a".repeat(64),
@@ -2992,11 +3052,12 @@ mod tests {
                 manifest_sha256: "b".repeat(64),
                 build: BuildIdentity {
                     executable_sha256: "c".repeat(64),
-                    git_revision: revision.to_owned(),
+                    git_revision: revision,
                     git_dirty: false,
                     worktree_state_sha256: None,
                     cargo_lock_sha256: Some("e".repeat(64)),
                     command_sha256: "f".repeat(64),
+                    environment_sha256: Some("d".repeat(64)),
                     rustc_version: "rustc test".to_owned(),
                     target_triple: "x86_64-unknown-linux-gnu".to_owned(),
                     build_profile: "release-perf".to_owned(),
@@ -3190,11 +3251,12 @@ mod tests {
                 manifest_sha256: "b".repeat(64),
                 build: BuildIdentity {
                     executable_sha256: "c".repeat(64),
-                    git_revision: "new".to_owned(),
+                    git_revision: "1".repeat(40),
                     git_dirty: false,
                     worktree_state_sha256: None,
                     cargo_lock_sha256: Some("e".repeat(64)),
                     command_sha256: "f".repeat(64),
+                    environment_sha256: Some("d".repeat(64)),
                     rustc_version: "rustc test".to_owned(),
                     target_triple: "x86_64-unknown-linux-gnu".to_owned(),
                     build_profile: "release-perf".to_owned(),
@@ -3638,15 +3700,6 @@ mod tests {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
-        rerun_evidence.provenance.machine.os = "macos".to_owned();
-        rerun_evidence.provenance.machine.arch = "aarch64".to_owned();
-        rerun_evidence.provenance.machine.execution.producer_os = crate::PerfProducerOs::Macos;
-        rerun_evidence
-            .provenance
-            .machine
-            .execution
-            .cpu_affinity_allowed_list = None;
-        rerun_evidence.provenance.build.target_triple = "aarch64-apple-darwin".to_owned();
         rerun_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
         );
@@ -3654,24 +3707,29 @@ mod tests {
         seal_evidence(&mut rerun_evidence);
         let threshold_bytes = threshold_artifact_bytes(&rerun);
         let evidence_bytes =
-            serde_json::to_vec_pretty(&rerun_evidence).expect("M4 pre-binding evidence");
-        let m4_identity =
-            crate::machine_class_registry::admitted_test_identity_from_vector_for_artifacts(
-                "MCV-002-m4-registered",
+            serde_json::to_vec_pretty(&rerun_evidence).expect("TRJ pre-binding evidence");
+        let alternate_trj_identity =
+            crate::machine_class_registry::admitted_test_identity_for_artifacts_with_trj_width(
+                32,
                 PerfGate::Qg6.label(),
-                "new",
+                &"1".repeat(40),
                 &"e".repeat(64),
                 &"c".repeat(64),
                 &"f".repeat(64),
-                "rerun-m4",
+                &"d".repeat(64),
+                "rerun-trj-32c",
                 &rerun.run_id,
                 &rerun.run_window,
                 &threshold_bytes,
                 &evidence_bytes,
             );
         rerun_evidence
-            .bind_machine_class_identity(m4_identity.clone(), &threshold_bytes, &evidence_bytes)
-            .expect("bind M4 rerun identity");
+            .bind_machine_class_identity(
+                alternate_trj_identity.clone(),
+                &threshold_bytes,
+                &evidence_bytes,
+            )
+            .expect("bind alternate-width TRJ rerun identity");
         seal_evidence(&mut rerun_evidence);
         let expected_class = candidate_evidence
             .machine_class
@@ -3688,7 +3746,7 @@ mod tests {
             rerun_evidence: Some(&rerun_evidence),
             expected_machine_class: Some(expected_class),
             candidate_runner_identity: candidate_evidence.machine_class.identity(),
-            rerun_runner_identity: Some(&m4_identity),
+            rerun_runner_identity: Some(&alternate_trj_identity),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
             expected_manifest_sha256: &"b".repeat(64),
@@ -3702,6 +3760,155 @@ mod tests {
                 .iter()
                 .any(|reason| reason.code == "perf.ratchet.mixed_machine_identity")
         );
+        assert!(result.comparisons.is_empty());
+    }
+
+    #[test]
+    fn candidate_and_rerun_cannot_mix_typed_finalizer_executables() {
+        let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
+        let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        rerun_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
+            "sealed runner receipt has not been bound",
+        );
+        rerun_evidence.artifact_sha256.clear();
+        seal_evidence(&mut rerun_evidence);
+        let threshold_bytes = threshold_artifact_bytes(&rerun);
+        let evidence_bytes =
+            serde_json::to_vec_pretty(&rerun_evidence).expect("rerun pre-binding evidence");
+        let build = &rerun_evidence.provenance.build;
+        let alternate_producer =
+            crate::machine_class_registry::admitted_test_identity_for_artifacts_with_producer(
+                PerfGate::Qg6.label(),
+                &build.git_revision,
+                build
+                    .cargo_lock_sha256
+                    .as_deref()
+                    .expect("test Cargo.lock digest"),
+                &build.executable_sha256,
+                &build.command_sha256,
+                build
+                    .environment_sha256
+                    .as_deref()
+                    .expect("test environment digest"),
+                &"6".repeat(64),
+                "rerun-producer-mismatch",
+                &rerun.run_id,
+                &rerun.run_window,
+                &threshold_bytes,
+                &evidence_bytes,
+            );
+        rerun_evidence
+            .bind_machine_class_identity(
+                alternate_producer.clone(),
+                &threshold_bytes,
+                &evidence_bytes,
+            )
+            .expect("bind alternate producer identity");
+        seal_evidence(&mut rerun_evidence);
+        let expected_class = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .class_id();
+
+        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+            baseline: Some(&baseline),
+            baseline_evidence: Some(&baseline_evidence),
+            candidate: &candidate,
+            rerun: Some(&rerun),
+            candidate_evidence: Some(&candidate_evidence),
+            rerun_evidence: Some(&rerun_evidence),
+            expected_machine_class: Some(expected_class),
+            candidate_runner_identity: candidate_evidence.machine_class.identity(),
+            rerun_runner_identity: Some(&alternate_producer),
+            gate_activated: true,
+            mode: PerfRatchetMode::Promotion,
+            expected_manifest_sha256: &"b".repeat(64),
+            evidence: Vec::new(),
+        });
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| { reason.code == "perf.ratchet.candidate_rerun_producer_mismatch" })
+        );
+        assert!(result.comparisons.is_empty());
+    }
+
+    #[test]
+    fn candidate_and_rerun_cannot_mix_benchmark_executables() {
+        let ratios = [[1.0; 3]; 4];
+        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
+        let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
+        let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
+        rerun_evidence.provenance.build.executable_sha256 = "7".repeat(64);
+        rerun_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
+            "sealed runner receipt has not been bound",
+        );
+        rerun_evidence.artifact_sha256.clear();
+        seal_evidence(&mut rerun_evidence);
+        let threshold_bytes = threshold_artifact_bytes(&rerun);
+        let evidence_bytes =
+            serde_json::to_vec_pretty(&rerun_evidence).expect("rerun pre-binding evidence");
+        let build = &rerun_evidence.provenance.build;
+        let alternate_benchmark =
+            crate::machine_class_registry::admitted_test_identity_for_artifacts(
+                PerfGate::Qg6.label(),
+                &build.git_revision,
+                build
+                    .cargo_lock_sha256
+                    .as_deref()
+                    .expect("test Cargo.lock digest"),
+                &build.executable_sha256,
+                &build.command_sha256,
+                build
+                    .environment_sha256
+                    .as_deref()
+                    .expect("test environment digest"),
+                "rerun-benchmark-mismatch",
+                &rerun.run_id,
+                &rerun.run_window,
+                &threshold_bytes,
+                &evidence_bytes,
+            );
+        rerun_evidence
+            .bind_machine_class_identity(
+                alternate_benchmark.clone(),
+                &threshold_bytes,
+                &evidence_bytes,
+            )
+            .expect("bind alternate benchmark identity");
+        seal_evidence(&mut rerun_evidence);
+        let expected_class = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .class_id();
+
+        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+            baseline: Some(&baseline),
+            baseline_evidence: Some(&baseline_evidence),
+            candidate: &candidate,
+            rerun: Some(&rerun),
+            candidate_evidence: Some(&candidate_evidence),
+            rerun_evidence: Some(&rerun_evidence),
+            expected_machine_class: Some(expected_class),
+            candidate_runner_identity: candidate_evidence.machine_class.identity(),
+            rerun_runner_identity: Some(&alternate_benchmark),
+            gate_activated: true,
+            mode: PerfRatchetMode::Promotion,
+            expected_manifest_sha256: &"b".repeat(64),
+            evidence: Vec::new(),
+        });
+
+        assert_eq!(result.decision, PerfGateDecision::Block);
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.candidate_rerun_benchmark_executable_mismatch"
+        }));
         assert!(result.comparisons.is_empty());
     }
 
@@ -3850,10 +4057,11 @@ mod tests {
         let alternate_identity =
             crate::machine_class_registry::admitted_test_identity_for_artifacts(
                 PerfGate::Qg6.label(),
-                "new",
+                &"1".repeat(40),
                 &"e".repeat(64),
                 &"c".repeat(64),
                 &"0".repeat(64),
+                &"d".repeat(64),
                 "baseline",
                 &baseline.run_id,
                 &baseline.run_window,

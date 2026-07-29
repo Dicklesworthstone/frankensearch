@@ -120,8 +120,8 @@ carries: both engines' absolute distributions from the same paired blocks, the
 paired log-ratio effect with a seeded bootstrap CI, same-invocation
 Tantivy/Tantivy and Quill/Quill A/A results for QG-1, bounded raw samples that
 every summary recomputes from on load, and a same-scope
-absolute-versus-paired reconciliation. Run provenance records the
-executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
+absolute-versus-paired reconciliation. Run provenance records the benchmark
+ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
 the exact NUL-separated and NUL-terminated argv SHA-256,
 rustc/target/profile/features, host identity, host-wide physical cores and
 logical threads, producer OS, process-available concurrency, configured engine
@@ -140,6 +140,20 @@ hardware/cpuset/snapshot/execution hash, and the SHA-256 plus exact bytes of one
 verified sealed runner-completion receipt and its exact artifact manifest. That
 manifest hashes the actual run log, canonical v5 threshold artifact, and exact
 pre-binding v3 evidence bytes and names their gate, run ID, and run window.
+The strict v5 completion receipt also binds the typed finalizer's contract
+version, build-time Git revision and dirty posture, build-time `Cargo.lock`
+SHA-256, and the SHA-256 independently computed from the finalizer executable
+handle held by the running process. It also binds a canonical digest of the
+cleared-and-rebuilt Cargo and measurement environments: the typed gate, run
+count, warmup count, bootstrap seed, thread budget, fixed fixture scope,
+resolved Cargo/rustc/Git paths and executable digests, compiler flags, and
+toolchain/cache roots are identity; run IDs and held artifact paths use typed
+placeholders so an immediate reproduction can retain the same policy identity.
+Unsupported ambient compiler, allocator, loader, Rayon, Cargo, Rustup, and
+`QUILL_PERF_*` overrides reject before compilation. Producer revision and lock must equal the
+benchmark build, and a fresh candidate plus its immediate rerun must use the
+same producer identity and byte-identical benchmark ELF; a historical baseline
+may retain its original producer and benchmark executable.
 Manifest, registry, receipt, threshold, and evidence parsers reject duplicate
 and unknown fields and require their typed canonical encodings. Loading
 re-admits the embedded receipt and manifest against the frozen registry;
@@ -151,18 +165,60 @@ promotion requires it to equal the sealed current-evidence execution block and
 to agree with the verified receipt's producer OS, physical/logical topology,
 configured thread budget, exact runtime ISA, and effective CPU-set bounds. A
 caller-supplied execution block is never an independent identity authority.
+The typed producer derives the exact maximum thread width from the selected
+gate's complete frozen matrix; the receipt thread budget and
+`RAYON_NUM_THREADS` must equal that width, never merely exceed it.
 
-Receipt binding is deliberately two-phase. The live benchmark writes the
-current v3 artifact with an explicit `unverified` binding and the exact
-NUL-delimited process-argv hash while the child is still running. One typed
-registered-host producer holds the exclusive lease across start probes, the
-exact benchmark child, log synchronization, end probes, manifest construction,
-receipt sealing, registry admission, and an in-memory bind-and-reverify preview.
-The producer—not an operator-supplied command—builds and resolves the exact
-benchmark executable from the clean source snapshot before the lease opens.
-After every check passes it writes the manifest and `PRECOMMIT.json`, syncs
-them, and writes the ratchet-required receipt last as the finalization commit
-boundary. Promotion receives a measured baseline as already-bound
+Receipt binding is deliberately two-phase on the currently promotion-capable
+Linux lane. The shell launcher performs only bounded argument and
+immutable-root shape checks, opens the prebuilt typed finalizer on inherited
+descriptor 9, and executes that held descriptor. The
+launched Rust producer derives and opens the canonical shared-namespace
+host-global lease before Git inspection, hashing, run-directory creation, or
+local benchmark compilation. Registered performance hosts must provide one
+shared mount namespace and must not unlink or rename the effective-user-owned
+lease inode while a campaign is active; receipts retain the platform-family
+logical lease identity. The lock descriptor is inherited by compiler and
+benchmark children so a killed producer cannot leave an unleased noisy orphan.
+Under the lease, the producer rejects redirecting `GIT_*` and process-injection state,
+assume-unchanged/skip-worktree entries, dirty source, and noncanonical external
+roots; it clears both child environments and repopulates only the bound typed
+allowlist. It rejects both Cargo configuration filenames in `CARGO_HOME`, the
+repository root, and every ancestor through the filesystem root before
+compilation and at every later held-build verification through receipt commit;
+the complete absent-path set is part of the controlled-environment preimage.
+The exact hashed rustup-selected `rustc` is forced into Cargo's build
+environment. It pins output and target directory
+descriptors, hashes and validates the launcher-held finalizer against its
+embedded build identity, and creates the unique run directory relative to the
+held output parent and synchronizes that parent entry. Linux benchmarks address
+artifact descendants through the held `/proc/self/fd` directory. A future
+macOS producer may use a canonical pinned artifact path because XNU's
+`/dev/fd` directory aliases are not traversable, but no current M4 run is
+promotion-admissible: the read-only descriptor design cannot execute and
+attest the actual loaded image there. Cargo must report
+one benchmark executable beneath the pinned target root. The producer opens
+that executable without following links, requires a single-link owned
+executable file, hashes the held descriptor, and executes through the descriptor
+while setting canonical `argv[0]`. After an observed thermal/start capture, the
+frozen registry admits the exact hardware/execution/durability envelope before
+the log is opened or the benchmark child is spawned. The live benchmark writes
+the current v3 artifact with an explicit `unverified` binding and exact
+NUL-delimited process-argv hash while the child runs. The producer keeps the
+lease and held roots/images across the exact child, log synchronization, end
+probes, manifest construction, receipt sealing, terminal registry admission,
+and an in-memory bind-and-reverify preview. A nonzero or signaled child writes a
+separately sealed `frankensearch.perf-runner-attempt.v1` diagnostic receipt and
+can never emit or be parsed as a promotion completion. After every promotion
+check passes, the producer writes the manifest and diagnostic-only
+`frankensearch.perf-run-precommit.v3` `PRECOMMIT.json`, syncs them, rechecks the
+lease, roots, source, held benchmark, and held producer, and writes the
+ratchet-required v5 receipt last as the sole finalization commit boundary.
+The canonical `environment-policy.json` preimage is written under the held run
+directory before the child starts, re-read by descriptor, and hashed directly
+by both completion and attempt receipts; `PRECOMMIT.json` inventories that same
+digest but is never an admission authority. Promotion receives a measured
+baseline as already-bound
 committed evidence; only candidate and rerun receive fresh external receipt,
 manifest, actual run-log, threshold, and pre-binding evidence inputs. The
 ratchet binds those two roles in memory and validates all three measured roles
@@ -197,7 +253,9 @@ committed evidence; candidate and rerun carry fresh external finalization
 inputs. Exact-bootstrap promotion carries candidate and rerun only; the
 sentinel has neither evidence nor identity. Promotion requires one
 registry-verified execution identity across every measured role before any
-mutable history path is opened.
+mutable history path is opened. The candidate and immediate rerun additionally
+require byte-equal nested producer identities; this parity law deliberately
+does not relabel or invalidate an older committed baseline's producer.
 `--machine-class` is an expected value only: it must equal the class derived
 from every receipt and cannot relabel evidence or select a different latest
 key. On `Allow`, the complete decision JSON first records and hashes the
@@ -222,17 +280,19 @@ CI and registered-host production are deliberately separate lanes:
   Exact ephemeral host identity makes the unmeasured-sentinel result an
   expected `Quarantine`; hosted `ubuntu-latest` is never promotion-eligible and
   this lane is not a functional pass-over-pass performance alarm.
-- Promotion runs only on a registered TRJ or currently eligible M4 P+E gate
-  through
+- Promotion runs currently occur only on a registered TRJ class through
   `scripts/perf-runner.sh` and the typed producer. Those finalized candidate and
   rerun bundles are supplied deliberately to `quill-perf-ratchet`; only its
   `Allow` path may write a reviewable history candidate.
 
-M4 QG-1/QG-8 remain unavailable until class-specific 10P and 14P+E endpoints
-are frozen; M4 QG-3/QG-4/QG-5 remain unavailable until a non-declarative
-witness proves symmetric `F_FULLFSYNC` use by both arms. P-only is
-non-admissible; ad-hoc P-only measurements are diagnostic-only until a real
-scheduler-assignment witness exists.
+Every M4 gate remains promotion-unavailable until a supported `O_EXEC` or
+loaded-image mechanism attests the actual executing image. All current Apple
+measurements are diagnostic-only. A future M4 contract must also freeze
+class-specific 10P and 14P+E endpoints, witness scheduler assignment, and
+retain the durability requirements. QG-3/QG-4/QG-5 remain unavailable on every
+machine class until both benchmark arms emit a non-declarative witness of the
+required symmetric durability treatment (`F_FULLFSYNC` on macOS and the
+registered equivalent on Linux).
 
 ## Topology honesty (QG-3/QG-4)
 

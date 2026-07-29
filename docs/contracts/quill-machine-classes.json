@@ -17,8 +17,9 @@
     "cross_class_policy": "Ratios, null bands, and promotion baselines never cross a canonical class ID or execution-identity key."
   },
   "receipt_contract": {
-    "schema_version": "frankensearch.perf-runner-completion.v3",
+    "schema_version": "frankensearch.perf-runner-completion.v5",
     "required_sections": [
+      "schema_version",
       "requested_class_id",
       "derived_class_id",
       "registry_sha256",
@@ -82,7 +83,16 @@
       "worktree_state_sha256",
       "cargo_lock_sha256",
       "executable_sha256",
-      "command_sha256"
+      "command_sha256",
+      "environment_sha256",
+      "producer"
+    ],
+    "required_producer_fields": [
+      "contract_version",
+      "source_git_revision",
+      "source_git_dirty",
+      "cargo_lock_sha256",
+      "executable_sha256"
     ],
     "required_durability_fields": [
       "adjacent",
@@ -101,6 +111,8 @@
     ],
     "sha256_fields_are_lowercase_hex": true,
     "pre_post_identity_must_match": true,
+    "exclusive_lease_identity": "Every registered Threadripper width uses trj-zen3-exclusive and every registered M4 run uses m4-macos-exclusive. The typed producer derives one canonical host-local path shared by every class; callers cannot supply a path or lease label. Registered performance hosts must use one shared mount namespace and must not unlink or rename the effective-user-owned lease inode while a campaign is active.",
+    "producer_identity": "On the currently promotion-capable Linux lane, the receipt binds the typed finalizer contract version, its build-time Git revision and dirty posture, its build-time Cargo.lock SHA-256, the SHA-256 independently computed from the launcher-held executing finalizer descriptor, and a canonical digest of the cleared-and-rebuilt Cargo plus measurement environment. The exact canonical environment-policy.json preimage is persisted under the held run directory before the child starts and reverified by descriptor before any receipt commit. The producer revision and lock must exactly equal the benchmark build identity. Under the lease, the producer rejects redirecting Git or process-injection state, hidden index flags, and noncanonical roots; pins output/target directory descriptors; constrains, opens, hashes, and executes the Cargo-reported benchmark through a held descriptor; and rechecks all identities before the receipt commit. M4 remains registered as hardware but every M4 gate is promotion-unavailable until a supported O_EXEC or loaded-image mechanism attests the actual executing image. Offline admission verifies the recorded tuple's strict shape, equality laws, and immutability rather than claiming to rediscover the past process image.",
     "promotion_requires_zero_exit": true
   },
   "artifact_manifest_contract": {
@@ -130,6 +142,7 @@
     "execution_snapshot_sha256": "SHA-256 of canonical JSON for one complete execution snapshot with snapshot_sha256 omitted.",
     "execution_identity_sha256": "After start/end equivalence is proven, SHA-256 of canonical JSON containing requested_class_id, derived_class_id, execution.request, and the stable execution fields from execution.start except thermal_pressure and snapshot_sha256.",
     "command_sha256": "SHA-256 over the exact argv byte strings separated and terminated by NUL; shell-joined command text is never hashed as a substitute.",
+    "environment_sha256": "SHA-256 over canonical sorted build and measurement policy entries after both child environments are cleared and rebuilt. Run-instance paths and IDs are represented by typed placeholders, while every workload-affecting value and resolved tool path/digest is bound.",
     "derived_field_order": [
       "hardware.fingerprint_sha256 from hardware facts",
       "execution.start/end.observed_hardware_fingerprint_sha256 from independently recaptured hardware facts",
@@ -155,7 +168,7 @@
     "hardware class predicates",
     "execution request and class-suffix predicates",
     "start/end snapshot validity and equivalence",
-    "exclusive lease and local execution",
+    "canonical shared-namespace host-global exclusive lock, family-specific attested lease identity, and local execution",
     "source and executable identity",
     "durability symmetry",
     "sealed completion",
@@ -402,7 +415,7 @@
     {
       "id": "MC-MUST-008",
       "level": "MUST",
-      "text": "Apple promotion evidence admits only the full P-plus-E scheduler pool and rejects thermal warnings. P-only is non-admissible; any ad-hoc P-only measurement is diagnostic-only until an observed scheduler-assignment witness exists. QG-1 and QG-8 remain unavailable on M4 until class-specific 10P and 14P-plus-E matrix endpoints are frozen."
+      "text": "M4 remains a registered hardware and optimization class, but every M4 gate is promotion-unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism. All current M4 measurements are diagnostic-only. Any future Apple promotion contract must also admit only a witnessed scheduler pool, reject thermal warnings, and freeze class-specific matrix endpoints."
     },
     {
       "id": "MC-MUST-009",
@@ -412,7 +425,7 @@
     {
       "id": "MC-MUST-010",
       "level": "MUST",
-      "text": "Timed evidence requires a clean exact source, local execution, and an exclusive measurement lease."
+      "text": "Timed promotion evidence requires a clean exact source with no hidden index entries or redirecting Git environment, local execution, an observed clear thermal state, pinned external roots and the actual executing benchmark image, and an exclusive measurement lease under the registered shared-namespace no-unlink host contract. A platform without a supported executing-image attestation mechanism is promotion-unavailable."
     },
     {
       "id": "MC-MUST-011",
@@ -422,7 +435,7 @@
     {
       "id": "MC-MUST-012",
       "level": "MUST",
-      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment. M4 QG-3, QG-4, and QG-5 remain unavailable until a non-declarative witness proves symmetric F_FULLFSYNC use by both arms."
+      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment. QG-3, QG-4, and QG-5 remain unavailable on every machine class until a non-declarative per-arm witness proves the required symmetric durability treatment."
     },
     {
       "id": "MC-MUST-013",
@@ -465,6 +478,11 @@
       "text": "Every fresh candidate and rerun binds one exact canonical artifact manifest to the actual run log, canonical threshold bytes, exact pre-binding evidence bytes, gate, run ID, and run window; any missing, substituted, noncanonical, or recomputed outer binding is rejected before history opens."
     },
     {
+      "id": "MC-MUST-021",
+      "level": "MUST",
+      "text": "Every fresh candidate and rerun binds the typed finalizer contract version, build-time Git revision and dirty posture, build-time Cargo.lock SHA-256, and independently hashed executing finalizer ELF. Producer revision and lock equal the benchmark build, and candidate plus immediate rerun use the same producer identity."
+    },
+    {
       "id": "MC-SHOULD-001",
       "level": "SHOULD",
       "text": "Receipts retain hostname, kernel, microcode, cache topology, and load for diagnosis even when those fields are not class predicates."
@@ -477,6 +495,7 @@
   ],
   "fact_templates": {
     "trj-valid-16c-smt2": {
+      "schema_version": "frankensearch.perf-runner-completion.v5",
       "requested_class_id": "trj-zen3-16c-smt2",
       "derived_class_id": "trj-zen3-16c-smt2",
       "registry_sha256": "$REGISTRY_SHA256",
@@ -609,7 +628,7 @@
           "governor": "performance",
           "thermal_pressure": false,
           "exclusive_lease": true,
-          "exclusive_lease_id": "fixture-trj-lease",
+          "exclusive_lease_id": "trj-zen3-exclusive",
           "local_execution": true,
           "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
           "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
@@ -678,7 +697,7 @@
           "governor": "performance",
           "thermal_pressure": false,
           "exclusive_lease": true,
-          "exclusive_lease_id": "fixture-trj-lease",
+          "exclusive_lease_id": "trj-zen3-exclusive",
           "local_execution": true,
           "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
           "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
@@ -691,7 +710,15 @@
         "worktree_state_sha256": null,
         "cargo_lock_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "command_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        "command_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "environment_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "producer": {
+          "contract_version": "frankensearch.quill-local-perf-producer.v3",
+          "source_git_revision": "ebd9175725ef9d97fd02d794394209b4719f8ce7",
+          "source_git_dirty": false,
+          "cargo_lock_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "executable_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
       },
       "durability": {
         "adjacent": false,
@@ -710,6 +737,7 @@
       }
     },
     "m4-valid-p-plus-e": {
+      "schema_version": "frankensearch.perf-runner-completion.v5",
       "requested_class_id": "m4-macos",
       "derived_class_id": "m4-macos",
       "registry_sha256": "$REGISTRY_SHA256",
@@ -757,7 +785,7 @@
           "governor": "not-applicable",
           "thermal_pressure": false,
           "exclusive_lease": true,
-          "exclusive_lease_id": "fixture-m4-lease",
+          "exclusive_lease_id": "m4-macos-exclusive",
           "local_execution": true,
           "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
           "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
@@ -776,7 +804,7 @@
           "governor": "not-applicable",
           "thermal_pressure": false,
           "exclusive_lease": true,
-          "exclusive_lease_id": "fixture-m4-lease",
+          "exclusive_lease_id": "m4-macos-exclusive",
           "local_execution": true,
           "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
           "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
@@ -789,7 +817,15 @@
         "worktree_state_sha256": null,
         "cargo_lock_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
         "executable_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-        "command_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+        "command_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "producer": {
+          "contract_version": "frankensearch.quill-local-perf-producer.v3",
+          "source_git_revision": "f9c6c57e44e07313f88b8a7d11c4df956ff44c24",
+          "source_git_dirty": false,
+          "cargo_lock_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "executable_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+        }
       },
       "durability": {
         "adjacent": false,
@@ -892,9 +928,9 @@
         "derived_sha256": {
           "hardware": "7980f60edce003ccf60d6d63cbbab12d25bcd52a440cd9e08306bbbeaac07295",
           "start_cpuset": "55d1f64b24dfe9f1f6c0d812469b95001f7831029fe7d45d0ba8b966005a5dbc",
-          "start_snapshot": "4515b24483b36ed22337eb34ffb063341d7aab240dfa04d7631e50cea3d83475",
-          "end_snapshot": "4515b24483b36ed22337eb34ffb063341d7aab240dfa04d7631e50cea3d83475",
-          "identity": "2174d9e7910ac7e7944346166211d265574dcce0b5c9ffa38ed212767364d315"
+          "start_snapshot": "15ac4336aa1bded34e18cde3d514de7f5271c3451447871e879bf992189d0f1a",
+          "end_snapshot": "15ac4336aa1bded34e18cde3d514de7f5271c3451447871e879bf992189d0f1a",
+          "identity": "517718cd1abef30a3ea07382643b4c0cab44fc1dab0d40461c99c88074e3aac9"
         }
       }
     },
@@ -912,6 +948,7 @@
         "MC-MUST-003",
         "MC-MUST-007",
         "MC-MUST-008",
+        "MC-MUST-009",
         "MC-MUST-010",
         "MC-MUST-011",
         "MC-MUST-013",
@@ -921,16 +958,9 @@
         "MC-MUST-018"
       ],
       "expected": {
-        "decision": "allow",
-        "class_id": "m4-macos",
-        "reason": "admitted",
-        "derived_sha256": {
-          "hardware": "5fe3655522548168c8d6cc6a43c03a87f8fc7a52046987f1317047cf7307aca0",
-          "start_cpuset": "a6bdee49912e0a0c743b36556734c8507ba479b3d58f4cfbf2bc98478213620b",
-          "start_snapshot": "b4eb02a78186b3915b56e93750b3ccef7ee1ae7fe8dfa0039189437fa76ac23f",
-          "end_snapshot": "b4eb02a78186b3915b56e93750b3ccef7ee1ae7fe8dfa0039189437fa76ac23f",
-          "identity": "749c8f9bcd8c556604d997a0ebf592d406799f4f5d3129da3b87fec48c9abd16"
-        }
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
       }
     },
     {
@@ -1538,7 +1568,7 @@
       "id": "MCV-037-pre-post-drift",
       "template": "trj-valid-16c-smt2",
       "set": {
-        "execution.end.exclusive_lease_id": "fixture-trj-lease-changed"
+        "execution.end.local_execution": false
       },
       "remove": [],
       "add_unknown": {},
@@ -1892,9 +1922,9 @@
         "derived_sha256": {
           "hardware": "7980f60edce003ccf60d6d63cbbab12d25bcd52a440cd9e08306bbbeaac07295",
           "start_cpuset": "f973c2be3391a296d572985a097f3d2c75c8520b80fe16033392c46520600eca",
-          "start_snapshot": "5da45f140b8a1ddab725727d118def57d6775aa202d61ac0dc0947f4c502dab9",
-          "end_snapshot": "5da45f140b8a1ddab725727d118def57d6775aa202d61ac0dc0947f4c502dab9",
-          "identity": "2096ce793265dbe100d2d8cb2ce925f6fb1e19e87ed033c8be839d6dc60138bf"
+          "start_snapshot": "d749082e282011b1b597f3295af8325a9a3ce08b9fa915bcb7901198393dc004",
+          "end_snapshot": "d749082e282011b1b597f3295af8325a9a3ce08b9fa915bcb7901198393dc004",
+          "identity": "92f3e143c6a99099b0135d25ae074253b84b68f9edc6c8cad5d4466995a0c61d"
         }
       }
     },
@@ -2121,6 +2151,290 @@
       "admission_context": {
         "gate": "QG-5",
         "destination_basename": "QG-5.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-012",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-059-old-receipt-schema",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "schema_version": "frankensearch.perf-runner-completion.v3"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-060-producer-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-061-producer-contract-version-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer.contract_version"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-062-producer-revision-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer.source_git_revision"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-063-producer-dirty-state-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer.source_git_dirty"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-064-producer-lock-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer.cargo_lock_sha256"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-065-producer-elf-missing",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [
+        "build.producer.executable_sha256"
+      ],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-066-producer-unknown-field",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "build.producer.unreviewed_identity": true
+      },
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCV-067-producer-duplicate-key",
+      "template": null,
+      "raw_json": "{\"build\":{\"producer\":{\"contract_version\":\"frankensearch.quill-local-perf-producer.v3\",\"contract_version\":\"substitute\"}}}",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-001",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "duplicate-key"
+      }
+    },
+    {
+      "id": "MCV-068-producer-contract-stale",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.producer.contract_version": "frankensearch.quill-local-perf-producer.v2"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-069-producer-dirty",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.producer.source_git_dirty": true
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-010",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-dirty"
+      }
+    },
+    {
+      "id": "MCV-070-producer-revision-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.producer.source_git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-071-producer-lock-mismatch",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.producer.cargo_lock_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-072-producer-elf-malformed",
+      "template": "trj-valid-16c-smt2",
+      "set": {
+        "build.producer.executable_sha256": "arbitrary-executable"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": [
+        "MC-MUST-011",
+        "MC-MUST-017",
+        "MC-MUST-021"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-073-trj-qg3-durability-witness-required",
+      "template": "trj-valid-16c-smt2",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-3",
+        "destination_basename": "QG-3.trj-zen3-16c-smt2.latest.json"
       },
       "covers": [
         "MC-MUST-012",

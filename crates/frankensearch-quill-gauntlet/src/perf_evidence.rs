@@ -294,6 +294,9 @@ pub struct BuildIdentity {
     pub cargo_lock_sha256: Option<String>,
     /// SHA-256 of exact NUL-separated, NUL-terminated process argv bytes.
     pub command_sha256: String,
+    /// SHA-256 of the typed producer's canonical build and workload environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_sha256: Option<String>,
     /// `rustc --version` of the toolchain that built the binary.
     pub rustc_version: String,
     /// Compilation target triple.
@@ -314,6 +317,10 @@ impl BuildIdentity {
         };
         if !hex_ok(&self.executable_sha256)
             || !hex_ok(&self.command_sha256)
+            || self
+                .environment_sha256
+                .as_deref()
+                .is_some_and(|value| !hex_ok(value))
             || self.git_revision.trim().is_empty()
             || self.rustc_version.trim().is_empty()
             || self.target_triple.trim().is_empty()
@@ -1697,7 +1704,9 @@ impl PerfEvidenceArtifact {
             && evidence_build.worktree_state_sha256.as_deref() == runner_worktree_state
             && evidence_build.cargo_lock_sha256.as_deref() == Some(runner_cargo_lock)
             && evidence_build.executable_sha256 == runner_string("executable_sha256")?
-            && evidence_build.command_sha256 == runner_string("command_sha256")?;
+            && evidence_build.command_sha256 == runner_string("command_sha256")?
+            && evidence_build.environment_sha256.as_deref()
+                == Some(runner_string("environment_sha256")?);
         if !build_matches {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: "evidence build identity differs from the verified runner receipt"
@@ -2436,11 +2445,12 @@ mod tests {
     fn build_identity() -> BuildIdentity {
         BuildIdentity {
             executable_sha256: "a".repeat(64),
-            git_revision: "deadbeef".to_owned(),
+            git_revision: "d".repeat(40),
             git_dirty: false,
             worktree_state_sha256: None,
             cargo_lock_sha256: Some("c".repeat(64)),
             command_sha256: "f".repeat(64),
+            environment_sha256: Some("e".repeat(64)),
             rustc_version: "rustc 1.91.0-nightly".to_owned(),
             target_triple: "x86_64-unknown-linux-gnu".to_owned(),
             build_profile: "test".to_owned(),
@@ -2508,10 +2518,11 @@ mod tests {
     ) -> VerifiedRunnerIdentity {
         crate::machine_class_registry::admitted_test_identity_for_artifacts(
             gate.label(),
-            "deadbeef",
+            &"d".repeat(40),
             &"c".repeat(64),
             &"a".repeat(64),
             &"f".repeat(64),
+            &"e".repeat(64),
             run_label,
             "run-a",
             "window-1",
@@ -2825,10 +2836,11 @@ mod tests {
         let drifted_argv_identity =
             crate::machine_class_registry::admitted_test_identity_for_artifacts(
                 PerfGate::Qg1.label(),
-                "deadbeef",
+                &"d".repeat(40),
                 &"c".repeat(64),
                 &"a".repeat(64),
                 &"0".repeat(64),
+                &"e".repeat(64),
                 "drifted-command",
                 "run-a",
                 "window-1",
@@ -2861,10 +2873,11 @@ mod tests {
             .expect("reconstruct pre-binding source");
         let different_receipt = crate::machine_class_registry::admitted_test_identity_for_artifacts(
             PerfGate::Qg1.label(),
-            "deadbeef",
+            &"d".repeat(40),
             &"c".repeat(64),
             &"a".repeat(64),
             &"f".repeat(64),
+            &"e".repeat(64),
             "different-completion",
             "run-a",
             "window-1",

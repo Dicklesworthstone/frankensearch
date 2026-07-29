@@ -459,11 +459,13 @@ impl PerfMatrixSpec {
         cold.writer_heap_bytes = Some(perf_writer_heap_bytes(1));
         cells.push(cold);
 
-        cells.push(PerfCellSpec::new(
+        let mut dependencies = PerfCellSpec::new(
             PerfGate::Qg10,
             "dependency_surface/default_lexical",
             "tantivy_nodes",
-        ));
+        );
+        dependencies.threads = Some(1);
+        cells.push(dependencies);
 
         Self {
             manifest: "docs/contracts/quill-perf-gates.toml".to_owned(),
@@ -475,6 +477,16 @@ impl PerfMatrixSpec {
     #[must_use]
     pub fn for_gate(&self, gate: PerfGate) -> Vec<&PerfCellSpec> {
         self.cells.iter().filter(|cell| cell.gate == gate).collect()
+    }
+
+    /// Maximum engine width required by a gate's complete frozen matrix.
+    #[must_use]
+    pub fn max_thread_width(&self, gate: PerfGate) -> Option<usize> {
+        self.cells
+            .iter()
+            .filter(|cell| cell.gate == gate)
+            .filter_map(|cell| cell.threads)
+            .max()
     }
 }
 
@@ -2313,6 +2325,15 @@ pub fn validate_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
             reason: "QG-5 requires a nonzero tombstone density".to_owned(),
         });
     }
+    if matrix
+        .cells
+        .iter()
+        .any(|cell| cell.threads.is_none_or(|threads| threads == 0))
+    {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "every performance cell requires a positive configured thread width".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -2877,7 +2898,9 @@ mod tests {
         assert_eq!(matrix.for_gate(PerfGate::Qg5).len(), 3);
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg8).len(), 6);
-        assert_eq!(matrix.for_gate(PerfGate::Qg10).len(), 1);
+        let qg10 = matrix.for_gate(PerfGate::Qg10);
+        assert_eq!(qg10.len(), 1);
+        assert_eq!(qg10[0].threads, Some(1));
     }
 
     #[test]

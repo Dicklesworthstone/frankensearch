@@ -3,11 +3,14 @@
 #
 # The Rust producer owns the exclusive lease, start/end host probes, benchmark
 # child, exact run log, artifact-manifest binding, receipt sealing, and
-# self-admission. This shell surface only builds the typed local producer,
-# establishes the requested Linux affinity/NUMA envelope, and launches that
-# producer. The producer itself builds and resolves the benchmark executable
-# from the clean source snapshot. This script never manufactures JSON or writes
-# promotion history.
+# self-admission. This shell surface requires an out-of-band prebuilt typed
+# producer, establishes the requested Linux affinity/NUMA envelope, and
+# launches it. The producer acquires the canonical host-global lease before it
+# builds and resolves the benchmark executable from the clean source snapshot.
+# Registered hosts provide one shared mount namespace and do not unlink or
+# rename the lease inode while a campaign is active.
+# This script never compiles during a measurement invocation, manufactures
+# JSON, or writes promotion history.
 #
 # Usage:
 #   scripts/perf-runner.sh \
@@ -25,13 +28,17 @@
 # Linux runs require --cpu-list. The producer proves that the selected CPUs
 # match the physical width and SMT suffix encoded by the class and that every
 # selected CPU uses the performance governor under NUMA-node-0 binding.
-# M4 runs currently admit only explicit P+E execution. P-only is
-# non-admissible; any ad-hoc P-only measurement is diagnostic-only until the
-# producer can prove scheduler assignment. QG-1/QG-8 remain blocked until their
-# normative matrices have M4-specific endpoints.
+# The thread budget defaults to, and if supplied must equal, the maximum width
+# in the selected gate's complete frozen matrix; it never defaults to host
+# capacity.
+# M4 is a recognized, fingerprinted optimization target, but every current M4
+# promotion invocation fails closed until the producer can attest the actual
+# executing image through a supported O_EXEC or loaded-image mechanism.
+# Diagnostic Apple profiling happens outside this promotion producer.
 # Timed runs are always local; there is no RCH override.
 
 set -euo pipefail
+export LC_ALL=C
 
 GATE=""
 CLASS=""
@@ -76,8 +83,10 @@ done
 [[ "$GATE" =~ ^QG-([1-9]|10)$ ]] || die "--gate must be QG-1 through QG-10"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "--run-id must use [A-Za-z0-9._-]"
 [[ "$RUN_WINDOW" =~ ^[A-Za-z0-9._-]+$ ]] || die "--run-window must use [A-Za-z0-9._-]"
-[[ "$RUNS" =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 10 ] ||
-    die "--runs must preserve the >=10-run evidence law"
+[ "${#RUN_ID}" -le 96 ] || die "--run-id must be at most 96 bytes"
+[ "${#RUN_WINDOW}" -le 96 ] || die "--run-window must be at most 96 bytes"
+[[ "$RUNS" =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 10 ] && [ "$RUNS" -le 100 ] ||
+    die "--runs must remain within 10..100"
 
 OS="$(uname -s)"
 if [[ "$CLASS" =~ ^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(-smt2)?$ ]]; then
@@ -90,45 +99,42 @@ if [[ "$CLASS" =~ ^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(-smt2)?$ ]]; then
     THREADS_PER_CORE=1
     [[ "${BASH_REMATCH[2]}" == "-smt2" ]] && THREADS_PER_CORE=2
     CLASS_CAPACITY=$((PHYSICAL_WIDTH * THREADS_PER_CORE))
-    THREAD_BUDGET="${THREAD_BUDGET:-$CLASS_CAPACITY}"
     APPLE_MODE="not-applicable"
-    LEASE_FAMILY="trj-zen3"
 elif [ "$CLASS" = "m4-macos" ]; then
     [ "$OS" = "Darwin" ] || die "class m4-macos requires macOS"
     [ -z "$CPU_LIST" ] || die "M4 scheduler-pool runs do not accept --cpu-list"
-    [ "$APPLE_MODE" = "p-plus-e" ] ||
-        die "M4 promotion runs currently require --apple-mode p-plus-e"
-    case "$GATE" in
-        QG-1|QG-8)
-            die "$GATE on M4 is blocked until the normative matrix has class-specific 10P/14P+E endpoints"
-            ;;
-        QG-3|QG-4|QG-5)
-            die "$GATE on macOS is blocked until both arms attest symmetric F_FULLFSYNC treatment"
-            ;;
-    esac
-    CLASS_CAPACITY=14
-    THREAD_BUDGET="${THREAD_BUDGET:-$CLASS_CAPACITY}"
-    LEASE_FAMILY="m4-macos"
+    die "M4 promotion is unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; current M4 work is diagnostic-only"
 else
     die "--class must name a registered trj-zen3-Nc[-smt2] or m4-macos class"
 fi
 
+case "$GATE" in
+    QG-1) NORMATIVE_THREAD_BUDGET=128 ;;
+    QG-7) NORMATIVE_THREAD_BUDGET=8 ;;
+    QG-8) NORMATIVE_THREAD_BUDGET=32 ;;
+    *) NORMATIVE_THREAD_BUDGET=1 ;;
+esac
+THREAD_BUDGET="${THREAD_BUDGET:-$NORMATIVE_THREAD_BUDGET}"
 [[ "$THREAD_BUDGET" =~ ^[0-9]+$ ]] &&
-    [ "$THREAD_BUDGET" -ge 1 ] &&
-    [ "$THREAD_BUDGET" -le "$CLASS_CAPACITY" ] ||
-    die "--thread-budget must be within 1..$CLASS_CAPACITY for $CLASS"
+    [ "$THREAD_BUDGET" -eq "$NORMATIVE_THREAD_BUDGET" ] ||
+    die "--thread-budget must equal the frozen $GATE matrix maximum $NORMATIVE_THREAD_BUDGET"
+[ "$THREAD_BUDGET" -le "$CLASS_CAPACITY" ] ||
+    die "$CLASS cannot execute the full $GATE matrix width $THREAD_BUDGET"
+case "$GATE" in
+    QG-3|QG-4|QG-5)
+        die "$GATE is promotion-unavailable on every host until both arms emit a non-declarative symmetric durability-treatment witness"
+        ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-    die "registered performance production requires a clean source tree"
-fi
 case "$OUT_ROOT" in
     /*) ;;
     *) die "--out must be an absolute directory outside the source repository" ;;
 esac
-OUT_PARENT="$(cd "$(dirname "$OUT_ROOT")" && pwd -P)" ||
-    die "--out parent must already exist"
-OUT_ROOT="$OUT_PARENT/$(basename "$OUT_ROOT")"
+[ ! -L "$OUT_ROOT" ] && [ -d "$OUT_ROOT" ] ||
+    die "--out must be an existing non-symlink directory"
+OUT_ROOT="$(cd "$OUT_ROOT" && pwd -P)" ||
+    die "--out must resolve cleanly"
 case "$OUT_ROOT/" in
     "$REPO_ROOT/"*) die "--out must remain outside the source repository" ;;
 esac
@@ -137,58 +143,56 @@ case "$PERF_TARGET_DIR" in
     /*) ;;
     *) die "CARGO_TARGET_DIR must be absolute and outside the source repository" ;;
 esac
-TARGET_PARENT="$(cd "$(dirname "$PERF_TARGET_DIR")" && pwd -P)" ||
-    die "CARGO_TARGET_DIR parent must already exist"
-PERF_TARGET_DIR="$TARGET_PARENT/$(basename "$PERF_TARGET_DIR")"
+[ ! -L "$PERF_TARGET_DIR" ] && [ -d "$PERF_TARGET_DIR" ] ||
+    die "CARGO_TARGET_DIR must be an existing non-symlink directory"
+PERF_TARGET_DIR="$(cd "$PERF_TARGET_DIR" && pwd -P)" ||
+    die "CARGO_TARGET_DIR must resolve cleanly"
 case "$PERF_TARGET_DIR/" in
     "$REPO_ROOT/"*) die "CARGO_TARGET_DIR must remain outside the source repository" ;;
 esac
+FINALIZER_ELF="$PERF_TARGET_DIR/release-perf/quill-perf-finalize"
+[ -x "$FINALIZER_ELF" ] ||
+    die "typed finalizer is not prebuilt at $FINALIZER_ELF; build it locally outside measurement windows with: RCH_DISABLE=1 RCH_CARGO_WRAPPER_BYPASS=1 CARGO_TARGET_DIR=$PERF_TARGET_DIR cargo build --locked --profile release-perf -p frankensearch-quill-gauntlet --bin quill-perf-finalize"
+exec 9<"$FINALIZER_ELF" ||
+    die "cannot hold the verified typed-finalizer executable open"
+HELD_FINALIZER_ELF="/proc/self/fd/9"
+[ -r "$HELD_FINALIZER_ELF" ] ||
+    die "cannot address the held typed-finalizer executable"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CLASS_ROOT="$OUT_ROOT/$CLASS"
 RUN_DIR="$CLASS_ROOT/$STAMP-$RUN_ID"
-mkdir -p "$CLASS_ROOT"
-mkdir "$RUN_DIR" || die "run directory already exists: $RUN_DIR"
+[ ! -L "$CLASS_ROOT" ] ||
+    die "machine-class output root must not be a symbolic link"
+[ -d "$CLASS_ROOT" ] ||
+    die "machine-class output root must already exist before the measurement window"
+CLASS_ROOT="$(cd "$CLASS_ROOT" && pwd -P)" ||
+    die "machine-class output root must resolve cleanly"
+case "$CLASS_ROOT/" in
+    "$OUT_ROOT/"*) ;;
+    *) die "machine-class output root escaped --out" ;;
+esac
+RUN_DIR="$CLASS_ROOT/$STAMP-$RUN_ID"
+[ ! -e "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] ||
+    die "run directory already exists: $RUN_DIR"
 
-# Keep compilation outside the repository and force it to remain on this host.
+# Force the typed producer and benchmark child to remain on this host.
 export CARGO_TARGET_DIR="$PERF_TARGET_DIR"
 export RCH_DISABLE=1
 export RCH_CARGO_WRAPPER_BYPASS=1
 export RCH_MIN_LOCAL_TIME_MS=999999999
-export QUILL_PERF_RUNS="$RUNS"
-export RAYON_NUM_THREADS="$THREAD_BUDGET"
+export QUILL_PERF_HELD_PRODUCER_FD=9
 
-BUILD_MESSAGES="$RUN_DIR/build-messages.jsonl"
 cd "$REPO_ROOT"
-command -v jq >/dev/null 2>&1 || die "jq is required to resolve exact Cargo executables"
-cargo build \
-    --locked \
-    --profile release-perf \
-    -p frankensearch-quill-gauntlet \
-    --bin quill-perf-finalize \
-    --message-format=json-render-diagnostics \
-    > "$BUILD_MESSAGES"
-FINALIZER_ELF="$(
-    jq -r '
-        select(.reason == "compiler-artifact")
-        | select(.target.name == "quill-perf-finalize")
-        | .executable // empty
-    ' "$BUILD_MESSAGES" | tail -n 1
-)"
-[ -x "$FINALIZER_ELF" ] || die "Cargo did not report an executable typed finalizer"
-
-LEASE_ROOT="$OUT_ROOT/.leases"
-mkdir -p "$LEASE_ROOT"
-LEASE_PATH="$LEASE_ROOT/$LEASE_FAMILY.lock"
 PRODUCER=(
-    "$FINALIZER_ELF"
+    "$HELD_FINALIZER_ELF"
     --gate "$GATE"
     --class "$CLASS"
     --run-id "$RUN_ID"
     --run-window "$RUN_WINDOW"
     --thread-budget "$THREAD_BUDGET"
+    --runs "$RUNS"
     --apple-mode "$APPLE_MODE"
-    --lease-path "$LEASE_PATH"
     --output-dir "$RUN_DIR"
 )
 if [ "$OS" = "Linux" ]; then
@@ -208,21 +212,16 @@ echo "thread budget: $THREAD_BUDGET"
 echo "benchmark ELF: built and resolved by the typed producer"
 
 if [ "$FOREGROUND" -eq 1 ]; then
-    set +e
-    "${LAUNCH[@]}" 2>&1 | tee "$RUN_DIR/launcher.log"
-    STATUS=${PIPESTATUS[0]}
-    set -e
-    echo "producer exit: $STATUS"
-    exit "$STATUS"
+    "${LAUNCH[@]}"
+    exit $?
 fi
 
 if command -v setsid >/dev/null 2>&1; then
-    nohup setsid "${LAUNCH[@]}" > "$RUN_DIR/launcher.log" 2>&1 < /dev/null &
+    nohup setsid "${LAUNCH[@]}" > /dev/null 2>&1 < /dev/null &
 else
-    nohup "${LAUNCH[@]}" > "$RUN_DIR/launcher.log" 2>&1 < /dev/null &
+    nohup "${LAUNCH[@]}" > /dev/null 2>&1 < /dev/null &
 fi
 PID=$!
-printf '%s\n' "$PID" > "$RUN_DIR/producer.pid"
 echo "detached:      pid $PID"
-echo "follow:        tail -f $RUN_DIR/launcher.log"
+echo "artifacts:     $RUN_DIR (created only after locked validation)"
 echo "committed:     test -f $RUN_DIR/$GATE.runner.json"
