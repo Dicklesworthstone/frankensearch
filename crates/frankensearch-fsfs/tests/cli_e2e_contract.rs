@@ -57,6 +57,10 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
 fn stabilize_bundle(bundle: &mut CliE2eArtifactBundle) {
     "2026-02-14T00:00:00Z".clone_into(&mut bundle.manifest.ts);
     "01JABCDEF00000000000000000".clone_into(&mut bundle.manifest.run_id);
+    // Golden receipts describe the contract fixture, not the host that runs
+    // the test. Keep Apple Silicon and non-x86 CI from changing the payload.
+    "linux".clone_into(&mut bundle.manifest.body.platform.os);
+    "x86_64".clone_into(&mut bundle.manifest.body.platform.arch);
     for event in &mut bundle.events {
         "2026-02-14T00:00:00Z".clone_into(&mut event.ts);
     }

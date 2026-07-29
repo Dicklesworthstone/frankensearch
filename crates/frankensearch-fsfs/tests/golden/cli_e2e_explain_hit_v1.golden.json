@@ -44,7 +44,7 @@
       "artifacts": [
         {
           "file": "artifacts_index.json",
-          "checksum": "sha256:986f9090bdf22ccc6bd9e848be85f67200f3170b121d91368b7e1beaf1497258"
+          "checksum": "sha256:b09fbe7370fbde3446fc9c9a383359b696eed61ca3892d1e54a335d07eb14081"
         },
         {
           "file": "env.json",
@@ -52,11 +52,11 @@
         },
         {
           "file": "replay_command.txt",
-          "checksum": "sha256:87e845481575d0d5ba95adbf5741499360445dd726964084519dc5d58bb9224f"
+          "checksum": "sha256:554c980074a71799a89087c95c965c47a88ae8517b7554ee2cd240ed6b8243cb"
         },
         {
           "file": "repro.lock",
-          "checksum": "sha256:22602527dac5ab1e563155b6a20688c8e154b1aeb8a1daff49deeb05356186e1"
+          "checksum": "sha256:d50d165f68a0eb50581171357642b8eddac72d80b12c0af4af4e967dc07bfa9a"
         },
         {
           "file": "structured_events.jsonl",
