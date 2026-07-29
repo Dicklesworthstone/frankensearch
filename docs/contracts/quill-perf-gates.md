@@ -27,13 +27,19 @@ other manifest byte still invalidates prior evidence.
 
 ```
 .bench-history/
-  QG-<n>.<machine-class>.latest.json     # committed; the ratchet baseline
-  QG-<n>.<machine-class>.<date>.json     # retained run window
-  QG-<n>.<machine-class>.latest.evidence.json
-  QG-<n>.<machine-class>.<date>.evidence.json
+  QG-<n>.<machine-class>.latest.json
+      # one atomic pointer to the complete immutable baseline generation
+  QG-<n>.<machine-class>.<date>.<run-id>.json
+      # immutable threshold object
+  QG-<n>.<machine-class>.<date>.<run-id>.evidence.json
+      # immutable receipt-bound evidence object
   QG-<n>.unmeasured.latest.json          # explicit bootstrap quarantine
 ```
-Schema per file: `{schema_version, gate, bench_elf_sha256,
+Measured latest pointers use
+`{schema_version, gate, machine_class, run_id, threshold_file,
+threshold_sha256, evidence_file, evidence_sha256}` and resolve both halves of
+one generation from the same directory. Threshold schema:
+`{schema_version, gate, bench_elf_sha256,
 machine_fingerprint, git_rev,
 run_window, run_id, corpus_manifest_hash, manifest_sha256, cells: [{fixture,
 metric, engine, unit, value, p50, median_ci95_low, median_ci95_high, p95, p99,
@@ -48,7 +54,12 @@ The bootstrap files contain no measurements. They make the absence of a real
 machine-class baseline visible without fabricating a number and force PR alarms
 to `Quarantine`. A full, evidence-admissible candidate/rerun pair may establish
 the first measured baseline and activate the gate with either a PASS or MISS
-target verdict. That first MISS baseline is a reference point, not a speed
+target verdict. The exemption is deliberately narrow: only the exact
+current-schema sentinel for the evaluated gate and manifest may omit baseline
+evidence and a baseline runner receipt. Supplying either for that sentinel is
+rejected as fabrication; near-sentinels and measured legacy artifacts receive
+no exemption. Candidate and rerun still require two independent, verified,
+post-exit receipts. That first MISS baseline is a reference point, not a speed
 claim.
 `quill-perf-ratchet` evaluates later candidates against that committed baseline
 with a directional 5% pass-over-pass threshold. A movement beyond 5% is
@@ -58,10 +69,12 @@ directional regression; a median movement whose CIs do not decide it is
 provenance only. Promotion also
 requires a second artifact from the same git revision, registry-derived machine
 class and execution identity, corpus hash, and run window, with a distinct run
-ID and independently sealed runner receipt. Baseline, candidate, and rerun
-must carry three distinct run IDs, one exact NUL-delimited argv identity, and
-one rustc/target/profile/feature context. Candidate and rerun medians must
-reproduce within 5%.
+ID and independently sealed runner receipt. Ordinary measured-baseline
+promotions require three distinct run IDs and receipts across baseline,
+candidate, and rerun. Exact-bootstrap promotion requires two across candidate
+and rerun and never fabricates a third. All measured roles share one exact
+NUL-delimited argv identity and one rustc/target/profile/feature context.
+Candidate and rerun medians must reproduce within 5%.
 
 ## Paired estimator contract
 
@@ -93,13 +106,13 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The v4 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
+The v5 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
 `paired_null_quill` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v2` artifact (`bd-uh2f` /
-`bd-uh2f.1`), which the harness now emits beside every v4 artifact from the
+Decision-grade output is the `quill-perf-evidence-v3` artifact (`bd-uh2f` /
+`bd-uh2f.1`), which the harness emits beside every v5 artifact from the
 exact same raw paired blocks.
 
-## Evidence artifacts (`quill-perf-evidence-v2`)
+## Evidence artifacts (`quill-perf-evidence-v3`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
@@ -111,36 +124,51 @@ absolute-versus-paired reconciliation. Run provenance records the
 executing ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
 the exact NUL-separated and NUL-terminated argv SHA-256,
 rustc/target/profile/features, host identity, host-wide physical cores and
-logical threads, process-available concurrency, exact thread widths exercised,
-runtime-detected ISA, effective affinity/cpuset cap, governor and load, peak RSS
-with its method (`unsupported` is reported honestly, never a zero), and
-corpus/query-set hashes with generator coordinates.
+logical threads, producer OS, process-available concurrency, configured engine
+thread widths, runtime-detected ISA, effective affinity/cpuset cap, governor and
+load, peak RSS with its method (`unsupported` is reported honestly, never a
+zero), and corpus/query-set hashes with generator coordinates. QG-1 and QG-8
+add per-cell Quill and Tantivy concurrency witnesses: each observation has a
+positive count and proves `min == max ==` the normative configured width. A
+configuration parameter alone is never described as observed concurrency.
 
-Version 2 additionally binds the exact frozen
+Version 3 additionally persists the producer OS and binds the exact frozen
 `quill-machine-classes.json` registry identity and canonicalization contract,
 the canonical class derived from strict runner facts, immutable hardware facts,
 the explicit execution request and start/end snapshots, every recomputed
 hardware/cpuset/snapshot/execution hash, and the SHA-256 plus exact bytes of one
-verified sealed runner-completion receipt. The registry and receipt parsers
-reject duplicate and unknown fields. Loading re-admits the embedded receipt
-against the frozen registry; resealing an artifact cannot legitimize a stale,
-drifted, mixed, incomplete, or tampered identity. An explicit `unverified`
-binding remains durable for diagnosis but is never ratchet-admissible.
-The v4 threshold artifact's execution block is only a compatibility projection:
+verified sealed runner-completion receipt and its exact artifact manifest. That
+manifest hashes the actual run log, canonical v5 threshold artifact, and exact
+pre-binding v3 evidence bytes and names their gate, run ID, and run window.
+Manifest, registry, receipt, threshold, and evidence parsers reject duplicate
+and unknown fields and require their typed canonical encodings. Loading
+re-admits the embedded receipt and manifest against the frozen registry;
+resealing an outer artifact cannot legitimize a stale, drifted, mixed,
+incomplete, or tampered identity. An explicit `unverified` binding remains
+durable for diagnosis but is never ratchet-admissible.
+The v5 threshold artifact's execution block is only a compatibility projection:
 promotion requires it to equal the sealed current-evidence execution block and
-to agree with the verified receipt's physical/logical topology, thread budget,
-and effective CPU-set bounds. A caller-supplied execution block is never an
-independent identity authority.
+to agree with the verified receipt's producer OS, physical/logical topology,
+configured thread budget, exact runtime ISA, and effective CPU-set bounds. A
+caller-supplied execution block is never an independent identity authority.
 
 Receipt binding is deliberately two-phase. The live benchmark writes the
-current v2 artifact with an explicit `unverified` binding and the exact
-NUL-delimited process-argv hash while the child is still running. The runner
-can seal its completion receipt only after that child exits. Promotion
-therefore admits each post-exit receipt, joins it to the corresponding
-baseline/candidate/rerun artifact in memory, recomputes the artifact seal, and
-validates the complete trio before opening any history destination. Only those
-new receipt-bound bytes may be written on `Allow`; the original unverified
-producer bytes remain diagnostic provenance and are never copied into history.
+current v3 artifact with an explicit `unverified` binding and the exact
+NUL-delimited process-argv hash while the child is still running. One typed
+registered-host producer holds the exclusive lease across start probes, the
+exact benchmark child, log synchronization, end probes, manifest construction,
+receipt sealing, registry admission, and an in-memory bind-and-reverify preview.
+The producer—not an operator-supplied command—builds and resolves the exact
+benchmark executable from the clean source snapshot before the lease opens.
+After every check passes it writes the manifest and `PRECOMMIT.json`, syncs
+them, and writes the ratchet-required receipt last as the finalization commit
+boundary. Promotion receives a measured baseline as already-bound
+committed evidence; only candidate and rerun receive fresh external receipt,
+manifest, actual run-log, threshold, and pre-binding evidence inputs. The
+ratchet binds those two roles in memory and validates all three measured roles
+before opening any history destination. Only receipt-bound bytes may be written
+on `Allow`; original unverified producer evidence remains diagnostic provenance
+and is never copied into history.
 
 Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
 two-stage hierarchical per-query resampling (QG-6, four query groups per
@@ -160,29 +188,51 @@ re-runs every estimator from the retained raw samples, and rejects truncated
 files and stale schema versions. Legacy v3 artifacts load only through the
 explicit read-only `load_legacy_gate_artifact_v3`.
 
-Every decision JSON names and SHA-256 hashes the manifest, baseline, candidate,
-rerun, all three current-schema evidence artifacts, and all three exact runner
-receipts. Promotion requires one registry-verified execution identity across
-baseline, candidate, and rerun before any mutable history path is opened.
+Every decision JSON names and SHA-256 hashes the contract manifest, baseline,
+candidate, rerun, the already-bound baseline evidence, each candidate/rerun
+source and bound evidence form, each fresh receipt and exact artifact manifest,
+and each actual candidate/rerun log applicable to promotion. Ordinary promotion
+has three measured roles, but the baseline identity is self-contained in its
+committed evidence; candidate and rerun carry fresh external finalization
+inputs. Exact-bootstrap promotion carries candidate and rerun only; the
+sentinel has neither evidence nor identity. Promotion requires one
+registry-verified execution identity across every measured role before any
+mutable history path is opened.
 `--machine-class` is an expected value only: it must equal the class derived
 from every receipt and cannot relabel evidence or select a different latest
-key. `Allow` writes the dated threshold object, dated evidence, latest evidence,
-and finally the legacy latest threshold pointer, with file and directory sync
-at each boundary. `Block`, `Quarantine`, receipt rejection, destination
+key. On `Allow`, the complete decision JSON first records and hashes the
+publication plan and reaches stable storage outside history. The ratchet then
+uses create-new/idempotent-exact writes for the run-ID-qualified threshold and
+evidence objects and atomically advances the one measured latest pointer last.
+The pointer binds both immutable hashes, so no crash can publish a mixed
+threshold/evidence generation. `Block`, `Quarantine`, receipt rejection, destination
 mismatch, and legacy/current mixtures leave every history byte unchanged.
 Legacy threshold artifacts remain readable only in explicitly nonpromotable
 regression-alarm mode. Older evidence is retained rather than automatically
 deleted under repository Rule 1.
 
-CI uses the same binary in two lanes:
+CI and registered-host production are deliberately separate lanes:
 
-- PRs run the QG-2 smoke slice twice and raise a regression alarm against the
-  committed Ubuntu baseline.
+- PRs run the QG-2 smoke slice twice to exercise the harness, reproduction
+  checks, canonical artifacts, and ratchet denial paths. There is no stable
+  hosted-Ubuntu performance baseline.
 - The scheduled/workflow-dispatch matrix runs each QG gate in full
   `release-perf`, measures candidate and rerun from one checkout/host/target,
-  evaluates promotion, and uploads measurements, decision, and any history
-  candidate. Since CI has read-only repository permission, an allowed history
-  update remains a reviewable artifact until committed deliberately.
+  evaluates a structural reproduction diagnostic, and uploads its artifacts.
+  Exact ephemeral host identity makes the unmeasured-sentinel result an
+  expected `Quarantine`; hosted `ubuntu-latest` is never promotion-eligible and
+  this lane is not a functional pass-over-pass performance alarm.
+- Promotion runs only on a registered TRJ or currently eligible M4 P+E gate
+  through
+  `scripts/perf-runner.sh` and the typed producer. Those finalized candidate and
+  rerun bundles are supplied deliberately to `quill-perf-ratchet`; only its
+  `Allow` path may write a reviewable history candidate.
+
+M4 QG-1/QG-8 remain unavailable until class-specific 10P and 14P+E endpoints
+are frozen; M4 QG-3/QG-4/QG-5 remain unavailable until a non-declarative
+witness proves symmetric `F_FULLFSYNC` use by both arms. P-only is
+non-admissible; ad-hoc P-only measurements are diagnostic-only until a real
+scheduler-assignment witness exists.
 
 ## Topology honesty (QG-3/QG-4)
 

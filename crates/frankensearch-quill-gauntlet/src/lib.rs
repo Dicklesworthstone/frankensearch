@@ -13,6 +13,7 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod local_perf_runner;
 mod machine_class_registry;
 mod perf;
 mod perf_evidence;
@@ -75,12 +76,16 @@ pub use generator::{
     SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
+pub use local_perf_runner::{
+    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, run_local_perf_command,
+};
 pub use machine_class_registry::{
     MACHINE_CLASS_REGISTRY_GIT_BLOB, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
     MACHINE_CLASS_REGISTRY_SHA256, MACHINE_CLASS_REGISTRY_SPEC_COMMIT,
     MachineClassAdmissionContext, MachineClassCanonicalizationBinding, MachineClassDecision,
     MachineClassDerivedHashes, MachineClassError, MachineClassEvidenceBinding, MachineClassLookup,
-    MachineClassReason, MachineClassRegistry, VerifiedRunnerIdentity,
+    MachineClassReason, MachineClassRegistry, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    RunnerArtifactManifest, RunnerArtifactManifestBinding, VerifiedRunnerIdentity,
 };
 pub use perf::{
     DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PAIRED_ESTIMATOR_SCHEMA_VERSION,
@@ -89,27 +94,29 @@ pub use perf::{
     PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError, PairedEstimatorReason,
     PairedEvidenceStatus, PairedExperimentResult, PerfCellResult, PerfCellSpec, PerfCorpus,
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
-    PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
-    PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
-    QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment, machine_fingerprint,
-    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_manifest_contract_sha256,
-    perf_writer_heap_bytes, seeded_balanced_pair_order, validate_matrix,
+    PerfMetricSemantics, PerfOperationScope, PerfProducerOs, PerfQueryClass, PerfRawSample,
+    PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
+    PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment,
+    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes,
+    perf_manifest_contract_sha256, perf_writer_heap_bytes, seeded_balanced_pair_order,
+    validate_matrix,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
-    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EvidenceArtifactError,
-    EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
+    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EngineConcurrencyObservation,
+    EvidenceArtifactError, EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
     EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
     EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION, HierarchicalGroupSummary,
     HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence,
-    PerfEvidenceArtifact, command_sha256_from_argv, estimate_hierarchical_latency,
-    human_table_from_json, load_legacy_gate_artifact_v3, required_estimand,
+    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfEvidenceArtifact,
+    command_sha256_from_argv, estimate_hierarchical_latency, human_table_from_json,
+    load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
-    evaluate_perf_ratchet,
+    evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6HarnessError,

@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::GauntletError;
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v4";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v5";
 /// Read-only schema identifier for historical gate artifacts that lack
 /// auditable host topology and effective-thread provenance.
 pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
@@ -1755,12 +1755,44 @@ pub fn median_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
+/// Closed producer operating-system identity for persisted evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerfProducerOs {
+    /// Linux producer, where the effective CPU allow-list is mandatory.
+    Linux,
+    /// macOS producer, where Linux affinity evidence is inapplicable.
+    Macos,
+}
+
+impl PerfProducerOs {
+    /// Stable serialized operating-system label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+        }
+    }
+
+    fn current() -> Option<Self> {
+        match std::env::consts::OS {
+            "linux" => Some(Self::Linux),
+            "macos" => Some(Self::Macos),
+            _ => None,
+        }
+    }
+}
+
 /// Auditable host topology and effective execution width for one benchmark
 /// artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfExecutionProvenance {
     /// Stable host name, not merely an architecture family label.
     pub host_identity: String,
+    /// Operating system of the producer that captured this persisted
+    /// provenance. Validation must never depend on the reader's host OS.
+    pub producer_os: PerfProducerOs,
     /// Host-wide physical core count.
     pub physical_cores: usize,
     /// Host-wide logical hardware-thread count.
@@ -1768,8 +1800,11 @@ pub struct PerfExecutionProvenance {
     /// Concurrency available to the benchmark process after scheduler and
     /// cgroup constraints.
     pub process_available_threads: usize,
-    /// Exact thread widths exercised by the cells in this artifact.
-    pub threads_actually_used: Vec<usize>,
+    /// Exact engine thread-width knobs configured by the selected cells.
+    ///
+    /// This is configuration provenance, never a claim that every configured
+    /// worker performed useful work.
+    pub configured_engine_thread_widths: Vec<usize>,
     /// ISA features detected at runtime on the executing host.
     pub runtime_detected_isa: Vec<String>,
     /// Effective Linux `Cpus_allowed_list`, when the platform exposes it.
@@ -1783,7 +1818,7 @@ impl PerfExecutionProvenance {
     /// Capture host-wide topology beside the exact widths selected by this
     /// invocation.
     #[must_use]
-    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(configured_engine_thread_widths: impl IntoIterator<Item = usize>) -> Self {
         let (physical_cores, logical_threads) = host_cpu_topology()
             .expect("performance evidence requires host physical/logical CPU topology");
         let process_available_threads = std::thread::available_parallelism().map_or(1, usize::from);
@@ -1809,19 +1844,21 @@ impl PerfExecutionProvenance {
         } else {
             None
         };
-        let mut threads_actually_used = threads_actually_used
+        let mut configured_engine_thread_widths = configured_engine_thread_widths
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        threads_actually_used.retain(|threads| *threads > 0);
+        configured_engine_thread_widths.retain(|threads| *threads > 0);
         let provenance = Self {
             host_identity: host_identity()
                 .expect("performance evidence requires a non-empty host identity"),
+            producer_os: PerfProducerOs::current()
+                .expect("performance evidence supports only Linux and macOS producers"),
             physical_cores,
             logical_threads,
             process_available_threads,
-            threads_actually_used,
+            configured_engine_thread_widths,
             runtime_detected_isa: runtime_detected_isa(),
             cpu_affinity_allowed_list,
             affinity_or_cpuset_cap,
@@ -1840,17 +1877,23 @@ impl PerfExecutionProvenance {
             && self.physical_cores > 0
             && self.logical_threads >= self.physical_cores
             && self.process_available_threads > 0
-            && !self.threads_actually_used.is_empty()
+            && !self.configured_engine_thread_widths.is_empty()
             && self
-                .threads_actually_used
+                .configured_engine_thread_widths
                 .iter()
                 .all(|threads| *threads > 0)
-            && !self.runtime_detected_isa.is_empty()
-            && (std::env::consts::OS != "linux"
-                || self
+            && self
+                .configured_engine_thread_widths
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && runtime_isa_is_normalized(&self.runtime_detected_isa)
+            && match self.producer_os {
+                PerfProducerOs::Linux => self
                     .cpu_affinity_allowed_list
                     .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()))
+                    .is_some_and(|value| !value.trim().is_empty()),
+                PerfProducerOs::Macos => true,
+            }
     }
 }
 
@@ -1971,7 +2014,7 @@ fn parse_cpu_list_count(value: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-fn runtime_detected_isa() -> Vec<String> {
+pub fn runtime_detected_isa() -> Vec<String> {
     let mut features = Vec::new();
     #[cfg(target_os = "linux")]
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
@@ -2022,7 +2065,30 @@ fn runtime_detected_isa() -> Vec<String> {
     if features.is_empty() {
         features.push("scalar".to_owned());
     }
+    features.sort_unstable();
+    features.dedup();
     features
+}
+
+fn runtime_isa_is_normalized(features: &[String]) -> bool {
+    const REPORTABLE_RUNTIME_ISA: &[&str] = &[
+        "aes", "asimd", "avx2", "avx512f", "bmi2", "fma", "neon", "scalar", "sha2", "vaes",
+    ];
+    let valid_token = |feature: &str| {
+        !feature.is_empty()
+            && feature.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'.' | b'-')
+            })
+    };
+    !features.is_empty()
+        && features.iter().all(|feature| valid_token(feature))
+        && features
+            .iter()
+            .all(|feature| REPORTABLE_RUNTIME_ISA.contains(&feature.as_str()))
+        && features.windows(2).all(|pair| pair[0] < pair[1])
+        && (features.len() == 1 || features.iter().all(|feature| feature != "scalar"))
 }
 
 /// One engine or comparison row in a gate artifact.
@@ -2038,14 +2104,15 @@ pub struct PerfCellResult {
 
 /// Per-gate JSON artifact matching the committed E0.6 schema contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required in v4. `None` exists only so the explicit read-only v3 loader
-    /// can deserialize historical artifacts without upgrading their claims.
+    /// Required on measured v5 artifacts. `None` exists only for the exact
+    /// unmeasured v5 sentinel and the explicit read-only v3 loader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
@@ -2077,14 +2144,14 @@ impl PerfGateArtifact {
             let _ = writeln!(
                 table,
                 "host={} | physical_cores={} | logical_threads={} | \
-                 process_available_threads={} | threads_actually_used={:?} | \
+                 process_available_threads={} | configured_engine_thread_widths={:?} | \
                  runtime_detected_isa={:?} | cpu_affinity_allowed_list={} | \
                  affinity_or_cpuset_cap={}",
                 execution.host_identity,
                 execution.physical_cores,
                 execution.logical_threads,
                 execution.process_available_threads,
-                execution.threads_actually_used,
+                execution.configured_engine_thread_widths,
                 execution.runtime_detected_isa,
                 execution
                     .cpu_affinity_allowed_list
@@ -2922,11 +2989,12 @@ mod tests {
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(PerfExecutionProvenance {
                 host_identity: "test-host".to_owned(),
+                producer_os: PerfProducerOs::Linux,
                 physical_cores: 64,
                 logical_threads: 128,
                 process_available_threads: 128,
-                threads_actually_used: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
-                runtime_detected_isa: vec!["avx2".to_owned(), "fma".to_owned(), "bmi2".to_owned()],
+                configured_engine_thread_widths: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
+                runtime_detected_isa: vec!["avx2".to_owned(), "bmi2".to_owned(), "fma".to_owned()],
                 cpu_affinity_allowed_list: Some("0-127".to_owned()),
                 affinity_or_cpuset_cap: None,
             }),
@@ -2967,7 +3035,9 @@ mod tests {
         assert!(table.contains("median_ci95"));
         assert!(table.contains("bulk/tiny/1/positions_on"));
         assert!(table.contains("sampled"));
-        assert!(table.contains("threads_actually_used=[1, 2, 4, 8, 16, 32, 64, 96, 128]"));
+        assert!(
+            table.contains("configured_engine_thread_widths=[1, 2, 4, 8, 16, 32, 64, 96, 128]")
+        );
     }
 
     #[test]

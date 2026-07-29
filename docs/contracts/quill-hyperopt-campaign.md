@@ -65,17 +65,18 @@ first-class; one lever per change). This campaign adds:
 
 ## 2. Machine-class matrix
 
-`.bench-history/QG-<n>.<machine-class>.latest.json` already keys baselines by
-machine class. The sole normative class grammar, predicates, receipt fields,
+`.bench-history/QG-<n>.<machine-class>.latest.json` keys baselines by machine
+class through one atomic pointer to immutable run-ID-qualified threshold and
+evidence objects. The sole normative class grammar, predicates, receipt fields,
 reason codes, and shared conformance fixtures are in
 [`quill-machine-classes.json`](quill-machine-classes.json); prose in this
 document cannot weaken or override that contract.
 
-| Class ID | Hardware | Campaign role | Mandatory provenance (beyond the evidence-v1 contract) |
+| Class ID | Hardware | Campaign role | Mandatory provenance (beyond the evidence-v3 contract) |
 |---|---|---|---|
 | `x86-vps-ovh` | Existing rch workers; homogeneity not yet proven | Diagnostic continuity only until `bd-9f03f` either proves one class or splits the fleet | Exact worker facts and receipt are retained, but the class is `diagnostic_only` and cannot promote history |
 | `trj-zen3-<N>c` / `trj-zen3-<N>c-smt2` | AMD Threadripper PRO 5995WX, Zen 3, 64 physical cores/128 SMT threads, one NUMA node, no AVX-512 | Scale-out truth: QG-1 high-thread cells, QG-8 scaling, allocator/NUMA attribution | `N` is effective physical-core slice width (1–64), not logical threads. No suffix means one hardware thread/core; SMT-on requires `-smt2`, preventing latest-artifact and null-band collisions. Requested and observed CPU sets, thread budget, NUMA binding, performance governor, exclusive lease, and pre/post fingerprints remain separately bound. `trj-zen-128c` is obsolete provenance only and is rejected for new evidence |
-| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | ARM64 latency truth: QG-6/QG-9; requested P-only versus P+E scaling | Requested pool/scheduler mode and what the OS actually exposes are recorded separately. A P-only request is never described as hard affinity without an observed CPU set. Thermal state, page size, local execution, sealed completion, and arm-symmetric `F_FULLFSYNC` treatment are bound |
+| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | Current ARM64 promotion envelope: full-pool P+E QG-2/QG-6/QG-7/QG-9/QG-10. QG-1/QG-8 await class-specific matrices; QG-3/QG-4/QG-5 await real `F_FULLFSYNC` witnesses | P-only is non-admissible; any ad-hoc P-only number is diagnostic-only until the OS assignment can be witnessed. Thermal state, page size, local execution, sealed completion, and applicable durability treatment remain bound |
 | `m5-macos` | No reachable, fingerprinted M5 host yet | Independent future M5 lane; descriptive M4/M5 delta only | `unavailable` and diagnostic-only until a real named host and immutable fingerprint are registered. No M5 fact or number is inferred from M4, and M5 never blocks non-M5 work |
 
 The registry is a specification plus executable conformance corpus:
@@ -84,7 +85,7 @@ The registry is a specification plus executable conformance corpus:
 |---|---|---|
 | Identity and resolution | Exact/pattern grammar, obsolete/unknown/ambiguous IDs, non-overlap, immutable fingerprint provenance | `bd-guum3` |
 | Receipt admission | Hardware identity plus explicit request/start/end execution snapshots, requested/observed CPU assignment, SMT/NUMA/P-E mode, one cross-language canonical hash contract, durability, sealed completion | `bd-guum3` |
-| Shared tests | 18 MUST and 2 SHOULD requirements; 2 class-lookup, 51 full receipt/admission, and 6 registry-loader vectors, including collision, duplicate-key, legacy-alias, unknown-field, cpuset, SMT-suffix, pre/post drift, derived-hash, destination-key, and tamper cases | `bd-guum3` |
+| Shared tests | 20 MUST and 2 SHOULD requirements; class-lookup, full receipt/admission, artifact-manifest, and registry-loader vectors, including collision, duplicate-key, legacy-alias, unknown-field, cpuset, SMT-suffix, ISA, pre/post drift, derived-hash, destination-key, log binding, and tamper cases | `bd-guum3` |
 | Rust evidence and ratchet | Strict loader, receipt-derived class binding, destination-stem enforcement, and no history writes on rejection | `bd-39bqp` |
 | Shell runner | The same registry and vectors, fail-closed preflight/finalization, no CLI relabeling | `bd-e8h-p0-runner-verify-jr6w` |
 
@@ -97,12 +98,14 @@ Rules:
   blocks diagnostic or activation-eligible work on another class.
 - `trj` and the Macs are NOT rch workers. They run via
   `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure),
-  which captures the fingerprint, runs detached, and emits the same sealed
-  artifact layout so the ratchet can consume all four classes.
-- QG-8's manifest already demands "Apple Silicon P-only vs P+E curves
-  published (graceful E-core join, no cliff)" and "any plateau ATTRIBUTED
-  (allocator contention axis mandatory)" — this matrix finally gives those
-  clauses hardware.
+  which builds the typed finalizer; that producer itself builds and resolves the
+  exact benchmark ELF from the clean source snapshot and owns one continuous
+  lease/probe/child/log/manifest/receipt lifecycle. Detached and
+  foreground modes emit the same finalized layout; neither path writes history.
+- M4 QG-1/QG-8 are deliberately unavailable today: the x86 normative widths
+  exceed the 14-core host and do not contain meaningful 10P/14P+E endpoints.
+  The future class-scoped matrix must add those endpoints and a scheduler
+  witness; trimming the x86 matrix ad hoc can never activate an Apple claim.
 
 ## 3. Phase plan
 
@@ -133,8 +136,10 @@ Phase 5  PER-LANE CONVERGENCE + ACTIVATION + RENEGOTIATION
    M5 when reachable (`bd-swfyn`). Derive A/A-only bands independently for
    x86 (`bd-jjs6q`), trj (`bd-cpqjb`), M4 (`bd-w7zxm`), and M5
    (`bd-6wnws`). Threadripper calibration is keyed by 1/16/32/64 physical-core
-   slices plus any explicitly used SMT-on lane; Apple calibration is keyed by
-   requested P-only/P+E mode, pool width, and observable scheduler state.
+   slices plus any explicitly used SMT-on lane; current Apple calibration is
+   keyed by the full 10P+4E mode, pool width, and observable scheduler state.
+   P-only calibration remains outside the registered producer until a real
+   scheduler-assignment witness exists.
    At least two independent live calibrations are required for a band.
    Diagnostic A/B runs may execute earlier only when labeled non-claim.
    Manifest (`quill-perf-gates.toml`) additions for the new classes are
@@ -283,9 +288,9 @@ Shard-per-worker indexing into independent segments, then
 problems plus one cheap concat. NUMA/CCD-aware sharding; per-thread arenas;
 sharded interners merged at seal (no global interner Mutex). Deliverables
 include the allocator-contention axis; "a bandwidth ceiling is honest, a lock
-plateau is a bug." On M4/M5: rayon pool requested P-only versus P+E,
-published as two separate curves with the scheduling-observability limit
-carried in every receipt.
+plateau is a bug." On M4, the next contract revision must freeze class-scoped
+10P and 14P+E endpoints plus a real scheduler-assignment witness before QG-1 or
+QG-8 can admit evidence. Until then there is no registered Apple scaling curve.
 
 ### W4 — SIMD/µarch kernels (all classes; safe-code constraint binding)
 
@@ -370,7 +375,8 @@ Reject retry predicate:
   produce a lever in lockstep.
 - Calling QG-6 done at smoke scale; the gate decision runs at 100K/1M with
   hierarchical per-query resampling.
-- macOS commit-latency numbers without the Law-7 attestation.
+- macOS QG-3/QG-4/QG-5 numbers without a non-declarative witness that both
+  benchmark arms used symmetric `F_FULLFSYNC`.
 - Treating a Quill self-speedup, or ratios collected from different source
   commits, as proof against the genuine Tantivy incumbent.
 - Hiding a failed, truncated, or validator-defective run instead of retaining
@@ -405,10 +411,13 @@ this contract was written).
   `docs/contracts/quill-perf-gates.md`, `quill-perf-gates.toml`.
 - Ledgers: `docs/PERF_LEDGER.md`, `docs/NEGATIVE_EVIDENCE.md` (+
   `scripts/check_ledger_null_control.sh` commit gate).
-- Runner: `scripts/perf-runner.sh` (machine-class provenance capture).
+- Runner: `scripts/perf-runner.sh` plus `quill-perf-finalize` (registered-host
+  lease, probes, exact child/log binding, receipt admission, and transactional
+  finalization).
 - QG-1 provisional miss row: `docs/NEGATIVE_EVIDENCE.md` § 2026-07-27
   (bd-h6eh). QG-2 pre-fix quarantined diagnostic: `73444b59` from timed
-  source `5bb74e76`; the corrected terminal-lifecycle rerun is owned by
-  `x4e4.5.5`. QG-6 attribution: `gwd4` bead body.
+  source `5bb74e76`; corrected terminal-lifecycle attempts ended in an explicit
+  no-claim closeout at `07718353`, so QG-2 remains inactive. QG-6 attribution:
+  `gwd4` bead body.
 - Flip decision consumer: `bd-3beo`; conformance authority:
   `bd-quill-flip-conformance-release-gate-0r2p`.

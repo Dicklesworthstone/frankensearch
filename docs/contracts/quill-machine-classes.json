@@ -17,7 +17,7 @@
     "cross_class_policy": "Ratios, null bands, and promotion baselines never cross a canonical class ID or execution-identity key."
   },
   "receipt_contract": {
-    "schema_version": "frankensearch.perf-runner-completion.v2",
+    "schema_version": "frankensearch.perf-runner-completion.v3",
     "required_sections": [
       "requested_class_id",
       "derived_class_id",
@@ -43,6 +43,7 @@
       "page_size_bytes",
       "performance_cores",
       "efficiency_cores",
+      "runtime_detected_isa",
       "topology_sha256",
       "fingerprint_sha256"
     ],
@@ -102,12 +103,29 @@
     "pre_post_identity_must_match": true,
     "promotion_requires_zero_exit": true
   },
+  "artifact_manifest_contract": {
+    "schema_version": "frankensearch.perf-runner-artifact-manifest.v1",
+    "unknown_field_policy": "reject",
+    "duplicate_key_policy": "reject",
+    "canonical_encoding": "Exact UTF-8 compact JSON emitted by the typed producer; the receipt hashes these bytes without reparsing or rewriting them.",
+    "required_fields": [
+      "schema_version",
+      "gate",
+      "run_id",
+      "run_window",
+      "run_log_sha256",
+      "threshold_artifact_sha256",
+      "evidence_artifact_sha256"
+    ],
+    "binding_law": "The completion receipt artifact_manifest_sha256 must hash the exact manifest bytes. The manifest must name the exact canonical threshold artifact, exact pre-binding evidence artifact, exact run log, gate, run ID, and run window supplied to finalization.",
+    "history_law": "A promoted candidate becomes a later baseline without role relabeling. Its bound evidence embeds the exact receipt and manifest and reconstructs the pre-binding evidence digest on every verified load."
+  },
   "canonical_hash_contract": {
     "algorithm": "sha256",
     "hex_encoding": "lowercase",
     "canonical_json_subset": "UTF-8 compact JSON with object keys sorted lexicographically, arrays in source order, integers in base-10 without leading zeros, and only ASCII strings, booleans, null, arrays, and objects. The bytes are exactly jq -cS output with its trailing newline removed.",
     "registry_sha256": "SHA-256 of the exact registry file bytes without rewriting whitespace.",
-    "hardware_fingerprint_sha256": "SHA-256 of canonical JSON for the hardware object with fingerprint_sha256 omitted.",
+    "hardware_fingerprint_sha256": "SHA-256 of canonical JSON for the hardware object, including the strictly normalized runtime_detected_isa vector, with fingerprint_sha256 omitted.",
     "effective_cpuset_sha256": "SHA-256 of canonical JSON containing observed_logical_cpu_ids, effective_physical_core_ids, cpu_assignment_observability, threads_per_core, and smt_state from one execution snapshot.",
     "execution_snapshot_sha256": "SHA-256 of canonical JSON for one complete execution snapshot with snapshot_sha256 omitted.",
     "execution_identity_sha256": "After start/end equivalence is proven, SHA-256 of canonical JSON containing requested_class_id, derived_class_id, execution.request, and the stable execution fields from execution.start except thermal_pressure and snapshot_sha256.",
@@ -140,7 +158,9 @@
     "exclusive lease and local execution",
     "source and executable identity",
     "durability symmetry",
-    "sealed completion"
+    "sealed completion",
+    "gate/class availability and exact destination identity",
+    "exact canonical artifact manifest and actual run-log, threshold, and pre-binding-evidence binding"
   ],
   "classes": [
     {
@@ -175,7 +195,14 @@
         "logical_cpus": 128,
         "numa_nodes": 1,
         "page_size_bytes": 4096,
-        "forbidden_cpu_flags": [
+        "runtime_detected_isa": [
+          "aes",
+          "avx2",
+          "bmi2",
+          "fma",
+          "vaes"
+        ],
+        "forbidden_runtime_isa": [
           "avx512f"
         ]
       },
@@ -236,21 +263,24 @@
         "memory_bytes": 68719476736,
         "page_size_bytes": 16384,
         "performance_cores": 10,
-        "efficiency_cores": 4
+        "efficiency_cores": 4,
+        "runtime_detected_isa": [
+          "aes",
+          "neon",
+          "sha2"
+        ]
       },
       "execution_predicates": {
         "allowed_requested_apple_execution_modes": [
-          "p-only",
           "p-plus-e"
         ],
-        "apple_execution_mode_semantics": "requested pool and scheduler policy; never a hard-affinity claim unless requested and observed CPU sets prove it",
+        "apple_execution_mode_semantics": "p-plus-e means the full 10P+4E scheduler pool. P-only is non-admissible; any ad-hoc P-only measurement is diagnostic-only outside the registered producer until requested and observed CPU sets prove scheduler assignment.",
         "allowed_start_end_cpu_assignment_observability": [
           "unavailable",
           "scheduler-observed",
           "affinity-enforced"
         ],
         "thread_budget_max_by_mode": {
-          "p-only": 10,
           "p-plus-e": 14
         },
         "allowed_threads_per_core": [
@@ -305,6 +335,7 @@
     "hardware-cpu-model-mismatch",
     "hardware-cpu-stepping-mismatch",
     "hardware-cpu-name-mismatch",
+    "hardware-isa-mismatch",
     "hardware-topology-mismatch",
     "hardware-numa-mismatch",
     "hardware-memory-mismatch",
@@ -371,7 +402,7 @@
     {
       "id": "MC-MUST-008",
       "level": "MUST",
-      "text": "Apple P-only and P-plus-E requests are distinct execution identities and thermal warnings reject timed evidence."
+      "text": "Apple promotion evidence admits only the full P-plus-E scheduler pool and rejects thermal warnings. P-only is non-admissible; any ad-hoc P-only measurement is diagnostic-only until an observed scheduler-assignment witness exists. QG-1 and QG-8 remain unavailable on M4 until class-specific 10P and 14P-plus-E matrix endpoints are frozen."
     },
     {
       "id": "MC-MUST-009",
@@ -391,7 +422,7 @@
     {
       "id": "MC-MUST-012",
       "level": "MUST",
-      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment."
+      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment. M4 QG-3, QG-4, and QG-5 remain unavailable until a non-declarative witness proves symmetric F_FULLFSYNC use by both arms."
     },
     {
       "id": "MC-MUST-013",
@@ -424,6 +455,16 @@
       "text": "Every registered class cites immutable raw fingerprint provenance; missing hardware is never fabricated."
     },
     {
+      "id": "MC-MUST-019",
+      "level": "MUST",
+      "text": "The receipt hardware fingerprint includes a strictly sorted, duplicate-free runtime ISA vector from a closed capability vocabulary; every required and forbidden runtime-ISA predicate is consumed and enforced, and threshold/evidence ISA must equal the admitted receipt projection."
+    },
+    {
+      "id": "MC-MUST-020",
+      "level": "MUST",
+      "text": "Every fresh candidate and rerun binds one exact canonical artifact manifest to the actual run log, canonical threshold bytes, exact pre-binding evidence bytes, gate, run ID, and run window; any missing, substituted, noncanonical, or recomputed outer binding is rejected before history opens."
+    },
+    {
       "id": "MC-SHOULD-001",
       "level": "SHOULD",
       "text": "Receipts retain hostname, kernel, microcode, cache topology, and load for diagnosis even when those fields are not class predicates."
@@ -454,6 +495,13 @@
         "page_size_bytes": 4096,
         "performance_cores": null,
         "efficiency_cores": null,
+        "runtime_detected_isa": [
+          "aes",
+          "avx2",
+          "bmi2",
+          "fma",
+          "vaes"
+        ],
         "topology_sha256": "faf66c070dc33f697eda30dfde3272aab99e7dbbf23f3c4050a1ac0da32929bd",
         "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
       },
@@ -661,7 +709,7 @@
         "finished_at_utc": "2026-07-28T23:10:00Z"
       }
     },
-    "m4-valid-p-only": {
+    "m4-valid-p-plus-e": {
       "requested_class_id": "m4-macos",
       "derived_class_id": "m4-macos",
       "registry_sha256": "$REGISTRY_SHA256",
@@ -680,15 +728,20 @@
         "page_size_bytes": 16384,
         "performance_cores": 10,
         "efficiency_cores": 4,
+        "runtime_detected_isa": [
+          "aes",
+          "neon",
+          "sha2"
+        ],
         "topology_sha256": "cd91e4ff2d11cf3d4fdd891b075f602b167ca0fb7c9ed801ece6b1b9f9757a1b",
         "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
       },
       "execution": {
         "request": {
           "requested_logical_cpu_ids": [],
-          "requested_physical_core_width": 10,
-          "thread_budget": 10,
-          "apple_execution_mode": "p-only"
+          "requested_physical_core_width": 14,
+          "thread_budget": 14,
+          "apple_execution_mode": "p-plus-e"
         },
         "start": {
           "observed_logical_cpu_ids": [],
@@ -837,17 +890,17 @@
         "class_id": "trj-zen3-16c-smt2",
         "reason": "admitted",
         "derived_sha256": {
-          "hardware": "6a311dbff98a6f615682d769f6278728359bcbac52d38419931abf02dee2e246",
+          "hardware": "7980f60edce003ccf60d6d63cbbab12d25bcd52a440cd9e08306bbbeaac07295",
           "start_cpuset": "55d1f64b24dfe9f1f6c0d812469b95001f7831029fe7d45d0ba8b966005a5dbc",
-          "start_snapshot": "fef0a4cc969f08cd680ce2146ee836f44b5c980a2a2a7443851fca22b6d4536d",
-          "end_snapshot": "fef0a4cc969f08cd680ce2146ee836f44b5c980a2a2a7443851fca22b6d4536d",
-          "identity": "44b34012ff88e0df949f55add2383a83edaf2fc333ff73ff0ab1d854fdb072ba"
+          "start_snapshot": "4515b24483b36ed22337eb34ffb063341d7aab240dfa04d7631e50cea3d83475",
+          "end_snapshot": "4515b24483b36ed22337eb34ffb063341d7aab240dfa04d7631e50cea3d83475",
+          "identity": "2174d9e7910ac7e7944346166211d265574dcce0b5c9ffa38ed212767364d315"
         }
       }
     },
     {
       "id": "MCV-002-m4-registered",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {},
       "remove": [],
       "add_unknown": {},
@@ -872,11 +925,11 @@
         "class_id": "m4-macos",
         "reason": "admitted",
         "derived_sha256": {
-          "hardware": "955b017942640f1f0eefb058220e0019143c27cc58b0c6dace2b6d11562f5c48",
+          "hardware": "5fe3655522548168c8d6cc6a43c03a87f8fc7a52046987f1317047cf7307aca0",
           "start_cpuset": "a6bdee49912e0a0c743b36556734c8507ba479b3d58f4cfbf2bc98478213620b",
-          "start_snapshot": "a271df4ac22d068a98e0f8a16fa62356196aa743218de5f7ca7cefdd97986fb4",
-          "end_snapshot": "a271df4ac22d068a98e0f8a16fa62356196aa743218de5f7ca7cefdd97986fb4",
-          "identity": "40524e7711ed0e169093fb91aebfedd0629d72e7e49138ed2213f5a601cdd4ab"
+          "start_snapshot": "b4eb02a78186b3915b56e93750b3ccef7ee1ae7fe8dfa0039189437fa76ac23f",
+          "end_snapshot": "b4eb02a78186b3915b56e93750b3ccef7ee1ae7fe8dfa0039189437fa76ac23f",
+          "identity": "749c8f9bcd8c556604d997a0ebf592d406799f4f5d3129da3b87fec48c9abd16"
         }
       }
     },
@@ -1223,7 +1276,7 @@
     },
     {
       "id": "MCV-023-m4-wrong-chip",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "hardware.cpu_model_name": "Apple M4"
       },
@@ -1241,7 +1294,7 @@
     },
     {
       "id": "MCV-024-m4-wrong-p-cores",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "hardware.performance_cores": 8
       },
@@ -1259,7 +1312,7 @@
     },
     {
       "id": "MCV-025-m4-wrong-e-cores",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "hardware.efficiency_cores": 6
       },
@@ -1277,7 +1330,7 @@
     },
     {
       "id": "MCV-026-m4-wrong-memory",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "hardware.memory_bytes": 34359738368
       },
@@ -1295,7 +1348,7 @@
     },
     {
       "id": "MCV-027-m4-wrong-page-size",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "hardware.page_size_bytes": 4096
       },
@@ -1312,10 +1365,10 @@
       }
     },
     {
-      "id": "MCV-028-m4-invalid-mode",
-      "template": "m4-valid-p-only",
+      "id": "MCV-028-m4-p-only-unverified",
+      "template": "m4-valid-p-plus-e",
       "set": {
-        "execution.request.apple_execution_mode": "efficiency-only"
+        "execution.request.apple_execution_mode": "p-only"
       },
       "remove": [],
       "add_unknown": {},
@@ -1331,7 +1384,7 @@
     },
     {
       "id": "MCV-029-m4-thermal-start",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "execution.start.thermal_pressure": true,
         "execution.end.thermal_pressure": true
@@ -1426,7 +1479,7 @@
     },
     {
       "id": "MCV-034-durability-asymmetric",
-      "template": "m4-valid-p-only",
+      "template": "m4-valid-p-plus-e",
       "set": {
         "durability.adjacent": true,
         "durability.control_treatment": "fsync",
@@ -1837,11 +1890,11 @@
         "class_id": "trj-zen3-16c",
         "reason": "admitted",
         "derived_sha256": {
-          "hardware": "6a311dbff98a6f615682d769f6278728359bcbac52d38419931abf02dee2e246",
+          "hardware": "7980f60edce003ccf60d6d63cbbab12d25bcd52a440cd9e08306bbbeaac07295",
           "start_cpuset": "f973c2be3391a296d572985a097f3d2c75c8520b80fe16033392c46520600eca",
-          "start_snapshot": "85c085ce1090f361f030e47b241402adc4a7f09484101c39b46d55c9e53a53d2",
-          "end_snapshot": "85c085ce1090f361f030e47b241402adc4a7f09484101c39b46d55c9e53a53d2",
-          "identity": "cfb81298460fcc49cc29e091c3ba44ebeb34fdda051f59486f082472a377ef10"
+          "start_snapshot": "5da45f140b8a1ddab725727d118def57d6775aa202d61ac0dc0947f4c502dab9",
+          "end_snapshot": "5da45f140b8a1ddab725727d118def57d6775aa202d61ac0dc0947f4c502dab9",
+          "identity": "2096ce793265dbe100d2d8cb2ce925f6fb1e19e87ed033c8be839d6dc60138bf"
         }
       }
     },
@@ -1977,6 +2030,106 @@
         "decision": "reject",
         "class_id": null,
         "reason": "destination-identity-mismatch"
+      }
+    },
+    {
+      "id": "MCV-054-m4-qg1-matrix-unavailable",
+      "template": "m4-valid-p-plus-e",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-1",
+        "destination_basename": "QG-1.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-008",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-055-m4-qg8-matrix-unavailable",
+      "template": "m4-valid-p-plus-e",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-8",
+        "destination_basename": "QG-8.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-008",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-056-m4-qg3-fullfsync-required",
+      "template": "m4-valid-p-plus-e",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-3",
+        "destination_basename": "QG-3.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-012",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-057-m4-qg4-fullfsync-required",
+      "template": "m4-valid-p-plus-e",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-4",
+        "destination_basename": "QG-4.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-012",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-058-m4-qg5-fullfsync-required",
+      "template": "m4-valid-p-plus-e",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-5",
+        "destination_basename": "QG-5.m4-macos.latest.json"
+      },
+      "covers": [
+        "MC-MUST-012",
+        "MC-MUST-017"
+      ],
+      "expected": {
+        "decision": "reject",
+        "class_id": null,
+        "reason": "class-unavailable"
       }
     }
   ],

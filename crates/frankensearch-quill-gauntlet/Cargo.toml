@@ -40,6 +40,10 @@ rustix = { version = "1.1.4", features = ["fs"] }
 name = "quill-perf-ratchet"
 path = "src/bin/quill_perf_ratchet.rs"
 
+[[bin]]
+name = "quill-perf-finalize"
+path = "src/bin/quill_perf_finalize.rs"
+
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }

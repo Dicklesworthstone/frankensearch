@@ -35,10 +35,11 @@ use frankensearch_quill::{
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
-    CountState, DistributionSummary, EngineObservation, EvidenceCell, EvidenceCellSpec,
-    EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity, NativeTieKey,
-    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence,
-    PerfCellResult, PerfCellSpec, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
+    CountState, DistributionSummary, EngineConcurrencyObservation, EngineObservation, EvidenceCell,
+    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity,
+    NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig,
+    PeakRssEvidence, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
+    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
@@ -67,6 +68,85 @@ const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPTS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+static CONCURRENCY_OBSERVATIONS: OnceLock<
+    Mutex<BTreeMap<(String, String), ConcurrencyAccumulator>>,
+> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct ConcurrencyAccumulator {
+    count: usize,
+    min: usize,
+    max: usize,
+}
+
+fn record_concurrency(spec: &PerfCellSpec, arm: EngineArm, observed_threads: usize) {
+    assert!(observed_threads > 0, "observed engine pool width is zero");
+    let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+    let mut observations = CONCURRENCY_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock concurrency observations");
+    let entry = observations
+        .entry((cell_id, arm.label().to_owned()))
+        .or_insert(ConcurrencyAccumulator {
+            count: 0,
+            min: observed_threads,
+            max: observed_threads,
+        });
+    entry.count = entry.count.saturating_add(1);
+    entry.min = entry.min.min(observed_threads);
+    entry.max = entry.max.max(observed_threads);
+    drop(observations);
+}
+
+fn take_concurrency_witness(spec: &PerfCellSpec) -> Option<PerfConcurrencyWitness> {
+    let required = spec.gate == PerfGate::Qg8
+        || (spec.gate == PerfGate::Qg1 && spec.metric != "tokenize_docs_per_second");
+    if !required {
+        return None;
+    }
+    let configured_threads = spec.threads.expect("scaling cell thread width");
+    let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+    let mut observations = CONCURRENCY_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock concurrency observations");
+    let make_observation = |arm: EngineArm,
+                            engine: PerfConcurrencyEngine,
+                            observer: PerfConcurrencyObserver,
+                            observations: &mut BTreeMap<
+        (String, String),
+        ConcurrencyAccumulator,
+    >| {
+        let observed = observations
+            .remove(&(cell_id.clone(), arm.label().to_owned()))
+            .unwrap_or_else(|| panic!("missing {} concurrency witness for {cell_id}", arm.label()));
+        EngineConcurrencyObservation {
+            engine,
+            observer,
+            observation_count: observed.count,
+            min_observed_worker_pool_threads: observed.min,
+            max_observed_worker_pool_threads: observed.max,
+        }
+    };
+    Some(PerfConcurrencyWitness {
+        configured_threads,
+        observations: vec![
+            make_observation(
+                EngineArm::Quill,
+                PerfConcurrencyEngine::Quill,
+                PerfConcurrencyObserver::RayonCurrentPoolWidth,
+                &mut observations,
+            ),
+            make_observation(
+                EngineArm::Tantivy,
+                PerfConcurrencyEngine::Tantivy,
+                PerfConcurrencyObserver::TantivyWriterConstruction,
+                &mut observations,
+            ),
+        ],
+    })
+}
 
 const NO_POSITION_FIELDS: [FieldDescriptor; 5] = [
     FieldDescriptor {
@@ -625,6 +705,12 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
+            if matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) {
+                let observed_threads = index
+                    .benchmark_materialized_writer_threads()
+                    .expect("scaling Tantivy arm uses the benchmark writer constructor");
+                record_concurrency(spec, arm, observed_threads);
+            }
             let (mut elapsed, periodic_commits) = if spec.gate == PerfGate::Qg1 {
                 index_batches_with_visibility_commits(
                     context,
@@ -665,11 +751,12 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
         .build()
         .expect("build QG-1/QG-8 Quill thread pool")
         .install(|| {
+            let observed_threads = rayon::current_num_threads();
             assert_eq!(
-                rayon::current_num_threads(),
-                threads,
+                observed_threads, threads,
                 "QG-1/QG-8 Quill cell escaped its pinned Rayon pool"
             );
+            record_concurrency(spec, arm, observed_threads);
             bulk_metric_unpooled(context, spec, arm)
         })
 }
@@ -2168,6 +2255,7 @@ fn collect_cell(
                 role: EvidenceRole::Diagnostic,
                 input_identity: None,
                 cold_cache: None,
+                concurrency_witness: None,
             },
             samples,
             &evidence.policy,
@@ -2330,6 +2418,7 @@ fn collect_cell(
             },
             input_identity,
             cold_cache,
+            concurrency_witness: take_concurrency_witness(spec),
         },
         experiment,
         &evidence.policy,

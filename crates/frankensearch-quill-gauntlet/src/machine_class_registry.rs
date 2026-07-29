@@ -19,13 +19,17 @@ use thiserror::Error;
 /// Reviewed commit containing the normative registry.
 pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "c3b581e286d04979a9954567a5d6c318d061f6cc";
 /// Exact Git blob of the normative registry.
-pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "83a904721c81a4e5d19c8164d4ffe3924f3afddd";
+pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "65d8f09358372abe6b85b74ab16e8abff8674641";
 /// SHA-256 of the exact normative registry file bytes.
 pub const MACHINE_CLASS_REGISTRY_SHA256: &str =
-    "ee047b288dbabc620a1eb5d4c4b619a8655ab11011d81adab0916375d495ab48";
+    "8540840a30c103293ec329d4e834ddb236752c4c1f2e44624b9cae9a8909449c";
 /// Registry schema accepted by this consumer.
 pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
     "frankensearch.quill-machine-class-registry.v1";
+/// Schema for the exact post-exit artifact manifest bound into one runner
+/// completion receipt.
+pub const RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str =
+    "frankensearch.perf-runner-artifact-manifest.v1";
 
 const REGISTRY_BYTES: &[u8] = include_bytes!("../../../docs/contracts/quill-machine-classes.json");
 const TRJ_PROVENANCE_BYTES: &[u8] =
@@ -75,6 +79,8 @@ pub enum MachineClassReason {
     HardwareCpuSteppingMismatch,
     /// CPU or chip name does not match the class.
     HardwareCpuNameMismatch,
+    /// Runtime-detected CPU ISA features are malformed, forbidden, or differ.
+    HardwareIsaMismatch,
     /// Physical or logical topology does not match the class.
     HardwareTopologyMismatch,
     /// NUMA hardware does not match the class.
@@ -150,6 +156,7 @@ impl MachineClassReason {
             Self::HardwareCpuModelMismatch => "hardware-cpu-model-mismatch",
             Self::HardwareCpuSteppingMismatch => "hardware-cpu-stepping-mismatch",
             Self::HardwareCpuNameMismatch => "hardware-cpu-name-mismatch",
+            Self::HardwareIsaMismatch => "hardware-isa-mismatch",
             Self::HardwareTopologyMismatch => "hardware-topology-mismatch",
             Self::HardwareNumaMismatch => "hardware-numa-mismatch",
             Self::HardwareMemoryMismatch => "hardware-memory-mismatch",
@@ -307,7 +314,98 @@ pub struct VerifiedRunnerIdentity {
     build: Value,
     durability: Value,
     completion: Value,
+    artifact_manifest: Option<RunnerArtifactManifestBinding>,
     derived_sha256: MachineClassDerivedHashes,
+}
+
+/// Strict post-exit manifest naming the exact artifacts emitted by one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerArtifactManifest {
+    schema_version: String,
+    gate: String,
+    run_id: String,
+    run_window: String,
+    run_log_sha256: String,
+    threshold_artifact_sha256: String,
+    evidence_artifact_sha256: String,
+}
+
+impl RunnerArtifactManifest {
+    /// Construct a canonical manifest for a completed invocation.
+    ///
+    /// The returned object still has to be serialized and named by the sealed
+    /// runner receipt before it can be admitted.
+    #[must_use]
+    pub fn from_artifacts(
+        gate: impl Into<String>,
+        run_id: impl Into<String>,
+        run_window: impl Into<String>,
+        run_log_bytes: &[u8],
+        threshold_artifact_bytes: &[u8],
+        evidence_artifact_bytes: &[u8],
+    ) -> Self {
+        Self {
+            schema_version: RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
+            gate: gate.into(),
+            run_id: run_id.into(),
+            run_window: run_window.into(),
+            run_log_sha256: sha256_hex(run_log_bytes),
+            threshold_artifact_sha256: sha256_hex(threshold_artifact_bytes),
+            evidence_artifact_sha256: sha256_hex(evidence_artifact_bytes),
+        }
+    }
+
+    /// Canonical compact JSON bytes used by the runner completion digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON serialization error only if the schema stops being
+    /// representable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    /// Gate sealed by this manifest.
+    #[must_use]
+    pub fn gate(&self) -> &str {
+        &self.gate
+    }
+
+    /// Producer run ID sealed by this manifest.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Producer run window sealed by this manifest.
+    #[must_use]
+    pub fn run_window(&self) -> &str {
+        &self.run_window
+    }
+}
+
+/// Exact manifest bytes verified against a sealed completion receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerArtifactManifestBinding {
+    manifest_json: String,
+    manifest_sha256: String,
+    manifest: RunnerArtifactManifest,
+}
+
+impl RunnerArtifactManifestBinding {
+    /// Parsed strict manifest facts.
+    #[must_use]
+    pub const fn manifest(&self) -> &RunnerArtifactManifest {
+        &self.manifest
+    }
+
+    /// SHA-256 of the exact strict manifest bytes.
+    #[must_use]
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
 }
 
 impl VerifiedRunnerIdentity {
@@ -383,6 +481,151 @@ impl VerifiedRunnerIdentity {
         &self.completion
     }
 
+    /// Exact artifact manifest admitted after the measured process exited.
+    #[must_use]
+    pub const fn artifact_manifest(&self) -> Option<&RunnerArtifactManifestBinding> {
+        self.artifact_manifest.as_ref()
+    }
+
+    /// Bind exact manifest bytes and prove they name this role's threshold and
+    /// pre-binding evidence artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed completion rejection if the manifest is malformed,
+    /// does not hash to the digest sealed by the receipt, names another role,
+    /// or names different artifact bytes.
+    pub fn bind_artifact_manifest(
+        mut self,
+        manifest_bytes: &[u8],
+        run_log_bytes: &[u8],
+        threshold_artifact_bytes: &[u8],
+        evidence_artifact_bytes: &[u8],
+    ) -> Result<Self, MachineClassError> {
+        self.verify()?;
+        let binding = parse_artifact_manifest_binding(manifest_bytes)?;
+        if let Some(existing) = &self.artifact_manifest
+            && existing != &binding
+        {
+            return Err(MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "runner identity already carries a different artifact manifest",
+            ));
+        }
+        self.artifact_manifest = Some(binding);
+        self.verify_artifact_inputs(
+            run_log_bytes,
+            threshold_artifact_bytes,
+            evidence_artifact_bytes,
+        )?;
+        self.verify()?;
+        Ok(self)
+    }
+
+    /// Recheck exact role and artifact bytes against the bound manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed completion rejection when no manifest is bound or any
+    /// exact digest differs.
+    pub fn verify_artifact_inputs(
+        &self,
+        run_log_bytes: &[u8],
+        threshold_artifact_bytes: &[u8],
+        evidence_artifact_bytes: &[u8],
+    ) -> Result<(), MachineClassError> {
+        let binding = self.artifact_manifest.as_ref().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "runner receipt has no exact artifact-manifest binding",
+            )
+        })?;
+        validate_artifact_manifest_binding(self, binding)?;
+        let manifest = &binding.manifest;
+        if manifest.run_log_sha256 != sha256_hex(run_log_bytes)
+            || manifest.threshold_artifact_sha256 != sha256_hex(threshold_artifact_bytes)
+            || manifest.evidence_artifact_sha256 != sha256_hex(evidence_artifact_bytes)
+        {
+            return Err(MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "artifact manifest does not name the supplied run-log/threshold/evidence bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recheck the exact post-exit run log against the bound manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed completion rejection if the exact bytes differ.
+    pub fn verify_run_log(&self, run_log_bytes: &[u8]) -> Result<(), MachineClassError> {
+        let binding = self.artifact_manifest.as_ref().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "runner receipt has no exact artifact-manifest binding",
+            )
+        })?;
+        validate_artifact_manifest_binding(self, binding)?;
+        if binding.manifest.run_log_sha256 != sha256_hex(run_log_bytes) {
+            return Err(MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "artifact manifest does not name the supplied run-log bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recheck only the exact threshold artifact for a ratchet role.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed completion rejection if the role or exact bytes differ.
+    pub fn verify_threshold_artifact(
+        &self,
+        threshold_artifact_bytes: &[u8],
+    ) -> Result<(), MachineClassError> {
+        let binding = self.artifact_manifest.as_ref().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "runner receipt has no exact artifact-manifest binding",
+            )
+        })?;
+        validate_artifact_manifest_binding(self, binding)?;
+        if binding.manifest.threshold_artifact_sha256 != sha256_hex(threshold_artifact_bytes) {
+            return Err(MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "artifact manifest does not name the supplied threshold bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recheck only the exact pre-binding evidence artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed completion rejection if the exact bytes differ.
+    pub fn verify_evidence_artifact(
+        &self,
+        evidence_artifact_bytes: &[u8],
+    ) -> Result<(), MachineClassError> {
+        let binding = self.artifact_manifest.as_ref().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "runner receipt has no exact artifact-manifest binding",
+            )
+        })?;
+        validate_artifact_manifest_binding(self, binding)?;
+        if binding.manifest.evidence_artifact_sha256 != sha256_hex(evidence_artifact_bytes) {
+            return Err(MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "artifact manifest does not name the supplied pre-binding evidence bytes",
+            ));
+        }
+        Ok(())
+    }
+
     /// Recomputed canonical identity hashes.
     #[must_use]
     pub const fn derived_sha256(&self) -> &MachineClassDerivedHashes {
@@ -398,14 +641,18 @@ impl VerifiedRunnerIdentity {
     pub fn verify(&self) -> Result<(), MachineClassError> {
         let registry = MachineClassRegistry::frozen()?;
         let recomputed = registry.admit(self.receipt_json.as_bytes(), &self.admission_context)?;
-        if recomputed == *self {
-            Ok(())
-        } else {
-            Err(MachineClassError::new(
+        let mut receipt_only = self.clone();
+        receipt_only.artifact_manifest = None;
+        if recomputed != receipt_only {
+            return Err(MachineClassError::new(
                 MachineClassReason::DerivedHashMismatch,
                 "stored runner binding does not equal exact re-admission",
-            ))
+            ));
         }
+        if let Some(binding) = &self.artifact_manifest {
+            validate_artifact_manifest_binding(self, binding)?;
+        }
+        Ok(())
     }
 
     /// Whether two receipts name the same registry, hardware, class, and
@@ -419,6 +666,97 @@ impl VerifiedRunnerIdentity {
             && self.derived_sha256.identity == other.derived_sha256.identity
             && self.durability == other.durability
     }
+}
+
+fn parse_artifact_manifest_binding(
+    manifest_bytes: &[u8],
+) -> Result<RunnerArtifactManifestBinding, MachineClassError> {
+    let manifest_value = parse_strict_json(manifest_bytes)?;
+    let manifest =
+        serde_json::from_value::<RunnerArtifactManifest>(manifest_value).map_err(|error| {
+            let detail = error.to_string();
+            let reason = if detail.contains("unknown field") {
+                MachineClassReason::UnknownField
+            } else if detail.contains("missing field") {
+                MachineClassReason::MissingField
+            } else {
+                MachineClassReason::CompletionUnverified
+            };
+            MachineClassError::new(reason, detail)
+        })?;
+    let canonical = manifest.to_json_bytes().map_err(|error| {
+        MachineClassError::new(MachineClassReason::CompletionUnverified, error.to_string())
+    })?;
+    if canonical != manifest_bytes {
+        return Err(MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "artifact manifest is not exact canonical compact JSON",
+        ));
+    }
+    let manifest_json = std::str::from_utf8(manifest_bytes)
+        .map_err(|error| {
+            MachineClassError::new(MachineClassReason::CompletionUnverified, error.to_string())
+        })?
+        .to_owned();
+    Ok(RunnerArtifactManifestBinding {
+        manifest_json,
+        manifest_sha256: sha256_hex(manifest_bytes),
+        manifest,
+    })
+}
+
+fn validate_artifact_manifest_binding(
+    identity: &VerifiedRunnerIdentity,
+    binding: &RunnerArtifactManifestBinding,
+) -> Result<(), MachineClassError> {
+    let reparsed = parse_artifact_manifest_binding(binding.manifest_json.as_bytes())?;
+    if reparsed != *binding {
+        return Err(MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "stored artifact manifest differs from strict reparsing",
+        ));
+    }
+    let manifest = &binding.manifest;
+    if manifest.schema_version != RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION
+        || manifest.gate.trim().is_empty()
+        || manifest.run_id.trim().is_empty()
+        || manifest.run_window.trim().is_empty()
+        || !is_sha256(&manifest.run_log_sha256)
+        || !is_sha256(&manifest.threshold_artifact_sha256)
+        || !is_sha256(&manifest.evidence_artifact_sha256)
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "artifact manifest schema, run identity, or digests are invalid",
+        ));
+    }
+    let completion = identity.completion.as_object().ok_or_else(|| {
+        MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "verified runner completion is not an object",
+        )
+    })?;
+    let completion_string = |field: &str| {
+        completion
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                MachineClassError::new(
+                    MachineClassReason::CompletionUnverified,
+                    format!("verified runner completion field {field:?} is not a string"),
+                )
+            })
+    };
+    if binding.manifest_sha256 != completion_string("artifact_manifest_sha256")?
+        || manifest.run_log_sha256 != completion_string("run_log_sha256")?
+        || manifest.gate != identity.admission_context.gate
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "artifact manifest does not match the receipt completion or admission gate",
+        ));
+    }
+    Ok(())
 }
 
 /// Explicit machine binding carried by current evidence.
@@ -509,108 +847,121 @@ struct RegistryClassRule {
     _notes: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerHardware {
-    os: String,
-    arch: String,
-    cpu_vendor: String,
-    cpu_family: Option<u64>,
-    cpu_model: Option<u64>,
-    cpu_stepping: Option<u64>,
-    cpu_model_name: String,
-    physical_cores: u64,
-    logical_cpus: u64,
-    numa_nodes: u64,
-    memory_bytes: u64,
-    page_size_bytes: u64,
-    performance_cores: Option<u64>,
-    efficiency_cores: Option<u64>,
-    topology_sha256: String,
-    fingerprint_sha256: String,
+struct RegistryArtifactManifestContract {
+    schema_version: String,
+    unknown_field_policy: String,
+    duplicate_key_policy: String,
+    canonical_encoding: String,
+    required_fields: Vec<String>,
+    binding_law: String,
+    history_law: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerExecutionRequest {
-    requested_logical_cpu_ids: Vec<u64>,
-    requested_physical_core_width: u64,
-    thread_budget: u64,
-    apple_execution_mode: String,
+pub struct RunnerHardware {
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    pub(crate) cpu_vendor: String,
+    pub(crate) cpu_family: Option<u64>,
+    pub(crate) cpu_model: Option<u64>,
+    pub(crate) cpu_stepping: Option<u64>,
+    pub(crate) cpu_model_name: String,
+    pub(crate) physical_cores: u64,
+    pub(crate) logical_cpus: u64,
+    pub(crate) numa_nodes: u64,
+    pub(crate) memory_bytes: u64,
+    pub(crate) page_size_bytes: u64,
+    pub(crate) performance_cores: Option<u64>,
+    pub(crate) efficiency_cores: Option<u64>,
+    pub(crate) runtime_detected_isa: Vec<String>,
+    pub(crate) topology_sha256: String,
+    pub(crate) fingerprint_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerExecutionSnapshot {
-    observed_logical_cpu_ids: Vec<u64>,
-    effective_physical_core_ids: Vec<String>,
-    cpu_assignment_observability: String,
-    effective_cpuset_sha256: String,
-    threads_per_core: u64,
-    smt_state: String,
-    numa_node_ids: Vec<u64>,
-    numa_policy: String,
-    governor: String,
-    thermal_pressure: bool,
-    exclusive_lease: bool,
-    exclusive_lease_id: String,
-    local_execution: bool,
-    observed_hardware_fingerprint_sha256: String,
-    snapshot_sha256: String,
+pub struct RunnerExecutionRequest {
+    pub(crate) requested_logical_cpu_ids: Vec<u64>,
+    pub(crate) requested_physical_core_width: u64,
+    pub(crate) thread_budget: u64,
+    pub(crate) apple_execution_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerExecution {
-    request: RunnerExecutionRequest,
-    start: RunnerExecutionSnapshot,
-    end: RunnerExecutionSnapshot,
-    identity_sha256: String,
+pub struct RunnerExecutionSnapshot {
+    pub(crate) observed_logical_cpu_ids: Vec<u64>,
+    pub(crate) effective_physical_core_ids: Vec<String>,
+    pub(crate) cpu_assignment_observability: String,
+    pub(crate) effective_cpuset_sha256: String,
+    pub(crate) threads_per_core: u64,
+    pub(crate) smt_state: String,
+    pub(crate) numa_node_ids: Vec<u64>,
+    pub(crate) numa_policy: String,
+    pub(crate) governor: String,
+    pub(crate) thermal_pressure: bool,
+    pub(crate) exclusive_lease: bool,
+    pub(crate) exclusive_lease_id: String,
+    pub(crate) local_execution: bool,
+    pub(crate) observed_hardware_fingerprint_sha256: String,
+    pub(crate) snapshot_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerBuild {
-    git_revision: String,
-    git_dirty: bool,
-    worktree_state_sha256: Option<String>,
-    cargo_lock_sha256: String,
-    executable_sha256: String,
-    command_sha256: String,
+pub struct RunnerExecution {
+    pub(crate) request: RunnerExecutionRequest,
+    pub(crate) start: RunnerExecutionSnapshot,
+    pub(crate) end: RunnerExecutionSnapshot,
+    pub(crate) identity_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerDurability {
-    adjacent: bool,
-    control_treatment: String,
-    candidate_treatment: String,
-    symmetric: bool,
+pub struct RunnerBuild {
+    pub(crate) git_revision: String,
+    pub(crate) git_dirty: bool,
+    pub(crate) worktree_state_sha256: Option<String>,
+    pub(crate) cargo_lock_sha256: String,
+    pub(crate) executable_sha256: String,
+    pub(crate) command_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerCompletion {
-    verified: bool,
-    exit_status: i64,
-    run_log_sha256: String,
-    artifact_manifest_sha256: String,
-    artifact_digests_verified: bool,
-    started_at_utc: String,
-    finished_at_utc: String,
+pub struct RunnerDurability {
+    pub(crate) adjacent: bool,
+    pub(crate) control_treatment: String,
+    pub(crate) candidate_treatment: String,
+    pub(crate) symmetric: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerReceipt {
-    requested_class_id: String,
-    derived_class_id: String,
-    registry_sha256: String,
-    hardware: RunnerHardware,
-    execution: RunnerExecution,
-    build: RunnerBuild,
-    durability: RunnerDurability,
-    completion: RunnerCompletion,
+pub struct RunnerCompletion {
+    pub(crate) verified: bool,
+    pub(crate) exit_status: i64,
+    pub(crate) run_log_sha256: String,
+    pub(crate) artifact_manifest_sha256: String,
+    pub(crate) artifact_digests_verified: bool,
+    pub(crate) started_at_utc: String,
+    pub(crate) finished_at_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerReceipt {
+    pub(crate) requested_class_id: String,
+    pub(crate) derived_class_id: String,
+    pub(crate) registry_sha256: String,
+    pub(crate) hardware: RunnerHardware,
+    pub(crate) execution: RunnerExecution,
+    pub(crate) build: RunnerBuild,
+    pub(crate) durability: RunnerDurability,
+    pub(crate) completion: RunnerCompletion,
 }
 
 #[derive(Debug, Clone)]
@@ -779,7 +1130,7 @@ fn validate_unknown_fields(
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(digest.len() * 2);
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -869,6 +1220,7 @@ impl MachineClassRegistry {
             "validation_precedence",
             "canonical_hash_contract",
             "receipt_contract",
+            "artifact_manifest_contract",
             "classes",
             "fact_templates",
             "requirements",
@@ -896,6 +1248,7 @@ impl MachineClassRegistry {
                 format!("unsupported registry schema {found_schema:?}"),
             ));
         }
+        validate_registry_artifact_manifest_contract(&raw)?;
 
         let classes = required_array(&raw, "classes")?
             .iter()
@@ -956,6 +1309,7 @@ impl MachineClassRegistry {
             ));
         }
         for class in classes {
+            validate_hardware_predicate_contract(class)?;
             match class.id_kind.as_str() {
                 "exact" if class.id.is_some() && class.id_pattern.is_none() => {}
                 "pattern"
@@ -1170,6 +1524,7 @@ impl MachineClassRegistry {
         validate_source_identity(&receipt)?;
         validate_durability(&receipt.durability)?;
         validate_completion(&receipt.completion)?;
+        validate_gate_class_policy(&resolved, context)?;
         validate_destination(context, &receipt.derived_class_id)?;
 
         let receipt_json = std::str::from_utf8(receipt_bytes)
@@ -1214,6 +1569,7 @@ impl MachineClassRegistry {
             completion: serde_json::to_value(&receipt.completion).map_err(|error| {
                 MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
             })?,
+            artifact_manifest: None,
             derived_sha256: derived,
         })
     }
@@ -1237,6 +1593,78 @@ impl MachineClassRegistry {
     fn raw(&self) -> &Value {
         &self.raw
     }
+}
+
+fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), MachineClassError> {
+    const MANIFEST_PRECEDENCE: &str = "exact canonical artifact manifest and actual run-log, threshold, and pre-binding-evidence binding";
+    let value = registry.get("artifact_manifest_contract").ok_or_else(|| {
+        MachineClassError::new(
+            MachineClassReason::MissingField,
+            "registry is missing artifact_manifest_contract",
+        )
+    })?;
+    let contract = serde_json::from_value::<RegistryArtifactManifestContract>(value.clone())
+        .map_err(|error| {
+            let detail = error.to_string();
+            let reason = if detail.contains("unknown field") {
+                MachineClassReason::UnknownField
+            } else {
+                MachineClassReason::MissingField
+            };
+            MachineClassError::new(reason, detail)
+        })?;
+    let expected_fields = [
+        "schema_version",
+        "gate",
+        "run_id",
+        "run_window",
+        "run_log_sha256",
+        "threshold_artifact_sha256",
+        "evidence_artifact_sha256",
+    ];
+    let canonical_encoding = contract.canonical_encoding.to_ascii_lowercase();
+    let manifest_precedence_present = registry
+        .get("validation_precedence")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.as_str() == Some(MANIFEST_PRECEDENCE))
+        });
+    let manifest_requirement_present = registry
+        .get("requirements")
+        .and_then(Value::as_array)
+        .is_some_and(|requirements| {
+            requirements.iter().any(|requirement| {
+                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-020")
+                    && requirement.get("level").and_then(Value::as_str) == Some("MUST")
+                    && requirement
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            text.contains("actual run log")
+                                && text.contains("pre-binding evidence")
+                                && text.contains("rejected before history opens")
+                        })
+            })
+        });
+    if contract.schema_version != RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION
+        || contract.unknown_field_policy != "reject"
+        || contract.duplicate_key_policy != "reject"
+        || contract.required_fields != expected_fields.map(str::to_owned).to_vec()
+        || !canonical_encoding.contains("compact json")
+        || !canonical_encoding.contains("exact")
+        || contract.binding_law.trim().is_empty()
+        || contract.history_law.trim().is_empty()
+        || !manifest_precedence_present
+        || !manifest_requirement_present
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::SourceIdentityInvalid,
+            "artifact manifest contract differs from the compiled strict schema",
+        ));
+    }
+    Ok(())
 }
 
 struct ResolvedClass<'a> {
@@ -1352,6 +1780,50 @@ fn derive_hashes(receipt: &RunnerReceipt) -> Result<MachineClassDerivedHashes, M
     })
 }
 
+pub fn seal_runner_receipt(mut receipt: RunnerReceipt) -> Result<Vec<u8>, MachineClassError> {
+    receipt.hardware.fingerprint_sha256.clear();
+    receipt
+        .execution
+        .start
+        .observed_hardware_fingerprint_sha256
+        .clear();
+    receipt
+        .execution
+        .end
+        .observed_hardware_fingerprint_sha256
+        .clear();
+    receipt.execution.start.effective_cpuset_sha256.clear();
+    receipt.execution.end.effective_cpuset_sha256.clear();
+    receipt.execution.start.snapshot_sha256.clear();
+    receipt.execution.end.snapshot_sha256.clear();
+    receipt.execution.identity_sha256.clear();
+
+    let mut hardware = serde_json::to_value(&receipt.hardware).map_err(|error| {
+        MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
+    })?;
+    hardware
+        .as_object_mut()
+        .expect("serialized runner hardware is an object")
+        .remove("fingerprint_sha256");
+    let hardware_sha256 = hash_value(&hardware)?;
+    receipt.hardware.fingerprint_sha256 = hardware_sha256.clone();
+    receipt
+        .execution
+        .start
+        .observed_hardware_fingerprint_sha256
+        .clone_from(&hardware_sha256);
+    receipt.execution.end.observed_hardware_fingerprint_sha256 = hardware_sha256;
+    receipt.execution.start.effective_cpuset_sha256 = derive_cpuset_hash(&receipt.execution.start)?;
+    receipt.execution.end.effective_cpuset_sha256 = derive_cpuset_hash(&receipt.execution.end)?;
+    receipt.execution.start.snapshot_sha256 = derive_snapshot_hash(&receipt.execution.start)?;
+    receipt.execution.end.snapshot_sha256 = derive_snapshot_hash(&receipt.execution.end)?;
+    receipt.execution.identity_sha256 = derive_execution_identity_hash(&receipt)?;
+
+    serde_json::to_vec(&receipt).map_err(|error| {
+        MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
+    })
+}
+
 fn derive_cpuset_hash(snapshot: &RunnerExecutionSnapshot) -> Result<String, MachineClassError> {
     let value = serde_json::json!({
         "observed_logical_cpu_ids": snapshot.observed_logical_cpu_ids,
@@ -1452,13 +1924,129 @@ fn validate_hardware(
             "efficiency_cores",
             MachineClassReason::HardwareEfficiencyCoreMismatch,
         ),
+        (
+            "runtime_detected_isa",
+            MachineClassReason::HardwareIsaMismatch,
+        ),
     ] {
         predicate_matches(&value[field], &class.hardware_predicates, field, reason)?;
+    }
+    validate_runtime_isa(&hardware.runtime_detected_isa)?;
+    if let Some(forbidden) = class.hardware_predicates.get("forbidden_runtime_isa") {
+        let forbidden = forbidden.as_array().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::SourceIdentityInvalid,
+                "forbidden_runtime_isa must be an array",
+            )
+        })?;
+        for feature in forbidden {
+            let feature = feature.as_str().ok_or_else(|| {
+                MachineClassError::new(
+                    MachineClassReason::SourceIdentityInvalid,
+                    "forbidden_runtime_isa entries must be strings",
+                )
+            })?;
+            if hardware
+                .runtime_detected_isa
+                .binary_search_by(|candidate| candidate.as_str().cmp(feature))
+                .is_ok()
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::HardwareIsaMismatch,
+                    format!("runtime-detected ISA includes forbidden feature {feature:?}"),
+                ));
+            }
+        }
     }
     if !is_sha256(&hardware.topology_sha256) {
         return Err(MachineClassError::new(
             MachineClassReason::SourceIdentityInvalid,
             "topology_sha256 is not lowercase SHA-256",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hardware_predicate_contract(
+    class: &RegistryClassRule,
+) -> Result<(), MachineClassError> {
+    const CONSUMED_FIELDS: &[&str] = &[
+        "os",
+        "arch",
+        "cpu_vendor",
+        "cpu_family",
+        "cpu_model",
+        "cpu_stepping",
+        "cpu_model_name",
+        "physical_cores",
+        "logical_cpus",
+        "numa_nodes",
+        "memory_bytes",
+        "page_size_bytes",
+        "performance_cores",
+        "efficiency_cores",
+        "runtime_detected_isa",
+        "forbidden_runtime_isa",
+    ];
+    if let Some(field) = class
+        .hardware_predicates
+        .keys()
+        .find(|field| !CONSUMED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::UnknownField,
+            format!(
+                "class family {:?} has unconsumed hardware predicate {field:?}",
+                class.family
+            ),
+        ));
+    }
+    if let Some(forbidden) = class.hardware_predicates.get("forbidden_runtime_isa") {
+        let forbidden = forbidden.as_array().ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::SourceIdentityInvalid,
+                "forbidden_runtime_isa must be an array",
+            )
+        })?;
+        let forbidden = forbidden
+            .iter()
+            .map(|feature| {
+                feature.as_str().map(str::to_owned).ok_or_else(|| {
+                    MachineClassError::new(
+                        MachineClassReason::SourceIdentityInvalid,
+                        "forbidden_runtime_isa entries must be strings",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_runtime_isa(&forbidden)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_isa(features: &[String]) -> Result<(), MachineClassError> {
+    const REPORTABLE_RUNTIME_ISA: &[&str] = &[
+        "aes", "asimd", "avx2", "avx512f", "bmi2", "fma", "neon", "scalar", "sha2", "vaes",
+    ];
+    let valid_token = |feature: &str| {
+        !feature.is_empty()
+            && feature.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'.' | b'-')
+            })
+    };
+    if features.is_empty()
+        || features.iter().any(|feature| !valid_token(feature))
+        || features
+            .iter()
+            .any(|feature| !REPORTABLE_RUNTIME_ISA.contains(&feature.as_str()))
+        || features.windows(2).any(|pair| pair[0] >= pair[1])
+        || (features.len() > 1 && features.iter().any(|feature| feature == "scalar"))
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::HardwareIsaMismatch,
+            "runtime-detected ISA must be a nonempty, strictly sorted, duplicate-free token list",
         ));
     }
     Ok(())
@@ -1550,12 +2138,11 @@ fn validate_execution(
         }
     } else if resolved.rule.family == "m4-macos" {
         let max_width = match request.apple_execution_mode.as_str() {
-            "p-only" => 10,
             "p-plus-e" => 14,
             _ => {
                 return Err(MachineClassError::new(
                     MachineClassReason::ExecutionModeMismatch,
-                    "M4 execution mode must be p-only or p-plus-e",
+                    "M4 promotion evidence currently admits only p-plus-e; p-only lacks a scheduler-assignment witness",
                 ));
             }
         };
@@ -1614,6 +2201,28 @@ fn validate_execution(
         }
     }
     let _ = &resolved.rule.execution_predicates;
+    Ok(())
+}
+
+fn validate_gate_class_policy(
+    resolved: &ResolvedClass<'_>,
+    context: &MachineClassAdmissionContext,
+) -> Result<(), MachineClassError> {
+    if resolved.rule.family != "m4-macos" {
+        return Ok(());
+    }
+    if matches!(
+        context.gate.as_str(),
+        "QG-1" | "QG-3" | "QG-4" | "QG-5" | "QG-8"
+    ) {
+        return Err(MachineClassError::new(
+            MachineClassReason::ClassUnavailable,
+            format!(
+                "{} is not currently promotion-admissible on M4: scaling gates require class-specific endpoints and durability-adjacent gates require a non-declarative F_FULLFSYNC witness",
+                context.gate,
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1709,24 +2318,6 @@ fn validate_destination(
 }
 
 #[cfg(test)]
-pub fn admitted_test_identity_for(
-    gate: &str,
-    git_revision: &str,
-    cargo_lock_sha256: &str,
-    executable_sha256: &str,
-    command_sha256: &str,
-) -> VerifiedRunnerIdentity {
-    admitted_test_identity_for_run(
-        gate,
-        git_revision,
-        cargo_lock_sha256,
-        executable_sha256,
-        command_sha256,
-        "fixture",
-    )
-}
-
-#[cfg(test)]
 pub fn admitted_test_identity_for_run(
     gate: &str,
     git_revision: &str,
@@ -1744,6 +2335,120 @@ pub fn admitted_test_identity_for_run(
         command_sha256,
         run_label,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn admitted_test_identity_for_artifacts(
+    gate: &str,
+    git_revision: &str,
+    cargo_lock_sha256: &str,
+    executable_sha256: &str,
+    command_sha256: &str,
+    run_label: &str,
+    run_id: &str,
+    run_window: &str,
+    threshold_artifact_bytes: &[u8],
+    evidence_artifact_bytes: &[u8],
+) -> VerifiedRunnerIdentity {
+    let bare = admitted_test_identity_for_run(
+        gate,
+        git_revision,
+        cargo_lock_sha256,
+        executable_sha256,
+        command_sha256,
+        run_label,
+    );
+    bind_test_identity_to_artifacts(
+        &bare,
+        gate,
+        run_id,
+        run_window,
+        format!("runner-log:{run_label}").as_bytes(),
+        threshold_artifact_bytes,
+        evidence_artifact_bytes,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn admitted_test_identity_from_vector_for_artifacts(
+    vector_id: &str,
+    gate: &str,
+    git_revision: &str,
+    cargo_lock_sha256: &str,
+    executable_sha256: &str,
+    command_sha256: &str,
+    run_label: &str,
+    run_id: &str,
+    run_window: &str,
+    threshold_artifact_bytes: &[u8],
+    evidence_artifact_bytes: &[u8],
+) -> VerifiedRunnerIdentity {
+    let bare = admitted_test_identity_from_vector_for_run(
+        vector_id,
+        gate,
+        git_revision,
+        cargo_lock_sha256,
+        executable_sha256,
+        command_sha256,
+        run_label,
+    );
+    bind_test_identity_to_artifacts(
+        &bare,
+        gate,
+        run_id,
+        run_window,
+        format!("runner-log:{run_label}").as_bytes(),
+        threshold_artifact_bytes,
+        evidence_artifact_bytes,
+    )
+}
+
+#[cfg(test)]
+fn bind_test_identity_to_artifacts(
+    bare: &VerifiedRunnerIdentity,
+    gate: &str,
+    run_id: &str,
+    run_window: &str,
+    run_log_bytes: &[u8],
+    threshold_artifact_bytes: &[u8],
+    evidence_artifact_bytes: &[u8],
+) -> VerifiedRunnerIdentity {
+    let receipt_run_log_sha256 = bare
+        .completion()
+        .get("run_log_sha256")
+        .and_then(Value::as_str)
+        .expect("test receipt run-log digest");
+    assert_eq!(receipt_run_log_sha256, sha256_hex(run_log_bytes));
+    let manifest = RunnerArtifactManifest::from_artifacts(
+        gate,
+        run_id,
+        run_window,
+        run_log_bytes,
+        threshold_artifact_bytes,
+        evidence_artifact_bytes,
+    );
+    let manifest_bytes = manifest.to_json_bytes().expect("test artifact manifest");
+    let mut receipt =
+        serde_json::from_str::<Value>(bare.receipt_json()).expect("test runner receipt JSON");
+    set_path(
+        &mut receipt,
+        "completion.artifact_manifest_sha256",
+        Value::String(sha256_hex(&manifest_bytes)),
+    );
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("test runner receipt bytes");
+    let registry = MachineClassRegistry::frozen().expect("frozen registry");
+    registry
+        .admit(&receipt_bytes, bare.admission_context())
+        .expect("test runner receipt admission")
+        .bind_artifact_manifest(
+            &manifest_bytes,
+            run_log_bytes,
+            threshold_artifact_bytes,
+            evidence_artifact_bytes,
+        )
+        .expect("test artifact-manifest binding")
 }
 
 #[cfg(test)]
@@ -2002,7 +2707,7 @@ mod tests {
         assert_eq!(sha256_hex(REGISTRY_BYTES), MACHINE_CLASS_REGISTRY_SHA256);
         assert_eq!(
             MACHINE_CLASS_REGISTRY_GIT_BLOB,
-            "83a904721c81a4e5d19c8164d4ffe3924f3afddd"
+            "65d8f09358372abe6b85b74ab16e8abff8674641"
         );
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
         assert_eq!(registry.raw()["classes"].as_array().unwrap().len(), 4);
@@ -2013,7 +2718,7 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 51);
+        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 56);
         assert_eq!(
             registry.raw()["registry_test_vectors"]
                 .as_array()
@@ -2107,7 +2812,7 @@ mod tests {
             }
         }
         assert_eq!(allow_count, 3);
-        assert_eq!(reject_count, 48);
+        assert_eq!(reject_count, 53);
     }
 
     #[test]
@@ -2161,5 +2866,82 @@ mod tests {
         let roundtrip: MachineClassEvidenceBinding =
             serde_json::from_str(&json).expect("deserialize binding");
         assert_eq!(roundtrip, binding);
+    }
+
+    #[test]
+    fn artifact_manifest_requires_exact_compact_typed_bytes() {
+        let manifest = RunnerArtifactManifest::from_artifacts(
+            "QG-2",
+            "candidate-a",
+            "window-a",
+            b"exact run log",
+            b"exact threshold",
+            b"exact pre-binding evidence",
+        );
+        let canonical = manifest.to_json_bytes().expect("canonical manifest");
+        parse_artifact_manifest_binding(&canonical).expect("canonical manifest admission");
+
+        let pretty = serde_json::to_vec_pretty(&manifest).expect("pretty manifest");
+        let mut trailing_lf = canonical.clone();
+        trailing_lf.push(b'\n');
+        let canonical_text = std::str::from_utf8(&canonical).expect("manifest UTF-8");
+        let duplicate = canonical_text.replacen("\"gate\":", "\"gate\":\"QG-2\",\"gate\":", 1);
+        let unknown = canonical_text.replacen('{', "{\"unreviewed\":true,", 1);
+        let mut missing = serde_json::to_value(&manifest).expect("manifest value");
+        missing
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("run_window");
+        let missing = serde_json::to_vec(&missing).expect("missing-field manifest");
+
+        for rejected in [
+            pretty.as_slice(),
+            trailing_lf.as_slice(),
+            duplicate.as_bytes(),
+            unknown.as_bytes(),
+            missing.as_slice(),
+        ] {
+            assert!(
+                parse_artifact_manifest_binding(rejected).is_err(),
+                "noncanonical or structurally invalid manifest was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_manifest_rejects_actual_artifact_tamper() {
+        let threshold = b"exact threshold";
+        let evidence = b"exact pre-binding evidence";
+        let identity = admitted_test_identity_for_artifacts(
+            "QG-2",
+            "deadbeef",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"f".repeat(64),
+            "manifest-tamper",
+            "candidate-a",
+            "window-a",
+            threshold,
+            evidence,
+        );
+
+        identity
+            .verify_artifact_inputs(b"runner-log:manifest-tamper", threshold, evidence)
+            .expect("exact artifact inputs");
+        assert!(
+            identity
+                .verify_run_log(b"runner-log:manifest-tampeR")
+                .is_err()
+        );
+        assert!(
+            identity
+                .verify_threshold_artifact(b"exact thresholD")
+                .is_err()
+        );
+        assert!(
+            identity
+                .verify_evidence_artifact(b"exact pre-binding evidencE")
+                .is_err()
+        );
     }
 }

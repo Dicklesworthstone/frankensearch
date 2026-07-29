@@ -44,7 +44,7 @@ use crate::{MachineClassEvidenceBinding, VerifiedRunnerIdentity};
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v2";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v3";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
@@ -354,8 +354,8 @@ pub struct MachineIdentity {
     pub arch: String,
     /// Logical CPU count observed by the process.
     pub logical_cpus: usize,
-    /// Host topology, ISA, affinity, and exact thread widths exercised by the
-    /// invocation.
+    /// Host topology, ISA, affinity, and exact configured engine widths for
+    /// the invocation.
     pub execution: PerfExecutionProvenance,
     /// CPU frequency governor, when the platform exposes one.
     pub cpu_governor: Option<String>,
@@ -369,13 +369,13 @@ impl MachineIdentity {
     /// Capture the current machine identity. Unavailable probes report
     /// `None` rather than fabricating zeros.
     #[must_use]
-    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(configured_engine_thread_widths: impl IntoIterator<Item = usize>) -> Self {
         Self {
             fingerprint: crate::perf::machine_fingerprint(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
-            execution: PerfExecutionProvenance::capture(threads_actually_used),
+            execution: PerfExecutionProvenance::capture(configured_engine_thread_widths),
             cpu_governor: fs::read_to_string(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             )
@@ -397,9 +397,12 @@ impl MachineIdentity {
             || self.arch.trim().is_empty()
             || self.logical_cpus == 0
             || !self.execution.is_complete()
+            || self.execution.producer_os.as_str() != self.os
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
-                reason: "machine identity requires fingerprint, os, arch, and CPUs".to_owned(),
+                reason: "machine identity requires fingerprint, os, arch, CPUs, and matching \
+                         serialized producer OS"
+                    .to_owned(),
             });
         }
         Ok(())
@@ -760,6 +763,90 @@ pub fn estimate_hierarchical_latency(
     })
 }
 
+/// Engine arm covered by a materialized-pool observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfConcurrencyEngine {
+    /// Quill candidate arm.
+    Quill,
+    /// Pinned Tantivy incumbent arm.
+    Tantivy,
+}
+
+/// Independent mechanism that witnessed a materialized engine pool width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfConcurrencyObserver {
+    /// `rayon::current_num_threads()` executed inside the exact Quill pool.
+    RayonCurrentPoolWidth,
+    /// Tantivy successfully constructed the exact configured writer pool.
+    TantivyWriterConstruction,
+}
+
+/// Repeated observations for one engine in one scaling cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineConcurrencyObservation {
+    /// Engine whose materialized pool was observed.
+    pub engine: PerfConcurrencyEngine,
+    /// Independent observation mechanism.
+    pub observer: PerfConcurrencyObserver,
+    /// Number of measured invocations covered by this observation.
+    pub observation_count: usize,
+    /// Minimum materialized pool width over all observations.
+    pub min_observed_worker_pool_threads: usize,
+    /// Maximum materialized pool width over all observations.
+    pub max_observed_worker_pool_threads: usize,
+}
+
+/// Exact per-cell witness that configured scaling knobs materialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerfConcurrencyWitness {
+    /// Thread-width knob declared by the normative matrix cell.
+    pub configured_threads: usize,
+    /// Exactly one Quill and one Tantivy observation, in engine order.
+    pub observations: Vec<EngineConcurrencyObservation>,
+}
+
+impl PerfConcurrencyWitness {
+    fn validate(&self) -> Result<(), EvidenceArtifactError> {
+        let expected = [
+            (
+                PerfConcurrencyEngine::Quill,
+                PerfConcurrencyObserver::RayonCurrentPoolWidth,
+            ),
+            (
+                PerfConcurrencyEngine::Tantivy,
+                PerfConcurrencyObserver::TantivyWriterConstruction,
+            ),
+        ];
+        if self.configured_threads == 0 || self.observations.len() != expected.len() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason:
+                    "scaling concurrency witness requires one positive-width observation per engine"
+                        .to_owned(),
+            });
+        }
+        for (observation, (engine, observer)) in self.observations.iter().zip(expected) {
+            if observation.engine != engine
+                || observation.observer != observer
+                || observation.observation_count == 0
+                || observation.min_observed_worker_pool_threads != self.configured_threads
+                || observation.max_observed_worker_pool_threads != self.configured_threads
+            {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason:
+                        "scaling concurrency witness is missing, duplicated, or disagrees with \
+                         the configured pool width"
+                            .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Identity of one evidence cell before measurement is attached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceCellSpec {
@@ -779,6 +866,9 @@ pub struct EvidenceCellSpec {
     pub input_identity: Option<PerfInputIdentity>,
     /// Cache-state proof, required for cold-open cells.
     pub cold_cache: Option<ColdCacheEvidence>,
+    /// Per-engine materialized-pool witness for QG-1/QG-8 scaling cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_witness: Option<PerfConcurrencyWitness>,
 }
 
 /// Measured body of one evidence cell.
@@ -882,6 +972,27 @@ impl EvidenceCell {
         policy: &EvidencePolicy,
     ) -> Result<Self, EvidenceArtifactError> {
         policy.validate()?;
+        let requires_concurrency_witness = spec.gate == PerfGate::Qg8
+            || (spec.gate == PerfGate::Qg1 && spec.role == EvidenceRole::Required);
+        match (
+            requires_concurrency_witness,
+            spec.concurrency_witness.as_ref(),
+        ) {
+            (true, Some(witness)) => witness.validate()?,
+            (true, None) => {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "QG-1/QG-8 scaling evidence requires a per-engine concurrency witness"
+                        .to_owned(),
+                });
+            }
+            (false, Some(_)) => {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: "only required QG-1/QG-8 scaling cells can carry concurrency witnesses"
+                        .to_owned(),
+                });
+            }
+            (false, None) => {}
+        }
         let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
         let retained = paired.effect_samples.len() + paired.null_samples.len();
         if retained > policy.max_raw_samples {
@@ -1472,7 +1583,10 @@ impl PerfEvidenceArtifact {
     #[must_use]
     pub fn ratchet_admissible(&self) -> bool {
         self.gate_status == EvidenceDecisionStatus::MeasuredProvisional
-            && self.machine_class.identity().is_some()
+            && self
+                .machine_class
+                .identity()
+                .is_some_and(|identity| identity.artifact_manifest().is_some())
             && self
                 .cells
                 .iter()
@@ -1493,12 +1607,40 @@ impl PerfEvidenceArtifact {
     pub fn bind_machine_class_identity(
         &mut self,
         identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
     ) -> Result<(), EvidenceArtifactError> {
+        let source = Self::from_verified_slice(prebinding_evidence_bytes)?;
+        if source != *self {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "in-memory evidence differs from the exact pre-binding source bytes"
+                    .to_owned(),
+            });
+        }
         identity
             .verify()
             .map_err(|error| EvidenceArtifactError::InvalidProvenance {
                 reason: format!("machine-class binding rejected: {error}"),
             })?;
+        identity
+            .verify_threshold_artifact(threshold_artifact_bytes)
+            .and_then(|()| identity.verify_evidence_artifact(prebinding_evidence_bytes))
+            .map_err(|error| EvidenceArtifactError::InvalidProvenance {
+                reason: format!("runner artifact-manifest binding rejected: {error}"),
+            })?;
+        let artifact_manifest = identity
+            .artifact_manifest()
+            .expect("exact artifact inputs require a manifest")
+            .manifest();
+        if artifact_manifest.gate() != self.gate.label()
+            || artifact_manifest.run_id() != self.provenance.run_id
+            || artifact_manifest.run_window() != self.provenance.run_window
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: "runner artifact manifest names a different gate, run ID, or run window"
+                    .to_owned(),
+            });
+        }
         if let Some(existing) = self.machine_class.identity()
             && existing != &identity
         {
@@ -1590,6 +1732,7 @@ impl PerfEvidenceArtifact {
         };
         if self.provenance.machine.os != hardware_os
             || self.provenance.machine.arch != hardware_arch
+            || self.provenance.machine.execution.producer_os.as_str() != hardware_os
             || !target_matches
         {
             return Err(EvidenceArtifactError::InvalidProvenance {
@@ -1620,21 +1763,36 @@ impl PerfEvidenceArtifact {
     pub fn bind_machine_class_identity_and_seal(
         &mut self,
         identity: VerifiedRunnerIdentity,
+        threshold_artifact_bytes: &[u8],
+        prebinding_evidence_bytes: &[u8],
     ) -> Result<Vec<u8>, EvidenceArtifactError> {
-        self.bind_machine_class_identity(identity)?;
-        self.artifact_sha256.clear();
-        let unsealed = serde_json::to_string_pretty(self)?;
-        self.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
-        let sealed = serde_json::to_vec_pretty(self)?;
-        self.verify_integrity()?;
+        let mut bound = self.clone();
+        bound.bind_machine_class_identity(
+            identity,
+            threshold_artifact_bytes,
+            prebinding_evidence_bytes,
+        )?;
+        bound.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(&bound)?;
+        bound.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
+        let sealed = serde_json::to_vec_pretty(&bound)?;
+        bound.verify_integrity()?;
+        *self = bound;
         Ok(sealed)
     }
 
     /// Fail closed when an invocation selected only part of a normative gate.
     ///
     /// The measured cells and raw samples remain durable, but the artifact
-    /// cannot establish a ratchet or accept a downstream gate decision.
+    /// cannot establish a ratchet or accept a downstream gate decision. If a
+    /// runner receipt was already bound, this pre-binding-content mutation
+    /// explicitly discards it: a fresh receipt must bind the changed bytes.
     pub fn force_no_claim(&mut self, code: &str, message: impl Into<String>) {
+        if self.machine_class.identity().is_some() {
+            self.machine_class = MachineClassEvidenceBinding::unverified(
+                "evidence changed after runner binding; a fresh receipt is required",
+            );
+        }
         self.admission_no_claim = Some(EvidenceReason::new(
             code,
             message,
@@ -1692,6 +1850,17 @@ impl PerfEvidenceArtifact {
         Ok(serde_json::to_string_pretty(&sealed)?)
     }
 
+    fn reconstructed_prebinding_bytes(&self) -> Result<Vec<u8>, EvidenceArtifactError> {
+        let mut source = self.clone();
+        source.machine_class =
+            MachineClassEvidenceBinding::unverified("sealed runner receipt has not been bound");
+        source.gate_decision = None;
+        source.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(&source)?;
+        source.artifact_sha256 = lower_hex(&Sha256::digest(unsealed.as_bytes()));
+        Ok(serde_json::to_vec_pretty(&source)?)
+    }
+
     /// Verify this in-memory artifact's seal and every derived invariant.
     ///
     /// This is the in-memory counterpart to [`Self::load_verified`]. Public
@@ -1725,6 +1894,27 @@ impl PerfEvidenceArtifact {
                 reason: format!("machine-class binding rejected: {error}"),
             }
         })?;
+        if let Some(identity) = self.machine_class.identity() {
+            let prebinding_bytes = self.reconstructed_prebinding_bytes()?;
+            identity
+                .verify_evidence_artifact(&prebinding_bytes)
+                .map_err(|error| EvidenceArtifactError::InvalidProvenance {
+                    reason: format!("runner evidence-artifact binding rejected: {error}"),
+                })?;
+            let manifest = identity
+                .artifact_manifest()
+                .expect("verified evidence binding requires an artifact manifest")
+                .manifest();
+            if manifest.gate() != self.gate.label()
+                || manifest.run_id() != self.provenance.run_id
+                || manifest.run_window() != self.provenance.run_window
+            {
+                return Err(EvidenceArtifactError::InvalidProvenance {
+                    reason: "bound artifact manifest names a different gate, run ID, or run window"
+                        .to_owned(),
+                });
+            }
+        }
         Self::validate_cell_set(self.gate, &self.cells)?;
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
@@ -2009,7 +2199,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v2")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v3")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -2271,10 +2461,11 @@ mod tests {
                 logical_cpus: 8,
                 execution: PerfExecutionProvenance {
                     host_identity: "test-machine".to_owned(),
+                    producer_os: crate::PerfProducerOs::Linux,
                     physical_cores: 4,
                     logical_threads: 8,
                     process_available_threads: 8,
-                    threads_actually_used: vec![1],
+                    configured_engine_thread_widths: vec![1],
                     runtime_detected_isa: vec!["avx2".to_owned()],
                     cpu_affinity_allowed_list: Some("0-7".to_owned()),
                     affinity_or_cpuset_cap: None,
@@ -2299,17 +2490,79 @@ mod tests {
         }
     }
 
-    fn admitted_identity(gate: PerfGate) -> VerifiedRunnerIdentity {
-        crate::machine_class_registry::admitted_test_identity_for(
+    fn seal_unbound_artifact(artifact: &mut PerfEvidenceArtifact) -> Vec<u8> {
+        let bytes = artifact
+            .sealed_json()
+            .expect("seal unbound test evidence")
+            .into_bytes();
+        *artifact = PerfEvidenceArtifact::from_verified_slice(&bytes)
+            .expect("reload unbound test evidence");
+        bytes
+    }
+
+    fn admitted_identity(
+        gate: PerfGate,
+        threshold_artifact_bytes: &[u8],
+        evidence_artifact_bytes: &[u8],
+        run_label: &str,
+    ) -> VerifiedRunnerIdentity {
+        crate::machine_class_registry::admitted_test_identity_for_artifacts(
             gate.label(),
             "deadbeef",
             &"c".repeat(64),
             &"a".repeat(64),
             &"f".repeat(64),
+            run_label,
+            "run-a",
+            "window-1",
+            threshold_artifact_bytes,
+            evidence_artifact_bytes,
         )
     }
 
+    fn bind_test_identity(
+        artifact: &mut PerfEvidenceArtifact,
+        gate: PerfGate,
+        threshold_artifact_bytes: &[u8],
+        run_label: &str,
+    ) -> Vec<u8> {
+        let source = seal_unbound_artifact(artifact);
+        let identity = admitted_identity(gate, threshold_artifact_bytes, &source, run_label);
+        artifact
+            .bind_machine_class_identity(identity, threshold_artifact_bytes, &source)
+            .expect("bind admitted test identity");
+        source
+    }
+
+    fn unbind_test_artifact(artifact: &mut PerfEvidenceArtifact) {
+        artifact.machine_class =
+            MachineClassEvidenceBinding::unverified("sealed runner receipt has not been bound");
+        artifact.gate_decision = None;
+        artifact.artifact_sha256.clear();
+    }
+
     fn cell_spec(gate: PerfGate, role: EvidenceRole) -> EvidenceCellSpec {
+        let concurrency_witness = (gate == PerfGate::Qg8
+            || (gate == PerfGate::Qg1 && role == EvidenceRole::Required))
+            .then(|| PerfConcurrencyWitness {
+                configured_threads: 1,
+                observations: vec![
+                    EngineConcurrencyObservation {
+                        engine: PerfConcurrencyEngine::Quill,
+                        observer: PerfConcurrencyObserver::RayonCurrentPoolWidth,
+                        observation_count: 12,
+                        min_observed_worker_pool_threads: 1,
+                        max_observed_worker_pool_threads: 1,
+                    },
+                    EngineConcurrencyObservation {
+                        engine: PerfConcurrencyEngine::Tantivy,
+                        observer: PerfConcurrencyObserver::TantivyWriterConstruction,
+                        observation_count: 12,
+                        min_observed_worker_pool_threads: 1,
+                        max_observed_worker_pool_threads: 1,
+                    },
+                ],
+            });
         EvidenceCellSpec {
             gate,
             fixture: "bulk/synthetic/1".to_owned(),
@@ -2324,6 +2577,7 @@ mod tests {
                 query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
             }),
             cold_cache: None,
+            concurrency_witness,
         }
     }
 
@@ -2347,9 +2601,12 @@ mod tests {
             vec![provisional_cell()],
         )
         .expect("provisional artifact");
-        artifact
-            .bind_machine_class_identity(admitted_identity(PerfGate::Qg1))
-            .expect("bind admitted test identity");
+        bind_test_identity(
+            &mut artifact,
+            PerfGate::Qg1,
+            b"qg1-threshold",
+            "qg1-primary",
+        );
         artifact
     }
 
@@ -2369,9 +2626,12 @@ mod tests {
         let mut artifact =
             PerfEvidenceArtifact::assemble(PerfGate::Qg6, policy(), provenance, vec![cell])
                 .expect("QG-6 artifact");
-        artifact
-            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
-            .expect("bind admitted test identity");
+        bind_test_identity(
+            &mut artifact,
+            PerfGate::Qg6,
+            b"qg6-threshold",
+            "qg6-primary",
+        );
         artifact
     }
 
@@ -2530,8 +2790,12 @@ mod tests {
             vec![provisional_cell()],
         )
         .expect("unverified producer evidence");
+        let threshold_bytes = b"qg1-threshold";
+        let source = seal_unbound_artifact(&mut artifact);
+        let identity =
+            admitted_identity(PerfGate::Qg1, threshold_bytes, &source, "post-exit-primary");
         let bytes = artifact
-            .bind_machine_class_identity_and_seal(admitted_identity(PerfGate::Qg1))
+            .bind_machine_class_identity_and_seal(identity, threshold_bytes, &source)
             .expect("post-exit receipt binding");
 
         assert_eq!(
@@ -2556,16 +2820,28 @@ mod tests {
             vec![provisional_cell()],
         )
         .expect("unverified producer evidence");
-        let drifted_argv_identity = crate::machine_class_registry::admitted_test_identity_for(
-            PerfGate::Qg1.label(),
-            "deadbeef",
-            &"c".repeat(64),
-            &"a".repeat(64),
-            &"0".repeat(64),
-        );
+        let threshold_bytes = b"qg1-threshold";
+        let source = seal_unbound_artifact(&mut artifact);
+        let drifted_argv_identity =
+            crate::machine_class_registry::admitted_test_identity_for_artifacts(
+                PerfGate::Qg1.label(),
+                "deadbeef",
+                &"c".repeat(64),
+                &"a".repeat(64),
+                &"0".repeat(64),
+                "drifted-command",
+                "run-a",
+                "window-1",
+                threshold_bytes,
+                &source,
+            );
 
         assert!(matches!(
-            artifact.bind_machine_class_identity_and_seal(drifted_argv_identity),
+            artifact.bind_machine_class_identity_and_seal(
+                drifted_argv_identity,
+                threshold_bytes,
+                &source,
+            ),
             Err(EvidenceArtifactError::InvalidProvenance { reason })
                 if reason.contains("build identity differs")
         ));
@@ -2573,26 +2849,37 @@ mod tests {
             artifact.machine_class,
             MachineClassEvidenceBinding::Unverified { .. }
         ));
-        assert!(artifact.artifact_sha256.is_empty());
+        assert!(!artifact.artifact_sha256.is_empty());
     }
 
     #[test]
     fn verified_runner_binding_cannot_be_reassigned_to_another_receipt() {
         let mut artifact = provisional_artifact();
         let original = artifact.machine_class.clone();
-        let different_receipt = crate::machine_class_registry::admitted_test_identity_for_run(
+        let source = artifact
+            .reconstructed_prebinding_bytes()
+            .expect("reconstruct pre-binding source");
+        let different_receipt = crate::machine_class_registry::admitted_test_identity_for_artifacts(
             PerfGate::Qg1.label(),
             "deadbeef",
             &"c".repeat(64),
             &"a".repeat(64),
             &"f".repeat(64),
             "different-completion",
+            "run-a",
+            "window-1",
+            b"qg1-threshold",
+            &source,
         );
 
         assert!(matches!(
-            artifact.bind_machine_class_identity_and_seal(different_receipt),
+            artifact.bind_machine_class_identity_and_seal(
+                different_receipt,
+                b"qg1-threshold",
+                &source,
+            ),
             Err(EvidenceArtifactError::InvalidProvenance { reason })
-                if reason.contains("verified bindings are immutable")
+                if reason.contains("in-memory evidence differs")
         ));
         assert_eq!(artifact.machine_class, original);
         assert!(artifact.artifact_sha256.is_empty());
@@ -2873,6 +3160,7 @@ mod tests {
     #[test]
     fn qg6_verified_load_rejects_sealed_cell_identity_divergence() {
         let mut artifact = qg6_artifact();
+        unbind_test_artifact(&mut artifact);
         artifact.cells[0]
             .spec
             .input_identity
@@ -2896,6 +3184,7 @@ mod tests {
     #[test]
     fn qg6_verified_load_recomputes_hierarchical_null_from_raw_groups() {
         let mut artifact = qg6_artifact();
+        unbind_test_artifact(&mut artifact);
         let EvidenceCellBody::Paired {
             hierarchical_null: Some(null),
             ..
@@ -3020,9 +3309,12 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 artifact");
-        artifact
-            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
-            .expect("bind admitted test identity");
+        bind_test_identity(
+            &mut artifact,
+            PerfGate::Qg6,
+            b"qg6-threshold",
+            "qg6-hierarchy-primary",
+        );
         assert!(artifact.ratchet_admissible());
         let directory = tempfile::tempdir().expect("QG-6 hierarchy-native artifact directory");
         let paths = artifact
@@ -3089,9 +3381,12 @@ mod tests {
             vec![cell],
         )
         .expect("QG-6 artifact");
-        artifact
-            .bind_machine_class_identity(admitted_identity(PerfGate::Qg6))
-            .expect("bind admitted test identity");
+        bind_test_identity(
+            &mut artifact,
+            PerfGate::Qg6,
+            b"qg6-threshold",
+            "qg6-conflict-primary",
+        );
         assert!(artifact.ratchet_admissible());
     }
 
@@ -3194,6 +3489,10 @@ mod tests {
 
         assert_eq!(artifact.gate_status, EvidenceDecisionStatus::NoDecision);
         assert!(!artifact.ratchet_admissible());
+        assert!(matches!(
+            artifact.machine_class,
+            MachineClassEvidenceBinding::Unverified { .. }
+        ));
         assert!(
             artifact
                 .reasons
@@ -3315,6 +3614,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("cell-set artifact directory");
 
         let mut wrong_gate = provisional_artifact();
+        unbind_test_artifact(&mut wrong_gate);
         wrong_gate.gate = PerfGate::Qg2;
         let wrong_gate_path = directory.path().join("wrong-gate.json");
         fs::write(
@@ -3330,6 +3630,7 @@ mod tests {
         ));
 
         let mut empty = provisional_artifact();
+        unbind_test_artifact(&mut empty);
         empty.cells.clear();
         let empty_path = directory.path().join("empty.json");
         fs::write(
@@ -3343,6 +3644,7 @@ mod tests {
         ));
 
         let mut duplicate = provisional_artifact();
+        unbind_test_artifact(&mut duplicate);
         duplicate.cells.push(duplicate.cells[0].clone());
         let duplicate_path = directory.path().join("duplicate.json");
         fs::write(
@@ -3356,6 +3658,7 @@ mod tests {
         ));
 
         let mut noncanonical = provisional_artifact();
+        unbind_test_artifact(&mut noncanonical);
         noncanonical.cells[0].cell_id = "forged/cell/id".to_owned();
         let noncanonical_path = directory.path().join("noncanonical-id.json");
         fs::write(

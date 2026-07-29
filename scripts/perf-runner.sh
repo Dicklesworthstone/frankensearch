@@ -1,206 +1,228 @@
 #!/usr/bin/env bash
-# perf-runner.sh — machine-class provenance runner for the E8-H hyperopt campaign.
+# perf-runner.sh — registered-host launcher for the E8-H performance campaign.
 #
-# Runs a benchmark command (default: the QG perf_matrix bench) on a non-rch
-# machine class (trj-zen-128c, m4-macos, m5-macos) or an rch-class host
-# (x86-vps-ovh), capturing the per-class provenance that
-# docs/contracts/quill-hyperopt-campaign.md § 2 makes mandatory:
-# CPU/NUMA topology, governor + SMT state (Linux), thermal pressure + page
-# size (macOS), git revision + dirty-state hash, toolchain versions.
-#
-# The benchmark process itself remains responsible for printing its own ELF
-# SHA-256 before Criterion output (quill-perf-gates.md § .bench-history) —
-# this runner records everything the process cannot know about its host.
+# The Rust producer owns the exclusive lease, start/end host probes, benchmark
+# child, exact run log, artifact-manifest binding, receipt sealing, and
+# self-admission. This shell surface only builds the typed local producer,
+# establishes the requested Linux affinity/NUMA envelope, and launches that
+# producer. The producer itself builds and resolves the benchmark executable
+# from the clean source snapshot. This script never manufactures JSON or writes
+# promotion history.
 #
 # Usage:
-#   scripts/perf-runner.sh --class <id> [options] [-- <command...>]
+#   scripts/perf-runner.sh \
+#     --gate <QG-1..QG-10> \
+#     --class <trj-zen3-Nc[-smt2]|m4-macos> \
+#     --run-id <unique-pass-id> \
+#     --run-window <shared-candidate-rerun-window> \
+#     [--thread-budget <N>] \
+#     [--cpu-list <taskset-list>] \
+#     [--apple-mode <p-plus-e>] \
+#     [--runs <N>] \
+#     [--foreground] \
+#     [--out <directory>]
 #
-#   --class <id>       one of: x86-vps-ovh | trj-zen-128c | m4-macos | m5-macos
-#   --label <name>     short label folded into the output directory name
-#   --calibrate-aa     record this run as an A/A-only calibration run
-#                      (exports QUILL_PERF_CALIBRATE_AA=1; harness-side
-#                      consumption is bd-quill-e8-hyperopt P0 scope)
-#   --foreground       run attached instead of detached (default: detached)
-#   --allow-rch        permit rch offload for this run (compile-only labels).
-#                      By DEFAULT the runner exports RCH_DISABLE=1 so the
-#                      command executes on THIS machine — a timed window that
-#                      silently offloads to an rch worker measures the wrong
-#                      machine (Law 6). Never pass this for timed runs.
-#   --out <dir>        output root (default: ~/.frankensearch-perf-runs)
-#   -- <command...>    command to run; default:
-#                      cargo bench -p frankensearch-quill-gauntlet
-#                        --bench perf_matrix --features perf-harness
-#                        --profile release-perf
-#
-# Environment passed through and recorded: QUILL_PERF_SCALE,
-# QUILL_PERF_FIXTURE, RAYON_NUM_THREADS.
-#
-# Law 6 (machine-class scoping): artifacts from this runner are only
-# comparable within one class. Law 7 (macOS): durability-adjacent numbers
-# need F_FULLFSYNC symmetry attested — this runner records the OS but the
-# harness owns the attestation.
+# Linux runs require --cpu-list. The producer proves that the selected CPUs
+# match the physical width and SMT suffix encoded by the class and that every
+# selected CPU uses the performance governor under NUMA-node-0 binding.
+# M4 runs currently admit only explicit P+E execution. P-only is
+# non-admissible; any ad-hoc P-only measurement is diagnostic-only until the
+# producer can prove scheduler assignment. QG-1/QG-8 remain blocked until their
+# normative matrices have M4-specific endpoints.
+# Timed runs are always local; there is no RCH override.
 
 set -euo pipefail
 
+GATE=""
 CLASS=""
-LABEL="run"
-CALIBRATE_AA=0
+RUN_ID=""
+RUN_WINDOW=""
+THREAD_BUDGET=""
+CPU_LIST=""
+APPLE_MODE=""
+RUNS="10"
 FOREGROUND=0
-ALLOW_RCH=0
 OUT_ROOT="${PERF_RUNNER_OUT:-$HOME/.frankensearch-perf-runs}"
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() {
+    printf '%s\n' \
+        "Usage:" \
+        "  scripts/perf-runner.sh --gate <QG-1..QG-10> \\" \
+        "    --class <trj-zen3-Nc[-smt2]|m4-macos> \\" \
+        "    --run-id <unique-pass-id> --run-window <shared-window> \\" \
+        "    [--thread-budget <N>] [--cpu-list <taskset-list>] \\" \
+        "    [--apple-mode <p-plus-e>] [--runs <N>] [--foreground] \\" \
+        "    [--out <absolute-directory>]"
+}
+die() { echo "perf-runner: $*" >&2; exit 64; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --gate) GATE="${2:?--gate needs a value}"; shift 2 ;;
         --class) CLASS="${2:?--class needs a value}"; shift 2 ;;
-        --label) LABEL="${2:?--label needs a value}"; shift 2 ;;
-        --calibrate-aa) CALIBRATE_AA=1; shift ;;
+        --run-id) RUN_ID="${2:?--run-id needs a value}"; shift 2 ;;
+        --run-window) RUN_WINDOW="${2:?--run-window needs a value}"; shift 2 ;;
+        --thread-budget) THREAD_BUDGET="${2:?--thread-budget needs a value}"; shift 2 ;;
+        --cpu-list) CPU_LIST="${2:?--cpu-list needs a value}"; shift 2 ;;
+        --apple-mode) APPLE_MODE="${2:?--apple-mode needs a value}"; shift 2 ;;
+        --runs) RUNS="${2:?--runs needs a value}"; shift 2 ;;
         --foreground) FOREGROUND=1; shift ;;
-        --allow-rch) ALLOW_RCH=1; shift ;;
         --out) OUT_ROOT="${2:?--out needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        --) shift; break ;;
-        *) echo "unknown argument: $1 (use --help)" >&2; exit 64 ;;
+        *) die "unknown argument: $1 (use --help)" ;;
     esac
 done
 
-case "$CLASS" in
-    # trj-zen3-<width>c per the committed-baseline convention
-    # (QG-2.trj-zen3-16c.latest.json); trj-zen-128c is the superseded label.
-    x86-vps-ovh|trj-zen-128c|trj-zen3-*) EXPECT_OS="Linux" ;;
-    m4-macos|m5-macos) EXPECT_OS="Darwin" ;;
-    "") echo "error: --class is required" >&2; exit 64 ;;
-    *) echo "error: unknown machine class '$CLASS'" >&2; exit 64 ;;
-esac
+[[ "$GATE" =~ ^QG-([1-9]|10)$ ]] || die "--gate must be QG-1 through QG-10"
+[[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "--run-id must use [A-Za-z0-9._-]"
+[[ "$RUN_WINDOW" =~ ^[A-Za-z0-9._-]+$ ]] || die "--run-window must use [A-Za-z0-9._-]"
+[[ "$RUNS" =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 10 ] ||
+    die "--runs must preserve the >=10-run evidence law"
 
 OS="$(uname -s)"
-if [ "$OS" != "$EXPECT_OS" ]; then
-    echo "error: class $CLASS expects $EXPECT_OS but this host is $OS" >&2
-    exit 65
-fi
-
-if [ $# -gt 0 ]; then
-    CMD=("$@")
+if [[ "$CLASS" =~ ^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(-smt2)?$ ]]; then
+    [ "$OS" = "Linux" ] || die "class $CLASS requires Linux"
+    [ -n "$CPU_LIST" ] || die "registered TRJ runs require --cpu-list"
+    [ -z "$APPLE_MODE" ] || die "TRJ runs do not accept --apple-mode"
+    command -v taskset >/dev/null 2>&1 || die "taskset is required for TRJ runs"
+    command -v numactl >/dev/null 2>&1 || die "numactl is required for TRJ runs"
+    PHYSICAL_WIDTH="${BASH_REMATCH[1]}"
+    THREADS_PER_CORE=1
+    [[ "${BASH_REMATCH[2]}" == "-smt2" ]] && THREADS_PER_CORE=2
+    CLASS_CAPACITY=$((PHYSICAL_WIDTH * THREADS_PER_CORE))
+    THREAD_BUDGET="${THREAD_BUDGET:-$CLASS_CAPACITY}"
+    APPLE_MODE="not-applicable"
+    LEASE_FAMILY="trj-zen3"
+elif [ "$CLASS" = "m4-macos" ]; then
+    [ "$OS" = "Darwin" ] || die "class m4-macos requires macOS"
+    [ -z "$CPU_LIST" ] || die "M4 scheduler-pool runs do not accept --cpu-list"
+    [ "$APPLE_MODE" = "p-plus-e" ] ||
+        die "M4 promotion runs currently require --apple-mode p-plus-e"
+    case "$GATE" in
+        QG-1|QG-8)
+            die "$GATE on M4 is blocked until the normative matrix has class-specific 10P/14P+E endpoints"
+            ;;
+        QG-3|QG-4|QG-5)
+            die "$GATE on macOS is blocked until both arms attest symmetric F_FULLFSYNC treatment"
+            ;;
+    esac
+    CLASS_CAPACITY=14
+    THREAD_BUDGET="${THREAD_BUDGET:-$CLASS_CAPACITY}"
+    LEASE_FAMILY="m4-macos"
 else
-    CMD=(cargo bench -p frankensearch-quill-gauntlet --bench perf_matrix
-        --features perf-harness --profile release-perf)
+    die "--class must name a registered trj-zen3-Nc[-smt2] or m4-macos class"
 fi
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[[ "$THREAD_BUDGET" =~ ^[0-9]+$ ]] &&
+    [ "$THREAD_BUDGET" -ge 1 ] &&
+    [ "$THREAD_BUDGET" -le "$CLASS_CAPACITY" ] ||
+    die "--thread-budget must be within 1..$CLASS_CAPACITY for $CLASS"
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+    die "registered performance production requires a clean source tree"
+fi
+case "$OUT_ROOT" in
+    /*) ;;
+    *) die "--out must be an absolute directory outside the source repository" ;;
+esac
+OUT_PARENT="$(cd "$(dirname "$OUT_ROOT")" && pwd -P)" ||
+    die "--out parent must already exist"
+OUT_ROOT="$OUT_PARENT/$(basename "$OUT_ROOT")"
+case "$OUT_ROOT/" in
+    "$REPO_ROOT/"*) die "--out must remain outside the source repository" ;;
+esac
+PERF_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.frankensearch-perf-target-$CLASS}"
+case "$PERF_TARGET_DIR" in
+    /*) ;;
+    *) die "CARGO_TARGET_DIR must be absolute and outside the source repository" ;;
+esac
+TARGET_PARENT="$(cd "$(dirname "$PERF_TARGET_DIR")" && pwd -P)" ||
+    die "CARGO_TARGET_DIR parent must already exist"
+PERF_TARGET_DIR="$TARGET_PARENT/$(basename "$PERF_TARGET_DIR")"
+case "$PERF_TARGET_DIR/" in
+    "$REPO_ROOT/"*) die "CARGO_TARGET_DIR must remain outside the source repository" ;;
+esac
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_DIR="$OUT_ROOT/$CLASS/$STAMP-$LABEL"
-mkdir -p "$RUN_DIR"
+CLASS_ROOT="$OUT_ROOT/$CLASS"
+RUN_DIR="$CLASS_ROOT/$STAMP-$RUN_ID"
+mkdir -p "$CLASS_ROOT"
+mkdir "$RUN_DIR" || die "run directory already exists: $RUN_DIR"
 
-# Isolated, per-class persistent target dir: avoids lock contention with the
-# agent swarm's builds AND avoids a cold rebuild on every run.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.frankensearch-perf-target-$CLASS}"
+# Keep compilation outside the repository and force it to remain on this host.
+export CARGO_TARGET_DIR="$PERF_TARGET_DIR"
+export RCH_DISABLE=1
+export RCH_CARGO_WRAPPER_BYPASS=1
+export RCH_MIN_LOCAL_TIME_MS=999999999
+export QUILL_PERF_RUNS="$RUNS"
+export RAYON_NUM_THREADS="$THREAD_BUDGET"
 
-sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
-
-GIT_REV="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-DIRTY_HASH="$( (git -C "$REPO_ROOT" status --porcelain; git -C "$REPO_ROOT" diff) 2>/dev/null | sha )"
-
-# --- per-OS fingerprint ------------------------------------------------------
-FP_DIR="$RUN_DIR/fingerprint"
-mkdir -p "$FP_DIR"
-uname -a > "$FP_DIR/uname.txt"
-GOVERNOR="n/a"; SMT="n/a"; THERMAL="n/a"; PAGE_SIZE="n/a"
-if [ "$OS" = "Linux" ]; then
-    lscpu > "$FP_DIR/lscpu.txt" 2>/dev/null || true
-    lscpu -e > "$FP_DIR/lscpu-e.txt" 2>/dev/null || true
-    command -v numactl >/dev/null 2>&1 && numactl -H > "$FP_DIR/numactl-H.txt" 2>/dev/null || true
-    [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ] && \
-        GOVERNOR="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
-    [ -r /sys/devices/system/cpu/smt/control ] && \
-        SMT="$(cat /sys/devices/system/cpu/smt/control)"
-    PAGE_SIZE="$(getconf PAGE_SIZE 2>/dev/null || echo n/a)"
-    if [ "$CLASS" = "trj-zen-128c" ] && [ "$GOVERNOR" != "performance" ]; then
-        echo "WARNING: governor is '$GOVERNOR', not 'performance' — trj timed" >&2
-        echo "         windows are inadmissible per campaign contract § 2." >&2
-    fi
-else
-    sysctl machdep.cpu hw.ncpu hw.memsize hw.pagesize hw.perflevel0 hw.perflevel1 \
-        > "$FP_DIR/sysctl.txt" 2>/dev/null || true
-    THERMAL="$(pmset -g therm 2>/dev/null | tr '\n' ' ' | tr -s ' ' || echo n/a)"
-    PAGE_SIZE="$(sysctl -n hw.pagesize 2>/dev/null || echo n/a)"
-fi
-
-# --- local-execution guarantee ------------------------------------------------
-# Some hosts (trj) shim cargo through rch; an offloaded "timed" run would
-# execute on a different machine than the one fingerprinted above. Default to
-# forcing local execution; --allow-rch opts out for compile-only labels.
-if [ "$ALLOW_RCH" -eq 0 ]; then
-    export RCH_DISABLE=1
-    export RCH_MIN_LOCAL_TIME_MS=999999999
-    # trj's cargo is a fail-closed rch wrapper; this is its documented bypass
-    # (execs the real ~/.cargo/bin/cargo). Harmless on hosts without the shim.
-    export RCH_CARGO_WRAPPER_BYPASS=1
-fi
-
-# The QG harness persists attempt bundles (evidence + lifecycle receipts)
-# only when QUILL_PERF_RUN_ID is set; a run without it leaves no on-disk
-# receipt trail. Default it to this run's identity, never override a caller's.
-export QUILL_PERF_RUN_ID="${QUILL_PERF_RUN_ID:-$CLASS-$LABEL-$STAMP}"
-
-# --- provenance --------------------------------------------------------------
-[ "$CALIBRATE_AA" -eq 1 ] && export QUILL_PERF_CALIBRATE_AA=1
-CMD_STR="$(printf '%q ' "${CMD[@]}")"
-# Escape for embedding in JSON string values (backslashes first, then quotes).
-json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-CMD_JSON="$(json_escape "$CMD_STR")"
-THERMAL_JSON="$(json_escape "$THERMAL")"
-cat > "$RUN_DIR/provenance.json" <<EOF
-{
-  "schema": "frankensearch.perf-runner.v1",
-  "machine_class": "$CLASS",
-  "label": "$LABEL",
-  "calibrate_aa": $CALIBRATE_AA,
-  "rch_disabled": $([ "$ALLOW_RCH" -eq 0 ] && echo true || echo false),
-  "timestamp_utc": "$STAMP",
-  "hostname": "$(hostname)",
-  "os": "$OS",
-  "git_rev": "$GIT_REV",
-  "dirty_state_sha256": "$DIRTY_HASH",
-  "rustc": "$(rustc -V 2>/dev/null || echo unknown)",
-  "cargo": "$(cargo -V 2>/dev/null || echo unknown)",
-  "governor": "$GOVERNOR",
-  "smt": "$SMT",
-  "thermal_pressure": "$THERMAL_JSON",
-  "page_size": "$PAGE_SIZE",
-  "cargo_target_dir": "$CARGO_TARGET_DIR",
-  "quill_perf_scale": "${QUILL_PERF_SCALE:-unset}",
-  "quill_perf_fixture": "${QUILL_PERF_FIXTURE:-unset}",
-  "rayon_num_threads": "${RAYON_NUM_THREADS:-unset}",
-  "command": "$CMD_JSON"
-}
-EOF
-
-echo "run dir:    $RUN_DIR"
-echo "class:      $CLASS  (git $GIT_REV, dirty $DIRTY_HASH)"
-echo "command:    $CMD_STR"
-
-# --- execute -----------------------------------------------------------------
+BUILD_MESSAGES="$RUN_DIR/build-messages.jsonl"
 cd "$REPO_ROOT"
-if [ "$FOREGROUND" -eq 1 ]; then
-    "${CMD[@]}" 2>&1 | tee "$RUN_DIR/run.log"
-    STATUS=${PIPESTATUS[0]}
-    echo "$STATUS" > "$RUN_DIR/exit-status"
-    echo "exit:       $STATUS"
-    exit "$STATUS"
+command -v jq >/dev/null 2>&1 || die "jq is required to resolve exact Cargo executables"
+cargo build \
+    --locked \
+    --profile release-perf \
+    -p frankensearch-quill-gauntlet \
+    --bin quill-perf-finalize \
+    --message-format=json-render-diagnostics \
+    > "$BUILD_MESSAGES"
+FINALIZER_ELF="$(
+    jq -r '
+        select(.reason == "compiler-artifact")
+        | select(.target.name == "quill-perf-finalize")
+        | .executable // empty
+    ' "$BUILD_MESSAGES" | tail -n 1
+)"
+[ -x "$FINALIZER_ELF" ] || die "Cargo did not report an executable typed finalizer"
+
+LEASE_ROOT="$OUT_ROOT/.leases"
+mkdir -p "$LEASE_ROOT"
+LEASE_PATH="$LEASE_ROOT/$LEASE_FAMILY.lock"
+PRODUCER=(
+    "$FINALIZER_ELF"
+    --gate "$GATE"
+    --class "$CLASS"
+    --run-id "$RUN_ID"
+    --run-window "$RUN_WINDOW"
+    --thread-budget "$THREAD_BUDGET"
+    --apple-mode "$APPLE_MODE"
+    --lease-path "$LEASE_PATH"
+    --output-dir "$RUN_DIR"
+)
+if [ "$OS" = "Linux" ]; then
+    LAUNCH=(
+        taskset -c "$CPU_LIST"
+        numactl --physcpubind="$CPU_LIST" --membind=0
+        "${PRODUCER[@]}"
+    )
 else
-    # Detached: survives SSH disconnect. setsid where available (Linux);
-    # macOS ships no setsid binary, nohup alone suffices there.
-    RUNNER="nohup"
-    command -v setsid >/dev/null 2>&1 && RUNNER="setsid nohup"
-    # shellcheck disable=SC2086
-    # </dev/null is load-bearing: without it the child inherits sshd's stdin
-    # on macOS (no setsid there) and a remote kickoff hangs until build end.
-    $RUNNER bash -c '"$@" > "$0/run.log" 2>&1; echo $? > "$0/exit-status"' \
-        "$RUN_DIR" "${CMD[@]}" > /dev/null 2>&1 < /dev/null &
-    PID=$!
-    echo "$PID" > "$RUN_DIR/runner.pid"
-    echo "detached:   pid $PID"
-    echo "follow:     tail -f $RUN_DIR/run.log"
-    echo "exit code:  cat $RUN_DIR/exit-status   (written on completion)"
+    LAUNCH=("${PRODUCER[@]}")
 fi
+
+echo "run dir:       $RUN_DIR"
+echo "gate/class:    $GATE / $CLASS"
+echo "run identity:  $RUN_ID (window $RUN_WINDOW)"
+echo "thread budget: $THREAD_BUDGET"
+echo "benchmark ELF: built and resolved by the typed producer"
+
+if [ "$FOREGROUND" -eq 1 ]; then
+    set +e
+    "${LAUNCH[@]}" 2>&1 | tee "$RUN_DIR/launcher.log"
+    STATUS=${PIPESTATUS[0]}
+    set -e
+    echo "producer exit: $STATUS"
+    exit "$STATUS"
+fi
+
+if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "${LAUNCH[@]}" > "$RUN_DIR/launcher.log" 2>&1 < /dev/null &
+else
+    nohup "${LAUNCH[@]}" > "$RUN_DIR/launcher.log" 2>&1 < /dev/null &
+fi
+PID=$!
+printf '%s\n' "$PID" > "$RUN_DIR/producer.pid"
+echo "detached:      pid $PID"
+echo "follow:        tail -f $RUN_DIR/launcher.log"
+echo "committed:     test -f $RUN_DIR/$GATE.runner.json"
