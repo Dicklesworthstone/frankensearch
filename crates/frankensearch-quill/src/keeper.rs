@@ -9751,6 +9751,17 @@ impl ManifestPublisher {
         }
     }
 
+    #[cfg(test)]
+    fn with_publish_lock_for_test(
+        directory: impl Into<PathBuf>,
+        publish_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            publish_lock,
+        }
+    }
+
     /// Publish one manifest using only the in-process serializer.
     ///
     /// This is a private substrate-test seam. Public mutation always goes
@@ -15000,14 +15011,30 @@ mod tests {
         let directory = root.path().join("target-index");
         let alias = root.path().join("index-alias");
         std::fs::create_dir(&directory).expect("create target index directory");
-        let first_publisher = ManifestPublisher::new(&alias);
-        let second_publisher = ManifestPublisher::new(&directory);
+        let production_first_publisher = ManifestPublisher::new(&alias);
+        let production_second_publisher = ManifestPublisher::new(&directory);
+        let test_publish_lock = Arc::new(Mutex::with_name(
+            "quill.manifest_publish.late_symlink_alias_test",
+            (),
+        ));
+        let first_publisher =
+            ManifestPublisher::with_publish_lock_for_test(&alias, Arc::clone(&test_publish_lock));
+        let second_publisher = ManifestPublisher::with_publish_lock_for_test(
+            &directory,
+            Arc::clone(&test_publish_lock),
+        );
         std::os::unix::fs::symlink(&directory, &alias).expect("create alias after first publisher");
+        let production_lock = production_first_publisher.publish_lock_for_test();
+        assert!(Arc::ptr_eq(
+            &production_lock,
+            &production_second_publisher.publish_lock_for_test()
+        ));
         let lock = first_publisher.publish_lock_for_test();
         assert!(Arc::ptr_eq(
             &lock,
             &second_publisher.publish_lock_for_test()
         ));
+        assert!(!Arc::ptr_eq(&lock, &production_lock));
         let saw_two_waiters = Arc::new(AtomicBool::new(false));
         let successes = Arc::new(AtomicUsize::new(0));
         let conflicts = Arc::new(AtomicUsize::new(0));
