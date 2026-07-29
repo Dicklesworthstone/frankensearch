@@ -17309,3 +17309,100 @@ terminal lifecycle and every fairness pin; require valid A/A controls in both
 candidate and immediate rerun plus at most `0.019803` log-ratio delta. Do not
 blind-resample the unchanged Threadripper route, weaken a null law, select a
 favorable pair, or gate on CV.
+
+### 2026-07-28 — QG-1 corrected-cadence tranche cannot promote (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Quill and Tantivy ran side-by-side in every invocation from exact ELF SHA-256
+`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`
+at clean revision `02372ce9c4bc501bf56e8dfba74f73692398acfd`.
+The matched QG-1 arms used eight writer threads, a 120,000,000-byte total
+heap, positions, the same analyzer/schema/corpus/order/batches, the shipping
+1,000 ms visibility cadence, in-memory durability, and one terminal commit.
+All 498 Tantivy lifecycle receipts joined indexing and merge workers and
+recorded `writer_rearmed=false`.
+
+Four medium calibration attempts were invalid rather than scored:
+
+- SMT-eligible warmup-1 candidate: apparent
+  `0.423925 [0.409020, 0.427619]`, null CI too wide;
+- same-pin rerun: apparent `0.408081 [0.394410, 0.421535]`, null width,
+  dispersion, and order effect failed;
+- physical-cores-0–15 candidate: apparent
+  `0.401922 [0.395089, 0.416259]`, null center, width, dispersion, order,
+  and drift failed;
+- ten-warmup physical candidate: apparent
+  `0.404418 [0.383978, 0.427316]`, null width and drift failed.
+
+At ten warmups and 30 pairs, both medium A/A controls admitted:
+`0.988191 [0.976000, 1.002801]` and
+`1.009861 [0.970286, 1.031514]`. Their Quill/Tantivy effects were
+`0.405807 [0.403372, 0.410703]` and
+`0.414845 [0.409321, 0.418691]`, each far below the 3.0x target. The pair
+still cannot promote because its log-median reproduction delta
+`0.022027` exceeds `0.019803`.
+
+The first xlarge target attempt was also non-decision-capable. Its apparent
+effect was `0.209583 [0.194532, 0.219311]`, while the same-invocation A/A
+control failed only null dispersion: log-MAD `0.059332 > 0.048790`.
+Counted commit receipts show the mechanism: at the same 1,000 ms policy,
+nominally identical Tantivy operations straddled 10 versus 11 periodic
+commits; Quill made 22–23 because its operations lasted longer. The attempt
+ended 12 seconds before the next hourly prune sweep, so external maintenance
+does not explain this null failure.
+
+The mandated fresh xlarge candidate and immediate rerun were both retained.
+The candidate's apparent effect was
+`0.197288 [0.194559, 0.217702]`; its A/A
+`0.978179 [0.928430, 1.061322]` failed dispersion, order effect, and drift.
+The rerun's apparent effect was `0.206296 [0.198693, 0.213267]`; its A/A
+`1.006406 [0.974261, 1.055636]` failed order effect. The effect medians'
+cross-run log delta was `0.044648 > 0.019803`. Both runs completed before
+the next maintenance sweep.
+
+**Decision: INVALID-REPRODUCTION + INVALID-NULL / NO QG-1 PROMOTION.**
+Medium supplies an honest target-slice MISS, but the full gate remains
+inactive and unmeasured. All nine attempt directories are retained under
+`.bench-history/attempts/2026-07-28/QG-1/`; evidence JSON SHA-256 values are
+`ea12d51a87fcd742b195b09ede2a55a5c148128e0b3c530206e2bb5796d505b7`,
+`96ac39cd3dceddf153fc5ac9e39111ca26338cad774dcc72f904a29d70ea2ef4`,
+`430d41e03391d0c4a0ba72db96b3da63041d220000723589dba0f4ac96e26fd9`,
+`f7218d6fd9783c53e1e22e6d7ca11d53ea6dde64aab45c5fa931760c3dc5385d`,
+`0c64964d80a3b9557ffb2ecabdd5db0b3ea6cdd2433f712b506d959715e454d1`,
+`ed7e597b07553665a1e7c203a9b2ae0237d256f94e11643f76e5958b14cef373`,
+`749b31bd0529dd9702ece070151cfe04eaf8c3b312e63b079936fac5a68ec6ac`,
+`da61921fa4d67672ed4ceabe15d2c9b308c5e99abe972cebfe6c31d236c2fbfb`,
+and
+`a56b1384727d6071da0862e405039c96cf67d6bd5e8bbc3f073769b219bf32a7`.
+
+**Retry predicate:** stop this route because the predeclared xlarge pair
+failed both A/A controls. Retry only after a materially different harness or
+workload scale removes the counted 10/11-commit boundary, then require valid
+same-ELF candidate and immediate-rerun nulls plus reproduction within
+`0.019803`. Also collect both tokenizer-only denominators. Do not resample
+medium or this xlarge configuration, choose a favorable prior pair, relax a
+null or reproduction law, activate QG-1 from a partial slice, or gate on CV.
+
+### 2026-07-28 — QG-1 alternate-host medium slice is diagnostic only (`bd-h6eh`, FoggySquirrel)
+
+The exact current ELF (`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`,
+revision `02372ce9c4bc501bf56e8dfba74f73692398acfd`) ran both arms
+interleaved on worker `vmi1264463` (`38.242.209.154`), an 8-CPU AMD EPYC
+host, cpuset `0-7`, with 10 warmups and 30 paired blocks. Load rose from
+`3.05` to `4.49`; the host was not pre-screened because the paired A/A is the
+quietness test. Quill and Tantivy used the same medium corpus, positions-on
+schema, eight threads, 120,000,000-byte heap, in-memory durability, and one
+terminal commit.
+
+The diagnostic effect was `0.431254 [0.394635, 0.455288]` (Quill
+`20,400.857` docs/s versus Tantivy `47,555.318` docs/s), below the QG-1
+`3.0x` target. Its same-invocation A/A was `0.984157 [0.858930, 1.117099]`;
+the wide null makes the row `INVALID-NULL` and **UNSCORED**, not a certified
+MISS. Evidence SHA-256 is
+`86626a6d1d45ad3b82815159f0ec6cb5a993cfa0e0573c9404ae8d5d6706e695`; summary
+SHA-256 is
+`665cf5898b8eb6828fb17079fc30d5ded2cec5aa8aa5fa08a5ff6304406ef406`.
+
+**Retry predicate:** run a predeclared same-host candidate and immediate
+rerun only when both A/A nulls admit; do not quote this diagnostic magnitude,
+gate on CV, or activate QG-1 from the partial cell.
