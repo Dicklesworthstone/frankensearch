@@ -17453,3 +17453,57 @@ Tantivy commit-boundary/order/drift failure. Require both A/A controls before
 interpreting any A/B magnitude, and require the full normative matrix plus an
 immediate same-ELF reproduction before activation. Never weaken a null law,
 select a favorable row, or gate on CV.
+
+### 2026-07-29 — REJECT: exclusive QG-1 sweep observes one active Quill ingest worker at every requested width (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Clean revision `3684b147797c5babdad4a5568e993db40ed90da5` ran the linked
+incumbent beside Quill from exact self-reporting ELF SHA-256
+`90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a`.
+The 1, 2, 4, 8, 16, 32, 64, 96, and 128 requested-thread rows ran under one
+exclusive `trj-booking` claim on the 64-core/128-thread Threadripper PRO
+5995WX. Every row records 499 GiB RAM, one NUMA node, performance governor,
+full `0-127` affinity, no cpuset cap, runtime
+AVX2/FMA/BMI2/AES/VAES, and both statically linked engine identities.
+
+The exact one-million-document positions-on fixture ran both A/A nulls and
+the A/B in each same invocation. The scoreable rows are all target MISSes:
+
+- requested 1: `0.257438 [0.250622, 0.262109]`;
+- requested 2: `0.189423 [0.183838, 0.193821]`;
+- requested 32: `0.218916 [0.209276, 0.227571]`;
+- requested 64: `0.219276 [0.217200, 0.226471]`;
+- requested 128: `0.249378 [0.236671, 0.258318]`.
+
+A/A null: `0.998882 [0.975242, 1.036296]` Tantivy/Tantivy and
+`0.997971 [0.980798, 1.010896]` Quill/Quill, same invocation at requested
+1. At requested 128,
+Tantivy/Tantivy `0.982049 [0.951422, 1.013386]` and Quill/Quill
+`0.990940 [0.982398, 1.017325]`, same invocation. Requested 4 and 16 have
+invalid Tantivy nulls; requested 8 and 96 have invalid Quill null centers.
+Those four raw ratios are **UNSCORED**, not misses. CV is provenance only
+and decided no row.
+
+The untimed exact-fixture probe distinguishes requested workers, distinct
+CPU-active worker IDs, and peak concurrent new workers. Quill observed one
+CPU-active worker at every width, even though peak new-worker high-water rose
+with the requested width from 1 to 128. Tantivy's distinct active-ID / peak
+worker counts rise from 39 / 8 at requested 1 to 3,556 / 264 at requested
+128. Quill throughput falls from 35,854.674 docs/s at requested 8 to
+27,130.469 docs/s at 128. The high-thread concat-merge thesis is therefore
+not exercised by the measured Quill hot path; additional requested workers
+add overhead without parallel ingest work.
+
+**Decision: REJECT / TARGET-SLICE MISS / NO QG-1 PROMOTION.** The slice is
+not the complete normative gate or an immediate reproduction, so
+`laws_attested=false`, QG-1 remains inactive, and the unmeasured placeholder
+is not replaced. Evidence:
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-exclusive-fullsweep-3684b147-r10-20260729T1645Z/`.
+
+**Retry predicate:** first count Quill versus Tantivy copy calls and bytes
+moved per document on identical input, and/or wire the requested workers into
+the measured ingest hot path so more than one is CPU-active. Only after a
+counted mechanism changes may this exact topology be rerun under the same
+ELF, same-invocation incumbent, dual-null, bootstrap median-CI, corpus, and
+affinity contract. Do not blind-resample invalid-null rows, select a
+favorable width, weaken a null law, or gate on CV.
