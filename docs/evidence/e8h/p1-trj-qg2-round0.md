@@ -100,3 +100,51 @@ QUILL_PERF_CHILD_ENGINE seam, or per-timed-window perf enable) so the profile
 contains the quill arm and nothing else. bd-6oiq's QG-1 card should adopt arm
 scoping from the start. Until such a profile exists, no further W2 lever
 implementations from this card's data.
+
+# ROUND-1: the arm-scoped profile exists — quill-only ingest attribution
+
+**Method:** the requirement above is satisfied via the harness's own child
+seam — `run_memory_child` with `QUILL_PERF_CHILD_ENGINE=quill` builds a full
+in-memory quill index (index_batches + commit, pinned config: heap 50MB,
+threads 1, positions on) with ZERO tantivy in the process. Run:
+`perf record -F 1997 -g --call-graph dwarf` over the b8c1465b ELF,
+`QUILL_PERF_CHILD_COUNT=200000`, 10,351 samples, trace at
+`trj:~/.frankensearch-perf-runs/quill-only.perf.data`. Residual harness
+presence: the corpus generator (`document_at` 3.44% direct + a share of the
+fmt family) — separable by namespace/callers; everything else is quill.
+
+## Time-ranked quill-owned findings (self-time)
+
+1. **Canonicalization/identity family ≈ 12–15% — the largest quill-owned
+   block.** `canonical_document_preimage` 3.59 + serde_json `serialize_str`
+   3.10 (incl. `format_escaped_str` 2.88 inlined) + `canonical_metadata`
+   1.19 + xxh3 hashing 2.61 (content_hash) + `stable_digit_scatter` 2.05 +
+   `append_canonical_term` 1.77 + a fmt-family share. Quill JSON-serializes
+   and content-hashes every document's canonical form at ingest — work the
+   incumbent does not do at all. Lever class: canonical-encode fast path
+   (direct byte emission instead of serde_json Serializer; itoa-style digit
+   emission instead of core::fmt) — CONSTRAINT: touches identity/registry
+   contracts (IDMAP content_hash 8B/doc is registry 1.0.2-pinned), so any
+   change must prove hash-identical output, not just rank-identical.
+2. **SipHash on u64-keyed std maps ≈ 4.8%** (`hash_one::<&u64>` 3.54 +
+   `sip::Hasher::write` 1.25). The aHash/FxHash swap is the proven repo
+   family win; DoS-resistance is irrelevant for internal u64 ids. Ownership
+   check (which map: keeper doc-id resolve at 1.53% is adjacent) is the
+   row's first task — dwarf caller chains flattened by inlining.
+3. **memmove 8.32% — largest single libc frame, attribution OPEN** (callers
+   fragment under inlining; candidates: columnar row copies, section-buffer
+   growth, interner storage).
+4. **Tokenizer `analyze` 8.71%** — proportionally comparable to the
+   incumbent's tokenizer share (7.07% of its arm in Round-0); NOT the
+   differentiator. Do not spend levers here first.
+5. Interner probe (`find_in_bucket` 1.86 + memcmp share of 2.35) — moderate,
+   as Round-0 estimated. Allocator residue ≈ 5% post-lever-1.
+
+## Round-1 lever queue (time-ranked, replaces the Round-0 ranking)
+
+| rank | lever | measured basis | bead |
+|---|---|---|---|
+| 1 | canonical-encode fast path (bytes-direct, digit emission) | ~12-15% family | new row under W2 |
+| 2 | u64-map hasher swap (aHash family) | ~4.8% | new row under W2 |
+| 3 | memmove attribution → then decide | 8.32% unattributed | task on this card |
+| — | interner arena (W2.1) | 1.86+share | stays open, lower rank |
