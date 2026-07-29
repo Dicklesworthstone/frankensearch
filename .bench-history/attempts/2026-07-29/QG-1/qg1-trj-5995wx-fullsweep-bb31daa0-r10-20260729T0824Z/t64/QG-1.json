@@ -1,0 +1,107 @@
+{
+  "schema_version": "quill-perf-artifact-v4",
+  "gate": "Qg1",
+  "bench_elf_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "host_identity": "threadripperje",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "process_available_threads": 128,
+    "threads_actually_used": [
+      64
+    ],
+    "runtime_detected_isa": [
+      "avx2",
+      "fma",
+      "bmi2",
+      "aes",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae",
+  "run_window": "qg1-trj-xlarge-fullsweep-bb31daa0-20260729T0824Z",
+  "run_id": "qg1-trj-xlarge-t64-bb31daa0-r10-20260729T0824Z",
+  "corpus_manifest_hash": "ac39bff9920adb9f665fa320641e3e5acbe238430df61a98243da6a5a8782a6d",
+  "manifest_sha256": "41e341ee4a2b881b2b3b7a4d09bfcc13748f8fd646e763be81881b93ac8c314d",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/64/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 28562.220549504367,
+      "p50": 28562.220549504367,
+      "median_ci95_low": 28477.380274560684,
+      "median_ci95_high": 28642.74213659922,
+      "p95": 28724.583012219977,
+      "p99": 28724.583012219977,
+      "mad": 73.26844937335773,
+      "cv_pct": 0.35476229745570487,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/64/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 126486.75034692031,
+      "p50": 126486.75034692031,
+      "median_ci95_low": 123062.63059057936,
+      "median_ci95_high": 128421.3429387039,
+      "p95": 133679.58293470542,
+      "p99": 133679.58293470542,
+      "mad": 2587.935359971656,
+      "cv_pct": 2.8139189519694425,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/64/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.22650163216407093,
+      "p50": 0.22650163216407093,
+      "median_ci95_low": 0.22192980756559105,
+      "median_ci95_high": 0.23163213229610644,
+      "p95": 0.2359766820467273,
+      "p99": 0.2359766820467273,
+      "mad": 0.004851162365257691,
+      "cv_pct": 2.632561042803899,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/64/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 0.9950414541359096,
+      "p50": 0.9950414541359096,
+      "median_ci95_low": 0.9706848313692629,
+      "median_ci95_high": 1.052640639549272,
+      "p95": 1.1182354309302072,
+      "p99": 1.1182354309302072,
+      "mad": 0.03681200202373297,
+      "cv_pct": 5.311720027026303,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/64/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 1.0050644929373638,
+      "p50": 1.0050644929373638,
+      "median_ci95_low": 0.9992909629720271,
+      "median_ci95_high": 1.0111642221393389,
+      "p95": 1.0482636331190582,
+      "p99": 1.0482636331190582,
+      "mad": 0.00558831150179856,
+      "cv_pct": 1.410573599435241,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false
+}

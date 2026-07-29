@@ -17406,3 +17406,50 @@ SHA-256 is
 **Retry predicate:** run a predeclared same-host candidate and immediate
 rerun only when both A/A nulls admit; do not quote this diagnostic magnitude,
 gate on CV, or activate QG-1 from the partial cell.
+
+### 2026-07-29 — QG-1 xlarge scaling does not expose a high-thread advantage (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT.** Clean revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` ran the linked Tantivy 0.26.1
+incumbent beside Quill from exact self-reporting ELF SHA-256
+`a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12`.
+The v4 artifacts prove the target was `threadripperje`, a 64-core/128-thread
+Threadripper PRO 5995WX with AVX2/FMA/BMI2/AES/VAES, full `0-127` affinity,
+no cpuset cap, and actual thread requests
+`1,2,4,8,16,32,64,96,128`.
+
+Each point used the same deterministic one-million-document positions-on
+recipe, equal per-point total heap, in-memory durability, a 1,000 ms commit
+cadence, and one terminal commit. Both A/A controls and the A/B ran in each
+same invocation. A/A null: 1-thread Tantivy/Tantivy `1.009191`, same
+invocation, with CI `[0.973456, 1.036773]`; its Quill/Quill null was
+`0.995811 [0.982944, 1.028535]`. At 96 threads, the same-invocation nulls
+were Tantivy/Tantivy `0.982554 [0.956492, 1.026133]` and Quill/Quill
+`0.994896 [0.985826, 1.004710]`. The scoreable rows were:
+
+- 1 thread: Quill/Tantivy `0.256083 [0.250163, 0.258549]`, **MISS**;
+- 96 threads: `0.236489 [0.233668, 0.239445]`, **MISS**.
+
+The 2-, 4-, 8-, 16-, 32-, 64-, and 128-thread rows are **UNSCORED**, not
+misses: their Tantivy/Tantivy nulls failed one or more fixed width,
+dispersion, order-effect, or drift laws. Every Quill/Quill null passed. Their
+raw diagnostic A/B ratios were respectively `0.208493`, `0.205067`,
+`0.237273`, `0.240605`, `0.209419`, `0.226495`, and `0.254452`. CV decided
+no row.
+
+**Decision: TARGET-SLICE MISS / NO HIGH-THREAD CONVERGENCE / NO QG-1
+PROMOTION.** The valid one-to-96-thread comparison moves from `0.256083` to
+`0.236489`; the raw one-to-128 endpoints are nearly identical. No
+concat-merge scaling advantage manifests in this tranche, but the seven
+invalid incumbent nulls prohibit a certified nine-point curve. QG-1 remains
+inactive. Complete artifacts and per-row retry reasons are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-5995wx-fullsweep-bb31daa0-r10-20260729T0824Z/`.
+
+**Retry predicate:** for the valid MISS rows, require a profile-attributed
+Quill hot-path change before rerunning the same exact-ELF/dual-null contract.
+For invalid rows, do not blind-resample this host/configuration; retry only on
+a distinct eligible 64C/128T host or after a counted mechanism removes the
+Tantivy commit-boundary/order/drift failure. Require both A/A controls before
+interpreting any A/B magnitude, and require the full normative matrix plus an
+immediate same-ELF reproduction before activation. Never weaken a null law,
+select a favorable row, or gate on CV.

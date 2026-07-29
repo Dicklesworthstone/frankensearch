@@ -7897,3 +7897,57 @@ legacy summary SHA-256 is
 remains inactive and the partial slice cannot replace its unmeasured
 baseline. Retry only with a predeclared same-host candidate/rerun whose null
 CI admits; do not claim this ratio or gate on CV.
+
+## 2026-07-29 — QG-1 full-SMT xlarge sweep: two target-slice MISS rows, seven UNSCORED (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Quill and Tantivy ran side-by-side at every thread point in one invocation,
+with a Tantivy/Tantivy null, a Quill/Quill null, and the A/B comparison.
+Source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` was clean; the self-reporting
+`release-perf` ELF SHA-256 was
+`a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12`
+(76,985,272 bytes).
+
+The v4 artifacts identify `threadripperje` as a Threadripper PRO 5995WX with
+64 physical cores, 128 logical threads, one NUMA node, 499 GiB RAM, runtime
+AVX2/FMA/BMI2/AES/VAES, process affinity `0-127`, and no cpuset cap. Each row
+records its actual requested thread count: 1, 2, 4, 8, 16, 32, 64, 96, or
+128. The fixture used one million deterministic documents, positions on,
+5,000-document batches, in-memory indexes, one excluded warmup, and ten
+paired blocks. Both arms had the same analyzer/schema, total heap, generated
+documents/order, 1,000 ms visibility cadence, and terminal commit. Quill's
+higher realized periodic-commit count follows its longer elapsed time; all
+counts are retained in the raw logs.
+
+| threads | Quill docs/s | Tantivy docs/s | Quill/Tantivy median-CI | null verdict | target verdict |
+|---:|---:|---:|---:|---|---|
+| 1 | 34,896.923 | 135,684.166 | `0.256083 [0.250163, 0.258549]` | both valid | **MISS** |
+| 2 | 34,543.200 | 165,817.834 | `(0.208493 [0.195344, 0.225094])` | Tantivy dispersion + order + drift | **UNSCORED** |
+| 4 | 35,589.081 | 173,165.385 | `(0.205067 [0.191886, 0.209096])` | Tantivy width + dispersion + drift | **UNSCORED** |
+| 8 | 33,770.710 | 142,833.746 | `(0.237273 [0.231981, 0.245118])` | Tantivy width + order | **UNSCORED** |
+| 16 | 32,791.136 | 136,259.514 | `(0.240605 [0.235825, 0.248195])` | Tantivy width + dispersion | **UNSCORED** |
+| 32 | 25,142.024 | 117,388.872 | `(0.209419 [0.199148, 0.216683])` | Tantivy dispersion | **UNSCORED** |
+| 64 | 28,562.221 | 126,486.750 | `(0.226495 [0.221930, 0.231632])` | Tantivy order + drift | **UNSCORED** |
+| 96 | 26,570.020 | 112,658.279 | `0.236489 [0.233668, 0.239445]` | both valid | **MISS** |
+| 128 | 28,211.911 | 108,901.704 | `(0.254452 [0.248195, 0.263064])` | Tantivy dispersion + order + drift | **UNSCORED** |
+
+Every Quill/Quill null passed. CV is provenance only and decided no row. The
+scoreable ratio does not narrow from one to 96 threads; the raw diagnostic
+endpoints are likewise nearly flat at `0.256083` and `0.254452`. Thus this
+tranche shows no manifested high-thread concat-merge advantage, while seven
+invalid incumbent nulls prevent calling it a certified nine-point curve.
+
+**Decision: PARTIAL TARGET-SLICE MISS / NO QG-1 PROMOTION.** QG-1 remains
+inactive because this was the xlarge positions-on tranche, not the complete
+normative matrix or an immediate reproduction. All 72 raw/evidence/host/
+lifecycle files plus the adjudication are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-5995wx-fullsweep-bb31daa0-r10-20260729T0824Z/`.
+
+Retry the valid 1- and 96-thread rows only after a profile-attributed Quill
+hot-path change, preserving the same topology, corpus, exact-ELF, dual-null,
+and median-CI contract. Do not blind-resample the seven invalid rows: retry
+only on a distinct eligible 64C/128T host or after a counted mechanism removes
+the Tantivy commit-boundary/order/drift failure. Activation still requires the
+full gate and immediate same-ELF reproduction; never weaken a null law, select
+a favorable row, or gate on CV.
