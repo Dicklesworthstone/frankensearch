@@ -108,9 +108,9 @@ Rules:
 - Every M4 gate is deliberately promotion-unavailable today because a
   read-only `/dev/fd` alias cannot attest or execute the loaded image under the
   strict contract. A future class-scoped contract must solve that boundary,
-  add meaningful 10P/14P+E scaling endpoints and a scheduler witness, and retain
-  the durability laws; trimming the x86 matrix ad hoc can never activate an
-  Apple claim.
+  add scheduler-managed 10- and 14-worker scaling endpoints plus a real
+  scheduler-state witness, and retain the durability laws; trimming the x86
+  matrix ad hoc can never activate an Apple claim.
 
 ## 3. Phase plan
 
@@ -120,7 +120,7 @@ Phase 1  PROFILE TRUTH                                     (per gate x class; lo
 Phase 2  HYPOTHESIS LEDGER SEEDING + PRIOR MINING          (mandatory before a production lever)
 Phase 3  INDEPENDENT OPTIMIZATION LOOPS                    (workstreams W1–W5)
 Phase 4  MATH-FAMILY ARTIFACTS                             (bounded to 3 families)
-Phase 5  PER-LANE CONVERGENCE + ACTIVATION + EVIDENCE REVIEW / NEXT ATTACK
+Phase 5  DISCOVERY REVIEW + ACTIVATION + TERMINAL GATE
 ```
 
 ### Phase 0 — Lane-local instrument integrity + onboarding
@@ -142,9 +142,11 @@ Phase 5  PER-LANE CONVERGENCE + ACTIVATION + EVIDENCE REVIEW / NEXT ATTACK
    x86 (`bd-jjs6q`), trj (`bd-cpqjb`), M4 (`bd-w7zxm`), and M5
    (`bd-6wnws`). Threadripper calibration is keyed by 1/16/32/64 physical-core
    slices plus any explicitly used SMT-on lane; current Apple calibration is
-   keyed by the full 10P+4E mode, pool width, and observable scheduler state.
-   P-only calibration remains outside the registered producer until a real
-   scheduler-assignment witness exists.
+   keyed by the registered P+E class, a scheduler-managed 10- or 14-worker
+   pool, and observable scheduler state. Report inferred P/E residency only as
+   a diagnostic: a worker-count request is not evidence that macOS assigned
+   those workers to performance cores. P-only calibration remains outside the
+   registered producer until a real scheduler-assignment witness exists.
    At least two independent live calibrations are required for a band.
    Diagnostic A/B runs may execute earlier only when labeled non-claim.
    Manifest (`quill-perf-gates.toml`) additions for the new classes are
@@ -166,11 +168,11 @@ Deliverable per (gate x class): a committed profile card with the top-10
 self-time frames ≥0.1%, triangulated (a lever is actionable only when two
 profilers agree on the frame). QG-1 cards additionally record the
 **tokenize-only honesty denominator** — the measured ceiling that converts
-"optimize indexing" into "close X% of a bounded gap." If a class's ceiling is
-itself below Tantivy's measured throughput, that evidence forces a new attack
-plan; it does not make the target negotiable. `x86-vps-ovh` cards are owned by
-the in-flight pre-admission beads (`bd-6oiq` for QG-1, `x4e4.5.4` for QG-6);
-the campaign adds trj/M4/M5 cards only.
+"optimize indexing" into "close X% of the measured current-architecture gap."
+If a class's ceiling is itself below Tantivy's measured throughput, that
+evidence forces a new attack plan; it does not make the target negotiable.
+`x86-vps-ovh` cards are owned by the in-flight pre-admission beads (`bd-6oiq`
+for QG-1, `x4e4.5.4` for QG-6); the campaign adds trj/M4/M5 cards only.
 
 ### Phase 2 — Hypothesis ledger + prior mining
 
@@ -214,9 +216,11 @@ candidate family, switch veins.
 
 Compiled artifacts only, never prose:
 
-1. **Information-theoretic ceiling** — the tokenize-only lane per class plus a
-   derived `ceiling.json` (max docs/s if inversion+seal were free). Every
-   W2/W3 lever states its expected signal as % of remaining ceiling gap.
+1. **Measured current-architecture tokenize-only ceiling** — the tokenize-only
+   lane per class plus a derived `ceiling.json` (diagnostic max docs/s if the
+   current architecture's inversion and seal work were free). This is not an
+   information-theoretic or cross-architecture bound. Every W2/W3 lever states
+   its expected signal as % of the remaining measured ceiling gap.
 2. **Queueing/pipeline stage budget for trj ingest** — measured per-stage
    service rates (tokenize → invert → seal → merge) at 1/16/64/128 workers,
    compiled to a **static** worker-allocation table with budgeted mode and
@@ -232,24 +236,38 @@ Explicitly NOT selected (diminishing-returns rule): optimal transport, TDA,
 control-theoretic compaction scheduling — no measured failure signature.
 Each gets a hypothesis-ledger row with the predicate that would revive it.
 
-### Phase 5 — Convergence, activation, and evidence review
+### Phase 5 — Discovery review, activation, and terminal gate
 
-- A lane converges after one of three auditable outcomes:
+- A lane's current **discovery phase** reaches an auditable review boundary
+  after one of three outcomes:
   1. it meets its predeclared target and passes independent confirmation;
-  2. measured tokenize/stage ceilings plus confidence bounds prove the target
-     infeasible; or
+  2. a measured current-architecture tokenize-only ceiling plus confidence
+     bounds shows that the current architecture cannot meet the target; or
   3. two consecutive clean profile/discovery passes leave no unresolved
      high-impact hypothesis above the documented EV threshold, and every
      currently valid high-EV row is KEEP or REJECT with a retry predicate.
+- Outcomes 2 and 3 end only the exhausted discovery phase. They leave the lane,
+  its QG, and the campaign open as a MISS or NoDecision and require an
+  evidence-review handoff to a materially different architecture, algorithm,
+  data layout, parallelization strategy, or platform-enablement attack.
+  Repeating a rejected family is forbidden unless its recorded retry predicate
+  has become true.
+- The performance campaign has one terminal convergence condition: every
+  complete written target frozen in `quill-perf-gates.toml` is a validated WIN
+  on every required machine class and cell. Infeasibility evidence, exhausted
+  hypotheses, unavailable hardware, missing execution attestation, or a
+  bounded non-inferiority result cannot close a gate, satisfy a dependency,
+  authorize a waiver, or retarget the target.
 - Gates activate per gate per class exactly per the existing activation
   contract. A complete eligible lane need not wait for unrelated gates or
   hardware. Diagnostic runs remain visible but cannot activate a claim.
 - **Round-6 evidence-review checkpoint (non-optional when triggered):** open
-  the review as soon as outcome 2 or 3 occurs while the lane remains below its
-  target. Present absolute and relative results, ceilings, old/new Quill causal
-  artifacts, the real Tantivy incumbent, null validity, parity, memory and
-  durability effects, retained rejects, retry predicates, and unmeasured
-  scopes. The output is the next optimization attack plan. It must not
+  the review as soon as discovery outcome 2 or 3 occurs while the lane remains
+  below its target. Present absolute and relative results, ceilings, old/new
+  Quill causal artifacts, the real Tantivy incumbent, null validity, parity,
+  memory and durability effects, retained rejects, retry predicates, and
+  unmeasured scopes. The output is the next materially different optimization
+  attack plan, with an owner and executable falsification test. It must not
   recommend or enact a bounded-envelope target reduction.
 - Performance and conformance proceed in parallel, but both block the library
   flip. Conformance is necessary and the complete written QG target surface is
@@ -295,9 +313,11 @@ problems plus one cheap concat. NUMA/CCD-aware sharding; per-thread arenas;
 sharded interners merged at seal (no global interner Mutex). Deliverables
 include the allocator-contention axis; "a bandwidth ceiling is honest, a lock
 plateau is a bug." On M4, the next promotion contract must first attest the
-actual executing image, then freeze class-scoped 10P and 14P+E endpoints plus a
-real scheduler-assignment witness before QG-1 or QG-8 can admit evidence. Until
-then there is no promotion-grade Apple scaling curve.
+actual executing image, then freeze class-scoped scheduler-managed 10- and
+14-worker endpoints plus a real scheduler-state witness before QG-1 or QG-8
+can admit evidence. P/E residency remains diagnostic unless the witness proves
+it; pool width alone must never be relabeled as `10P` or `14P+E`. Until then
+there is no promotion-grade Apple scaling curve.
 
 ### W4 — SIMD/µarch kernels (all classes; safe-code constraint binding)
 
