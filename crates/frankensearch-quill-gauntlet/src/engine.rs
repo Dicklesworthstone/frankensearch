@@ -4665,6 +4665,7 @@ mod tests {
             ("boolean-or", "alpha OR gamma"),
             ("fielded-term", "title:alpha"),
         ];
+        type PositionModeEvidence = Vec<(String, Vec<(String, u32)>, CountState)>;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut quill_mode_evidence = Vec::new();
@@ -4754,13 +4755,53 @@ mod tests {
                 tantivy_mode_evidence.push(tantivy_queries);
             }
 
+            let stable_membership = |evidence: &PositionModeEvidence| {
+                evidence
+                    .iter()
+                    .map(|(query_id, hits, count)| {
+                        let mut doc_ids = hits
+                            .iter()
+                            .map(|(doc_id, _score_bits)| doc_id.clone())
+                            .collect::<Vec<_>>();
+                        doc_ids.sort();
+                        (query_id.clone(), doc_ids, count.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(
-                quill_mode_evidence[0], quill_mode_evidence[1],
-                "Quill position-independent IDs, order, score bits, or counts changed with positions",
+                stable_membership(&quill_mode_evidence[0]),
+                stable_membership(&quill_mode_evidence[1]),
+                "Quill position-independent membership or counts changed with positions",
             );
             assert_eq!(
-                tantivy_mode_evidence[0], tantivy_mode_evidence[1],
-                "Tantivy position-independent IDs, order, score bits, or counts changed with positions",
+                stable_membership(&tantivy_mode_evidence[0]),
+                stable_membership(&tantivy_mode_evidence[1]),
+                "Tantivy position-independent membership or counts changed with positions",
+            );
+
+            let repeated_term_scores = |evidence: &PositionModeEvidence| {
+                evidence
+                    .iter()
+                    .find(|(query_id, _, _)| query_id == "repeated-term")
+                    .map(|(_, hits, _)| {
+                        let mut score_bits_by_doc = hits
+                            .iter()
+                            .map(|(doc_id, score_bits)| (doc_id.clone(), *score_bits))
+                            .collect::<Vec<_>>();
+                        score_bits_by_doc.sort_by(|left, right| left.0.cmp(&right.0));
+                        score_bits_by_doc
+                    })
+                    .expect("repeated-term evidence")
+            };
+            assert_ne!(
+                repeated_term_scores(&quill_mode_evidence[0]),
+                repeated_term_scores(&quill_mode_evidence[1]),
+                "Quill positioned fields retain frequencies while Basic fields clamp tf to one",
+            );
+            assert_ne!(
+                repeated_term_scores(&tantivy_mode_evidence[0]),
+                repeated_term_scores(&tantivy_mode_evidence[1]),
+                "Tantivy positioned fields retain frequencies while Basic fields clamp tf to one",
             );
         });
     }
