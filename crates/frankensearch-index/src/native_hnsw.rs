@@ -952,6 +952,24 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
         NativeHnswGenerationBindingV2::from_validated_fsvi(owner)
     }
 
+    fn from_verified_graph(
+        owner: &'owner ValidatedFsviBytes,
+        binding: NativeHnswGenerationBindingV2,
+        graph: NativeHnsw,
+    ) -> SearchResult<Self> {
+        graph
+            .verify_for_store(owner)
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "native-hnsw",
+                source: Box::new(source),
+            })?;
+        Ok(Self {
+            owner,
+            binding,
+            graph,
+        })
+    }
+
     /// Build a graph from every physical row of one admitted FSVI owner.
     ///
     /// Tombstoned owners fail closed. Indexing tombstones and filtering only
@@ -962,7 +980,9 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
     /// # Errors
     ///
     /// Returns identity/cardinality errors from receipt binding construction
-    /// or distance-computation errors from the admitted owner.
+    /// or distance-computation errors from the admitted owner, and a
+    /// `native-hnsw` [`SearchError::SubsystemError`] if post-build structural
+    /// attestation rejects the graph.
     pub fn build(
         owner: &'owner ValidatedFsviBytes,
         params: HnswParams,
@@ -970,11 +990,7 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
     ) -> SearchResult<Self> {
         let binding = Self::binding_for_live_owner(owner)?;
         let graph = NativeHnsw::build(params, seed, owner)?;
-        Ok(Self {
-            owner,
-            binding,
-            graph,
-        })
+        Self::from_verified_graph(owner, binding, graph)
     }
 
     /// Load a graph only after its receipt matches the exact admitted owner.
@@ -1026,7 +1042,13 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
         ))
     }
 
-    /// Atomically publish this owner-built graph and its adjacent receipt.
+    /// Durably publish this owner-built graph, then its adjacent receipt.
+    ///
+    /// The two renames are not a single transaction: a crash or concurrent
+    /// writer between them can leave a mismatched pair, which every load
+    /// rejects. Production publication must therefore use a serialized,
+    /// generation-specific staging path and select the generation only after
+    /// both artifacts are sealed.
     ///
     /// # Errors
     ///
@@ -1043,13 +1065,29 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
     ///
     /// # Errors
     ///
-    /// Returns graph-distance or owner row-resolution errors.
+    /// Returns [`SearchError::DimensionMismatch`] when the query does not
+    /// match the admitted owner's dimension, [`SearchError::InvalidConfig`]
+    /// for non-finite query values, or graph-distance and owner row-resolution
+    /// errors.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         ef: Option<usize>,
     ) -> SearchResult<Vec<ValidatedNativeHnswHit<'owner>>> {
+        if query.len() != self.owner.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.owner.dimension(),
+                found: query.len(),
+            });
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "query".to_owned(),
+                value: "non-finite".to_owned(),
+                reason: "all query vector values must be finite".to_owned(),
+            });
+        }
         let owner: &'owner ValidatedFsviBytes = self.owner;
         self.graph
             .search(query, k, ef, owner)?
@@ -4408,6 +4446,167 @@ mod tests {
                     && reason.contains("all-LIVE")
             ),
             "unexpected tombstone load rejection: {load_error:?}"
+        );
+    }
+
+    #[test]
+    fn validated_owner_bound_search_rejects_invalid_queries_before_zero_result_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let nonempty_binding = fsvi_v2_binding(37, 0x37, "query-validation-nonempty", 4);
+        let nonempty_rows = fsvi_rows(8, 4);
+        let nonempty_owner = admitted_fsvi_owner(
+            directory.path(),
+            "query-validation-nonempty.fsvi",
+            &nonempty_binding,
+            &nonempty_rows,
+        );
+        let nonempty = ValidatedNativeHnsw::build(&nonempty_owner, params(), 37)
+            .expect("build nonempty owner-bound graph");
+
+        let wrong_dimension = nonempty
+            .search(&[1.0, 0.0, 0.0], 0, None)
+            .expect_err("zero-k must not bypass query-dimension validation");
+        assert!(matches!(
+            wrong_dimension,
+            SearchError::DimensionMismatch {
+                expected: 4,
+                found: 3
+            }
+        ));
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = nonempty
+                .search(&[non_finite, 0.0, 0.0, 0.0], 0, None)
+                .expect_err("zero-k must not bypass non-finite query validation");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig {
+                        ref field,
+                        ref value,
+                        ref reason,
+                    } if field == "query"
+                        && value == "non-finite"
+                        && reason == "all query vector values must be finite"
+                ),
+                "unexpected non-finite query rejection: {error:?}"
+            );
+        }
+        assert!(
+            nonempty
+                .search(&[1.0, 0.0, 0.0, 0.0], 0, None)
+                .expect("valid zero-k query")
+                .is_empty()
+        );
+
+        let empty_binding = fsvi_v2_binding(38, 0x38, "query-validation-empty", 4);
+        let empty_owner = admitted_fsvi_owner(
+            directory.path(),
+            "query-validation-empty.fsvi",
+            &empty_binding,
+            &[],
+        );
+        let empty = ValidatedNativeHnsw::build(&empty_owner, params(), 38)
+            .expect("build empty owner-bound graph");
+
+        let wrong_dimension = empty
+            .search(&[1.0, 0.0, 0.0], 1, None)
+            .expect_err("empty graph must not bypass query-dimension validation");
+        assert!(matches!(
+            wrong_dimension,
+            SearchError::DimensionMismatch {
+                expected: 4,
+                found: 3
+            }
+        ));
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = empty
+                .search(&[non_finite, 0.0, 0.0, 0.0], 1, None)
+                .expect_err("empty graph must not bypass non-finite query validation");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig {
+                        ref field,
+                        ref value,
+                        ref reason,
+                    } if field == "query"
+                        && value == "non-finite"
+                        && reason == "all query vector values must be finite"
+                ),
+                "unexpected non-finite empty-graph rejection: {error:?}"
+            );
+        }
+        assert!(
+            empty
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                .expect("valid empty-graph query")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validated_owner_bound_constructor_attests_graph_before_handle_escape() {
+        fn assert_graph_defect(error: SearchError, expected: &GraphDefect) {
+            let SearchError::SubsystemError { subsystem, source } = error else {
+                panic!("expected native-hnsw subsystem error, got {error:?}");
+            };
+            assert_eq!(subsystem, "native-hnsw");
+            assert_eq!(
+                source.downcast_ref::<GraphDefect>(),
+                Some(expected),
+                "verified constructor must preserve the exact graph defect"
+            );
+        }
+
+        let owner = generation_owner(39, 0x39, "post-build-attestation", 4, 32);
+        let binding = ValidatedNativeHnsw::binding_for_live_owner(&owner)
+            .expect("derive exact owner binding");
+        let sound = NativeHnsw::build(params(), 39, &owner).expect("build sound graph");
+        ValidatedNativeHnsw::from_verified_graph(&owner, binding.clone(), sound)
+            .expect("sound graph passes public-handle attestation");
+
+        let mut one_way = NativeHnsw::build(params(), 39, &owner).expect("build graph to corrupt");
+        let (id, layer, neighbour) = one_way
+            .adjacency
+            .iter()
+            .enumerate()
+            .find_map(|(id, point)| {
+                point
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .find_map(|(layer, neighbours)| {
+                        neighbours
+                            .first()
+                            .copied()
+                            .map(|neighbour| (id, layer, neighbour))
+                    })
+            })
+            .expect("nontrivial graph has an edge");
+        let id = u32::try_from(id).expect("test graph length fits u32");
+        one_way.adjacency[neighbour as usize].layers[layer].retain(|&candidate| candidate != id);
+        let error = ValidatedNativeHnsw::from_verified_graph(&owner, binding.clone(), one_way)
+            .expect_err("one-way graph must not escape as a public handle");
+        assert_graph_defect(
+            error,
+            &GraphDefect::MissingReciprocalEdge {
+                id,
+                layer,
+                neighbour,
+            },
+        );
+
+        let mut truncated =
+            NativeHnsw::build(params(), 39, &owner).expect("build graph to truncate");
+        truncated.adjacency.pop().expect("graph has a final row");
+        let error = ValidatedNativeHnsw::from_verified_graph(&owner, binding, truncated)
+            .expect_err("cardinality-mismatched graph must not escape as a public handle");
+        assert_graph_defect(
+            error,
+            &GraphDefect::StoreCardinalityMismatch {
+                graph_points: 31,
+                store_rows: 32,
+            },
         );
     }
 
