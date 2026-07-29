@@ -654,20 +654,20 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
 }
 
 fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
-    if spec.gate != PerfGate::Qg8 || arm != EngineArm::Quill {
+    if !matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) || arm != EngineArm::Quill {
         return bulk_metric_unpooled(context, spec, arm);
     }
 
-    let threads = spec.threads.expect("QG-8 thread count");
+    let threads = spec.threads.expect("QG-1/QG-8 thread count");
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
-        .expect("build QG-8 Quill thread pool")
+        .expect("build QG-1/QG-8 Quill thread pool")
         .install(|| {
             assert_eq!(
                 rayon::current_num_threads(),
                 threads,
-                "QG-8 Quill cell escaped its pinned Rayon pool"
+                "QG-1/QG-8 Quill cell escaped its pinned Rayon pool"
             );
             bulk_metric_unpooled(context, spec, arm)
         })
@@ -2186,47 +2186,67 @@ fn collect_cell(
     // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
     // four-arm runner so setup is impossible inside timed samples and null/
     // effect blocks are interleaved.
-    let (null_samples, effect_samples, input_identity) = if spec.gate == PerfGate::Qg6 {
-        let (null, effect, input_identity) =
-            prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
-        (null, effect, Some(input_identity))
-    } else {
-        let null = paired_raw_stream(
-            context,
-            spec,
-            evidence,
-            &scope,
-            origin,
-            &StreamPlan {
-                control: EngineArm::Tantivy,
-                treatment: EngineArm::Tantivy,
-                rounds: runs,
-                seed: cell_seed ^ 0xaa,
-                block_id_base: 0,
-                sample_id_base: 1_000_000,
-                group_id: None,
-                query_override: None,
-            },
-        );
-        let effect = paired_raw_stream(
-            context,
-            spec,
-            evidence,
-            &scope,
-            origin,
-            &StreamPlan {
-                control: EngineArm::Tantivy,
-                treatment: EngineArm::Quill,
-                rounds: runs,
-                seed: cell_seed,
-                block_id_base: 0,
-                sample_id_base: 0,
-                group_id: None,
-                query_override: None,
-            },
-        );
-        (null, effect, None)
-    };
+    let (oracle_null_samples, treatment_null_samples, effect_samples, input_identity) =
+        if spec.gate == PerfGate::Qg6 {
+            let (null, effect, input_identity) =
+                prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
+            (null, None, effect, Some(input_identity))
+        } else {
+            let oracle_null = paired_raw_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                &StreamPlan {
+                    control: EngineArm::Tantivy,
+                    treatment: EngineArm::Tantivy,
+                    rounds: runs,
+                    seed: cell_seed ^ 0xaa,
+                    block_id_base: 0,
+                    sample_id_base: 1_000_000,
+                    group_id: None,
+                    query_override: None,
+                },
+            );
+            let treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
+                paired_raw_stream(
+                    context,
+                    spec,
+                    evidence,
+                    &scope,
+                    origin,
+                    &StreamPlan {
+                        control: EngineArm::Quill,
+                        treatment: EngineArm::Quill,
+                        rounds: runs,
+                        seed: cell_seed ^ 0x55,
+                        block_id_base: 2_000_000,
+                        sample_id_base: 2_000_000,
+                        group_id: None,
+                        query_override: None,
+                    },
+                )
+            });
+            let effect = paired_raw_stream(
+                context,
+                spec,
+                evidence,
+                &scope,
+                origin,
+                &StreamPlan {
+                    control: EngineArm::Tantivy,
+                    treatment: EngineArm::Quill,
+                    rounds: runs,
+                    seed: cell_seed,
+                    block_id_base: 0,
+                    sample_id_base: 0,
+                    group_id: None,
+                    query_override: None,
+                },
+            );
+            (oracle_null, treatment_null, effect, None)
+        };
 
     let quill_distribution =
         DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Treatment))
@@ -2237,34 +2257,66 @@ fn collect_cell(
     let paired_distribution =
         DistributionSummary::from_samples(&block_ratios_treatment_over_control(&effect_samples))
             .expect("paired distribution");
-    let null_distribution =
-        DistributionSummary::from_samples(&block_ratios_treatment_over_control(&null_samples))
-            .expect("null distribution");
+    let oracle_null_distribution = DistributionSummary::from_samples(
+        &block_ratios_treatment_over_control(&oracle_null_samples),
+    )
+    .expect("oracle null distribution");
+    let treatment_null_distribution = treatment_null_samples.as_ref().map(|samples| {
+        DistributionSummary::from_samples(&block_ratios_treatment_over_control(samples))
+            .expect("treatment-arm null distribution")
+    });
     eprintln!(
-        "[quill-perf-paired] fixture={} null_median={:.6} null_ci95=[{:.6},{:.6}] \
-         null_cv_pct={:.3} ab_median={:.6} ab_ci95=[{:.6},{:.6}] ab_cv_pct={:.3} \
-         checksum={:016x}",
+        "[quill-perf-paired] fixture={} tantivy_null_median={:.6} \
+         tantivy_null_ci95=[{:.6},{:.6}] tantivy_null_cv_pct={:.3} \
+         quill_null_median={} quill_null_ci95={} quill_null_cv_pct={} \
+         ab_median={:.6} ab_ci95=[{:.6},{:.6}] ab_cv_pct={:.3} checksum={:016x}",
         spec.fixture,
-        null_distribution.p50,
-        null_distribution.median_ci95_low,
-        null_distribution.median_ci95_high,
-        null_distribution.cv_pct,
+        oracle_null_distribution.p50,
+        oracle_null_distribution.median_ci95_low,
+        oracle_null_distribution.median_ci95_high,
+        oracle_null_distribution.cv_pct,
+        treatment_null_distribution
+            .as_ref()
+            .map_or_else(|| "n/a".to_owned(), |summary| format!("{:.6}", summary.p50)),
+        treatment_null_distribution.as_ref().map_or_else(
+            || "n/a".to_owned(),
+            |summary| {
+                format!(
+                    "[{:.6},{:.6}]",
+                    summary.median_ci95_low, summary.median_ci95_high
+                )
+            },
+        ),
+        treatment_null_distribution.as_ref().map_or_else(
+            || "n/a".to_owned(),
+            |summary| format!("{:.3}", summary.cv_pct)
+        ),
         paired_distribution.p50,
         paired_distribution.median_ci95_low,
         paired_distribution.median_ci95_high,
         paired_distribution.cv_pct,
-        values_checksum(&null_samples) ^ values_checksum(&effect_samples).rotate_left(29),
+        values_checksum(&oracle_null_samples)
+            ^ treatment_null_samples
+                .as_deref()
+                .map_or(0, values_checksum)
+                .rotate_left(17)
+            ^ values_checksum(&effect_samples).rotate_left(29),
     );
 
-    let experiment = estimate_paired_experiment(&effect_samples, &null_samples, &evidence.config)
-        .expect("paired estimator rejected harness-produced streams");
+    let experiment =
+        estimate_paired_experiment(&effect_samples, &oracle_null_samples, &evidence.config)
+            .expect("paired estimator rejected harness-produced streams");
+    let treatment_null_experiment = treatment_null_samples.as_ref().map(|samples| {
+        estimate_paired_experiment(&effect_samples, samples, &evidence.config)
+            .expect("treatment-arm null estimator rejected harness-produced streams")
+    });
     let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
     let cold_cache = (spec.gate == PerfGate::Qg9).then(|| ColdCacheEvidence {
         procedure: "same-process index drop and reopen; the OS page cache is not dropped"
             .to_owned(),
         verified: false,
     });
-    let cell = EvidenceCell::evaluate(
+    let mut cell = EvidenceCell::evaluate(
         EvidenceCellSpec {
             gate: spec.gate,
             fixture: spec.fixture.clone(),
@@ -2282,13 +2334,17 @@ fn collect_cell(
         &evidence.policy,
     )
     .expect("evidence cell evaluation");
+    if let Some(treatment_null_experiment) = treatment_null_experiment {
+        cell.attach_treatment_arm_null(treatment_null_experiment, &evidence.policy)
+            .expect("attach treatment-arm A/A null");
+    }
 
     let absolute_engine = if is_tokenizer_null {
         "quill_tokenizer"
     } else {
         EngineArm::Quill.label()
     };
-    let results = vec![
+    let mut results = vec![
         PerfCellResult {
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
@@ -2319,9 +2375,18 @@ fn collect_cell(
             metric: format!("{}_tantivy_over_tantivy", spec.metric),
             engine: "paired_null".to_owned(),
             unit: "ratio".to_owned(),
-            distribution: null_distribution,
+            distribution: oracle_null_distribution,
         },
     ];
+    if let Some(distribution) = treatment_null_distribution {
+        results.push(PerfCellResult {
+            fixture: spec.fixture.clone(),
+            metric: format!("{}_quill_over_quill", spec.metric),
+            engine: "paired_null_quill".to_owned(),
+            unit: "ratio".to_owned(),
+            distribution,
+        });
+    }
     CellCollection {
         results,
         evidence: Some(cell),
@@ -2662,7 +2727,11 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             build_profile: build_profile.clone(),
         },
     };
-    let mut machine = MachineIdentity::capture();
+    let mut machine = MachineIdentity::capture(selected.iter().filter_map(|spec| spec.threads));
+    eprintln!(
+        "[quill-perf-execution-provenance] {}",
+        serde_json::to_string(&machine.execution).expect("serialize execution provenance")
+    );
 
     let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
     let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
@@ -2685,7 +2754,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         run_window: run_window.clone(),
         manifest_sha256: manifest_hash.clone(),
         build: build_identity(bench_elf_sha256, &revision, &build_profile),
-        machine,
+        machine: machine.clone(),
         peak_rss: PeakRssEvidence::capture(),
         corpus: corpus_identity(&context, &selected, &corpus_hash),
     };
@@ -2721,6 +2790,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             gate,
             bench_elf_sha256: bench_elf_sha256.to_owned(),
             machine_fingerprint: machine_fingerprint(),
+            execution: Some(machine.execution.clone()),
             git_rev: revision.clone(),
             run_window: run_window.clone(),
             run_id: run_id.clone(),

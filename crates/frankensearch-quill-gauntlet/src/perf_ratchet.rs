@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::perf::PERF_NULL_MARGIN_MULTIPLIER;
 use crate::{
     DistributionSummary, EvidenceCellBody, EvidenceRole, PERF_ARTIFACT_SCHEMA_VERSION,
-    PERF_MIN_RUNS, PerfCellResult, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfMatrixSpec,
+    PERF_MIN_RUNS, PerfCellResult, PerfEvidenceArtifact, PerfExecutionProvenance, PerfGate,
+    PerfGateArtifact, PerfMatrixSpec,
 };
 
 /// Version of the machine-readable ratchet decision artifact.
@@ -501,6 +501,20 @@ fn validate_artifact<'a>(
     let explicit_bootstrap = artifact.cells.is_empty()
         && artifact.machine_fingerprint == "unmeasured"
         && artifact.bench_elf_sha256 == "unmeasured";
+    if !explicit_bootstrap
+        && !artifact
+            .execution
+            .as_ref()
+            .is_some_and(PerfExecutionProvenance::is_complete)
+    {
+        state.fatal(
+            "perf.ratchet.missing_execution_provenance",
+            format!(
+                "{role} must record host identity, physical/logical topology, effective threads, \
+                 runtime ISA, and affinity/cpuset provenance"
+            ),
+        );
+    }
     if !explicit_bootstrap && !is_lower_hex_sha256(&artifact.bench_elf_sha256) {
         state.fatal(
             "perf.ratchet.invalid_bench_elf_sha256",
@@ -779,6 +793,7 @@ fn validate_current_evidence_cell(
     match &cell.body {
         EvidenceCellBody::Paired {
             paired,
+            treatment_arm_null,
             hierarchical,
             hierarchical_null,
             ..
@@ -813,7 +828,14 @@ fn validate_current_evidence_cell(
                 );
             }
             if normative {
-                reconcile_current_cell_with_projection(cell, paired, legacy_cells, role, state);
+                reconcile_current_cell_with_projection(
+                    cell,
+                    paired,
+                    treatment_arm_null.as_deref(),
+                    legacy_cells,
+                    role,
+                    state,
+                );
             }
         }
         EvidenceCellBody::Facts {
@@ -857,6 +879,7 @@ fn validate_current_evidence_cell(
 fn reconcile_current_cell_with_projection(
     cell: &crate::EvidenceCell,
     paired: &crate::PairedExperimentResult,
+    treatment_arm_null: Option<&crate::PairedExperimentResult>,
     legacy_cells: &BTreeMap<CellKey, &PerfCellResult>,
     role: &str,
     state: &mut DecisionState,
@@ -882,10 +905,22 @@ fn reconcile_current_cell_with_projection(
     let control = legacy_cells.get(&absolute(control_engine));
     let effect = legacy_cells.get(&ratio("quill_over_tantivy", "paired_ab"));
     let null = legacy_cells.get(&ratio("tantivy_over_tantivy", "paired_null"));
+    let treatment_null = legacy_cells.get(&ratio("quill_over_quill", "paired_null_quill"));
     let projected_effect = projected_ratio_distribution(&paired.effect_samples);
     let projected_null = projected_ratio_distribution(&paired.null_samples);
-    let aligned = treatment
-        .is_some_and(|projected| projected.distribution == paired.effect.treatment)
+    let treatment_null_aligned = if cell.spec.gate == PerfGate::Qg1 {
+        treatment_arm_null.is_some_and(|evidence| {
+            treatment_null.is_some_and(|projected| {
+                projected_ratio_distribution(&evidence.null_samples)
+                    .as_ref()
+                    .is_some_and(|summary| projected.distribution == *summary)
+            })
+        })
+    } else {
+        treatment_arm_null.is_none() && treatment_null.is_none()
+    };
+    let aligned = treatment_null_aligned
+        && treatment.is_some_and(|projected| projected.distribution == paired.effect.treatment)
         && control.is_some_and(|projected| projected.distribution == paired.effect.control)
         && effect.is_some_and(|projected| {
             projected_effect
@@ -901,8 +936,8 @@ fn reconcile_current_cell_with_projection(
         state.fatal(
             "perf.ratchet.current_evidence_projection_mismatch",
             format!(
-                "{role} cell {} does not reproduce both absolute arms plus A/B and A/A medians \
-                 in its legacy threshold projection",
+                "{role} cell {} does not reproduce both absolute arms plus A/B and required \
+                 per-arm A/A medians in its legacy threshold projection",
                 cell.cell_id
             ),
         );
@@ -1186,17 +1221,48 @@ fn validate_paired_evidence(
             // taken from the recomputable current-schema hierarchy.
             continue;
         }
-        if !validate_null_control(null, role, state) {
+        let mut nulls = vec![null];
+        if gate == PerfGate::Qg1 {
+            let treatment_null_key = CellKey {
+                fixture: key.fixture.clone(),
+                metric: format!("{metric_stem}_quill_over_quill"),
+                engine: "paired_null_quill".to_owned(),
+                unit: "ratio".to_owned(),
+            };
+            let Some(treatment_null) = cells.get(&treatment_null_key).copied() else {
+                state.quarantine(
+                    "perf.ratchet.missing_treatment_arm_null_control",
+                    format!(
+                        "{role} QG-1 paired claim {}/{} has no same-invocation Quill/Quill \
+                         A/A null row",
+                        key.fixture, key.metric
+                    ),
+                );
+                continue;
+            };
+            nulls.push(treatment_null);
+        }
+        let mut nulls_valid = true;
+        for null in &nulls {
+            nulls_valid &= validate_null_control(null, role, state);
+        }
+        if !nulls_valid {
             continue;
         }
 
-        let null_floor = (null.distribution.median_ci95_low - 1.0)
-            .abs()
-            .max((null.distribution.median_ci95_high - 1.0).abs());
+        let null_ci_low = nulls
+            .iter()
+            .map(|null| null.distribution.median_ci95_low)
+            .fold(f64::INFINITY, f64::min);
+        let null_ci_high = nulls
+            .iter()
+            .map(|null| null.distribution.median_ci95_high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let null_floor = (null_ci_low - 1.0).abs().max((null_ci_high - 1.0).abs());
 
         let effect = (claim.distribution.p50 - 1.0).abs();
-        let outside_null = claim.distribution.p50 < null.distribution.median_ci95_low
-            || claim.distribution.p50 > null.distribution.median_ci95_high;
+        let outside_null =
+            claim.distribution.p50 < null_ci_low || claim.distribution.p50 > null_ci_high;
         if !outside_null || effect < PERF_NULL_MARGIN_MULTIPLIER * null_floor {
             state.quarantine(
                 "perf.ratchet.inconclusive_paired_claim",
@@ -1206,8 +1272,8 @@ fn validate_paired_evidence(
                     key.fixture,
                     key.metric,
                     claim.distribution.p50,
-                    null.distribution.median_ci95_low,
-                    null.distribution.median_ci95_high,
+                    null_ci_low,
+                    null_ci_high,
                     PERF_NULL_MARGIN_MULTIPLIER,
                 ),
             );
@@ -1238,7 +1304,7 @@ fn expected_gate_keys(gate: PerfGate) -> BTreeSet<CellKey> {
             } else {
                 "tantivy"
             };
-            vec![
+            let mut keys = vec![
                 CellKey {
                     fixture: spec.fixture.clone(),
                     metric: spec.metric.clone(),
@@ -1263,7 +1329,16 @@ fn expected_gate_keys(gate: PerfGate) -> BTreeSet<CellKey> {
                     engine: "paired_null".to_owned(),
                     unit: "ratio".to_owned(),
                 },
-            ]
+            ];
+            if gate == PerfGate::Qg1 {
+                keys.push(CellKey {
+                    fixture: spec.fixture.clone(),
+                    metric: format!("{}_quill_over_quill", spec.metric),
+                    engine: "paired_null_quill".to_owned(),
+                    unit: "ratio".to_owned(),
+                });
+            }
+            keys
         })
         .collect()
 }
@@ -1356,6 +1431,13 @@ fn compare_baseline(
         );
         return;
     }
+    if baseline.execution != candidate.execution {
+        state.quarantine(
+            "perf.ratchet.execution_provenance_mismatch",
+            "baseline and candidate differ in host topology, effective threads, ISA, or \
+             affinity/cpuset provenance",
+        );
+    }
     if baseline.corpus_manifest_hash != candidate.corpus_manifest_hash {
         state.quarantine(
             "perf.ratchet.corpus_mismatch",
@@ -1376,13 +1458,16 @@ fn compare_baseline(
             continue;
         };
         if candidate.gate == PerfGate::Qg6
-            && matches!(key.engine.as_str(), "paired_ab" | "paired_null")
+            && matches!(
+                key.engine.as_str(),
+                "paired_ab" | "paired_null" | "paired_null_quill"
+            )
         {
             // QG-6's flat paired rows are compatibility projections. Current
             // hierarchical evidence owns effect and null inference.
             continue;
         }
-        if key.engine == "paired_null" {
+        if matches!(key.engine.as_str(), "paired_null" | "paired_null_quill") {
             let _ = validate_null_control(current, "candidate", state);
             continue;
         }
@@ -1493,6 +1578,13 @@ fn compare_reproduction(
             "candidate and rerun must come from the same machine fingerprint",
         );
     }
+    if candidate.execution != rerun.execution {
+        state.quarantine(
+            "perf.ratchet.rerun_execution_provenance_mismatch",
+            "candidate and rerun must share host topology, effective threads, ISA, and \
+             affinity/cpuset provenance",
+        );
+    }
     if candidate.corpus_manifest_hash != rerun.corpus_manifest_hash {
         state.quarantine(
             "perf.ratchet.rerun_corpus_mismatch",
@@ -1507,7 +1599,10 @@ fn compare_reproduction(
     }
     for (key, first) in candidate_cells {
         if candidate.gate == PerfGate::Qg6
-            && matches!(key.engine.as_str(), "paired_ab" | "paired_null")
+            && matches!(
+                key.engine.as_str(),
+                "paired_ab" | "paired_null" | "paired_null_quill"
+            )
         {
             // The verified current-schema two-stage estimates are the only
             // QG-6 effect and null reproduction inputs. Flat compatibility
@@ -2145,6 +2240,19 @@ mod tests {
         }
     }
 
+    fn execution_provenance() -> PerfExecutionProvenance {
+        PerfExecutionProvenance {
+            host_identity: "test-machine".to_owned(),
+            physical_cores: 4,
+            logical_threads: 8,
+            process_available_threads: 8,
+            threads_actually_used: vec![1],
+            runtime_detected_isa: vec!["avx2".to_owned()],
+            cpu_affinity_allowed_list: Some("0-7".to_owned()),
+            affinity_or_cpuset_cap: None,
+        }
+    }
+
     fn qg2_artifact(revision: &str, quill: f64, oracle: f64) -> PerfGateArtifact {
         let ratio = quill / oracle;
         PerfGateArtifact {
@@ -2152,6 +2260,7 @@ mod tests {
             gate: PerfGate::Qg2,
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
+            execution: Some(execution_provenance()),
             git_rev: revision.to_owned(),
             run_window: "test-window".to_owned(),
             run_id: format!("{revision}-{quill}-{oracle}"),
@@ -2279,6 +2388,7 @@ mod tests {
             gate: PerfGate::Qg2,
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
+            execution: Some(execution_provenance()),
             git_rev: revision.to_owned(),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
@@ -2341,6 +2451,7 @@ mod tests {
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),
                     logical_cpus: 8,
+                    execution: execution_provenance(),
                     cpu_governor: None,
                     load_average_start: None,
                     load_average_end: None,
@@ -2473,6 +2584,7 @@ mod tests {
             gate: PerfGate::Qg6,
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
+            execution: Some(execution_provenance()),
             git_rev: "new".to_owned(),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
@@ -2535,6 +2647,7 @@ mod tests {
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),
                     logical_cpus: 8,
+                    execution: execution_provenance(),
                     cpu_governor: None,
                     load_average_start: None,
                     load_average_end: None,

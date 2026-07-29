@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,10 @@ use thiserror::Error;
 use crate::GauntletError;
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v3";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v4";
+/// Read-only schema identifier for historical gate artifacts that lack
+/// auditable host topology and effective-thread provenance.
+pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
 /// Minimum independent samples required by the standing statistical law.
 pub const PERF_MIN_RUNS: usize = 10;
 /// Deterministic bootstrap resamples used for the 95% confidence interval on
@@ -295,7 +299,7 @@ impl PerfMatrixSpec {
             PerfCorpus::Xlarge,
         ];
         for corpus in corpora {
-            for threads in [1, 4, 8, 16] {
+            for threads in [1, 2, 4, 8, 16, 32, 64, 96, 128] {
                 for positions in [PositionMode::On, PositionMode::Off] {
                     let mut cell = PerfCellSpec::new(
                         PerfGate::Qg1,
@@ -1751,6 +1755,276 @@ pub fn median_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
+/// Auditable host topology and effective execution width for one benchmark
+/// artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfExecutionProvenance {
+    /// Stable host name, not merely an architecture family label.
+    pub host_identity: String,
+    /// Host-wide physical core count.
+    pub physical_cores: usize,
+    /// Host-wide logical hardware-thread count.
+    pub logical_threads: usize,
+    /// Concurrency available to the benchmark process after scheduler and
+    /// cgroup constraints.
+    pub process_available_threads: usize,
+    /// Exact thread widths exercised by the cells in this artifact.
+    pub threads_actually_used: Vec<usize>,
+    /// ISA features detected at runtime on the executing host.
+    pub runtime_detected_isa: Vec<String>,
+    /// Effective Linux `Cpus_allowed_list`, when the platform exposes it.
+    pub cpu_affinity_allowed_list: Option<String>,
+    /// Effective affinity, cpuset, or scheduler cap when narrower than the
+    /// host-wide logical topology.
+    pub affinity_or_cpuset_cap: Option<String>,
+}
+
+impl PerfExecutionProvenance {
+    /// Capture host-wide topology beside the exact widths selected by this
+    /// invocation.
+    #[must_use]
+    pub fn capture(threads_actually_used: impl IntoIterator<Item = usize>) -> Self {
+        let (physical_cores, logical_threads) = host_cpu_topology()
+            .expect("performance evidence requires host physical/logical CPU topology");
+        let process_available_threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let cpu_affinity_allowed_list = linux_cpu_allowed_list();
+        let allowed_threads = cpu_affinity_allowed_list
+            .as_deref()
+            .and_then(parse_cpu_list_count);
+        let affinity_or_cpuset_cap = if allowed_threads.is_some_and(|count| count < logical_threads)
+        {
+            Some(format!(
+                "Cpus_allowed_list={} ({} of {} host logical threads)",
+                cpu_affinity_allowed_list
+                    .as_deref()
+                    .expect("allowed-thread count came from an affinity list"),
+                allowed_threads.expect("narrow affinity has a parsed count"),
+                logical_threads,
+            ))
+        } else if process_available_threads < logical_threads {
+            Some(format!(
+                "available_parallelism={process_available_threads} of \
+                     {logical_threads} host logical threads"
+            ))
+        } else {
+            None
+        };
+        let mut threads_actually_used = threads_actually_used
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        threads_actually_used.retain(|threads| *threads > 0);
+        let provenance = Self {
+            host_identity: host_identity()
+                .expect("performance evidence requires a non-empty host identity"),
+            physical_cores,
+            logical_threads,
+            process_available_threads,
+            threads_actually_used,
+            runtime_detected_isa: runtime_detected_isa(),
+            cpu_affinity_allowed_list,
+            affinity_or_cpuset_cap,
+        };
+        assert!(
+            provenance.is_complete(),
+            "performance execution provenance is incomplete: {provenance:?}"
+        );
+        provenance
+    }
+
+    /// Whether all fields required to interpret a scaling result are present.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.host_identity.trim().is_empty()
+            && self.physical_cores > 0
+            && self.logical_threads >= self.physical_cores
+            && self.process_available_threads > 0
+            && !self.threads_actually_used.is_empty()
+            && self
+                .threads_actually_used
+                .iter()
+                .all(|threads| *threads > 0)
+            && !self.runtime_detected_isa.is_empty()
+            && (std::env::consts::OS != "linux"
+                || self
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+    }
+}
+
+fn host_identity() -> Option<String> {
+    fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn host_cpu_topology() -> Option<(usize, usize)> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|contents| parse_linux_cpu_topology(&contents))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let physical = sysctl_usize("hw.physicalcpu")?;
+        let logical = sysctl_usize("hw.logicalcpu")?;
+        Some((physical, logical))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+fn parse_linux_cpu_topology(cpuinfo: &str) -> Option<(usize, usize)> {
+    let mut logical_threads = 0_usize;
+    let mut cores = BTreeSet::new();
+    for record in cpuinfo.split("\n\n") {
+        let mut has_processor = false;
+        let mut physical_id = None;
+        let mut core_id = None;
+        for line in record.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            match name.trim() {
+                "processor" => has_processor = value.trim().parse::<usize>().is_ok(),
+                "physical id" => physical_id = value.trim().parse::<usize>().ok(),
+                "core id" => core_id = value.trim().parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        if has_processor {
+            logical_threads = logical_threads.saturating_add(1);
+            if let (Some(package), Some(core)) = (physical_id, core_id) {
+                cores.insert((package, core));
+            }
+        }
+    }
+    (!cores.is_empty() && logical_threads >= cores.len()).then_some((cores.len(), logical_threads))
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_usize(name: &str) -> Option<usize> {
+    Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn linux_cpu_allowed_list() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("Cpus_allowed_list:")
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                })
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn parse_cpu_list_count(value: &str) -> Option<usize> {
+    let mut count = 0_usize;
+    for component in value.split(',') {
+        let component = component.trim();
+        let (first, last) = component
+            .split_once('-')
+            .map_or((component, component), |(first, last)| (first, last));
+        let first = first.parse::<usize>().ok()?;
+        let last = last.parse::<usize>().ok()?;
+        if last < first {
+            return None;
+        }
+        count = count.checked_add(last.checked_sub(first)?.checked_add(1)?)?;
+    }
+    (count > 0).then_some(count)
+}
+
+fn runtime_detected_isa() -> Vec<String> {
+    let mut features = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        let flags = cpuinfo.lines().find_map(|line| {
+            let (name, values) = line.split_once(':')?;
+            matches!(name.trim(), "flags" | "Features").then_some(values)
+        });
+        if let Some(flags) = flags {
+            let flags = flags.split_ascii_whitespace().collect::<BTreeSet<_>>();
+            for feature in [
+                "avx2", "fma", "bmi2", "aes", "vaes", "avx512f", "neon", "asimd",
+            ] {
+                if flags.contains(feature) {
+                    features.push(feature.to_owned());
+                }
+            }
+        }
+    }
+    #[cfg(all(
+        not(target_os = "linux"),
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    {
+        for (name, detected) in [
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+            ("bmi2", std::is_x86_feature_detected!("bmi2")),
+            ("aes", std::is_x86_feature_detected!("aes")),
+            ("avx512f", std::is_x86_feature_detected!("avx512f")),
+        ] {
+            if detected {
+                features.push(name.to_owned());
+            }
+        }
+    }
+    #[cfg(all(not(target_os = "linux"), target_arch = "aarch64"))]
+    {
+        for (name, detected) in [
+            ("neon", std::arch::is_aarch64_feature_detected!("neon")),
+            ("aes", std::arch::is_aarch64_feature_detected!("aes")),
+            ("sha2", std::arch::is_aarch64_feature_detected!("sha2")),
+        ] {
+            if detected {
+                features.push(name.to_owned());
+            }
+        }
+    }
+    if features.is_empty() {
+        features.push("scalar".to_owned());
+    }
+    features
+}
+
 /// One engine or comparison row in a gate artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerfCellResult {
@@ -1770,6 +2044,10 @@ pub struct PerfGateArtifact {
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
+    /// Required in v4. `None` exists only so the explicit read-only v3 loader
+    /// can deserialize historical artifacts without upgrading their claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
     /// Shared identifier for the bounded candidate/rerun measurement window.
     pub run_window: String,
@@ -1794,7 +2072,31 @@ impl PerfGateArtifact {
     /// Render the compact operator table printed beside JSON.
     #[must_use]
     pub fn human_table(&self) -> String {
-        let mut table = String::from(
+        let mut table = String::new();
+        if let Some(execution) = &self.execution {
+            let _ = writeln!(
+                table,
+                "host={} | physical_cores={} | logical_threads={} | \
+                 process_available_threads={} | threads_actually_used={:?} | \
+                 runtime_detected_isa={:?} | cpu_affinity_allowed_list={} | \
+                 affinity_or_cpuset_cap={}",
+                execution.host_identity,
+                execution.physical_cores,
+                execution.logical_threads,
+                execution.process_available_threads,
+                execution.threads_actually_used,
+                execution.runtime_detected_isa,
+                execution
+                    .cpu_affinity_allowed_list
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                execution
+                    .affinity_or_cpuset_cap
+                    .as_deref()
+                    .unwrap_or("none"),
+            );
+        }
+        table.push_str(
             "fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission\n",
         );
         table.push_str("--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---\n");
@@ -1844,7 +2146,10 @@ impl PerfGateArtifact {
 /// cross-machine ratchet comparisons.
 #[must_use]
 pub fn machine_fingerprint() -> String {
-    let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+    let logical_threads = host_cpu_topology()
+        .map(|(_, logical_threads)| logical_threads)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let host = host_identity().unwrap_or_else(|| "unknown-host".to_owned());
     let cpu = fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|contents| {
@@ -1859,7 +2164,7 @@ pub fn machine_fingerprint() -> String {
         })
         .unwrap_or_else(|| "unknown-cpu".to_owned());
     format!(
-        "{}-{}-{parallelism}cpu-{}",
+        "{}-{}-{host}-{logical_threads}thread-{}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cpu.replace(['/', ' '], "_")
@@ -2498,9 +2803,9 @@ mod tests {
                 .into_iter()
                 .filter(|cell| cell.metric == "docs_per_second")
                 .count(),
-            4 * 4 * 2
+            4 * 9 * 2
         );
-        assert_eq!(matrix.for_gate(PerfGate::Qg1).len(), 4 * 4 * 2 + 2);
+        assert_eq!(matrix.for_gate(PerfGate::Qg1).len(), 4 * 9 * 2 + 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg3).len(), 5);
         assert_eq!(matrix.for_gate(PerfGate::Qg5).len(), 3);
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
@@ -2615,6 +2920,16 @@ mod tests {
             gate: PerfGate::Qg1,
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
+            execution: Some(PerfExecutionProvenance {
+                host_identity: "test-host".to_owned(),
+                physical_cores: 64,
+                logical_threads: 128,
+                process_available_threads: 128,
+                threads_actually_used: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
+                runtime_detected_isa: vec!["avx2".to_owned(), "fma".to_owned(), "bmi2".to_owned()],
+                cpu_affinity_allowed_list: Some("0-127".to_owned()),
+                affinity_or_cpuset_cap: None,
+            }),
             git_rev: "0123456789abcdef".to_owned(),
             run_window: "test-window".to_owned(),
             run_id: "candidate".to_owned(),
@@ -2636,6 +2951,7 @@ mod tests {
             "gate",
             "bench_elf_sha256",
             "machine_fingerprint",
+            "execution",
             "git_rev",
             "run_window",
             "run_id",
@@ -2651,6 +2967,32 @@ mod tests {
         assert!(table.contains("median_ci95"));
         assert!(table.contains("bulk/tiny/1/positions_on"));
         assert!(table.contains("sampled"));
+        assert!(table.contains("threads_actually_used=[1, 2, 4, 8, 16, 32, 64, 96, 128]"));
+    }
+
+    #[test]
+    fn cpu_topology_and_affinity_parsers_preserve_host_wide_width() {
+        let cpuinfo = "\
+processor : 0
+physical id : 0
+core id : 0
+
+processor : 1
+physical id : 0
+core id : 0
+
+processor : 2
+physical id : 0
+core id : 1
+
+processor : 3
+physical id : 0
+core id : 1
+";
+        assert_eq!(parse_linux_cpu_topology(cpuinfo), Some((2, 4)));
+        assert_eq!(parse_cpu_list_count("0-127"), Some(128));
+        assert_eq!(parse_cpu_list_count("0-15,32-47,63"), Some(33));
+        assert_eq!(parse_cpu_list_count("4-2"), None);
     }
 
     #[test]

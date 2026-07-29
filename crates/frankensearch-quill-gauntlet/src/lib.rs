@@ -75,11 +75,12 @@ pub use generator::{
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use perf::{
-    DistributionSummary, PAIRED_ESTIMATOR_SCHEMA_VERSION, PERF_ARTIFACT_SCHEMA_VERSION,
-    PERF_MAX_CV_PCT, PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES,
-    PairedClaimState, PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError,
-    PairedEstimatorReason, PairedEvidenceStatus, PairedExperimentResult, PerfCellResult,
-    PerfCellSpec, PerfCorpus, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PAIRED_ESTIMATOR_SCHEMA_VERSION,
+    PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,
+    PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PairedClaimState,
+    PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError, PairedEstimatorReason,
+    PairedEvidenceStatus, PairedExperimentResult, PerfCellResult, PerfCellSpec, PerfCorpus,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
     PerfMetricSemantics, PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm,
     PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode,
     QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment, machine_fingerprint,

@@ -6,23 +6,23 @@
 
 [defaults]
 oracle = "tantivy 0.26.1 via frankensearch-lexical (feature tantivy-oracle)"
-oracle_config = "identical analyzer semantics; identical heap budget; commits inside the same versioned operation scope for BOTH engines; symmetric setup/teardown and warmup outside decision samples; same-binary paired blocks with stable IDs and deterministic seeded balanced-random order; identical-pipeline A/A and candidate A/B"
+oracle_config = "identical analyzer semantics; identical heap budget; commits inside the same versioned operation scope for BOTH engines; symmetric setup/teardown and warmup outside decision samples; same-binary paired blocks with stable IDs and deterministic seeded balanced-random order; Tantivy/Tantivy A/A plus Quill/Quill A/A and candidate A/B in the same QG-1 invocation"
 build_profile = "release-perf equivalent: opt-level=3, lto=thin, codegen-units=1, force-frame-pointers=yes"
 stat_rule = "quill-paired-estimator-v1; >=10 complete blocks; primary effect is the robust center of paired log(treatment/control) with deterministic seeded paired-bootstrap 95% CI (2000 resamples); persist both-arm absolutes and a diagnostic ratio-of-arm-medians; A/A must pass predeclared center, CI-width, log-dispersion, order-balance, order-effect and drift limits; structural mismatch fails closed; invalid null or contradictory summaries emit NoDecision; NEVER gate on cv_pct"
 operation_scope = "stable operation_id@positive-version plus metric semantics and unit; Criterion may coexist only under an explicitly different scope or when it consumes the exact same raw blocks"
 raw_sample = "stable block/sample IDs; arm and execution order; warmup/measurement phase; monotonic start/end timestamps; matched docs/work and bytes denominators; executable/corpus/worker/profile provenance"
 decision_precedence = "Fatal > Block > Quarantine > NoDecision/Provisional > Allow"
 ratchet = ".bench-history/<gate>.latest.json committed; pass-over-pass within thresholds; regressions replay via seeded harness"
-machines = ["apple-silicon >= M2 Pro class (P/E asymmetric)", "x86 Zen3+ >=16C (RCH fleet for trend lines; documented noise budget; attribution runs LOCAL only per bd-e41k)"]
+machines = ["apple-silicon M4/M5 class (P/E asymmetric)", "x86 Zen3 Threadripper PRO 5995WX 64C/128T (trj high-core target)"]
 rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (per-OS abstraction mandatory — e8.4 notes)"
 
 [evidence]
 # Decision-grade artifact layer above the paired estimator (bd-uh2f / bd-uh2f.1).
-schema = "quill-perf-evidence-v1"
+schema = "quill-perf-evidence-v2"
 artifact = "<gate>.evidence.json sealed with an embedded SHA-256 over its own canonical JSON; <gate>.evidence.md derived from the persisted JSON string; atomic tmp+fsync+rename+dirsync writes; load verifies seal, recomputes every estimator from retained raw samples, and rejects truncated or stale-schema files; legacy v3 loads only via the explicit read-only path"
 estimands = "metric-specific, enforced by gate: QG-1/2/3/4/5/8 flat paired log ratio; QG-6 hierarchical two-stage per-query resampling (queries first, then blocks; 4 pinned queries per class); QG-7 process RSS; QG-9 cold open requiring verified cache-state proof (currently NoDecision: in-process reopen does not drop the OS page cache); QG-10 dependency facts outside timing A/A (diagnostic)"
 policy = "reconciliation dead band ln(1.005); absolute-vs-paired tolerance ln(1.25); >=2 hierarchical groups with >=2 pairs each; 1 warmup round outside every decision set; raw-sample cap 20000 per cell"
-provenance = "executing ELF SHA-256; git revision + dirty-state hash; Cargo.lock SHA-256; rustc/target/profile/features; machine fingerprint + governor + load averages; peak RSS with method (unsupported reported as absent, never zero); corpus/query-set hashes + generator seed/revision"
+provenance = "executing ELF SHA-256; git revision + dirty-state hash; Cargo.lock SHA-256; rustc/target/profile/features; host identity; host-wide physical cores and logical threads; process-available threads; exact thread widths exercised; runtime-detected ISA; effective affinity/cpuset cap; machine fingerprint + governor + load averages; peak RSS with method (unsupported reported as absent, never zero); corpus/query-set hashes + generator seed/revision"
 ratchet_seam = "invalid runs persist as InvalidNull/NoDecision and are never ratchet-admissible; downstream validators consult ratchet_admissible() and record Allow/Block/Quarantine via apply_gate_decision (bd-quill-e8-perf-doctrine-x4e4.15.1)"
 
 [corpus.tiny]
@@ -37,7 +37,7 @@ status = "LANDED deterministic content-addressed 1M-doc generator (quill-e6.1)"
 
 [gate.QG-1]
 name = "bulk indexing, multi-core"
-fixture = "medium + xlarge; positions ON; threads = 8; commit included in timed window"
+fixture = "tiny + small + medium + xlarge; positions ON/OFF; threads = 1,2,4,8,16,32,64,96,128; commit included in timed window"
 target = "docs_per_sec >= 3.0x oracle AND >= 0.60x measured tokenize-only bandwidth ceiling (honesty denominator lane: same corpus through the tokenizer alone)"
 activated = false
 
