@@ -7616,11 +7616,12 @@ mod tests {
             .claim_fresh_campaign()
             .expect("claim UNION_HORIZON Tantivy oracle");
 
-        let ranges = segment_split.map_or_else(
-            || vec![0..fixture.documents.len()],
-            |split| vec![0..split, split..fixture.documents.len()],
-        );
+        let split = segment_split.unwrap_or(fixture.documents.len());
+        let ranges = [0..split, split..fixture.documents.len()];
         for range in ranges {
+            if range.is_empty() {
+                continue;
+            }
             let documents = fixture.documents[range]
                 .iter()
                 .cloned()
@@ -7657,8 +7658,19 @@ mod tests {
             .expect("commit UNION_HORIZON Tantivy campaign");
 
         let expected_segment_doc_counts = segment_split.map_or_else(
-            || vec![UNION_HORIZON_DOCUMENT_COUNT as u32],
-            |split| vec![split as u32, (UNION_HORIZON_DOCUMENT_COUNT - split) as u32],
+            || {
+                vec![
+                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                        .expect("UNION_HORIZON document count fits u32"),
+                ]
+            },
+            |split| {
+                vec![
+                    u32::try_from(split).expect("UNION_HORIZON segment split fits u32"),
+                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
+                        .expect("UNION_HORIZON tail segment count fits u32"),
+                ]
+            },
         );
         let snapshot = subject
             .index()
@@ -7830,10 +7842,16 @@ mod tests {
                 .clone(),
         )
         .expect("UNION_HORIZON trace is UTF-8");
-        let segment_doc_count = segment_split
-            .map_or(UNION_HORIZON_DOCUMENT_COUNT as u64, |split| {
-                (UNION_HORIZON_DOCUMENT_COUNT - split) as u64
-            });
+        let segment_doc_count = segment_split.map_or_else(
+            || {
+                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                    .expect("UNION_HORIZON document count fits u64")
+            },
+            |split| {
+                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
+                    .expect("UNION_HORIZON tail segment count fits u64")
+            },
+        );
         let trace = union_horizon_trace_receipt(&logs, segment_doc_count);
 
         UnionHorizonProof { comparisons, trace }
