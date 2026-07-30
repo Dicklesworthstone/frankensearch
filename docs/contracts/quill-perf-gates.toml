@@ -61,7 +61,7 @@ activated = false
 
 [gate.QG-5]
 name = "full compaction"
-fixture = "1M docs (xlarge) at tombstone densities {5, 20, 50}% — NEVER 0% (bd-6m8p lesson)"
+fixture = "50k docs (medium) at tombstone densities {5, 20, 50}% — NEVER 0% (bd-6m8p lesson). Scored on medium, not xlarge: corpus.xlarge is still PENDING its e6.1 generator, so an xlarge-pinned cell can only ever emit NoDecision and never scores. Re-pin to xlarge and re-baseline when the generator lands."
 target = "wall-clock >= 5x faster than oracle force-merge at 20%; report all densities"
 activated = false
 

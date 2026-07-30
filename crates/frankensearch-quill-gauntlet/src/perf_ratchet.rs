@@ -1624,8 +1624,10 @@ fn evaluate_qg4(target: &mut GateTargetEvaluator<'_, '_>) {
 }
 
 fn evaluate_qg5(target: &mut GateTargetEvaluator<'_, '_>) {
+    // Fixture tracks `PerfMatrixSpec`'s QG-5 cell label, which scores on the
+    // committed `medium` corpus rather than the still-PENDING xlarge generator.
     if let Some(ratio) = target.value(
-        "compaction/xlarge/20pct",
+        "compaction/medium/20pct",
         "wall_clock_ms_quill_over_tantivy",
         "paired_ab",
     ) {
