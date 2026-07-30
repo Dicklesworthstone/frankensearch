@@ -1,26 +1,29 @@
-# E8-H P12 — canonical-encode direct preimage encoder (bd-e8h-w2-canonical-encode-si8mk takeover), local-5975wx-32c (2026-07-30) — DRAFT (BANKED, publication freeze)
+# E8-H P12 — canonical-encode direct preimage encoder (bd-e8h-w2-canonical-encode-si8mk takeover), local-5975wx-32c (2026-07-30)
 
-**Landing provenance:** landed at 928a16ba-successor; measurements are diagnostic/NoClaim per card scope.
+**Publication provenance:** integrated after `a61456ec` in evidence-set
+commit `5b91f680`; measurements are diagnostic/NoClaim per card scope.
 
 **Task:** implement and adjudicate the rank-1 QG-2 lever from the P9
-generator-corrected attribution (`scratchpad/p9/p9-local-qg2-generator-corrected-attribution-DRAFT.md`):
+generator-corrected attribution
+(`docs/evidence/e8h/p9-local-qg2-generator-corrected-attribution.md`):
 replace the serde_json-built canonical document preimage
 (`canonical_document_preimage` + `canonical_metadata`,
 `crates/frankensearch-quill/src/index.rs`) with a direct encoder producing
 BYTE-IDENTICAL preimage bytes, under the registry-1.0.2 IDMAP `content_hash`
 contract (xxh3 over exactly those bytes). Sanctioned takeover of the silent
 W2.5/W2 lanes (IndigoOsprey/RusticDeer salvage, ScarletPelican retainer).
-Freeze constraints held: zero shared-tree edits/commits/tracker calls;
-overlay-only on pristine `git archive 3684b147`; all artifacts in
-`scratchpad/p12/`.
+The measurement freeze constraints held: the pass made zero shared-tree
+edits, commits, or tracker calls; it was overlay-only on pristine
+`git archive 3684b147`, with raw session artifacts in `scratchpad/p12/`.
 
 ## W2.5 negative-result disposition (the brief said it was LOST — it is NOT)
 
 The W2.5 lane's "naive direct-encoder falsified" result WAS ledgered, but only
-on a non-main lineage: commit `217e73c1` ("perf(quill): bank contaminated
-W2.5 encoder diagnostic", YellowSparrow, 2026-07-29, reachable from the
-`codex/*` branches, NOT in `origin/main`) appends full NEGATIVE_EVIDENCE.md +
-PERF_LEDGER.md rows. Contents that bind this pass:
+on a non-main lineage when this pass was adjudicated: commit `217e73c1`
+("perf(quill): bank contaminated W2.5 encoder diagnostic", YellowSparrow,
+2026-07-29, then reachable from `codex/*` branches but not `origin/main`)
+appends full NEGATIVE_EVIDENCE.md + PERF_LEDGER.md rows. Contents that bind
+this pass:
 
 - Falsified form: a **scalar per-byte hand-written canonical JSON emitter**
   replacing `serde_json::to_vec` (their overlay diff sha

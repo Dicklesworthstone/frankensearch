@@ -1,6 +1,7 @@
-# E8-H P9 — GENERATOR-CORRECTED arm-scoped attribution, quill QG-2 ingest, local-5975wx-32c (2026-07-29/30) — DRAFT (BANKED, publication freeze)
+# E8-H P9 — GENERATOR-CORRECTED arm-scoped attribution, quill QG-2 ingest, local-5975wx-32c (2026-07-29/30)
 
-**Landing provenance:** landed at 928a16ba-successor; measurements are diagnostic/NoClaim per card scope.
+**Publication provenance:** integrated after `a61456ec` in evidence-set
+commit `5b91f680`; measurements are diagnostic/NoClaim per card scope.
 
 **Task:** the sibling card `docs/evidence/e8h/p1-local-qg2-incumbent-copy-comparison-20260729.md`
 (commit `5b19f4f2`) proved the QG-2 200k in-memory profiles are contaminated:
@@ -9,8 +10,9 @@ of BOTH arms, and the Round-1 "canonicalization ~12-15% family" figure was
 suspected of being inflated by generator frame-name collisions (fmt/serde).
 This card partitions every sample of a fresh quill-child profile by CALL
 CHAIN — generator subtree vs engine subtree — and re-derives the engine-only
-family table plus the lever ranking. Measurement-only pass: zero shared-tree
-edits, zero commits, zero tracker calls.
+family table plus the lever ranking. The measurement pass itself made zero
+shared-tree edits, commits, or tracker calls; this document is its published
+diagnostic record.
 
 **Headline: the deflation feared by 5b19f4f2 does NOT kill the canonical
 lever. Net of ALL generator cost, canonicalization/identity is 16.2% of the

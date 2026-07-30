@@ -1,9 +1,12 @@
-# E8-H P7 — QG-2 ingest codegen sensitivity (target-cpu G/N/Z), LOCAL — DRAFT (measurement-only, publication freeze)
+# E8-H P7 — QG-2 ingest codegen sensitivity (target-cpu G/N/Z), LOCAL
 
-**Landing provenance:** landed at 928a16ba-successor; measurements are diagnostic/NoClaim per card scope.
+**Publication provenance:** integrated after `a61456ec` in evidence-set
+commit `5b91f680`; measurements are diagnostic/NoClaim per card scope.
 
-**Status: NULL RESULT, hypothesis evidence only.** Zero shared-tree edits, zero
-commits, zero tracker mutations. All artifacts under `scratchpad/p7/`.
+**Status: PUBLISHED NULL RESULT, hypothesis evidence only.** The measurement
+pass itself made zero shared-tree edits, commits, or tracker mutations; this
+publication adds the card and its explicit SURVEY row. Raw session artifacts
+remain under `scratchpad/p7/`.
 
 **Machine class: local-5975wx-32c** (AMD Ryzen Threadripper PRO 5975WX, Zen 3,
 Linux 6.17.0-35-generic). Diagnostic-only class. **Every number in this card is
@@ -181,8 +184,8 @@ that the win there came from removing hash WORK, not from wider vectors.
    per-class CI/perf-runner build profiles — now evidence-free on Zen 3 — or
    `#[target_feature]` dispatch in source, which re-opens the bd-7zjk
    packaging question and now also lacks a demonstrated ingest-side payoff.)
-3. **Do NOT write a NEGATIVE_EVIDENCE row from this pass** (publication
-   freeze); this card is the banked draft for the orchestrator to publish.
+3. **The published NEGATIVE_EVIDENCE row remains a SURVEY/NULL.** Do not
+   promote this diagnostic pass into a lever verdict or QG claim.
 
 ## Repro
 

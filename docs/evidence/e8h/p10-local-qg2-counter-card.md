@@ -1,12 +1,14 @@
 # P10 — Same-binary two-arm perf-counter card (local-5975wx-32c, seam-diagnostic)
 
-**Landing provenance:** landed at 928a16ba-successor; measurements are diagnostic/NoClaim per card scope.
+**Publication provenance:** integrated after `a61456ec` in evidence-set
+commit `5b91f680`; measurements are diagnostic/NoClaim per card scope.
 
-Date: 2026-07-30T~02:00Z. Author: SandyGrove (orchestrator-run). Status: BANKED
-DRAFT (publication freeze; lands with the batch). This is the local-class half
-of the approved P7 routing ("same-binary cross-class counters"); the 5800X/trj/
-m4 halves difference against THIS card later. Seam = QG-2 smoke memory child
-(200k docs, thread=1, positions on, core 8) — NEVER gate evidence.
+Date: 2026-07-30T~02:00Z. Author: SandyGrove (orchestrator-run). Status:
+PUBLISHED DIAGNOSTIC (the measurement was banked under the publication
+freeze). This is the local-class half of the approved P7 routing
+("same-binary cross-class counters"); the 5800X/trj/m4 halves difference
+against THIS card later. Seam = QG-2 smoke memory child (200k docs, thread=1,
+positions on, core 8) — NEVER gate evidence.
 
 ELF: perf_matrix_G (P7 generic build) sha256 ae96a2ac... — SAME binary, both
 arms. perf stat, 3 interleaved runs per arm, medians.

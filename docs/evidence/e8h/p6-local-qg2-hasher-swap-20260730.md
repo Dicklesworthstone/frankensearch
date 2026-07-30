@@ -1,11 +1,12 @@
 # E8-H P6 — TermInterner bucket-map identity-hasher swap, LOCAL QG-2 ingest (measured 2026-07-29, landed 2026-07-30)
 
-**Bead:** `bd-e8h-w2-u64-hasher-swap-vcfft`. **Status: LANDED** at the
-928a16ba landing base (origin/main == origin/master ==
-`928a16baed6d997fb5f63827387eb51cb3f4f4fa`), third slot in the frozen
-post-UNION landing order. The lever was measured under a publication freeze
-as `scratchpad/p6/p6-hasher-swap.patch` (81-line unified diff against the
-continuity base's `crates/frankensearch-quill/src/scribe.rs`) and is landed
+**Bead:** `bd-e8h-w2-u64-hasher-swap-vcfft`. **Status: LANDED** through the
+serialized post-UNION integration train rooted at
+`a61456eca99c2a19394e37fe5d826094989982d6` (source commit `bd16d35d` in that
+train). The lever was prepared and revalidated on the exact `928a16ba`
+landing base, measured under a publication freeze as
+`scratchpad/p6/p6-hasher-swap.patch` (81-line unified diff against the
+continuity base's `crates/frankensearch-quill/src/scribe.rs`), and published
 here together with this card.
 
 ## Verdict

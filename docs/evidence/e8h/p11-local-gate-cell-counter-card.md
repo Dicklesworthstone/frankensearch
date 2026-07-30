@@ -1,13 +1,15 @@
-# E8-H P11 — GATE-CELL-SHAPED counter battery, QG-2 bulk/medium, local-5975wx-32c (2026-07-30) — DRAFT (BANKED, publication freeze)
+# E8-H P11 — GATE-CELL-SHAPED counter battery, QG-2 bulk/medium, local-5975wx-32c (2026-07-30)
 
-**Landing provenance:** landed at 928a16ba-successor; measurements are diagnostic/NoClaim per card scope.
+**Publication provenance:** integrated after `a61456ec` in evidence-set
+commit `5b91f680`; measurements are diagnostic/NoClaim per card scope.
 
 **NoClaim. Diagnostic attribution evidence only. This battery NEVER activates a
 QG and produces NO speed claim** (prereg exclusion, quoted verbatim below).
 Executed against the FROZEN pre-registration
 `scratchpad/p11-gate-cell-counter-battery-PREREG.md` (registered before any
 collection; both collection gates satisfied: P9 reported, timed slot free).
-Measurement-only pass: zero shared-tree edits, zero commits, zero tracker calls.
+The measurement pass itself made zero shared-tree edits, commits, or tracker
+calls; this document is its published diagnostic record.
 
 ## HEADLINE (estimand 1, primary)
 
