@@ -31,8 +31,8 @@ use thiserror::Error;
 
 use crate::error::QuillError;
 use crate::grimoire::{
-    ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermInput, TermMetadata,
-    TermSectionLengths, ValidatedTermDictionaryMetadata,
+    ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermDictionaryError, TermInput,
+    TermMetadata, TermSectionLengths, ValidatedTermDictionaryMetadata,
 };
 use crate::quiver::{
     BlockMaxConcatList, DocLenFieldInput, DocLenSection, EncodedBlockMax, EncodedDocLenSection,
@@ -582,6 +582,16 @@ pub enum KeeperError {
         path: PathBuf,
         /// Failed identity, range, length, or checksum-witness comparison.
         detail: String,
+    },
+    /// Eager TERMDICT admission stopped for a reason that does not prove the
+    /// durable segment bytes are corrupt.
+    #[error("cannot admit Quill TERMDICT metadata at {path}: {source}")]
+    SegmentTermDictionaryUnavailable {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Schema, resource-budget, allocation, or host-size diagnosis.
+        #[source]
+        source: TermDictionaryError,
     },
     /// A queryable segment omitted one required identity section.
     #[error("Quill segment at {path} is missing required identity section {kind:?}")]
@@ -1995,12 +2005,60 @@ fn validate_term_dictionary_metadata(
             .map(|entry| entry.len),
         blockmax: required_section_length(path, reader, SectionKind::BLOCKMAX)?,
     };
-    TermDictionary::validate_metadata(dictionary, schema, sections).map_err(|source| {
-        KeeperError::SegmentMetadataMismatch {
+    TermDictionary::validate_metadata(dictionary, schema, sections)
+        .map_err(|source| term_dictionary_admission_error(path, source))
+}
+
+fn term_dictionary_admission_error(path: &Path, source: TermDictionaryError) -> KeeperError {
+    match source {
+        source @ (TermDictionaryError::InvalidSchema { .. }
+        | TermDictionaryError::ByteBudgetExceeded { .. }
+        | TermDictionaryError::BlockBudgetExceeded { .. }
+        | TermDictionaryError::TermBudgetExceeded { .. }
+        | TermDictionaryError::RestartBudgetExceeded { .. }
+        | TermDictionaryError::NonAscendingInput { .. }
+        | TermDictionaryError::InvalidRange
+        | TermDictionaryError::MaterializationLimitExceeded { .. }
+        | TermDictionaryError::GlobExpansionLimitExceeded { .. }
+        | TermDictionaryError::Allocation { .. }
+        | TermDictionaryError::SizeOverflow { .. }) => {
+            KeeperError::SegmentTermDictionaryUnavailable {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+        source @ (TermDictionaryError::ImplausibleBlockCount { .. }
+        | TermDictionaryError::Truncated { .. }
+        | TermDictionaryError::NonCanonicalVint { .. }
+        | TermDictionaryError::VintOverflow { .. }
+        | TermDictionaryError::ValueOutOfRange { .. }
+        | TermDictionaryError::TermTooLong { .. }
+        | TermDictionaryError::UnknownField { .. }
+        | TermDictionaryError::NonTermField { .. }
+        | TermDictionaryError::NonAscendingKey { .. }
+        | TermDictionaryError::ZeroDocFrequency { .. }
+        | TermDictionaryError::EmptyReference { .. }
+        | TermDictionaryError::ReferenceOverflow { .. }
+        | TermDictionaryError::ReferenceOutOfBounds { .. }
+        | TermDictionaryError::NonContiguousReference { .. }
+        | TermDictionaryError::SectionLengthMismatch { .. }
+        | TermDictionaryError::PositionsPresenceMismatch { .. }
+        | TermDictionaryError::PositionsSectionMismatch { .. }
+        | TermDictionaryError::NonAscendingIndexKey { .. }
+        | TermDictionaryError::InvalidBlockOffset { .. }
+        | TermDictionaryError::EmptyBlock { .. }
+        | TermDictionaryError::ImplausibleEntryCount { .. }
+        | TermDictionaryError::OversizedBlock { .. }
+        | TermDictionaryError::PrematureBlockSplit { .. }
+        | TermDictionaryError::InvalidPrefix { .. }
+        | TermDictionaryError::NonCanonicalPrefix { .. }
+        | TermDictionaryError::IndexKeyMismatch { .. }
+        | TermDictionaryError::TrailingBlockBytes { .. }
+        | TermDictionaryError::TrailingEmptyBytes { .. }) => KeeperError::SegmentMetadataMismatch {
             path: path.to_path_buf(),
             detail: source.to_string(),
-        }
-    })
+        },
+    }
 }
 
 fn first_tombstone_hole(
@@ -15356,6 +15414,91 @@ mod tests {
             "the prior snapshot retains its own cache generation"
         );
         Ok(())
+    }
+
+    #[test]
+    fn term_dictionary_admission_preserves_resource_and_corruption_taxonomy() {
+        let path = Path::new("segment-0000000000000cab.fslx");
+        let non_corruption = [
+            TermDictionaryError::InvalidSchema {
+                detail: "test schema rejection".to_owned(),
+            },
+            TermDictionaryError::ByteBudgetExceeded {
+                limit: 8,
+                actual: 9,
+            },
+            TermDictionaryError::BlockBudgetExceeded {
+                limit: 8,
+                actual: 9,
+            },
+            TermDictionaryError::TermBudgetExceeded {
+                limit: 8,
+                actual: 9,
+            },
+            TermDictionaryError::RestartBudgetExceeded {
+                limit: 8,
+                actual: 9,
+            },
+            TermDictionaryError::NonAscendingInput { index: 1 },
+            TermDictionaryError::InvalidRange,
+            TermDictionaryError::MaterializationLimitExceeded { limit: 8 },
+            TermDictionaryError::GlobExpansionLimitExceeded {
+                field_ord: 1,
+                limit: 8,
+                actual: 9,
+            },
+            TermDictionaryError::Allocation {
+                context: "test metadata",
+                count: 9,
+            },
+            TermDictionaryError::SizeOverflow {
+                field: "test metadata",
+            },
+        ];
+        for source in non_corruption {
+            let error = term_dictionary_admission_error(path, source);
+            assert!(
+                matches!(error, KeeperError::SegmentTermDictionaryUnavailable { .. }),
+                "non-corruption TERMDICT failure changed class: {error}",
+            );
+            assert!(
+                !recovery_retryable(&error),
+                "resource/schema/query-shape failures must not be retried as damaged segments",
+            );
+            let public: SearchError = error.into();
+            assert!(
+                matches!(
+                    public,
+                    SearchError::SubsystemError {
+                        subsystem: "quill",
+                        ..
+                    }
+                ),
+                "non-corruption TERMDICT failure became public corruption: {public}",
+            );
+        }
+
+        let error = term_dictionary_admission_error(
+            path,
+            TermDictionaryError::Truncated {
+                offset: 4,
+                needed: 8,
+                remaining: 1,
+            },
+        );
+        assert!(
+            matches!(error, KeeperError::SegmentMetadataMismatch { .. }),
+            "malformed durable TERMDICT bytes must remain segment corruption: {error}",
+        );
+        assert!(
+            recovery_retryable(&error),
+            "durable TERMDICT mismatch retains the read-once recovery retry",
+        );
+        let public: SearchError = error.into();
+        assert!(
+            matches!(public, SearchError::IndexCorrupted { .. }),
+            "malformed durable TERMDICT bytes must remain public corruption: {public}",
+        );
     }
 
     #[test]
