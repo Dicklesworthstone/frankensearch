@@ -74,12 +74,22 @@ pub fn perf_manifest_contract_sha256(manifest: &str) -> String {
 }
 
 fn lower_sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    finish_sha256_hex(Sha256::new_with_prefix(bytes))
+}
+
+fn finish_sha256_hex(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
     encoded
+}
+
+fn update_length_framed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(bytes.len().to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(bytes);
 }
 
 /// Equal total heap budget for one thread-count cell.
@@ -293,6 +303,24 @@ impl PerfCellSpec {
             topology: None,
         }
     }
+
+    /// Domain-separated identity of every serialized cell-contract field.
+    ///
+    /// The JSON payload is length-framed so string contents cannot alias field
+    /// boundaries. Struct field order and enum spellings are deliberately part
+    /// of this versioned contract: adding, removing, reordering, or changing a
+    /// field changes the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error if the cell cannot be serialized.
+    pub fn contract_sha256(&self) -> Result<String, GauntletError> {
+        let encoded = serde_json::to_vec(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.perf-cell-contract.v1\0");
+        update_length_framed(&mut hasher, encoded.as_slice());
+        Ok(finish_sha256_hex(hasher))
+    }
 }
 
 /// Complete, deterministic QG-1..QG-10 execution matrix.
@@ -303,6 +331,16 @@ pub struct PerfMatrixSpec {
 }
 
 impl PerfMatrixSpec {
+    /// Schema bound into canonical gate-matrix identities.
+    pub const CONTRACT_SCHEMA_VERSION: &str = "quill-perf-gate-matrix-contract-v1";
+
+    /// Reviewed identity of the unchanged canonical 74-cell QG-1 universe.
+    ///
+    /// Per-machine applicability plans project this universe; they must never
+    /// replace it with a smaller caller-selected matrix.
+    pub const QG1_CANONICAL_SHA256: &str =
+        "1b0080f0ebb444a9e653161e4989c6df19971235037d44b45e2506c2cbf2a3a7";
+
     /// Build every normative cell. Runtime slice filters may select a gate or
     /// fixture, but they never redefine the matrix.
     #[must_use]
@@ -503,6 +541,39 @@ impl PerfMatrixSpec {
             .filter(|cell| cell.gate == gate)
             .filter_map(|cell| cell.threads)
             .max()
+    }
+
+    /// Hash one gate's ordered projection from the global immutable matrix.
+    ///
+    /// This binds the matrix schema, gate, cell count, cell order, and every
+    /// domain-separated cell-contract hash. The normalized semantic manifest
+    /// hash remains a separate identity so later plans can reconcile both
+    /// independently. Applicability is intentionally absent: a later
+    /// machine-bound plan classifies these exact cells without redefining them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gate has no cells or a cell cannot be
+    /// serialized.
+    pub fn gate_contract_sha256(&self, gate: PerfGate) -> Result<String, GauntletError> {
+        let cells = self.for_gate(gate);
+        if cells.is_empty() {
+            return Err(GauntletError::InvalidCampaign {
+                reason: format!("{} has no cells to hash", gate),
+            });
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.perf-gate-matrix-contract.v1\0");
+        update_length_framed(&mut hasher, Self::CONTRACT_SCHEMA_VERSION.as_bytes());
+        update_length_framed(&mut hasher, gate.label().as_bytes());
+        update_length_framed(&mut hasher, cells.len().to_string().as_bytes());
+        for (ordinal, cell) in cells.into_iter().enumerate() {
+            update_length_framed(&mut hasher, ordinal.to_string().as_bytes());
+            let cell_sha256 = cell.contract_sha256()?;
+            update_length_framed(&mut hasher, cell_sha256.as_bytes());
+        }
+        Ok(finish_sha256_hex(hasher))
     }
 }
 
@@ -2500,6 +2571,8 @@ fn validate_qg6_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
 mod tests {
     use super::*;
 
+    const PERF_MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+
     #[test]
     fn prepared_input_fingerprint_binds_each_component_independently() {
         let identity = PerfInputIdentity {
@@ -3092,6 +3165,128 @@ mod tests {
     }
 
     #[test]
+    fn qg1_matrix_identity_is_golden_ordered_and_roundtrips() {
+        let matrix = PerfMatrixSpec::complete();
+        let qg1_cells = matrix.for_gate(PerfGate::Qg1);
+        assert_eq!(qg1_cells.len(), 74);
+
+        let qg1_sha256 = matrix
+            .gate_contract_sha256(PerfGate::Qg1)
+            .expect("hash canonical QG-1 matrix");
+        assert_eq!(qg1_sha256, PerfMatrixSpec::QG1_CANONICAL_SHA256);
+        assert_eq!(qg1_sha256.len(), 64);
+        assert!(
+            qg1_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+
+        let cell_hashes = qg1_cells
+            .iter()
+            .map(|cell| cell.contract_sha256().expect("hash QG-1 cell"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cell_hashes.len(), qg1_cells.len());
+
+        let encoded = serde_json::to_vec(&matrix).expect("encode matrix");
+        let decoded: PerfMatrixSpec = serde_json::from_slice(&encoded).expect("decode matrix");
+        assert_eq!(
+            decoded
+                .gate_contract_sha256(PerfGate::Qg1)
+                .expect("hash decoded QG-1 matrix"),
+            qg1_sha256
+        );
+
+        let mut reordered = matrix.clone();
+        let qg1_indices = reordered
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| (cell.gate == PerfGate::Qg1).then_some(index))
+            .collect::<Vec<_>>();
+        reordered.cells.swap(qg1_indices[0], qg1_indices[1]);
+        assert_ne!(
+            reordered
+                .gate_contract_sha256(PerfGate::Qg1)
+                .expect("hash reordered QG-1 matrix"),
+            qg1_sha256
+        );
+
+        let mut changed_cell = matrix.clone();
+        changed_cell.cells[qg1_indices[0]]
+            .fixture
+            .push_str("/mutated");
+        assert_ne!(
+            changed_cell
+                .gate_contract_sha256(PerfGate::Qg1)
+                .expect("hash cell-mutated QG-1 matrix"),
+            qg1_sha256
+        );
+    }
+
+    #[test]
+    fn cell_identity_binds_every_serialized_contract_field() {
+        let cell = PerfCellSpec {
+            gate: PerfGate::Qg6,
+            fixture: "query/identifier/k10/100k".to_owned(),
+            metric: "latency_ms".to_owned(),
+            corpus: Some(PerfCorpus::Medium),
+            document_count: Some(100_000),
+            threads: Some(8),
+            writer_heap_bytes: Some(perf_writer_heap_bytes(8)),
+            positions: Some(PositionMode::On),
+            tombstone_density_pct: Some(10),
+            query_class: Some(PerfQueryClass::Identifier),
+            k: Some(10),
+            topology: Some(PerfTopology::InProcess),
+        };
+        let baseline = cell.contract_sha256().expect("hash complete cell");
+        let assert_changed = |mutated: PerfCellSpec, field: &str| {
+            assert_ne!(
+                mutated.contract_sha256().expect("hash mutated cell"),
+                baseline,
+                "{field} must participate in the cell-contract identity"
+            );
+        };
+
+        let mut mutated = cell.clone();
+        mutated.gate = PerfGate::Qg1;
+        assert_changed(mutated, "gate");
+        let mut mutated = cell.clone();
+        mutated.fixture.push_str("/mutated");
+        assert_changed(mutated, "fixture");
+        let mut mutated = cell.clone();
+        mutated.metric.push_str("_mutated");
+        assert_changed(mutated, "metric");
+        let mut mutated = cell.clone();
+        mutated.corpus = Some(PerfCorpus::Xlarge);
+        assert_changed(mutated, "corpus");
+        let mut mutated = cell.clone();
+        mutated.document_count = Some(1_000_000);
+        assert_changed(mutated, "document_count");
+        let mut mutated = cell.clone();
+        mutated.threads = Some(16);
+        assert_changed(mutated, "threads");
+        let mut mutated = cell.clone();
+        mutated.writer_heap_bytes = Some(perf_writer_heap_bytes(16));
+        assert_changed(mutated, "writer_heap_bytes");
+        let mut mutated = cell.clone();
+        mutated.positions = Some(PositionMode::Off);
+        assert_changed(mutated, "positions");
+        let mut mutated = cell.clone();
+        mutated.tombstone_density_pct = Some(20);
+        assert_changed(mutated, "tombstone_density_pct");
+        let mut mutated = cell.clone();
+        mutated.query_class = Some(PerfQueryClass::Boolean);
+        assert_changed(mutated, "query_class");
+        let mut mutated = cell.clone();
+        mutated.k = Some(100);
+        assert_changed(mutated, "k");
+        let mut mutated = cell;
+        mutated.topology = Some(PerfTopology::FreshProcess);
+        assert_changed(mutated, "topology");
+    }
+
+    #[test]
     fn qg6_matrix_rejects_missing_duplicate_reclassified_and_non_warm_cells() {
         let complete = PerfMatrixSpec::complete();
         let first_qg6 = complete
@@ -3124,7 +3319,7 @@ mod tests {
 
     #[test]
     fn manifest_contract_hash_ignores_only_activation_state() {
-        let manifest = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+        let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
         assert_eq!(
             perf_manifest_contract_sha256(manifest),

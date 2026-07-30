@@ -14,13 +14,13 @@
 //!     --features perf-harness --profile release-perf --bench perf_matrix
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, runtime::Runtime};
@@ -35,17 +35,17 @@ use frankensearch_quill::{
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
-    CountState, DistributionSummary, EngineConcurrencyObservation, EngineObservation, EvidenceCell,
-    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, MachineIdentity,
-    NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS, PairedEstimatorConfig,
-    PeakRssEvidence, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
-    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
-    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
-    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
-    Qg6SearchResult, Qg6SelectionScope, Qg6SemanticContract, RankClass, RankedHit,
-    ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
+    CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
+    EngineObservation, EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceProvenance,
+    EvidenceRole, MachineIdentity, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
+    PairedEstimatorConfig, PeakRssEvidence, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine,
+    PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate,
+    PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope,
+    PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
+    PerfSampleProvenance, PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
+    Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding,
+    Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SelectionScope, Qg6SemanticContract,
+    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
     command_sha256_from_argv, compare_observations, estimate_paired_experiment,
     machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
     seeded_balanced_pair_order, validate_matrix,
@@ -315,10 +315,212 @@ struct PreparedQueryPreflight {
     observation: Option<EngineObservation>,
 }
 
+struct PreparedQg1Prefix {
+    manifest: CorpusManifest,
+    manifest_sha256: String,
+    indexed_content_sha256: String,
+}
+
+struct PreparedQg1Corpus {
+    documents: Arc<[IndexableDocument]>,
+    prefixes: BTreeMap<u64, PreparedQg1Prefix>,
+}
+
+fn hash_qg1_indexed_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(
+        u64::try_from(bytes.len())
+            .expect("QG-1 indexed field length fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(bytes);
+}
+
+fn qg1_indexed_content_sha256(documents: &[IndexableDocument]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch-quill-qg1-indexable-documents-v1\0");
+    hasher.update(
+        u64::try_from(documents.len())
+            .expect("QG-1 indexed document count fits u64")
+            .to_le_bytes(),
+    );
+    let mut metadata = Vec::new();
+    for document in documents {
+        hash_qg1_indexed_bytes(&mut hasher, document.id.as_bytes());
+        match &document.title {
+            Some(title) => {
+                hasher.update([1]);
+                hash_qg1_indexed_bytes(&mut hasher, title.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hash_qg1_indexed_bytes(&mut hasher, document.content.as_bytes());
+
+        metadata.extend(document.metadata.iter());
+        metadata.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left_value.cmp(right_value))
+        });
+        hasher.update(
+            u64::try_from(metadata.len())
+                .expect("QG-1 indexed metadata count fits u64")
+                .to_le_bytes(),
+        );
+        for (key, value) in &metadata {
+            hash_qg1_indexed_bytes(&mut hasher, key.as_bytes());
+            hash_qg1_indexed_bytes(&mut hasher, value.as_bytes());
+        }
+        metadata.clear();
+    }
+    lower_hex(&hasher.finalize())
+}
+
+impl PreparedQg1Corpus {
+    fn for_selected(scale: MatrixScale, selected: &[PerfCellSpec]) -> Option<Self> {
+        let effective_counts = selected
+            .iter()
+            .filter(|spec| spec.gate == PerfGate::Qg1)
+            .map(|spec| {
+                scale.document_count(
+                    spec.document_count
+                        .expect("selected QG-1 cell has a document count"),
+                )
+            });
+        Self::from_effective_counts(effective_counts)
+    }
+
+    fn from_effective_counts(counts: impl IntoIterator<Item = u64>) -> Option<Self> {
+        let mut distinct_counts = BTreeSet::new();
+        for count in counts {
+            assert!(count > 0, "prepared QG-1 corpus count must be positive");
+            distinct_counts.insert(count);
+        }
+        let largest_count = distinct_counts.last().copied()?;
+        let largest_corpus = corpus_for(largest_count);
+        let generated = largest_corpus.iter().collect::<Vec<_>>();
+        assert_eq!(
+            generated.len(),
+            usize::try_from(largest_count).expect("largest QG-1 corpus count fits usize"),
+            "prepared QG-1 corpus materialized a different document count"
+        );
+
+        let mut verified_manifests = BTreeMap::new();
+        for count in distinct_counts {
+            let prefix_len = usize::try_from(count).expect("QG-1 corpus prefix count fits usize");
+            let manifest = corpus_for(count)
+                .manifest()
+                .expect("build exact prepared QG-1 corpus manifest");
+            let generated_prefix = generated
+                .get(..prefix_len)
+                .expect("prepared QG-1 manifest prefix is within the largest corpus");
+            manifest
+                .verify_documents(generated_prefix)
+                .expect("prepared QG-1 corpus prefix matches its exact manifest");
+            assert_eq!(
+                manifest.document_count, count,
+                "prepared QG-1 prefix manifest count drifted"
+            );
+            assert!(
+                verified_manifests
+                    .insert(
+                        count,
+                        (
+                            manifest
+                                .manifest_hash()
+                                .expect("hash verified QG-1 corpus manifest"),
+                            manifest,
+                        ),
+                    )
+                    .is_none(),
+                "prepared QG-1 corpus repeated an effective count"
+            );
+        }
+
+        let documents: Arc<[IndexableDocument]> = generated
+            .into_iter()
+            .map(IndexableDocument::from)
+            .collect::<Vec<_>>()
+            .into();
+        let prefixes = verified_manifests
+            .into_iter()
+            .map(|(count, (manifest_sha256, manifest))| {
+                let prefix_len =
+                    usize::try_from(count).expect("QG-1 corpus prefix count fits usize");
+                let indexed_documents = documents
+                    .get(..prefix_len)
+                    .expect("prepared QG-1 corpus prefix is within the largest corpus");
+                (
+                    count,
+                    PreparedQg1Prefix {
+                        manifest,
+                        manifest_sha256,
+                        indexed_content_sha256: qg1_indexed_content_sha256(indexed_documents),
+                    },
+                )
+            })
+            .collect();
+        Some(Self {
+            documents,
+            prefixes,
+        })
+    }
+
+    fn prefix(&self, document_count: u64) -> (&PreparedQg1Prefix, &[IndexableDocument]) {
+        let prefix = self
+            .prefixes
+            .get(&document_count)
+            .expect("selected QG-1 corpus prefix was prepared");
+        let prefix_len = usize::try_from(prefix.manifest.document_count)
+            .expect("prepared QG-1 manifest count fits usize");
+        assert_eq!(
+            prefix.manifest.document_count, document_count,
+            "prepared QG-1 prefix identity drifted"
+        );
+        (
+            prefix,
+            self.documents
+                .get(..prefix_len)
+                .expect("prepared QG-1 prefix is within the largest corpus"),
+        )
+    }
+
+    fn validate_prefix(&self, document_count: u64) -> Result<(&str, &str), String> {
+        let prefix = self
+            .prefixes
+            .get(&document_count)
+            .ok_or_else(|| format!("QG-1 corpus prefix {document_count} was not prepared"))?;
+        if prefix.manifest.document_count != document_count {
+            return Err(format!(
+                "QG-1 manifest count {} differs from prepared prefix {document_count}",
+                prefix.manifest.document_count
+            ));
+        }
+        let prefix_len = usize::try_from(document_count)
+            .map_err(|error| format!("QG-1 corpus prefix count does not fit usize: {error}"))?;
+        let indexed_documents = self
+            .documents
+            .get(..prefix_len)
+            .ok_or_else(|| "QG-1 prepared corpus is shorter than its prefix".to_owned())?;
+        let observed_manifest_sha256 = prefix
+            .manifest
+            .manifest_hash()
+            .map_err(|error| format!("hash QG-1 corpus manifest: {error}"))?;
+        if observed_manifest_sha256 != prefix.manifest_sha256 {
+            return Err("QG-1 prepared manifest identity changed after replay verification".into());
+        }
+        let observed_indexed_content_sha256 = qg1_indexed_content_sha256(indexed_documents);
+        if observed_indexed_content_sha256 != prefix.indexed_content_sha256 {
+            return Err("QG-1 prepared indexed content changed after verification".into());
+        }
+        Ok((&prefix.manifest_sha256, &prefix.indexed_content_sha256))
+    }
+}
+
 struct BenchContext {
     runtime: Runtime,
     cx: Cx,
     scale: MatrixScale,
+    prepared_qg1: Option<PreparedQg1Corpus>,
 }
 
 impl BenchContext {
@@ -329,7 +531,21 @@ impl BenchContext {
                 .expect("QG benchmark runtime"),
             cx: Cx::for_testing(),
             scale,
+            prepared_qg1: None,
         }
+    }
+
+    fn for_selected(scale: MatrixScale, selected: &[PerfCellSpec]) -> Self {
+        let mut context = Self::new(scale);
+        context.prepared_qg1 = PreparedQg1Corpus::for_selected(scale, selected);
+        context
+    }
+
+    fn qg1_prefix(&self, document_count: u64) -> (&PreparedQg1Prefix, &[IndexableDocument]) {
+        self.prepared_qg1
+            .as_ref()
+            .expect("selected QG-1 cells have one prepared corpus")
+            .prefix(document_count)
     }
 }
 
@@ -674,30 +890,42 @@ where
     measured
 }
 
-fn index_batches_with_visibility_commits<E: LexicalWrite>(
+fn index_prepared_qg1_batches<E: LexicalWrite>(
     context: &BenchContext,
     index: &E,
-    corpus: &SyntheticCorpus,
-    document_count: u64,
+    documents: &[IndexableDocument],
+) -> Duration {
+    let mut measured = Duration::ZERO;
+    for batch in documents.chunks(context.scale.batch_documents()) {
+        let timer = Instant::now();
+        context.runtime.block_on(async {
+            index
+                .index_documents(&context.cx, batch)
+                .await
+                .expect("QG-1 prepared index batch");
+        });
+        measured += timer.elapsed();
+    }
+    measured
+}
+
+fn index_prepared_qg1_batches_with_visibility_commits<E: LexicalWrite>(
+    context: &BenchContext,
+    index: &E,
+    documents: &[IndexableDocument],
     commit_cadence: Duration,
 ) -> (Duration, usize) {
     let mut measured = Duration::ZERO;
     let mut unpublished_since = None;
     let mut periodic_commits = 0_usize;
-    let batch_documents = context.scale.batch_documents();
-    let mut start = 0_u64;
-    while start < document_count {
-        let remaining = document_count - start;
-        let count =
-            usize::try_from(remaining.min(batch_documents as u64)).expect("bounded batch count");
-        let documents = generated_batch(corpus, start, count, None);
+    for batch in documents.chunks(context.scale.batch_documents()) {
         let timer = Instant::now();
         let unpublished_started = *unpublished_since.get_or_insert(timer);
         context.runtime.block_on(async {
             index
-                .index_documents(&context.cx, &documents)
+                .index_documents(&context.cx, batch)
                 .await
-                .expect("QG index batch");
+                .expect("QG-1 prepared index batch");
         });
         measured += timer.elapsed();
         if unpublished_started.elapsed() >= commit_cadence {
@@ -705,7 +933,6 @@ fn index_batches_with_visibility_commits<E: LexicalWrite>(
             periodic_commits = periodic_commits.saturating_add(1);
             unpublished_since = None;
         }
-        start = start.saturating_add(u64::try_from(count).expect("batch count fits u64"));
     }
     (measured, periodic_commits)
 }
@@ -721,12 +948,26 @@ fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
 fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
-    let corpus = corpus_for(count);
+    let prepared_qg1_documents = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count).1);
+    let generated_corpus = (spec.gate != PerfGate::Qg1).then(|| corpus_for(count));
     let elapsed = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
             let generation_before = index.snapshot().loaded_manifest().manifest.generation;
-            let mut elapsed = index_batches(context, &index, &corpus, count, None);
+            let mut elapsed = prepared_qg1_documents.map_or_else(
+                || {
+                    index_batches(
+                        context,
+                        &index,
+                        generated_corpus
+                            .as_ref()
+                            .expect("non-QG-1 bulk cell has a generated corpus"),
+                        count,
+                        None,
+                    )
+                },
+                |documents| index_prepared_qg1_batches(context, &index, documents),
+            );
             let generation_after = index.snapshot().loaded_manifest().manifest.generation;
             elapsed += commit(context, &index);
             if spec.gate == PerfGate::Qg1 {
@@ -750,15 +991,25 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                 record_concurrency(spec, arm, observed_threads);
             }
             let (mut elapsed, periodic_commits) = if spec.gate == PerfGate::Qg1 {
-                index_batches_with_visibility_commits(
+                index_prepared_qg1_batches_with_visibility_commits(
                     context,
                     &index,
-                    &corpus,
-                    count,
+                    prepared_qg1_documents.expect("QG-1 bulk cell has a prepared immutable corpus"),
                     Duration::from_millis(quill_config(spec).max_visibility_lag_ms),
                 )
             } else {
-                (index_batches(context, &index, &corpus, count, None), 0)
+                (
+                    index_batches(
+                        context,
+                        &index,
+                        generated_corpus
+                            .as_ref()
+                            .expect("non-QG-1 bulk cell has a generated corpus"),
+                        count,
+                        None,
+                    ),
+                    0,
+                )
             };
             elapsed += commit(context, &index);
             if spec.gate == PerfGate::Qg1 {
@@ -803,20 +1054,18 @@ fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
     let count = context
         .scale
         .document_count(spec.document_count.expect("tokenize document count"));
-    let corpus = corpus_for(count);
+    assert_eq!(
+        spec.gate,
+        PerfGate::Qg1,
+        "prepared tokenizer corpus is reserved for QG-1"
+    );
+    let (_, documents) = context.qg1_prefix(count);
     let mut tokenizer = FrankensearchTokenizer::default();
     let mut measured = Duration::ZERO;
-    let mut start = 0_u64;
-    while start < count {
-        let remaining = count - start;
-        let batch_count = usize::try_from(
-            remaining.min(u64::try_from(context.scale.batch_documents()).expect("batch size")),
-        )
-        .expect("tokenize batch count");
-        let documents = generated_batch(&corpus, start, batch_count, None);
+    for batch in documents.chunks(context.scale.batch_documents()) {
         let timer = Instant::now();
         let mut token_count = 0_usize;
-        for document in &documents {
+        for document in batch {
             tokenizer.analyze(
                 Analyzer::FrankensearchDefault,
                 black_box(&document.content),
@@ -825,7 +1074,6 @@ fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
         }
         measured += timer.elapsed();
         black_box(token_count);
-        start = start.saturating_add(u64::try_from(batch_count).expect("batch count"));
     }
     count as f64 / measured.as_secs_f64().max(f64::MIN_POSITIVE)
 }
@@ -2718,7 +2966,35 @@ fn manifest_sha256() -> String {
     perf_manifest_contract_sha256(MANIFEST)
 }
 
-fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> String {
+fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Result<String, String> {
+    let qg1_counts = cells
+        .iter()
+        .filter(|cell| cell.gate == PerfGate::Qg1)
+        .map(|cell| {
+            context
+                .scale
+                .document_count(cell.document_count.unwrap_or_default())
+        })
+        .collect::<BTreeSet<_>>();
+    let qg1_identities = qg1_counts
+        .into_iter()
+        .map(|document_count| {
+            let prepared = context
+                .prepared_qg1
+                .as_ref()
+                .ok_or_else(|| "selected QG-1 cells have no prepared corpus".to_owned())?;
+            let (manifest_sha256, indexed_content_sha256) =
+                prepared.validate_prefix(document_count)?;
+            Ok((
+                document_count,
+                (
+                    manifest_sha256.to_owned(),
+                    indexed_content_sha256.to_owned(),
+                ),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+
     let mut hasher = Sha256::new();
     for cell in cells {
         let requested = cell.document_count.unwrap_or_default();
@@ -2728,8 +3004,17 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Strin
         hasher.update(CORPUS_SEED.to_le_bytes());
         hasher.update(VOCABULARY_SIZE.to_le_bytes());
         hasher.update(MAX_DOCUMENT_BYTES.to_le_bytes());
+        if cell.gate == PerfGate::Qg1 {
+            let (manifest_sha256, indexed_content_sha256) = qg1_identities
+                .get(&effective)
+                .ok_or_else(|| format!("QG-1 corpus identity {effective} was not verified"))?;
+            hasher.update(b"\0prepared-qg1-corpus-manifest-v2\0");
+            hasher.update(manifest_sha256.as_bytes());
+            hasher.update(b"\0prepared-qg1-indexed-content-v1\0");
+            hasher.update(indexed_content_sha256.as_bytes());
+        }
     }
-    lower_hex(&hasher.finalize())
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -2959,10 +3244,10 @@ fn evidence_policy_from_env() -> EvidencePolicy {
 fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let scale = MatrixScale::from_env();
     let build_profile = build_profile_label(scale);
-    let context = BenchContext::new(scale);
     let matrix = PerfMatrixSpec::complete();
     validate_matrix(&matrix).expect("normative QG matrix");
     let selected = selected_cells(&matrix, scale);
+    let context = BenchContext::for_selected(scale, &selected);
     preflight_indexing_fixtures(&context, &matrix, &selected);
     let configured_runs = std::env::var("QUILL_PERF_RUNS")
         .ok()
@@ -2986,7 +3271,8 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let run_id = std::env::var("QUILL_PERF_RUN_ID")
         .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
-    let corpus_hash = corpus_manifest_hash(&context, &selected);
+    let corpus_hash = corpus_manifest_hash(&context, &selected)
+        .expect("verify exact prepared QG-1 corpus identity");
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -3275,6 +3561,134 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qg1_prepared_corpus_prefixes_replay_exact_manifests_and_share_one_materialization() {
+        let prepared = super::PreparedQg1Corpus::from_effective_counts([12, 40, 12])
+            .expect("prepare distinct QG-1 corpus prefixes");
+        let (short_prefix, short_documents) = prepared.prefix(12);
+        let (long_prefix, long_documents) = prepared.prefix(40);
+
+        assert_eq!(
+            short_prefix.manifest,
+            super::corpus_for(12).manifest().expect("short manifest")
+        );
+        assert_eq!(
+            long_prefix.manifest,
+            super::corpus_for(40).manifest().expect("long manifest")
+        );
+        assert_eq!(short_documents.len(), 12);
+        assert_eq!(long_documents.len(), 40);
+        assert_eq!(
+            short_documents.as_ptr(),
+            long_documents.as_ptr(),
+            "every prepared prefix must borrow the same immutable allocation"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&prepared.documents),
+            1,
+            "prepared prefixes must not clone the corpus allocation"
+        );
+        let replayed =
+            super::PreparedQg1Corpus::from_effective_counts([40]).expect("replay QG-1 corpus");
+        let (replayed_prefix, _) = replayed.prefix(40);
+        assert_eq!(
+            long_prefix.indexed_content_sha256, replayed_prefix.indexed_content_sha256,
+            "indexed-content identity must ignore HashMap iteration order"
+        );
+
+        let expected = frankensearch_core::IndexableDocument::from(
+            super::corpus_for(40).document_at(11).expect("document 11"),
+        );
+        let actual = short_documents
+            .get(11)
+            .expect("short prepared prefix contains document 11");
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.content, expected.content);
+        assert_eq!(actual.title, expected.title);
+        assert_eq!(actual.metadata, expected.metadata);
+
+        let generated = super::corpus_for(40)
+            .document_at(17)
+            .expect("document for move proof");
+        let id_pointer = generated.id.as_ptr();
+        let content_pointer = generated.content.as_ptr();
+        let title_pointer = generated.title.as_ref().map(|title| title.as_ptr());
+        let converted = frankensearch_core::IndexableDocument::from(generated);
+        assert_eq!(converted.id.as_ptr(), id_pointer);
+        assert_eq!(converted.content.as_ptr(), content_pointer);
+        assert_eq!(
+            converted.title.as_ref().map(|title| title.as_ptr()),
+            title_pointer
+        );
+    }
+
+    #[test]
+    fn qg1_corpus_identity_rejects_mutated_indexed_documents() {
+        let cell = frankensearch_quill_gauntlet::PerfMatrixSpec::complete()
+            .cells
+            .into_iter()
+            .find(|cell| cell.gate == frankensearch_quill_gauntlet::PerfGate::Qg1)
+            .expect("normative matrix has a QG-1 cell");
+        assert_eq!(cell.fixture, "bulk/tiny/1/positions_on");
+        let mut context =
+            super::BenchContext::for_selected(super::MatrixScale::Smoke, &[cell.clone()]);
+        super::corpus_manifest_hash(&context, &[cell.clone()])
+            .expect("verified QG-1 corpus identity");
+
+        let documents = std::sync::Arc::get_mut(
+            &mut context
+                .prepared_qg1
+                .as_mut()
+                .expect("prepared QG-1 corpus")
+                .documents,
+        )
+        .expect("QG-1 test corpus has one owner");
+        documents
+            .first_mut()
+            .expect("normative QG-1 corpus is nonempty")
+            .content
+            .push_str(" adversarial-indexed-content-tamper");
+
+        let error = super::corpus_manifest_hash(&context, &[cell])
+            .expect_err("mutated indexed documents must fail closed");
+        assert!(error.contains("indexed content"));
+    }
+
+    #[test]
+    fn qg1_corpus_identity_rejects_mutated_verified_manifest() {
+        let cell = frankensearch_quill_gauntlet::PerfMatrixSpec::complete()
+            .cells
+            .into_iter()
+            .find(|cell| cell.gate == frankensearch_quill_gauntlet::PerfGate::Qg1)
+            .expect("normative matrix has a QG-1 cell");
+        let effective_count = super::MatrixScale::Smoke.document_count(
+            cell.document_count
+                .expect("normative QG-1 cell has a document count"),
+        );
+        let mut context =
+            super::BenchContext::for_selected(super::MatrixScale::Smoke, &[cell.clone()]);
+        super::corpus_manifest_hash(&context, &[cell.clone()])
+            .expect("verified QG-1 corpus identity");
+
+        let manifest = &mut context
+            .prepared_qg1
+            .as_mut()
+            .expect("prepared QG-1 corpus")
+            .prefixes
+            .get_mut(&effective_count)
+            .expect("prepared normative QG-1 prefix")
+            .manifest;
+        let replacement = if manifest.content_sha256.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        manifest.content_sha256.replace_range(..1, replacement);
+        let error = super::corpus_manifest_hash(&context, &[cell])
+            .expect_err("mutated verified manifest must fail closed");
+        assert!(error.contains("manifest identity"));
+    }
+
     #[test]
     fn typed_qg6_query_count_contract_accepts_exact_value_and_rejects_mismatch() {
         let exact = "[gate.QG-6]\nqueries_per_class = 16\n";
