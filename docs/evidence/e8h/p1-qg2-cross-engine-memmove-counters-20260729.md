@@ -171,6 +171,91 @@ with the Quill caller attribution already mapped to stored-field append,
 section assembly, publication clone, canonical preimage assembly, and
 seal-path posting re-decode/re-encode.
 
+## Q2 deferral audit: only the flush half is implemented
+
+**Explicit verdict: the full Q2 deferral does not happen in the profiled hot
+path.** Quill defers radix grouping, posting construction, term sorting, and
+durable TERMDICT encoding until flush. It does **not** defer token-to-local-term
+resolution. Every admitted token synchronously hashes and probes the shard's
+local term interner before Quill can append its columnar triple.
+
+The distinction matters because “term-dictionary lookup” can refer to two
+different operations:
+
+- Quill does not probe an on-disk FSLX TERMDICT for each token.
+- Quill does synchronously probe its in-memory `TermInterner` dictionary for
+  each token.
+
+The exact profiled path at source `3684b147` is:
+
+```text
+perf_matrix::run_memory_child
+  -> index_batches
+  -> LexicalSearch::index_documents
+  -> QuillIndex::upsert_documents
+  -> QuillWriter::index_documents
+  -> ColumnarAccumulator::add_document_with_values
+  -> analyze_admitted callback, once per admitted token
+       term_id = terms.intern(field_ord, token_bytes)
+       column.append_token(term_id, doc_ord, position)
+```
+
+`TermInterner::intern_accounted` then performs the work synchronously:
+
+1. hash `(field_ord, term bytes)`;
+2. probe `HashMap<u64, Bucket>`;
+3. resolve the candidate arena span and compare the term bytes;
+4. for a new term, copy the composite key into the byte arena and insert the
+   bucket immediately.
+
+Only after accumulation does `flush_accumulator` materialize
+`FlushTokenRow { term_id, doc_ord, position }`, radix-scatter rows by
+`term_id`, call `TermInterner::sorted_ids`, and build the ordered
+POSTINGS/POSITIONS/BLOCKMAX/TERMDICT streams.
+
+This is not a source-lineage ambiguity. At audit time, the profiled revision
+`3684b147` and current `origin/main` (`ae8acd03`) have the identical
+`crates/frankensearch-quill/src/scribe.rs` Git blob
+`0d66bba20f4fd988c4b0f4a13cc757b274c63af2`. The same per-token call is at
+`scribe.rs:2342-2345`; the hash/probe/compare path is at
+`scribe.rs:1148-1188`; flush-time resolution starts at
+`scribe.rs:4014-4033`.
+
+The design document itself contains the unresolved tension. Its Q2 headline
+says cache-shaped sequential passes replace per-token hashmap random access,
+while §6.1 also specifies a shard-local `ahash` interner and triples keyed by
+`local_term_id`. The implementation follows the latter: it emits a compact
+triple only after a per-token map lookup has already produced that ID.
+
+The matching Quill DWARF profile exposes the direct self-time:
+
+| Phase | Frame | Self-time |
+|---|---|---:|
+| per-token local resolution | `TermInterner::find_in_bucket` | 1.79% |
+| per-token local resolution | `TermInterner::matches` | 1.34% |
+| per-token local resolution | `TermInterner::intern_accounted` | 0.83% |
+| per-token local resolution | `TermInterner::hash_parts` | 0.78% |
+| **explicit per-token subtotal** |  | **4.74%** |
+| flush resolution | `TermInterner::field_and_term` | 1.04% |
+| flush sort | `sort_unstable_by` over `TermInterner::sorted_ids` | at least 0.58% |
+
+These are self-time leaves, not an inclusive cost bound: generic hash-table,
+comparison, allocation, cache-miss, and copy work may land in other symbols.
+They prove that the supposedly deferred lookup is live; they do not prove
+that deleting the four named frames alone yields a 5-10x wall-speedup.
+
+**Hypothesis disposition:** “Q2 already removes synchronous per-token
+dictionary lookup” is **REJECTED**. A true deferred-resolution experiment is
+a structurally distinct follow-up, but it is not yet a measured explanation
+of the 8.16x copy counter: the existing caller attribution places most named
+copy bytes in stored-field append, section assembly, publication, canonical
+preimage, and posting re-encode rather than interner storage. Evaluate it as
+one representation change with byte-identical index output, exact
+token-stream parity, and a 200,000-document mechanism rerun. Only if the
+relevant interner cost and/or copy bytes/document falls should it advance to a
+same-invocation QG-2 A/A+A/B. Until that experiment exists, “5-10x from Q2”
+remains a hypothesis rather than a measured speedup.
+
 ## `powersave` / EPP asymmetry audit
 
 No governor, EPP, affinity, boost, or sysctl setting was changed.
