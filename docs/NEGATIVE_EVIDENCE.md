@@ -17772,3 +17772,42 @@ Full card: `docs/evidence/e8h/p3-local-qg2-allocator-sensitivity-20260729.md`.
 certified class moves the quill arm's median ratio >3% with an admissible
 same-invocation A/A null, or (b) a certified-class arm-scoped profile
 attributes >8% of quill self-time to allocator frames.
+
+### 2026-07-29 — INVALID-HARNESS: single-sample fusion exclusion latency assertion replaced by a deterministic work bound (YellowSparrow)
+
+The exact protected-candidate all-features diagnostic at revision
+`544ffeb19b519d2e6c849f68334a3eabefb3573a` reached
+`frankensearch-fusion` after a long, contended debug-profile workspace run and
+failed only
+`searcher::tests::exclusion_overhead_is_sub_millisecond_for_typical_query`.
+Its one baseline search measured 1.3424 ms; its one subsequent negated search
+measured 2.5812 ms; subtracting them produced a nominal 1.2389 ms overhead
+against the test's hard 1 ms assertion.
+
+This is not admissible performance evidence. The test always ran one baseline
+then one candidate, without warm-up, AB/BA order balance, repetition, an A/A
+null, a confidence interval, a release build, or worker isolation. It timed
+the complete Phase-1 pipeline—including Rayon scheduling, vector search,
+calibration, and fusion—rather than the exclusion filter alone, and clamped a
+negative difference to zero. This same assertion had already failed at
+1.066 ms on loaded `ovh-a` and passed unchanged on `hz2`; QG-6 separately
+established that one sub-millisecond search per sample is dominated by timer
+resolution and scheduling noise. The relevant production search/filter blobs
+are also byte-identical between the candidate and its `origin/main` base, so
+the observation cannot establish a candidate regression.
+
+**Decision: INVALID-HARNESS / test contract repaired, no performance claim.**
+The wall-clock subtraction was replaced with a deterministic complexity and
+correctness guard: for the ten-document fixture, the negated search must scan
+ten vectors, hydrate every semantic candidate exactly once, retain nine
+semantic candidates, and remove `doc-0`. The absolute latency claim remains
+owned by the release-profile negation benchmark, whose paired AB/BA and A/A
+evidence already demonstrated byte-identical output and a large normalizer
+speedup.
+
+**Retry predicate for any full-path `<1 ms` claim:** add a dedicated
+release-profile, same-binary harness with warm-up, many inner searches per
+sample, alternating AB/BA order, exact result and hydration-count parity, an
+A/A null, median confidence intervals, and a quiet pinned worker. Never
+restore a one-shot debug-test threshold, raise that threshold, or retry it
+until green.

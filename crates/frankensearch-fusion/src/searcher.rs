@@ -5626,29 +5626,21 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_overhead_is_sub_millisecond_for_typical_query() {
+    fn exclusion_filter_hydrates_each_semantic_candidate_once() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+            let hydrated_candidates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut initial_results = Vec::new();
 
-            let baseline = searcher
-                .search(
-                    &cx,
-                    "rust systems",
-                    10,
-                    |_| Some("safe rust systems".to_owned()),
-                    |_| {},
-                )
-                .await
-                .expect("baseline search should succeed")
-                .phase1_total_ms;
-            let negated = searcher
+            let metrics = searcher
                 .search(
                     &cx,
                     "rust systems -unsafe",
                     10,
                     |doc_id| {
+                        hydrated_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let text = if doc_id == "doc-0" {
                             "unsafe rust systems"
                         } else {
@@ -5656,16 +5648,30 @@ mod tests {
                         };
                         Some(text.to_owned())
                     },
-                    |_| {},
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
                 )
                 .await
-                .expect("negated search should succeed")
-                .phase1_total_ms;
+                .expect("negated search should succeed");
 
-            let overhead_ms = (negated - baseline).max(0.0);
+            assert_eq!(
+                metrics.phase1_vectors_searched, 10,
+                "the fixture must scan all ten semantic vectors"
+            );
+            assert_eq!(
+                hydrated_candidates.load(std::sync::atomic::Ordering::Relaxed),
+                metrics.phase1_vectors_searched,
+                "exclusion filtering must hydrate each semantic candidate exactly once"
+            );
+            assert_eq!(metrics.semantic_candidates, 9);
+            assert_eq!(initial_results.len(), 9);
             assert!(
-                overhead_ms < 1.0,
-                "expected exclusion overhead <1ms, observed {overhead_ms:.4}ms (baseline={baseline:.4}ms, negated={negated:.4}ms)"
+                !initial_results
+                    .iter()
+                    .any(|result| matches!(result.doc_id.as_str(), "doc-0"))
             );
         });
     }
