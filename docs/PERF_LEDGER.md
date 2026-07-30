@@ -8153,3 +8153,65 @@ than one observed CPU-active Quill ingest worker. If bytes/document do not
 fall, record the counted mechanism as unchanged and route elsewhere without
 timing; never derive an A/B ratio from separate profiler invocations or gate
 on CV.
+
+## 2026-07-30 — QG-1 current-producer `trj` width sweep: Tantivy directionally stops scaling at 2 workers; no QG claim (`bd-h6eh`, MaroonJay)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Clean source
+`544ffeb19b519d2e6c849f68334a3eabefb3573a` ran Quill and pinned Tantivy
+side-by-side in the same self-reporting `release-perf` ELF,
+`e0dc6ba3c3c651e25e5693c12e053c1f77e829f38aac603f692266d8e7306ba1`
+(78,029,032 bytes). The binary was built strictly remotely by RCH job
+`j-29953680971137050` from an exact clean base with no overlay and copied
+back for execution; no local Cargo build ran.
+
+The exclusive `trj-booking` sweep ran from `2026-07-30T03:48:36Z` through
+`08:35:49Z`, and release message `6747` was posted at `08:36:03Z`. The host
+was `threadripperje`, a 64-core/128-thread Threadripper PRO 5995WX with one
+NUMA node and affinity `0-127`. Each of the nine xlarge positions-on rows
+used one million identical deterministic documents, one excluded warmup, ten
+paired blocks, and both independent same-invocation A/A controls. Every row
+seals 33 observations per engine and proves observed worker-pool
+`min == max == requested` for Quill and Tantivy.
+
+| observed workers | Quill docs/s | Tantivy docs/s | Quill/Tantivy bootstrap median-CI | independent-null admission |
+|---:|---:|---:|---:|---|
+| 1 | 33,381.135 | 133,744.012 | `0.249111 [0.245709, 0.256117]` | both valid; clears 2x floor |
+| 2 | 35,254.033 | 194,518.425 | `(0.181479 [0.175571, 0.192343])` | UNSCORED: Tantivy width, dispersion, order, drift |
+| 4 | 33,548.584 | 163,632.892 | `(0.203995 [0.199033, 0.212938])` | UNSCORED: Tantivy center, width, dispersion, drift |
+| 8 | 33,896.044 | 149,192.426 | `(0.226381 [0.221486, 0.233467])` | UNSCORED: Tantivy drift |
+| 16 | 29,464.768 | 129,896.195 | `(0.226288 [0.214720, 0.234257])` | UNSCORED: Tantivy drift |
+| 32 | 25,293.486 | 127,936.433 | `(0.197659 [0.183384, 0.210235])` | UNSCORED: Quill center |
+| 64 | 25,029.379 | 124,060.934 | `0.201267 [0.198519, 0.206829]` | both valid; clears 2x floor |
+| 96 | 26,665.837 | 114,905.833 | `0.232032 [0.225772, 0.236904]` | both valid; clears 2x floor |
+| 128 | 26,125.237 | 111,044.317 | `(0.230974 [0.221999, 0.241340])` | UNSCORED: Tantivy order |
+
+CV decided no row. For the three both-null-valid cells, effect distances
+`0.750889`, `0.798733`, and `0.767968` exceed their required 2x worst-null
+floors `0.059010`, `0.109911`, and `0.111533`.
+
+Tantivy's raw median peaks at two observed workers (`1.4544x` its one-worker
+throughput), then declines monotonically through 128 (`0.8303x`). Its
+two-worker lower median CI is above the four-worker upper median CI, but both
+rows have invalid Tantivy nulls. Thus **two workers is a directional scaling
+stop, not a certified breakpoint**. Quill rises only `1.0561x` at two,
+remains approximately flat through eight, and falls below one-worker
+throughput from 16 onward.
+
+**Decision: DIAGNOSTIC DIRECTION / NO QG-1 CLAIM / NO PROMOTION.** This
+single xlarge positions-on tranche is an incomplete gate selection; every
+artifact has `laws_attested=false`, so even the three admissible cell effects
+remain partial-gate `no_decision`. Raw Quill/Tantivy medians span
+`0.181479x` to `0.249111x`, meaning Tantivy remains 4.0x to 5.5x faster.
+The 5-10x-faster indexing target is decisively unmet. Search was not measured,
+so this row makes no search-speed claim.
+
+The 74 retained source/build/host/lifecycle artifacts and full adjudication
+are under
+`.bench-history/attempts/2026-07-30/QG-1/trj-thread-sweep-r10-20260730T0346Z/`.
+Do not blind-resample the unchanged route. Retry after a counted ingest
+mechanism change—preferably one that materially reduces the already measured
+8.1587x copy bytes/document—then require the same exact-ELF incumbent,
+independent nulls, bootstrap median-CI plus 2x floor, observed worker
+witnesses, complete normative matrix, and immediate reproduction. Never gate
+on CV.
