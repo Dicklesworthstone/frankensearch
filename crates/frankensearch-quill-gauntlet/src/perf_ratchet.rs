@@ -3094,18 +3094,19 @@ mod tests {
         (artifact, evidence)
     }
 
-    fn qg6_current_pair(
+    fn qg6_current_pair<const GROUPS: usize>(
         run_id: &str,
-        group_ratios: [[f64; 3]; 4],
+        group_ratios: [[f64; 3]; GROUPS],
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
-        qg6_current_pair_with_null(run_id, group_ratios, [[1.0; 3]; 4])
+        qg6_current_pair_with_null(run_id, group_ratios, [[1.0; 3]; GROUPS])
     }
 
-    fn qg6_current_pair_with_null(
+    fn qg6_current_pair_with_null<const GROUPS: usize>(
         run_id: &str,
-        effect_group_ratios: [[f64; 3]; 4],
-        null_group_ratios: [[f64; 3]; 4],
+        effect_group_ratios: [[f64; 3]; GROUPS],
+        null_group_ratios: [[f64; 3]; GROUPS],
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
+        assert!(GROUPS > 0, "QG-6 test fixture requires a group pattern");
         let fixture = "query/identifier/k10/medium";
         let scope = PerfOperationScope {
             operation_id: "qg6.prepared_query".to_owned(),
@@ -3128,11 +3129,13 @@ mod tests {
             worker_id: "linux-x86_64-test".to_owned(),
             build_profile: "release-perf".to_owned(),
         };
-        let order = seeded_balanced_pair_order(12, 0x5156_0006).expect("balanced QG-6 pair order");
-        let stream = |group_ratios: &[[f64; 3]; 4], sample_base: u64| {
-            let mut samples = Vec::with_capacity(24);
+        let order = seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * 3, 0x5156_0006)
+            .expect("balanced QG-6 pair order");
+        let stream = |group_ratios: &[[f64; 3]; GROUPS], sample_base: u64| {
+            let mut samples = Vec::with_capacity(crate::QG6_QUERY_GROUPS * 3 * 2);
             let mut ordinal = 0_usize;
-            for (group_index, ratios) in group_ratios.iter().enumerate() {
+            for (group_index, group_id) in crate::QG6_QUERY_GROUP_IDS.into_iter().enumerate() {
+                let ratios = &group_ratios[group_index % GROUPS];
                 for ratio in ratios {
                     let block_id = u64::try_from(ordinal).expect("QG-6 block");
                     let first_start = block_id * 1_000;
@@ -3162,7 +3165,7 @@ mod tests {
                             work_units: None,
                             byte_count: None,
                             observed_value: Some(value),
-                            group_id: Some(u64::try_from(group_index).expect("QG-6 group")),
+                            group_id: Some(group_id),
                         });
                     }
                     ordinal += 1;
@@ -4440,7 +4443,10 @@ mod tests {
 
     #[test]
     fn qg6_gate_uses_hierarchical_ci_when_flat_projection_would_false_pass() {
-        let ratios = [[0.91; 3], [0.91; 3], [0.91; 3], [1.20; 3]];
+        let mut ratios = [[0.91; 3]; crate::QG6_QUERY_GROUPS];
+        for group in &mut ratios[9..] {
+            *group = [0.91, 1.20, 1.20];
+        }
         let (artifact, evidence) = qg6_current_pair("candidate", ratios);
         let flat = artifact
             .cells
@@ -4537,13 +4543,11 @@ mod tests {
 
     #[test]
     fn qg6_null_admission_uses_hierarchy_when_flat_projection_would_false_pass() {
-        let effect_ratios = [[0.95; 3]; 4];
-        let null_ratios = [
-            [1.0, 1.0, 1.0],
-            [1.08, 1.08, 1.0],
-            [1.08, 1.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ];
+        let effect_ratios = [[0.95; 3]; crate::QG6_QUERY_GROUPS];
+        let mut null_ratios = [[1.0; 3]; crate::QG6_QUERY_GROUPS];
+        for group in &mut null_ratios[9..] {
+            *group = [1.0, 1.08, 1.08];
+        }
         let (artifact, evidence) =
             qg6_current_pair_with_null("candidate", effect_ratios, null_ratios);
         let flat = artifact

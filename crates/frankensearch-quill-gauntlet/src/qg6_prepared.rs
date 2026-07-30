@@ -7,20 +7,168 @@
 //! construction, commits, configuration, warmup, and parity checks outside
 //! every timed interval.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::hint::black_box;
+use std::ops::Bound;
 use std::time::Instant;
 
+use frankensearch_quill::{
+    BooleanOperator, DEFAULT_SCHEMA, DefaultQueryParser, Occur, Query, QueryValue,
+    canonicalize_query,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
-const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v1";
+use crate::perf::{PerfQueryClass, QG6_QUERY_GROUPS};
+
+const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v2";
 const QG6_RESULT_DIGEST_VERSION: &str = "frankensearch-qg6-ordered-result-v1";
+const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v1";
+const QG6_CORPUS_GENERATOR_REVISION: &str =
+    "frankensearch-quill-gauntlet/generator-v2;schema=2;zipf=s11;vocab=8192;max_doc=4096";
+const QG6_FROZEN_MANIFEST_SHA256: &str =
+    "1994690d27929beccf09dad2dc82aa09d9e3fb3a00d9e7fab11ed3d79eafa8e8";
+const QG6_AD_HOC_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-query-v1";
+const QG6_AD_HOC_CORPUS_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-corpus-v1";
+const QG6_SAMPLING_FRAME: &str = "five public query classes; sixteen independently frozen \
+    normalized/AST identities per class; every query receives equal weight; repeated leaves are \
+    within-query measurements and never independent queries; wider intervals require more \
+    independently frozen queries, never threshold weakening or leaf pseudoreplication";
+const QG6_SUPPORTED_K: [usize; 2] = [10, 100];
+const QG6_TOTAL_QUERY_COUNT: usize = PerfQueryClass::ALL.len() * QG6_QUERY_GROUPS;
+const QG6_REVIEWED_DIVERGENCE_ID: &str = "quill-divergence/qg6-native-tie-and-score-epsilon-v3";
+const QG6_REVIEWED_DIVERGENCE_CONTRACT: &str = "rank-exact or reviewed native cutoff tie order / score epsilon 0.0001 caused only by \
+     oracle segment geometry; exact total count and live document count remain mandatory";
 const MAX_QUERY_COUNT: usize = 4_096;
 const MAX_QUERY_ID_BYTES: usize = 256;
 const MAX_QUERY_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_DOC_ID_BYTES: usize = 4 * 1_024;
 const MAX_K: usize = 100_000;
+
+/// Declared corpus prevalence represented by one frozen query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg6PrevalenceStratum {
+    /// High-frequency generated terms or combinations.
+    Common,
+    /// Mid-frequency generated terms or combinations.
+    MidFrequency,
+    /// Low-frequency terms or combinations.
+    Rare,
+    /// Deliberate no-hit query.
+    NoHit,
+}
+
+impl Qg6PrevalenceStratum {
+    const ALL: [Self; 4] = [Self::Common, Self::MidFrequency, Self::Rare, Self::NoHit];
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Common => 0,
+            Self::MidFrequency => 1,
+            Self::Rare => 2,
+            Self::NoHit => 3,
+        }
+    }
+}
+
+/// Declared parser/execution difficulty represented by one frozen query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qg6DifficultyStratum {
+    /// One uncomplicated leaf.
+    Easy,
+    /// Several ordinary leaves.
+    Moderate,
+    /// A rarer or nested supported shape.
+    Hard,
+    /// A supported boundary/adversarial shape.
+    Adversarial,
+}
+
+impl Qg6DifficultyStratum {
+    const ALL: [Self; 4] = [Self::Easy, Self::Moderate, Self::Hard, Self::Adversarial];
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Easy => 0,
+            Self::Moderate => 1,
+            Self::Hard => 2,
+            Self::Adversarial => 3,
+        }
+    }
+}
+
+/// Frozen support state and any reviewed cross-engine result divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum Qg6SupportDivergence {
+    /// Both engines must be exactly result-identical.
+    SupportedExact,
+    /// Native tie order or score bits may differ only under this reviewed rule.
+    SupportedWithReviewedDivergence {
+        /// Stable reviewed-register entry.
+        register_id: String,
+        /// SHA-256 of the exact reviewed semantic rule.
+        contract_sha256: String,
+    },
+    /// Explicit unsupported syntax. A normative manifest containing this state
+    /// fails before preparation rather than silently dropping the query.
+    Unsupported {
+        /// Stable bounded reason code with no raw query text.
+        reason_code: String,
+    },
+}
+
+impl Qg6SupportDivergence {
+    fn reviewed() -> Self {
+        Self::SupportedWithReviewedDivergence {
+            register_id: QG6_REVIEWED_DIVERGENCE_ID.to_owned(),
+            contract_sha256: sha256_hex(QG6_REVIEWED_DIVERGENCE_CONTRACT.as_bytes()),
+        }
+    }
+
+    /// Whether a non-rank-exact result may enter the reviewed comparator.
+    #[must_use]
+    pub const fn allows_reviewed_divergence(&self) -> bool {
+        matches!(self, Self::SupportedWithReviewedDivergence { .. })
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256) {
+        match self {
+            Self::SupportedExact => hasher.update([0]),
+            Self::SupportedWithReviewedDivergence {
+                register_id,
+                contract_sha256,
+            } => {
+                hasher.update([1]);
+                hash_len_prefixed(hasher, register_id.as_bytes());
+                hash_len_prefixed(hasher, contract_sha256.as_bytes());
+            }
+            Self::Unsupported { reason_code } => {
+                hasher.update([2]);
+                hash_len_prefixed(hasher, reason_code.as_bytes());
+            }
+        }
+    }
+}
+
+/// Redacted query identity safe for benchmark logs and evidence diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6QueryLogIdentity {
+    /// Stable non-sensitive query identifier.
+    pub query_id: String,
+    /// Declared public class.
+    pub class: PerfQueryClass,
+    /// SHA-256 of normalized source text.
+    pub normalized_text_sha256: String,
+    /// SHA-256 of the canonical parsed Quill AST.
+    pub parsed_ast_sha256: String,
+}
 
 /// The four independent logical indexes in the QG-6 admission experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -140,21 +288,63 @@ impl Qg6SelectionScope {
 }
 
 /// One frozen query in the prepared QG-6 workload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is deliberately redacted. The raw query remains available to the
+/// engine adapter and the immutable manifest serializer, but benchmark logs
+/// get only [`Self::log_identity`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Qg6QuerySpec {
     id: String,
     text: String,
+    class: PerfQueryClass,
+    normalized_text_sha256: String,
+    parsed_ast_sha256: String,
+    prevalence: Qg6PrevalenceStratum,
+    difficulty: Qg6DifficultyStratum,
+    support_divergence: Qg6SupportDivergence,
+    supported_k: [usize; 2],
+    query_generator_revision: String,
+    corpus_generator_revision: String,
 }
 
 impl Qg6QuerySpec {
-    /// Construct a bounded query. Diagnostics retain only `id`, never `text`.
+    /// Construct a bounded ad-hoc query for focused harness tests.
+    ///
+    /// Normative QG-6 execution must use [`Self::normative_for_class`]. The
+    /// ad-hoc constructor still derives and validates normalized/AST identity,
+    /// so generic prepared-run tests exercise the same fail-closed boundary.
     ///
     /// # Errors
     ///
-    /// Rejects empty or oversized IDs and empty or oversized query text.
+    /// Rejects malformed IDs, raw query bounds, parser recovery, or a query
+    /// shape inconsistent with the stable ID's class prefix.
     pub fn new(id: impl Into<String>, text: impl Into<String>) -> Result<Self, Qg6HarnessError> {
         let id = id.into();
         let text = text.into();
+        let class = class_from_query_id(&id)?;
+        Self::build(
+            id,
+            text,
+            class,
+            Qg6PrevalenceStratum::Common,
+            Qg6DifficultyStratum::Easy,
+            Qg6SupportDivergence::reviewed(),
+            QG6_AD_HOC_QUERY_GENERATOR_REVISION,
+            QG6_AD_HOC_CORPUS_GENERATOR_REVISION,
+        )
+    }
+
+    fn build(
+        id: String,
+        text: String,
+        class: PerfQueryClass,
+        prevalence: Qg6PrevalenceStratum,
+        difficulty: Qg6DifficultyStratum,
+        support_divergence: Qg6SupportDivergence,
+        query_generator_revision: &str,
+        corpus_generator_revision: &str,
+    ) -> Result<Self, Qg6HarnessError> {
         if id.is_empty() || id.len() > MAX_QUERY_ID_BYTES {
             return Err(Qg6HarnessError::InvalidSpec {
                 reason: "query ID must be non-empty and at most 256 bytes".to_owned(),
@@ -165,7 +355,29 @@ impl Qg6QuerySpec {
                 reason: "query text must be non-empty and at most 16384 bytes".to_owned(),
             });
         }
-        Ok(Self { id, text })
+        let normalized = normalize_query_text(&text);
+        if normalized.is_empty() {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {id:?} normalizes to empty text"),
+            });
+        }
+        let (parsed_ast_sha256, parsed) = parsed_ast_sha256(&normalized, &id)?;
+        validate_query_shape(class, &parsed.query, &id)?;
+        let query = Self {
+            id,
+            text,
+            class,
+            normalized_text_sha256: sha256_hex(normalized.as_bytes()),
+            parsed_ast_sha256,
+            prevalence,
+            difficulty,
+            support_divergence,
+            supported_k: QG6_SUPPORTED_K,
+            query_generator_revision: query_generator_revision.to_owned(),
+            corpus_generator_revision: corpus_generator_revision.to_owned(),
+        };
+        query.validate_entry()?;
+        Ok(query)
     }
 
     /// Stable, non-sensitive query identifier.
@@ -179,6 +391,777 @@ impl Qg6QuerySpec {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// Frozen public query class.
+    #[must_use]
+    pub const fn class(&self) -> PerfQueryClass {
+        self.class
+    }
+
+    /// Frozen corpus prevalence stratum.
+    #[must_use]
+    pub const fn prevalence(&self) -> Qg6PrevalenceStratum {
+        self.prevalence
+    }
+
+    /// Frozen parser/execution difficulty stratum.
+    #[must_use]
+    pub const fn difficulty(&self) -> Qg6DifficultyStratum {
+        self.difficulty
+    }
+
+    /// Whether the frozen comparator contract permits a reviewed native
+    /// cutoff-tie or score-epsilon divergence for this query.
+    #[must_use]
+    pub const fn allows_reviewed_divergence(&self) -> bool {
+        self.support_divergence.allows_reviewed_divergence()
+    }
+
+    /// Stable redacted support label for benchmark diagnostics.
+    #[must_use]
+    pub const fn support_label(&self) -> &'static str {
+        match &self.support_divergence {
+            Qg6SupportDivergence::SupportedExact => "supported_exact",
+            Qg6SupportDivergence::SupportedWithReviewedDivergence { .. } => {
+                "supported_reviewed_divergence"
+            }
+            Qg6SupportDivergence::Unsupported { .. } => "unsupported",
+        }
+    }
+
+    /// Redacted identity for logs and bounded diagnostics.
+    #[must_use]
+    pub fn log_identity(&self) -> Qg6QueryLogIdentity {
+        Qg6QueryLogIdentity {
+            query_id: self.id.clone(),
+            class: self.class,
+            normalized_text_sha256: self.normalized_text_sha256.clone(),
+            parsed_ast_sha256: self.parsed_ast_sha256.clone(),
+        }
+    }
+
+    /// Sampling frame that governs every normative QG-6 query cell.
+    #[must_use]
+    pub const fn sampling_frame() -> &'static str {
+        QG6_SAMPLING_FRAME
+    }
+
+    /// Stable query-generator revision bound into every normative query hash.
+    #[must_use]
+    pub const fn normative_query_generator_revision() -> &'static str {
+        QG6_QUERY_GENERATOR_REVISION
+    }
+
+    /// Stable corpus-generator revision bound into every normative query hash.
+    #[must_use]
+    pub const fn normative_corpus_generator_revision() -> &'static str {
+        QG6_CORPUS_GENERATOR_REVISION
+    }
+
+    /// Construct the exact sixteen-query slice for one public class.
+    ///
+    /// This first constructs and validates the complete 80-query manifest, so
+    /// a class slice cannot be generated from a different or incomplete global
+    /// workload.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the built-in frozen manifest violates any count, identity,
+    /// parser, stratum, support, or revision invariant.
+    pub fn normative_for_class(class: PerfQueryClass) -> Result<Vec<Self>, Qg6HarnessError> {
+        let manifest = build_normative_query_manifest()?;
+        validate_complete_query_manifest(&manifest)?;
+        Ok(manifest
+            .into_iter()
+            .filter(|query| query.class == class)
+            .collect())
+    }
+
+    /// SHA-256 of the complete order-independent frozen 80-query manifest.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the built-in manifest no longer validates.
+    pub fn normative_manifest_sha256() -> Result<String, Qg6HarnessError> {
+        let manifest = build_normative_query_manifest()?;
+        validate_complete_query_manifest(&manifest)?;
+        Ok(query_manifest_sha256(&manifest))
+    }
+
+    fn validate_entry(&self) -> Result<(), Qg6HarnessError> {
+        if self.id.is_empty() || self.id.len() > MAX_QUERY_ID_BYTES {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "query ID must be non-empty and at most 256 bytes".to_owned(),
+            });
+        }
+        if self.text.is_empty() || self.text.len() > MAX_QUERY_TEXT_BYTES {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} has invalid raw-text bounds", self.id),
+            });
+        }
+        if class_from_query_id(&self.id)? != self.class {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} was reclassified", self.id),
+            });
+        }
+        if self.supported_k != QG6_SUPPORTED_K {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "query {:?} does not support exactly k=10 and k=100",
+                    self.id
+                ),
+            });
+        }
+        if self.query_generator_revision.is_empty()
+            || self.query_generator_revision.len() > 256
+            || self.corpus_generator_revision.is_empty()
+            || self.corpus_generator_revision.len() > 512
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "query {:?} has invalid generator revision identity",
+                    self.id
+                ),
+            });
+        }
+        match &self.support_divergence {
+            Qg6SupportDivergence::SupportedExact => {}
+            Qg6SupportDivergence::SupportedWithReviewedDivergence {
+                register_id,
+                contract_sha256,
+            } => {
+                if register_id.is_empty()
+                    || register_id.len() > 256
+                    || !is_lower_hex_sha256(contract_sha256)
+                {
+                    return Err(Qg6HarnessError::InvalidSpec {
+                        reason: format!(
+                            "query {:?} has an invalid reviewed divergence binding",
+                            self.id
+                        ),
+                    });
+                }
+            }
+            Qg6SupportDivergence::Unsupported { reason_code } => {
+                return Err(Qg6HarnessError::InvalidSpec {
+                    reason: format!(
+                        "query {:?} is explicitly unsupported ({reason_code}); refusing silent skip",
+                        self.id
+                    ),
+                });
+            }
+        }
+        let normalized = normalize_query_text(&self.text);
+        let normalized_sha256 = sha256_hex(normalized.as_bytes());
+        if normalized_sha256 != self.normalized_text_sha256 {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} normalized-text hash drifted", self.id),
+            });
+        }
+        let (parsed_ast_sha256, parsed) = parsed_ast_sha256(&normalized, &self.id)?;
+        if parsed_ast_sha256 != self.parsed_ast_sha256 {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} parsed-AST hash drifted", self.id),
+            });
+        }
+        validate_query_shape(self.class, &parsed.query, &self.id)
+    }
+}
+
+impl fmt::Debug for Qg6QuerySpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Qg6QuerySpec")
+            .field("id", &self.id)
+            .field("class", &self.class)
+            .field("normalized_text_sha256", &self.normalized_text_sha256)
+            .field("parsed_ast_sha256", &self.parsed_ast_sha256)
+            .field("prevalence", &self.prevalence)
+            .field("difficulty", &self.difficulty)
+            .field("support_divergence", &self.support_divergence)
+            .field("supported_k", &self.supported_k)
+            .field("query_generator_revision", &self.query_generator_revision)
+            .field("corpus_generator_revision", &self.corpus_generator_revision)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Qg6QuerySeed {
+    text: &'static str,
+    prevalence: Qg6PrevalenceStratum,
+    difficulty: Qg6DifficultyStratum,
+}
+
+const fn query_seed(
+    text: &'static str,
+    prevalence: Qg6PrevalenceStratum,
+    difficulty: Qg6DifficultyStratum,
+) -> Qg6QuerySeed {
+    Qg6QuerySeed {
+        text,
+        prevalence,
+        difficulty,
+    }
+}
+
+const IDENTIFIER_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
+    query_seed(
+        "term00042",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00137",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "src/main.rs",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        r"crate\:\:module\:\:TypeName",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "snake_case_identifier",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "camelCaseIdentifier",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "HTTPServer2",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "config.toml",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "path/to/module.rs",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "qgupdateg7d42",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "sha256deadbeef",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "user_id",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "nonexistentIdentifierAlpha",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "missing/path/file.rs",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        r"UnknownModule\:\:Type",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "qg6_nohit_identifier_15",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+];
+
+const SHORT_KEYWORD_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
+    query_seed(
+        "term00001",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00002",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "generated",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "record",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "term00005",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00011",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "term00017",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "term00029",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "term02048",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term04096",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "term06000",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "term08190",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "missingkeywordalpha",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "missingkeywordbeta",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "missingkeywordgamma",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "missingkeyworddelta",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+];
+
+const NATURAL_LANGUAGE_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
+    query_seed(
+        "term00001 term00007 generated record",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00002 term00013 generated record",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "term00003 term00017 generated record",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "term00005 term00019 generated record",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "search record containing term00023 term00031",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "generated document mentions term00037 term00041",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "find term00043 beside term00047 in record",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "which generated record includes term00053 term00059",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "rare generated record term02048 term03001",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "locate term04096 with term05003 in generated content",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "record containing rare terms term06000 term07001",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "generated content near term08180 and term08190",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "no matching prose alpha qg6missingone",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "find absent generated record qg6missingtwo",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "where is qg6missingthree in this corpus",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "adversarial but valid prose qg6missingfour term08191",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+];
+
+const PHRASE_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
+    query_seed(
+        "\"term00001 term00002\"",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "\"term00002 term00003\"",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "\"generated record\"",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "\"term00005 term00006 term00007\"",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "\"term00011 term00012\"",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "\"term00017 term00018\"",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "\"term00023 term00024 term00025\"",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "\"record term00031 generated\"",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "\"term02048 term02049\"",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "\"term04096 term04097\"",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "\"term06000 term06001 term06002\"",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "\"term08180 term08181\"",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "\"qg6 missing phrase alpha\"",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "\"qg6 missing phrase beta\"",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "\"qg6 missing phrase gamma delta\"",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "\"qg6 adversarial nohit phrase epsilon\"",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+];
+
+const BOOLEAN_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
+    query_seed(
+        "term00001 OR term00002",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00003 AND term00004",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "term00005 OR term00007 OR term00011",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "(term00013 OR term00017) AND term00019",
+        Qg6PrevalenceStratum::Common,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "term00023 AND NOT term08191",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term00029 OR NOT term08190",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "(term00031 AND term00037) OR term00041",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "term00043 AND (term00047 OR term00053) AND NOT term08189",
+        Qg6PrevalenceStratum::MidFrequency,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "term02048 OR term03001",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "term04096 AND term05003",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "(term06000 OR term07001) AND term08001",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "term08180 AND NOT (term00001 OR term00002)",
+        Qg6PrevalenceStratum::Rare,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+    query_seed(
+        "qg6missingboolalpha AND term00001",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Easy,
+    ),
+    query_seed(
+        "qg6missingboolbeta OR qg6missingboolgamma",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Moderate,
+    ),
+    query_seed(
+        "(qg6missingbooldelta AND term08191) OR qg6missingboolepsilon",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Hard,
+    ),
+    query_seed(
+        "qg6missingboolzeta AND NOT (term00001 OR term00002 OR term00003)",
+        Qg6PrevalenceStratum::NoHit,
+        Qg6DifficultyStratum::Adversarial,
+    ),
+];
+
+fn seeds_for_class(class: PerfQueryClass) -> &'static [Qg6QuerySeed; QG6_QUERY_GROUPS] {
+    match class {
+        PerfQueryClass::Identifier => &IDENTIFIER_QUERY_SEEDS,
+        PerfQueryClass::ShortKeyword => &SHORT_KEYWORD_QUERY_SEEDS,
+        PerfQueryClass::NaturalLanguage => &NATURAL_LANGUAGE_QUERY_SEEDS,
+        PerfQueryClass::Phrase => &PHRASE_QUERY_SEEDS,
+        PerfQueryClass::Boolean => &BOOLEAN_QUERY_SEEDS,
+    }
+}
+
+fn build_normative_query_manifest() -> Result<Vec<Qg6QuerySpec>, Qg6HarnessError> {
+    let mut queries = Vec::with_capacity(QG6_TOTAL_QUERY_COUNT);
+    for class in PerfQueryClass::ALL {
+        for (index, seed) in seeds_for_class(class).iter().enumerate() {
+            queries.push(Qg6QuerySpec::build(
+                format!("{}-{index:02}", class_slug(class)),
+                seed.text.to_owned(),
+                class,
+                seed.prevalence,
+                seed.difficulty,
+                Qg6SupportDivergence::reviewed(),
+                QG6_QUERY_GENERATOR_REVISION,
+                QG6_CORPUS_GENERATOR_REVISION,
+            )?);
+        }
+    }
+    Ok(queries)
+}
+
+fn validate_complete_query_manifest(queries: &[Qg6QuerySpec]) -> Result<(), Qg6HarnessError> {
+    if queries.len() != QG6_TOTAL_QUERY_COUNT {
+        return Err(Qg6HarnessError::InvalidSpec {
+            reason: "QG-6 frozen manifest requires exactly 80 queries".to_owned(),
+        });
+    }
+    let mut ids = BTreeSet::new();
+    let mut normalized_hashes = BTreeSet::new();
+    let mut ast_hashes = BTreeSet::new();
+    let mut class_counts = BTreeMap::new();
+    let mut prevalence = BTreeMap::<PerfQueryClass, BTreeSet<Qg6PrevalenceStratum>>::new();
+    let mut difficulty = BTreeMap::<PerfQueryClass, BTreeSet<Qg6DifficultyStratum>>::new();
+    for query in queries {
+        query.validate_entry()?;
+        if query.query_generator_revision != QG6_QUERY_GENERATOR_REVISION
+            || query.corpus_generator_revision != QG6_CORPUS_GENERATOR_REVISION
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "query {:?} has a non-normative generator revision",
+                    query.id
+                ),
+            });
+        }
+        if !ids.insert(query.id.as_str())
+            || !normalized_hashes.insert(query.normalized_text_sha256.as_str())
+            || !ast_hashes.insert(query.parsed_ast_sha256.as_str())
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "query {:?} aliases an existing stable ID, normalized text, or parsed AST",
+                    query.id
+                ),
+            });
+        }
+        *class_counts.entry(query.class).or_insert(0_usize) += 1;
+        prevalence
+            .entry(query.class)
+            .or_default()
+            .insert(query.prevalence);
+        difficulty
+            .entry(query.class)
+            .or_default()
+            .insert(query.difficulty);
+    }
+    for class in PerfQueryClass::ALL {
+        if class_counts.get(&class) != Some(&QG6_QUERY_GROUPS) {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "QG-6 class {} requires exactly sixteen queries",
+                    class_slug(class)
+                ),
+            });
+        }
+        let expected_ids = (0..QG6_QUERY_GROUPS)
+            .map(|index| format!("{}-{index:02}", class_slug(class)))
+            .collect::<BTreeSet<_>>();
+        let observed_ids = queries
+            .iter()
+            .filter(|query| query.class == class)
+            .map(|query| query.id.clone())
+            .collect::<BTreeSet<_>>();
+        if observed_ids != expected_ids {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "QG-6 class {} has a missing or replaced ID",
+                    class_slug(class)
+                ),
+            });
+        }
+        if prevalence.get(&class) != Some(&Qg6PrevalenceStratum::ALL.into_iter().collect())
+            || difficulty.get(&class) != Some(&Qg6DifficultyStratum::ALL.into_iter().collect())
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!(
+                    "QG-6 class {} must cover every prevalence and difficulty stratum",
+                    class_slug(class)
+                ),
+            });
+        }
+    }
+    let observed_sha256 = query_manifest_sha256(queries);
+    if observed_sha256 != QG6_FROZEN_MANIFEST_SHA256 {
+        return Err(Qg6HarnessError::InvalidSpec {
+            reason: format!(
+                "QG-6 frozen manifest hash drifted: expected={} observed={observed_sha256}",
+                QG6_FROZEN_MANIFEST_SHA256
+            ),
+        });
+    }
+    Ok(())
+}
+
+const fn class_slug(class: PerfQueryClass) -> &'static str {
+    match class {
+        PerfQueryClass::Identifier => "identifier",
+        PerfQueryClass::ShortKeyword => "short_keyword",
+        PerfQueryClass::NaturalLanguage => "natural_language",
+        PerfQueryClass::Phrase => "phrase",
+        PerfQueryClass::Boolean => "boolean",
+    }
+}
+
+fn class_from_query_id(id: &str) -> Result<PerfQueryClass, Qg6HarnessError> {
+    PerfQueryClass::ALL
+        .into_iter()
+        .find(|class| {
+            id.strip_prefix(class_slug(*class))
+                .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+        .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+            reason: format!("query ID {id:?} does not carry one canonical class prefix"),
+        })
 }
 
 /// Immutable corpus, query, and semantic configuration identity shared by all arms.
@@ -1419,6 +2402,251 @@ fn median_sorted_u64(values: &[u64]) -> u64 {
     }
 }
 
+fn normalize_query_text(text: &str) -> String {
+    let nfc = text.nfc().collect::<String>();
+    nfc.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parsed_ast_sha256(
+    normalized_text: &str,
+    query_id: &str,
+) -> Result<(String, frankensearch_quill::ParsedQuery), Qg6HarnessError> {
+    let parser =
+        DefaultQueryParser::new(DEFAULT_SCHEMA).map_err(|error| Qg6HarnessError::InvalidSpec {
+            reason: format!(
+                "QG-6 parser contract is unavailable for query {query_id:?}: sha256={}",
+                sha256_hex(error.to_string().as_bytes())
+            ),
+        })?;
+    let mut parsed = parser.parse_lenient(normalized_text);
+    if parsed.was_truncated || !parsed.diagnostics.is_empty() || parsed.query.is_empty() {
+        let mut diagnostic_hasher = Sha256::new();
+        diagnostic_hasher.update([u8::from(parsed.was_truncated)]);
+        for diagnostic in &parsed.diagnostics {
+            hash_len_prefixed(
+                &mut diagnostic_hasher,
+                format!("{:?}", diagnostic.kind).as_bytes(),
+            );
+        }
+        return Err(Qg6HarnessError::InvalidSpec {
+            reason: format!(
+                "query {query_id:?} has unsupported or recovered syntax; diagnostic_sha256={}",
+                lower_hex(diagnostic_hasher.finalize())
+            ),
+        });
+    }
+    let _report = canonicalize_query(&mut parsed.query);
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/qg6/canonical-query-ast/v1\0");
+    hash_query_ast(&mut hasher, &parsed.query);
+    Ok((lower_hex(hasher.finalize()), parsed))
+}
+
+fn validate_query_shape(
+    class: PerfQueryClass,
+    query: &Query,
+    query_id: &str,
+) -> Result<(), Qg6HarnessError> {
+    let accepted = match class {
+        PerfQueryClass::Identifier => {
+            !query_contains_explicit_boolean(query) && !query_contains_must_not(query)
+        }
+        PerfQueryClass::ShortKeyword => {
+            matches!(query, Query::Term { .. } | Query::Glob { .. })
+        }
+        PerfQueryClass::NaturalLanguage => {
+            matches!(query, Query::Boolean { operator: None, .. })
+                && !query_contains_must_not(query)
+                && !query_contains_explicit_boolean(query)
+        }
+        PerfQueryClass::Phrase => {
+            query_contains_phrase(query)
+                && !query_contains_explicit_boolean(query)
+                && !query_contains_must_not(query)
+        }
+        PerfQueryClass::Boolean => {
+            matches!(query, Query::Boolean { .. })
+                && (query_contains_explicit_boolean(query) || query_contains_must_not(query))
+        }
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(Qg6HarnessError::InvalidSpec {
+            reason: format!(
+                "query {query_id:?} parsed to a shape outside class {}",
+                class_slug(class)
+            ),
+        })
+    }
+}
+
+fn query_contains_phrase(query: &Query) -> bool {
+    match query {
+        Query::Phrase { .. } => true,
+        Query::Boolean { clauses, .. } => clauses
+            .iter()
+            .any(|clause| query_contains_phrase(&clause.query)),
+        Query::Boost { query, .. } => query_contains_phrase(query),
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => false,
+    }
+}
+
+fn query_contains_must_not(query: &Query) -> bool {
+    match query {
+        Query::Boolean { clauses, .. } => clauses
+            .iter()
+            .any(|clause| clause.occur == Occur::MustNot || query_contains_must_not(&clause.query)),
+        Query::Boost { query, .. } => query_contains_must_not(query),
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Phrase { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => false,
+    }
+}
+
+fn query_contains_explicit_boolean(query: &Query) -> bool {
+    match query {
+        Query::Boolean { clauses, operator } => {
+            operator.is_some()
+                || clauses
+                    .iter()
+                    .any(|clause| query_contains_explicit_boolean(&clause.query))
+        }
+        Query::Boost { query, .. } => query_contains_explicit_boolean(query),
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Phrase { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => false,
+    }
+}
+
+fn hash_query_ast(hasher: &mut Sha256, query: &Query) {
+    match query {
+        Query::Empty => hasher.update([0]),
+        Query::All => hasher.update([1]),
+        Query::Term { fields, text } => {
+            hasher.update([2]);
+            hash_query_fields(hasher, fields);
+            hash_len_prefixed(hasher, text.as_bytes());
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            hasher.update([3]);
+            hash_query_fields(hasher, fields);
+            hasher.update(usize_to_u64_infallible(terms.len()).to_le_bytes());
+            for term in terms {
+                hasher.update(term.position.to_le_bytes());
+                hash_len_prefixed(hasher, term.text.as_bytes());
+            }
+            hasher.update(slop.to_le_bytes());
+            hasher.update([u8::from(*prefix)]);
+        }
+        Query::Boolean { clauses, operator } => {
+            hasher.update([4]);
+            hasher.update([match operator {
+                None => 0,
+                Some(BooleanOperator::And) => 1,
+                Some(BooleanOperator::Or) => 2,
+            }]);
+            hasher.update(usize_to_u64_infallible(clauses.len()).to_le_bytes());
+            for clause in clauses {
+                hasher.update([match clause.occur {
+                    Occur::Must => 0,
+                    Occur::Should => 1,
+                    Occur::MustNot => 2,
+                }]);
+                hash_query_ast(hasher, &clause.query);
+            }
+        }
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => {
+            hasher.update([5]);
+            hasher.update(field_id.to_le_bytes());
+            hash_query_bound(hasher, lower);
+            hash_query_bound(hasher, upper);
+        }
+        Query::Set { field_id, values } => {
+            hasher.update([6]);
+            hasher.update(field_id.to_le_bytes());
+            hasher.update(usize_to_u64_infallible(values.len()).to_le_bytes());
+            for value in values {
+                hash_query_value(hasher, value);
+            }
+        }
+        Query::Glob { field_ids, pattern } => {
+            hasher.update([7]);
+            hasher.update(usize_to_u64_infallible(field_ids.len()).to_le_bytes());
+            for field_id in field_ids {
+                hasher.update(field_id.to_le_bytes());
+            }
+            hash_len_prefixed(hasher, pattern.as_bytes());
+        }
+        Query::Boost { query, factor } => {
+            hasher.update([8]);
+            hasher.update(factor.to_bits().to_le_bytes());
+            hash_query_ast(hasher, query);
+        }
+    }
+}
+
+fn hash_query_fields(hasher: &mut Sha256, fields: &[frankensearch_quill::QueryField]) {
+    hasher.update(usize_to_u64_infallible(fields.len()).to_le_bytes());
+    for field in fields {
+        hasher.update(field.field_id.to_le_bytes());
+        hasher.update(field.boost.to_bits().to_le_bytes());
+    }
+}
+
+fn hash_query_bound(hasher: &mut Sha256, bound: &Bound<QueryValue>) {
+    match bound {
+        Bound::Included(value) => {
+            hasher.update([0]);
+            hash_query_value(hasher, value);
+        }
+        Bound::Excluded(value) => {
+            hasher.update([1]);
+            hash_query_value(hasher, value);
+        }
+        Bound::Unbounded => hasher.update([2]),
+    }
+}
+
+fn hash_query_value(hasher: &mut Sha256, value: &QueryValue) {
+    match value {
+        QueryValue::I64(value) => {
+            hasher.update([0]);
+            hasher.update(value.to_le_bytes());
+        }
+        QueryValue::U64(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        QueryValue::Str(value) => {
+            hasher.update([2]);
+            hash_len_prefixed(hasher, value.as_bytes());
+        }
+    }
+}
+
 fn validate_experiment_inputs(
     document_count: u64,
     k: usize,
@@ -1439,14 +2667,32 @@ fn validate_experiment_inputs(
             reason: "QG-6 query count is outside 1..=4096".to_owned(),
         });
     }
-    let mut ids = queries
+    for query in queries {
+        query.validate_entry()?;
+        if !query.supported_k.contains(&k) {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} does not admit k={k}", query.id),
+            });
+        }
+    }
+    let ids = queries
         .iter()
         .map(|query| query.id.as_str())
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    if ids.windows(2).any(|window| window[0] == window[1]) {
+        .collect::<BTreeSet<_>>();
+    let normalized = queries
+        .iter()
+        .map(|query| query.normalized_text_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    let asts = queries
+        .iter()
+        .map(|query| query.parsed_ast_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    if ids.len() != queries.len()
+        || normalized.len() != queries.len()
+        || asts.len() != queries.len()
+    {
         return Err(Qg6HarnessError::InvalidSpec {
-            reason: "QG-6 query IDs must be unique".to_owned(),
+            reason: "QG-6 query IDs, normalized texts, and parsed ASTs must be unique".to_owned(),
         });
     }
     Ok(())
@@ -1470,11 +2716,35 @@ fn adapter_failure(
 fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, QG6_QUERY_MANIFEST_VERSION.as_bytes());
-    for query in queries {
+    hash_len_prefixed(&mut hasher, QG6_SAMPLING_FRAME.as_bytes());
+    let mut ordered = queries.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    hasher.update(usize_to_u64_infallible(ordered.len()).to_le_bytes());
+    for query in ordered {
         hash_len_prefixed(&mut hasher, query.id.as_bytes());
-        hash_len_prefixed(&mut hasher, query.text.as_bytes());
+        hasher.update([query_class_tag(query.class)]);
+        hash_len_prefixed(&mut hasher, query.normalized_text_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, query.parsed_ast_sha256.as_bytes());
+        hasher.update([query.prevalence.tag()]);
+        hasher.update([query.difficulty.tag()]);
+        query.support_divergence.hash_into(&mut hasher);
+        for k in query.supported_k {
+            hasher.update(usize_to_u64_infallible(k).to_le_bytes());
+        }
+        hash_len_prefixed(&mut hasher, query.query_generator_revision.as_bytes());
+        hash_len_prefixed(&mut hasher, query.corpus_generator_revision.as_bytes());
     }
     lower_hex(hasher.finalize())
+}
+
+const fn query_class_tag(class: PerfQueryClass) -> u8 {
+    match class {
+        PerfQueryClass::Identifier => 0,
+        PerfQueryClass::ShortKeyword => 1,
+        PerfQueryClass::NaturalLanguage => 2,
+        PerfQueryClass::Phrase => 3,
+        PerfQueryClass::Boolean => 4,
+    }
 }
 
 fn ordered_doc_ids_sha256(doc_ids: &[String]) -> String {
@@ -1589,6 +2859,10 @@ mod tests {
         .expect("prepared experiment")
     }
 
+    fn normative_manifest() -> Vec<Qg6QuerySpec> {
+        build_normative_query_manifest().expect("frozen QG-6 manifest")
+    }
+
     fn canonical_result(query: &Qg6QuerySpec) -> Vec<String> {
         vec![
             format!("{}-doc-0", query.id()),
@@ -1631,6 +2905,213 @@ mod tests {
                 .expect("first counts")
                 .abs_diff(*first_counts.values().min().expect("first counts"))
                 <= 1
+        );
+    }
+
+    #[test]
+    fn frozen_manifest_has_eighty_unique_queries_and_twenty_equal_weight_cells() {
+        let manifest = normative_manifest();
+        validate_complete_query_manifest(&manifest).expect("complete frozen manifest");
+        assert_eq!(manifest.len(), 5 * 16);
+        assert_eq!(QG6_TOTAL_QUERY_COUNT, 80);
+        assert!(Qg6QuerySpec::sampling_frame().contains("equal weight"));
+        assert!(Qg6QuerySpec::sampling_frame().contains("never independent queries"));
+
+        let mut ids = BTreeSet::new();
+        let mut normalized = BTreeSet::new();
+        let mut asts = BTreeSet::new();
+        for class in PerfQueryClass::ALL {
+            let class_queries = manifest
+                .iter()
+                .filter(|query| query.class() == class)
+                .collect::<Vec<_>>();
+            assert_eq!(class_queries.len(), 16);
+            assert_eq!(
+                class_queries
+                    .iter()
+                    .map(|query| query.prevalence())
+                    .collect::<BTreeSet<_>>(),
+                Qg6PrevalenceStratum::ALL.into_iter().collect()
+            );
+            assert_eq!(
+                class_queries
+                    .iter()
+                    .map(|query| query.difficulty())
+                    .collect::<BTreeSet<_>>(),
+                Qg6DifficultyStratum::ALL.into_iter().collect()
+            );
+            for query in class_queries {
+                assert!(ids.insert(query.id()));
+                assert!(normalized.insert(query.normalized_text_sha256.as_str()));
+                assert!(asts.insert(query.parsed_ast_sha256.as_str()));
+            }
+        }
+
+        let forward_hash = query_manifest_sha256(&manifest);
+        assert_eq!(forward_hash, QG6_FROZEN_MANIFEST_SHA256);
+        let mut reversed = manifest;
+        reversed.reverse();
+        assert_eq!(
+            forward_hash,
+            query_manifest_sha256(&reversed),
+            "manifest identity must not depend on load order"
+        );
+        assert_eq!(
+            forward_hash,
+            Qg6QuerySpec::normative_manifest_sha256().expect("normative hash")
+        );
+    }
+
+    #[test]
+    fn frozen_manifest_reloads_and_independent_corpus_builds_are_deterministic() {
+        let manifest = normative_manifest();
+        let json = serde_json::to_vec(&manifest).expect("serialize manifest");
+        let first: Vec<Qg6QuerySpec> = serde_json::from_slice(&json).expect("first fresh load");
+        let second: Vec<Qg6QuerySpec> = serde_json::from_slice(&json).expect("second fresh load");
+        validate_complete_query_manifest(&first).expect("first fresh load validates");
+        validate_complete_query_manifest(&second).expect("second fresh load validates");
+        assert_eq!(
+            query_manifest_sha256(&first),
+            query_manifest_sha256(&second)
+        );
+
+        let corpus_spec = crate::SyntheticCorpusSpec {
+            seed: 0x5155_494c_4c50_4552,
+            document_count: 256,
+            vocabulary_size: 8_192,
+            zipf_exponent: crate::ZipfExponent::S11,
+            max_document_bytes: 4_096,
+        };
+        let first_corpus =
+            crate::SyntheticCorpus::new(corpus_spec.clone()).expect("first corpus build");
+        let second_corpus = crate::SyntheticCorpus::new(corpus_spec).expect("second corpus build");
+        assert_eq!(
+            first_corpus
+                .manifest()
+                .expect("first manifest")
+                .content_sha256,
+            second_corpus
+                .manifest()
+                .expect("second manifest")
+                .content_sha256
+        );
+    }
+
+    #[test]
+    fn frozen_manifest_rejects_fifteen_or_seventeen_queries_per_class() {
+        let mut fifteen = normative_manifest();
+        fifteen.remove(0);
+        assert!(validate_complete_query_manifest(&fifteen).is_err());
+
+        let mut seventeen = normative_manifest();
+        let mut extra = seventeen[0].clone();
+        extra.id = "identifier-16".to_owned();
+        extra.text = "qg6seventeenthidentifier".to_owned();
+        let normalized = normalize_query_text(&extra.text);
+        extra.normalized_text_sha256 = sha256_hex(normalized.as_bytes());
+        extra.parsed_ast_sha256 = parsed_ast_sha256(&normalized, &extra.id)
+            .expect("extra AST")
+            .0;
+        seventeen.push(extra);
+        assert!(validate_complete_query_manifest(&seventeen).is_err());
+    }
+
+    #[test]
+    fn frozen_manifest_rejects_alias_reclassification_hash_drift_and_unsupported() {
+        let mut normalized_alias = normative_manifest();
+        normalized_alias[1].text = normalized_alias[0].text.clone();
+        normalized_alias[1].normalized_text_sha256 =
+            normalized_alias[0].normalized_text_sha256.clone();
+        normalized_alias[1].parsed_ast_sha256 = normalized_alias[0].parsed_ast_sha256.clone();
+        assert!(validate_complete_query_manifest(&normalized_alias).is_err());
+
+        let mut ast_alias = normative_manifest();
+        ast_alias[1].text = ast_alias[0].text.to_ascii_uppercase();
+        let normalized = normalize_query_text(&ast_alias[1].text);
+        ast_alias[1].normalized_text_sha256 = sha256_hex(normalized.as_bytes());
+        ast_alias[1].parsed_ast_sha256 = parsed_ast_sha256(&normalized, ast_alias[1].id())
+            .expect("case-alias AST")
+            .0;
+        assert_ne!(
+            ast_alias[0].normalized_text_sha256,
+            ast_alias[1].normalized_text_sha256
+        );
+        assert_eq!(
+            ast_alias[0].parsed_ast_sha256,
+            ast_alias[1].parsed_ast_sha256
+        );
+        assert!(validate_complete_query_manifest(&ast_alias).is_err());
+
+        let mut reclassified = normative_manifest();
+        reclassified[0].class = PerfQueryClass::Boolean;
+        assert!(validate_complete_query_manifest(&reclassified).is_err());
+
+        let mut drifted = normative_manifest();
+        drifted[0].normalized_text_sha256 = "f".repeat(64);
+        assert!(validate_complete_query_manifest(&drifted).is_err());
+
+        let mut unsupported = normative_manifest();
+        unsupported[0].support_divergence = Qg6SupportDivergence::Unsupported {
+            reason_code: "unsupported_test_syntax".to_owned(),
+        };
+        let error = validate_complete_query_manifest(&unsupported)
+            .expect_err("unsupported syntax fails before timing");
+        assert!(error.to_string().contains("refusing silent skip"));
+    }
+
+    #[test]
+    fn frozen_manifest_rejects_unknown_fields_and_raw_text_never_enters_log_identity() {
+        let manifest = normative_manifest();
+        let raw_text = manifest[0].text().to_owned();
+        let debug = format!("{:?}", manifest[0]);
+        let log_json =
+            serde_json::to_string(&manifest[0].log_identity()).expect("serialize log identity");
+        assert!(!debug.contains(&raw_text));
+        assert!(!log_json.contains(&raw_text));
+
+        let mut json = serde_json::to_value(&manifest[0]).expect("query JSON");
+        json.as_object_mut()
+            .expect("query object")
+            .insert("raw_text_log".to_owned(), serde_json::json!(raw_text));
+        assert!(
+            serde_json::from_value::<Qg6QuerySpec>(json).is_err(),
+            "unknown/raw-text logging fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn unsupported_parser_syntax_and_unknown_field_syntax_fail_before_preparation() {
+        let recovered =
+            Qg6QuerySpec::new("phrase-hostile", "\"unterminated").expect_err("parser recovery");
+        assert!(
+            recovered
+                .to_string()
+                .contains("unsupported or recovered syntax")
+        );
+
+        let unknown_field = Qg6QuerySpec::new("identifier-hostile", "unknown_field:value")
+            .expect_err("unknown field");
+        assert!(
+            unknown_field
+                .to_string()
+                .contains("unsupported or recovered syntax")
+        );
+    }
+
+    #[test]
+    fn normative_class_slice_has_sixteen_queries_and_rejects_silent_skip() {
+        let class =
+            Qg6QuerySpec::normative_for_class(PerfQueryClass::Boolean).expect("boolean slice");
+        assert_eq!(class.len(), QG6_QUERY_GROUPS);
+        let mut skipped = class;
+        skipped.pop();
+        assert_eq!(skipped.len(), 15);
+        assert_ne!(
+            query_manifest_sha256(&skipped),
+            query_manifest_sha256(
+                &Qg6QuerySpec::normative_for_class(PerfQueryClass::Boolean)
+                    .expect("complete boolean slice")
+            )
         );
     }
 
