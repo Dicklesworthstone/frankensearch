@@ -5632,6 +5632,7 @@ mod tests {
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
             let hydrated_candidates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hydrated_candidate_ids = Arc::new(std::sync::atomic::AtomicU16::new(0));
             let mut initial_results = Vec::new();
 
             let metrics = searcher
@@ -5641,6 +5642,21 @@ mod tests {
                     10,
                     |doc_id| {
                         hydrated_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let candidate_bit = match doc_id {
+                            "doc-0" => 1 << 0,
+                            "doc-1" => 1 << 1,
+                            "doc-2" => 1 << 2,
+                            "doc-3" => 1 << 3,
+                            "doc-4" => 1 << 4,
+                            "doc-5" => 1 << 5,
+                            "doc-6" => 1 << 6,
+                            "doc-7" => 1 << 7,
+                            "doc-8" => 1 << 8,
+                            "doc-9" => 1 << 9,
+                            _ => 1 << 15,
+                        };
+                        hydrated_candidate_ids
+                            .fetch_or(candidate_bit, std::sync::atomic::Ordering::Relaxed);
                         let text = if doc_id == "doc-0" {
                             "unsafe rust systems"
                         } else {
@@ -5659,12 +5675,17 @@ mod tests {
 
             assert_eq!(
                 metrics.phase1_vectors_searched, 10,
-                "the fixture must scan all ten semantic vectors"
+                "the fixture must expose all ten semantic vectors to Phase 1"
             );
             assert_eq!(
                 hydrated_candidates.load(std::sync::atomic::Ordering::Relaxed),
                 metrics.phase1_vectors_searched,
-                "exclusion filtering must hydrate each semantic candidate exactly once"
+                "exclusion filtering must perform exactly one hydration per fixture candidate"
+            );
+            assert_eq!(
+                hydrated_candidate_ids.load(std::sync::atomic::Ordering::Relaxed),
+                (1_u16 << 10) - 1,
+                "exclusion filtering must hydrate every distinct fixture candidate exactly once"
             );
             assert_eq!(metrics.semantic_candidates, 9);
             assert_eq!(initial_results.len(), 9);

@@ -17792,18 +17792,19 @@ calibration, and fusion—rather than the exclusion filter alone, and clamped a
 negative difference to zero. This same assertion had already failed at
 1.066 ms on loaded `ovh-a` and passed unchanged on `hz2`; QG-6 separately
 established that one sub-millisecond search per sample is dominated by timer
-resolution and scheduling noise. The relevant production search/filter blobs
-are also byte-identical between the candidate and its `origin/main` base, so
-the observation cannot establish a candidate regression.
+resolution and scheduling noise. The production exclusion implementation and
+its surrounding fusion searcher path were unchanged by this candidate; the
+one-shot observation therefore cannot isolate a regression to changed
+production code.
 
 **Decision: INVALID-HARNESS / test contract repaired, no performance claim.**
 The wall-clock subtraction was replaced with a deterministic complexity and
-correctness guard: for the ten-document fixture, the negated search must scan
-ten vectors, hydrate every semantic candidate exactly once, retain nine
-semantic candidates, and remove `doc-0`. The absolute latency claim remains
-owned by the release-profile negation benchmark, whose paired AB/BA and A/A
-evidence already demonstrated byte-identical output and a large normalizer
-speedup.
+correctness guard: the ten-document fixture must expose all ten vectors to
+Phase 1, hydrate every distinct semantic candidate exactly once, retain nine
+semantic candidates, and remove `doc-0`. No full-path `<1 ms` claim remains;
+current controlled timing evidence is limited to the isolated normalizer
+benchmark, whose paired AB/BA and A/A evidence demonstrated byte-identical
+output and a large normalizer speedup.
 
 **Retry predicate for any full-path `<1 ms` claim:** add a dedicated
 release-profile, same-binary harness with warm-up, many inner searches per
