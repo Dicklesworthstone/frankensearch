@@ -1246,6 +1246,7 @@ impl Qg6SemanticContract {
             || self.document_count == 0
             || self.k == 0
             || self.k > MAX_K
+            || !QG6_SUPPORTED_K.contains(&self.k)
             || self.groups.is_empty()
             || self.groups.len() > MAX_QUERY_COUNT
             || self.contract_sha256 != self.canonical_sha256()
