@@ -92,9 +92,9 @@ Prior local Quill card: wall 5.78 s, user 5.39 s, sys 0.38 s, peak RSS 509 MB.
 This run: 5.58 / 5.19 / 0.38 / 508 MB — **reproduces within 3.5%**, so the
 anchor holds.
 
-Traced runs: Tantivy **14,645 samples** (438.8 MB), Quill **12,881 samples**
+Traced runs (dwarf): Tantivy **14,645 samples** (438.8 MB), Quill **12,881 samples**
 (395.1 MB), event `cycles:P`, F=1997. Prior card: 10,572. Both far above the
-≥2000-sample escalation rule; no pooling required.
+≥2000-sample escalation rule; no pooling required. fp cross-check runs: Tantivy **14,441 samples** (2.1 MB), Quill **11,891 samples** (2.1 MB) — both unwinders agree on every headline family figure (see table).
 
 ## THE TABLE — copy/alloc family self-time, both arms, one host, one binary, one corpus
 
@@ -108,6 +108,7 @@ heap 50 MB, positions ON, `QUILL_PERF_CHILD_THREADS=1`, batch 250, smoke scale.
 | `__memset_avx2_unaligned_erms` | **0.08%** | **0.22%** | 2.75× |
 | `realloc` + `_int_realloc` | **0.30%** | **0.37%** | 1.23× |
 | copy family subtotal (memmove+memset+realloc) | **6.17%** | **7.70%** | 1.25× |
+| *fp-unwinder cross-check, same three families* | *5.64% / 0.11% / 0.38%* | *7.04% / 0.31% / 0.32%* | *1.25× / — / —* |
 | — engine-owned portion of that memmove | 4.96% of arm | 6.38% of arm | 1.29× |
 | — harness-generator portion of that memmove | 0.70% of arm | 0.68% of arm | 0.97× (identical, as required) |
 | **memmove normalized to each engine's OWN CPU** | **6.33%** (thread-scoped cross-check: 3.99/58.76 = 6.79%) | **7.97%** | **1.26×** |
@@ -130,6 +131,53 @@ prior card's 10.9% independently.
 
 **Deleting Quill's ENTIRE memmove excess over the incumbent recovers 0.061 s of
 5.57 s CPU = 1.1%.**
+
+## Top-10 self-time per arm (dwarf primary; `addr2line -f -C -i` resolved)
+
+Host `thinkstation1` / `local-5975wx-32c` on every row; 200k-doc seed-pinned
+corpus; `threads=1` pinned. Thread column is the owning `comm`.
+
+**Tantivy 0.26.1 — 4 threads observed** (`thrd-tantivy-in` 47.48%, main 41.23%,
+`docstore-compre` 9.87%, `segment_updater` 1.41%):
+
+| # | self% | thread | frame | file:line |
+|---|---|---|---|---|
+| 1 | 8.74% | `thrd-tantivy-in` | `FrankensearchTokenStream::advance` (tantivy tokenizer adapter) | `crates/frankensearch-lexical/src/lib.rs:643` |
+| 2 | 6.22% | `thrd-tantivy-in` | `SpecializedPostingsWriter<TfAndPositionRecorder>::subscribe::{closure#0}` | `tantivy-0.26.1/src/postings/postings_writer.rs:212` |
+| 3 | 5.99% | `thrd-tantivy-in` | `SpecializedPostingsWriter<TfAndPositionRecorder>::subscribe` | `tantivy-0.26.1/src/postings/postings_writer.rs:212` |
+| 4 | 5.80% | split 3 threads | `__memmove_avx_unaligned_erms` | libc, no debuginfo (callers resolved below) |
+| 5 | 5.13% | `docstore-compre` | `lz4_flex::compress_internal::<HashTable4KU16,…>` | `lz4_flex-0.13.1/src/block/compress.rs:318` |
+| 6 | 4.66% | main | `_int_malloc` | libc, no debuginfo |
+| 7 | 4.63% | main | `SyntheticCorpus::document_at` — **harness, not engine** | `crates/frankensearch-quill-gauntlet/src/generator.rs:304` |
+| 8 | 3.61% | main | `Formatter::pad_integral` — **harness fmt** | `library/core/src/fmt/mod.rs:1826` |
+| 9 | 2.41% | main | `core::fmt::write` — **harness fmt** | `library/core/src/fmt/mod.rs:1631` |
+| 10 | 1.96% | main | `String as fmt::Write>::write_char` — **harness fmt** | `serde_core-1.0.229/src/de/mod.rs:2372` |
+
+**Quill — 1 thread observed** (main 99.99%):
+
+| # | self% | thread | frame | file:line |
+|---|---|---|---|---|
+| 1 | 12.15% | main | `FrankensearchTokenizer::analyze` | `crates/frankensearch-quill/src/scribe.rs:527` |
+| 2 | 7.11% | main | `__memmove_avx_unaligned_erms` | libc, no debuginfo (callers resolved below) |
+| 3 | 3.99% | main | `SyntheticCorpus::document_at` — **harness, not engine** | `crates/frankensearch-quill-gauntlet/src/generator.rs:304` |
+| 4 | 3.12% | main | `serde_json Serializer::serialize_str` — **part harness** (see below) | `serde_json-1.0.151/src/ser.rs:190` |
+| 5 | 2.98% | main | `Formatter::pad_integral` — **part harness** | `library/core/src/fmt/mod.rs:1826` |
+| 6 | 2.81% | main | `RandomState::hash_one::<&u64>` (SipHash on u64 keys) | `library/core/src/hash/mod.rs:694` |
+| 7 | 2.80% | main | `index::canonical_document_preimage` | `crates/frankensearch-quill/src/index.rs:5862` |
+| 8 | 2.45% | main | `KeeperSnapshot::resolve_document_id_in` | `crates/frankensearch-quill/src/keeper.rs:2985` |
+| 9 | 2.36% | main | `core::fmt::write` — **part harness** | `library/core/src/fmt/mod.rs:1631` |
+| 10 | 2.20% | main | `scribe::stable_digit_scatter` | `crates/frankensearch-quill/src/scribe.rs:3950` |
+
+**Read rows 4/5/9 of the Quill table against rows 8/9/10 of the Tantivy table.**
+The Tantivy arm shows `pad_integral` 3.61%, `fmt::write` 2.41%,
+`write_char` 1.96% and `serialize_str` 1.45% **with zero Quill in the process**.
+Those frames are therefore substantially harness-generator cost in *both* arms,
+which is what deflates Round-1's "canonicalization ~12-15% family" estimate.
+
+Note also rows 1: both engines run the **same** frankensearch tokenizer family.
+Engine-normalized that is Quill 12.15/79.98 = **15.19%** vs Tantivy
+8.74/78.41 = **11.15%** — a real **1.36×** excess, against Round-1's
+"proportionally comparable … NOT the differentiator".
 
 ## Where each arm's copies actually are (addr2line -f -C -i, same binary)
 
