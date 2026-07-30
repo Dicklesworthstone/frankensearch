@@ -6109,6 +6109,17 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    fn trace_last_field_u64(line: &str, field: &str) -> Option<u64> {
+        let prefix = format!("{field}=");
+        let start = line.rfind(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)?.parse().ok()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn trace_field_text<'a>(line: &'a str, field: &str) -> Option<&'a str> {
         let prefix = format!("{field}=");
         let start = line.find(&prefix)?.saturating_add(prefix.len());
@@ -7425,6 +7436,409 @@ mod tests {
             .await
     }
 
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_QUERY: &str = "content:alpha OR content:beta OR content:gamma";
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_DOCUMENT_COUNT: usize = 9_001;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_TWO_SEGMENT_SPLIT: usize = 257;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_TIE_EXPANSION: u64 = 1;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_RANKED_DOCUMENT_TOKENS: usize = 128;
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UnionHorizonTraceReceipt {
+        segment_doc_count: u64,
+        plan: String,
+        pruning_windows: u64,
+        blocks_skipped: u64,
+        candidate_docs: u64,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UnionHorizonProof {
+        comparisons: Vec<HarnessRun>,
+        trace: UnionHorizonTraceReceipt,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn union_horizon_ranked_content(gamma_frequency: usize) -> Vec<u8> {
+        assert!(
+            gamma_frequency < UNION_HORIZON_RANKED_DOCUMENT_TOKENS,
+            "UNION_HORIZON ranked-document frequency must leave room for alpha",
+        );
+        let mut tokens = Vec::with_capacity(UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.push("alpha");
+        tokens.extend(std::iter::repeat_n("gamma", gamma_frequency));
+        tokens.extend(std::iter::repeat_n(
+            "padding",
+            UNION_HORIZON_RANKED_DOCUMENT_TOKENS - gamma_frequency - 1,
+        ));
+        assert_eq!(tokens.len(), UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.join(" ").into_bytes()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn make_union_horizon_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_entries(
+            "union-horizon-late-winner",
+            (0..UNION_HORIZON_DOCUMENT_COUNT).map(|ordinal| {
+                let bytes = match ordinal {
+                    // These 99 documents give the public top-100 comparison a
+                    // strictly ordered prefix. Their fixed field length makes
+                    // increasing gamma frequency the only score-changing
+                    // variable, so a segment split cannot expose Tantivy's
+                    // native DocAddress tie order against Quill's global
+                    // document-id tie order.
+                    0..=98 => union_horizon_ranked_content(ordinal + 10),
+                    99..=4_095 => b"alpha beta".to_vec(),
+                    4_096..=8_999 => b"alpha".to_vec(),
+                    // The late winner retains the same fixed field length as
+                    // the ranked prefix and has the unique largest gamma
+                    // frequency. It remains beyond the first empty
+                    // competitive window in both segment layouts.
+                    9_000 => union_horizon_ranked_content(120),
+                    _ => unreachable!("UNION_HORIZON fixture ordinal is bounded"),
+                };
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from(format!("docs/{ordinal:05}.txt")),
+                    bytes,
+                }
+            }),
+        )
+        .expect("UNION_HORIZON repository snapshot");
+        let corpus_hash = snapshot
+            .manifest
+            .manifest_hash()
+            .expect("UNION_HORIZON corpus hash");
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202_4096,
+                default_limit: 100,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [1_u64, 20, 100]
+                .into_iter()
+                .map(|limit| GeneratedQueryCase {
+                    id: format!("union-horizon-k{limit}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Boolean,
+                    query: UNION_HORIZON_QUERY.to_owned(),
+                    limit,
+                    offset: 0,
+                    count_requested: true,
+                    filters: crate::generator::GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "runner.rs UNION_HORIZON late-winner regression".to_owned(),
+                })
+                .collect(),
+        )
+        .expect("UNION_HORIZON query suite");
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn union_horizon_trace_receipt(logs: &str, segment_doc_count: u64) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::tracing_conventions::ARGUS_SCORE;
+
+        let matching = logs
+            .lines()
+            .filter(|line| is_stage_close(line, ARGUS_SCORE))
+            // Close records contain the outer query span before the nested
+            // score span, and both carry `doc_count`. Select the innermost
+            // (last) field so a multi-segment query's aggregate count cannot
+            // masquerade as the target segment's count.
+            .filter(|line| trace_last_field_u64(line, "doc_count") == Some(segment_doc_count))
+            .filter(|line| trace_has_text_field(line, "plan", "max_score"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "UNION_HORIZON target segment must emit exactly one MaxScore close receipt; \
+             segment_doc_count={segment_doc_count} logs={logs}",
+        );
+        let score = matching[0];
+        let receipt = UnionHorizonTraceReceipt {
+            segment_doc_count,
+            plan: trace_field_text(score, "plan")
+                .expect("UNION_HORIZON score plan")
+                .to_owned(),
+            pruning_windows: trace_field_u64(score, "pruning_windows")
+                .expect("UNION_HORIZON pruning-window count"),
+            blocks_skipped: trace_field_u64(score, "blocks_skipped")
+                .expect("UNION_HORIZON skipped-block count"),
+            candidate_docs: trace_field_u64(score, "candidate_docs")
+                .expect("UNION_HORIZON candidate count"),
+        };
+        assert_eq!(trace_field_u64(score, "segments_touched"), Some(1));
+        assert_eq!(receipt.plan, "max_score");
+        assert_eq!(receipt.pruning_windows, 2);
+        assert_eq!(receipt.blocks_skipped, 0);
+        assert_eq!(receipt.candidate_docs, 1);
+        receipt
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_union_horizon_proof(
+        cx: &Cx,
+        fixture: &Fixture,
+        segment_split: Option<usize>,
+    ) -> UnionHorizonProof {
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject = crate::engine::QuillSubject::in_memory(
+            config,
+            "union-horizon-deterministic-regression-not-live-provenance",
+            false,
+        )
+        .expect("fresh UNION_HORIZON Quill subject");
+        let mut oracle =
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+                .expect("fresh UNION_HORIZON Tantivy oracle");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Quill subject");
+        oracle
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Tantivy oracle");
+
+        let ranges = segment_split.map_or_else(
+            || vec![0..fixture.documents.len()],
+            |split| vec![0..split, split..fixture.documents.len()],
+        );
+        for range in ranges {
+            let documents = fixture.documents[range]
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .index_documents(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Quill segment");
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Quill segment");
+            oracle
+                .index()
+                .index_documents(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Tantivy segment");
+            oracle
+                .index()
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Tantivy segment");
+        }
+        subject
+            .mark_committed()
+            .expect("commit UNION_HORIZON Quill campaign");
+        oracle
+            .mark_committed()
+            .expect("commit UNION_HORIZON Tantivy campaign");
+
+        let expected_segment_doc_counts = segment_split.map_or_else(
+            || vec![UNION_HORIZON_DOCUMENT_COUNT as u32],
+            |split| vec![split as u32, (UNION_HORIZON_DOCUMENT_COUNT - split) as u32],
+        );
+        let snapshot = subject
+            .index()
+            .expect("UNION_HORIZON Quill index")
+            .snapshot();
+        let actual_segment_doc_counts = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.doc_count())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_segment_doc_counts, expected_segment_doc_counts,
+            "UNION_HORIZON Quill segment shape drifted",
+        );
+        if let Some(split) = segment_split {
+            assert_eq!(9_000_usize - split, 8_743);
+            assert!(9_000_usize - split >= 2 * 4_096);
+        }
+
+        let target_id = fixture
+            .documents
+            .last()
+            .expect("UNION_HORIZON target document")
+            .id
+            .as_str();
+        let harness = crate::engine::DifferentialHarness::new(
+            ComparisonMode::CrossEngine,
+            ComparatorConfig::default(),
+        );
+        let mut comparisons = Vec::new();
+        for query in &fixture.query_suite.cases {
+            let case = DifferentialCase {
+                fixture_id: query.id.clone(),
+                query: query.query.clone(),
+                limit: query.limit,
+                offset: query.offset,
+                tie_expansion_limit: UNION_HORIZON_TIE_EXPANSION,
+                count_requested: query.count_requested,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some(GENERATOR_ID.to_owned()),
+                    generator_seed: Some(fixture.query_suite.manifest.spec.seed),
+                    corpus_hash: Some(fixture.corpus_hash.clone()),
+                },
+            };
+            let run = harness
+                .run(cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "UNION_HORIZON segment_split={segment_split:?} limit={} failed: {error}",
+                        query.limit,
+                    )
+                });
+            assert_eq!(
+                run.comparison.status,
+                ComparisonStatus::Exact,
+                "UNION_HORIZON limit={} comparison report: {:#?}",
+                query.limit,
+                run.comparison,
+            );
+            assert_eq!(
+                run.comparison.rank_class,
+                RankClass::RankExact,
+                "UNION_HORIZON limit={} comparison report: {:#?}",
+                query.limit,
+                run.comparison,
+            );
+            let subject_rows = run
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_rows = run
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subject_rows, oracle_rows,
+                "UNION_HORIZON limit={} IDs or score bits diverged",
+                query.limit,
+            );
+            assert_eq!(
+                subject_rows.first().map(|(doc_id, _)| *doc_id),
+                Some(target_id),
+                "UNION_HORIZON late winner must rank first",
+            );
+            assert!(
+                subject_rows.windows(2).all(|rows| {
+                    f32::from_bits(rows[0].1).total_cmp(&f32::from_bits(rows[1].1))
+                        == std::cmp::Ordering::Greater
+                }),
+                "UNION_HORIZON limit={} ranked prefix must have strictly descending unique scores",
+                query.limit,
+            );
+            if query.limit == 100 {
+                assert_eq!(
+                    subject_rows.len(),
+                    100,
+                    "UNION_HORIZON top-100 proof must return the complete ranked prefix",
+                );
+                assert_eq!(subject_rows[0].0, "repo:docs/09000.txt");
+                for (rank, ordinal) in (0..=98).rev().enumerate() {
+                    assert_eq!(
+                        subject_rows[rank + 1].0,
+                        format!("repo:docs/{ordinal:05}.txt"),
+                        "UNION_HORIZON ranked-anchor identity drifted at rank {}",
+                        rank + 1,
+                    );
+                }
+            }
+            let subject_ties = run
+                .comparison
+                .subject
+                .cutoff_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_ties = run
+                .comparison
+                .oracle
+                .cutoff_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subject_ties, oracle_ties,
+                "UNION_HORIZON limit={} cutoff tie evidence diverged",
+                query.limit,
+            );
+            assert!(
+                run.comparison.subject.cutoff_tie_complete
+                    && run.comparison.oracle.cutoff_tie_complete,
+                "UNION_HORIZON limit={} requires complete cutoff-tie evidence",
+                query.limit,
+            );
+            comparisons.push(run);
+        }
+
+        let trace_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || TraceLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        let traced = tracing::subscriber::with_default(subscriber, || {
+            subject
+                .index()
+                .expect("UNION_HORIZON Quill index")
+                .search_paginated(cx, UNION_HORIZON_QUERY, 1, 0, false)
+        })
+        .expect("trace UNION_HORIZON Quill search");
+        assert_eq!(traced.hits.len(), 1);
+        assert_eq!(traced.hits[0].document_id, target_id);
+        assert_eq!(traced.hits[0].global_docid, 9_000);
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("UNION_HORIZON trace buffer lock")
+                .clone(),
+        )
+        .expect("UNION_HORIZON trace is UTF-8");
+        let segment_doc_count = segment_split
+            .map_or(UNION_HORIZON_DOCUMENT_COUNT as u64, |split| {
+                (UNION_HORIZON_DOCUMENT_COUNT - split) as u64
+            });
+        let trace = union_horizon_trace_receipt(&logs, segment_doc_count);
+
+        UnionHorizonProof { comparisons, trace }
+    }
+
     #[test]
     fn quill_subject_rejects_calls_outside_its_one_shot_lifecycle() {
         let fixture = make_fixture();
@@ -8720,6 +9134,22 @@ mod tests {
         )
         .expect("captured Quill trace is UTF-8");
         assert_scalar_g1a_trace_contract(&logs);
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for segment_split in [None, Some(UNION_HORIZON_TWO_SEGMENT_SPLIT)] {
+                let first = run_union_horizon_proof(&cx, &fixture, segment_split).await;
+                let second = run_union_horizon_proof(&cx, &fixture, segment_split).await;
+                assert_eq!(
+                    first, second,
+                    "UNION_HORIZON segment_split={segment_split:?} changed across fresh rebuilds",
+                );
+            }
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
