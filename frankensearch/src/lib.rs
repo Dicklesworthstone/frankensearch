@@ -277,7 +277,7 @@ pub use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetric
 
 // Traits
 pub use frankensearch_core::traits::{
-    Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
+    Embedder, LexicalRead, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
     NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
     SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
@@ -400,9 +400,9 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalSearch, Reranker,
-        ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
-        TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead,
+        LexicalSearch, Reranker, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
+        SyncTwoTierSearcher, TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
     };
 
     #[cfg(feature = "storage")]
