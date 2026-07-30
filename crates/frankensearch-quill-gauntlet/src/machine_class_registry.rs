@@ -17,12 +17,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Reviewed commit containing the normative registry.
-pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "6a5707d8b8b12e4420457ab3138b203d3c21b39c";
+pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "cc94cb772908dc3efdd69d010d172037160c6847";
 /// Exact Git blob of the normative registry.
-pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "f4dee7ba4f88076e6bc020aff6458faf863e063a";
+pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "1fa886f13857e8dbca0d182e8c6ccc5a83952d83";
 /// SHA-256 of the exact normative registry file bytes.
 pub const MACHINE_CLASS_REGISTRY_SHA256: &str =
-    "222248376442da954768be131af4af028ad0dc4117d6174f88045686089a808b";
+    "1fa701e17f4266f92edb56970efe2780b2ab25d2de611f1850b2f91cdde37443";
 /// Registry schema accepted by this consumer.
 pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
     "frankensearch.quill-machine-class-registry.v1";
