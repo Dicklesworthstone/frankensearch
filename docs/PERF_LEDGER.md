@@ -8297,3 +8297,74 @@ on CV.
   were added during hostile review. Full narrative and consolidated raw rows:
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
+
+## 2026-07-30 — KEEP (BANKED; push gated on the user ruling `bd-s1rc1-ubs-user-ruling-gate-82rpt`): Quill `EncodedSegment` per-commit deep-clone elimination via `Arc<Vec<u8>>` byte backing (`bd-s1rc1`, REBASE pass at tip `504fa185`)
+
+- **Comparison class: SELF-SPEEDUP (maintenance).** Both arms are
+  frankensearch (Quill); no incumbent arm anywhere in this evidence.
+- **Claim class: MEMORY/MECHANISM.** Allocation censuses (valgrind-3.25.1
+  DHAT, load-insensitive); explicitly NOT a latency/throughput claim; zero
+  wall-clock measurements in this pass.
+- **Lever:** `EncodedSegment.bytes` became `Arc<Vec<u8>>`;
+  `impl AsRef<[u8]> for EncodedSegment`; new `SegmentReader::from_encoded`
+  retains the shared backing through the existing
+  `SegmentReader<B: AsRef<[u8]>>` generic; `RecoveredSegment::bind_owned`
+  switched to it; `into_bytes` is
+  `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())` so unique
+  owners stay zero-copy. `sections` stays a plain Vec.
+  `publish_owned_segments` signature unchanged; index.rs functionally
+  untouched — its clone sites collapse by type effect. Blessed design
+  FoggyPrairie #6267/#6255 + MossyPine refinement, followed exactly.
+  Rebased from base `3684b147` onto tip `504fa185` via `git apply --3way`:
+  all hunks applied cleanly (segment.rs base blob identical; keeper.rs and
+  index.rs hunks context-shifted only, train changes preserved, no
+  semantic redesign).
+- **Exact mechanism claim:** the payload-site allocation family — program
+  points whose stacks contain a `(to_vec|clone)<u8>` byte-copy frame
+  reached through `EncodedSegment`'s derive-Clone (`clone (segment.rs:NNN)`)
+  — drops to **0 bytes / 0 pps** on the lever arm at both scales
+  (`dhat_family.py` v2, mutation selftest 4/4 PASS).
+- **Executing ELFs (both arms built from tip `504fa185`,
+  `--profile release-perf --features perf-harness`, frame pointers on):**
+  - BEFORE (pristine tip) ELF sha256: `39c4ecabd787e3ca4f4fdcd62c5af3381bf1309362c8937324b1182fe7c74ab4`
+  - AFTER (lever) ELF sha256: `40de3a53a6886af16096f608556b04fc868e3cf730a297c1c27ca8b397187311`
+- **DHAT 50k (memory child, 1 thread, positions on):** v2 payload-site
+  87,884,436 bytes (2 pps) → **0 bytes (0 pps)**; total allocated
+  1,171,626,962 → 1,085,915,139 (−7.32%). Against the banked 3684-era
+  baseline (88,280,448 payload bytes) the lever is likewise 0.
+- **DHAT 200k:** v2 payload-site 353,951,118 bytes (2 pps) → **0 (0 pps)**;
+  payload bytes/doc 1,769.8 → 0; total 7,275,372,547 → 6,906,437,248
+  (−5.07%). Child peak 1,052,307,456 → 1,028,395,008 (observation only).
+- **Byte identity (tip-built probe, 2 ELFs × 2 runs, 10 artifacts each):**
+  all four per-run SHA-256 manifests byte-identical; combined-manifest
+  canonical digest
+  `8678387786cb0cbc1e8473bba34641393f7bd57016adc32d89d60f598211b98a` —
+  identical to the REV 3 overlay digest, so neither the tip train nor the
+  lever changed a single emitted byte.
+- **Behavior proofs (tests land with the patch, all green):**
+  pre-publication cancellation retains the pending seal and retries
+  losslessly (aborted attempt, not a publisher failure); a REAL typed
+  MANIFEST-write permission failure on a read-only Keeper directory
+  retains the pending seal (`segment_installed == true`, same `Arc`) and a
+  retry publishes losslessly advancing exactly one generation
+  (`#[cfg(unix)]`); old snapshots keep pointer-stable byte backing across
+  successor publications; unique-owner `into_bytes` is pointer-identical
+  zero-copy.
+- **Gates at tip:** check/clippy/fmt/tests all strict EXIT_STATUS=0;
+  clippy warning sets EMPTY on both arms (diff empty); 490 lib tests
+  (489 passed, 1 ignored) + 3 integration + 2 doctests, 0 failed.
+- **UBS three-file census (v5.3.7), honest state:** raw exit 1 on BOTH
+  arms (inherited pre-existing findings). Pristine tip 310 critical /
+  4,879 warning / 981 info; lever 310 / 5,055 / 988. **Zero new criticals**
+  — the two net-new test `panic!` sites from the REV 3 patch were
+  converted to typed expect-style assertions in this pass (−2 vs the REV 3
+  patch state); `panic!(` counts per file are identical across arms.
+  Warning +176 / info +7 are the `.expect()` density of ~390 added
+  TEST-only lines, same finding classes both arms.
+- **Timing:** intentionally EMPTY in this row class; any timing claim
+  requires the separate same-worker interleaved paired A/B and its own
+  ledger discipline.
+- **Status:** BANKED — commit prepared in a detached worktree at base
+  `504fa185`, NOT pushed; push awaits the user ruling gate
+  (`bd-s1rc1-ubs-user-ruling-gate-82rpt`). Full narrative:
+  `docs/evidence/e8h/p5-s1rc1-arc-backing-rebase-20260730.md`.

@@ -1897,7 +1897,7 @@ impl TombstoneIndex {
 
 enum RecoveredSegmentBacking {
     Mapped(SegmentReader<ReadOnlyMappedFile>),
-    Owned(SegmentReader<Vec<u8>>),
+    Owned(SegmentReader<EncodedSegment>),
 }
 
 impl RecoveredSegmentBacking {
@@ -2265,7 +2265,7 @@ impl RecoveredSegment {
         encoded: EncodedSegment,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
-        let reader = SegmentReader::from_owned(encoded.into_bytes(), schema).map_err(|source| {
+        let reader = SegmentReader::from_encoded(encoded, schema).map_err(|source| {
             KeeperError::SegmentOpen {
                 path: path.clone(),
                 source,

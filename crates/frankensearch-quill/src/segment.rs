@@ -8,7 +8,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -191,9 +191,14 @@ pub(crate) enum SegmentWriteCheckpoint {
 }
 
 /// Owned canonical FSLX bytes ready for Keeper publication.
+///
+/// The canonical byte payload is backing-shared: [`Clone`] bumps a reference
+/// count on the immutable byte buffer instead of copying it, so retaining a
+/// pending segment across publication attempts and binding it into reader
+/// snapshots are O(1) in the payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedSegment {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     header: SegmentHeader,
     sections: Vec<SectionEntry>,
     file_xxh3: u64,
@@ -475,7 +480,7 @@ impl SegmentAssembler {
         let source_xxh3 = source_hasher.digest();
 
         Ok(EncodedSegment {
-            bytes: self.bytes,
+            bytes: Arc::new(self.bytes),
             header: self.header,
             sections: self.sections,
             file_xxh3,
@@ -647,7 +652,7 @@ impl EncodedSegment {
         debug_assert_eq!(bytes.len(), file_len);
 
         Ok(Self {
-            bytes,
+            bytes: Arc::new(bytes),
             header: parsed_header,
             sections: table,
             file_xxh3,
@@ -662,9 +667,13 @@ impl EncodedSegment {
     }
 
     /// Consume the wrapper and return its canonical bytes.
+    ///
+    /// A uniquely owned segment gives back its buffer without copying; a
+    /// segment whose byte backing is still shared with readers or retained
+    /// publication state clones the bytes instead.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        Arc::try_unwrap(self.bytes).unwrap_or_else(|arc| (*arc).clone())
     }
 
     /// Parsed header represented by these bytes.
@@ -786,6 +795,12 @@ impl EncodedSegment {
     }
 }
 
+impl AsRef<[u8]> for EncodedSegment {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// A synced but unpublished `.tmp-segment-*` artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingSegmentFile {
@@ -863,6 +878,31 @@ impl SegmentReader<Vec<u8>> {
         limits: SegmentLimits,
     ) -> Result<Self, QuillError> {
         Self::parse_source(bytes, PathBuf::from(MEMORY_PATH), schema, limits)
+    }
+}
+
+impl SegmentReader<EncodedSegment> {
+    /// Parse an encoded in-memory segment, retaining its shared byte backing.
+    ///
+    /// The reader keeps the [`EncodedSegment`] alive instead of copying its
+    /// bytes into a fresh buffer, so any other holder of the same encoded
+    /// segment (for example retained publication state) shares one immutable
+    /// allocation with this reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed corruption, schema, or resource errors as
+    /// `SegmentReader::from_owned`.
+    pub fn from_encoded(
+        encoded: EncodedSegment,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, QuillError> {
+        Self::parse_source(
+            encoded,
+            PathBuf::from(MEMORY_PATH),
+            schema,
+            SegmentLimits::default(),
+        )
     }
 }
 
@@ -2054,6 +2094,64 @@ mod tests {
         let borrowed = SegmentReader::from_bytes(first.as_bytes(), DEFAULT_SCHEMA)?;
         assert_eq!(borrowed.header(), reader.header());
         borrowed.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn encoded_segment_clone_shares_backing_and_unique_extraction_is_zero_copy() -> TestResult {
+        let owned = fixture_sections(MINIMAL_SCHEMA, false);
+        let unique = encode_owned(fixture_header(MINIMAL_SCHEMA), &owned)?;
+        assert_eq!(Arc::strong_count(&unique.bytes), 1);
+        let unique_ptr = unique.as_bytes().as_ptr();
+        let extracted = unique.into_bytes();
+        assert_eq!(
+            extracted.as_ptr(),
+            unique_ptr,
+            "a uniquely owned segment must extract its bytes without copying"
+        );
+
+        let original = encode_owned(fixture_header(MINIMAL_SCHEMA), &owned)?;
+        let shared = original.clone();
+        assert_eq!(Arc::strong_count(&original.bytes), 2);
+        assert!(
+            std::ptr::eq(original.as_bytes(), shared.as_bytes()),
+            "clone must share the immutable byte backing"
+        );
+        assert_eq!(original, shared);
+
+        let copied = shared.into_bytes();
+        assert_eq!(
+            Arc::strong_count(&original.bytes),
+            1,
+            "shared extraction must release its backing reference"
+        );
+        assert_ne!(
+            copied.as_ptr(),
+            original.as_bytes().as_ptr(),
+            "extraction from a shared segment must copy, never steal"
+        );
+        assert_eq!(copied, extracted);
+        assert_eq!(original.as_bytes(), extracted.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn from_encoded_reader_retains_backing_and_matches_from_owned() -> TestResult {
+        let owned = fixture_sections(DEFAULT_SCHEMA, false);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let baseline = SegmentReader::from_owned(encoded.as_bytes().to_vec(), DEFAULT_SCHEMA)?;
+
+        let sibling = encoded.clone();
+        let reader = SegmentReader::from_encoded(encoded, DEFAULT_SCHEMA)?;
+        assert_eq!(reader.header(), baseline.header());
+        assert_eq!(reader.section_entries(), baseline.section_entries());
+        assert_eq!(reader.file_xxh3(), baseline.file_xxh3());
+        assert_eq!(reader.file_len(), baseline.file_len());
+        reader.verify()?;
+        assert!(
+            std::ptr::eq(reader.source_bytes(), sibling.as_bytes()),
+            "the reader must retain the encoded segment's shared byte backing"
+        );
         Ok(())
     }
 
