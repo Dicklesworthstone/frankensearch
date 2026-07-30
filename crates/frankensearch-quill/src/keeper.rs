@@ -2385,10 +2385,12 @@ impl RecoveredSegment {
         schema: SchemaDescriptor,
     ) -> Result<TermDictionary<'_>, KeeperError> {
         if schema != self.term_dictionary_metadata.schema() {
-            return Err(KeeperError::SegmentMetadataMismatch {
-                path: self.path.clone(),
-                detail: "query schema disagrees with validated TERMDICT metadata".to_owned(),
-            });
+            return Err(term_dictionary_admission_error(
+                &self.path,
+                TermDictionaryError::InvalidSchema {
+                    detail: "query schema disagrees with validated TERMDICT metadata".to_owned(),
+                },
+            ));
         }
         let bytes = self
             .reader
@@ -2402,11 +2404,7 @@ impl RecoveredSegment {
                 detail: "validated TERMDICT section disappeared".to_owned(),
             })?;
         let dictionary =
-            TermDictionary::from_validated_metadata(bytes, &self.term_dictionary_metadata)
-                .map_err(|source| KeeperError::SegmentMetadataMismatch {
-                    path: self.path.clone(),
-                    detail: source.to_string(),
-                })?;
+            bind_validated_term_dictionary(&self.path, bytes, &self.term_dictionary_metadata)?;
         #[cfg(test)]
         self.term_dictionary_cache_counters
             .borrowed_views
@@ -2562,6 +2560,15 @@ impl RecoveredSegment {
     pub fn verify(&self) -> Result<(), QuillError> {
         self.reader.verify()
     }
+}
+
+fn bind_validated_term_dictionary<'a>(
+    path: &Path,
+    bytes: &'a [u8],
+    metadata: &'a ValidatedTermDictionaryMetadata,
+) -> Result<TermDictionary<'a>, KeeperError> {
+    TermDictionary::from_validated_metadata(bytes, metadata)
+        .map_err(|source| term_dictionary_admission_error(path, source))
 }
 
 impl crate::argus::LiveDocs for RecoveredSegment {
@@ -15499,6 +15506,85 @@ mod tests {
             matches!(public, SearchError::IndexCorrupted { .. }),
             "malformed durable TERMDICT bytes must remain public corruption: {public}",
         );
+    }
+
+    #[test]
+    fn cached_term_dictionary_binding_failures_remain_public_subsystem_errors() -> TestResult {
+        fn assert_public_invariant(
+            error: KeeperError,
+            expected_path: &Path,
+            expected_detail: &str,
+        ) {
+            assert!(
+                matches!(
+                    &error,
+                    KeeperError::SegmentTermDictionaryUnavailable {
+                        path,
+                        source: TermDictionaryError::InvalidSchema { detail },
+                    } if path == expected_path && detail.contains(expected_detail)
+                ),
+                "cached TERMDICT binding invariant changed class: {error}",
+            );
+            assert!(
+                !recovery_retryable(&error),
+                "cached TERMDICT binding invariants must not retry a prior generation",
+            );
+            let public: SearchError = error.into();
+            assert!(
+                matches!(
+                    public,
+                    SearchError::SubsystemError {
+                        subsystem: "quill",
+                        ..
+                    }
+                ),
+                "cached TERMDICT binding invariant became public corruption: {public}",
+            );
+        }
+
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let segment = encoded_identity_test_segment(0xcb1, 0, &[Some("live")])?;
+        let mut manifest = genesis.next_manifest()?;
+        manifest.docid_high_watermark = 1;
+        manifest.segments = vec![manifest_segment(&segment, 1)];
+        let published = genesis.publish_owned_segments(&manifest, vec![segment])?;
+        let bound = &published.segments()[0];
+
+        assert_ne!(DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA);
+        assert_public_invariant(
+            bound
+                .term_dictionary(FSFS_CHUNK_SCHEMA)
+                .expect_err("query schema disagreement must fail"),
+            bound.path(),
+            "query schema disagrees",
+        );
+
+        let validated_bytes = bound
+            .reader
+            .section(SectionKind::TERMDICT)?
+            .expect("published identity fixture has TERMDICT");
+        let copied_bytes = validated_bytes.to_vec();
+        assert_public_invariant(
+            bind_validated_term_dictionary(
+                bound.path(),
+                &copied_bytes,
+                &bound.term_dictionary_metadata,
+            )
+            .expect_err("metadata must remain bound to its exact immutable bytes"),
+            bound.path(),
+            "different byte source",
+        );
+        assert_public_invariant(
+            bind_validated_term_dictionary(
+                bound.path(),
+                &validated_bytes[..validated_bytes.len() - 1],
+                &bound.term_dictionary_metadata,
+            )
+            .expect_err("metadata must remain bound to the exact validated byte length"),
+            bound.path(),
+            "different byte source",
+        );
+        Ok(())
     }
 
     #[test]
