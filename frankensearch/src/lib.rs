@@ -277,10 +277,15 @@ pub use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetric
 
 // Traits
 pub use frankensearch_core::traits::{
-    Embedder, LexicalRead, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
+    Embedder, LexicalRead, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
     NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
     SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
+// The combined read/write contract remains available for explicit legacy
+// consumers until the coordinated bd-8nqz.1 B2 removal. It is intentionally
+// omitted from the prelude so wildcard imports cannot make `LexicalRead`
+// methods ambiguous.
+pub use frankensearch_core::traits::LexicalSearch;
 pub use frankensearch_core::{
     AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
     DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
@@ -400,9 +405,9 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead,
-        LexicalSearch, Reranker, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
-        SyncTwoTierSearcher, TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead, Reranker,
+        ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
+        TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
     };
 
     #[cfg(feature = "storage")]
@@ -591,11 +596,11 @@ mod feature_matrix_smoke {
         let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
         let index = frankensearch_lexical::TantivyIndex::create(dir.path())
             .expect("create hybrid lexical index");
-        assert_eq!(index.doc_count(), 0);
+        assert_eq!(LexicalRead::doc_count(&index), 0);
         emit_evidence(
             "hybrid",
             "tantivy_lexical_create",
-            &serde_json::json!({"documents": index.doc_count()}),
+            &serde_json::json!({"documents": LexicalRead::doc_count(&index)}),
         );
     }
 
@@ -705,12 +710,10 @@ mod feature_matrix_smoke {
             let adapter = Fts5LexicalSearch::new(Fts5Config::default());
             let document =
                 IndexableDocument::new("doc-fts5", "fts5 feature matrix integration fixture");
-            adapter
-                .index_document(&cx, &document)
+            LexicalSearch::index_document(&adapter, &cx, &document)
                 .await
                 .expect("index FTS5 document");
-            let hits = adapter
-                .search(&cx, "integration", 5)
+            let hits = LexicalRead::search(&adapter, &cx, "integration", 5)
                 .await
                 .expect("search FTS5 document");
             assert_eq!(hits.len(), 1);
@@ -718,7 +721,10 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "full-fts5",
                 "real_fts5_index_search",
-                &serde_json::json!({"documents": adapter.doc_count(), "hits": hits.len()}),
+                &serde_json::json!({
+                    "documents": LexicalRead::doc_count(&adapter),
+                    "hits": hits.len(),
+                }),
             );
         });
     }
@@ -776,13 +782,13 @@ mod feature_matrix_smoke {
                 IndexableDocument::new("doc-alpha", "alpha tantivy oracle matrix"),
                 IndexableDocument::new("doc-beta", "beta consumer integration"),
             ];
-            index
-                .index_documents(&cx, &documents)
+            LexicalSearch::index_documents(&index, &cx, &documents)
                 .await
                 .expect("index Tantivy documents");
-            index.commit(&cx).await.expect("commit Tantivy index");
-            let hits = index
-                .search(&cx, "alpha", 5)
+            LexicalSearch::commit(&index, &cx)
+                .await
+                .expect("commit Tantivy index");
+            let hits = LexicalRead::search(&index, &cx, "alpha", 5)
                 .await
                 .expect("search Tantivy index");
             assert_eq!(hits.len(), 1);
