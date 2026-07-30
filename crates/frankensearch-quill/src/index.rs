@@ -2948,6 +2948,13 @@ impl LifecycleTrigger {
 }
 
 struct PendingDeltaSeal {
+    /// Retained encoded segment shared with the in-flight publication task.
+    ///
+    /// The outer [`Arc`] shares the whole segment (header plus section
+    /// table) with `KeeperWriter::publish_encoded_segment_retryable`, which
+    /// needs `'static` ownership on the blocking lane. The segment's byte
+    /// payload is additionally backing-shared, so the memory-backend
+    /// republication copies stay O(1) in the payload.
     encoded: Option<Arc<EncodedSegment>>,
     segment_installed: bool,
     manifest: Manifest,
@@ -16323,6 +16330,395 @@ mod tests {
                         .to_string_lossy()
                         .starts_with(".tmp-segment-")),
                 "exact canonical reconciliation must not manufacture a redundant retry temp"
+            );
+        });
+    }
+
+    /// Pre-publication cancellation: the cancel gate immediately before
+    /// MANIFEST authority changes aborts the attempt AFTER the retained
+    /// proposal was cloned for owned publication but BEFORE
+    /// `publish_owned_segments` runs. This pins retention across an aborted
+    /// attempt; it is NOT a publisher failure — see
+    /// `durable_delta_seal_retains_pending_on_manifest_write_failure_then_retries`
+    /// for a real typed publisher error.
+    #[test]
+    fn memory_delta_seal_retains_pending_on_prepublication_cancellation_then_retries() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let base_seal_seq = index.writer_mut().next_seal_seq;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("in-memory retry-test Delta source");
+            apply_alpha_delta(&mut delta, 0, "retry-survivor", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish retry-test Delta");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query pre-seal Delta");
+
+            let encoded = Arc::new(
+                flush_delta_snapshot(
+                    &sealed,
+                    DeltaFlushInput {
+                        segment_id: 0x51c1_0001,
+                        created_unix_s: 1_700_000_050,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("build retained seal")
+                .expect("live Delta emits FSLX"),
+            );
+            let mut manifest = index
+                .snapshot()
+                .next_manifest()
+                .expect("successor MANIFEST");
+            manifest.last_publish_unix_s = 0;
+            manifest
+                .segments
+                .push(manifest_segment(&encoded, base_seal_seq));
+            manifest.docid_high_watermark = sealed.lease_end();
+            let mut pending_field_stats = BTreeMap::new();
+            for field in DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+            {
+                pending_field_stats.insert(
+                    field.id,
+                    (
+                        sealed
+                            .live_total_tokens(field.id)
+                            .expect("retained Delta field stats"),
+                        1,
+                    ),
+                );
+            }
+            manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)
+                .expect("merge retained Delta field stats");
+            let prepared = index
+                .reader
+                .published_snapshot
+                .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
+                .expect("prepare retained local swap");
+            index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
+                encoded: Some(Arc::clone(&encoded)),
+                segment_installed: false,
+                manifest,
+                prepared,
+                next_seal_seq: base_seal_seq + 1,
+                successor_watermark: sealed.lease_end(),
+            });
+
+            // Pre-publication cancellation: `check_cancel(cx, "Delta
+            // MANIFEST publish")` fires after the memory-owned clones ran
+            // but before the publisher executes.
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            let failure = index.resume_pending_delta_seal(&cancelled).await;
+            assert!(failure.is_err(), "cancelled attempt must fail");
+            let retained_encoded = index
+                .writer_mut()
+                .pending_delta_seal
+                .as_ref()
+                .expect("aborted attempt must retain the pending seal")
+                .encoded
+                .as_ref()
+                .map(Arc::clone)
+                .expect("retained seal keeps its encoded segment");
+            assert!(
+                Arc::ptr_eq(&retained_encoded, &encoded),
+                "the retained seal must still reference the exact encoded bytes"
+            );
+            drop(retained_encoded);
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                2,
+                "only the test handle and the retained seal may hold the segment"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old epoch remains visible after the aborted attempt"),
+                before
+            );
+
+            index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("retried publication succeeds with no bytes lost");
+            assert!(index.writer_mut().pending_delta_seal.is_none());
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                1,
+                "publication must consume the retained reference"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query the published successor"),
+                before
+            );
+        });
+    }
+
+    /// A REAL publisher failure: the MANIFEST write itself returns a typed
+    /// permission error after the segment was already installed. The
+    /// retained seal must survive the failed publication attempt, and a
+    /// retry must publish losslessly once the directory is writable again.
+    #[cfg(unix)]
+    #[test]
+    fn durable_delta_seal_retains_pending_on_manifest_write_failure_then_retries() {
+        run_with_cx(|cx| async move {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().expect("temporary Keeper directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let base_seal_seq = index.writer_mut().next_seal_seq;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("manifest-failure Delta source");
+            apply_alpha_delta(&mut delta, 0, "manifest-failure-survivor", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish manifest-failure Delta");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query pre-seal Delta");
+
+            let encoded = Arc::new(
+                flush_delta_snapshot(
+                    &sealed,
+                    DeltaFlushInput {
+                        segment_id: 0x51c1_0002,
+                        created_unix_s: 1_700_000_051,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("build retained seal")
+                .expect("live Delta emits FSLX"),
+            );
+            let mut manifest = index
+                .snapshot()
+                .next_manifest()
+                .expect("successor MANIFEST");
+            manifest.last_publish_unix_s = 0;
+            manifest
+                .segments
+                .push(manifest_segment(&encoded, base_seal_seq));
+            manifest.docid_high_watermark = sealed.lease_end();
+            let mut pending_field_stats = BTreeMap::new();
+            for field in DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+            {
+                pending_field_stats.insert(
+                    field.id,
+                    (
+                        sealed
+                            .live_total_tokens(field.id)
+                            .expect("retained Delta field stats"),
+                        1,
+                    ),
+                );
+            }
+            manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)
+                .expect("merge retained Delta field stats");
+            let prepared = index
+                .reader
+                .published_snapshot
+                .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
+                .expect("prepare retained local swap");
+            index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
+                encoded: Some(Arc::clone(&encoded)),
+                segment_installed: false,
+                manifest,
+                prepared,
+                next_seal_seq: base_seal_seq + 1,
+                successor_watermark: sealed.lease_end(),
+            });
+
+            // Install the segment for real while the directory is writable,
+            // exactly like a publication whose caller future lost completion
+            // after the install step.
+            {
+                let writer = match &mut index.writer_mut().backend {
+                    IndexBackend::Durable(writer) => Some(writer),
+                    IndexBackend::Memory(_) => None,
+                }
+                .expect("fixture must use a durable Keeper");
+                writer
+                    .publish_encoded_segment_retryable(&cx, Arc::clone(&encoded))
+                    .await
+                    .expect("install segment before the injected MANIFEST failure");
+            }
+
+            // Injected REAL publisher failure: with the Keeper directory
+            // read-only, resume reconciles the already-installed segment
+            // without a new temp, then the MANIFEST publication itself
+            // returns a typed permission error.
+            let writable = std::fs::metadata(directory.path())
+                .expect("read Keeper directory permissions")
+                .permissions();
+            let mut read_only = writable.clone();
+            read_only.set_mode(0o555);
+            std::fs::set_permissions(directory.path(), read_only)
+                .expect("revoke Keeper directory write permission");
+            let failure = index.resume_pending_delta_seal(&cx).await;
+            std::fs::set_permissions(directory.path(), writable)
+                .expect("restore Keeper directory write permission");
+
+            let failure = failure
+                .err()
+                .expect("read-only MANIFEST target must fail publication");
+            let rendered = format!("{failure:?}");
+            assert!(
+                rendered.contains("ermission") || rendered.contains("denied"),
+                "failure must be the injected permission error, got: {rendered}"
+            );
+            assert!(
+                !rendered.to_lowercase().contains("cancel"),
+                "failure must be a publisher error, not a cancellation, got: {rendered}"
+            );
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "failed MANIFEST publication must not advance durable authority"
+            );
+            {
+                let retained = index
+                    .writer_mut()
+                    .pending_delta_seal
+                    .as_ref()
+                    .expect("failed publication must retain the pending seal");
+                assert!(
+                    retained.segment_installed,
+                    "the reconciled install must be recorded before the failed publish"
+                );
+                assert!(
+                    Arc::ptr_eq(
+                        retained.encoded.as_ref().expect("retained encoded segment"),
+                        &encoded
+                    ),
+                    "the retained seal must still reference the exact encoded bytes"
+                );
+            }
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                2,
+                "only the test handle and the retained seal may hold the segment"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old epoch remains visible after the failed publication"),
+                before
+            );
+
+            index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("retried publication succeeds with no bytes lost");
+            assert!(index.writer_mut().pending_delta_seal.is_none());
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                1,
+                "publication must consume the retained reference"
+            );
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation + 1,
+                "retried publication must advance exactly one generation"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query the published successor"),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn published_memory_snapshot_bytes_survive_successor_publication() {
+        run_with_cx(|cx| async move {
+            let index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-a", "aardvark burrows deep"),
+                )
+                .await
+                .expect("index first document");
+            index.commit(&cx).await.expect("first commit publishes");
+            let old = index.snapshot();
+            for segment in old.segments() {
+                segment.verify().expect("fresh snapshot verifies");
+            }
+            let old_segment_count = old.segments().len();
+            let old_backing: Vec<*const u8> = old
+                .segments()
+                .iter()
+                .map(|segment| segment.source_bytes().as_ptr())
+                .collect();
+            let before = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("query first publication");
+
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-b", "bobcat prowls quietly"),
+                )
+                .await
+                .expect("index second document");
+            index.commit(&cx).await.expect("second commit publishes");
+
+            let new = index.snapshot();
+            assert!(
+                !Arc::ptr_eq(&old, &new),
+                "a successor publication must install a new snapshot"
+            );
+            assert!(new.segments().len() > old_segment_count);
+            // The pre-publication snapshot still owns valid, hash-verified
+            // bytes: successor publication and writer-side pending-state
+            // clearing must not disturb the shared backing.
+            for segment in old.segments() {
+                segment
+                    .verify()
+                    .expect("pre-publication snapshot backing must stay intact");
+            }
+            assert_eq!(old.segments().len(), old_segment_count);
+            let old_backing_after: Vec<*const u8> = old
+                .segments()
+                .iter()
+                .map(|segment| segment.source_bytes().as_ptr())
+                .collect();
+            assert_eq!(
+                old_backing, old_backing_after,
+                "the old snapshot must keep its exact byte backing"
+            );
+            // Corpus statistics legitimately change with the second commit,
+            // so compare identity, not scores.
+            let after = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("first document remains visible");
+            assert_eq!(after.total_count, Some(1));
+            assert_eq!(after.hits.len(), 1);
+            assert_eq!(after.hits[0].document_id, before.hits[0].document_id);
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "bobcat", 10, 0, true)
+                    .expect("second document becomes visible")
+                    .total_count,
+                Some(1)
             );
         });
     }
