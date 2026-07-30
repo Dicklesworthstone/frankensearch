@@ -597,6 +597,9 @@ pub struct PerfInputIdentity {
     pub query_manifest_sha256: String,
     /// SHA-256 of the semantic configuration shared by both engines.
     pub config_contract_sha256: String,
+    /// SHA-256 of the cell-local sealed QG-6 semantic receipt contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_contract_sha256: Option<String>,
     /// Number of ordered query groups represented by the manifest.
     pub query_group_count: usize,
     /// Exact ordered group IDs emitted into both A/B and A/A raw streams.
@@ -608,13 +611,17 @@ impl PerfInputIdentity {
         if !is_lower_hex_digest(&self.prepared_corpus_sha256)
             || !is_lower_hex_digest(&self.query_manifest_sha256)
             || !is_lower_hex_digest(&self.config_contract_sha256)
+            || self
+                .semantic_contract_sha256
+                .as_deref()
+                .is_none_or(|digest| !is_lower_hex_digest(digest))
             || self.query_group_count != QG6_QUERY_GROUPS
             || self.query_group_ids.as_slice() != QG6_QUERY_GROUP_IDS.as_slice()
         {
             return Err(PairedEstimatorError::InvalidProvenance {
                 reason: "prepared-input identity requires separate lowercase SHA-256 prepared \
-                         corpus, ordered query, and configuration hashes plus the exact sixteen \
-                         canonical query-group IDs"
+                         corpus, ordered query, configuration, and semantic-contract hashes plus \
+                         the exact sixteen canonical query-group IDs"
                     .to_owned(),
             });
         }
@@ -635,6 +642,14 @@ impl PerfInputIdentity {
         hasher.update(self.query_manifest_sha256.as_bytes());
         hasher.update(b"config-contract-sha256\0");
         hasher.update(self.config_contract_sha256.as_bytes());
+        hasher.update(b"semantic-contract-sha256\0");
+        match self.semantic_contract_sha256.as_deref() {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
         hasher.update(b"query-group-count\0");
         hasher.update(self.query_group_count.to_string().as_bytes());
         hasher.update(b"\0query-group-ids\0");
@@ -735,6 +750,24 @@ pub enum PerfSamplePhase {
     Measurement,
 }
 
+/// Compact per-row binding into the cell-local QG-6 semantic contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6SampleBinding {
+    /// Stable redacted query ID resolved through `group_id`.
+    pub query_id: String,
+    /// Domain-separated digest of the validated role receipt sequence.
+    pub result_sequence_sha256: String,
+}
+
+impl Qg6SampleBinding {
+    fn validate(&self) -> bool {
+        !self.query_id.is_empty()
+            && self.query_id.len() <= 256
+            && is_lower_hex_digest(&self.result_sequence_sha256)
+    }
+}
+
 /// One bounded raw record emitted by the timing harness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerfRawSample {
@@ -767,12 +800,33 @@ pub struct PerfRawSample {
     /// leave this unset; hierarchical estimation requires it on every sample.
     #[serde(default)]
     pub group_id: Option<u64>,
+    /// Compact semantic binding for QG-6 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qg6_sample_binding: Option<Qg6SampleBinding>,
 }
 
 impl PerfRawSample {
     fn validate_and_value(&self) -> Result<f64, PairedEstimatorError> {
         self.scope.validate()?;
         self.provenance.validate()?;
+        match (
+            self.provenance.input_identity.is_some(),
+            self.qg6_sample_binding.as_ref(),
+        ) {
+            (true, Some(binding)) if binding.validate() => {}
+            (true, _) => {
+                return Err(PairedEstimatorError::InvalidProvenance {
+                    reason: "prepared-input samples require one valid compact QG-6 result binding"
+                        .to_owned(),
+                });
+            }
+            (false, None) => {}
+            (false, Some(_)) => {
+                return Err(PairedEstimatorError::InvalidProvenance {
+                    reason: "non-QG-6 samples cannot carry QG-6 result bindings".to_owned(),
+                });
+            }
+        }
         if self.phase != PerfSamplePhase::Measurement {
             return Err(PairedEstimatorError::WarmupInDecisionSet {
                 sample_id: self.sample_id,
@@ -940,6 +994,8 @@ pub enum PairedEstimatorError {
     MissingGroupId { sample_id: u64 },
     #[error("paired block {block_id} mixes hierarchical group IDs")]
     GroupMismatch { block_id: u64 },
+    #[error("paired block {block_id} mixes QG-6 query bindings")]
+    Qg6BindingMismatch { block_id: u64 },
     #[error("paired block {block_id} compares different work or byte denominators")]
     WorkMismatch { block_id: u64 },
     #[error("paired experiment has only {actual} complete blocks; require {required}")]
@@ -1223,6 +1279,17 @@ pub fn validate_paired_blocks(
         }
         if control.group_id != treatment.group_id {
             return Err(PairedEstimatorError::GroupMismatch { block_id });
+        }
+        if control
+            .qg6_sample_binding
+            .as_ref()
+            .map(|binding| binding.query_id.as_str())
+            != treatment
+                .qg6_sample_binding
+                .as_ref()
+                .map(|binding| binding.query_id.as_str())
+        {
+            return Err(PairedEstimatorError::Qg6BindingMismatch { block_id });
         }
         if control.order == treatment.order {
             return Err(PairedEstimatorError::InvalidOrder { block_id });
@@ -2439,6 +2506,7 @@ mod tests {
             prepared_corpus_sha256: "a".repeat(64),
             query_manifest_sha256: "b".repeat(64),
             config_contract_sha256: "c".repeat(64),
+            semantic_contract_sha256: Some("d".repeat(64)),
             query_group_count: QG6_QUERY_GROUPS,
             query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
         };
@@ -2449,12 +2517,16 @@ mod tests {
             "prepared_corpus_sha256",
             "query_manifest_sha256",
             "config_contract_sha256",
+            "semantic_contract_sha256",
         ] {
             let mut mutated = identity.clone();
             match field {
                 "prepared_corpus_sha256" => mutated.prepared_corpus_sha256 = "d".repeat(64),
                 "query_manifest_sha256" => mutated.query_manifest_sha256 = "e".repeat(64),
                 "config_contract_sha256" => mutated.config_contract_sha256 = "f".repeat(64),
+                "semantic_contract_sha256" => {
+                    mutated.semantic_contract_sha256 = Some("0".repeat(64));
+                }
                 _ => unreachable!("enumerated identity field"),
             }
             assert_ne!(
@@ -2473,6 +2545,26 @@ mod tests {
         wrong_ids.query_group_ids.swap(0, 1);
         assert_ne!(fingerprint, wrong_ids.fingerprint_sha256());
         assert!(wrong_ids.validate().is_err());
+    }
+
+    #[test]
+    fn absent_semantic_contract_has_a_total_fingerprint_and_omits_the_wire_field() {
+        let identity = PerfInputIdentity {
+            prepared_corpus_sha256: "a".repeat(64),
+            query_manifest_sha256: "b".repeat(64),
+            config_contract_sha256: "c".repeat(64),
+            semantic_contract_sha256: None,
+            query_group_count: QG6_QUERY_GROUPS,
+            query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+        };
+        let fingerprint = identity.fingerprint_sha256();
+        assert!(is_lower_hex_digest(&fingerprint));
+        let json = serde_json::to_value(&identity).expect("identity JSON");
+        assert!(json.get("semantic_contract_sha256").is_none());
+
+        let mut present = identity;
+        present.semantic_contract_sha256 = Some("d".repeat(64));
+        assert_ne!(fingerprint, present.fingerprint_sha256());
     }
 
     fn estimator_config() -> PairedEstimatorConfig {
@@ -2567,6 +2659,7 @@ mod tests {
                 byte_count: Some(64_000),
                 observed_value: None,
                 group_id: None,
+                qg6_sample_binding: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -2582,6 +2675,7 @@ mod tests {
                 byte_count: Some(64_000),
                 observed_value: None,
                 group_id: None,
+                qg6_sample_binding: None,
             });
         }
         samples
@@ -2628,6 +2722,7 @@ mod tests {
                 byte_count: None,
                 observed_value: Some(*control),
                 group_id: None,
+                qg6_sample_binding: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -2647,6 +2742,7 @@ mod tests {
                 byte_count: None,
                 observed_value: Some(*treatment),
                 group_id: None,
+                qg6_sample_binding: None,
             });
         }
         samples

@@ -227,7 +227,7 @@ on `Allow`; original unverified producer evidence remains diagnostic provenance
 and is never copied into history.
 
 Estimands are metric-specific: flat paired log ratios (QG-1/2/3/4/5/8),
-two-stage hierarchical per-query resampling (QG-6, four query groups per
+two-stage hierarchical per-query resampling (QG-6, sixteen query groups per
 class), process RSS (QG-7), cold open requiring verified cache-state proof
 (QG-9 currently persists `NoDecision` because the harness reopens in-process
 without dropping the OS page cache), and dependency facts outside timing A/A
