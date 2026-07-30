@@ -3792,6 +3792,65 @@ mod tests {
     }
 
     #[test]
+    fn qg6_verified_load_rejects_fully_resealed_unsupported_contract_cutoff() {
+        let mut artifact = qg6_artifact();
+        unbind_test_artifact(&mut artifact);
+        let cell = &mut artifact.cells[0];
+        let contract = cell
+            .spec
+            .qg6_semantic_contract
+            .as_mut()
+            .expect("QG-6 semantic contract");
+        contract.k = 99;
+        contract.contract_sha256 = contract.canonical_sha256();
+        let semantic_contract_sha256 = contract.contract_sha256.clone();
+
+        cell.spec.fixture = "query/identifier/k99/100k".to_owned();
+        cell.cell_id = format!(
+            "{}/{}/{}",
+            cell.spec.gate, cell.spec.fixture, cell.spec.metric
+        );
+        let identity = cell
+            .spec
+            .input_identity
+            .as_mut()
+            .expect("QG-6 input identity");
+        identity.semantic_contract_sha256 = Some(semantic_contract_sha256);
+        let identity = identity.clone();
+        let EvidenceCellBody::Paired { paired, .. } = &mut cell.body else {
+            unreachable!("QG-6 must be paired");
+        };
+        paired.provenance.input_identity = Some(identity.clone());
+        for sample in paired
+            .effect_samples
+            .iter_mut()
+            .chain(&mut paired.null_samples)
+        {
+            sample.provenance.input_identity = Some(identity.clone());
+        }
+
+        let directory = tempfile::tempdir().expect("QG-6 artifact directory");
+        let path = directory.path().join("qg6-resealed-unsupported-k99.json");
+        fs::write(
+            &path,
+            artifact
+                .sealed_json()
+                .expect("outer-reseal unsupported cutoff"),
+        )
+        .expect("persist fully resealed unsupported cutoff");
+        let error = PerfEvidenceArtifact::load_verified(&path)
+            .expect_err("fully resealed unsupported cutoff must fail verified reload");
+        assert!(
+            matches!(
+                error,
+                EvidenceArtifactError::InconsistentArtifact { ref reason }
+                    if reason.contains("semantic contract failed verification")
+            ),
+            "unsupported cutoff failed outside the semantic-contract boundary: {error}"
+        );
+    }
+
+    #[test]
     fn qg6_outer_reseal_cannot_hide_any_nested_result_receipt_mutation() {
         for mutation in [
             "returned_count",
