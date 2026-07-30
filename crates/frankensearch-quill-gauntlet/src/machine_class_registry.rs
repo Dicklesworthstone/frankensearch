@@ -3258,7 +3258,7 @@ mod tests {
         assert_eq!(sha256_hex(REGISTRY_BYTES), MACHINE_CLASS_REGISTRY_SHA256);
         assert_eq!(
             MACHINE_CLASS_REGISTRY_GIT_BLOB,
-            "f4dee7ba4f88076e6bc020aff6458faf863e063a"
+            "1fa886f13857e8dbca0d182e8c6ccc5a83952d83"
         );
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
         assert_eq!(registry.raw()["classes"].as_array().unwrap().len(), 4);
