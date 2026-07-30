@@ -43,21 +43,32 @@ Installer goals:
 ## Cargo Install (Developer Path)
 
 `fsfs` currently builds from this workspace and uses the pinned nightly toolchain
-(`rust-toolchain.toml`). Its default feature set embeds two pinned semantic
-models; provision and verify those build inputs before invoking Cargo:
+(`rust-toolchain.toml`). Its default feature set is model-free, so normal
+workspace and crates.io builds need no model artifacts:
 
 ```bash
-scripts/rch-ensure-deps.sh --models-only
 cargo +nightly install --path crates/frankensearch-fsfs
 fsfs version
 fsfs status --no-watch-mode --format json
 ```
 
-The provisioning command validates every artifact's byte length and SHA-256.
-It writes to `FRANKENSEARCH_BUNDLED_MODELS_SOURCE_DIR`,
-`FRANKENSEARCH_MODEL_DIR`, or
-`~/.local/share/frankensearch/models` (in that precedence order). The Cargo
-build itself remains network-free.
+That model-free binary can acquire and verify model files, but it does not
+compile the Model2Vec or FastEmbed execution backends. Explicit semantic
+requests therefore fail closed; downloading files alone does not add semantic
+capability to an already-built binary.
+
+To build the full binary profile with Potion and MiniLM embedded, provision the
+revision-pinned inputs and select the feature explicitly:
+
+```bash
+scripts/rch-ensure-deps.sh --models-only
+scripts/rch-ensure-deps.sh --models-only --check
+cargo +nightly install --path crates/frankensearch-fsfs \
+  --no-default-features --features embedded-models
+```
+
+Provisioning validates every artifact's byte length and SHA-256. Cargo's build
+script performs no network access.
 
 ## Quick Start (60 Seconds)
 
@@ -96,7 +107,7 @@ Result: responsive first answers plus better final ranking without blocking the 
 
 ## Core Features
 
-- Bundled default semantic models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) with optional alternate-model downloads
+- Full release binaries bundle default semantic models (`potion-multilingual-128M` + `all-MiniLM-L6-v2`) with optional alternate-model downloads
 - Progressive search phases (`Initial`, `Refined`, `RefinementFailed`)
 - Agent-friendly streaming (`--stream`) with machine-readable output
 - Result explanation surfaces (`fsfs explain <result-id>`)

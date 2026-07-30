@@ -826,6 +826,10 @@ pub struct IndexingConfig {
     pub fast_model: String,
     pub quality_model: String,
     pub model_dir: String,
+    /// Forbid all model-network acquisition while still permitting verified
+    /// artifacts already present under `model_dir`.
+    #[serde(default)]
+    pub offline: bool,
     pub embedding_batch_size: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
@@ -837,6 +841,7 @@ impl Default for IndexingConfig {
             fast_model: "potion-multilingual-128M".into(),
             quality_model: "all-MiniLM-L6-v2".into(),
             model_dir: "~/.local/share/frankensearch/models".into(),
+            offline: false,
             embedding_batch_size: 64,
             reindex_on_change: true,
             watch_mode: false,
@@ -997,6 +1002,7 @@ struct IndexingConfigPatch {
     fast_model: Option<String>,
     quality_model: Option<String>,
     model_dir: Option<String>,
+    offline: Option<bool>,
     embedding_batch_size: Option<usize>,
     reindex_on_change: Option<bool>,
     watch_mode: Option<bool>,
@@ -1147,6 +1153,8 @@ pub struct ContractIndexingConfig {
     pub fast_model: String,
     pub quality_model: String,
     pub model_dir: String,
+    #[serde(default)]
+    pub offline: bool,
     pub embedding_batch_size: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
@@ -1254,6 +1262,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 fast_model: config.indexing.fast_model.clone(),
                 quality_model: config.indexing.quality_model.clone(),
                 model_dir: config.indexing.model_dir.clone(),
+                offline: config.indexing.offline,
                 embedding_batch_size: config.indexing.embedding_batch_size,
                 reindex_on_change: config.indexing.reindex_on_change,
                 watch_mode: config.indexing.watch_mode,
@@ -1408,6 +1417,7 @@ pub struct CliOverrides {
     pub exclude_patterns: Option<Vec<String>>,
     pub limit: Option<usize>,
     pub fast_only: Option<bool>,
+    pub offline: Option<bool>,
     pub allow_background_indexing: Option<bool>,
     pub explain: Option<bool>,
     pub profile: Option<PressureProfile>,
@@ -1433,6 +1443,9 @@ impl CliOverrides {
         }
         if self.fast_only.is_some() {
             flags.push("--fast-only".into());
+        }
+        if let Some(offline) = self.offline {
+            flags.push(if offline { "--offline" } else { "--online" }.into());
         }
         if self.allow_background_indexing.is_some() {
             flags.push("--watch-mode".into());
@@ -2042,6 +2055,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(model_dir) = indexing.model_dir {
             config.indexing.model_dir = model_dir;
         }
+        if let Some(offline) = indexing.offline {
+            config.indexing.offline = offline;
+        }
         if let Some(embedding_batch_size) = indexing.embedding_batch_size {
             config.indexing.embedding_batch_size = embedding_batch_size;
         }
@@ -2256,6 +2272,11 @@ fn apply_env_overrides(
         let watch_mode = parse_bool(value, "indexing.watch_mode")?;
         config.indexing.watch_mode = watch_mode;
         profile_overrides.allow_background_indexing = Some(watch_mode);
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_OFFLINE", "FSFS_OFFLINE") {
+        config.indexing.offline = parse_bool(value, "indexing.offline")?;
         keys_used.push(key.into());
     }
 
@@ -2490,6 +2511,10 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSo
         config.search.fast_only = fast_only;
     }
 
+    if let Some(offline) = cli.offline {
+        config.indexing.offline = offline;
+    }
+
     if let Some(allow_background_indexing) = cli.allow_background_indexing {
         config.indexing.watch_mode = allow_background_indexing;
     }
@@ -2586,6 +2611,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 "fast_model",
                 "quality_model",
                 "model_dir",
+                "offline",
                 "embedding_batch_size",
                 "reindex_on_change",
                 "watch_mode",
@@ -3270,21 +3296,25 @@ mod tests {
     #[test]
     fn precedence_is_cli_then_env_then_file_then_defaults() {
         let file = "\
+[indexing]\noffline = false\n\
 [search]\ndefault_limit = 11\n\
 [tui]\ntheme = \"light\"\n";
         let env = HashMap::from([
+            ("FRANKENSEARCH_OFFLINE".into(), "true".into()),
             ("FSFS_SEARCH_DEFAULT_LIMIT".into(), "17".into()),
             ("FSFS_TUI_THEME".into(), "auto".into()),
         ]);
 
         let cli = CliOverrides {
             limit: Some(29),
+            offline: Some(false),
             theme: Some(super::TuiTheme::Dark),
             ..CliOverrides::default()
         };
 
         let result = load_from_str(Some(file), None, &env, &cli, home()).expect("load config");
         assert_eq!(result.config.search.default_limit, 29);
+        assert!(!result.config.indexing.offline);
         assert_eq!(result.config.tui.theme, super::TuiTheme::Dark);
         assert!(
             result
@@ -3292,6 +3322,12 @@ mod tests {
                 .contains(&"FSFS_SEARCH_DEFAULT_LIMIT".to_string())
         );
         assert!(result.cli_flags_used.contains(&"--limit".to_string()));
+        assert!(result.cli_flags_used.contains(&"--online".to_string()));
+        assert!(
+            result
+                .env_keys_used
+                .contains(&"FRANKENSEARCH_OFFLINE".to_string())
+        );
     }
 
     #[test]
@@ -4699,6 +4735,7 @@ mod tests {
         let cfg = super::IndexingConfig::default();
         assert_eq!(cfg.fast_model, "potion-multilingual-128M");
         assert_eq!(cfg.quality_model, "all-MiniLM-L6-v2");
+        assert!(!cfg.offline);
         assert_eq!(cfg.embedding_batch_size, 64);
         assert!(cfg.reindex_on_change);
         assert!(!cfg.watch_mode);
@@ -4798,6 +4835,7 @@ mod tests {
             exclude_patterns: Some(vec!["target".into()]),
             limit: Some(20),
             fast_only: Some(true),
+            offline: Some(true),
             allow_background_indexing: Some(false),
             explain: Some(true),
             profile: Some(super::PressureProfile::Strict),
@@ -4808,11 +4846,12 @@ mod tests {
             config_path: Some(Path::new("/tmp/config.toml").to_path_buf()),
         };
         let flags = cli.used_flags();
-        assert_eq!(flags.len(), 12);
+        assert_eq!(flags.len(), 13);
         assert!(flags.contains(&"--roots".to_string()));
         assert!(flags.contains(&"--exclude".to_string()));
         assert!(flags.contains(&"--limit".to_string()));
         assert!(flags.contains(&"--fast-only".to_string()));
+        assert!(flags.contains(&"--offline".to_string()));
         assert!(flags.contains(&"--watch-mode".to_string()));
         assert!(flags.contains(&"--explain".to_string()));
         assert!(flags.contains(&"--profile".to_string()));

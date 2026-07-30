@@ -7,7 +7,7 @@
 //! - uncapped result cardinality checks under large corpus load.
 //!
 //! Run manually:
-//! `cargo test -p frankensearch-fsfs --test limit_all_large_corpus_benchmark -- --ignored --nocapture`
+//! `cargo test -p frankensearch-fsfs --features embedded-models --test limit_all_large_corpus_benchmark -- --ignored --nocapture`
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};

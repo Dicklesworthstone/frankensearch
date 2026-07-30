@@ -44,11 +44,14 @@ pub trait SyncLexicalSearch: Send + Sync {
 /// [`SyncLexicalSearch`] receives only the semantic query vector, so the text
 /// query and its structured-concurrency context are carried explicitly by this
 /// adapter. Quill's reader path is synchronous and lock-free; `search_sync`
-/// therefore never creates a runtime or blocks on an async operation.
+/// therefore never creates a runtime or blocks on an async operation. The
+/// adapter accepts only a [`frankensearch_quill::QuillSearchIndex`], so a
+/// synchronous search consumer cannot retain Quill's writer lease or mutation
+/// surface.
 #[cfg(feature = "quill")]
 #[derive(Clone)]
 pub struct QuillSyncLexicalSearch {
-    index: Arc<frankensearch_quill::QuillIndex>,
+    index: Arc<frankensearch_quill::QuillSearchIndex>,
     cx: asupersync::Cx,
     query: Arc<str>,
 }
@@ -58,7 +61,7 @@ impl QuillSyncLexicalSearch {
     /// Bind a Quill index to one consumer-owned request context and text query.
     #[must_use]
     pub fn new(
-        index: Arc<frankensearch_quill::QuillIndex>,
+        index: Arc<frankensearch_quill::QuillSearchIndex>,
         cx: asupersync::Cx,
         query: impl Into<Arc<str>>,
     ) -> Self {
@@ -1358,20 +1361,23 @@ mod tests {
 
     #[cfg(feature = "quill")]
     #[test]
-    fn quill_sync_adapter_carries_query_context_and_maps_cancellation() {
+    fn quill_sync_adapter_is_read_only_and_maps_cancellation() {
         use frankensearch_core::IndexableDocument;
-        use frankensearch_quill::{QuillConfig, QuillIndex};
+        use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             fn assert_send_sync<T: Send + Sync>() {}
             assert_send_sync::<QuillSyncLexicalSearch>();
 
-            let quill = QuillIndex::in_memory(QuillConfig {
+            let directory = tempfile::tempdir().expect("Quill fixture directory");
+            let config = QuillConfig {
                 deterministic_ingest: true,
                 ..QuillConfig::default()
-            })
-            .expect("create in-memory Quill index");
-            quill
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create durable Quill writer");
+            writer
                 .index_documents(
                     &cx,
                     &[IndexableDocument::new(
@@ -1381,9 +1387,19 @@ mod tests {
                 )
                 .await
                 .expect("index Quill fixture");
-            quill.commit(&cx).await.expect("commit Quill fixture");
+            writer.commit(&cx).await.expect("commit Quill fixture");
+            drop(writer);
 
-            let quill = Arc::new(quill);
+            let quill = Arc::new(
+                QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("open read-only Quill search handle"),
+            );
+            let reopened_writer = QuillIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("read-only search handle must not retain the writer lease");
+            drop(reopened_writer);
+
             let lexical = Arc::new(QuillSyncLexicalSearch::new(
                 Arc::clone(&quill),
                 cx.clone(),

@@ -2,7 +2,7 @@
   "kind": "fsfs_model_cache_diagnostics_report",
   "v": 1,
   "generated_at": "2026-05-08T00:00:00Z",
-  "surface": "fsfs doctor --check-models --format json",
+  "surface": "fsfs doctor --format json",
   "diagnostics": {
     "state": "warm",
     "warmup_latency_ms": 18,

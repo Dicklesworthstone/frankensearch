@@ -758,14 +758,79 @@ fn quill_observe(
             .ok_or_else(|| GauntletError::InvalidCase {
                 reason: "expanded Quill observation window does not fit usize".to_owned(),
             })?;
-    // The first call is the collector mode under test. Keep the expanded
-    // exact-count call separate: it exists only to furnish comparator tie
-    // evidence and must never stand in for pagination or count-free execution.
-    let observed = index.search_paginated(cx, &case.query, limit, offset, case.count_requested)?;
-    let evidence = index.search_paginated(cx, &case.query, fetch_limit, 0, true)?;
-    quill_observation_from_results(&observed, &evidence, limit, offset, case.count_requested)
+    // Preserve the production count-free collector for both the requested
+    // page and its expanded tie evidence. Exact count is an independent
+    // observation: enabling it must never switch the collector that supplies
+    // ranked score bits or native tie keys.
+    let observed = index.search_paginated(cx, &case.query, limit, offset, false)?;
+    let evidence = index.search_paginated(cx, &case.query, fetch_limit, 0, false)?;
+    let count_evidence = index.search_paginated(cx, &case.query, 0, 0, true)?;
+    quill_native_observation_from_results(
+        &observed,
+        &evidence,
+        &count_evidence,
+        limit,
+        offset,
+        case.count_requested,
+    )
 }
 
+fn quill_native_observation_from_results(
+    observed: &QuillSearchResult,
+    evidence: &QuillSearchResult,
+    count_evidence: &QuillSearchResult,
+    limit: usize,
+    offset: usize,
+    count_requested: bool,
+) -> Result<EngineObservation, GauntletError> {
+    if observed.total_count.is_some() || evidence.total_count.is_some() {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill native ranked observations unexpectedly executed exact-count work"
+                .to_owned(),
+        });
+    }
+    if !count_evidence.hits.is_empty() {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill count-only evidence unexpectedly returned ranked hits".to_owned(),
+        });
+    }
+    if observed.doc_count != evidence.doc_count || observed.doc_count != count_evidence.doc_count {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill native ranked and count-only observations disagreed on the committed document count"
+                .to_owned(),
+        });
+    }
+    if observed.diagnostics != evidence.diagnostics
+        || observed.diagnostics != count_evidence.diagnostics
+    {
+        return Err(GauntletError::InvalidObservation {
+            reason:
+                "Quill native ranked and count-only observations disagreed on parser diagnostics"
+                    .to_owned(),
+        });
+    }
+    let total_count =
+        count_evidence
+            .total_count
+            .ok_or_else(|| GauntletError::InvalidObservation {
+                reason: "Quill count-only evidence omitted its exact count".to_owned(),
+            })?;
+    let match_count = if count_requested {
+        CountState::Value(total_count)
+    } else {
+        CountState::NotRequested
+    };
+    quill_observation_from_validated_results(
+        observed,
+        evidence,
+        total_count,
+        match_count,
+        limit,
+        offset,
+    )
+}
+
+#[cfg(any(feature = "tantivy-oracle", test))]
 fn quill_observation_from_results(
     observed: &QuillSearchResult,
     evidence: &QuillSearchResult,
@@ -773,11 +838,6 @@ fn quill_observation_from_results(
     offset: usize,
     count_requested: bool,
 ) -> Result<EngineObservation, GauntletError> {
-    let page_end = offset
-        .checked_add(limit)
-        .ok_or_else(|| GauntletError::InvalidObservation {
-            reason: "Quill observation page boundary does not fit usize".to_owned(),
-        })?;
     if observed.doc_count != evidence.doc_count {
         return Err(GauntletError::InvalidObservation {
             reason: "Quill collector modes disagreed on the committed document count".to_owned(),
@@ -786,24 +846,6 @@ fn quill_observation_from_results(
     if observed.diagnostics != evidence.diagnostics {
         return Err(GauntletError::InvalidObservation {
             reason: "Quill collector modes disagreed on parser diagnostics".to_owned(),
-        });
-    }
-    let expected_start = offset.min(evidence.hits.len());
-    let expected_end = page_end.min(evidence.hits.len());
-    let expected_page = &evidence.hits[expected_start..expected_end];
-    let rank_safe = observed.hits.len() == expected_page.len()
-        && observed
-            .hits
-            .iter()
-            .zip(expected_page)
-            .all(|(actual, expected)| {
-                actual.global_docid == expected.global_docid
-                    && actual.document_id == expected.document_id
-                    && actual.score.to_bits() == expected.score.to_bits()
-            });
-    if !rank_safe {
-        return Err(GauntletError::InvalidObservation {
-            reason: "Quill observed and exhaustive collector pages differ".to_owned(),
         });
     }
     let total_count = evidence
@@ -832,6 +874,47 @@ fn quill_observation_from_results(
             });
         }
     };
+    quill_observation_from_validated_results(
+        observed,
+        evidence,
+        total_count,
+        match_count,
+        limit,
+        offset,
+    )
+}
+
+fn quill_observation_from_validated_results(
+    observed: &QuillSearchResult,
+    evidence: &QuillSearchResult,
+    total_count: u64,
+    match_count: CountState,
+    limit: usize,
+    offset: usize,
+) -> Result<EngineObservation, GauntletError> {
+    let page_end = offset
+        .checked_add(limit)
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "Quill observation page boundary does not fit usize".to_owned(),
+        })?;
+    let expected_start = offset.min(evidence.hits.len());
+    let expected_end = page_end.min(evidence.hits.len());
+    let expected_page = &evidence.hits[expected_start..expected_end];
+    let rank_safe = observed.hits.len() == expected_page.len()
+        && observed
+            .hits
+            .iter()
+            .zip(expected_page)
+            .all(|(actual, expected)| {
+                actual.global_docid == expected.global_docid
+                    && actual.document_id == expected.document_id
+                    && actual.score.to_bits() == expected.score.to_bits()
+            });
+    if !rank_safe {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill observed and expanded collector pages differ".to_owned(),
+        });
+    }
     let ranked = evidence
         .hits
         .iter()
@@ -4146,7 +4229,7 @@ mod tests {
             total_count: None,
             ..evidence.clone()
         };
-        let expected_reason = "Quill observed and exhaustive collector pages differ";
+        let expected_reason = "Quill observed and expanded collector pages differ";
 
         let mut wrong_external_id = observed.clone();
         wrong_external_id.hits[0].document_id = "other".to_owned();
@@ -4161,6 +4244,141 @@ mod tests {
                 Err(GauntletError::InvalidObservation { reason }) if reason == expected_reason
             ));
         }
+    }
+
+    #[test]
+    fn quill_native_observation_keeps_ranked_scores_separate_from_exact_count() {
+        let native_score = f32::from_bits(0x4005_5fc7);
+        let ranked = QuillSearchResult {
+            hits: vec![frankensearch_quill::QuillHit {
+                document_id: "test-cooking-015".to_owned(),
+                global_docid: 15,
+                score: native_score,
+            }],
+            total_count: None,
+            doc_count: 120,
+            diagnostics: Vec::new(),
+        };
+        let count_evidence = QuillSearchResult {
+            hits: Vec::new(),
+            total_count: Some(110),
+            doc_count: 120,
+            diagnostics: Vec::new(),
+        };
+
+        let counted =
+            quill_native_observation_from_results(&ranked, &ranked, &count_evidence, 1, 0, true)
+                .expect("native ranking plus independent count evidence");
+        assert_eq!(counted.hits[0].score_bits, native_score.to_bits());
+        assert_eq!(counted.match_count, CountState::Value(110));
+
+        let count_free =
+            quill_native_observation_from_results(&ranked, &ranked, &count_evidence, 1, 0, false)
+                .expect("internal count evidence stays hidden for a count-free case");
+        assert_eq!(count_free.hits[0].score_bits, native_score.to_bits());
+        assert_eq!(count_free.match_count, CountState::NotRequested);
+    }
+
+    #[test]
+    fn quill_native_observation_rejects_collector_contract_mixups() {
+        let ranked = QuillSearchResult {
+            hits: vec![frankensearch_quill::QuillHit {
+                document_id: "winner".to_owned(),
+                global_docid: 7,
+                score: 3.5,
+            }],
+            total_count: None,
+            doc_count: 3,
+            diagnostics: Vec::new(),
+        };
+        let count_evidence = QuillSearchResult {
+            hits: Vec::new(),
+            total_count: Some(1),
+            doc_count: 3,
+            diagnostics: Vec::new(),
+        };
+
+        let mut counted_ranked = ranked.clone();
+        counted_ranked.total_count = Some(1);
+        assert!(matches!(
+            quill_native_observation_from_results(
+                &counted_ranked,
+                &ranked,
+                &count_evidence,
+                1,
+                0,
+                true,
+            ),
+            Err(GauntletError::InvalidObservation { reason })
+                if reason == "Quill native ranked observations unexpectedly executed exact-count work"
+        ));
+
+        let mut scored_count = count_evidence.clone();
+        scored_count.hits.clone_from(&ranked.hits);
+        assert!(matches!(
+            quill_native_observation_from_results(
+                &ranked,
+                &ranked,
+                &scored_count,
+                1,
+                0,
+                true,
+            ),
+            Err(GauntletError::InvalidObservation { reason })
+                if reason == "Quill count-only evidence unexpectedly returned ranked hits"
+        ));
+
+        let mut wrong_doc_count = count_evidence.clone();
+        wrong_doc_count.doc_count = 4;
+        assert!(matches!(
+            quill_native_observation_from_results(
+                &ranked,
+                &ranked,
+                &wrong_doc_count,
+                1,
+                0,
+                true,
+            ),
+            Err(GauntletError::InvalidObservation { reason })
+                if reason == "Quill native ranked and count-only observations disagreed on the committed document count"
+        ));
+
+        let mut wrong_diagnostics = count_evidence.clone();
+        wrong_diagnostics
+            .diagnostics
+            .push(frankensearch_quill::QueryDiagnostic {
+                kind: frankensearch_quill::QueryDiagnosticKind::SyntaxRecovery,
+                message: "different parser result".to_owned(),
+                byte_offset: None,
+                fragment: None,
+            });
+        assert!(matches!(
+            quill_native_observation_from_results(
+                &ranked,
+                &ranked,
+                &wrong_diagnostics,
+                1,
+                0,
+                true,
+            ),
+            Err(GauntletError::InvalidObservation { reason })
+                if reason == "Quill native ranked and count-only observations disagreed on parser diagnostics"
+        ));
+
+        let mut missing_count = count_evidence;
+        missing_count.total_count = None;
+        assert!(matches!(
+            quill_native_observation_from_results(
+                &ranked,
+                &ranked,
+                &missing_count,
+                1,
+                0,
+                true,
+            ),
+            Err(GauntletError::InvalidObservation { reason })
+                if reason == "Quill count-only evidence omitted its exact count"
+        ));
     }
 
     #[test]
@@ -4447,6 +4665,7 @@ mod tests {
             ("boolean-or", "alpha OR gamma"),
             ("fielded-term", "title:alpha"),
         ];
+        type PositionModeEvidence = Vec<(String, Vec<(String, u32)>, CountState)>;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut quill_mode_evidence = Vec::new();
@@ -4536,13 +4755,53 @@ mod tests {
                 tantivy_mode_evidence.push(tantivy_queries);
             }
 
+            let stable_membership = |evidence: &PositionModeEvidence| {
+                evidence
+                    .iter()
+                    .map(|(query_id, hits, count)| {
+                        let mut doc_ids = hits
+                            .iter()
+                            .map(|(doc_id, _score_bits)| doc_id.clone())
+                            .collect::<Vec<_>>();
+                        doc_ids.sort();
+                        (query_id.clone(), doc_ids, *count)
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(
-                quill_mode_evidence[0], quill_mode_evidence[1],
-                "Quill position-independent IDs, order, score bits, or counts changed with positions",
+                stable_membership(&quill_mode_evidence[0]),
+                stable_membership(&quill_mode_evidence[1]),
+                "Quill position-independent membership or counts changed with positions",
             );
             assert_eq!(
-                tantivy_mode_evidence[0], tantivy_mode_evidence[1],
-                "Tantivy position-independent IDs, order, score bits, or counts changed with positions",
+                stable_membership(&tantivy_mode_evidence[0]),
+                stable_membership(&tantivy_mode_evidence[1]),
+                "Tantivy position-independent membership or counts changed with positions",
+            );
+
+            let repeated_term_scores = |evidence: &PositionModeEvidence| {
+                evidence
+                    .iter()
+                    .find(|(query_id, _, _)| query_id == "repeated-term")
+                    .map(|(_, hits, _)| {
+                        let mut score_bits_by_doc = hits
+                            .iter()
+                            .map(|(doc_id, score_bits)| (doc_id.clone(), *score_bits))
+                            .collect::<Vec<_>>();
+                        score_bits_by_doc.sort_by(|left, right| left.0.cmp(&right.0));
+                        score_bits_by_doc
+                    })
+                    .expect("repeated-term evidence")
+            };
+            assert_ne!(
+                repeated_term_scores(&quill_mode_evidence[0]),
+                repeated_term_scores(&quill_mode_evidence[1]),
+                "Quill positioned fields retain frequencies while Basic fields clamp tf to one",
+            );
+            assert_ne!(
+                repeated_term_scores(&tantivy_mode_evidence[0]),
+                repeated_term_scores(&tantivy_mode_evidence[1]),
+                "Tantivy positioned fields retain frequencies while Basic fields clamp tf to one",
             );
         });
     }

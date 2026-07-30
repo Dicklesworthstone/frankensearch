@@ -707,6 +707,9 @@ pub struct TantivyIndex {
     /// (a deleted doc's ordinal simply never appears in search results).
     ord_table: RwLock<Vec<DocId>>,
     path: Option<PathBuf>,
+    /// Exact writer-pool width accepted by Tantivy's benchmark constructor.
+    #[cfg(feature = "bench-internals")]
+    benchmark_writer_threads: Option<usize>,
 }
 
 impl std::fmt::Debug for TantivyIndex {
@@ -740,6 +743,15 @@ impl TantivyIndex {
                 reason: format!("writer lock timed out at {deadline:?}"),
             },
         }
+    }
+
+    /// Return the writer-pool width successfully materialized by the
+    /// benchmark-only Tantivy constructor.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn benchmark_materialized_writer_threads(&self) -> Option<usize> {
+        self.benchmark_writer_threads
     }
 
     /// Create a new Tantivy index at the given directory path.
@@ -988,6 +1000,7 @@ impl TantivyIndex {
             doc_count,
             ord_table,
             path,
+            benchmark_writer_threads: _,
         } = self;
         let mut receipt = Self::benchmark_join_writer(&index, writer)?;
         let writer = index
@@ -1006,6 +1019,7 @@ impl TantivyIndex {
                 doc_count,
                 ord_table,
                 path,
+                benchmark_writer_threads: Some(writer_threads),
             },
             receipt,
         ))
@@ -1033,13 +1047,21 @@ impl TantivyIndex {
             doc_count,
             ord_table,
             path,
+            benchmark_writer_threads,
         } = self;
         let receipt = Self::benchmark_join_writer(&index, writer)?;
         // Keep the same reader, ordinal, and accounting owners alive across the
         // join as the rearm path. Dropping them first could release pinned
         // segment/search state and make the terminal benchmark lifecycle a
         // materially different incumbent workload.
-        drop((fields, reader, doc_count, ord_table, path));
+        drop((
+            fields,
+            reader,
+            doc_count,
+            ord_table,
+            path,
+            benchmark_writer_threads,
+        ));
         Ok(receipt)
     }
 
@@ -1267,6 +1289,8 @@ impl TantivyIndex {
             doc_count: AtomicUsize::new(doc_count),
             ord_table: RwLock::new(ord_table),
             path,
+            #[cfg(feature = "bench-internals")]
+            benchmark_writer_threads: writer_threads,
         })
     }
 

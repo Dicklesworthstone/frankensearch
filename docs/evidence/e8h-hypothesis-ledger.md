@@ -89,12 +89,14 @@ same invocation through the RUN_ID-defaulting runner; lifecycle receipt shows
 | quill | 88,051.5 | [86,344.9, 88,934.9] | 4.0 |
 | tantivy | 163,602.2 | [159,398.3, 210,883.0] | 20.1 |
 | paired_ab | 0.5284 | [0.4041, 0.5445] | 18.5 |
-| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — contains 1.0, admissible |
+| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — `INVALID_NULL`; no decision |
 
-Two-run reading: ab CIs overlap in [0.404, 0.481]; the m4 truth sits in the
-0.40–0.53 band and the dominant uncertainty is the INCUMBENT arm's macOS
-variance (cv 20%, Quill's own arm tight at cv 4%). This is Observation 2
-confirming itself; no single-run m4 ratio may be quoted without its band.
+Evidence disposition: `INVALID_NULL` / no decision. The observed 0.528
+[0.404, 0.545] ratio is diagnostic only and is neither an admissible baseline
+nor performance truth. The source tree was dirty, A/A log-MAD was 0.089611
+(limit 0.048790), and the A/A order effect was 0.051195 (limit 0.048790).
+QG-2 remains inactive pending a clean, calibrated m4-macos rerun; this receipt
+must not be used to make or refine a cross-engine performance claim.
 
 ## Open rows
 

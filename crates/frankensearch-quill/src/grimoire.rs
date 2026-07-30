@@ -6,6 +6,7 @@
 //! section and builds a bounded in-memory restart directory; exact lookup then
 //! decodes at most one restart group while ordered scans reuse one key buffer.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::{Bound, Range};
 
@@ -898,14 +899,38 @@ struct IndexRecord {
     relative_offset: u64,
 }
 
+/// Owned, allocation-bounded metadata produced by one complete TERMDICT
+/// validation.
+///
+/// This stays crate-private so callers cannot pair validated offsets with an
+/// unrelated byte source. [`TermDictionary::from_validated_metadata`] also
+/// checks the exact live slice address and length before constructing a cheap
+/// borrowed view.
+#[derive(Debug)]
+pub(crate) struct ValidatedTermDictionaryMetadata {
+    source_start: usize,
+    source_len: usize,
+    schema: SchemaDescriptor,
+    sections: TermSectionLengths,
+    blocks: Vec<BlockMeta>,
+    restarts: Vec<RestartMeta>,
+    term_count: u32,
+}
+
+impl ValidatedTermDictionaryMetadata {
+    pub(crate) const fn schema(&self) -> SchemaDescriptor {
+        self.schema
+    }
+}
+
 /// Borrowed, eagerly validated TERMDICT view.
 #[derive(Clone, Debug)]
 pub struct TermDictionary<'a> {
     bytes: &'a [u8],
     schema: SchemaDescriptor,
     sections: TermSectionLengths,
-    blocks: Vec<BlockMeta>,
-    restarts: Vec<RestartMeta>,
+    blocks: Cow<'a, [BlockMeta]>,
+    restarts: Cow<'a, [RestartMeta]>,
     term_count: u32,
 }
 
@@ -982,8 +1007,8 @@ impl<'a> TermDictionary<'a> {
                 bytes,
                 schema,
                 sections,
-                blocks: Vec::new(),
-                restarts: Vec::new(),
+                blocks: Cow::Owned(Vec::new()),
+                restarts: Cow::Owned(Vec::new()),
                 term_count: 0,
             });
         }
@@ -1131,9 +1156,60 @@ impl<'a> TermDictionary<'a> {
             bytes,
             schema,
             sections,
+            blocks: Cow::Owned(blocks),
+            restarts: Cow::Owned(restarts),
+            term_count: term_count_u32,
+        })
+    }
+
+    /// Perform one complete validation and retain only owned bounded metadata.
+    ///
+    /// The returned value is crate-private and remains bound to the exact live
+    /// byte slice by address and length.
+    pub(crate) fn validate_metadata(
+        bytes: &'a [u8],
+        schema: SchemaDescriptor,
+        sections: TermSectionLengths,
+    ) -> Result<ValidatedTermDictionaryMetadata, TermDictionaryError> {
+        let parsed = Self::parse(bytes, schema, sections)?;
+        let Self {
+            bytes,
+            schema,
+            sections,
             blocks,
             restarts,
-            term_count: term_count_u32,
+            term_count,
+        } = parsed;
+        Ok(ValidatedTermDictionaryMetadata {
+            source_start: bytes.as_ptr() as usize,
+            source_len: bytes.len(),
+            schema,
+            sections,
+            blocks: blocks.into_owned(),
+            restarts: restarts.into_owned(),
+            term_count,
+        })
+    }
+
+    /// Construct a cheap borrowed view over metadata validated for these exact
+    /// immutable bytes.
+    pub(crate) fn from_validated_metadata(
+        bytes: &'a [u8],
+        metadata: &'a ValidatedTermDictionaryMetadata,
+    ) -> Result<Self, TermDictionaryError> {
+        if bytes.len() != metadata.source_len || bytes.as_ptr() as usize != metadata.source_start {
+            return Err(TermDictionaryError::InvalidSchema {
+                detail: "validated TERMDICT metadata is bound to a different byte source"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            bytes,
+            schema: metadata.schema,
+            sections: metadata.sections,
+            blocks: Cow::Borrowed(&metadata.blocks),
+            restarts: Cow::Borrowed(&metadata.restarts),
+            term_count: metadata.term_count,
         })
     }
 
@@ -3093,6 +3169,47 @@ mod tests {
     }
 
     #[test]
+    fn validated_metadata_builds_borrowed_views_only_for_its_exact_byte_source() -> TestResult {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ValidatedTermDictionaryMetadata>();
+
+        let keys = sorted_numbered_keys(33);
+        let (encoded, inputs, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
+        let metadata =
+            TermDictionary::validate_metadata(encoded.as_bytes(), KEYWORD_SCHEMA, sections)?;
+
+        let first = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
+        let second = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
+        assert!(matches!(&first.blocks, Cow::Borrowed(_)));
+        assert!(matches!(&first.restarts, Cow::Borrowed(_)));
+        assert_eq!(first.term_count(), 33);
+        assert_eq!(first.block_count(), second.block_count());
+        assert_eq!(first.restart_count(), second.restart_count());
+        assert_eq!(
+            first.lookup(0, b"term-00016")?,
+            Some(TermMatch {
+                term_ord: 16,
+                metadata: inputs[16].metadata,
+            })
+        );
+        assert_eq!(
+            terms_from_cursor(second.cursor()?)?
+                .into_iter()
+                .map(|term| term.term)
+                .collect::<Vec<_>>(),
+            keys.into_iter().map(|(_, term)| term).collect::<Vec<_>>()
+        );
+
+        let copied_bytes = encoded.as_bytes().to_vec();
+        assert!(matches!(
+            TermDictionary::from_validated_metadata(&copied_bytes, &metadata),
+            Err(TermDictionaryError::InvalidSchema { detail })
+                if detail.contains("different byte source")
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn restart_boundaries_support_hits_and_neighbor_misses() -> TestResult {
         for (count, expected_restarts) in [(15, 1), (16, 1), (17, 2)] {
             let keys = sorted_numbered_keys(count);
@@ -3122,7 +3239,7 @@ mod tests {
         let (encoded, _, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
         let dictionary = encoded.dictionary(KEYWORD_SCHEMA, sections)?;
         assert!(dictionary.block_count() > 1);
-        for block in &dictionary.blocks {
+        for block in dictionary.blocks.iter() {
             let byte_len = block.byte_range.end - block.byte_range.start;
             assert!(block.entry_count == 1 || byte_len <= TERM_BLOCK_TARGET_BYTES);
         }

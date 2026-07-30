@@ -77,7 +77,11 @@ impl TestContext {
             .env("FRANKENSEARCH_MODEL_DIR", &self.model_dir)
             .env("FRANKENSEARCH_OFFLINE", "1")
             .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
-            .env("NO_COLOR", "1");
+            .env("NO_COLOR", "1")
+            .env_remove("FRANKENSEARCH_INDEX_DIR")
+            .env_remove("FSFS_INDEX_DIR")
+            .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
+            .env_remove("FSFS_STORAGE_INDEX_DIR");
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -1122,6 +1126,78 @@ fn status_csv_output_uses_generic_csv_envelope() {
 }
 
 #[test]
+fn explain_discovers_parent_index_from_nested_cwd() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let project = temp.path().join("project");
+    let corpus = project.join("corpus");
+    let index_dir = project.join(".frankensearch");
+    let nested_cwd = project.join("nested").join("deeper");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    fs::write(
+        corpus.join("retry.md"),
+        "Retry backoff strategy with jitter and exponential delay for network calls",
+    )
+    .expect("write retry fixture");
+
+    let ctx = TestContext::new(temp.path());
+    let corpus_arg = corpus.display().to_string();
+    let index_arg = index_dir.display().to_string();
+    let index_output = ctx.run(
+        &project,
+        &[
+            "index",
+            &corpus_arg,
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("explain discovery: fixture index", &index_output);
+
+    let search_output = ctx.run(
+        &project,
+        &[
+            "search",
+            "retry backoff",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success("explain discovery: prerequisite search", &search_output);
+    let search_json = parse_json("explain discovery: prerequisite search", &search_output);
+    assert!(
+        search_json
+            .pointer("/data/hits/0/path")
+            .and_then(Value::as_str)
+            .is_some(),
+        "prerequisite search should produce result R0"
+    );
+
+    fs::create_dir_all(&nested_cwd).expect("create nested cwd");
+    let explain_output = ctx.run(
+        &nested_cwd,
+        &["explain", "R0", "--no-watch-mode", "--format", "json"],
+    );
+    assert_success(
+        "explain should discover parent index from nested cwd",
+        &explain_output,
+    );
+    let explain_json = parse_json("explain from nested cwd", &explain_output);
+    assert_eq!(
+        explain_json.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "explain should resolve the saved search session through ancestor discovery"
+    );
+}
+
+#[test]
 fn config_validate_csv_output_uses_generic_csv_envelope() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let ctx = TestContext::new(temp.path());
@@ -1152,7 +1228,20 @@ fn download_list_csv_output_uses_generic_csv_envelope() {
 fn explain_csv_without_search_context_reports_error() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let ctx = TestContext::new(temp.path());
-    let output = ctx.run(temp.path(), &["explain", "R1", "--format", "csv"]);
+    let index_dir = temp.path().join("index");
+    fs::create_dir_all(&index_dir).expect("create empty index dir");
+    let index_arg = index_dir.display().to_string();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "explain",
+            "R1",
+            "--index-dir",
+            &index_arg,
+            "--format",
+            "csv",
+        ],
+    );
     assert!(
         !output.status.success(),
         "explain without prior search should fail"

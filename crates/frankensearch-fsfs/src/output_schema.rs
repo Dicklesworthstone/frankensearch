@@ -826,20 +826,29 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
 
     match err {
         SearchError::EmbedderUnavailable { model, .. } => Some(format!(
-            "Default semantic models are bundled and should auto-install on first use.\n\
-             If this failed, set FRANKENSEARCH_MODEL_DIR to a writable directory.\n\
-             Optional: fsfs download-models --model {model} (for alternate model sets)."
+            "Inspect the exact cause: fsfs doctor --format json\n\
+             List supported model ids: fsfs download-models --list\n\
+             If embedder support is compiled out, install a build with the matching feature; downloading files alone cannot enable it.\n\
+             If the model artifact is missing, network recovery (explicit): fsfs download-models --model {model}\n\
+             Verify the selected cache: fsfs download-models --model {model} --verify\n\
+             Offline recovery: set FRANKENSEARCH_MODEL_DIR to a pre-provisioned, verified model cache, then run the verification command.",
+            model = bounded_public_model_id(model),
         )),
         SearchError::ModelNotFound { name } => Some(format!(
-            "Default semantic models are bundled but not available in the active cache path.\n\
-             Ensure FRANKENSEARCH_MODEL_DIR is writable and run: fsfs status\n\
-             Optional override: fsfs download-models --model {name}\n\
-             Check cache: fsfs doctor --format json"
+            "List supported model ids: fsfs download-models --list\n\
+             Network recovery (explicit): fsfs download-models --model {name}\n\
+             Verify the selected cache: fsfs download-models --model {name} --verify\n\
+             Offline recovery: set FRANKENSEARCH_MODEL_DIR to a pre-provisioned, verified model cache, then run the verification command.\n\
+             Run fsfs doctor --format json before retrying semantic search.",
+            name = bounded_public_model_id(name),
         )),
         SearchError::ModelLoadFailed { path, .. } => Some(format!(
-            "The model file at {} may be corrupted.\n\
-             Try: fsfs download-models --force --model <name>\n\
-             Then verify: fsfs doctor --format json",
+            "The model artifact at {} failed to load.\n\
+             List configured model ids: fsfs download-models --list\n\
+             Network recovery (replace MODEL_ID with the selected id): fsfs download-models --model MODEL_ID --force\n\
+             Verify the replacement: fsfs download-models --model MODEL_ID --verify\n\
+             Offline recovery: replace the affected entry in FRANKENSEARCH_MODEL_DIR with an approved, verified local copy.\n\
+             Run fsfs doctor --format json before retrying semantic search.",
             path.display()
         )),
         SearchError::UnverifiableRemoteSpace { producer, .. } => Some(format!(
@@ -884,7 +893,7 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
         )),
         SearchError::Io(_) => Some(
             "Check file permissions and available disk space.\n\
-             Bundled default semantic models require ~600MB in the model cache; search indices vary by corpus size."
+             Explicit model downloads require space in the selected model cache; search indices vary by corpus size."
                 .to_owned(),
         ),
         SearchError::SearchTimeout {
@@ -929,6 +938,22 @@ fn bounded_public_producer(producer: &str) -> &str {
     }
 }
 
+fn bounded_public_model_id(model: &str) -> &str {
+    if model.len() <= 128
+        && model
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        model
+    } else {
+        "MODEL_ID"
+    }
+}
+
 /// Return explanatory context about why a [`SearchError`] matters.
 #[must_use]
 fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
@@ -937,17 +962,21 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
     match err {
         SearchError::EmbedderUnavailable { .. } => Some(
             "Without an embedding model, semantic search is unavailable. \
-             Lexical (keyword) search via BM25 may still work if a lexical index exists."
+             Hash embeddings are a control, not a semantic substitute. Lexical (keyword) \
+             search may still work if a lexical index exists."
                 .to_owned(),
         ),
         SearchError::ModelNotFound { .. } => Some(
-            "Default semantic models are bundled in fsfs and materialized into the local cache on first use. \
-             If models are still missing, check model-dir permissions and cache path selection."
+            "fsfs does not acquire a missing model implicitly. Semantic search stays \
+             unavailable until the operator explicitly downloads the model or selects a \
+             pre-provisioned verified cache, the model loads successfully, and the semantic \
+             index is compatible."
                 .to_owned(),
         ),
         SearchError::ModelLoadFailed { .. } => Some(
-            "A corrupted model file can produce wrong results or crash the ONNX runtime. \
-             Re-downloading ensures integrity."
+            "A model that fails verification or its load self-test must not serve semantic \
+             queries. Reacquiring the artifact is explicit; semantic readiness additionally \
+             requires a successful load and a compatible index."
                 .to_owned(),
         ),
         SearchError::UnverifiableRemoteSpace { .. } => Some(
@@ -1778,7 +1807,7 @@ mod tests {
     // ─── Helpful Error Messages (bd-2w7x.31) ──────────────────────────
 
     #[test]
-    fn suggestion_for_model_not_found() {
+    fn recovery_contract_suggests_explicit_model_acquisition() {
         use frankensearch_core::SearchError;
 
         let err = SearchError::ModelNotFound {
@@ -1786,18 +1815,30 @@ mod tests {
         };
         let out = output_error_from(&err);
         let suggestion = out.suggestion.unwrap();
+        assert!(suggestion.starts_with("List supported model ids: fsfs download-models --list"));
         assert!(
-            suggestion.contains("fsfs download-models"),
-            "suggestion should tell user to download: {suggestion}"
+            suggestion.contains("fsfs download-models --model potion-128m"),
+            "suggestion should provide the exact explicit download command: {suggestion}"
         );
         assert!(
-            suggestion.contains("potion-128m"),
-            "suggestion should mention the missing model: {suggestion}"
+            suggestion.contains("fsfs download-models --model potion-128m --verify"),
+            "suggestion should provide the exact verification command: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("FRANKENSEARCH_MODEL_DIR")
+                && suggestion.contains("pre-provisioned"),
+            "suggestion should provide a truthful offline recovery path: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("auto-install")
+                && !suggestion.contains("first use")
+                && !suggestion.contains("bundled"),
+            "suggestion must not claim implicit model acquisition: {suggestion}"
         );
     }
 
     #[test]
-    fn suggestion_for_embedder_unavailable() {
+    fn recovery_contract_distinguishes_compiled_out_embedder() {
         use frankensearch_core::SearchError;
 
         let err = SearchError::EmbedderUnavailable {
@@ -1808,6 +1849,51 @@ mod tests {
         let suggestion = out.suggestion.unwrap();
         assert!(suggestion.contains("FRANKENSEARCH_MODEL_DIR"));
         assert!(suggestion.contains("MiniLM-L6-v2"));
+        assert!(suggestion.contains("fsfs download-models --model MiniLM-L6-v2"));
+        assert!(suggestion.contains("downloading files alone cannot enable it"));
+        assert!(
+            !suggestion.contains("auto-install")
+                && !suggestion.contains("first use")
+                && !suggestion.contains("bundled")
+        );
+    }
+
+    #[test]
+    fn recovery_contract_requires_explicit_model_reacquisition() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::ModelLoadFailed {
+            path: PathBuf::from("/models/all-MiniLM-L6-v2/model.onnx"),
+            source: Box::new(std::io::Error::other("load self-test failed")),
+        };
+        let out = output_error_from(&err);
+        let suggestion = out.suggestion.unwrap();
+
+        assert!(suggestion.contains("fsfs download-models --list"));
+        assert!(suggestion.contains("fsfs download-models --model MODEL_ID --force"));
+        assert!(suggestion.contains("fsfs download-models --model MODEL_ID --verify"));
+        assert!(suggestion.contains("/models/all-MiniLM-L6-v2/model.onnx"));
+        assert!(suggestion.contains("FRANKENSEARCH_MODEL_DIR"));
+        assert!(
+            !suggestion.contains("auto-install")
+                && !suggestion.contains("first use")
+                && !suggestion.contains("bundled")
+        );
+    }
+
+    #[test]
+    fn recovery_contract_uses_shell_safe_untrusted_model_placeholder() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::ModelNotFound {
+            name: "model; curl attacker.invalid".to_owned(),
+        };
+        let suggestion = output_error_from(&err).suggestion.unwrap();
+
+        assert!(suggestion.starts_with("List supported model ids: fsfs download-models --list"));
+        assert!(suggestion.contains("fsfs download-models --model MODEL_ID"));
+        assert!(!suggestion.contains("attacker.invalid"));
+        assert!(!suggestion.contains('<') && !suggestion.contains('>'));
     }
 
     #[test]
@@ -1839,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn context_for_model_errors() {
+    fn recovery_contract_context_rejects_implicit_model_acquisition() {
         use frankensearch_core::SearchError;
 
         let err = SearchError::ModelNotFound {
@@ -1848,8 +1934,16 @@ mod tests {
         let out = output_error_from(&err);
         let context = out.context.unwrap();
         assert!(
-            context.contains("bundled"),
-            "context should mention bundled models: {context}"
+            context.contains("does not acquire a missing model implicitly"),
+            "context should state the explicit acquisition contract: {context}"
+        );
+        assert!(
+            context.contains("compatible"),
+            "context should state that acquisition alone is insufficient: {context}"
+        );
+        assert!(
+            !context.contains("bundled") && !context.contains("first use"),
+            "context must not claim implicit model acquisition: {context}"
         );
     }
 

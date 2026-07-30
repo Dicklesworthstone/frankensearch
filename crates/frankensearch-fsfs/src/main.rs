@@ -11,9 +11,9 @@ use frankensearch_fsfs::{
     CliCommand, CliInput, CliOverrides, ConfigAction, ConfigLoadResult, ConfigWarning, FsfsConfig,
     FsfsRuntime, InterfaceMode, OutputEnvelope, OutputFormat, ShutdownCoordinator, ShutdownReason,
     Verbosity, default_project_config_file_path, default_user_config_file_path, detect_auto_mode,
-    emit_config_loaded, emit_envelope, exit_code, init_subscriber, is_cache_valid,
+    emit_config_loaded, emit_envelope, exit_code, exit_code_for, init_subscriber, is_cache_valid,
     load_from_layered_sources, load_from_sources, load_from_str, maybe_print_update_notice,
-    meta_for_format, parse_cli_args, read_version_cache, resolve_output_format,
+    meta_for_format, output_error_from, parse_cli_args, read_version_cache, resolve_output_format,
     spawn_version_cache_refresh,
 };
 use serde::Serialize;
@@ -60,6 +60,34 @@ struct ConfigStageSnapshot {
     changed_keys: HashSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessErrorContext {
+    command: String,
+    format: OutputFormat,
+}
+
+impl ProcessErrorContext {
+    fn from_args(args: &[String], stdout_is_tty: bool) -> Self {
+        if let Ok(cli_input) = parse_cli_args(args.iter().cloned()) {
+            return Self {
+                command: cli_command_name(cli_input.command).to_owned(),
+                format: resolve_output_format(
+                    cli_input.format,
+                    cli_input.format_explicit,
+                    stdout_is_tty,
+                ),
+            };
+        }
+
+        Self {
+            command: fallback_command_name(args),
+            format: requested_output_format(args).unwrap_or_else(|| {
+                resolve_output_format(OutputFormat::Table, false, stdout_is_tty)
+            }),
+        }
+    }
+}
+
 fn allow_missing_explicit_config(command: CliCommand, action: Option<&ConfigAction>) -> bool {
     if command != CliCommand::Config {
         return false;
@@ -70,9 +98,28 @@ fn allow_missing_explicit_config(command: CliCommand, action: Option<&ConfigActi
     )
 }
 
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let error_context = ProcessErrorContext::from_args(&args, stdout_is_tty);
+
+    if let Err(error) = run(args) {
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        let code = report_process_error(
+            &error,
+            &error_context,
+            &mut stdout,
+            &mut stderr,
+            iso_timestamp_now(),
+        );
+        std::process::exit(code);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn main() -> SearchResult<()> {
-    let mut cli_input = parse_cli_args(std::env::args().skip(1))?;
+fn run(args: Vec<String>) -> SearchResult<()> {
+    let mut cli_input = parse_cli_args(args)?;
     let env_map: HashMap<String, String> = std::env::vars().collect();
     apply_cli_env_overrides(&mut cli_input, &env_map)?;
 
@@ -857,6 +904,118 @@ fn config_file_summary(
     }
 }
 
+const fn cli_command_name(command: CliCommand) -> &'static str {
+    match command {
+        CliCommand::Search => "search",
+        CliCommand::Index => "index",
+        CliCommand::Watch => "watch",
+        CliCommand::Status => "status",
+        CliCommand::Flush => "flush",
+        CliCommand::Explain => "explain",
+        CliCommand::Config => "config",
+        CliCommand::Download => "download-models",
+        CliCommand::Doctor => "doctor",
+        CliCommand::Update => "update",
+        CliCommand::Completions => "completions",
+        CliCommand::Uninstall => "uninstall",
+        CliCommand::Help => "help",
+        CliCommand::Tui => "tui",
+        CliCommand::Version => "version",
+        CliCommand::Serve => "serve",
+        CliCommand::AppendBatch => "append-batch",
+        CliCommand::Delete => "delete",
+        CliCommand::Compact => "compact",
+        CliCommand::Daemon => "daemon",
+    }
+}
+
+fn fallback_command_name(args: &[String]) -> String {
+    args.first()
+        .filter(|token| {
+            !token.starts_with('-')
+                && !token.is_empty()
+                && token.len() <= 64
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .cloned()
+        .unwrap_or_else(|| "fsfs".to_owned())
+}
+
+fn requested_output_format(args: &[String]) -> Option<OutputFormat> {
+    args.windows(2).rev().find_map(|pair| {
+        if !matches!(pair[0].as_str(), "--format" | "-f") {
+            return None;
+        }
+        match pair[1].as_str() {
+            "table" => Some(OutputFormat::Table),
+            "json" => Some(OutputFormat::Json),
+            "csv" => Some(OutputFormat::Csv),
+            "jsonl" => Some(OutputFormat::Jsonl),
+            "toon" => Some(OutputFormat::Toon),
+            _ => None,
+        }
+    })
+}
+
+fn report_process_error<WOut, WErr>(
+    error: &SearchError,
+    context: &ProcessErrorContext,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+    timestamp: String,
+) -> i32
+where
+    WOut: Write,
+    WErr: Write,
+{
+    let code = exit_code_for(error);
+    let envelope: OutputEnvelope<()> = OutputEnvelope::error(
+        output_error_from(error),
+        meta_for_format(&context.command, context.format),
+        timestamp,
+    );
+    let emission = match context.format {
+        OutputFormat::Table => emit_error_envelope(&envelope, context.format, stderr),
+        OutputFormat::Json | OutputFormat::Csv | OutputFormat::Jsonl | OutputFormat::Toon => {
+            emit_error_envelope(&envelope, context.format, stdout)
+        }
+    };
+
+    if let Err(emission_error) = emission {
+        let _ = writeln!(stderr, "error: {error}");
+        let _ = writeln!(
+            stderr,
+            "error: failed to render structured fsfs error output: {emission_error}"
+        );
+    }
+
+    code
+}
+
+fn emit_error_envelope<W: Write>(
+    envelope: &OutputEnvelope<()>,
+    format: OutputFormat,
+    writer: &mut W,
+) -> SearchResult<()> {
+    emit_envelope(envelope, format, writer)?;
+    if format != OutputFormat::Jsonl {
+        writer
+            .write_all(b"\n")
+            .map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.process",
+                source: Box::new(source),
+            })?;
+    }
+    writer
+        .flush()
+        .map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.process",
+            source: Box::new(source),
+        })
+}
+
 fn emit_success_payload<T: Serialize>(
     command: &str,
     payload: &T,
@@ -967,11 +1126,11 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, ConfigAction, SearchError, allow_missing_explicit_config,
-        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, run_config_init_command,
-        run_config_reset_command, run_config_set_command,
+        CliCommand, ConfigAction, ProcessErrorContext, SearchError, allow_missing_explicit_config,
+        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, report_process_error,
+        run_config_init_command, run_config_reset_command, run_config_set_command,
     };
-    use frankensearch_fsfs::CliInput;
+    use frankensearch_fsfs::{CliInput, OutputFormat};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -1022,6 +1181,109 @@ mod tests {
         apply_cli_env_overrides(&mut input, &env).expect("apply env");
         assert!(input.no_color);
         assert!(input.verbose);
+    }
+
+    #[test]
+    fn recovery_contract_preserves_requested_machine_format() {
+        let args = ["search", "semantic query", "--format", "json"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        let context = ProcessErrorContext::from_args(&args, true);
+
+        assert_eq!(context.command, "search");
+        assert_eq!(context.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn recovery_contract_recovers_format_from_malformed_cli() {
+        let args = [
+            "search",
+            "semantic query",
+            "--format",
+            "json",
+            "--format",
+            "toon",
+            "--not-a-real-flag",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        let context = ProcessErrorContext::from_args(&args, false);
+
+        assert_eq!(context.command, "search");
+        assert_eq!(context.format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn recovery_contract_exits_78_with_json_model_error() {
+        let error = SearchError::ModelNotFound {
+            name: "potion-128m".to_owned(),
+        };
+        let context = ProcessErrorContext {
+            command: "search".to_owned(),
+            format: OutputFormat::Json,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = report_process_error(
+            &error,
+            &context,
+            &mut stdout,
+            &mut stderr,
+            "2026-07-28T00:00:00Z".to_owned(),
+        );
+
+        assert_eq!(code, 78);
+        assert!(stderr.is_empty());
+        let value: serde_json::Value =
+            serde_json::from_slice(&stdout).expect("parse process error envelope");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "model_not_found");
+        assert_eq!(value["error"]["exit_code"], 78);
+        assert_eq!(value["meta"]["command"], "search");
+        assert_eq!(value["meta"]["format"], "json");
+        let suggestion = value["error"]["suggestion"]
+            .as_str()
+            .expect("model error carries recovery suggestion");
+        assert!(suggestion.contains("fsfs download-models --model potion-128m"));
+        assert!(suggestion.contains("FRANKENSEARCH_MODEL_DIR"));
+        assert!(
+            !suggestion.contains("auto-install")
+                && !suggestion.contains("first use")
+                && !suggestion.contains("bundled")
+        );
+    }
+
+    #[test]
+    fn recovery_contract_renders_human_model_error_to_stderr() {
+        let error = SearchError::EmbedderUnavailable {
+            model: "all-MiniLM-L6-v2".to_owned(),
+            reason: "model files are absent".to_owned(),
+        };
+        let context = ProcessErrorContext {
+            command: "search".to_owned(),
+            format: OutputFormat::Table,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = report_process_error(
+            &error,
+            &context,
+            &mut stdout,
+            &mut stderr,
+            "2026-07-28T00:00:00Z".to_owned(),
+        );
+
+        assert_eq!(code, 78);
+        assert!(stdout.is_empty());
+        let rendered = String::from_utf8(stderr).expect("human error is utf-8");
+        assert!(rendered.contains("error: [embedder_unavailable]"));
+        assert!(rendered.contains("Fix:"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod local_perf_runner;
+mod machine_class_registry;
 mod perf;
 mod perf_evidence;
 mod perf_ratchet;
@@ -74,42 +76,57 @@ pub use generator::{
     SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
+pub use local_perf_runner::{
+    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, local_perf_producer_contract_json,
+    run_local_perf_command,
+};
+pub use machine_class_registry::{
+    LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_GIT_BLOB,
+    MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
+    MACHINE_CLASS_REGISTRY_SPEC_COMMIT, MachineClassAdmissionContext,
+    MachineClassCanonicalizationBinding, MachineClassDecision, MachineClassDerivedHashes,
+    MachineClassError, MachineClassEvidenceBinding, MachineClassLookup, MachineClassReason,
+    MachineClassRegistry, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION, RUNNER_RECEIPT_SCHEMA_VERSION,
+    RunnerArtifactManifest, RunnerArtifactManifestBinding, VerifiedRunnerIdentity,
+};
 pub use perf::{
     DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PAIRED_ESTIMATOR_SCHEMA_VERSION,
     PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,
     PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PairedClaimState,
     PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError, PairedEstimatorReason,
     PairedEvidenceStatus, PairedExperimentResult, PerfCellResult, PerfCellSpec, PerfCorpus,
-    PerfEngineBinaryIdentity, PerfEngineThreadObservation, PerfExecutionProvenance, PerfGate,
-    PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope,
-    PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
-    PerfSampleProvenance, PerfThreadProvenance, PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS,
-    QG6_QUERY_GROUPS, estimate_paired_experiment, machine_fingerprint,
-    parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_manifest_contract_sha256,
-    perf_writer_heap_bytes, seeded_balanced_pair_order, validate_matrix,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    PerfMetricSemantics, PerfOperationScope, PerfProducerOs, PerfQueryClass, PerfRawSample,
+    PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
+    PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6SampleBinding,
+    estimate_paired_experiment, machine_fingerprint, parse_macos_time_max_rss_bytes,
+    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
+    seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
-    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EvidenceArtifactError,
-    EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
+    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EngineConcurrencyObservation,
+    EvidenceArtifactError, EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
     EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
     EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION, HierarchicalGroupSummary,
     HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence,
-    PerfEvidenceArtifact, estimate_hierarchical_latency, human_table_from_json,
+    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfEvidenceArtifact,
+    command_sha256_from_argv, estimate_hierarchical_latency, human_table_from_json,
     load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
-    evaluate_perf_ratchet,
+    evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
 pub use qg6_prepared::{
-    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6HarnessError,
-    Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase, Qg6PreparedExperiment,
-    Qg6QuerySpec, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionClaim,
-    Qg6SelectionScope, Qg6SetupRecorder, Qg6TimedSample, Qg6ValidatedExperiment,
-    seeded_interleaved_four_arm_schedule,
+    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
+    Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase,
+    Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
+    Qg6RankedHitReceipt, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
+    Qg6SelectionClaim, Qg6SelectionScope, Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample,
+    Qg6ValidatedExperiment, qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,

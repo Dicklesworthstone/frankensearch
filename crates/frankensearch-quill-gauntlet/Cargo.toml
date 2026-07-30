@@ -34,11 +34,18 @@ tracing = { workspace = true }
 toml = { workspace = true }
 unicode-normalization = { workspace = true }
 xxhash-rust = { workspace = true }
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[build-dependencies]
+sha2 = { workspace = true }
 
 [[bin]]
 name = "quill-perf-ratchet"
 path = "src/bin/quill_perf_ratchet.rs"
+
+[[bin]]
+name = "quill-perf-finalize"
+path = "src/bin/quill_perf_finalize.rs"
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }

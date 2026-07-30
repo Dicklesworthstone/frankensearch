@@ -26,8 +26,8 @@
 //! └─────────────────────────────────────┘
 //! ```
 
-use std::fs::OpenOptions;
-use std::io::{Seek, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher as Crc32Hasher;
@@ -38,9 +38,14 @@ use frankensearch_core::{
     },
 };
 use half::f16;
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::Quantization;
+use crate::{
+    FsviAdmissionError, FsviSnapshotRejectionReason, Quantization, open_readonly_noatime_nofollow,
+    snapshot_parent_or_current, snapshot_rejected, stable_file_identity,
+    validate_single_link_regular_file,
+};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -112,6 +117,49 @@ pub struct CompactionStats {
     pub total_records_after: usize,
     /// Time taken in milliseconds.
     pub elapsed_ms: f64,
+}
+
+/// Strict, side-effect-free classification of a WAL pathname.
+///
+/// Unlike crash-recovery loading, this diagnostic never truncates, removes,
+/// repairs, or silently discards a corrupt suffix. Every present byte must form
+/// one complete valid header/batch sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrictWalInspection {
+    /// No directory entry existed for the WAL path during the stable snapshot.
+    Absent,
+    /// A zero-length regular file existed. This is staging state only and is
+    /// still forbidden beside a published FSVI v2 generation.
+    Empty {
+        /// SHA-256 of the empty byte image.
+        whole_image_sha256: [u8; 32],
+    },
+    /// A complete legacy WAL v1 byte image.
+    LegacyV1(StrictWalImage),
+    /// A complete identity-bound WAL v2 byte image.
+    IdentityBoundV2 {
+        /// Exact validated identity header.
+        header: WalIdentityHeaderV2,
+        /// Redacted byte/batch witness.
+        image: StrictWalImage,
+    },
+}
+
+/// Redacted strict WAL byte/batch witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictWalImage {
+    /// Exact byte length.
+    pub byte_len: u64,
+    /// SHA-256 of every WAL byte.
+    pub whole_image_sha256: [u8; 32],
+    /// Stored vector dimension.
+    pub dimension: u32,
+    /// Stored quantization.
+    pub quantization: Quantization,
+    /// Number of complete batches.
+    pub batch_count: u64,
+    /// Total entries across complete batches.
+    pub entry_count: u64,
 }
 
 /// Parsed, validated identity header for a version-2 WAL.
@@ -528,6 +576,271 @@ pub fn wal_path_for(fsvi_path: &Path) -> PathBuf {
     let mut p = fsvi_path.as_os_str().to_os_string();
     p.push(".wal");
     PathBuf::from(p)
+}
+
+/// Strictly inspect one WAL pathname without mutating bytes, timestamps, or
+/// directory entries.
+///
+/// The present-file path uses the same no-atime/no-follow, single-link,
+/// pre/post inode and containing-directory checks as immutable FSVI admission.
+/// Crash-recovery tolerance is deliberately not applied: a truncated or corrupt
+/// final batch is an error rather than an implicitly discarded suffix.
+///
+/// # Errors
+///
+/// Returns typed snapshot rejection for unsafe path topology or concurrent
+/// mutation and [`SearchError::IndexCorrupted`] for every malformed WAL field.
+pub fn inspect_wal_strict(path: &Path) -> Result<StrictWalInspection, FsviAdmissionError> {
+    let parent = snapshot_parent_or_current(path);
+    let parent_metadata = fs::symlink_metadata(parent).map_err(SearchError::Io)?;
+    if !parent_metadata.file_type().is_dir() {
+        return Err(snapshot_rejected(
+            FsviSnapshotRejectionReason::DirectoryChangedDuringRead,
+            "the WAL parent must be a real directory, not a symlink or special file",
+        ));
+    }
+    let parent_identity = stable_file_identity(&parent_metadata);
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let after = fs::symlink_metadata(parent).map_err(SearchError::Io)?;
+            if !after.file_type().is_dir() || stable_file_identity(&after) != parent_identity {
+                return Err(snapshot_rejected(
+                    FsviSnapshotRejectionReason::DirectoryChangedDuringRead,
+                    "the WAL parent changed while absence was being inspected",
+                ));
+            }
+            return Ok(StrictWalInspection::Absent);
+        }
+        Err(error) => return Err(SearchError::Io(error).into()),
+    };
+    let path_identity = validate_single_link_regular_file(&path_metadata)?;
+    let mut file = open_readonly_noatime_nofollow(path)?;
+    let opened_identity =
+        validate_single_link_regular_file(&file.metadata().map_err(SearchError::Io)?)?;
+    if opened_identity != path_identity {
+        return Err(snapshot_rejected(
+            FsviSnapshotRejectionReason::PathChangedDuringRead,
+            "the WAL pathname and opened descriptor identify different bytes",
+        ));
+    }
+    let byte_len = usize::try_from(path_identity.size)
+        .map_err(|_| wal_corrupted(path, "WAL byte length does not fit in usize"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| SearchError::InvalidConfig {
+            field: "wal_snapshot.byte_len".to_owned(),
+            value: byte_len.to_string(),
+            reason: "unable to reserve the exact immutable WAL byte image".to_owned(),
+        })?;
+    bytes.resize(byte_len, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            snapshot_rejected(
+                FsviSnapshotRejectionReason::PathChangedDuringRead,
+                "the WAL inode was truncated while being inspected",
+            )
+        } else {
+            FsviAdmissionError::Index(SearchError::Io(error))
+        }
+    })?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(SearchError::Io)? != 0 {
+        return Err(snapshot_rejected(
+            FsviSnapshotRejectionReason::PathChangedDuringRead,
+            "the WAL inode grew while being inspected",
+        ));
+    }
+    let descriptor_identity =
+        validate_single_link_regular_file(&file.metadata().map_err(SearchError::Io)?)?;
+    let final_path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            snapshot_rejected(
+                FsviSnapshotRejectionReason::PathChangedDuringRead,
+                "the WAL pathname disappeared while being inspected",
+            )
+        } else {
+            FsviAdmissionError::Index(SearchError::Io(error))
+        }
+    })?;
+    let final_path_identity = validate_single_link_regular_file(&final_path_metadata)?;
+    if descriptor_identity != path_identity || final_path_identity != path_identity {
+        return Err(snapshot_rejected(
+            FsviSnapshotRejectionReason::PathChangedDuringRead,
+            "the WAL inode identity, size, mode, links, or timestamps changed during inspection",
+        ));
+    }
+    let final_parent = fs::symlink_metadata(parent).map_err(SearchError::Io)?;
+    if !final_parent.file_type().is_dir() || stable_file_identity(&final_parent) != parent_identity
+    {
+        return Err(snapshot_rejected(
+            FsviSnapshotRejectionReason::DirectoryChangedDuringRead,
+            "the WAL containing directory changed during inspection",
+        ));
+    }
+    parse_strict_wal_bytes(path, &bytes).map_err(FsviAdmissionError::Index)
+}
+
+fn parse_strict_wal_bytes(path: &Path, data: &[u8]) -> SearchResult<StrictWalInspection> {
+    if data.is_empty() {
+        return Ok(StrictWalInspection::Empty {
+            whole_image_sha256: Sha256::digest(data).into(),
+        });
+    }
+    if data.len() < 6 {
+        return Err(wal_corrupted(path, "WAL magic/version prefix is truncated"));
+    }
+    if data[..4] != WAL_MAGIC {
+        return Err(wal_corrupted(path, "bad magic bytes"));
+    }
+    let version = u16::from_le_bytes([data[4], data[5]]);
+    let (cursor, dimension, quantization, format) = match version {
+        WAL_VERSION => {
+            if data.len() < WAL_HEADER_SIZE {
+                return Err(wal_corrupted(path, "legacy WAL header is truncated"));
+            }
+            let dimension = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+            if dimension == 0 {
+                return Err(wal_corrupted(
+                    path,
+                    "legacy WAL dimension must be greater than zero",
+                ));
+            }
+            let quantization = Quantization::from_wire(data[10], path)?;
+            if data[12..16] != [0; 4] {
+                return Err(wal_corrupted(
+                    path,
+                    "legacy WAL reserved bytes must be zero",
+                ));
+            }
+            let stored_crc = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            if stored_crc != crc32_of(&data[..16]) {
+                return Err(wal_corrupted(path, "legacy WAL header CRC mismatch"));
+            }
+            (
+                WAL_HEADER_SIZE,
+                dimension,
+                quantization,
+                StrictWalFormat::Legacy,
+            )
+        }
+        IDENTITY_BOUND_WAL_VERSION => {
+            let header = WalIdentityHeaderV2::decode(data, path)?;
+            let dimension = header.dimension();
+            let quantization = header.quantization();
+            (
+                IDENTITY_BOUND_WAL_HEADER_SIZE,
+                dimension,
+                quantization,
+                StrictWalFormat::IdentityBound(header),
+            )
+        }
+        found => {
+            return Err(wal_corrupted(
+                path,
+                format!("unsupported WAL version {found}"),
+            ));
+        }
+    };
+    let dimension_usize = usize::try_from(dimension)
+        .map_err(|_| wal_corrupted(path, "WAL dimension does not fit in usize"))?;
+    let vector_bytes = dimension_usize
+        .checked_mul(quantization.bytes_per_element())
+        .ok_or_else(|| wal_corrupted(path, "WAL vector byte length overflow"))?;
+    let (batch_count, entry_count) = inspect_complete_batches(path, &data[cursor..], vector_bytes)?;
+    let image = StrictWalImage {
+        byte_len: u64::try_from(data.len())
+            .map_err(|_| wal_corrupted(path, "WAL byte length does not fit in u64"))?,
+        whole_image_sha256: Sha256::digest(data).into(),
+        dimension,
+        quantization,
+        batch_count,
+        entry_count,
+    };
+    Ok(match format {
+        StrictWalFormat::Legacy => StrictWalInspection::LegacyV1(image),
+        StrictWalFormat::IdentityBound(header) => {
+            StrictWalInspection::IdentityBoundV2 { header, image }
+        }
+    })
+}
+
+enum StrictWalFormat {
+    Legacy,
+    IdentityBound(WalIdentityHeaderV2),
+}
+
+fn inspect_complete_batches(
+    path: &Path,
+    data: &[u8],
+    vector_bytes: usize,
+) -> SearchResult<(u64, u64)> {
+    let mut cursor = 0usize;
+    let mut batch_count = 0_u64;
+    let mut total_entries = 0_u64;
+    while cursor < data.len() {
+        let remaining = &data[cursor..];
+        if remaining.len() < 8 {
+            return Err(wal_corrupted(path, "WAL batch header is truncated"));
+        }
+        if remaining[..4] != BATCH_MAGIC {
+            return Err(wal_corrupted(path, "WAL batch magic mismatch"));
+        }
+        let entry_count =
+            u32::from_le_bytes([remaining[4], remaining[5], remaining[6], remaining[7]]);
+        let mut batch_cursor = 8usize;
+        for _ in 0..entry_count {
+            let len_end = batch_cursor
+                .checked_add(2)
+                .ok_or_else(|| wal_corrupted(path, "WAL entry length offset overflow"))?;
+            if len_end > remaining.len() {
+                return Err(wal_corrupted(path, "WAL entry length is truncated"));
+            }
+            let doc_id_len = usize::from(u16::from_le_bytes([
+                remaining[batch_cursor],
+                remaining[batch_cursor + 1],
+            ]));
+            batch_cursor = len_end;
+            let doc_end = batch_cursor
+                .checked_add(doc_id_len)
+                .ok_or_else(|| wal_corrupted(path, "WAL document id offset overflow"))?;
+            let vector_end = doc_end
+                .checked_add(vector_bytes)
+                .ok_or_else(|| wal_corrupted(path, "WAL vector offset overflow"))?;
+            if vector_end > remaining.len() {
+                return Err(wal_corrupted(path, "WAL entry payload is truncated"));
+            }
+            std::str::from_utf8(&remaining[batch_cursor..doc_end]).map_err(|error| {
+                wal_corrupted(path, format!("WAL document id is not UTF-8: {error}"))
+            })?;
+            batch_cursor = vector_end;
+        }
+        let crc_end = batch_cursor
+            .checked_add(4)
+            .ok_or_else(|| wal_corrupted(path, "WAL batch CRC offset overflow"))?;
+        if crc_end > remaining.len() {
+            return Err(wal_corrupted(path, "WAL batch CRC is truncated"));
+        }
+        let stored_crc = u32::from_le_bytes(
+            remaining[batch_cursor..crc_end]
+                .try_into()
+                .map_err(|_| wal_corrupted(path, "WAL batch CRC is truncated"))?,
+        );
+        if stored_crc != crc32_of(&remaining[..batch_cursor]) {
+            return Err(wal_corrupted(path, "WAL batch CRC mismatch"));
+        }
+        cursor = cursor
+            .checked_add(crc_end)
+            .ok_or_else(|| wal_corrupted(path, "WAL batch cursor overflow"))?;
+        batch_count = batch_count
+            .checked_add(1)
+            .ok_or_else(|| wal_corrupted(path, "WAL batch count overflow"))?;
+        total_entries = total_entries
+            .checked_add(u64::from(entry_count))
+            .ok_or_else(|| wal_corrupted(path, "WAL entry count overflow"))?;
+    }
+    Ok((batch_count, total_entries))
 }
 
 // ─── WAL reading ────────────────────────────────────────────────────────────
@@ -1008,6 +1321,320 @@ mod tests {
     fn refresh_identity_header_crc(bytes: &mut [u8; IDENTITY_BOUND_WAL_HEADER_SIZE]) {
         let crc = crc32_of(&bytes[..IDENTITY_BOUND_WAL_CRC_OFFSET]);
         bytes[IDENTITY_BOUND_WAL_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn encoded_test_batch(entries: &[WalEntry], quantization: Quantization) -> Vec<u8> {
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&BATCH_MAGIC);
+        batch.extend_from_slice(
+            &u32::try_from(entries.len())
+                .expect("test batch entry count fits")
+                .to_le_bytes(),
+        );
+        for entry in entries {
+            let doc_id = entry.doc_id.as_bytes();
+            batch.extend_from_slice(
+                &u16::try_from(doc_id.len())
+                    .expect("test document id fits")
+                    .to_le_bytes(),
+            );
+            batch.extend_from_slice(doc_id);
+            encode_vector(&mut batch, &entry.embedding, quantization);
+        }
+        let crc = crc32_of(&batch);
+        batch.extend_from_slice(&crc.to_le_bytes());
+        batch
+    }
+
+    fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = fs::read_dir(path)
+            .expect("read private WAL fixture directory")
+            .map(|entry| entry.expect("read WAL fixture entry").file_name())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_noatime(path: &Path) -> Vec<u8> {
+        let mut file = open_readonly_noatime_nofollow(path).expect("open test WAL without atime");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .expect("read test WAL without atime");
+        bytes
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn freeze_test_timestamps(path: &Path) {
+        let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_321);
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .expect("open WAL to freeze timestamps");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(timestamp)
+                .set_modified(timestamp),
+        )
+        .expect("freeze WAL timestamps");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn assert_strict_inspection_preserved_snapshot(
+        directory: &Path,
+        path: &Path,
+        expected_bytes: &[u8],
+        file_before: crate::StableFileIdentity,
+        parent_before: crate::StableFileIdentity,
+        entries_before: &[std::ffi::OsString],
+    ) {
+        assert_eq!(
+            stable_file_identity(&fs::symlink_metadata(path).expect("WAL metadata after")),
+            file_before
+        );
+        assert_eq!(
+            stable_file_identity(
+                &fs::symlink_metadata(directory).expect("WAL parent metadata after")
+            ),
+            parent_before
+        );
+        assert_eq!(directory_entry_names(directory), entries_before);
+        assert_eq!(read_noatime(path), expected_bytes);
+        assert_eq!(
+            stable_file_identity(&fs::symlink_metadata(path).expect("WAL metadata after reread")),
+            file_before
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn strict_inspection_classifies_absent_empty_legacy_and_identity_bound_images() {
+        let directory = tempfile::tempdir().expect("private strict WAL directory");
+
+        let absent = directory.path().join("absent.fsvi.wal");
+        let absent_entries = directory_entry_names(directory.path());
+        let absent_parent = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("absent parent before"),
+        );
+        assert_eq!(
+            inspect_wal_strict(&absent).expect("inspect absent WAL"),
+            StrictWalInspection::Absent
+        );
+        assert_eq!(
+            stable_file_identity(
+                &fs::symlink_metadata(directory.path()).expect("absent parent after")
+            ),
+            absent_parent
+        );
+        assert_eq!(directory_entry_names(directory.path()), absent_entries);
+        assert!(!absent.exists());
+
+        let empty = directory.path().join("empty.fsvi.wal");
+        fs::write(&empty, []).expect("write empty WAL");
+        freeze_test_timestamps(&empty);
+        let empty_bytes = Vec::new();
+        let empty_entries = directory_entry_names(directory.path());
+        let empty_file =
+            stable_file_identity(&fs::symlink_metadata(&empty).expect("empty metadata before"));
+        let empty_parent = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("empty parent before"),
+        );
+        assert_eq!(
+            inspect_wal_strict(&empty).expect("inspect empty WAL"),
+            StrictWalInspection::Empty {
+                whole_image_sha256: Sha256::digest([]).into(),
+            }
+        );
+        assert_strict_inspection_preserved_snapshot(
+            directory.path(),
+            &empty,
+            &empty_bytes,
+            empty_file,
+            empty_parent,
+            &empty_entries,
+        );
+
+        let header_only = directory.path().join("header-only.fsvi.wal");
+        let mut header_bytes = Vec::new();
+        write_wal_header(&mut header_bytes, 4, Quantization::F32, 7).expect("encode legacy header");
+        fs::write(&header_only, &header_bytes).expect("write header-only WAL");
+        freeze_test_timestamps(&header_only);
+        let header_entries = directory_entry_names(directory.path());
+        let header_file = stable_file_identity(
+            &fs::symlink_metadata(&header_only).expect("header metadata before"),
+        );
+        let header_parent = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("header parent before"),
+        );
+        let StrictWalInspection::LegacyV1(header_image) =
+            inspect_wal_strict(&header_only).expect("inspect header-only WAL")
+        else {
+            panic!("header-only WAL was not classified as legacy v1");
+        };
+        assert_eq!(header_image.byte_len, WAL_HEADER_SIZE as u64);
+        let expected_header_sha256: [u8; 32] = Sha256::digest(&header_bytes).into();
+        assert_eq!(header_image.whole_image_sha256, expected_header_sha256);
+        assert_eq!(header_image.dimension, 4);
+        assert_eq!(header_image.quantization, Quantization::F32);
+        assert_eq!(header_image.batch_count, 0);
+        assert_eq!(header_image.entry_count, 0);
+        assert_strict_inspection_preserved_snapshot(
+            directory.path(),
+            &header_only,
+            &header_bytes,
+            header_file,
+            header_parent,
+            &header_entries,
+        );
+
+        let multi_batch = directory.path().join("multi-batch.fsvi.wal");
+        append_wal_batch(
+            &multi_batch,
+            &[make_entry("first", 1.0, 4)],
+            4,
+            Quantization::F16,
+            0,
+            false,
+        )
+        .expect("write first strict batch");
+        append_wal_batch(
+            &multi_batch,
+            &[make_entry("second", 2.0, 4), make_entry("third", 3.0, 4)],
+            4,
+            Quantization::F16,
+            0,
+            false,
+        )
+        .expect("write second strict batch");
+        let multi_bytes = fs::read(&multi_batch).expect("read multi-batch bytes");
+        freeze_test_timestamps(&multi_batch);
+        let multi_entries = directory_entry_names(directory.path());
+        let multi_file = stable_file_identity(
+            &fs::symlink_metadata(&multi_batch).expect("multi metadata before"),
+        );
+        let multi_parent = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("multi parent before"),
+        );
+        let StrictWalInspection::LegacyV1(multi_image) =
+            inspect_wal_strict(&multi_batch).expect("inspect multi-batch WAL")
+        else {
+            panic!("multi-batch WAL was not classified as legacy v1");
+        };
+        assert_eq!(
+            multi_image.byte_len,
+            u64::try_from(multi_bytes.len()).expect("multi byte length fits")
+        );
+        let expected_multi_sha256: [u8; 32] = Sha256::digest(&multi_bytes).into();
+        assert_eq!(multi_image.whole_image_sha256, expected_multi_sha256);
+        assert_eq!(multi_image.dimension, 4);
+        assert_eq!(multi_image.quantization, Quantization::F16);
+        assert_eq!(multi_image.batch_count, 2);
+        assert_eq!(multi_image.entry_count, 3);
+        assert_strict_inspection_preserved_snapshot(
+            directory.path(),
+            &multi_batch,
+            &multi_bytes,
+            multi_file,
+            multi_parent,
+            &multi_entries,
+        );
+
+        let identity_bound = directory.path().join("identity-bound.fsvi.wal");
+        let identity_binding = identity_binding_v2(4, QuantizationFormat::F16);
+        let identity_header = identity_binding.encode_header();
+        let identity_entries = [make_entry("identity-doc", 4.0, 4)];
+        let mut identity_bytes = identity_header.to_vec();
+        identity_bytes.extend_from_slice(&encoded_test_batch(&identity_entries, Quantization::F16));
+        fs::write(&identity_bound, &identity_bytes).expect("write identity-bound WAL");
+        freeze_test_timestamps(&identity_bound);
+        let bound_entries = directory_entry_names(directory.path());
+        let bound_file = stable_file_identity(
+            &fs::symlink_metadata(&identity_bound).expect("identity metadata before"),
+        );
+        let bound_parent = stable_file_identity(
+            &fs::symlink_metadata(directory.path()).expect("identity parent before"),
+        );
+        let StrictWalInspection::IdentityBoundV2 { header, image } =
+            inspect_wal_strict(&identity_bound).expect("inspect identity-bound WAL")
+        else {
+            panic!("identity-bound WAL was not classified as v2");
+        };
+        identity_binding
+            .validate_header(&header.encode(), &identity_bound)
+            .expect("strict inspector retained exact identity header");
+        assert_eq!(
+            image.byte_len,
+            u64::try_from(identity_bytes.len()).expect("identity byte length fits")
+        );
+        let expected_identity_sha256: [u8; 32] = Sha256::digest(&identity_bytes).into();
+        assert_eq!(image.whole_image_sha256, expected_identity_sha256);
+        assert_eq!(image.dimension, 4);
+        assert_eq!(image.quantization, Quantization::F16);
+        assert_eq!(image.batch_count, 1);
+        assert_eq!(image.entry_count, 1);
+        assert_strict_inspection_preserved_snapshot(
+            directory.path(),
+            &identity_bound,
+            &identity_bytes,
+            bound_file,
+            bound_parent,
+            &bound_entries,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn strict_inspection_rejects_corrupt_or_truncated_suffix_without_recovery_mutation() {
+        let directory = tempfile::tempdir().expect("private corrupt WAL directory");
+        let source = directory.path().join("source.fsvi.wal");
+        append_wal_batch(
+            &source,
+            &[make_entry("complete", 1.0, 4)],
+            4,
+            Quantization::F16,
+            0,
+            false,
+        )
+        .expect("write complete source WAL");
+        let complete = fs::read(&source).expect("read complete source WAL");
+
+        let mut bad_crc = complete.clone();
+        *bad_crc.last_mut().expect("batch CRC byte") ^= 1;
+        let mut truncated = complete.clone();
+        truncated.pop();
+        let mut corrupt_suffix = complete;
+        corrupt_suffix.extend_from_slice(b"FWB");
+        for (name, bytes) in [
+            ("bad-crc", bad_crc),
+            ("truncated", truncated),
+            ("corrupt-suffix", corrupt_suffix),
+        ] {
+            let path = directory.path().join(format!("{name}.fsvi.wal"));
+            fs::write(&path, &bytes).expect("write malformed strict WAL");
+            freeze_test_timestamps(&path);
+            let entries_before = directory_entry_names(directory.path());
+            let file_before = stable_file_identity(
+                &fs::symlink_metadata(&path).expect("malformed metadata before"),
+            );
+            let parent_before = stable_file_identity(
+                &fs::symlink_metadata(directory.path()).expect("malformed parent before"),
+            );
+
+            assert!(matches!(
+                inspect_wal_strict(&path),
+                Err(FsviAdmissionError::Index(
+                    SearchError::IndexCorrupted { .. }
+                ))
+            ));
+            assert_strict_inspection_preserved_snapshot(
+                directory.path(),
+                &path,
+                &bytes,
+                file_before,
+                parent_before,
+                &entries_before,
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,21 @@
 # QG-1 exclusive trj xlarge thread sweep
 
+> **Correction — diagnostic/no-claim only.** The original adjudication below
+> is retained as superseded audit history. Direct inspection of the nine
+> sealed evidence summaries shows `gate_decision: null` and
+> `admission_no_claim.code: evidence.incomplete_gate_selection` in every
+> cell. Widths 1, 2, 32, 64, and 128 are `gate_status: no_decision`
+> (measured-provisional); widths 4, 8, 16, and 96 are
+> `gate_status: invalid_null` (UNSCORED). Every `QG-1.json` has
+> `laws_attested: false`. Therefore no ratio is a decision-valid MISS, no
+> target slice is rejected or promoted, no certified width curve exists, and
+> QG-1 remains inactive. The one-CPU-active-Quill-worker observation is
+> structural routing evidence only. This tracked tranche contains 63
+> per-width files plus this adjudication, or 64 files total; the prior
+> 72-file claim counted nine ignored `run.log` files. Retry only after a
+> counted mechanism change, using the complete normative gate and immediate
+> same-ELF reproduction with all laws attested.
+
 This target slice ran under the exclusive `trj-booking` claim from
 2026-07-29T16:45:32Z through 2026-07-29T21:23:28Z. It supersedes the earlier
 co-tenant sweep for thread-scaling attribution.

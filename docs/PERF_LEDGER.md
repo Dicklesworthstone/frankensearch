@@ -7952,6 +7952,80 @@ the Tantivy commit-boundary/order/drift failure. Activation still requires the
 full gate and immediate same-ELF reproduction; never weaken a null law, select
 a favorable row, or gate on CV.
 
+## 2026-07-29 — W2.5 scalar canonical encoder: INVALID-EXTERNAL-INTERFERENCE / NO-SHIP (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
+
+**Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
+The experimental source base was committed candidate
+`37c42ed4a278e6fa50022c3e358db65388802b22`; its uncommitted, index-only
+overlay had SHA-256
+`77f95402188255bd62a65e98dbc9a262a2420a8197cdd6dc882e11f6fb8101f8`.
+It replaced `serde_json::to_vec` in deterministic IDMAP serialization with a
+scalar direct emitter.
+
+Correctness job `j-29952570386546852` ran strictly remote and passed 15/15
+selected tests: independent golden bytes, hostile Unicode/control content,
+all `u8` digit-width boundaries, metadata insertion-order permutations,
+canonical byte and content-hash equality, and whole FSLX segment byte
+identity.
+
+Timing job `j-29952570386546854` ran exact ELF SHA-256
+`21d8aa832825fdecf69a95069ab66c15bbdfb676f1e69b4025f3ef3bb35a88e4`
+(51,677,560 bytes) on `vmi1227854`. The raw 41-round, four-inner result was:
+
+- serde/serde same-invocation A/A null: `0.989567 [0.977726, 1.000756]`;
+- direct/serde latency median-CI:
+  `1.133086 [1.123543, 1.140405]`;
+- raw medians: serde 6,084.7 ns/document; direct 6,791.2 ns/document.
+
+The entire timing result is **invalid**, including the apparently admissible
+same-binary null. The enclosing RCH job interval was
+13:48:09Z–14:02:58Z, but per-sample occupancy was not bound. Scheduler mail
+records unrelated four-slot job `j-29952570386546855` starting on the same
+worker at 13:59:32Z while the benchmark remained in execute, filling the
+worker to eight of eight slots. RCH history also records earlier job-level
+co-residency with `j-29952570386546853`. Complete-interval isolation is
+therefore unproven, so cross-project CPU, memory, and cache interference
+invalidates the entire invocation. The raw 1.133x slowdown is recorded only
+as an adverse diagnostic and may not be quoted as a decision-valid regression.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** The
+candidate has exact correctness but no admissible positive timing evidence;
+the entire overlay was manually removed and no product change landed. This is
+not a QG activation, baseline, incumbent comparison, or terminal W2.5 verdict.
+
+Retry only for a profile-named, materially different mechanism such as block
+escape scanning or a one-pass serializer/hash/IDMAP sink. Require the same
+byte/hash/whole-segment oracle first, then prove same-binary A/A and A/B with
+exclusive-worker occupancy bound over the complete interval. Terminal W2.5
+claims still require the separate Apple-Silicon and Threadripper cross-engine
+contract.
+
+## 2026-07-29 — CORRECTION: retract QG-1 width-sweep MISS labels; concurrency was not receipt-bound (`bd-h6eh`, YellowSparrow)
+
+The preceding full-SMT sweep row is corrected to **DIAGNOSTIC / UNSCORED**.
+Its clean source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates `9b23e0d4`, the
+change that records and binds QG-1 concurrency observations. Every sealed
+cell artifact has `spec.concurrency_witness: null`.
+
+Requested thread counts, affinity, and the old Quill-side Rayon pool assertion
+do not satisfy the current contract's requirement for persisted Quill and
+Tantivy observations. That contract explicitly says configuration alone is
+never observed concurrency. The 1- and 96-thread A/A controls therefore
+cannot admit their A/B rows.
+
+**Corrected decision: DIAGNOSTIC / UNSCORED / NO QG-1 CLAIM.** Retract the
+previous 1-thread `0.256083 [0.250163, 0.258549]` and 96-thread
+`0.236489 [0.233668, 0.239445]` target-slice MISS labels. Those values and
+the other seven ratios remain raw routing diagnostics only. The evidence does
+not establish a certified width curve, high-thread convergence, or any QG
+activation.
+
+Retry only with source at or after `9b23e0d4`, requiring each QG-1 cell's
+receipt to prove positive Quill and Tantivy observations with
+`min == max == configured width`. Preserve the same exact-ELF, dual-null,
+complete-matrix, and immediate-reproduction laws before interpreting any
+A/B magnitude.
 ## 2026-07-29 — REJECT: exclusive QG-1 xlarge sweep proves requested workers do not reach Quill ingest (`bd-h6eh`, FoggySquirrel)
 
 **Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
@@ -8014,3 +8088,133 @@ hot path use more than one CPU-active worker. Then rerun the same
 exact-ELF/same-invocation Tantivy incumbent, dual-null, bootstrap median-CI,
 topology, corpus, and affinity contract. Do not blind-resample invalid-null
 rows, weaken a null law, choose a favorable width, or gate on CV.
+
+## 2026-07-29 — CORRECTION: exclusive QG-1 sweep is diagnostic/no-claim (`bd-h6eh`, YellowSparrow)
+
+The preceding MISS/negative-verdict adjudication is superseded. All nine
+sealed `QG-1.evidence.json` files have `gate_decision: null` and
+`admission_no_claim.code: evidence.incomplete_gate_selection`. Widths 1, 2,
+32, 64, and 128 report `gate_status: no_decision` and remain
+measured-provisional; widths 4, 8, 16, and 96 report
+`gate_status: invalid_null` and remain UNSCORED. All nine cell manifests have
+`laws_attested: false`.
+
+**Corrected decision: DIAGNOSTIC / NO-CLAIM / NO QG-1 VERDICT.** Retract
+every MISS and target-slice negative-verdict label attached to this tranche.
+It does not certify a scaling curve, activate QG-1, or support promotion. The
+one-CPU-active-Quill-worker observation remains useful mechanism-routing
+evidence only. The tracked tranche is 63 per-width files plus `SWEEP.md`, or
+64 files total; nine ignored `run.log` files caused the earlier local
+filesystem count of 72 source artifacts.
+
+Retry only after a counted change reduces Quill copy calls/bytes per document
+or reaches more than one CPU-active Quill worker, then run the complete
+normative QG-1 matrix and immediate reproduction. A publishable verdict
+requires the actual Tantivy incumbent in the same invocation, both A/A
+controls, bootstrap median-CIs, exact-ELF provenance, sealed concurrency
+witnesses, and `laws_attested: true`.
+
+## 2026-07-29 — METHODOLOGY / VALID-MECHANISM: Quill moves 8.1587x Tantivy copy bytes/document on the source-3684 diagnostic child (`bd-e8h`, FoggySquirrel)
+
+**Evidence class: DIAGNOSTIC MECHANISM, not an incumbent timing or QG
+claim.** Exact ELF SHA-256
+`03308f4b4b74140cc2a9cbcf926cbe29b9c9118e34512af947e70538d88114e0`
+ran an identical 200,000-document, 50,000,000-byte writer-heap,
+requested-threads=1, positions-on child fixture. Separate sequential uprobe
+invocations counted 203,720,623 resolved AVX copy entries and
+41,437,077,594 bytes for Quill, versus 104,016,287 entries and
+5,078,894,209 bytes for pinned Tantivy 0.26.1. That is 1,018.603 versus
+520.081 calls/document, 202.329 versus 24.799 KiB/document, and
+Quill/Tantivy ratios of 1.958545x calls and 8.158681x bytes.
+
+Matching profiles attribute 7.74% dwarf / 7.25% frame-pointer self-time to
+Quill memmove and 5.75% / 5.29% to Tantivy. Quill copy bytes/document rise
+205.63% from 20,000 to 200,000 documents while Tantivy stays flat, supporting
+flush, seal, or publication copy amplification as the next investigation
+route. A five-run balanced powersave audit observed median 4.268922 GHz for
+Quill and 4.029451 GHz for Tantivy; the 5.943% frequency skew favored Quill
+and cannot explain its copy deficit. The diagnostic child also reports about
+0.996 versus 1.815 CPU-equivalents, so it is not single-hardware-thread wall
+timing evidence.
+
+**Decision: VALID-MECHANISM / DIAGNOSTIC ONLY.** There is no A/A control
+because the counters came from separate profiler invocations. Do not infer a
+performance ratio, current-incumbent verdict, QG state, or activation from
+this mechanism receipt. Route the next lever to an already mapped copy site.
+The complete receipt and counter definitions are in
+`docs/evidence/e8h/p1-qg2-cross-engine-memmove-counters-20260729.md`.
+
+**Retry predicate:** after immutable integration, require byte-identical
+index output and repeat the same 200,000-document mechanism probe. The lever
+must materially reduce Quill copy bytes/document before any QG rerun. Then
+run QG-2 with the exact-current ELF, pinned Tantivy in the same invocation,
+both A/A nulls, and bootstrap median-CIs. QG-1 additionally requires more
+than one observed CPU-active Quill ingest worker. If bytes/document do not
+fall, record the counted mechanism as unchanged and route elsewhere without
+timing; never derive an A/B ratio from separate profiler invocations or gate
+on CV.
+
+## 2026-07-30 — KEEP: Quill TermInterner bucket-map identity hasher — 1.033x QG-2 single-thread ingest (`bd-e8h-w2-u64-hasher-swap-vcfft`, P6)
+
+- **Comparison class: SELF-SPEEDUP.** Both arms are frankensearch (Quill);
+  maintenance evidence only, no incumbent arm anywhere in this measurement.
+- **Machine class:** `local-5975wx-32c` (diagnostic-only class, P1 card
+  fingerprint; not ratchet-admissible). Measured 2026-07-29 from a
+  continuity-base `3684b1477` overlay export; toolchain rustc
+  1.99.0-nightly (9f36de775). **Landed 2026-07-30 at the
+  `928a16baed6d997fb5f63827387eb51cb3f4f4fa` landing base under the
+  revision-bound clause:** scribe.rs is blob-identical
+  (`0d66bba20f4fd988c4b0f4a13cc757b274c63af2`) between the measurement base
+  and the landing base, and the byte-identity probe re-run fresh at the
+  landing base reproduces the banked artifact hashes exactly.
+- **Lever:** `scribe.rs` `TermInterner.buckets` was
+  `std::collections::HashMap<u64, Bucket>` (SipHash) keyed by the
+  ALREADY-FINALIZED `hash_parts` output (ahash) — every token paid a
+  SipHash re-hash of a u64 that is already a hash. Swapped the MAP hasher
+  to a local identity `Hasher` (`PrehashedKeyHasher`, key-is-already-a-hash
+  invariant documented at the type and field); `hash_parts` itself and all
+  durable xxh3 hashing are untouched (the workspace "never substitute
+  durable xxh3" rule governs on-disk hashes, not in-memory map hashers —
+  delta.rs `AHashMap` precedent). No new dependency.
+- **Workload:** QG-2 smoke memory child, `QUILL_PERF_CHILD_MODE=memory`,
+  `ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on, taskset
+  core 8, external wall time, interleaved paired.
+- **Executing ELFs (Arm A = base, pass-2 stash, SHA re-verified; Arm B = lever):**
+  - Arm A ELF sha256: `9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`
+  - Arm B ELF sha256: `454205fd818de191ceca5d69700c51f5c6b441e1e4c39e574a65ed38e66e1bd9`
+- **A/A null (same invocation method, n=16):** paired docs/s ratio median
+  1.0012, mean 1.0010, 95% t-CI [0.9962, 1.0057], span 0.9802–1.0184.
+- **Result (n=32 pairs, two independent batches):** docs/s ratio lever/base
+  mean **1.0334**, median 1.0340, 95% t-CI [1.0296, 1.0372], 32/32 pairs
+  favor the lever; time-ratio convention (new/old) **0.9677**,
+  CI [0.9641, 0.9713] — point and median clear the [0.97, 1.03] band, CI
+  upper bound touches the band edge, and the A/B interval is disjoint from
+  the A/A null interval. ~38.8k → ~40.1k docs/s.
+- **Mechanism (perf dwarf F=1997, self-time):** `hash_one::<&u64>`
+  3.11% → absent; sip `Hasher::write` (u64 site) 1.40% → absent;
+  `find_in_bucket` 2.08% → 1.81%; `matches` 1.47% → 0.78%;
+  `intern_accounted` 0.86% → 1.14% (inlined map op); `hash_parts`
+  unchanged (0.93% → 0.99%), as required.
+- **Byte identity:** deterministic 3-cycle ingest probe (9k docs, ~20k
+  terms/cycle, flush + interner reset each cycle) — all emitted FSLX
+  segment files SHA-256-identical across arms and across repeated runs, on
+  BOTH the 3684-era overlay ELFs AND fresh rebuilds from the 928a16ba
+  landing worktree (pristine probe ELF `aa314dee…`, patched `e3e86843…`,
+  identical artifact hashes `d3b2382d…`/`1a42f42e…`/`dc861ef5…`/
+  `dd4257a8…`); ordering seam pinned by
+  `sorted_ids_match_composite_byte_order_and_field_grouping`, and a
+  deliberately reversed sort turns that test RED and hard-errors the flush
+  (`TermDictionary(NonAscendingInput)`), so an ordering leak cannot emit
+  bytes silently.
+- **Tests at the landing base:** `cargo test -p frankensearch-quill` =
+  482 passed / 0 failed / 1 ignored (lib) + green integration suites, exit
+  0, on BOTH pristine and patched arms; the 3684-era labruntime flake did
+  not reproduce, so no exemption was needed. clippy `--no-deps` warning-set
+  diff vs pristine: empty. `cargo fmt --check`: clean. UBS on scribe.rs:
+  identical totals (47/1408/163) and a byte-identical 22-row per-class
+  census on both arms — zero new findings.
+- **Status:** LANDED (this commit; scribe.rs +48/−3 including one
+  doc-comment backtick added post-measurement to satisfy
+  `clippy::doc_markdown` — doc-text only, probe artifacts re-verified
+  identical after the fix). Full evidence:
+  `docs/evidence/e8h/p6-local-qg2-hasher-swap-20260730.md`.

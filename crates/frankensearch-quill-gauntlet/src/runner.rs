@@ -6034,6 +6034,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::comparator::{AstDifference, AstLoweringKind, CountState, NativeTieKey, RankedHit};
+    #[cfg(feature = "tantivy-oracle")]
+    use crate::comparator::{
+        LexicalContractBundle, LexicalContractComparison, LexicalCountExposure, LexicalCountState,
+        LexicalEmptyShape, LexicalErrorClass, LexicalErrorObservation, LexicalFieldExposure,
+        LexicalHitObservation, LexicalHydrationExecution, LexicalHydrationResult,
+        LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
+        LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
+        LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
+        SensitiveValueObservation,
+    };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
         QueryGeneratorSpec, RepositoryEntry, RepositorySnapshot, SharedFixtureSuite,
@@ -6096,6 +6106,17 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     fn trace_field_u64(line: &str, field: &str) -> Option<u64> {
         trace_field_text(line, field)?.parse().ok()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_last_field_u64(line: &str, field: &str) -> Option<u64> {
+        let prefix = format!("{field}=");
+        let start = line.rfind(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)?.parse().ok()
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -6340,19 +6361,40 @@ mod tests {
         assert!(close_position(KEEPER_SEAL) < committed_open);
         assert!(close_position(ARGUS_PARSE) < close_position(ARGUS_SCORE));
         assert!(close_position(ARGUS_SCORE) < close_position(ARGUS_COLLECT));
-        assert!(
-            logs.lines().any(|line| {
+        let paginated_queries = logs
+            .lines()
+            .filter(|line| {
                 is_stage_close(line, ARGUS_QUERY)
-                    && line.contains("offset=17")
-                    && line.contains("exact_count=true")
+                    && trace_has_text_field(line, "query_id", "paginated")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(7)
+                    && trace_field_u64(line, "offset") == Some(17)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's paginated collector: {logs}",
+            "live G1a trace did not execute Quill's count-free requested page: {logs}",
         );
         assert!(
-            logs.lines().any(|line| {
-                is_stage_close(line, ARGUS_QUERY) && line.contains("exact_count=false")
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(280)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's count-free collector: {logs}",
+            "live G1a trace did not execute Quill's expanded ranked evidence: {logs}",
+        );
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(0)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=true")
+                    && trace_field_u64(line, "result_count") == Some(0)
+                    && trace_field_u64(line, "total_count").is_some_and(|count| count > 0)
+            }),
+            "live G1a trace did not execute Quill's independent count-only evidence: {logs}",
         );
         let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
             .expect("parse committed E4.10 rank-list golden for trace contract");
@@ -7392,6 +7434,427 @@ mod tests {
                 &fixture.query_suite,
             )
             .await
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_QUERY: &str = "content:alpha OR content:beta OR content:gamma";
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_DOCUMENT_COUNT: usize = 9_001;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_TWO_SEGMENT_SPLIT: usize = 257;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_TIE_EXPANSION: u64 = 1;
+    #[cfg(feature = "tantivy-oracle")]
+    const UNION_HORIZON_RANKED_DOCUMENT_TOKENS: usize = 128;
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UnionHorizonTraceReceipt {
+        segment_doc_count: u64,
+        plan: String,
+        pruning_windows: u64,
+        blocks_skipped: u64,
+        candidate_docs: u64,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UnionHorizonProof {
+        comparisons: Vec<HarnessRun>,
+        trace: UnionHorizonTraceReceipt,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn union_horizon_ranked_content(gamma_frequency: usize) -> Vec<u8> {
+        assert!(
+            gamma_frequency < UNION_HORIZON_RANKED_DOCUMENT_TOKENS,
+            "UNION_HORIZON ranked-document frequency must leave room for alpha",
+        );
+        let mut tokens = Vec::with_capacity(UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.push("alpha");
+        tokens.extend(std::iter::repeat_n("gamma", gamma_frequency));
+        tokens.extend(std::iter::repeat_n(
+            "padding",
+            UNION_HORIZON_RANKED_DOCUMENT_TOKENS - gamma_frequency - 1,
+        ));
+        assert_eq!(tokens.len(), UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.join(" ").into_bytes()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn make_union_horizon_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_entries(
+            "union-horizon-late-winner",
+            (0..UNION_HORIZON_DOCUMENT_COUNT).map(|ordinal| {
+                let bytes = match ordinal {
+                    // These 99 documents give the public top-100 comparison a
+                    // strictly ordered prefix. Their fixed field length makes
+                    // increasing gamma frequency the only score-changing
+                    // variable, so a segment split cannot expose Tantivy's
+                    // native DocAddress tie order against Quill's global
+                    // document-id tie order.
+                    0..=98 => union_horizon_ranked_content(ordinal + 10),
+                    99..=4_095 => b"alpha beta".to_vec(),
+                    4_096..=8_999 => b"alpha".to_vec(),
+                    // The late winner retains the same fixed field length as
+                    // the ranked prefix and has the unique largest gamma
+                    // frequency. It remains beyond the first empty
+                    // competitive window in both segment layouts.
+                    9_000 => union_horizon_ranked_content(120),
+                    _ => unreachable!("UNION_HORIZON fixture ordinal is bounded"),
+                };
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from(format!("docs/{ordinal:05}.txt")),
+                    bytes,
+                }
+            }),
+        )
+        .expect("UNION_HORIZON repository snapshot");
+        let corpus_hash = snapshot
+            .manifest
+            .manifest_hash()
+            .expect("UNION_HORIZON corpus hash");
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202_4096,
+                default_limit: 100,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [1_u64, 20, 100]
+                .into_iter()
+                .map(|limit| GeneratedQueryCase {
+                    id: format!("union-horizon-k{limit}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Boolean,
+                    query: UNION_HORIZON_QUERY.to_owned(),
+                    limit,
+                    offset: 0,
+                    count_requested: true,
+                    filters: crate::generator::GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "runner.rs UNION_HORIZON late-winner regression".to_owned(),
+                })
+                .collect(),
+        )
+        .expect("UNION_HORIZON query suite");
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn union_horizon_trace_receipt(logs: &str, segment_doc_count: u64) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::tracing_conventions::ARGUS_SCORE;
+
+        let matching = logs
+            .lines()
+            .filter(|line| is_stage_close(line, ARGUS_SCORE))
+            // Close records contain the outer query span before the nested
+            // score span, and both carry `doc_count`. Select the innermost
+            // (last) field so a multi-segment query's aggregate count cannot
+            // masquerade as the target segment's count.
+            .filter(|line| trace_last_field_u64(line, "doc_count") == Some(segment_doc_count))
+            .filter(|line| trace_has_text_field(line, "plan", "max_score"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "UNION_HORIZON target segment must emit exactly one MaxScore close receipt; \
+             segment_doc_count={segment_doc_count} logs={logs}",
+        );
+        let score = matching[0];
+        let receipt = UnionHorizonTraceReceipt {
+            segment_doc_count,
+            plan: trace_field_text(score, "plan")
+                .expect("UNION_HORIZON score plan")
+                .to_owned(),
+            pruning_windows: trace_field_u64(score, "pruning_windows")
+                .expect("UNION_HORIZON pruning-window count"),
+            blocks_skipped: trace_field_u64(score, "blocks_skipped")
+                .expect("UNION_HORIZON skipped-block count"),
+            candidate_docs: trace_field_u64(score, "candidate_docs")
+                .expect("UNION_HORIZON candidate count"),
+        };
+        assert_eq!(trace_field_u64(score, "segments_touched"), Some(1));
+        assert_eq!(receipt.plan, "max_score");
+        assert_eq!(receipt.pruning_windows, 2);
+        assert_eq!(receipt.blocks_skipped, 0);
+        assert_eq!(receipt.candidate_docs, 1);
+        receipt
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_union_horizon_proof(
+        cx: &Cx,
+        fixture: &Fixture,
+        segment_split: Option<usize>,
+    ) -> UnionHorizonProof {
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject = crate::engine::QuillSubject::in_memory(
+            config,
+            "union-horizon-deterministic-regression-not-live-provenance",
+            false,
+        )
+        .expect("fresh UNION_HORIZON Quill subject");
+        let mut oracle =
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+                .expect("fresh UNION_HORIZON Tantivy oracle");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Quill subject");
+        oracle
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Tantivy oracle");
+
+        let split = segment_split.unwrap_or(fixture.documents.len());
+        let ranges = [0..split, split..fixture.documents.len()];
+        for range in ranges {
+            if range.is_empty() {
+                continue;
+            }
+            let documents = fixture.documents[range]
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .index_documents(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Quill segment");
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Quill segment");
+            oracle
+                .index()
+                .index_documents(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Tantivy segment");
+            oracle
+                .index()
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Tantivy segment");
+        }
+        subject
+            .mark_committed()
+            .expect("commit UNION_HORIZON Quill campaign");
+        oracle
+            .mark_committed()
+            .expect("commit UNION_HORIZON Tantivy campaign");
+
+        let expected_segment_doc_counts = segment_split.map_or_else(
+            || {
+                vec![
+                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                        .expect("UNION_HORIZON document count fits u32"),
+                ]
+            },
+            |split| {
+                vec![
+                    u32::try_from(split).expect("UNION_HORIZON segment split fits u32"),
+                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
+                        .expect("UNION_HORIZON tail segment count fits u32"),
+                ]
+            },
+        );
+        let snapshot = subject
+            .index()
+            .expect("UNION_HORIZON Quill index")
+            .snapshot();
+        let actual_segment_doc_counts = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.doc_count())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_segment_doc_counts, expected_segment_doc_counts,
+            "UNION_HORIZON Quill segment shape drifted",
+        );
+        if let Some(split) = segment_split {
+            assert_eq!(9_000_usize - split, 8_743);
+            assert!(9_000_usize - split >= 2 * 4_096);
+        }
+
+        let target_id = fixture
+            .documents
+            .last()
+            .expect("UNION_HORIZON target document")
+            .id
+            .as_str();
+        let harness = crate::engine::DifferentialHarness::new(
+            ComparisonMode::CrossEngine,
+            ComparatorConfig::default(),
+        );
+        let mut comparisons = Vec::new();
+        for query in &fixture.query_suite.cases {
+            let case = DifferentialCase {
+                fixture_id: query.id.clone(),
+                query: query.query.clone(),
+                limit: query.limit,
+                offset: query.offset,
+                tie_expansion_limit: UNION_HORIZON_TIE_EXPANSION,
+                count_requested: query.count_requested,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some(GENERATOR_ID.to_owned()),
+                    generator_seed: Some(fixture.query_suite.manifest.spec.seed),
+                    corpus_hash: Some(fixture.corpus_hash.clone()),
+                },
+            };
+            let run = harness
+                .run(cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "UNION_HORIZON segment_split={segment_split:?} limit={} failed: {error}",
+                        query.limit,
+                    )
+                });
+            assert_eq!(
+                run.comparison.status,
+                ComparisonStatus::Exact,
+                "UNION_HORIZON limit={} comparison report: {:#?}",
+                query.limit,
+                run.comparison,
+            );
+            assert_eq!(
+                run.comparison.rank_class,
+                RankClass::RankExact,
+                "UNION_HORIZON limit={} comparison report: {:#?}",
+                query.limit,
+                run.comparison,
+            );
+            let subject_rows = run
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_rows = run
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subject_rows, oracle_rows,
+                "UNION_HORIZON limit={} IDs or score bits diverged",
+                query.limit,
+            );
+            assert_eq!(
+                subject_rows.first().map(|(doc_id, _)| *doc_id),
+                Some(target_id),
+                "UNION_HORIZON late winner must rank first",
+            );
+            assert!(
+                subject_rows.windows(2).all(|rows| {
+                    f32::from_bits(rows[0].1).total_cmp(&f32::from_bits(rows[1].1))
+                        == std::cmp::Ordering::Greater
+                }),
+                "UNION_HORIZON limit={} ranked prefix must have strictly descending unique scores",
+                query.limit,
+            );
+            if query.limit == 100 {
+                assert_eq!(
+                    subject_rows.len(),
+                    100,
+                    "UNION_HORIZON top-100 proof must return the complete ranked prefix",
+                );
+                assert_eq!(subject_rows[0].0, "repo:docs/09000.txt");
+                for (rank, ordinal) in (0..=98).rev().enumerate() {
+                    assert_eq!(
+                        subject_rows[rank + 1].0,
+                        format!("repo:docs/{ordinal:05}.txt"),
+                        "UNION_HORIZON ranked-anchor identity drifted at rank {}",
+                        rank + 1,
+                    );
+                }
+            }
+            let subject_ties = run
+                .comparison
+                .subject
+                .cutoff_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_ties = run
+                .comparison
+                .oracle
+                .cutoff_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subject_ties, oracle_ties,
+                "UNION_HORIZON limit={} cutoff tie evidence diverged",
+                query.limit,
+            );
+            assert!(
+                run.comparison.subject.cutoff_tie_complete
+                    && run.comparison.oracle.cutoff_tie_complete,
+                "UNION_HORIZON limit={} requires complete cutoff-tie evidence",
+                query.limit,
+            );
+            comparisons.push(run);
+        }
+
+        let trace_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || TraceLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        let traced = tracing::subscriber::with_default(subscriber, || {
+            subject
+                .index()
+                .expect("UNION_HORIZON Quill index")
+                .search_paginated(cx, UNION_HORIZON_QUERY, 1, 0, false)
+        })
+        .expect("trace UNION_HORIZON Quill search");
+        assert_eq!(traced.hits.len(), 1);
+        assert_eq!(traced.hits[0].document_id, target_id);
+        assert_eq!(traced.hits[0].global_docid, 9_000);
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("UNION_HORIZON trace buffer lock")
+                .clone(),
+        )
+        .expect("UNION_HORIZON trace is UTF-8");
+        let segment_doc_count = segment_split.map_or_else(
+            || {
+                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                    .expect("UNION_HORIZON document count fits u64")
+            },
+            |split| {
+                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
+                    .expect("UNION_HORIZON tail segment count fits u64")
+            },
+        );
+        let trace = union_horizon_trace_receipt(&logs, segment_doc_count);
+
+        UnionHorizonProof { comparisons, trace }
     }
 
     #[test]
@@ -8689,6 +9152,22 @@ mod tests {
         )
         .expect("captured Quill trace is UTF-8");
         assert_scalar_g1a_trace_contract(&logs);
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for segment_split in [None, Some(UNION_HORIZON_TWO_SEGMENT_SPLIT)] {
+                let first = run_union_horizon_proof(&cx, &fixture, segment_split).await;
+                let second = run_union_horizon_proof(&cx, &fixture, segment_split).await;
+                assert_eq!(
+                    first, second,
+                    "UNION_HORIZON segment_split={segment_split:?} changed across fresh rebuilds",
+                );
+            }
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -10217,6 +10696,171 @@ mod tests {
         source_root: &std::path::Path,
         report: &CampaignReport,
     ) {
+        fn core_comparison(object: &mut ArtifactObject) -> &mut LexicalContractComparison {
+            let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                &mut object.lexical_contract
+            else {
+                unreachable!("mutation target must retain Core Lexical V3 evidence")
+            };
+            comparison
+        }
+
+        fn subject_bundle(object: &mut ArtifactObject) -> &mut LexicalContractBundle {
+            &mut core_comparison(object).subject
+        }
+
+        fn subject_full_context(object: &mut ArtifactObject) -> &mut LexicalObservationContext {
+            &mut subject_bundle(object).full_search.context
+        }
+
+        fn success_fields(
+            observation: &mut LexicalObservation,
+        ) -> (
+            &mut Vec<LexicalHitObservation>,
+            &mut u64,
+            &mut LexicalEmptyShape,
+            &mut LexicalCountState,
+        ) {
+            let LexicalObservationOutcome::Success {
+                hits,
+                returned_count,
+                empty_shape,
+                total_count,
+            } = &mut observation.outcome
+            else {
+                unreachable!("selected mutation target must be a successful observation")
+            };
+            (hits, returned_count, empty_shape, total_count)
+        }
+
+        fn first_subject_full_hit(object: &mut ArtifactObject) -> &mut LexicalHitObservation {
+            success_fields(&mut subject_bundle(object).full_search)
+                .0
+                .first_mut()
+                .expect("selected mutation target must retain a full-search hit")
+        }
+
+        fn attempted_hydration(
+            execution: &mut LexicalHydrationExecution,
+        ) -> (
+            &mut LexicalObservation,
+            &mut LexicalObservation,
+            &mut LexicalHydrationResult,
+        ) {
+            let LexicalHydrationExecution::Attempted {
+                input,
+                post_state,
+                result,
+            } = execution
+            else {
+                unreachable!("selected mutation target must retain attempted hydration")
+            };
+            (input, post_state, result)
+        }
+
+        fn flip_sha256_nibble(value: &mut String) {
+            assert_eq!(value.len(), 64, "mutation target must be a SHA-256");
+            let replacement = if value.starts_with('0') { "1" } else { "0" };
+            value.replace_range(0..1, replacement);
+        }
+
+        fn mutate_sensitive_digest(value: &mut SensitiveValueObservation) {
+            let sha256 = match value {
+                SensitiveValueObservation::PresentEmpty { sha256, .. }
+                | SensitiveValueObservation::Present { sha256, .. } => sha256,
+                SensitiveValueObservation::NotExposed | SensitiveValueObservation::Absent => {
+                    unreachable!("mutation target must retain a digest-bearing sensitive value")
+                }
+            };
+            flip_sha256_nibble(sha256);
+        }
+
+        fn mutate_sensitive_length(value: &mut SensitiveValueObservation) {
+            let byte_len = match value {
+                SensitiveValueObservation::PresentEmpty { byte_len, .. }
+                | SensitiveValueObservation::Present { byte_len, .. } => byte_len,
+                SensitiveValueObservation::NotExposed | SensitiveValueObservation::Absent => {
+                    unreachable!("mutation target must retain a length-bearing sensitive value")
+                }
+            };
+            *byte_len = byte_len.saturating_add(1);
+        }
+
+        fn digest_bearing_metadata_hit(
+            observation: &mut LexicalObservation,
+        ) -> &mut LexicalHitObservation {
+            success_fields(observation)
+                .0
+                .iter_mut()
+                .find(|hit| {
+                    matches!(
+                        &hit.metadata,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
+                    )
+                })
+                .expect("selected mutation target must retain metadata digest evidence")
+        }
+
+        fn digest_bearing_explanation_hit(
+            observation: &mut LexicalObservation,
+        ) -> &mut LexicalHitObservation {
+            success_fields(observation)
+                .0
+                .iter_mut()
+                .find(|hit| {
+                    matches!(
+                        &hit.explanation,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
+                    )
+                })
+                .expect("selected mutation target must retain explanation digest evidence")
+        }
+
+        fn query_error_observation() -> LexicalErrorObservation {
+            let error = frankensearch_core::SearchError::QueryParseError {
+                query: "redacted by persisted mutation test".to_owned(),
+                detail: "typed failure replacement".to_owned(),
+            };
+            crate::comparator::observe_lexical_search_error(&error)
+                .expect("observe typed mutation error")
+        }
+
+        fn replace_with_query_error(outcome: &mut LexicalObservationOutcome) {
+            *outcome = LexicalObservationOutcome::Error(query_error_observation());
+        }
+
+        fn mutate_one_full_score_bit(object: &mut ArtifactObject) {
+            let hits = success_fields(&mut subject_bundle(object).full_search).0;
+            for index in 0..hits.len() {
+                let candidate_bits = hits[index].normalized_score_bits ^ 1;
+                let candidate = f32::from_bits(candidate_bits);
+                let previous_allows = index == 0
+                    || f32::from_bits(hits[index - 1].normalized_score_bits) >= candidate;
+                let next_allows = index + 1 == hits.len()
+                    || candidate >= f32::from_bits(hits[index + 1].normalized_score_bits);
+                if candidate.is_finite() && previous_allows && next_allows {
+                    hits[index].normalized_score_bits = candidate_bits;
+                    hits[index].raw_lexical_score_bits = Some(candidate_bits);
+                    return;
+                }
+            }
+            unreachable!("selected mutation target must admit a finite one-bit score mutation");
+        }
+
+        fn swap_tied_full_hits(object: &mut ArtifactObject) {
+            let hits = success_fields(&mut subject_bundle(object).full_search).0;
+            let index = hits
+                .windows(2)
+                .position(|pair| pair[0].normalized_score_bits == pair[1].normalized_score_bits)
+                .expect("selected mutation target must retain an adjacent score tie");
+            hits.swap(index, index + 1);
+            hits[index].rank = u64::try_from(index).expect("persisted hit ordinal must fit in u64");
+            hits[index + 1].rank =
+                u64::try_from(index + 1).expect("persisted hit ordinal must fit in u64");
+        }
+
         let scratch = tempfile::tempdir().expect("isolated mutation store");
         let scratch_root = scratch.path();
         let source_campaign = source_root.join("campaigns").join(&report.run_id);
@@ -10272,22 +10916,66 @@ mod tests {
                 else {
                     return None;
                 };
-                if hits.is_empty()
-                    || !matches!(
-                        &comparison.subject.all_lexical_winners_hydration.execution,
-                        crate::comparator::LexicalHydrationExecution::Attempted { .. }
+                let has_adjacent_score_tie = hits
+                    .windows(2)
+                    .any(|pair| pair[0].normalized_score_bits == pair[1].normalized_score_bits);
+                let has_metadata_digest = hits.iter().any(|hit| {
+                    matches!(
+                        &hit.metadata,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
                     )
+                });
+                let all_hydrations_attempted = [
+                    &comparison.subject.all_lexical_winners_hydration,
+                    &comparison.subject.strict_hybrid_winners_hydration,
+                    &comparison.subject.semantic_only_hydration,
+                    &comparison.subject.mixed_winners_hydration,
+                ]
+                .into_iter()
+                .all(|transition| {
+                    matches!(
+                        &transition.execution,
+                        LexicalHydrationExecution::Attempted { .. }
+                    )
+                });
+                let strict_has_explanation_digest = match &comparison
+                    .subject
+                    .strict_hybrid_winners_hydration
+                    .execution
+                {
+                    LexicalHydrationExecution::Attempted { input, .. } => match &input.outcome {
+                        LexicalObservationOutcome::Success { hits, .. } => hits.iter().any(|hit| {
+                            matches!(
+                                &hit.explanation,
+                                SensitiveValueObservation::PresentEmpty { .. }
+                                    | SensitiveValueObservation::Present { .. }
+                            )
+                        }),
+                        LexicalObservationOutcome::Error(_) => false,
+                    },
+                    LexicalHydrationExecution::NotRun { .. } => false,
+                };
+                if !has_adjacent_score_tie
+                    || !has_metadata_digest
+                    || !all_hydrations_attempted
+                    || !strict_has_explanation_digest
                 {
                     return None;
                 }
                 Some((ordinal, hash.clone(), object))
             })
-            .expect("live Core V3 campaign has a nonempty, hydrated persisted case");
+            .expect(
+                "live Core V3 campaign has a tied, metadata-bearing, fully hydrated persisted case",
+            );
         let target_path = scratch_objects.join(format!("{target_hash}.json"));
         let original_bytes = std::fs::read(&target_path).expect("read scratch target object");
         let target_case_path = scratch_cases.join(format!("q{target_ordinal:06}.json"));
         let original_case_bytes =
             std::fs::read(&target_case_path).expect("read scratch target run manifest");
+        let reservation_path = scratch_campaign.join("reservation.json");
+        let original_reservation_bytes =
+            std::fs::read(&reservation_path).expect("read scratch campaign reservation");
         let report_path = scratch_campaign.join("report.json");
         let original_report_bytes =
             std::fs::read(&report_path).expect("read scratch campaign report");
@@ -10307,7 +10995,9 @@ mod tests {
 
         let mut raw_content_tamper = original_bytes.clone();
         raw_content_tamper.push(b' ');
+        let mut existing_mutation_count = 0;
         assert_stale_address_rejected("raw_content_byte", &raw_content_tamper);
+        existing_mutation_count += 1;
 
         let original_value: serde_json::Value =
             serde_json::from_slice(&original_bytes).expect("object JSON");
@@ -10332,71 +11022,360 @@ mod tests {
                 &format!("missing_lane_{lane}"),
                 &serde_json::to_vec(&missing_lane).expect("encode missing-lane mutation"),
             );
+            existing_mutation_count += 1;
         }
 
         type TypedMutation = fn(&mut ArtifactObject);
-        let typed_mutations: [(&str, TypedMutation); 6] = [
-            ("schema", |object| {
+        let typed_mutations: &[(&str, TypedMutation)] = &[
+            ("object_canonicalization_schema", |object| {
                 object.canonicalization_version = object.canonicalization_version.saturating_add(1);
             }),
-            ("context", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                comparison.subject.full_search.context.seed ^= 1;
+            ("comparison_schema", |object| {
+                core_comparison(object).schema_version.push_str("-tampered");
             }),
-            ("hit", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                let crate::comparator::LexicalObservationOutcome::Success { hits, .. } =
-                    &mut comparison.subject.full_search.outcome
-                else {
-                    unreachable!()
-                };
-                hits[0].doc_id.push_str("-tampered");
+            ("bundle_schema", |object| {
+                subject_bundle(object).schema_version.push_str("-tampered");
             }),
-            ("error", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                let error = frankensearch_core::SearchError::QueryParseError {
-                    query: "redacted by persisted mutation test".to_owned(),
-                    detail: "typed failure replacement".to_owned(),
-                };
-                comparison.subject.full_search.outcome =
-                    crate::comparator::LexicalObservationOutcome::Error(
-                        crate::comparator::observe_lexical_search_error(&error)
-                            .expect("observe typed mutation error"),
-                    );
+            ("bundle_engine_role", |object| {
+                subject_bundle(object).engine_role = LexicalEngineRole::Oracle;
             }),
-            ("hydration", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
+            ("bundle_snapshot_sha256", |object| {
+                flip_sha256_nibble(&mut subject_bundle(object).snapshot_sha256);
+            }),
+            ("bundle_capability", |object| {
+                let bundle = subject_bundle(object);
+                bundle.fusion_metadata_deferred = !bundle.fusion_metadata_deferred;
+            }),
+            ("context_schema", |object| {
+                subject_full_context(object)
+                    .schema_version
+                    .push_str("-tampered");
+            }),
+            ("context_boundary", |object| {
+                subject_full_context(object).boundary =
+                    crate::comparator::LexicalBoundary::FusionCandidates;
+            }),
+            ("context_backend_engine", |object| {
+                subject_full_context(object)
+                    .backend
+                    .engine
+                    .push_str("-tampered");
+            }),
+            ("context_backend_revision", |object| {
+                subject_full_context(object)
+                    .backend
+                    .revision
+                    .push_str("-tampered");
+            }),
+            ("context_backend_index_identity", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).backend.index_identity);
+            }),
+            ("context_corpus_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).corpus_sha256);
+            }),
+            ("context_query_contract_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).query_contract_sha256);
+            }),
+            ("context_query_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).query_sha256);
+            }),
+            ("context_query_bytes", |object| {
+                let context = subject_full_context(object);
+                context.query_bytes = context.query_bytes.saturating_add(1);
+            }),
+            ("context_normalized_query", |object| {
+                subject_full_context(object).normalized_query = LexicalNormalizedQuery::Value {
+                    transform_id: "persisted-mutation-transform".to_owned(),
+                    sha256: "0".repeat(64),
+                    byte_len: 0,
                 };
-                comparison.subject.all_lexical_winners_hydration.selection =
-                    crate::comparator::LexicalHydrationSelection::SemanticOnlyControl {
-                        control_id: u32::MAX,
-                    };
+            }),
+            ("context_query_class", |object| {
+                let context = subject_full_context(object);
+                context.query_class = match context.query_class {
+                    LexicalQueryClass::Empty => LexicalQueryClass::Identifier,
+                    LexicalQueryClass::Identifier => LexicalQueryClass::ShortKeyword,
+                    LexicalQueryClass::ShortKeyword => LexicalQueryClass::NaturalLanguage,
+                    LexicalQueryClass::NaturalLanguage => LexicalQueryClass::ShortKeyword,
+                };
+            }),
+            ("context_seed", |object| {
+                subject_full_context(object).seed ^= 1;
+            }),
+            ("context_limit", |object| {
+                let context = subject_full_context(object);
+                context.limit = context.limit.saturating_add(1);
+            }),
+            ("context_metadata_exposure", |object| {
+                subject_full_context(object).exposure.metadata = LexicalFieldExposure::NotExposed;
+            }),
+            ("context_explanation_exposure", |object| {
+                subject_full_context(object).exposure.explanation =
+                    LexicalFieldExposure::NotExposed;
+            }),
+            ("context_count_exposure", |object| {
+                subject_full_context(object).exposure.total_count =
+                    LexicalCountExposure::NotRequested;
+            }),
+            ("context_snippet_exposure", |object| {
+                subject_full_context(object).exposure.snippet = LexicalFieldExposure::Exposed;
+            }),
+            ("context_highlight_exposure", |object| {
+                subject_full_context(object).exposure.highlight_spans =
+                    LexicalFieldExposure::Exposed;
+            }),
+            ("hit_rank", |object| {
+                let hit = first_subject_full_hit(object);
+                hit.rank = hit.rank.saturating_add(1);
+            }),
+            ("hit_order", swap_tied_full_hits),
+            ("hit_doc_id", |object| {
+                first_subject_full_hit(object).doc_id.push_str("-tampered");
+            }),
+            ("hit_one_bit_score", mutate_one_full_score_bit),
+            ("hit_raw_lexical_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("all-winner hydration input must retain a hit");
+                hit.raw_lexical_score_bits = hit.raw_lexical_score_bits.map(|bits| bits ^ 1);
+            }),
+            ("hit_source", |object| {
+                first_subject_full_hit(object).source = LexicalScoreSource::Hybrid;
+            }),
+            ("hit_index_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("strict hydration input must retain a hit");
+                hit.index = hit.index.map(|index| index.saturating_add(1));
+            }),
+            ("hit_fast_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("strict hydration input must retain a hit");
+                hit.fast_score_bits = hit.fast_score_bits.map(|bits| bits ^ 1);
+            }),
+            ("hit_quality_component", |object| {
+                first_subject_full_hit(object).quality_score_bits = Some(0.125_f32.to_bits());
+            }),
+            ("hit_rerank_component", |object| {
+                first_subject_full_hit(object).rerank_score_bits = Some(0.25_f32.to_bits());
+            }),
+            ("hit_metadata_presence", |object| {
+                digest_bearing_metadata_hit(&mut subject_bundle(object).full_search).metadata =
+                    SensitiveValueObservation::Absent;
+            }),
+            ("hit_metadata_digest", |object| {
+                mutate_sensitive_digest(
+                    &mut digest_bearing_metadata_hit(&mut subject_bundle(object).full_search)
+                        .metadata,
+                );
+            }),
+            ("hit_metadata_length", |object| {
+                mutate_sensitive_length(
+                    &mut digest_bearing_metadata_hit(&mut subject_bundle(object).full_search)
+                        .metadata,
+                );
+            }),
+            ("hit_explanation_presence", |object| {
+                let explanation = &mut first_subject_full_hit(object).explanation;
+                *explanation = if matches!(explanation, SensitiveValueObservation::Absent) {
+                    SensitiveValueObservation::Present {
+                        sha256: "0".repeat(64),
+                        byte_len: 1,
+                    }
+                } else {
+                    SensitiveValueObservation::Absent
+                };
+            }),
+            ("hit_explanation_digest", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                mutate_sensitive_digest(&mut digest_bearing_explanation_hit(input).explanation);
+            }),
+            ("hit_snippet_state", |object| {
+                first_subject_full_hit(object).snippet = SensitiveValueObservation::Absent;
+            }),
+            ("hit_highlight_state", |object| {
+                first_subject_full_hit(object).highlight_spans = LexicalObserved::Absent;
+            }),
+            ("success_returned_count", |object| {
+                let (_, returned_count, _, _) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *returned_count = returned_count.saturating_add(1);
+            }),
+            ("success_empty_shape", |object| {
+                let (_, _, empty_shape, _) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *empty_shape = LexicalEmptyShape::Empty;
+            }),
+            ("success_count_state", |object| {
+                let (_, _, _, total_count) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *total_count = LexicalCountState::NotRequested;
+            }),
+            ("error_outcome_kind", |object| {
+                replace_with_query_error(&mut subject_bundle(object).full_search.outcome);
+            }),
+            ("error_class", |object| {
+                let mut error = query_error_observation();
+                error.class = LexicalErrorClass::Index;
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("error_code", |object| {
+                let mut error = query_error_observation();
+                error.code.push_str("-tampered");
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("error_contract_payload", |object| {
+                let mut error = query_error_observation();
+                mutate_sensitive_digest(&mut error.contract_payload);
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("hydration_all_selection", |object| {
+                subject_bundle(object)
+                    .all_lexical_winners_hydration
+                    .selection = LexicalHydrationSelection::SemanticOnlyControl {
+                    control_id: u32::MAX,
+                };
+            }),
+            ("hydration_strict_candidate_rank", |object| {
+                let selection = &mut subject_bundle(object)
+                    .strict_hybrid_winners_hydration
+                    .selection;
+                let LexicalHydrationSelection::StrictHybridWinnerSubset { candidate_ranks } =
+                    selection
+                else {
+                    unreachable!("strict hydration must retain strict-rank selection")
+                };
+                candidate_ranks[0] = u64::MAX;
+            }),
+            ("hydration_semantic_control_id", |object| {
+                let selection = &mut subject_bundle(object).semantic_only_hydration.selection;
+                let LexicalHydrationSelection::SemanticOnlyControl { control_id } = selection
+                else {
+                    unreachable!("semantic hydration must retain its control selection")
+                };
+                *control_id ^= 1;
+            }),
+            ("hydration_mixed_lexical_origin_rank", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let rank = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::Lexical { candidate_rank, .. } => Some(candidate_rank),
+                        LexicalWinnerOrigin::NonLexicalControl { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a lexical origin");
+                *rank = rank.saturating_add(1);
+            }),
+            ("hydration_mixed_lexical_projection", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let projection = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::Lexical { projection, .. } => Some(projection),
+                        LexicalWinnerOrigin::NonLexicalControl { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a lexical origin");
+                *projection = match projection {
+                    LexicalWinnerProjection::LexicalOnly => LexicalWinnerProjection::HybridFast,
+                    LexicalWinnerProjection::HybridFast => LexicalWinnerProjection::LexicalOnly,
+                };
+            }),
+            ("hydration_mixed_nonlexical_control_id", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let control_id = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::NonLexicalControl { control_id, .. } => {
+                            Some(control_id)
+                        }
+                        LexicalWinnerOrigin::Lexical { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a non-lexical origin");
+                *control_id ^= 1;
+            }),
+            ("hydration_mixed_nonlexical_kind", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let kind = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::NonLexicalControl { kind, .. } => Some(kind),
+                        LexicalWinnerOrigin::Lexical { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a non-lexical origin");
+                *kind = match kind {
+                    LexicalNonLexicalControlKind::SemanticFast => {
+                        LexicalNonLexicalControlKind::GraphOnlyHybrid
+                    }
+                    LexicalNonLexicalControlKind::GraphOnlyHybrid => {
+                        LexicalNonLexicalControlKind::SemanticFast
+                    }
+                };
+            }),
+            ("hydration_mixed_origin_order", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                origins.swap(0, 1);
+            }),
+            ("hydration_input", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                success_fields(input).0[0].doc_id.push_str("-tampered");
+            }),
+            ("hydration_post_state", |object| {
+                let bundle = subject_bundle(object);
+                let (_, post_state, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                success_fields(post_state).0[0].doc_id.push_str("-tampered");
+            }),
+            ("hydration_result", |object| {
+                let bundle = subject_bundle(object);
+                let (_, _, result) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                *result = LexicalHydrationResult::Error(query_error_observation());
             }),
             ("derived", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                comparison.status = LexicalComparisonStatus::Mismatch;
+                core_comparison(object).status = LexicalComparisonStatus::Mismatch;
             }),
         ];
-        for (label, mutate) in typed_mutations {
+        assert_eq!(
+            typed_mutations.len(),
+            60,
+            "Core V3 must keep one typed mutation for every admitted comparison field family"
+        );
+        for &(label, mutate) in typed_mutations {
             let mut mutated = target_object.clone();
             mutate(&mut mutated);
             let object_bytes = mutated
@@ -10457,6 +11436,116 @@ mod tests {
             );
         }
 
+        type ProvenanceMutation = fn(&mut CampaignProvenance);
+        let provenance_mutations: &[(&str, ProvenanceMutation)] = &[
+            ("subject_git_revision", |value| {
+                value.subject_git_revision = "2".repeat(40);
+            }),
+            ("subject_source_dirty", |value| {
+                value.subject_source_dirty = !value.subject_source_dirty;
+            }),
+            ("oracle_git_revision", |value| {
+                value.oracle_git_revision = "3".repeat(40);
+            }),
+            ("oracle_source_dirty", |value| {
+                value.oracle_source_dirty = !value.oracle_source_dirty;
+            }),
+            ("cargo_lock_sha256", |value| {
+                value.cargo_lock_sha256 = "0".repeat(64);
+            }),
+            ("rustc_version_verbose", |value| {
+                value.rustc_version_verbose.push_str("mismatch");
+            }),
+            ("rust_toolchain_channel", |value| {
+                value.rust_toolchain_channel = "nightly-1970-01-01".to_owned();
+            }),
+            ("unicode_version", |value| {
+                value.unicode_version = "0.0.0".to_owned();
+            }),
+            ("unicode_normalization_version", |value| {
+                value.unicode_normalization_version = "0.0.0".to_owned();
+            }),
+            ("unicode_normalization_table_version", |value| {
+                value.unicode_normalization_table_version = "0.0.0".to_owned();
+            }),
+            ("query_generator_id", |value| {
+                value.query_generator_id = "wrong-generator".to_owned();
+            }),
+            ("query_generator_schema_version", |value| {
+                value.query_generator_schema_version =
+                    value.query_generator_schema_version.saturating_add(1);
+            }),
+            ("query_seed", |value| {
+                value.query_seed ^= 1;
+            }),
+            ("query_source_identity_sha256", |value| {
+                value.query_source_identity_sha256 = "0".repeat(64);
+            }),
+            ("query_profile_sha256", |value| {
+                value.query_profile_sha256 = "0".repeat(64);
+            }),
+            ("analyzer_contract_hash", |value| {
+                value.analyzer_contract_hash = "0".repeat(64);
+            }),
+            ("schema_contract_hash", |value| {
+                value.schema_contract_hash = "0".repeat(64);
+            }),
+            ("corpus_manifest_hash", |value| {
+                value.corpus_manifest_hash = "0".repeat(64);
+            }),
+            ("query_manifest_hash", |value| {
+                value.query_manifest_hash = "0".repeat(64);
+            }),
+            ("corpus_seed", |value| {
+                value.corpus_seed = Some(value.corpus_seed.map_or(0, |seed| seed ^ 1));
+            }),
+        ];
+        assert_eq!(
+            provenance_mutations.len(),
+            20,
+            "campaign provenance mutation coverage must remain field-complete"
+        );
+        for &(field, mutate) in provenance_mutations {
+            let mut mutated_report = report.clone();
+            mutate(
+                mutated_report
+                    .provenance
+                    .as_mut()
+                    .expect("live mutation campaign must retain provenance"),
+            );
+            std::fs::write(
+                &reservation_path,
+                mutated_report
+                    .reservation_bytes_unchecked()
+                    .expect("encode coherently mutated campaign reservation"),
+            )
+            .expect("write coherently mutated campaign reservation");
+            std::fs::write(
+                &report_path,
+                mutated_report
+                    .canonical_bytes_unchecked()
+                    .expect("encode coherently mutated campaign report"),
+            )
+            .expect("write coherently mutated campaign report");
+
+            let error = store
+                .load_verified_campaign(&report.run_id)
+                .expect_err("verified campaign reload must reject mutated provenance");
+            std::fs::write(&reservation_path, &original_reservation_bytes)
+                .expect("restore campaign reservation");
+            std::fs::write(&report_path, &original_report_bytes)
+                .expect("restore campaign report after provenance mutation");
+            store
+                .load_verified_campaign(&report.run_id)
+                .unwrap_or_else(|error| {
+                    panic!("restored campaign failed after provenance {field}: {error}")
+                });
+            assert!(
+                matches!(&error, GauntletError::InvalidCampaign { .. }),
+                "provenance {field} must reach campaign provenance validation, got: {error}"
+            );
+        }
+
         let foreign_hash = report
             .cases
             .iter()
@@ -10501,6 +11590,18 @@ mod tests {
                     .to_string()
                     .contains("campaign case result does not match its immutable artifact"),
             "valid but ordinal-mismatched object must reach campaign evidence validation: {error}"
+        );
+        existing_mutation_count += 1;
+        assert_eq!(
+            existing_mutation_count, 8,
+            "the pre-V3 mutation corpus must execute one raw-byte case, six missing-lane cases, \
+             and one wrong-ordinal case"
+        );
+        assert_eq!(
+            existing_mutation_count + typed_mutations.len() + provenance_mutations.len(),
+            88,
+            "the persisted Core V3 replay corpus must execute every pre-V3, typed, and provenance \
+             mutation"
         );
     }
 

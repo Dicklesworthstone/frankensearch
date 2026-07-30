@@ -128,6 +128,7 @@
             "fast_model",
             "quality_model",
             "model_dir",
+            "offline",
             "embedding_batch_size",
             "reindex_on_change",
             "watch_mode"
@@ -144,6 +145,9 @@
             "model_dir": {
               "type": "string",
               "minLength": 1
+            },
+            "offline": {
+              "type": "boolean"
             },
             "embedding_batch_size": {
               "type": "integer",
@@ -364,6 +368,7 @@
       "required": [
         "discovery_roots",
         "discovery_exclude_patterns",
+        "indexing_offline",
         "search_default_limit",
         "search_fast_only",
         "search_explain",
@@ -379,6 +384,10 @@
         "discovery_exclude_patterns": {
           "type": "string",
           "const": "FSFS_DISCOVERY_EXCLUDE_PATTERNS"
+        },
+        "indexing_offline": {
+          "type": "string",
+          "const": "FRANKENSEARCH_OFFLINE"
         },
         "search_default_limit": {
           "type": "string",
@@ -413,6 +422,8 @@
         "roots",
         "exclude",
         "limit",
+        "offline",
+        "online",
         "fast_only",
         "explain",
         "profile",
@@ -430,6 +441,14 @@
         "limit": {
           "type": "string",
           "const": "--limit"
+        },
+        "offline": {
+          "type": "string",
+          "const": "--offline"
+        },
+        "online": {
+          "type": "string",
+          "const": "--online"
         },
         "fast_only": {
           "type": "string",

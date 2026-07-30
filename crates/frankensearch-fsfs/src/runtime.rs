@@ -23,12 +23,14 @@ use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IndexableDocument, ScoreComponent, SearchError, SearchResult,
+    HitExplanation, IndexableDocument, ModelCategory, ScoreComponent, SearchError, SearchResult,
 };
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
+#[cfg(test)]
+use frankensearch_embed::HashEmbedder;
 use frankensearch_embed::{
-    ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
-    ModelLifecycle, ModelManifest, ensure_default_semantic_models,
+    ConsentSource, DetectOptions, DownloadConsent, EmbedderStack, ModelDownloader, ModelLifecycle,
+    ModelManifest, ensure_default_semantic_models,
 };
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
@@ -84,8 +86,8 @@ use crate::config::{
     default_project_config_file_path, default_user_config_file_path,
 };
 use crate::degradation_advisor::{
-    DegradationAdvice, DegradationAdviceInput, DegradationFailureKind, advice_for_search_error,
-    advice_for_zero_signal,
+    DegradationAdvice, DegradationAdviceInput, DegradationFailureKind, advice_for_zero_signal,
+    classify_search_error,
 };
 use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
 use crate::file_classification::{
@@ -105,6 +107,7 @@ use crate::lifecycle::{
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
     IndexFreshnessPayload, OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload,
+    error_code_for,
 };
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
@@ -122,7 +125,7 @@ use crate::query_planning::{
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
 use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
-    terminal_event_completed, terminal_event_from_error,
+    is_retryable_error, terminal_event_completed, terminal_event_from_error,
 };
 use crate::watcher::{FsWatcher, WatchIngestOp, WatchIngestPipeline};
 
@@ -536,15 +539,23 @@ impl SemanticVoiDecision {
 
 struct SearchExecutionResources {
     index_root: PathBuf,
+    generation_fingerprint: String,
     lexical_index: Option<QuillSearchIndex>,
     shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
     vector_index: Option<VectorIndex>,
+    pending_semantic_initialization_failure: Option<PendingSemanticInitializationFailure>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
     degradation_advice: Vec<DegradationAdvice>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSemanticInitializationFailure {
+    error_code: &'static str,
+    sanitized_summary: &'static str,
 }
 
 struct ShadowPressureSampler {
@@ -1190,9 +1201,30 @@ struct IndexManifestEntry {
 
 const FSFS_CHECKPOINT_FILE: &str = "index_checkpoint.json";
 const EMBEDDING_PROBE_MAX_RETRIES: usize = 2;
-const EMBEDDING_BATCH_MAX_RETRIES: usize = 3;
+const EMBEDDING_BATCH_MAX_ATTEMPTS: usize = 3;
 const CHECKPOINT_PERSIST_INTERVAL: usize = 4;
 const INDEXING_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticRetryDisposition {
+    Cancelled,
+    Permanent,
+    Transient,
+}
+
+#[derive(Debug)]
+enum IndexingBatchEmbeddingOutcome {
+    Ready {
+        embeddings: Vec<Vec<f32>>,
+        embedding_elapsed_ms: u128,
+        retries_executed: usize,
+    },
+    Exhausted {
+        error: SearchError,
+        embedding_elapsed_ms: u128,
+        retries_executed: usize,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CheckpointFileEntry {
@@ -1333,7 +1365,6 @@ enum IndexingProgressStage {
     Indexing,
     RetryingEmbedding,
     Finalizing,
-    SemanticUpgrade,
     Completed,
     CompletedDegraded,
 }
@@ -1346,7 +1377,6 @@ impl IndexingProgressStage {
             Self::Indexing => "Indexing Content",
             Self::RetryingEmbedding => "Retrying Embedding...",
             Self::Finalizing => "Finalizing Artifacts",
-            Self::SemanticUpgrade => "Upgrading Semantic Embeddings",
             Self::Completed => "Completed",
             Self::CompletedDegraded => "Completed (Degraded)",
         }
@@ -1355,7 +1385,6 @@ impl IndexingProgressStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexingWarningSeverity {
-    Info,
     Warn,
     Error,
 }
@@ -2175,7 +2204,8 @@ impl LiveIngestPipeline {
                         Err(error) => {
                             warn!(
                                 file_key = %rel_key,
-                                error = %error,
+                                error_code = error_code_for(&error),
+                                reason = FsfsRuntime::semantic_runtime_failure_summary(&error),
                                 reason_code = %vector_plan.reason_code,
                                 "watcher ingest: embedding failed; lexical-only for this file"
                             );
@@ -4972,34 +5002,46 @@ impl FsfsRuntime {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "embedded-models"),
+        allow(clippy::unnecessary_wraps, clippy::unused_self)
+    )]
     fn search_mode_hint(&self) -> SearchResult<Option<String>> {
-        let models = self.collect_model_statuses()?;
-        let fast_cached = models
-            .iter()
-            .any(|model| model.tier == "fast" && model.cached);
-        let quality_cached = models
-            .iter()
-            .any(|model| model.tier == "quality" && model.cached);
-
-        if fast_cached && quality_cached && !self.config.search.fast_only {
-            return Ok(None);
+        #[cfg(not(feature = "embedded-models"))]
+        {
+            Ok(Some(model_free_semantic_recovery_guidance().to_owned()))
         }
-        if fast_cached {
-            if self.config.search.fast_only {
+
+        #[cfg(feature = "embedded-models")]
+        {
+            let models = self.collect_model_statuses()?;
+            let fast_cached = models
+                .iter()
+                .any(|model| model.tier == "fast" && model.cached);
+            let quality_cached = models
+                .iter()
+                .any(|model| model.tier == "quality" && model.cached);
+
+            if fast_cached && quality_cached && !self.config.search.fast_only {
+                return Ok(None);
+            }
+            if fast_cached {
+                if self.config.search.fast_only {
+                    return Ok(Some(
+                        "Search mode: fast semantic tier only (quality disabled by `fast_only=true`)."
+                            .to_owned(),
+                    ));
+                }
                 return Ok(Some(
-                    "Search mode: fast semantic tier only (quality disabled by `fast_only=true`)."
+                    "Search mode: fast semantic tier active; quality model missing, so refinement is skipped."
                         .to_owned(),
                 ));
             }
-            return Ok(Some(
-                "Search mode: fast semantic tier active; quality model missing, so refinement is skipped."
+            Ok(Some(
+                "Search mode: lexical-only because no verified semantic model is available. Check model-cache permissions and `fsfs status`; semantic results never use the hash control embedder."
                     .to_owned(),
-            ));
+            ))
         }
-        Ok(Some(
-            "Search mode: built-in hash + lexical fallback. Default semantic models are bundled; if this persists, check model-dir permissions and run `fsfs status`."
-                .to_owned(),
-        ))
     }
 
     async fn run_search_stream_command(
@@ -5109,9 +5151,7 @@ impl FsfsRuntime {
 
     #[allow(clippy::too_many_lines)]
     async fn run_search_serve_stdio_command(&self, cx: &Cx) -> SearchResult<()> {
-        let mut resources = self
-            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
-            .await?;
+        let mut resources = self.prepare_search_serve_resources(cx).await?;
         let stdin = std::io::stdin();
         let mut line = String::new();
         let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
@@ -5217,9 +5257,7 @@ impl FsfsRuntime {
             path: socket_path.clone(),
         };
 
-        let resources = self
-            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
-            .await?;
+        let resources = self.prepare_search_serve_resources(cx).await?;
         let hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let shared = Arc::new(asupersync::sync::Mutex::new((resources, hot_cache)));
@@ -5407,6 +5445,13 @@ impl FsfsRuntime {
         hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
         hot_cache_enabled: bool,
     ) -> SearchResult<SearchServeResponse> {
+        let mode = parse_search_execution_mode(request.mode.as_deref())?;
+        if self
+            .rebind_search_resources_if_generation_changed(cx, mode, resources)
+            .await?
+        {
+            hot_cache.clear();
+        }
         if let Some(index) = resources.lexical_index.as_ref()
             && index.refresh(cx).await?
         {
@@ -5418,7 +5463,6 @@ impl FsfsRuntime {
                 );
             }
         }
-        let mode = parse_search_execution_mode(request.mode.as_deref())?;
         let requested_limit = request.limit.unwrap_or_else(|| {
             self.cli_input
                 .overrides
@@ -5467,6 +5511,7 @@ impl FsfsRuntime {
                 .await?;
             (false, payloads)
         };
+        Self::validate_bound_search_resources(resources, mode)?;
 
         Ok(SearchServeResponse {
             ok: true,
@@ -6116,6 +6161,7 @@ impl FsfsRuntime {
             .await
     }
 
+    #[cfg(test)]
     async fn execute_search_payloads_with_mode(
         &self,
         cx: &Cx,
@@ -6201,14 +6247,28 @@ impl FsfsRuntime {
                 )
                 .await;
         }
+        let index_root = self.resolve_status_index_root()?;
+        Self::validate_search_generation_at_root(&index_root, mode)?;
+        let lookup_fingerprint = Self::search_index_fingerprint_at_root(&index_root)?;
+        Self::validate_search_generation_fingerprint(&index_root, &lookup_fingerprint, mode)?;
         let key = self.search_cache_key(query, limit, mode);
-        match self.try_load_search_payload_cache(&key) {
+        match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
                 if let Some(sink) = phase_sink.as_deref_mut() {
                     for payload in &payloads {
+                        Self::validate_search_generation_fingerprint(
+                            &index_root,
+                            &lookup_fingerprint,
+                            mode,
+                        )?;
                         sink(payload)?;
                     }
                 }
+                Self::validate_search_generation_fingerprint(
+                    &index_root,
+                    &lookup_fingerprint,
+                    mode,
+                )?;
                 if let Err(error) =
                     self.persist_explain_session_for_cached_payloads(query, &payloads)
                 {
@@ -6228,10 +6288,31 @@ impl FsfsRuntime {
             }
         }
 
-        let payloads = self
-            .execute_search_payloads_with_mode_and_phase_sink(cx, query, limit, mode, phase_sink)
+        let mut resources = self
+            .prepare_search_execution_resources_at_root_with_modes(cx, &index_root, mode, mode)
             .await?;
-        if let Err(error) = self.write_search_payload_cache(&key, &payloads) {
+        let execution_fingerprint = resources.generation_fingerprint.clone();
+        let artifacts = self
+            .execute_search_phase_artifacts_with_mode_using_resources(
+                cx,
+                query,
+                limit,
+                mode,
+                &mut resources,
+                SearchExecutionFlags {
+                    include_snippets: true,
+                    persist_explain_session: true,
+                },
+                phase_sink,
+            )
+            .await?;
+        Self::validate_search_generation_fingerprint(&index_root, &execution_fingerprint, mode)?;
+        let payloads = artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect::<Vec<_>>();
+        if let Err(error) = self.write_search_payload_cache(&key, &payloads, &execution_fingerprint)
+        {
             warn!(
                 error = %error,
                 "fsfs search cache write failed; continuing without cache persistence"
@@ -6275,30 +6356,73 @@ impl FsfsRuntime {
         // Gather payloads from each expanded query. Use a larger internal limit
         // to get enough candidates for meaningful fusion.
         let expansion_limit = (limit.saturating_mul(2)).max(20);
-        let mut all_payloads: Vec<SearchPayload> = Vec::new();
+        let mut resources = self
+            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+            .await?;
+        let expansion_fingerprint = resources.generation_fingerprint.clone();
+        let all_payloads = self
+            .execute_expanded_query_variants(
+                cx,
+                &expansion.queries,
+                expansion_limit,
+                &mut resources,
+                &expansion_fingerprint,
+            )
+            .await?;
 
-        for expanded in &expansion.queries {
+        // Fuse all results using cross-query reciprocal rank fusion.
+        let fused_payload =
+            Self::fuse_expanded_payloads(query, &all_payloads, limit, self.config.search.rrf_k);
+        Self::validate_search_generation_fingerprint(
+            &resources.index_root,
+            &expansion_fingerprint,
+            SearchExecutionMode::Full,
+        )?;
+
+        Ok(vec![fused_payload])
+    }
+
+    async fn execute_expanded_query_variants(
+        &self,
+        cx: &Cx,
+        queries: &[query_expansion::ExpandedQuery],
+        expansion_limit: usize,
+        resources: &mut SearchExecutionResources,
+        expansion_fingerprint: &str,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let mut payloads = Vec::new();
+        for expanded in queries {
+            Self::validate_search_generation_fingerprint(
+                &resources.index_root,
+                expansion_fingerprint,
+                SearchExecutionMode::Full,
+            )?;
             info!(
                 strategy = expanded.strategy.label(),
                 query_text = expanded.text,
                 "fsfs expanded query: executing search variant"
             );
             let variant_payloads = self
-                .execute_search_payloads_with_mode(
+                .execute_search_payloads_with_mode_using_resources(
                     cx,
                     &expanded.text,
                     expansion_limit,
                     SearchExecutionMode::Full,
+                    resources,
+                    SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: true,
+                    },
                 )
                 .await?;
-            all_payloads.extend(variant_payloads);
+            Self::validate_search_generation_fingerprint(
+                &resources.index_root,
+                expansion_fingerprint,
+                SearchExecutionMode::Full,
+            )?;
+            payloads.extend(variant_payloads);
         }
-
-        // Fuse all results using cross-query reciprocal rank fusion.
-        let fused_payload =
-            Self::fuse_expanded_payloads(query, &all_payloads, limit, self.config.search.rrf_k);
-
-        Ok(vec![fused_payload])
+        Ok(payloads)
     }
 
     /// Fuse search payloads from multiple expanded queries using RRF.
@@ -6444,30 +6568,29 @@ impl FsfsRuntime {
         Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
     }
 
+    #[cfg(test)]
     fn search_index_fingerprint(&self) -> SearchResult<String> {
         let index_root = self.resolve_status_index_root()?;
+        Self::search_index_fingerprint_at_root(&index_root)
+    }
+
+    fn search_index_fingerprint_at_root(index_root: &Path) -> SearchResult<String> {
         let mut hasher = Sha256::new();
 
-        if let Some(sentinel) = Self::read_index_sentinel(&index_root)? {
-            hasher.update(sentinel.source_hash_hex.as_bytes());
-            hasher.update(sentinel.generated_at_ms.to_le_bytes());
-        }
-
-        for rel in [
-            FSFS_VECTOR_INDEX_FILE,
-            FSFS_VECTOR_MANIFEST_FILE,
-            FSFS_LEXICAL_MANIFEST_FILE,
-            FSFS_SENTINEL_FILE,
-            "lexical",
+        for (label, path) in [
+            (CURRENT_FILE_NAME, index_root.join(CURRENT_FILE_NAME)),
+            (
+                "lexical/CURRENT",
+                index_root.join("lexical").join(CURRENT_FILE_NAME),
+            ),
+            (FSFS_SENTINEL_FILE, index_root.join(FSFS_SENTINEL_FILE)),
         ] {
-            let path = index_root.join(rel);
-            hasher.update(rel.as_bytes());
-            match fs::metadata(&path) {
-                Ok(metadata) => {
+            hasher.update(label.as_bytes());
+            match fs::read(path) {
+                Ok(bytes) => {
                     hasher.update([1]);
-                    hasher.update(metadata.len().to_le_bytes());
-                    let modified_ms = metadata.modified().ok().map_or(0, system_time_to_ms);
-                    hasher.update(modified_ms.to_le_bytes());
+                    hasher.update(bytes.len().to_le_bytes());
+                    hasher.update(bytes);
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     hasher.update([0]);
@@ -6476,12 +6599,84 @@ impl FsfsRuntime {
             }
         }
 
+        for rel in [
+            FSFS_CHECKPOINT_FILE,
+            FSFS_VECTOR_INDEX_FILE,
+            FSFS_VECTOR_MANIFEST_FILE,
+            FSFS_LEXICAL_MANIFEST_FILE,
+            FSFS_SENTINEL_FILE,
+            "lexical",
+        ] {
+            let path = index_root.join(rel);
+            Self::hash_search_artifact_identity(&mut hasher, rel, &path)?;
+        }
+        let vector_wal_path =
+            frankensearch_index::wal_path_for(&index_root.join(FSFS_VECTOR_INDEX_FILE));
+        Self::hash_search_artifact_identity(&mut hasher, "vector_index_wal", &vector_wal_path)?;
+
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        if let Some(engine_dir) = lexical_layout.engine_dir() {
+            for file_name in ["MANIFEST", "MANIFEST.prev", "meta.json"] {
+                let path = engine_dir.join(file_name);
+                let label = format!("active_lexical/{file_name}");
+                Self::hash_search_artifact_identity(&mut hasher, &label, &path)?;
+            }
+        }
+
         Ok(sha256_digest_hex(hasher.finalize()))
+    }
+
+    fn hash_search_artifact_identity(
+        hasher: &mut Sha256,
+        label: &str,
+        path: &Path,
+    ) -> SearchResult<()> {
+        hasher.update(label.as_bytes());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                hasher.update([0]);
+                return Ok(());
+            }
+            Err(error) => return Err(SearchError::Io(error)),
+        };
+        hasher.update([1]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+            hasher.update(metadata.len().to_le_bytes());
+            hasher.update(metadata.mtime().to_le_bytes());
+            hasher.update(metadata.mtime_nsec().to_le_bytes());
+            hasher.update(metadata.ctime().to_le_bytes());
+            hasher.update(metadata.ctime_nsec().to_le_bytes());
+        }
+
+        #[cfg(not(unix))]
+        {
+            hasher.update(metadata.len().to_le_bytes());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
+            hasher.update(modified.map_or(0, |value| value.as_secs()).to_le_bytes());
+            hasher.update(
+                modified
+                    .map_or(0, |value| value.subsec_nanos())
+                    .to_le_bytes(),
+            );
+        }
+
+        Ok(())
     }
 
     fn try_load_search_payload_cache(
         &self,
         key: &SearchCacheKey,
+        expected_fingerprint: &str,
     ) -> SearchResult<Option<Vec<SearchPayload>>> {
         let cache_path = self.search_cache_path(key)?;
         let raw = match fs::read_to_string(&cache_path) {
@@ -6499,7 +6694,7 @@ impl FsfsRuntime {
         if record.schema_version != FSFS_SEARCH_CACHE_SCHEMA_VERSION || record.key != *key {
             return Ok(None);
         }
-        if record.index_fingerprint != self.search_index_fingerprint()? {
+        if record.index_fingerprint != expected_fingerprint {
             return Ok(None);
         }
         Ok(Some(record.payloads))
@@ -6509,6 +6704,7 @@ impl FsfsRuntime {
         &self,
         key: &SearchCacheKey,
         payloads: &[SearchPayload],
+        index_fingerprint: &str,
     ) -> SearchResult<()> {
         let cache_path = self.search_cache_path(key)?;
         if let Some(parent) = cache_path.parent() {
@@ -6517,7 +6713,7 @@ impl FsfsRuntime {
 
         let record = SearchCacheRecord {
             schema_version: FSFS_SEARCH_CACHE_SCHEMA_VERSION.to_owned(),
-            index_fingerprint: self.search_index_fingerprint()?,
+            index_fingerprint: index_fingerprint.to_owned(),
             key: key.clone(),
             payloads: payloads.to_vec(),
         };
@@ -6924,6 +7120,8 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        self.rebind_search_resources_if_generation_changed(cx, mode, resources)
+            .await?;
         let index_freshness = resources
             .lexical_index
             .as_ref()
@@ -6939,9 +7137,11 @@ impl FsfsRuntime {
                     index_freshness,
                 ),
             };
+            Self::validate_bound_search_resources(resources, mode)?;
             if let Some(sink) = phase_sink.as_deref_mut() {
                 sink(&artifact.payload)?;
             }
+            Self::validate_bound_search_resources(resources, mode)?;
             return Ok(vec![artifact]);
         }
 
@@ -7180,14 +7380,52 @@ impl FsfsRuntime {
             "fsfs semantic-stage VOI decision"
         );
 
-        if plan.semantic_stage.enabled
-            && semantic_decision.run_semantic
-            && !matches!(mode, SearchExecutionMode::LexicalOnly)
+        // FastOnly is an explicit semantic-readiness contract. A favorable
+        // lexical head may still let VOI skip the expensive embed/search, but
+        // it must never hide a missing, corrupt, or inadmissible semantic lane.
+        // Full may continue without that lane only after the planner selects a
+        // real lexical stage and the response records stable recovery advice.
+        let lexical_fallback_authorized = matches!(mode, SearchExecutionMode::Full)
+            && plan.lexical_stage.enabled
+            && lexical_available;
+        let semantic_initialization_fallback_required =
+            lexical_fallback_authorized && resources.vector_index.is_none();
+        let semantic_readiness_required = matches!(mode, SearchExecutionMode::FastOnly)
+            || semantic_initialization_fallback_required
+            || (plan.semantic_stage.enabled
+                && semantic_decision.run_semantic
+                && !matches!(mode, SearchExecutionMode::LexicalOnly));
+
+        if semantic_readiness_required && resources.vector_index.is_none() {
+            let error = Self::semantic_index_unavailable_error(resources);
+            if lexical_fallback_authorized {
+                Self::record_semantic_initialization_fallback(resources, &normalized_query, &error);
+            } else {
+                return Err(error);
+            }
+        }
+
+        if semantic_readiness_required
             && resources.vector_index.is_some()
             && resources.fast_embedder.is_none()
             && !resources.fast_embedder_attempted
         {
-            self.maybe_prepare_fast_embedder(resources, lexical_available)?;
+            self.maybe_prepare_fast_embedder(
+                resources,
+                lexical_fallback_authorized,
+                &normalized_query,
+            )?;
+        }
+        if semantic_readiness_required
+            && resources.vector_index.is_some()
+            && resources.fast_embedder.is_none()
+            && !lexical_fallback_authorized
+        {
+            return Err(SearchError::EmbedderUnavailable {
+                model: "semantic".to_owned(),
+                reason: "the semantic vector generation has no admitted matching embedder"
+                    .to_owned(),
+            });
         }
 
         let semantic_candidates = if plan.semantic_stage.enabled && semantic_decision.run_semantic {
@@ -7224,16 +7462,15 @@ impl FsfsRuntime {
                                     .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
                                     .collect::<Vec<_>>()
                             }
-                            Err(error) if lexical_available => {
-                                info!(
-                                    error = %error,
-                                    "fsfs search falling back to lexical-only mode after vector search failure"
-                                );
-                                resources.degradation_advice.push(advice_for_search_error(
+                            Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
+                                return Err(error);
+                            }
+                            Err(error) if lexical_fallback_authorized => {
+                                Self::record_semantic_lexical_fallback(
+                                    resources,
                                     &normalized_query,
-                                    Some(&resources.index_root),
                                     &error,
-                                ));
+                                );
                                 Vec::new()
                             }
                             Err(error) => return Err(error),
@@ -7244,16 +7481,12 @@ impl FsfsRuntime {
                         // the stream command can emit the Cancelled terminal.
                         return Err(error);
                     }
-                    Err(error) if lexical_available => {
-                        info!(
-                            error = %error,
-                            "fsfs search falling back to lexical-only mode after query embedding failure"
-                        );
-                        resources.degradation_advice.push(advice_for_search_error(
+                    Err(error) if lexical_fallback_authorized => {
+                        Self::record_semantic_lexical_fallback(
+                            resources,
                             &normalized_query,
-                            Some(&resources.index_root),
                             &error,
-                        ));
+                        );
                         Vec::new()
                     }
                     Err(error) => return Err(error),
@@ -7311,6 +7544,7 @@ impl FsfsRuntime {
             fused: fused_initial.clone(),
             payload: payload.clone(),
         };
+        Self::validate_bound_search_resources(resources, mode)?;
         if let Some(sink) = phase_sink.as_deref_mut() {
             sink(&initial_artifact.payload)?;
         }
@@ -7390,29 +7624,35 @@ impl FsfsRuntime {
                             fused: fused_refined,
                             payload: refined_payload,
                         };
+                        Self::validate_bound_search_resources(resources, mode)?;
                         if let Some(sink) = phase_sink.as_deref_mut() {
                             sink(&refined_artifact.payload)?;
                         }
                         artifacts.push(refined_artifact);
                     }
                     Err(error) => {
+                        let error_code = error_code_for(&error);
+                        let reason = Self::semantic_runtime_failure_summary(&error);
                         if let SearchError::DimensionMismatch { .. } = error {
                             resources.quality_embedder = None;
                             resources.quality_embedder_attempted = true;
                             info!(
-                                error = %error,
+                                error_code,
+                                reason,
                                 "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
                             );
                         } else {
                             info!(
-                                error = %error,
+                                error_code,
+                                reason,
                                 "fsfs quality refinement failed; falling back to initial phase payload"
                             );
                         }
                         let mut advice = resources.degradation_advice.clone();
-                        advice.push(advice_for_search_error(
+                        advice.push(Self::sanitized_semantic_degradation_advice(
+                            classify_search_error(&error),
                             &normalized_query,
-                            Some(&resources.index_root),
+                            &resources.index_root,
                             &error,
                         ));
                         let failed_payload = Self::attach_index_freshness(
@@ -7432,6 +7672,7 @@ impl FsfsRuntime {
                             fused: fused_initial.clone(),
                             payload: failed_payload,
                         };
+                        Self::validate_bound_search_resources(resources, mode)?;
                         if let Some(sink) = phase_sink.as_deref_mut() {
                             sink(&failed_artifact.payload)?;
                         }
@@ -7464,6 +7705,7 @@ impl FsfsRuntime {
                     fused: fused_initial.clone(),
                     payload: failed_payload,
                 };
+                Self::validate_bound_search_resources(resources, mode)?;
                 if let Some(sink) = phase_sink {
                     sink(&failed_artifact.payload)?;
                 }
@@ -7536,6 +7778,7 @@ impl FsfsRuntime {
             "fsfs search rerank phase status"
         );
 
+        Self::validate_bound_search_resources(resources, mode)?;
         Ok(artifacts)
     }
 
@@ -8301,21 +8544,12 @@ impl FsfsRuntime {
             ("quality", self.config.indexing.quality_model.as_str()),
         ] {
             let model_path = model_root.join(model_name);
-            if model_path.exists() {
-                checks.push(DoctorCheck {
-                    name: format!("model.{tier}"),
-                    verdict: DoctorVerdict::Pass,
-                    detail: format!("{model_name} cached at {}", model_path.display()),
-                    suggestion: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    name: format!("model.{tier}"),
-                    verdict: DoctorVerdict::Warn,
-                    detail: format!("{model_name} not found at {}", model_path.display()),
-                    suggestion: Some("run `fsfs download-models` to download".to_owned()),
-                });
-            }
+            checks.push(Self::model_doctor_check(
+                tier,
+                model_name,
+                &model_path,
+                model_path.exists(),
+            ));
         }
 
         // 3. Model directory writable
@@ -8345,9 +8579,7 @@ impl FsfsRuntime {
                 name: "model_dir.writable".to_owned(),
                 verdict: DoctorVerdict::Warn,
                 detail: format!("{} does not exist yet", model_root.display()),
-                suggestion: Some(
-                    "directory will be created on first `fsfs download-models`".to_owned(),
-                ),
+                suggestion: Some(semantic_model_directory_guidance().to_owned()),
             });
         }
 
@@ -8358,7 +8590,19 @@ impl FsfsRuntime {
             if let Some(sentinel) = &sentinel {
                 let stale = Self::count_stale_files(&index_root, Some(sentinel))?;
                 let stale_count = stale.unwrap_or(0);
-                if stale_count == 0 {
+                if !sentinel.generation_complete {
+                    checks.push(DoctorCheck {
+                        name: "index".to_owned(),
+                        verdict: DoctorVerdict::Warn,
+                        detail: format!(
+                            "{} files have a durable lexical generation, but semantic indexing is incomplete",
+                            sentinel.indexed_files,
+                        ),
+                        suggestion: Some(
+                            "resume `fsfs index` before using semantic search".to_owned(),
+                        ),
+                    });
+                } else if stale_count == 0 {
                     checks.push(DoctorCheck {
                         name: "index".to_owned(),
                         verdict: DoctorVerdict::Pass,
@@ -8504,6 +8748,43 @@ impl FsfsRuntime {
             fail_count,
             overall,
         })
+    }
+
+    fn model_doctor_check(
+        tier: &str,
+        model_name: &str,
+        model_path: &Path,
+        cached: bool,
+    ) -> DoctorCheck {
+        if cached {
+            #[cfg(feature = "embedded-models")]
+            {
+                return DoctorCheck {
+                    name: format!("model.{tier}"),
+                    verdict: DoctorVerdict::Pass,
+                    detail: format!("{model_name} cached at {}", model_path.display()),
+                    suggestion: None,
+                };
+            }
+            #[cfg(not(feature = "embedded-models"))]
+            {
+                return DoctorCheck {
+                    name: format!("model.{tier}"),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!(
+                        "{model_name} files are present at {}, but this binary has no Model2Vec/FastEmbed loader",
+                        model_path.display()
+                    ),
+                    suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
+                };
+            }
+        }
+        DoctorCheck {
+            name: format!("model.{tier}"),
+            verdict: DoctorVerdict::Warn,
+            detail: format!("{model_name} not found at {}", model_path.display()),
+            suggestion: Some(semantic_model_doctor_recovery_guidance().to_owned()),
+        }
     }
 
     fn collect_shadow_oracle_doctor_check(&self, index_root: &Path) -> SearchResult<DoctorCheck> {
@@ -9692,8 +9973,8 @@ impl FsfsRuntime {
         let mut embedding_retries = 0_usize;
         let mut embedding_failures = 0_usize;
         let mut semantic_deferred_files = 0_usize;
-        let mut embedder_degraded = false;
-        let mut degradation_reason: Option<String> = None;
+        let embedder_degraded = false;
+        let degradation_reason: Option<String> = None;
         let mut recent_warnings: Vec<IndexingWarning> = Vec::new();
 
         // Helper to push a warning, keeping at most 8 recent entries
@@ -9782,67 +10063,15 @@ impl FsfsRuntime {
 
         candidates.sort_by(|left, right| left.file_key.cmp(&right.file_key));
 
+        // 1. Resolve and prove the real semantic embedder before creating any
+        // vector/cache artifacts. Test builds may retain their explicit hash
+        // control fixture, but no production indexing path admits it.
+        let embedder = self.resolve_fast_embedder()?;
+        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
+        Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
-
-        // 1. Resolve and probe embedder with retry
-        let mut embedder = self.resolve_fast_embedder()?;
-        let mut embedder_is_hash_fallback = false;
-        {
-            let mut probe_ok = false;
-            for attempt in 0..=EMBEDDING_PROBE_MAX_RETRIES {
-                match embedder.embed(cx, "probe").await {
-                    Ok(_) => {
-                        probe_ok = true;
-                        break;
-                    }
-                    Err(error) => {
-                        if attempt < EMBEDDING_PROBE_MAX_RETRIES {
-                            let backoff_ms = if attempt == 0 { 500 } else { 1_000 };
-                            info!(
-                                embedder = embedder.id(),
-                                attempt = attempt + 1,
-                                backoff_ms,
-                                error = %error,
-                                "embedder probe failed; retrying"
-                            );
-                            asupersync::time::sleep(
-                                asupersync::time::wall_now(),
-                                Duration::from_millis(backoff_ms),
-                            )
-                            .await;
-                        } else {
-                            let reason = format!(
-                                "embedder '{}' probe failed after {} attempts: {}",
-                                embedder.id(),
-                                EMBEDDING_PROBE_MAX_RETRIES + 1,
-                                error
-                            );
-                            info!(
-                                embedder = embedder.id(),
-                                error = %error,
-                                "fsfs semantic embedder probe failed; falling back to hash embeddings"
-                            );
-                            embedder_is_hash_fallback = true;
-                            embedder_degraded = true;
-                            degradation_reason = Some(reason.clone());
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Warn,
-                                reason,
-                            );
-                            embedder = Arc::new(HashEmbedder::new(
-                                embedder.dimension().max(1),
-                                HashAlgorithm::FnvModular,
-                            ));
-                        }
-                    }
-                }
-            }
-            if probe_ok {
-                info!(embedder = embedder.id(), "embedder probe succeeded");
-            }
-        }
 
         // Emit progress with embedder status
         on_progress(&make_snapshot(
@@ -9929,7 +10158,7 @@ impl FsfsRuntime {
                 updated_at_ms: pressure_timestamp_ms(),
                 embedder_id: embedder.id().to_owned(),
                 embedder_dimension: embedder.dimension(),
-                embedder_is_hash_fallback,
+                embedder_is_hash_fallback: false,
                 artifacts_durable: false,
                 source_hash_hex: existing_checkpoint
                     .as_ref()
@@ -10052,7 +10281,7 @@ impl FsfsRuntime {
                     &content_hash_hex,
                     embedder.id(),
                     embedder.dimension(),
-                    embedder_is_hash_fallback,
+                    false,
                     &initial_live_vector_ids,
                 );
                 if reuse == CheckpointReuse::None {
@@ -10130,7 +10359,7 @@ impl FsfsRuntime {
             updated_at_ms: pressure_timestamp_ms(),
             embedder_id: embedder.id().to_string(),
             embedder_dimension: embedder.dimension(),
-            embedder_is_hash_fallback,
+            embedder_is_hash_fallback: false,
             artifacts_durable: false,
             source_hash_hex: String::new(),
             reason_codes: observed_reason_codes.iter().cloned().collect(),
@@ -10357,117 +10586,108 @@ impl FsfsRuntime {
                     .map(|pending| pending.document.content.as_str())
                     .collect::<Vec<_>>();
 
-                let mut batch_succeeded = false;
-                for attempt in 0..EMBEDDING_BATCH_MAX_RETRIES {
-                    let embed_start = Instant::now();
-                    let embeddings_result = embedder.embed_batch(cx, &semantic_texts).await;
-                    embedding_elapsed_ms =
-                        embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
+                const RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] = [200, 400];
+                let batch_outcome = Self::embed_indexing_batch_with_backoffs(
+                    cx,
+                    embedder.as_ref(),
+                    &semantic_texts,
+                    &RETRY_BACKOFFS_MS,
+                    |retry_number, retry_budget, backoff_ms, error, batch_embedding_elapsed_ms| {
+                        let error_code = error_code_for(error);
+                        let reason = Self::semantic_runtime_failure_summary(error);
+                        warn!(
+                            chunk_size = semantic_docs.len(),
+                            retry_number,
+                            retry_budget,
+                            backoff_ms,
+                            error_code,
+                            reason,
+                            "embedding batch failed; retrying"
+                        );
+                        push_warning(
+                            &mut recent_warnings,
+                            IndexingWarningSeverity::Warn,
+                            format!(
+                                "Embedding batch retry {retry_number}/{retry_budget} \
+                                 ({backoff_ms}ms backoff): {error_code}: {reason}",
+                            ),
+                        );
+                        on_progress(&make_snapshot(
+                            IndexingProgressStage::RetryingEmbedding,
+                            stats.discovered_files,
+                            candidates.len(),
+                            processed_files,
+                            stats.skipped_files.saturating_add(content_skipped_files),
+                            semantic_doc_count,
+                            canonical_bytes_total,
+                            canonical_line_count,
+                            Self::path_bytes(&index_root).unwrap_or_default(),
+                            discovery_elapsed_ms,
+                            lexical_elapsed_ms,
+                            embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms),
+                            vector_elapsed_ms,
+                            last_active_file.clone(),
+                            embedding_retries.saturating_add(retry_number),
+                            embedding_failures,
+                            semantic_deferred_files,
+                            embedder_degraded,
+                            &degradation_reason,
+                            &recent_warnings,
+                        ))
+                    },
+                )
+                .await?;
 
-                    match embeddings_result {
-                        Ok(embeddings) => {
-                            if embeddings.len() != semantic_docs.len() {
-                                return Err(frankensearch_core::SearchError::EmbeddingFailed {
-                                    model: embedder.id().to_string(),
-                                    source: format!(
-                                        "embed_batch returned {} vectors for {} documents",
-                                        embeddings.len(),
-                                        semantic_docs.len(),
-                                    )
-                                    .into(),
-                                });
-                            }
-                            let vector_start = Instant::now();
-                            let vector_batch = semantic_docs
-                                .iter()
-                                .zip(embeddings)
-                                .map(|(pending, embedding)| {
-                                    (pending.document.id.clone(), embedding)
-                                })
-                                .collect::<Vec<_>>();
-                            vector_index.append_batch(&vector_batch)?;
-                            semantic_succeeded_this_chunk.extend(
-                                semantic_docs.iter().map(|pending| pending.file_key.clone()),
-                            );
-                            vector_elapsed_ms = vector_elapsed_ms
-                                .saturating_add(vector_start.elapsed().as_millis());
-                            batch_succeeded = true;
-                            break;
-                        }
-                        Err(error) => {
-                            embedding_retries = embedding_retries.saturating_add(1);
-                            if attempt + 1 < EMBEDDING_BATCH_MAX_RETRIES {
-                                let backoff_ms = 200_u64 << attempt;
-                                warn!(
-                                    chunk_size = semantic_docs.len(),
-                                    attempt = attempt + 1,
-                                    backoff_ms,
-                                    error = %error,
-                                    "embedding batch failed; retrying"
-                                );
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Warn,
-                                    format!(
-                                        "Embedding batch retry {}/{} ({}ms backoff): {}",
-                                        attempt + 1,
-                                        EMBEDDING_BATCH_MAX_RETRIES,
-                                        backoff_ms,
-                                        error
-                                    ),
-                                );
-                                on_progress(&make_snapshot(
-                                    IndexingProgressStage::RetryingEmbedding,
-                                    stats.discovered_files,
-                                    candidates.len(),
-                                    processed_files,
-                                    stats.skipped_files.saturating_add(content_skipped_files),
-                                    semantic_doc_count,
-                                    canonical_bytes_total,
-                                    canonical_line_count,
-                                    Self::path_bytes(&index_root).unwrap_or_default(),
-                                    discovery_elapsed_ms,
-                                    lexical_elapsed_ms,
-                                    embedding_elapsed_ms,
-                                    vector_elapsed_ms,
-                                    last_active_file.clone(),
-                                    embedding_retries,
-                                    embedding_failures,
-                                    semantic_deferred_files,
-                                    embedder_degraded,
-                                    &degradation_reason,
-                                    &recent_warnings,
-                                ))?;
-                                asupersync::time::sleep(
-                                    asupersync::time::wall_now(),
-                                    Duration::from_millis(backoff_ms),
-                                )
-                                .await;
-                            } else {
-                                embedding_failures = embedding_failures.saturating_add(1);
-                                let msg = format!(
-                                    "Embedding batch permanently failed after {} attempts for {} files: {}",
-                                    EMBEDDING_BATCH_MAX_RETRIES,
-                                    semantic_docs.len(),
-                                    error
-                                );
-                                warn!(
-                                    chunk_size = semantic_docs.len(),
-                                    error = %error,
-                                    "embedding batch permanently failed; deferring semantic indexing for these files"
-                                );
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    msg,
-                                );
-                                semantic_deferred_files =
-                                    semantic_deferred_files.saturating_add(semantic_docs.len());
-                            }
-                        }
+                match batch_outcome {
+                    IndexingBatchEmbeddingOutcome::Ready {
+                        embeddings,
+                        embedding_elapsed_ms: batch_embedding_elapsed_ms,
+                        retries_executed,
+                    } => {
+                        embedding_elapsed_ms =
+                            embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms);
+                        embedding_retries = embedding_retries.saturating_add(retries_executed);
+                        let vector_start = Instant::now();
+                        let vector_batch = semantic_docs
+                            .iter()
+                            .zip(embeddings)
+                            .map(|(pending, embedding)| (pending.document.id.clone(), embedding))
+                            .collect::<Vec<_>>();
+                        vector_index.append_batch(&vector_batch)?;
+                        semantic_succeeded_this_chunk
+                            .extend(semantic_docs.iter().map(|pending| pending.file_key.clone()));
+                        vector_elapsed_ms =
+                            vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
+                    }
+                    IndexingBatchEmbeddingOutcome::Exhausted {
+                        error,
+                        embedding_elapsed_ms: batch_embedding_elapsed_ms,
+                        retries_executed,
+                    } => {
+                        embedding_elapsed_ms =
+                            embedding_elapsed_ms.saturating_add(batch_embedding_elapsed_ms);
+                        embedding_retries = embedding_retries.saturating_add(retries_executed);
+                        embedding_failures = embedding_failures.saturating_add(1);
+                        let error_code = error_code_for(&error);
+                        let reason = Self::semantic_runtime_failure_summary(&error);
+                        let attempts = retries_executed.saturating_add(1);
+                        let msg = format!(
+                            "Embedding batch transient retry budget exhausted after {attempts} \
+                             attempts for {} files: {error_code}: {reason}",
+                            semantic_docs.len(),
+                        );
+                        warn!(
+                            chunk_size = semantic_docs.len(),
+                            attempts,
+                            error_code,
+                            reason,
+                            "embedding batch transient retry budget exhausted; deferring semantic indexing for these files"
+                        );
+                        push_warning(&mut recent_warnings, IndexingWarningSeverity::Error, msg);
+                        semantic_deferred_files =
+                            semantic_deferred_files.saturating_add(semantic_docs.len());
                     }
                 }
-                let _ = batch_succeeded;
             }
 
             // Update checkpoint entries for this batch
@@ -10625,363 +10845,6 @@ impl FsfsRuntime {
             &recent_warnings,
         ))?;
 
-        // Semantic upgrade pass: if running with hash fallback, try real embedder
-        if embedder_is_hash_fallback {
-            if let Ok(real_embedder) = self.resolve_fast_embedder() {
-                if real_embedder.embed(cx, "probe").await.is_ok() {
-                    info!(
-                        embedder = real_embedder.id(),
-                        "semantic upgrade: real embedder now available, rebuilding semantic index"
-                    );
-                    on_progress(&make_snapshot(
-                        IndexingProgressStage::SemanticUpgrade,
-                        stats.discovered_files,
-                        candidates.len(),
-                        processed_files,
-                        stats.skipped_files.saturating_add(content_skipped_files),
-                        semantic_doc_count,
-                        canonical_bytes_total,
-                        canonical_line_count,
-                        Self::path_bytes(&index_root).unwrap_or_default(),
-                        discovery_elapsed_ms,
-                        lexical_elapsed_ms,
-                        embedding_elapsed_ms,
-                        vector_elapsed_ms,
-                        None,
-                        embedding_retries,
-                        embedding_failures,
-                        semantic_deferred_files,
-                        true,
-                        &degradation_reason,
-                        &recent_warnings,
-                    ))?;
-
-                    // Retire the last advertised generation before the upgrade
-                    // mutates or replaces its vector artifact. A crash during
-                    // the rebuild must never make the prior checkpoint admit a
-                    // partially upgraded FSVI file on the next run.
-                    checkpoint.artifacts_durable = false;
-                    checkpoint.updated_at_ms = pressure_timestamp_ms();
-                    write_indexing_checkpoint(&index_root, &checkpoint)?;
-
-                    vector_index.compact()?;
-
-                    let upgrade_suffix = pressure_timestamp_ms();
-                    let upgrade_path =
-                        vector_path.with_extension(format!("fsvi.upgrade.{upgrade_suffix}"));
-                    let mut upgrade_writer = VectorIndex::create(
-                        &upgrade_path,
-                        real_embedder.id(),
-                        real_embedder.dimension(),
-                    )?;
-
-                    let mut upgrade_failed = false;
-                    let mut upgrade_batch: Vec<(String, IndexableDocument)> =
-                        Vec::with_capacity(BATCH_SIZE);
-
-                    for entry in manifests
-                        .values()
-                        .filter(|entry| entry.ingestion_class == "full_semantic_lexical")
-                    {
-                        if upgrade_failed {
-                            break;
-                        }
-
-                        let source_path = target_root.join(&entry.file_key);
-                        let metadata = match fs::metadata(&source_path) {
-                            Ok(metadata) => metadata,
-                            Err(error) if is_ignorable_index_walk_error(&error) => {
-                                warn!(
-                                    path = %source_path.display(),
-                                    error = %error,
-                                    "semantic upgrade skipped file with unreadable metadata"
-                                );
-                                upgrade_failed = true;
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    format!(
-                                        "Semantic upgrade aborted: unreadable metadata for {}",
-                                        source_path.display()
-                                    ),
-                                );
-                                break;
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
-
-                        let modified_ms = metadata
-                            .modified()
-                            .ok()
-                            .map(system_time_to_ms)
-                            .unwrap_or_default();
-                        let indexed_revision_ms = u64::try_from(entry.revision).unwrap_or_default();
-                        if modified_ms != indexed_revision_ms {
-                            upgrade_failed = true;
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Error,
-                                format!(
-                                    "Semantic upgrade aborted: {} changed during indexing",
-                                    source_path.display()
-                                ),
-                            );
-                            warn!(
-                                path = %source_path.display(),
-                                modified_ms,
-                                indexed_revision_ms,
-                                "semantic upgrade aborted due to file change"
-                            );
-                            break;
-                        }
-
-                        let bytes = match async_file_read(&source_path).await {
-                            Ok(bytes) => bytes,
-                            Err(error) if is_ignorable_index_walk_error(&error) => {
-                                warn!(
-                                    path = %source_path.display(),
-                                    error = %error,
-                                    "semantic upgrade skipped file with read error"
-                                );
-                                upgrade_failed = true;
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    format!(
-                                        "Semantic upgrade aborted: read error for {}",
-                                        source_path.display()
-                                    ),
-                                );
-                                break;
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
-                        let content_hash_hex = content_sha256_hex(&bytes);
-                        if checkpoint.files.get(&entry.file_key).is_none_or(|indexed| {
-                            indexed.revision != entry.revision
-                                || indexed.content_hash_hex != content_hash_hex
-                        }) {
-                            upgrade_failed = true;
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Error,
-                                format!(
-                                    "Semantic upgrade aborted: content changed for {}",
-                                    source_path.display()
-                                ),
-                            );
-                            warn!(
-                                path = %source_path.display(),
-                                "semantic upgrade aborted due to content hash mismatch"
-                            );
-                            break;
-                        }
-
-                        let canonical = if is_pdf_file(&source_path) {
-                            match try_extract_pdf_text(&bytes, &source_path) {
-                                Some(pdf_text) => canonicalizer.canonicalize(&pdf_text),
-                                None => {
-                                    upgrade_failed = true;
-                                    push_warning(
-                                        &mut recent_warnings,
-                                        IndexingWarningSeverity::Error,
-                                        format!(
-                                            "Semantic upgrade aborted: unable to extract PDF {}",
-                                            source_path.display()
-                                        ),
-                                    );
-                                    break;
-                                }
-                            }
-                        } else {
-                            let classification = classify_file_for_ingest(&source_path, &bytes);
-                            if !file_classification_allows_index(&classification) {
-                                upgrade_failed = true;
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    format!(
-                                        "Semantic upgrade aborted: {} classified as {:?} ({})",
-                                        source_path.display(),
-                                        classification.detected_type,
-                                        classification.reason_code
-                                    ),
-                                );
-                                break;
-                            }
-
-                            let raw_text = String::from_utf8_lossy(&bytes);
-                            canonicalizer.canonicalize(&raw_text)
-                        };
-
-                        if canonical.trim().is_empty() {
-                            upgrade_failed = true;
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Error,
-                                format!(
-                                    "Semantic upgrade aborted: empty canonical text for {}",
-                                    source_path.display()
-                                ),
-                            );
-                            break;
-                        }
-
-                        let file_name = source_path
-                            .file_name()
-                            .and_then(std::ffi::OsStr::to_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        let doc = IndexableDocument::new(entry.file_key.clone(), canonical)
-                            .with_title(file_name)
-                            .with_metadata("source_path", source_path.display().to_string())
-                            .with_metadata("ingestion_class", entry.ingestion_class.clone())
-                            .with_metadata("source_modified_ms", indexed_revision_ms.to_string());
-                        upgrade_batch.push((entry.file_key.clone(), doc));
-
-                        if upgrade_batch.len() >= BATCH_SIZE {
-                            let texts: Vec<&str> = upgrade_batch
-                                .iter()
-                                .map(|(_, doc)| doc.content.as_str())
-                                .collect();
-                            let embed_start = Instant::now();
-                            let embeddings_result = real_embedder.embed_batch(cx, &texts).await;
-                            embedding_elapsed_ms = embedding_elapsed_ms
-                                .saturating_add(embed_start.elapsed().as_millis());
-
-                            match embeddings_result {
-                                Ok(embeddings) => {
-                                    if embeddings.len() != upgrade_batch.len() {
-                                        upgrade_failed = true;
-                                        push_warning(
-                                            &mut recent_warnings,
-                                            IndexingWarningSeverity::Error,
-                                            format!(
-                                                "Semantic upgrade aborted: embed_batch returned {} vectors for {} documents",
-                                                embeddings.len(),
-                                                upgrade_batch.len(),
-                                            ),
-                                        );
-                                        break;
-                                    }
-                                    let vector_start = Instant::now();
-                                    for ((_, doc), embedding) in
-                                        upgrade_batch.iter().zip(embeddings)
-                                    {
-                                        upgrade_writer.write_record(&doc.id, &embedding)?;
-                                    }
-                                    vector_elapsed_ms = vector_elapsed_ms
-                                        .saturating_add(vector_start.elapsed().as_millis());
-                                }
-                                Err(error) => {
-                                    upgrade_failed = true;
-                                    warn!(
-                                        error = %error,
-                                        "semantic upgrade embedding batch failed"
-                                    );
-                                    push_warning(
-                                        &mut recent_warnings,
-                                        IndexingWarningSeverity::Error,
-                                        format!(
-                                            "Semantic upgrade aborted: embedding batch failed: {error}"
-                                        ),
-                                    );
-                                    break;
-                                }
-                            }
-                            upgrade_batch.clear();
-                        }
-                    }
-
-                    if !upgrade_failed && !upgrade_batch.is_empty() {
-                        let texts: Vec<&str> = upgrade_batch
-                            .iter()
-                            .map(|(_, doc)| doc.content.as_str())
-                            .collect();
-                        let embed_start = Instant::now();
-                        let embeddings_result = real_embedder.embed_batch(cx, &texts).await;
-                        embedding_elapsed_ms =
-                            embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
-
-                        match embeddings_result {
-                            Ok(embeddings) => {
-                                if embeddings.len() != upgrade_batch.len() {
-                                    upgrade_failed = true;
-                                    push_warning(
-                                        &mut recent_warnings,
-                                        IndexingWarningSeverity::Error,
-                                        format!(
-                                            "Semantic upgrade aborted: embed_batch returned {} vectors for {} documents",
-                                            embeddings.len(),
-                                            upgrade_batch.len(),
-                                        ),
-                                    );
-                                } else {
-                                    let vector_start = Instant::now();
-                                    for ((_, doc), embedding) in
-                                        upgrade_batch.iter().zip(embeddings)
-                                    {
-                                        upgrade_writer.write_record(&doc.id, &embedding)?;
-                                    }
-                                    vector_elapsed_ms = vector_elapsed_ms
-                                        .saturating_add(vector_start.elapsed().as_millis());
-                                }
-                            }
-                            Err(error) => {
-                                upgrade_failed = true;
-                                warn!(
-                                    error = %error,
-                                    "semantic upgrade embedding batch failed"
-                                );
-                                push_warning(
-                                    &mut recent_warnings,
-                                    IndexingWarningSeverity::Error,
-                                    format!(
-                                        "Semantic upgrade aborted: embedding batch failed: {error}"
-                                    ),
-                                );
-                            }
-                        }
-                    }
-
-                    if upgrade_failed {
-                        push_warning(
-                            &mut recent_warnings,
-                            IndexingWarningSeverity::Warn,
-                            format!(
-                                "Semantic upgrade aborted; keeping hash index (upgrade file at {})",
-                                upgrade_path.display()
-                            ),
-                        );
-                    } else {
-                        upgrade_writer.finish()?;
-                        drop(vector_index);
-                        vector_index =
-                            VectorIndex::install_replacement(&vector_path, &upgrade_path)?;
-
-                        semantic_deferred_files = 0;
-                        embedder_is_hash_fallback = false;
-                        embedder_degraded = false;
-                        checkpoint.embedder_id = real_embedder.id().to_string();
-                        checkpoint.embedder_dimension = real_embedder.dimension();
-                        checkpoint.embedder_is_hash_fallback = false;
-                        for (file_key, entry) in &mut checkpoint.files {
-                            if manifests.get(file_key).is_some_and(|manifest| {
-                                manifest.ingestion_class == "full_semantic_lexical"
-                            }) {
-                                entry.semantic_indexed = true;
-                            }
-                        }
-                        push_warning(
-                            &mut recent_warnings,
-                            IndexingWarningSeverity::Info,
-                            "Semantic embedder recovered; upgrade complete".to_owned(),
-                        );
-                    }
-                }
-            }
-        }
-
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
         checkpoint.artifacts_durable = false;
@@ -11007,9 +10870,10 @@ impl FsfsRuntime {
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
         self.write_index_artifacts(&index_root, &lexical_manifest_path, &manifests)?;
+        let generation_complete = semantic_generation_complete(semantic_deferred_files);
         let sentinel = IndexSentinel {
             schema_version: 1,
-            generation_complete: true,
+            generation_complete,
             generated_at_ms: pressure_timestamp_ms(),
             command: format!("{command:?}").to_ascii_lowercase(),
             target_root: target_root.display().to_string(),
@@ -11021,21 +10885,6 @@ impl FsfsRuntime {
             total_canonical_bytes,
             source_hash_hex: source_hash_hex.clone(),
         };
-        self.write_index_sentinel(&index_root, &sentinel)?;
-
-        // Remove checkpoint on successful completion (unless degraded or deferred).
-        let should_persist_checkpoint = embedder_is_hash_fallback || semantic_deferred_files > 0;
-        if should_persist_checkpoint {
-            checkpoint.updated_at_ms = pressure_timestamp_ms();
-            checkpoint.artifacts_durable = true;
-            checkpoint.source_hash_hex = source_hash_hex;
-            checkpoint.reason_codes = reason_codes;
-            checkpoint.discovered_files = stats.discovered_files;
-            checkpoint.skipped_files = skipped_files;
-            write_indexing_checkpoint(&index_root, &checkpoint)?;
-        } else {
-            remove_indexing_checkpoint(&index_root)?;
-        }
 
         let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
@@ -11046,11 +10895,42 @@ impl FsfsRuntime {
         storage_usage.lexical_index_bytes = lexical_index.segment_stats().managed_disk_bytes;
         let elapsed_ms = total_start.elapsed().as_millis();
 
-        let final_stage = if embedder_degraded {
-            IndexingProgressStage::CompletedDegraded
+        let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
+
+        if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.lexical.current",
+                    source: Box::new(source),
+                }
+            })?;
+            info!(
+                event = "fsfs.lexical_current_published",
+                engine = pointer.engine().label(),
+                engine_dir = pointer.dir_name(),
+                index_format_version = pointer.index_format_version(),
+                old_dir_retained = lexical_plan.previous_engine.is_some(),
+                "fsfs published the rebuilt lexical engine"
+            );
+        }
+
+        // CURRENT and every durable artifact must become visible before the
+        // completeness sentinel unlocks this generation. The undurable
+        // checkpoint remains an admission lock across the entire publication
+        // window, so a concurrent search cannot combine the successor vector
+        // generation with the predecessor lexical CURRENT.
+        self.write_index_sentinel(&index_root, &sentinel)?;
+        if generation_complete {
+            remove_indexing_checkpoint(&index_root)?;
         } else {
-            IndexingProgressStage::Completed
-        };
+            checkpoint.updated_at_ms = pressure_timestamp_ms();
+            checkpoint.artifacts_durable = true;
+            checkpoint.source_hash_hex = source_hash_hex;
+            checkpoint.reason_codes = reason_codes;
+            checkpoint.discovered_files = stats.discovered_files;
+            checkpoint.skipped_files = skipped_files;
+            write_indexing_checkpoint(&index_root, &checkpoint)?;
+        }
 
         on_progress(&make_snapshot(
             final_stage,
@@ -11075,23 +10955,6 @@ impl FsfsRuntime {
             &recent_warnings,
         ))?;
 
-        if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
-            publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
-                SearchError::SubsystemError {
-                    subsystem: "fsfs.lexical.current",
-                    source: Box::new(source),
-                }
-            })?;
-            info!(
-                event = "fsfs.lexical_current_published",
-                engine = pointer.engine().label(),
-                engine_dir = pointer.dir_name(),
-                index_format_version = pointer.index_format_version(),
-                old_dir_retained = lexical_plan.previous_engine.is_some(),
-                "fsfs published the rebuilt lexical engine"
-            );
-        }
-
         info!(
             command = ?command,
             target_root = %target_root.display(),
@@ -11106,6 +10969,7 @@ impl FsfsRuntime {
             embedding_retries,
             embedding_failures,
             semantic_deferred_files,
+            generation_complete,
             discovery_elapsed_ms,
             canonicalize_elapsed_ms,
             lexical_elapsed_ms,
@@ -11128,7 +10992,12 @@ impl FsfsRuntime {
             );
             if embedder_degraded {
                 println!(
-                    "WARNING: Completed with hash embeddings (degraded). Semantic embeddings will be upgraded on next run."
+                    "WARNING: A legacy hash control generation was detected; semantic results were not admitted. Rebuild with a verified semantic embedder."
+                );
+            } else if semantic_deferred_files > 0 {
+                println!(
+                    "WARNING: {semantic_deferred_files} file(s) have deferred semantic embeddings. Durable lexical artifacts were preserved, but this generation is not admitted for semantic search; rerun `fsfs index {}`.",
+                    target_root.display(),
                 );
             }
         }
@@ -11289,22 +11158,483 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    fn ensure_semantic_embedder_admissible(
+        embedder: &dyn Embedder,
+        allow_hash_control: bool,
+    ) -> SearchResult<()> {
+        if allow_hash_control {
+            return Ok(());
+        }
+        if embedder.category() == ModelCategory::HashEmbedder || !embedder.is_semantic() {
+            return Err(SearchError::EmbedderUnavailable {
+                model: "semantic".to_owned(),
+                reason: "production semantic retrieval requires a verified non-hash embedder"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    fn is_legacy_hash_vector_generation(embedder_id: &str) -> bool {
+        embedder_id.eq_ignore_ascii_case("hash")
+            || embedder_id.eq_ignore_ascii_case("hash-fnv1a")
+            || embedder_id.eq_ignore_ascii_case("fnv1a-custom")
+            || embedder_id
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("fnv1a-"))
+    }
+
+    fn validate_fast_embedder_for_vector_index(
+        index: &VectorIndex,
+        embedder: &dyn Embedder,
+        allow_hash_control: bool,
+    ) -> SearchResult<()> {
+        if !allow_hash_control && Self::is_legacy_hash_vector_generation(index.embedder_id()) {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.vector_generation".to_owned(),
+                value: "legacy_hash".to_owned(),
+                reason: "legacy FNV/hash vector generations are control artifacts, not admissible semantic search generations; rebuild with a verified semantic embedder"
+                    .to_owned(),
+            });
+        }
+        Self::ensure_semantic_embedder_admissible(embedder, allow_hash_control)?;
+        if !index.embedder_id().eq_ignore_ascii_case(embedder.id()) {
+            return Err(SearchError::UnverifiableRemoteSpace {
+                producer: "fsfs.vector_generation".to_owned(),
+                reason: "the active embedder identity does not match the stored vector generation"
+                    .to_owned(),
+            });
+        }
+        if embedder.dimension() != index.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: index.dimension(),
+                found: embedder.dimension(),
+            });
+        }
+        Ok(())
+    }
+
+    fn semantic_retry_disposition(error: &SearchError) -> SemanticRetryDisposition {
+        if matches!(error, SearchError::Cancelled { .. }) {
+            SemanticRetryDisposition::Cancelled
+        } else if is_retryable_error(error) {
+            SemanticRetryDisposition::Transient
+        } else {
+            SemanticRetryDisposition::Permanent
+        }
+    }
+
+    fn semantic_retry_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+        cx.checkpoint().map_err(|_| SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: "runtime cancellation requested".to_owned(),
+        })
+    }
+
+    async fn semantic_retry_backoff(
+        cx: &Cx,
+        phase: &'static str,
+        mut duration: Duration,
+    ) -> SearchResult<()> {
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        while !duration.is_zero() {
+            Self::semantic_retry_checkpoint(cx, phase)?;
+            let chunk = duration.min(CANCEL_POLL_INTERVAL);
+            asupersync::time::sleep(cx.now(), chunk).await;
+            duration = duration.saturating_sub(chunk);
+        }
+        Self::semantic_retry_checkpoint(cx, phase)
+    }
+
+    async fn embed_indexing_batch_with_backoffs<'a, F>(
+        cx: &'a Cx,
+        embedder: &'a dyn Embedder,
+        texts: &'a [&'a str],
+        retry_backoffs_ms: &[u64],
+        mut on_retry_started: F,
+    ) -> SearchResult<IndexingBatchEmbeddingOutcome>
+    where
+        F: FnMut(usize, usize, u64, &SearchError, u128) -> SearchResult<()>,
+    {
+        let mut embedding_elapsed_ms = 0_u128;
+        let mut retries_executed = 0_usize;
+        let mut pending_retry: Option<(u64, SearchError)> = None;
+
+        for _attempt in 0..=retry_backoffs_ms.len() {
+            if let Some((backoff_ms, previous_error)) = pending_retry.take() {
+                Self::semantic_retry_backoff(
+                    cx,
+                    "fsfs.semantic_batch_backoff",
+                    Duration::from_millis(backoff_ms),
+                )
+                .await?;
+                let retry_number = retries_executed.saturating_add(1);
+                on_retry_started(
+                    retry_number,
+                    retry_backoffs_ms.len(),
+                    backoff_ms,
+                    &previous_error,
+                    embedding_elapsed_ms,
+                )?;
+                retries_executed = retry_number;
+            } else {
+                Self::semantic_retry_checkpoint(cx, "fsfs.semantic_batch")?;
+            }
+
+            let embed_start = Instant::now();
+            let embeddings_result = embedder.embed_batch(cx, texts).await;
+            embedding_elapsed_ms =
+                embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
+            let embeddings_result = match embeddings_result {
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                other => other,
+            };
+            Self::semantic_retry_checkpoint(cx, "fsfs.semantic_batch_after_inference")?;
+
+            match embeddings_result {
+                Ok(embeddings) => {
+                    if embeddings.len() != texts.len() {
+                        return Err(SearchError::InvalidConfig {
+                            field: "semantic.embedding_batch".to_owned(),
+                            value: "count_mismatch".to_owned(),
+                            reason: format!(
+                                "embed_batch returned {} vectors for {} documents",
+                                embeddings.len(),
+                                texts.len(),
+                            ),
+                        });
+                    }
+                    for embedding in &embeddings {
+                        Self::validate_semantic_embedding_vector(embedder, embedding)?;
+                    }
+                    return Ok(IndexingBatchEmbeddingOutcome::Ready {
+                        embeddings,
+                        embedding_elapsed_ms,
+                        retries_executed,
+                    });
+                }
+                Err(error) => match Self::semantic_retry_disposition(&error) {
+                    SemanticRetryDisposition::Cancelled | SemanticRetryDisposition::Permanent => {
+                        return Err(error);
+                    }
+                    SemanticRetryDisposition::Transient => {
+                        let Some(backoff_ms) = retry_backoffs_ms.get(retries_executed).copied()
+                        else {
+                            return Ok(IndexingBatchEmbeddingOutcome::Exhausted {
+                                error,
+                                embedding_elapsed_ms,
+                                retries_executed,
+                            });
+                        };
+                        pending_retry = Some((backoff_ms, error));
+                    }
+                },
+            }
+        }
+        unreachable!("the bounded semantic batch retry loop always returns")
+    }
+
+    fn validate_semantic_embedding_vector(
+        embedder: &dyn Embedder,
+        embedding: &[f32],
+    ) -> SearchResult<()> {
+        if embedding.is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.embedding_output".to_owned(),
+                value: "empty".to_owned(),
+                reason: "semantic embedder returned no vector components".to_owned(),
+            });
+        }
+        let expected = embedder.dimension();
+        if embedding.len() != expected {
+            return Err(SearchError::DimensionMismatch {
+                expected,
+                found: embedding.len(),
+            });
+        }
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.embedding_output".to_owned(),
+                value: "non_finite".to_owned(),
+                reason: "semantic embedder returned a non-finite component".to_owned(),
+            });
+        }
+        let norm_squared = embedding
+            .iter()
+            .fold(0.0_f32, |sum, value| value.mul_add(*value, sum));
+        if !norm_squared.is_finite() {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.embedding_output".to_owned(),
+                value: "non_finite_norm".to_owned(),
+                reason: "semantic embedding norm overflowed to a non-finite value".to_owned(),
+            });
+        }
+        if norm_squared <= f32::EPSILON {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.embedding_output".to_owned(),
+                value: "zero_signal".to_owned(),
+                reason: "semantic embedder returned no usable signal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn probe_indexing_embedder_with_backoffs(
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        retry_backoffs_ms: &[u64],
+    ) -> SearchResult<()> {
+        for attempt in 0..=retry_backoffs_ms.len() {
+            Self::semantic_retry_checkpoint(cx, "fsfs.semantic_probe")?;
+            let embedding_result = embedder.embed(cx, "probe").await;
+            let embedding_result = match embedding_result {
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                other => other,
+            };
+            Self::semantic_retry_checkpoint(cx, "fsfs.semantic_probe_after_inference")?;
+            let probe_result = embedding_result.and_then(|embedding| {
+                Self::validate_semantic_embedding_vector(embedder, &embedding)
+            });
+            match probe_result {
+                Ok(()) => {
+                    info!(
+                        event = "fsfs.semantic_probe_succeeded",
+                        attempt = attempt + 1,
+                        attempts_allowed = retry_backoffs_ms.len() + 1,
+                        category = ?embedder.category(),
+                        dimension = embedder.dimension(),
+                        "fsfs semantic embedder probe succeeded"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    match Self::semantic_retry_disposition(&error) {
+                        SemanticRetryDisposition::Cancelled
+                        | SemanticRetryDisposition::Permanent => return Err(error),
+                        SemanticRetryDisposition::Transient => {}
+                    }
+                    let error_code = error_code_for(&error);
+                    let Some(backoff_ms) = retry_backoffs_ms.get(attempt).copied() else {
+                        warn!(
+                            event = "fsfs.semantic_probe_failed",
+                            error_code,
+                            attempts = attempt + 1,
+                            "fsfs semantic embedder probe exhausted its retry budget"
+                        );
+                        return Err(error);
+                    };
+                    info!(
+                        event = "fsfs.semantic_probe_retry",
+                        error_code,
+                        attempt = attempt + 1,
+                        attempts_allowed = retry_backoffs_ms.len() + 1,
+                        backoff_ms,
+                        "fsfs semantic embedder probe failed; retrying"
+                    );
+                    if backoff_ms > 0 {
+                        Self::semantic_retry_backoff(
+                            cx,
+                            "fsfs.semantic_probe_backoff",
+                            Duration::from_millis(backoff_ms),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        unreachable!("the bounded semantic probe loop always returns")
+    }
+
+    async fn probe_indexing_embedder(cx: &Cx, embedder: &dyn Embedder) -> SearchResult<()> {
+        const RETRY_BACKOFFS_MS: [u64; EMBEDDING_PROBE_MAX_RETRIES] = [500, 1_000];
+        Self::probe_indexing_embedder_with_backoffs(cx, embedder, &RETRY_BACKOFFS_MS).await
+    }
+
+    fn record_semantic_lexical_fallback(
+        resources: &mut SearchExecutionResources,
+        query: &str,
+        error: &SearchError,
+    ) {
+        let error_code = error_code_for(error);
+        let advice = Self::sanitized_semantic_degradation_advice(
+            DegradationFailureKind::LexicalFallback,
+            query,
+            &resources.index_root,
+            error,
+        );
+        info!(
+            event = "fsfs.semantic_lexical_fallback",
+            error_code,
+            reason_code = advice.reason_code,
+            "fsfs semantic retrieval unavailable; using the authorized lexical stage"
+        );
+        resources
+            .degradation_advice
+            .retain(|existing| existing.reason_code != advice.reason_code);
+        resources.degradation_advice.push(advice);
+    }
+
+    fn record_semantic_initialization_fallback(
+        resources: &mut SearchExecutionResources,
+        query: &str,
+        fallback_error: &SearchError,
+    ) {
+        let (error_code, sanitized_summary) = resources
+            .pending_semantic_initialization_failure
+            .as_ref()
+            .map_or_else(
+                || {
+                    (
+                        error_code_for(fallback_error),
+                        Self::semantic_initialization_failure_summary(fallback_error),
+                    )
+                },
+                |pending| (pending.error_code, pending.sanitized_summary),
+            );
+        let mut advice = DegradationAdvice::from_input(DegradationAdviceInput {
+            failure: DegradationFailureKind::LexicalFallback,
+            query,
+            index_dir: Some(&resources.index_root),
+            original_error: None,
+            replay_command: None,
+        });
+        advice.original_error = Some(format!("{error_code}: {sanitized_summary}"));
+        info!(
+            event = "fsfs.semantic_lexical_fallback",
+            error_code,
+            reason_code = advice.reason_code,
+            "fsfs semantic retrieval unavailable; using the authorized lexical stage"
+        );
+        resources
+            .degradation_advice
+            .retain(|existing| existing.reason_code != advice.reason_code);
+        resources.degradation_advice.push(advice);
+    }
+
+    #[must_use]
+    const fn semantic_initialization_failure_summary(error: &SearchError) -> &'static str {
+        match error {
+            SearchError::IndexCorrupted { .. } => {
+                "semantic vector generation failed integrity validation"
+            }
+            SearchError::IndexVersionMismatch { .. } => {
+                "semantic vector generation uses an incompatible format version"
+            }
+            SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
+                "semantic vector generation is missing"
+            }
+            SearchError::Io(_) => "semantic vector generation could not be read",
+            _ => "semantic vector generation could not be opened safely",
+        }
+    }
+
+    fn sanitized_semantic_degradation_advice(
+        failure: DegradationFailureKind,
+        query: &str,
+        index_root: &Path,
+        error: &SearchError,
+    ) -> DegradationAdvice {
+        let mut advice = DegradationAdvice::from_input(DegradationAdviceInput {
+            failure,
+            query,
+            index_dir: Some(index_root),
+            original_error: None,
+            replay_command: None,
+        });
+        advice.original_error = Some(format!(
+            "{}: {}",
+            error_code_for(error),
+            Self::semantic_runtime_failure_summary(error)
+        ));
+        advice
+    }
+
+    #[must_use]
+    const fn semantic_runtime_failure_summary(error: &SearchError) -> &'static str {
+        match error {
+            SearchError::EmbedderUnavailable { .. } => "semantic embedder is unavailable",
+            SearchError::EmbeddingFailed { .. } => "semantic query embedding failed",
+            SearchError::ModelNotFound { .. } => "semantic model files are unavailable",
+            SearchError::ModelLoadFailed { .. } => "semantic model could not be loaded safely",
+            SearchError::IndexCorrupted { .. } => {
+                "semantic vector generation failed integrity validation"
+            }
+            SearchError::IndexVersionMismatch { .. } => {
+                "semantic vector generation uses an incompatible format version"
+            }
+            SearchError::DimensionMismatch { .. } => {
+                "semantic query and vector generation dimensions are incompatible"
+            }
+            SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
+                "semantic vector generation is missing"
+            }
+            SearchError::SearchTimeout { .. } => {
+                "semantic retrieval exceeded its bounded time budget"
+            }
+            SearchError::FederatedInsufficientResponses { .. } => {
+                "semantic retrieval received too few verified responses"
+            }
+            SearchError::RerankerUnavailable { .. } => "semantic reranking is unavailable",
+            SearchError::RerankFailed { .. } => "semantic reranking failed safely",
+            SearchError::UnverifiableRemoteSpace { .. } => {
+                "semantic embedder identity could not be verified"
+            }
+            SearchError::HashMismatch { .. } => "semantic model verification failed",
+            SearchError::Io(_) => "semantic retrieval could not read its artifacts",
+            SearchError::InvalidConfig { .. } => "semantic retrieval configuration is invalid",
+            SearchError::QueryParseError { .. } => "semantic query could not be parsed",
+            SearchError::QueueFull { .. } => "semantic embedding capacity is unavailable",
+            SearchError::SubsystemError { .. } => "semantic retrieval subsystem failed safely",
+            SearchError::Cancelled { .. } => "semantic retrieval was cancelled",
+            SearchError::DurabilityDisabled => "semantic artifact repair is unavailable",
+        }
+    }
+
+    fn semantic_index_unavailable_error(resources: &SearchExecutionResources) -> SearchError {
+        let vector_path = resources.index_root.join(FSFS_VECTOR_INDEX_FILE);
+        if vector_path.exists() {
+            SearchError::InvalidConfig {
+                field: "semantic.vector_index".to_owned(),
+                value: "unreadable".to_owned(),
+                reason: "the semantic vector generation could not be opened safely; run `fsfs doctor` and rebuild the index"
+                    .to_owned(),
+            }
+        } else {
+            SearchError::IndexNotFound { path: vector_path }
+        }
+    }
+
+    #[cfg_attr(test, allow(clippy::unnecessary_wraps, clippy::unused_self))]
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
-        if cfg!(test) {
-            return Ok(Arc::new(HashEmbedder::default_256()));
+        #[cfg(test)]
+        {
+            Ok(Arc::new(HashEmbedder::default_256()))
         }
 
-        let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
-            .or_else(|_| EmbedderStack::auto_detect());
+        #[cfg(not(test))]
+        {
+            let configured_root = PathBuf::from(&self.config.indexing.model_dir);
+            let options = DetectOptions {
+                offline: Some(self.config.indexing.offline),
+            };
+            let embedder =
+                EmbedderStack::auto_detect_with_options(Some(&configured_root), &options).and_then(
+                    |stack| {
+                        let embedder = stack.fast_arc();
+                        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
+                        Ok(embedder)
+                    },
+                );
 
-        #[cfg(not(feature = "embedded-models"))]
-        let stack = stack.map_err(|err| {
-            emit_lite_build_model_hint(&configured_root);
-            err
-        });
+            #[cfg(not(feature = "embedded-models"))]
+            let embedder = embedder.inspect_err(|_| {
+                emit_model_free_build_hint();
+            });
 
-        Ok(stack?.fast_arc())
+            embedder
+        }
     }
 
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
@@ -11313,16 +11643,86 @@ impl FsfsRuntime {
         }
 
         let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
-            .or_else(|_| EmbedderStack::auto_detect());
+        let options = DetectOptions {
+            offline: Some(self.config.indexing.offline),
+        };
+        let stack = EmbedderStack::auto_detect_with_options(Some(&configured_root), &options);
 
         #[cfg(not(feature = "embedded-models"))]
-        let stack = stack.map_err(|err| {
-            emit_lite_build_model_hint(&configured_root);
-            err
+        let stack = stack.inspect_err(|_| {
+            emit_model_free_build_hint();
         });
 
         Ok(stack?.quality_arc())
+    }
+
+    fn validate_search_generation_at_root(
+        index_root: &Path,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        if let Some(sentinel) = Self::read_index_sentinel(index_root)? {
+            validate_sentinel_search_admission(index_root, &sentinel, mode)?;
+        }
+        if let Some(checkpoint) = read_indexing_checkpoint(index_root)? {
+            validate_checkpoint_search_admission(index_root, &checkpoint, mode)?;
+        }
+        Ok(())
+    }
+
+    fn validate_bound_search_resources(
+        resources: &SearchExecutionResources,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        Self::validate_search_generation_fingerprint(
+            &resources.index_root,
+            &resources.generation_fingerprint,
+            mode,
+        )
+    }
+
+    fn validate_search_generation_fingerprint(
+        index_root: &Path,
+        expected_fingerprint: &str,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        let current_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
+        if current_fingerprint != expected_fingerprint {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "index generation changed while search results were being computed; retry the request"
+                    .to_owned(),
+            });
+        }
+        if !matches!(mode, SearchExecutionMode::LexicalOnly) {
+            Self::validate_search_generation_at_root(index_root, mode)?;
+        }
+        Ok(())
+    }
+
+    async fn rebind_search_resources_if_generation_changed(
+        &self,
+        cx: &Cx,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+    ) -> SearchResult<bool> {
+        let current_fingerprint = Self::search_index_fingerprint_at_root(&resources.index_root)?;
+        if current_fingerprint == resources.generation_fingerprint {
+            if !matches!(mode, SearchExecutionMode::LexicalOnly) {
+                Self::validate_search_generation_at_root(&resources.index_root, mode)?;
+            }
+            return Ok(false);
+        }
+        let index_root = resources.index_root.clone();
+        *resources = self
+            .prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                &index_root,
+                mode,
+                SearchExecutionMode::Full,
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn prepare_search_execution_resources(
@@ -11330,21 +11730,50 @@ impl FsfsRuntime {
         cx: &Cx,
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
+        self.prepare_search_execution_resources_with_modes(cx, mode, mode)
+            .await
+    }
+
+    async fn prepare_search_serve_resources(
+        &self,
+        cx: &Cx,
+    ) -> SearchResult<SearchExecutionResources> {
+        self.prepare_search_execution_resources_with_modes(
+            cx,
+            SearchExecutionMode::LexicalOnly,
+            SearchExecutionMode::Full,
+        )
+        .await
+    }
+
+    async fn prepare_search_execution_resources_with_modes(
+        &self,
+        cx: &Cx,
+        admission_mode: SearchExecutionMode,
+        resource_mode: SearchExecutionMode,
+    ) -> SearchResult<SearchExecutionResources> {
         let index_root = self.resolve_status_index_root()?;
-        self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
+        self.prepare_search_execution_resources_at_root_with_modes(
+            cx,
+            &index_root,
+            admission_mode,
+            resource_mode,
+        )
+        .await
+    }
+
+    async fn prepare_search_execution_resources_at_root_with_modes(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        admission_mode: SearchExecutionMode,
+        resource_mode: SearchExecutionMode,
+    ) -> SearchResult<SearchExecutionResources> {
+        self.rebuild_tantivy_lexical_index_if_needed(cx, index_root)
             .await?;
-        if let Some(checkpoint) = read_indexing_checkpoint(&index_root)?
-            && (checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
-                || !checkpoint.artifacts_durable)
-        {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.index_dir".to_owned(),
-                value: index_root.display().to_string(),
-                reason: "index generation is incomplete; resume `fsfs index` before searching"
-                    .to_owned(),
-            });
-        }
-        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        Self::validate_search_generation_at_root(index_root, admission_mode)?;
+        let admitted_generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
         let lexical_path = lexical_layout.engine_dir();
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -11356,7 +11785,7 @@ impl FsfsRuntime {
         };
         let lexical_available = lexical_index.is_some();
         let shadow_runtime = lexical_index.as_ref().and_then(|index| {
-            self.prepare_shadow_oracle_observer(&index_root, &lexical_layout, index)
+            self.prepare_shadow_oracle_observer(index_root, &lexical_layout, index)
         });
         let (shadow_observer, shadow_pressure_sampler) = shadow_runtime
             .map_or((None, None), |(observer, sampler)| {
@@ -11364,26 +11793,27 @@ impl FsfsRuntime {
             });
 
         let should_open_vector =
-            !matches!(mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
-        let mut degradation_advice = Vec::new();
+            !matches!(resource_mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
+        let degradation_advice = Vec::new();
+        let mut pending_semantic_initialization_failure = None;
         let vector_index = if should_open_vector && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index) => Some(index),
-                Err(error) if lexical_available => {
+                Err(error)
+                    if lexical_available && matches!(resource_mode, SearchExecutionMode::Full) =>
+                {
+                    pending_semantic_initialization_failure =
+                        Some(PendingSemanticInitializationFailure {
+                            error_code: error_code_for(&error),
+                            sanitized_summary: Self::semantic_initialization_failure_summary(
+                                &error,
+                            ),
+                        });
                     warn!(
-                        error = %error,
-                        path = %vector_path.display(),
-                        "fsfs search falling back to lexical-only mode after vector index load failure"
+                        event = "fsfs.semantic_index_open_failed",
+                        error_code = error_code_for(&error),
+                        "fsfs semantic vector generation could not be opened"
                     );
-                    degradation_advice.push(DegradationAdvice::from_input(
-                        DegradationAdviceInput {
-                            failure: DegradationFailureKind::LexicalFallback,
-                            query: "",
-                            index_dir: Some(&index_root),
-                            original_error: Some(&error),
-                            replay_command: None,
-                        },
-                    ));
                     None
                 }
                 Err(error) => return Err(error),
@@ -11400,12 +11830,25 @@ impl FsfsRuntime {
             });
         }
 
+        Self::validate_search_generation_at_root(index_root, admission_mode)?;
+        let generation_fingerprint = Self::search_index_fingerprint_at_root(index_root)?;
+        if generation_fingerprint != admitted_generation_fingerprint {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "index generation changed while search resources were opening; retry the request"
+                    .to_owned(),
+            });
+        }
+
         Ok(SearchExecutionResources {
-            index_root,
+            index_root: index_root.to_path_buf(),
+            generation_fingerprint,
             lexical_index,
             shadow_observer,
             shadow_pressure_sampler,
             vector_index,
+            pending_semantic_initialization_failure,
             fast_embedder: None,
             quality_embedder: None,
             fast_embedder_attempted: false,
@@ -11589,81 +12032,43 @@ impl FsfsRuntime {
         None
     }
 
-    fn hash_embedder_for_vector_index(index: &VectorIndex) -> Option<Arc<dyn Embedder>> {
-        let index_embedder_id = index.embedder_id();
-        if index_embedder_id.eq_ignore_ascii_case("fnv1a-256") {
-            return Some(Arc::new(HashEmbedder::default_256()));
-        }
-        if index_embedder_id.eq_ignore_ascii_case("fnv1a-384") {
-            return Some(Arc::new(HashEmbedder::default_384()));
-        }
-        if index_embedder_id.eq_ignore_ascii_case("fnv1a-custom")
-            || index_embedder_id
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("fnv1a-"))
-        {
-            return Some(Arc::new(HashEmbedder::new(
-                index.dimension(),
-                HashAlgorithm::FnvModular,
-            )));
-        }
-        None
-    }
-
     fn maybe_prepare_fast_embedder(
         &self,
         resources: &mut SearchExecutionResources,
-        lexical_available: bool,
+        lexical_fallback_authorized: bool,
+        query: &str,
     ) -> SearchResult<()> {
         if resources.fast_embedder.is_some() || resources.fast_embedder_attempted {
             return Ok(());
         }
         resources.fast_embedder_attempted = true;
 
-        if let Some(index) = resources.vector_index.as_ref()
-            && let Some(embedder) = Self::hash_embedder_for_vector_index(index)
-        {
-            info!(
-                index_embedder_id = index.embedder_id(),
-                fast_embedder_id = embedder.id(),
-                "fsfs search using hash embedder matched to vector index revision"
-            );
-            resources.fast_embedder = Some(embedder);
-            return Ok(());
-        }
-
         match self.resolve_fast_embedder() {
             Ok(embedder) => {
                 if let Some(index) = resources.vector_index.as_ref() {
-                    let index_embedder_id = index.embedder_id();
-                    if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
-                        info!(
-                            index_embedder_id,
-                            fast_embedder_id = embedder.id(),
-                            "fsfs search disabling fast semantic tier after embedder-id mismatch"
-                        );
-                        return Ok(());
-                    }
-                    let index_dimension = index.dimension();
-                    let embedder_dimension = embedder.dimension();
-                    if embedder_dimension != index_dimension {
-                        info!(
-                            index_dimension,
-                            embedder_dimension,
-                            embedder_id = embedder.id(),
-                            "fsfs search disabling fast semantic tier after embedder/index dimension mismatch"
-                        );
-                        return Ok(());
+                    if let Err(error) = Self::validate_fast_embedder_for_vector_index(
+                        index,
+                        embedder.as_ref(),
+                        cfg!(test),
+                    ) {
+                        if lexical_fallback_authorized {
+                            Self::record_semantic_lexical_fallback(resources, query, &error);
+                            return Ok(());
+                        }
+                        return Err(error);
                     }
                 }
+                info!(
+                    event = "fsfs.fast_semantic_admitted",
+                    category = ?embedder.category(),
+                    dimension = embedder.dimension(),
+                    "fsfs fast semantic embedder matches the vector generation"
+                );
                 resources.fast_embedder = Some(embedder);
                 Ok(())
             }
-            Err(error) if lexical_available => {
-                info!(
-                    error = %error,
-                    "fsfs search falling back to lexical-only mode after fast embedder init failure"
-                );
+            Err(error) if lexical_fallback_authorized => {
+                Self::record_semantic_lexical_fallback(resources, query, &error);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -11709,7 +12114,8 @@ impl FsfsRuntime {
             Ok(None) => Ok(()),
             Err(error) if lexical_available => {
                 info!(
-                    error = %error,
+                    error_code = error_code_for(&error),
+                    reason = Self::semantic_runtime_failure_summary(&error),
                     "fsfs search continuing without quality embedder after initialization failure"
                 );
                 Ok(())
@@ -12552,16 +12958,25 @@ impl FsfsRuntime {
         } else {
             payload.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
         };
+        #[cfg(feature = "embedded-models")]
         let fast_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "fast")
             .is_some_and(|model| model.cached);
+        #[cfg(feature = "embedded-models")]
         let quality_cached = payload
             .models
             .iter()
             .find(|model| model.tier == "quality")
             .is_some_and(|model| model.cached);
+        #[cfg(not(feature = "embedded-models"))]
+        let mode_summary = paint(
+            "lexical only (binary lacks embedded-models loaders)",
+            "38;5;214",
+            no_color,
+        );
+        #[cfg(feature = "embedded-models")]
         let mode_summary = if fast_cached && quality_cached && !self.config.search.fast_only {
             paint("full hybrid (fast + quality semantic)", "32", no_color)
         } else if fast_cached {
@@ -12572,7 +12987,7 @@ impl FsfsRuntime {
             )
         } else {
             paint(
-                "hash + lexical fallback (offline-safe default)",
+                "lexical only (no verified semantic model available)",
                 "38;5;214",
                 no_color,
             )
@@ -13788,7 +14203,9 @@ fn print_cli_help() {
         "  daemon [--daemon-poll-ms <ms>]            Long-running process that auto-compacts when WAL grows"
     );
     println!();
-    println!("Global flags: --verbose/-v --quiet/-q --no-color --format --config");
+    println!(
+        "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
+    );
     println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
 
@@ -14367,7 +14784,6 @@ const fn stage_color_code(stage: IndexingProgressStage) -> &'static str {
         IndexingProgressStage::Indexing => "1;38;5;45",
         IndexingProgressStage::RetryingEmbedding => "1;38;5;208",
         IndexingProgressStage::Finalizing => "1;38;5;208",
-        IndexingProgressStage::SemanticUpgrade => "1;38;5;177",
         IndexingProgressStage::Completed => "1;32",
         IndexingProgressStage::CompletedDegraded => "1;38;5;220",
     }
@@ -14718,6 +15134,9 @@ fn render_existing_index_dashboard_frame(
     fast_only: bool,
     no_color: bool,
 ) {
+    #[cfg(not(feature = "embedded-models"))]
+    let _ = fast_only;
+
     let area = frame.bounds();
     if area.is_empty() {
         return;
@@ -14754,23 +15173,31 @@ fn render_existing_index_dashboard_frame(
     } else {
         payload.index.lexical_index_bytes as f64 / payload.index.size_bytes as f64
     };
+    #[cfg(feature = "embedded-models")]
     let fast_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
+    #[cfg(feature = "embedded-models")]
     let quality_cached = payload
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
+    #[cfg(not(feature = "embedded-models"))]
+    let mode_label = "lexical only (binary lacks embedded-models loaders)";
+    #[cfg(feature = "embedded-models")]
     let mode_label = if fast_cached && quality_cached && !fast_only {
         "full hybrid semantic + lexical"
     } else if fast_cached {
         "fast semantic + lexical"
     } else {
-        "hash + lexical fallback"
+        "lexical only (no verified semantic model)"
     };
+    #[cfg(not(feature = "embedded-models"))]
+    let mode_style = ui_fg(no_color, PackedRgba::rgb(255, 156, 156)).bold();
+    #[cfg(feature = "embedded-models")]
     let mode_style = if fast_cached && quality_cached && !fast_only {
         ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold()
     } else if fast_cached {
@@ -16308,9 +16735,6 @@ fn render_indexing_progress_frame(
             ui_fg(no_color, PackedRgba::rgb(255, 165, 80)).bold()
         }
         IndexingProgressStage::Finalizing => ui_fg(no_color, PackedRgba::rgb(253, 188, 128)).bold(),
-        IndexingProgressStage::SemanticUpgrade => {
-            ui_fg(no_color, PackedRgba::rgb(200, 160, 255)).bold()
-        }
         IndexingProgressStage::Completed => ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
         IndexingProgressStage::CompletedDegraded => {
             ui_fg(no_color, PackedRgba::rgb(255, 220, 100)).bold()
@@ -16588,7 +17012,7 @@ fn render_indexing_progress_frame(
         if snapshot.embedder_degraded {
             health_lines.push(Line::from(Span::styled(
                 format!(
-                    "DEGRADED: hash embeddings active{}",
+                    "DEGRADED: legacy hash control present; semantic disabled{}",
                     snapshot
                         .degradation_reason
                         .as_deref()
@@ -16610,12 +17034,10 @@ fn render_indexing_progress_frame(
         }
         for warning in snapshot.recent_warnings.iter().rev().take(3).rev() {
             let icon = match warning.severity {
-                IndexingWarningSeverity::Info => "i",
                 IndexingWarningSeverity::Warn => "!",
                 IndexingWarningSeverity::Error => "X",
             };
             let color = match warning.severity {
-                IndexingWarningSeverity::Info => PackedRgba::rgb(170, 190, 222),
                 IndexingWarningSeverity::Warn => PackedRgba::rgb(255, 200, 60),
                 IndexingWarningSeverity::Error => PackedRgba::rgb(255, 100, 100),
             };
@@ -16858,7 +17280,11 @@ fn render_indexing_progress_screen(
         || snapshot.embedding_failures > 0
     {
         let health_state = if snapshot.embedder_degraded {
-            paint("DEGRADED (hash embeddings)", "1;33", no_color)
+            paint(
+                "DEGRADED (legacy hash control; semantic disabled)",
+                "1;33",
+                no_color,
+            )
         } else if snapshot.embedding_failures > 0 {
             paint("PARTIAL FAILURES", "1;38;5;208", no_color)
         } else {
@@ -16876,7 +17302,6 @@ fn render_indexing_progress_screen(
         .map_err(tui_io_error)?;
         for warning in snapshot.recent_warnings.iter().rev().take(3).rev() {
             let icon = match warning.severity {
-                IndexingWarningSeverity::Info => "i",
                 IndexingWarningSeverity::Warn => "!",
                 IndexingWarningSeverity::Error => "X",
             };
@@ -16941,16 +17366,25 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     } else {
         status.index.size_bytes / u64::try_from(indexed_files).unwrap_or(1)
     };
+    #[cfg(feature = "embedded-models")]
     let fast_cached = status
         .models
         .iter()
         .find(|model| model.tier == "fast")
         .is_some_and(|model| model.cached);
+    #[cfg(feature = "embedded-models")]
     let quality_cached = status
         .models
         .iter()
         .find(|model| model.tier == "quality")
         .is_some_and(|model| model.cached);
+    #[cfg(not(feature = "embedded-models"))]
+    let search_mode_line = paint(
+        "  mode: lexical only (this binary lacks the embedded-models loaders)",
+        "38;5;214",
+        no_color,
+    );
+    #[cfg(feature = "embedded-models")]
     let search_mode_line = if fast_cached && quality_cached && !status.config.fast_only {
         paint(
             "  mode: full hybrid (fast + quality semantic)",
@@ -16973,7 +17407,7 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         }
     } else {
         paint(
-            "  mode: hash + lexical fallback (no semantic model cache)",
+            "  mode: lexical only (no verified semantic model available)",
             "38;5;214",
             no_color,
         )
@@ -17495,6 +17929,73 @@ fn vector_live_doc_ids(index: &VectorIndex) -> SearchResult<HashSet<String>> {
     index.live_doc_ids()
 }
 
+fn checkpoint_has_deferred_semantic_rows(checkpoint: &IndexingCheckpoint) -> bool {
+    checkpoint.files.values().any(|entry| {
+        entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
+            && !entry.semantic_indexed
+    })
+}
+
+const fn semantic_generation_complete(semantic_deferred_files: usize) -> bool {
+    semantic_deferred_files == 0
+}
+
+const fn indexing_final_stage(
+    embedder_degraded: bool,
+    generation_complete: bool,
+) -> IndexingProgressStage {
+    if embedder_degraded || !generation_complete {
+        IndexingProgressStage::CompletedDegraded
+    } else {
+        IndexingProgressStage::Completed
+    }
+}
+
+fn validate_checkpoint_search_admission(
+    index_root: &Path,
+    checkpoint: &IndexingCheckpoint,
+    mode: SearchExecutionMode,
+) -> SearchResult<()> {
+    if checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
+        || !checkpoint.artifacts_durable
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.index_dir".to_owned(),
+            value: index_root.display().to_string(),
+            reason: "index generation is incomplete; resume `fsfs index` before searching"
+                .to_owned(),
+        });
+    }
+    if !matches!(mode, SearchExecutionMode::LexicalOnly)
+        && checkpoint_has_deferred_semantic_rows(checkpoint)
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "semantic.index_generation".to_owned(),
+            value: "deferred_rows".to_owned(),
+            reason: "semantic index generation has deferred rows; resume `fsfs index` before semantic search".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sentinel_search_admission(
+    index_root: &Path,
+    sentinel: &IndexSentinel,
+    mode: SearchExecutionMode,
+) -> SearchResult<()> {
+    if !matches!(mode, SearchExecutionMode::LexicalOnly) && !sentinel.generation_complete {
+        return Err(SearchError::InvalidConfig {
+            field: "semantic.index_generation".to_owned(),
+            value: "incomplete".to_owned(),
+            reason: format!(
+                "semantic index generation at {} is incomplete; resume `fsfs index` before semantic search",
+                index_root.display(),
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn reconcile_vector_generation(
     index: &mut VectorIndex,
     checkpoint: &IndexingCheckpoint,
@@ -17835,37 +18336,39 @@ fn remove_indexing_checkpoint(index_root: &Path) -> SearchResult<()> {
     }
 }
 
-/// Emit a helpful hint when model detection fails in a lite build
-/// (one compiled without embedded models via `--no-default-features`).
-///
-/// This guides the user to either download models or switch to the
-/// standard build that bundles them.
 #[cfg(not(feature = "embedded-models"))]
-fn emit_lite_build_model_hint(model_root: &Path) {
-    let default_root = dirs::home_dir()
-        .map(|h| {
-            h.join(".local")
-                .join("share")
-                .join("frankensearch")
-                .join("models")
-        })
-        .unwrap_or_else(|| PathBuf::from("~/.local/share/frankensearch/models"));
+const fn model_free_semantic_recovery_guidance() -> &'static str {
+    "Search mode: lexical-only. This model-free binary has download support but no Model2Vec/FastEmbed loaders, so downloaded model files alone cannot activate semantic retrieval. Install a full fsfs prebuilt, or rebuild verified inputs with `cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models`. Hash control embeddings are never admitted as semantic results."
+}
+
+#[cfg(feature = "embedded-models")]
+const fn semantic_model_doctor_recovery_guidance() -> &'static str {
+    "provision the configured model with `fsfs download-models`, verify it with `fsfs download-models --verify`, or point FRANKENSEARCH_MODEL_DIR at a verified cache"
+}
+
+#[cfg(not(feature = "embedded-models"))]
+const fn semantic_model_doctor_recovery_guidance() -> &'static str {
+    "install a full fsfs prebuilt, or rebuild verified inputs with `cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models`; downloaded files alone cannot activate this binary"
+}
+
+#[cfg(feature = "embedded-models")]
+const fn semantic_model_directory_guidance() -> &'static str {
+    "create a verified model cache with `fsfs download-models`, or set FRANKENSEARCH_MODEL_DIR to an existing verified cache"
+}
+
+#[cfg(not(feature = "embedded-models"))]
+const fn semantic_model_directory_guidance() -> &'static str {
+    "a model directory alone cannot activate this binary; install a full fsfs prebuilt, or rebuild with `--no-default-features --features embedded-models`"
+}
+
+/// Explain why a model-free binary cannot activate semantic retrieval even
+/// when verified model files are already present.
+#[cfg(not(feature = "embedded-models"))]
+fn emit_model_free_build_hint() {
     eprintln!();
-    eprintln!("--- fsfs lite build: no embedded models ---");
+    eprintln!("--- fsfs model-free build: semantic loaders unavailable ---");
     eprintln!();
-    eprintln!("This binary was built without bundled ML models (--no-default-features).");
-    eprintln!("Semantic search requires model files on disk. Looked in:");
-    eprintln!("  1. {}", model_root.display());
-    if model_root != default_root {
-        eprintln!("  2. {}", default_root.display());
-    }
-    eprintln!();
-    eprintln!("To download the required models, run:");
-    eprintln!();
-    eprintln!("  fsfs download-models");
-    eprintln!();
-    eprintln!("Or set FRANKENSEARCH_MODEL_DIR to point to an existing model cache.");
-    eprintln!("Until then, fsfs will fall back to hash-based embeddings (degraded quality).");
+    eprintln!("{}", model_free_semantic_recovery_guidance());
     eprintln!();
 }
 
@@ -17876,7 +18379,7 @@ mod tests {
     use std::future::{Future, poll_fn};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::thread;
@@ -17900,21 +18403,22 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        ContextPreviewFormat, EmbedderAvailability, FSFS_DAEMON_REQUEST_MAX_BYTES,
-        FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
-        FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
-        FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
-        SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
-        SearchServeRequest, SemanticGateDecisionInput, SemanticRecallDecisionInput,
-        VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
-        degradation_controller_config_for_profile, detect_context_preview_format,
-        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
-        render_status_table,
+        ContextPreviewFormat, DegradationFailureKind, EmbedderAvailability,
+        FSFS_DAEMON_REQUEST_MAX_BYTES, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
+        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsFlushAck, FsfsFlushRequest,
+        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
+        IndexStoragePaths, IndexingBatchEmbeddingOutcome, InterfaceMode, LiveIngestPipeline,
+        SearchCacheRecord, SearchDashboardState, SearchExecutionFlags, SearchExecutionMode,
+        SearchExecutionResources, SearchServeRequest, SemanticGateDecisionInput,
+        SemanticRecallDecisionInput, VectorIndexWriteAction, VectorPipelineInput,
+        VectorSchedulingTier, degradation_controller_config_for_profile,
+        detect_context_preview_format, is_likely_html_fragment,
+        normalize_html_fragment_for_markdown, read_durable_json, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -17932,6 +18436,7 @@ mod tests {
     use crate::pressure::HostPressureCollector;
     use crate::pressure::{DegradationStage, PressureSignal, PressureState, QueryCapabilityMode};
     use crate::query_execution::{FusedCandidate, LexicalCandidate};
+    use crate::query_expansion;
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
     use crate::stream_protocol::{
@@ -18038,6 +18543,491 @@ mod tests {
     }
 
     #[test]
+    fn indexing_probe_returns_final_typed_error_after_bounded_retries() {
+        run_test_with_cx(|cx| async move {
+            let embedder = FailingProbeEmbedder::new();
+            let error = FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &embedder, &[0, 0])
+                .await
+                .expect_err("the final real-embedder probe failure must escape");
+
+            assert!(
+                matches!(
+                    error,
+                    SearchError::EmbeddingFailed { model, .. }
+                        if model == "failing-probe-384"
+                ),
+                "probe failure lost its typed error"
+            );
+            assert_eq!(
+                embedder.attempts.load(Ordering::Acquire),
+                3,
+                "two retries permit exactly three total attempts"
+            );
+        });
+    }
+
+    #[test]
+    fn indexing_probe_never_retries_permanent_or_embedder_cancelled_failures() {
+        run_test_with_cx(|cx| async move {
+            let permanent = FailingProbeEmbedder::permanent();
+            let permanent_error =
+                FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &permanent, &[0, 0])
+                    .await
+                    .expect_err("permanent probe failure must escape immediately");
+            assert!(matches!(
+                permanent_error,
+                SearchError::UnverifiableRemoteSpace { producer, reason }
+                    if producer == "typed-probe-provider" && reason == "typed-probe-reason"
+            ));
+            assert_eq!(
+                permanent.attempts.load(Ordering::Acquire),
+                1,
+                "a permanent failure must consume exactly one attempt"
+            );
+
+            let cancelled = FailingProbeEmbedder::cancelled();
+            let cancelled_error =
+                FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &cancelled, &[0, 0])
+                    .await
+                    .expect_err("embedder cancellation must escape immediately");
+            assert!(matches!(
+                cancelled_error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "typed-probe-embed"
+                        && reason == "typed-probe-cancellation"
+            ));
+            assert_eq!(
+                cancelled.attempts.load(Ordering::Acquire),
+                1,
+                "embedder cancellation must consume exactly one attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn indexing_probe_observes_context_cancellation_before_and_after_inference() {
+        run_test_with_cx(|cx| async move {
+            let never_started = FailingProbeEmbedder::new();
+            cx.set_cancel_requested(true);
+            let pre_attempt_error =
+                FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &never_started, &[10])
+                    .await
+                    .expect_err("pre-attempt cancellation must escape");
+            cx.set_cancel_requested(false);
+            assert!(matches!(
+                pre_attempt_error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "fsfs.semantic_probe"
+                        && reason == "runtime cancellation requested"
+            ));
+            assert_eq!(
+                never_started.attempts.load(Ordering::Acquire),
+                0,
+                "a cancelled context must not invoke the embedder"
+            );
+
+            let after_inference = FailingProbeEmbedder::cancel_with_transient();
+            let after_inference_error =
+                FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &after_inference, &[50])
+                    .await
+                    .expect_err("post-inference cancellation must escape");
+            cx.set_cancel_requested(false);
+            assert!(matches!(
+                after_inference_error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "fsfs.semantic_probe_after_inference"
+                        && reason == "runtime cancellation requested"
+            ));
+            assert_eq!(
+                after_inference.attempts.load(Ordering::Acquire),
+                1,
+                "cancellation observed after inference must prevent a second embed attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn semantic_retry_backoff_observes_context_cancellation_before_sleep() {
+        run_test_with_cx(|cx| async move {
+            cx.set_cancel_requested(true);
+            let error = FsfsRuntime::semantic_retry_backoff(
+                &cx,
+                "test.semantic_retry_backoff",
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("cancelled retry backoff must not sleep");
+            cx.set_cancel_requested(false);
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "test.semantic_retry_backoff"
+                        && reason == "runtime cancellation requested"
+            ));
+        });
+    }
+
+    #[test]
+    fn indexing_probe_observes_cancellation_that_arrives_during_inference() {
+        run_test_with_cx(|cx| async move {
+            for embedder in [
+                FailingProbeEmbedder::cancel_with_success(),
+                FailingProbeEmbedder::cancel_with_permanent(),
+            ] {
+                let error =
+                    FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &embedder, &[0, 0])
+                        .await
+                        .expect_err("inference-time cancellation must override non-cancel output");
+                cx.set_cancel_requested(false);
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == "fsfs.semantic_probe_after_inference"
+                            && reason == "runtime cancellation requested"
+                ));
+                assert_eq!(
+                    embedder.attempts.load(Ordering::Acquire),
+                    1,
+                    "inference-time cancellation must prevent every retry"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn indexing_batch_retries_only_transient_failures_with_exact_accounting() {
+        run_test_with_cx(|cx| async move {
+            let texts = ["alpha", "beta"];
+            let transient = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let mut retry_events = Vec::new();
+            let outcome = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &transient,
+                &texts,
+                &[0, 0],
+                |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
+                    assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
+                    retry_events.push((retry_number, retry_budget, backoff_ms));
+                    Ok(())
+                },
+            )
+            .await
+            .expect("transient exhaustion is a deferred batch outcome");
+            let IndexingBatchEmbeddingOutcome::Exhausted {
+                error,
+                retries_executed,
+                ..
+            } = outcome
+            else {
+                panic!("always-transient batch must exhaust its retry budget");
+            };
+            assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
+            assert_eq!(transient.attempts.load(Ordering::Acquire), 3);
+            assert_eq!(retries_executed, 2);
+            assert_eq!(retry_events, [(1, 2, 0), (2, 2, 0)]);
+
+            let permanent = BatchProbeEmbedder::new(BatchProbeBehavior::Permanent);
+            let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &permanent,
+                &texts,
+                &[0, 0],
+                |_, _, _, _, _| Ok(()),
+            )
+            .await
+            .expect_err("permanent batch failure must escape immediately");
+            assert!(matches!(
+                error,
+                SearchError::UnverifiableRemoteSpace { producer, reason }
+                    if producer == "typed-batch-provider" && reason == "typed-batch-reason"
+            ));
+            assert_eq!(permanent.attempts.load(Ordering::Acquire), 1);
+
+            let cancelled = BatchProbeEmbedder::new(BatchProbeBehavior::Cancelled);
+            let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &cancelled,
+                &texts,
+                &[0, 0],
+                |_, _, _, _, _| Ok(()),
+            )
+            .await
+            .expect_err("embedder batch cancellation must escape immediately");
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "typed-batch-embed"
+                        && reason == "typed-batch-cancellation"
+            ));
+            assert_eq!(cancelled.attempts.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn indexing_batch_rejects_invalid_vectors_before_ready_or_retry() {
+        run_test_with_cx(|cx| async move {
+            let texts = ["alpha", "beta"];
+            for behavior in [
+                BatchProbeBehavior::CountMismatch,
+                BatchProbeBehavior::Empty,
+                BatchProbeBehavior::NonFinite,
+                BatchProbeBehavior::ZeroSignal,
+            ] {
+                let embedder = BatchProbeEmbedder::new(behavior);
+                let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                    &cx,
+                    &embedder,
+                    &texts,
+                    &[0, 0],
+                    |_, _, _, _, _| Ok(()),
+                )
+                .await
+                .expect_err("invalid batch output must fail before append admission");
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::InvalidConfig {
+                            ref field,
+                            ..
+                        } if field == "semantic.embedding_batch"
+                            || field == "semantic.embedding_output"
+                    ),
+                    "invalid batch output lost its permanent typed error: {error:?}"
+                );
+                assert_eq!(
+                    embedder.attempts.load(Ordering::Acquire),
+                    1,
+                    "invalid batch output must never be retried"
+                );
+            }
+
+            let valid = BatchProbeEmbedder::new(BatchProbeBehavior::Valid);
+            let outcome = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &valid,
+                &texts,
+                &[0, 0],
+                |_, _, _, _, _| Ok(()),
+            )
+            .await
+            .expect("valid batch must be admitted");
+            assert!(matches!(
+                outcome,
+                IndexingBatchEmbeddingOutcome::Ready {
+                    ref embeddings,
+                    retries_executed: 0,
+                    ..
+                } if embeddings.len() == texts.len()
+            ));
+            assert_eq!(valid.attempts.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn indexing_batch_observes_cancellation_that_arrives_during_inference() {
+        run_test_with_cx(|cx| async move {
+            let texts = ["alpha"];
+            for behavior in [
+                BatchProbeBehavior::CancelWithSuccess,
+                BatchProbeBehavior::CancelWithPermanent,
+            ] {
+                let embedder = BatchProbeEmbedder::new(behavior);
+                let error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                    &cx,
+                    &embedder,
+                    &texts,
+                    &[0, 0],
+                    |_, _, _, _, _| Ok(()),
+                )
+                .await
+                .expect_err("inference-time cancellation must override non-cancel batch output");
+                cx.set_cancel_requested(false);
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, reason }
+                        if phase == "fsfs.semantic_batch_after_inference"
+                            && reason == "runtime cancellation requested"
+                ));
+                assert_eq!(embedder.attempts.load(Ordering::Acquire), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn indexing_batch_cancellation_prevents_attempts_and_pending_backoff_retries() {
+        run_test_with_cx(|cx| async move {
+            let texts = ["alpha"];
+            let never_started = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let mut pre_attempt_retry_events = 0_usize;
+            cx.set_cancel_requested(true);
+            let pre_attempt_error = FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &never_started,
+                &texts,
+                &[100],
+                |_, _, _, _, _| {
+                    pre_attempt_retry_events = pre_attempt_retry_events.saturating_add(1);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("pre-attempt cancellation must escape");
+            cx.set_cancel_requested(false);
+            assert!(matches!(
+                pre_attempt_error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "fsfs.semantic_batch"
+                        && reason == "runtime cancellation requested"
+            ));
+            assert_eq!(never_started.attempts.load(Ordering::Acquire), 0);
+            assert_eq!(pre_attempt_retry_events, 0);
+
+            let transient = BatchProbeEmbedder::new(BatchProbeBehavior::Transient);
+            let mut pending_backoff_retry_events = 0_usize;
+            let mut pending_backoff = Box::pin(FsfsRuntime::embed_indexing_batch_with_backoffs(
+                &cx,
+                &transient,
+                &texts,
+                &[100],
+                |_, _, _, _, _| {
+                    pending_backoff_retry_events = pending_backoff_retry_events.saturating_add(1);
+                    Ok(())
+                },
+            ));
+            let mut observed_pending_backoff = false;
+            let backoff_error = poll_fn(|task_cx| {
+                let polled = pending_backoff.as_mut().poll(task_cx);
+                if matches!(polled, Poll::Pending) && !observed_pending_backoff {
+                    observed_pending_backoff = true;
+                    cx.set_cancel_requested(true);
+                    task_cx.waker().wake_by_ref();
+                }
+                polled
+            })
+            .await
+            .expect_err("cancellation during a pending backoff must escape before retry");
+            drop(pending_backoff);
+            cx.set_cancel_requested(false);
+            assert!(
+                observed_pending_backoff,
+                "the test must cancel only after entering a real nonzero backoff"
+            );
+            assert!(matches!(
+                backoff_error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == "fsfs.semantic_batch_backoff"
+                        && reason == "runtime cancellation requested"
+            ));
+            assert_eq!(
+                transient.attempts.load(Ordering::Acquire),
+                1,
+                "cancellation during backoff must prevent the retry attempt"
+            );
+            assert_eq!(
+                pending_backoff_retry_events, 0,
+                "a retry is accounted only after its backoff completes"
+            );
+        });
+    }
+
+    #[test]
+    fn indexing_probe_precedes_vector_and_cache_artifact_creation() {
+        let source = include_str!("runtime.rs");
+        let pipeline_start = source
+            .find("async fn run_one_shot_index_scaffold_internal")
+            .expect("one-shot indexing pipeline");
+        let pipeline_end = source[pipeline_start..]
+            .find("\n    fn resolve_target_root")
+            .map(|offset| pipeline_start + offset)
+            .expect("one-shot indexing pipeline end");
+        let pipeline = &source[pipeline_start..pipeline_end];
+
+        let probe = pipeline
+            .find("Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;")
+            .expect("fail-closed real-embedder probe");
+        let vector_dir = pipeline
+            .find("fs::create_dir_all(index_root.join(\"vector\"))?;")
+            .expect("vector artifact directory creation");
+        let cache_dir = pipeline
+            .find("fs::create_dir_all(index_root.join(\"cache\"))?;")
+            .expect("cache artifact directory creation");
+        assert!(
+            probe < vector_dir && probe < cache_dir,
+            "a failed semantic probe must return before vector/cache artifact creation"
+        );
+        assert!(
+            !pipeline.contains("HashEmbedder::new"),
+            "the production indexing pipeline must not synthesize a hash fallback"
+        );
+        assert!(
+            !pipeline.contains("falling back to hash embeddings"),
+            "the production indexing pipeline must not report false semantic success"
+        );
+    }
+
+    #[test]
+    fn semantic_degradation_logs_and_warnings_never_format_raw_errors() {
+        fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source
+                .find(start)
+                .expect("semantic degradation region start");
+            let end = source[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .expect("semantic degradation region end");
+            &source[start..end]
+        }
+
+        let source = include_str!("runtime.rs");
+        let regions = [
+            (
+                "watcher live ingest",
+                source_region(
+                    source,
+                    "async fn apply_live_vector_actions",
+                    "async fn apply_upsert_op",
+                ),
+            ),
+            (
+                "one-shot embedding batch",
+                source_region(
+                    source,
+                    "let batch_outcome = Self::embed_indexing_batch_with_backoffs(",
+                    "// Update checkpoint entries for this batch",
+                ),
+            ),
+            (
+                "quality refinement",
+                source_region(
+                    source,
+                    "Err(error) => {\n                        let error_code = error_code_for(&error);",
+                    "let mut advice = resources.degradation_advice.clone();",
+                ),
+            ),
+            (
+                "quality initialization",
+                source_region(
+                    source,
+                    "fn maybe_prepare_quality_embedder",
+                    "async fn build_live_ingest_pipeline",
+                ),
+            ),
+        ];
+
+        for (label, region) in regions {
+            assert!(
+                !region.contains("error = %error") && !region.contains("{error}"),
+                "{label} must not render raw semantic provider errors"
+            );
+            assert!(
+                region.contains("error_code")
+                    && region.contains("semantic_runtime_failure_summary"),
+                "{label} must emit only a stable error code and static reason"
+            );
+        }
+    }
+
+    #[test]
     fn async_indexing_reads_use_asupersync_fs_helpers() {
         let source = include_str!("runtime.rs");
         let sync_read = ["fs", "::read"].concat();
@@ -18091,9 +19081,14 @@ mod tests {
             source.contains(required),
             "async fsfs mutation path should use asupersync helper: {required}"
         );
+        let (production_source, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("runtime.rs must preserve the exact test-module boundary");
         assert!(
-            source.contains("VectorIndex::install_replacement(&vector_path, &upgrade_path)"),
-            "semantic upgrade should use the WAL-safe durable replacement API"
+            !production_source
+                .contains("VectorIndex::install_replacement(&vector_path, &upgrade_path)")
+                && !production_source.contains("Semantic upgrade aborted; keeping hash index"),
+            "the removed compatibility-only hash-upgrade branch must not be reintroduced"
         );
     }
 
@@ -18474,7 +19469,155 @@ mod tests {
     }
 
     #[test]
-    fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
+    fn search_generation_fingerprint_tracks_exact_current_pointer_bytes() {
+        let temp = tempfile::tempdir().expect("index root");
+        let first = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-a1",
+            frankensearch_quill::FSLX_FORMAT_VERSION,
+        )
+        .expect("create first same-width CURRENT pointer");
+        let second = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-b1",
+            frankensearch_quill::FSLX_FORMAT_VERSION,
+        )
+        .expect("create second same-width CURRENT pointer");
+        assert_eq!(
+            first.encode().len(),
+            second.encode().len(),
+            "regression requires a metadata-size-equivalent CURRENT swap"
+        );
+        fs::create_dir_all(temp.path().join(first.dir_name()))
+            .expect("create first root CURRENT engine directory");
+        fs::create_dir_all(temp.path().join(second.dir_name()))
+            .expect("create second root CURRENT engine directory");
+
+        publish_current(temp.path(), &first).expect("publish first CURRENT pointer");
+        let first_fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+            .expect("fingerprint first CURRENT pointer");
+
+        publish_current(temp.path(), &second).expect("publish second CURRENT pointer");
+        let second_fingerprint = FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+            .expect("fingerprint second CURRENT pointer");
+
+        assert_ne!(
+            first_fingerprint, second_fingerprint,
+            "CURRENT content, not size or millisecond mtime alone, must identify the lexical generation"
+        );
+
+        let nested_root = tempfile::tempdir().expect("nested lexical root");
+        let nested_lexical = nested_root.path().join("lexical");
+        fs::create_dir_all(&nested_lexical).expect("create nested lexical directory");
+        fs::create_dir_all(nested_lexical.join(first.dir_name()))
+            .expect("create first nested CURRENT engine directory");
+        fs::create_dir_all(nested_lexical.join(second.dir_name()))
+            .expect("create second nested CURRENT engine directory");
+        publish_current(&nested_lexical, &first).expect("publish first nested CURRENT pointer");
+        let first_nested_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(nested_root.path())
+                .expect("fingerprint first nested CURRENT pointer");
+
+        publish_current(&nested_lexical, &second).expect("publish second nested CURRENT pointer");
+        let second_nested_fingerprint =
+            FsfsRuntime::search_index_fingerprint_at_root(nested_root.path())
+                .expect("fingerprint second nested CURRENT pointer");
+
+        assert_ne!(
+            first_nested_fingerprint, second_nested_fingerprint,
+            "the legacy nested lexical CURRENT location must remain generation-bound"
+        );
+    }
+
+    #[test]
+    fn search_resources_rebind_on_vector_wal_append_and_tombstone() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("index root");
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            let vector = vec![0.125_f32; 384];
+            let mut writer = VectorIndex::create(&vector_path, "hash-384", vector.len())
+                .expect("create vector index");
+            writer
+                .write_record("old.md", &vector)
+                .expect("write main-generation vector");
+            writer.finish().expect("finish main vector generation");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::Full)
+                .await
+                .expect("open initial vector resources");
+            assert_eq!(
+                resources
+                    .vector_index
+                    .as_ref()
+                    .expect("initial vector resource")
+                    .wal_record_count(),
+                0
+            );
+
+            let mut mutator = VectorIndex::open(&vector_path).expect("open WAL mutator");
+            mutator
+                .append("new.md", &vector)
+                .expect("append successor vector through WAL");
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .expect("rebind after WAL append"),
+                "WAL-only append must invalidate retained search resources"
+            );
+            let after_append = resources
+                .vector_index
+                .as_ref()
+                .expect("vector resource after append");
+            assert_eq!(after_append.wal_record_count(), 1);
+            assert!(
+                super::vector_live_doc_ids(after_append)
+                    .expect("read append generation ids")
+                    .contains("new.md")
+            );
+
+            assert!(
+                mutator
+                    .soft_delete("old.md")
+                    .expect("tombstone main vector through WAL")
+            );
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .expect("rebind after WAL tombstone"),
+                "WAL-only tombstone must invalidate retained search resources"
+            );
+            let after_tombstone = resources
+                .vector_index
+                .as_ref()
+                .expect("vector resource after tombstone");
+            let live_ids =
+                super::vector_live_doc_ids(after_tombstone).expect("read tombstone generation ids");
+            assert!(live_ids.contains("new.md"));
+            assert!(!live_ids.contains("old.md"));
+        });
+    }
+
+    #[test]
+    fn expanded_query_variants_reject_cross_generation_fusion() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("index root");
             let lexical_path = temp.path().join("lexical");
@@ -18482,25 +19625,119 @@ mod tests {
             writer
                 .index_document(&cx, &IndexableDocument::new("alpha.md", "alpha token"))
                 .await
+                .expect("stage first expansion witness");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish first expansion witness");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::Full)
+                .await
+                .expect("open expansion resources");
+            let pinned_fingerprint = resources.generation_fingerprint.clone();
+            let first = [query_expansion::ExpandedQuery {
+                text: "alpha".to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Original,
+            }];
+            let first_payloads = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    &first,
+                    20,
+                    &mut resources,
+                    &pinned_fingerprint,
+                )
+                .await
+                .expect("execute first pinned expansion variant");
+            assert!(
+                first_payloads
+                    .iter()
+                    .any(|payload| payload.hits.iter().any(|hit| hit.path == "alpha.md"))
+            );
+
+            writer
+                .index_document(&cx, &IndexableDocument::new("beta.md", "beta token"))
+                .await
+                .expect("stage successor expansion witness");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish successor expansion generation");
+
+            let second = [query_expansion::ExpandedQuery {
+                text: "beta".to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Keyword,
+            }];
+            let error = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    &second,
+                    20,
+                    &mut resources,
+                    &pinned_fingerprint,
+                )
+                .await
+                .expect_err("cross-generation expansion fusion must fail closed");
+            assert!(
+                error.to_string().contains("generation changed"),
+                "expanded search must return retry guidance, got {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
+        run_test_with_cx(|cx| async move {
+            let serving_root = tempfile::tempdir().expect("serving index root");
+            let configured_decoy_root = tempfile::tempdir().expect("configured decoy index root");
+            let lexical_path = serving_root.path().join("lexical");
+            let writer = create_test_quill(&cx, &lexical_path).await;
+            writer
+                .index_document(&cx, &IndexableDocument::new("alpha.md", "alpha token"))
+                .await
                 .expect("stage first document");
             writer.commit(&cx).await.expect("publish first document");
+
+            let decoy = create_test_quill(&cx, &configured_decoy_root.path().join("lexical")).await;
+            decoy
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("decoy.md", "configured decoy token"),
+                )
+                .await
+                .expect("stage configured decoy document");
+            decoy.commit(&cx).await.expect("publish configured decoy");
 
             let reader = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
                 .await
                 .expect("open serve reader");
             let mut resources = SearchExecutionResources {
-                index_root: temp.path().to_path_buf(),
+                index_root: serving_root.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(
+                    serving_root.path(),
+                )
+                .expect("serve generation fingerprint"),
                 lexical_index: Some(reader),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: None,
+                pending_semantic_initialization_failure: None,
                 fast_embedder: None,
                 quality_embedder: None,
                 fast_embedder_attempted: true,
                 quality_embedder_attempted: true,
                 degradation_advice: Vec::new(),
             };
-            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = configured_decoy_root.path().display().to_string();
+            let runtime = FsfsRuntime::new(config);
             let mut hot_cache = HashMap::new();
             let request = |query: &str| SearchServeRequest {
                 query: query.to_owned(),
@@ -18576,6 +19813,28 @@ mod tests {
                     .payloads
                     .iter()
                     .any(|payload| { payload.hits.iter().any(|hit| hit.path == "beta.md") })
+            );
+            assert_eq!(
+                resources.index_root,
+                serving_root.path(),
+                "rebind must retain the root that produced the admitted resources"
+            );
+            let decoy_result = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("configured decoy token"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("query retained serving root");
+            assert!(
+                decoy_result
+                    .payloads
+                    .iter()
+                    .all(|payload| payload.hits.iter().all(|hit| hit.path != "decoy.md")),
+                "a valid configured decoy root must never replace the retained serving root"
             );
         });
     }
@@ -20669,13 +21928,32 @@ mod tests {
                 target_path: Some(project.clone()),
                 ..CliInput::default()
             });
+            let index_root = project.join(".frankensearch");
+            let mut observed_complete_publication = false;
 
             runtime
-                .run_mode(&cx, InterfaceMode::Cli)
+                .run_one_shot_index_scaffold_with_progress(&cx, CliCommand::Index, |snapshot| {
+                    if snapshot.stage == super::IndexingProgressStage::Completed {
+                        assert!(
+                            index_root.join("lexical").join(CURRENT_FILE_NAME).is_file(),
+                            "Completed must not become observable before lexical CURRENT"
+                        );
+                        FsfsRuntime::validate_search_generation_at_root(
+                            &index_root,
+                            SearchExecutionMode::Full,
+                        )
+                        .expect("Completed callback must observe an admitted full generation");
+                        observed_complete_publication = true;
+                    }
+                    Ok(())
+                })
                 .await
                 .expect("index scaffold command should succeed");
+            assert!(
+                observed_complete_publication,
+                "fresh semantic index must emit one admitted Completed publication"
+            );
 
-            let index_root = project.join(".frankensearch");
             assert!(index_root.join(super::FSFS_SENTINEL_FILE).exists());
             assert!(index_root.join(super::FSFS_VECTOR_MANIFEST_FILE).exists());
             assert!(index_root.join(super::FSFS_LEXICAL_MANIFEST_FILE).exists());
@@ -21496,6 +22774,154 @@ mod tests {
     }
 
     #[test]
+    fn fast_only_search_propagates_typed_vector_initialization_failure() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_dir = temp.path().join(".frankensearch");
+            let lexical_path = index_dir.join("lexical");
+            let lexical = create_test_quill(&cx, &lexical_path).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new(
+                        "src/auth.rs",
+                        "authentication middleware validates bearer tokens",
+                    ),
+                )
+                .await
+                .expect("index lexical fixture");
+            lexical.commit(&cx).await.expect("commit lexical fixture");
+            drop(lexical);
+            let vector_path = index_dir.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(
+                vector_path
+                    .parent()
+                    .expect("vector generation path must have a parent directory"),
+            )
+            .expect("create vector generation directory");
+            fs::write(vector_path, b"not-fsvi").expect("write corrupt vector generation");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = index_dir.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(index_dir),
+                ..CliInput::default()
+            });
+
+            let error = runtime
+                .execute_search_phase_artifacts_with_mode(
+                    &cx,
+                    "authentication middleware",
+                    5,
+                    SearchExecutionMode::FastOnly,
+                    None,
+                )
+                .await
+                .expect_err("FastOnly must not convert semantic initialization failure to lexical");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::IndexCorrupted { .. }
+                        | SearchError::IndexVersionMismatch { .. }
+                        | SearchError::Io(_)
+                ),
+                "FastOnly lost the typed vector initialization error: {error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn fast_only_strong_lexical_head_still_requires_semantic_readiness() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let lexical_path = temp.path().join("lexical");
+            let lexical = create_test_quill(&cx, &lexical_path).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new(
+                        "src/needle.rs",
+                        "needle needle needle needle needle exact lexical answer",
+                    ),
+                )
+                .await
+                .expect("index strong lexical head");
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("src/noise.rs", "unrelated background document"),
+                )
+                .await
+                .expect("index lexical noise");
+            lexical.commit(&cx).await.expect("commit lexical fixture");
+            drop(lexical);
+
+            let reader = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("open lexical fixture");
+            let lexical_head = reader
+                .search_doc_ids(&cx, "needle", 5)
+                .expect("search strong lexical fixture")
+                .into_iter()
+                .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
+                .collect::<Vec<_>>();
+            assert!(
+                !lexical_head.is_empty(),
+                "fixture must produce a lexical head"
+            );
+            let voi = FsfsRuntime::semantic_voi_decision(
+                SearchExecutionMode::FastOnly,
+                QueryIntentClass::ShortKeyword,
+                "needle",
+                5,
+                &lexical_head,
+            );
+            assert!(
+                !voi.run_semantic,
+                "fixture must exercise the VOI-skip path that previously hid readiness failures"
+            );
+
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("search generation fingerprint"),
+                lexical_index: Some(reader),
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
+                vector_index: None,
+                pending_semantic_initialization_failure: None,
+                fast_embedder: None,
+                quality_embedder: None,
+                fast_embedder_attempted: false,
+                quality_embedder_attempted: false,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let error = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "needle",
+                    5,
+                    SearchExecutionMode::FastOnly,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect_err("FastOnly readiness must fail closed before lexical-only output");
+            assert!(
+                matches!(error, SearchError::IndexNotFound { .. }),
+                "FastOnly lost the typed missing-vector error: {error:?}"
+            );
+        });
+    }
+
+    #[test]
     fn runtime_search_payload_falls_back_to_lexical_when_vector_index_is_corrupt() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -21555,7 +22981,139 @@ mod tests {
                 !freshness.live_writer,
                 "read-only search must not manufacture a live writer lease"
             );
+            let fallback = payload
+                .degradation_advice
+                .get(DegradationFailureKind::LexicalFallback.reason_code())
+                .expect("authorized Full fallback must attach stable recovery advice");
+            assert_eq!(
+                fallback.schema_version,
+                crate::degradation_advisor::DEGRADATION_ADVICE_SCHEMA_VERSION
+            );
+            assert!(fallback.preserves_initial_results);
+            assert_eq!(
+                fallback.original_error.as_deref(),
+                Some("index_corrupted: semantic vector generation failed integrity validation"),
+                "Full fallback advice must retain the original typed classification in sanitized stable form"
+            );
+            let index_path = project.join(".frankensearch");
+            assert!(
+                fallback
+                    .original_error
+                    .as_deref()
+                    .is_some_and(|summary| !summary.contains(&index_path.display().to_string())),
+                "fallback advice must not expose a temporary index path"
+            );
+            assert!(
+                fallback
+                    .next_actions
+                    .iter()
+                    .any(|action| action.reason_code == "degrade.action.verify_vector_index")
+            );
         });
+    }
+
+    #[test]
+    fn semantic_lexical_fallback_serialization_excludes_provider_paths_and_reasons() {
+        const SENTINEL_PATH: &str = "/private/fsfs/SENTINEL_MODEL_PATH/model.onnx";
+        const SENTINEL_REASON: &str = "SENTINEL_PROVIDER_REASON_DO_NOT_SERIALIZE";
+
+        let cases = [
+            (
+                SearchError::ModelLoadFailed {
+                    path: PathBuf::from(SENTINEL_PATH),
+                    source: Box::new(std::io::Error::other(SENTINEL_REASON)),
+                },
+                "model_load_failed: semantic model could not be loaded safely",
+            ),
+            (
+                SearchError::UnverifiableRemoteSpace {
+                    producer: SENTINEL_PATH.to_owned(),
+                    reason: SENTINEL_REASON.to_owned(),
+                },
+                "unverifiable_remote_space: semantic embedder identity could not be verified",
+            ),
+        ];
+
+        for (error, expected_summary) in cases {
+            let mut resources = SearchExecutionResources {
+                index_root: PathBuf::from("/verified/index"),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(Path::new(
+                    "/verified/index",
+                ))
+                .expect("verified generation fingerprint"),
+                lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
+                vector_index: None,
+                pending_semantic_initialization_failure: None,
+                fast_embedder: None,
+                quality_embedder: None,
+                fast_embedder_attempted: false,
+                quality_embedder_attempted: false,
+                degradation_advice: Vec::new(),
+            };
+            FsfsRuntime::record_semantic_lexical_fallback(&mut resources, "needle", &error);
+            let payload = crate::output_schema::SearchPayload::new(
+                "needle",
+                crate::output_schema::SearchOutputPhase::Initial,
+                0,
+                Vec::new(),
+            )
+            .with_degradation_advice(resources.degradation_advice.clone());
+            let fallback = payload
+                .degradation_advice
+                .get(DegradationFailureKind::LexicalFallback.reason_code())
+                .expect("serialized payload must retain lexical fallback advice");
+            assert_eq!(
+                fallback.original_error.as_deref(),
+                Some(expected_summary),
+                "fallback must retain only a stable typed classification and static summary"
+            );
+
+            for serialized in [
+                serde_json::to_string(fallback).expect("serialize fallback advice"),
+                serde_json::to_string(&payload).expect("serialize search payload"),
+            ] {
+                assert!(
+                    !serialized.contains(SENTINEL_PATH) && !serialized.contains(SENTINEL_REASON),
+                    "fallback serialization leaked raw provider state: {serialized}"
+                );
+            }
+
+            let refinement_advice = FsfsRuntime::sanitized_semantic_degradation_advice(
+                crate::degradation_advisor::classify_search_error(&error),
+                "needle",
+                Path::new("/verified/index"),
+                &error,
+            );
+            assert_eq!(
+                refinement_advice.original_error.as_deref(),
+                Some(expected_summary),
+                "refinement failure must use the same sanitized typed summary"
+            );
+            let refinement_payload = crate::output_schema::SearchPayload::new(
+                "needle",
+                crate::output_schema::SearchOutputPhase::RefinementFailed,
+                0,
+                Vec::new(),
+            )
+            .with_degradation_advice([refinement_advice.clone()]);
+            assert_eq!(
+                refinement_payload.phase,
+                crate::output_schema::SearchOutputPhase::RefinementFailed
+            );
+            for serialized in [
+                serde_json::to_string(&refinement_advice)
+                    .expect("serialize refinement failure advice"),
+                serde_json::to_string(&refinement_payload)
+                    .expect("serialize refinement failure payload"),
+            ] {
+                assert!(
+                    !serialized.contains(SENTINEL_PATH) && !serialized.contains(SENTINEL_REASON),
+                    "refinement serialization leaked raw provider state: {serialized}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -21648,6 +23206,430 @@ mod tests {
                 .run_mode(&cx, InterfaceMode::Cli)
                 .await
                 .expect("search command should complete via cli dispatch");
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProbeFailureKind {
+        Transient,
+        Permanent,
+        Cancelled,
+        CancelWithTransient,
+        CancelWithSuccess,
+        CancelWithPermanent,
+    }
+
+    struct FailingProbeEmbedder {
+        attempts: AtomicUsize,
+        kind: ProbeFailureKind,
+    }
+
+    impl FailingProbeEmbedder {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::Transient,
+            }
+        }
+
+        fn permanent() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::Permanent,
+            }
+        }
+
+        fn cancelled() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::Cancelled,
+            }
+        }
+
+        fn cancel_with_transient() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::CancelWithTransient,
+            }
+        }
+
+        fn cancel_with_success() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::CancelWithSuccess,
+            }
+        }
+
+        fn cancel_with_permanent() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                kind: ProbeFailureKind::CancelWithPermanent,
+            }
+        }
+    }
+
+    impl Embedder for FailingProbeEmbedder {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            let kind = self.kind;
+            Box::pin(async move {
+                match kind {
+                    ProbeFailureKind::Transient => Err(SearchError::EmbeddingFailed {
+                        model: "failing-probe-384".to_owned(),
+                        source: std::io::Error::other("typed transient probe failure").into(),
+                    }),
+                    ProbeFailureKind::Permanent => Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "typed-probe-provider".to_owned(),
+                        reason: "typed-probe-reason".to_owned(),
+                    }),
+                    ProbeFailureKind::Cancelled => Err(SearchError::Cancelled {
+                        phase: "typed-probe-embed".to_owned(),
+                        reason: "typed-probe-cancellation".to_owned(),
+                    }),
+                    ProbeFailureKind::CancelWithTransient => {
+                        cx.set_cancel_requested(true);
+                        Err(SearchError::EmbeddingFailed {
+                            model: "failing-probe-384".to_owned(),
+                            source: std::io::Error::other(
+                                "typed transient failure before cancellation",
+                            )
+                            .into(),
+                        })
+                    }
+                    ProbeFailureKind::CancelWithSuccess => {
+                        cx.set_cancel_requested(true);
+                        Ok(vec![1.0; 384])
+                    }
+                    ProbeFailureKind::CancelWithPermanent => {
+                        cx.set_cancel_requested(true);
+                        Err(SearchError::UnverifiableRemoteSpace {
+                            producer: "typed-probe-provider".to_owned(),
+                            reason: "permanent failure concurrent with cancellation".to_owned(),
+                        })
+                    }
+                }
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            384
+        }
+
+        fn id(&self) -> &'static str {
+            "failing-probe-384"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Failing Probe Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::ApiEmbedder
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BatchProbeBehavior {
+        Transient,
+        Permanent,
+        Cancelled,
+        Valid,
+        CountMismatch,
+        Empty,
+        NonFinite,
+        ZeroSignal,
+        CancelWithSuccess,
+        CancelWithPermanent,
+    }
+
+    struct BatchProbeEmbedder {
+        attempts: AtomicUsize,
+        behavior: BatchProbeBehavior,
+    }
+
+    impl BatchProbeEmbedder {
+        fn new(behavior: BatchProbeBehavior) -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                behavior,
+            }
+        }
+    }
+
+    impl Embedder for BatchProbeEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async {
+                Err(SearchError::SubsystemError {
+                    subsystem: "test.batch_probe.single_embed",
+                    source: std::io::Error::other(
+                        "batch probe must be invoked through embed_batch",
+                    )
+                    .into(),
+                })
+            })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            let behavior = self.behavior;
+            Box::pin(async move {
+                match behavior {
+                    BatchProbeBehavior::Transient => Err(SearchError::EmbeddingFailed {
+                        model: "batch-probe-4".to_owned(),
+                        source: std::io::Error::other("typed transient batch failure").into(),
+                    }),
+                    BatchProbeBehavior::Permanent => Err(SearchError::UnverifiableRemoteSpace {
+                        producer: "typed-batch-provider".to_owned(),
+                        reason: "typed-batch-reason".to_owned(),
+                    }),
+                    BatchProbeBehavior::Cancelled => Err(SearchError::Cancelled {
+                        phase: "typed-batch-embed".to_owned(),
+                        reason: "typed-batch-cancellation".to_owned(),
+                    }),
+                    BatchProbeBehavior::Valid => Ok(vec![vec![1.0, 0.0, 0.0, 0.0]; texts.len()]),
+                    BatchProbeBehavior::CountMismatch => Ok(Vec::new()),
+                    BatchProbeBehavior::Empty => Ok(vec![Vec::new(); texts.len()]),
+                    BatchProbeBehavior::NonFinite => {
+                        Ok(vec![vec![1.0, f32::NAN, 0.0, 0.0]; texts.len()])
+                    }
+                    BatchProbeBehavior::ZeroSignal => Ok(vec![vec![0.0; 4]; texts.len()]),
+                    BatchProbeBehavior::CancelWithSuccess => {
+                        cx.set_cancel_requested(true);
+                        Ok(vec![vec![1.0, 0.0, 0.0, 0.0]; texts.len()])
+                    }
+                    BatchProbeBehavior::CancelWithPermanent => {
+                        cx.set_cancel_requested(true);
+                        Err(SearchError::UnverifiableRemoteSpace {
+                            producer: "typed-batch-provider".to_owned(),
+                            reason: "permanent failure concurrent with cancellation".to_owned(),
+                        })
+                    }
+                }
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &'static str {
+            "batch-probe-4"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Batch Probe Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::ApiEmbedder
+        }
+    }
+
+    struct ProbeVectorEmbedder {
+        dimension: usize,
+        embedding: Vec<f32>,
+        attempts: AtomicUsize,
+    }
+
+    impl ProbeVectorEmbedder {
+        fn new(dimension: usize, embedding: Vec<f32>) -> Self {
+            Self {
+                dimension,
+                embedding,
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Embedder for ProbeVectorEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            let embedding = self.embedding.clone();
+            Box::pin(async move { Ok(embedding) })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &'static str {
+            "probe-vector"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Probe Vector Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    struct FixedSemanticEmbedder {
+        id: &'static str,
+        dimension: usize,
+    }
+
+    impl Embedder for FixedSemanticEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let dimension = self.dimension;
+            Box::pin(async move { Ok(vec![0.0; dimension]) })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Fixed Semantic Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[test]
+    fn production_vector_admission_rejects_legacy_fnv_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("legacy-fnv.fsvi");
+        VectorIndex::create(&vector_path, "fnv1a-384", 384)
+            .expect("create legacy vector generation")
+            .finish()
+            .expect("finish legacy vector generation");
+        let index = VectorIndex::open(&vector_path).expect("open legacy vector generation");
+        let embedder = FixedSemanticEmbedder {
+            id: "fnv1a-384",
+            dimension: 384,
+        };
+
+        let error = FsfsRuntime::validate_fast_embedder_for_vector_index(&index, &embedder, false)
+            .expect_err("legacy FNV generation must not be auto-admitted");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { ref field, ref value, .. }
+                if field == "semantic.vector_generation" && value == "legacy_hash"
+        ));
+    }
+
+    #[test]
+    fn production_vector_admission_returns_typed_identity_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("identity-mismatch.fsvi");
+        VectorIndex::create(&vector_path, "verified-model-a", 384)
+            .expect("create vector generation")
+            .finish()
+            .expect("finish vector generation");
+        let index = VectorIndex::open(&vector_path).expect("open vector generation");
+        let embedder = FixedSemanticEmbedder {
+            id: "verified-model-b",
+            dimension: 384,
+        };
+
+        let error = FsfsRuntime::validate_fast_embedder_for_vector_index(&index, &embedder, false)
+            .expect_err("identity mismatch must remain typed");
+        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+    }
+
+    #[test]
+    fn production_vector_admission_returns_typed_dimension_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vector_path = temp.path().join("dimension-mismatch.fsvi");
+        VectorIndex::create(&vector_path, "verified-model", 256)
+            .expect("create vector generation")
+            .finish()
+            .expect("finish vector generation");
+        let index = VectorIndex::open(&vector_path).expect("open vector generation");
+        let embedder = FixedSemanticEmbedder {
+            id: "verified-model",
+            dimension: 384,
+        };
+
+        let error = FsfsRuntime::validate_fast_embedder_for_vector_index(&index, &embedder, false)
+            .expect_err("dimension mismatch must remain typed");
+        assert!(matches!(
+            error,
+            SearchError::DimensionMismatch {
+                expected: 256,
+                found: 384
+            }
+        ));
+    }
+
+    #[test]
+    fn indexing_probe_rejects_empty_wrong_dimension_and_zero_signal_vectors() {
+        run_test_with_cx(|cx| async move {
+            for (dimension, embedding, expected_found) in
+                [(4, Vec::new(), 0), (4, vec![1.0, 0.0, 0.0], 3)]
+            {
+                let embedder = ProbeVectorEmbedder::new(dimension, embedding);
+                let error = FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &embedder, &[])
+                    .await
+                    .expect_err("wrong-sized probe output must fail readiness");
+                if expected_found == 0 {
+                    assert!(matches!(
+                        error,
+                        SearchError::InvalidConfig { field, value, .. }
+                            if field == "semantic.embedding_output" && value == "empty"
+                    ));
+                } else {
+                    assert!(matches!(
+                        error,
+                        SearchError::DimensionMismatch { expected: 4, found }
+                            if found == expected_found
+                    ));
+                }
+                assert_eq!(
+                    embedder.attempts.load(Ordering::Acquire),
+                    1,
+                    "invalid probe output must not be retried"
+                );
+            }
+
+            for embedding in [vec![0.0; 4], vec![1.0, f32::NAN, 0.0, 0.0]] {
+                let embedder = ProbeVectorEmbedder::new(4, embedding);
+                let error =
+                    FsfsRuntime::probe_indexing_embedder_with_backoffs(&cx, &embedder, &[0, 0])
+                        .await
+                        .expect_err("zero or non-finite probe output must fail readiness");
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::InvalidConfig { ref field, .. }
+                            if field == "semantic.embedding_output"
+                    ),
+                    "probe signal validation lost its typed error: {error:?}"
+                );
+                assert_eq!(
+                    embedder.attempts.load(Ordering::Acquire),
+                    1,
+                    "zero and non-finite vectors are permanent failures"
+                );
+            }
         });
     }
 
@@ -21798,10 +23780,13 @@ mod tests {
             let barrier = Arc::new(QualityBarrier::default());
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("stream generation fingerprint"),
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
                 fast_embedder_attempted: true,
@@ -21974,10 +23959,13 @@ mod tests {
 
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("stream generation fingerprint"),
                 lexical_index: Some(lexical_index),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(CancelledEmbedder)),
                 quality_embedder: None,
                 fast_embedder_attempted: true,
@@ -22053,10 +24041,13 @@ mod tests {
 
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
+                generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
+                    .expect("stream generation fingerprint"),
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                pending_semantic_initialization_failure: None,
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(CancelledEmbedder)),
                 fast_embedder_attempted: true,
@@ -22355,7 +24346,16 @@ mod tests {
             assert_eq!(payload.models[0].tier, "fast");
             assert!(payload.models[0].cached);
             assert_eq!(payload.models[1].tier, "quality");
-            assert!(payload.models[1].cached);
+            #[cfg(feature = "embedded-models")]
+            {
+                assert!(payload.models[1].cached);
+                assert!(payload.models[1].size_bytes > 0);
+            }
+            #[cfg(not(feature = "embedded-models"))]
+            {
+                assert!(!payload.models[1].cached);
+                assert_eq!(payload.models[1].size_bytes, 0);
+            }
             assert_eq!(
                 payload.runtime.tracked_index_bytes,
                 Some(payload.index.size_bytes)
@@ -23129,6 +25129,56 @@ mod tests {
             payload.pass_count + payload.warn_count + payload.fail_count,
             payload.checks.len(),
             "verdict counts should sum to total checks"
+        );
+    }
+
+    #[test]
+    fn doctor_warns_when_semantic_generation_is_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        runtime
+            .write_index_sentinel(
+                &index_root,
+                &super::IndexSentinel {
+                    schema_version: 1,
+                    generation_complete: false,
+                    generated_at_ms: super::pressure_timestamp_ms(),
+                    command: "index".to_owned(),
+                    target_root: temp.path().join("project").display().to_string(),
+                    index_root: index_root.display().to_string(),
+                    discovered_files: 2,
+                    indexed_files: 2,
+                    skipped_files: 0,
+                    reason_codes: Vec::new(),
+                    total_canonical_bytes: 128,
+                    source_hash_hex: "partial-generation".to_owned(),
+                },
+            )
+            .expect("write incomplete sentinel");
+
+        let payload = runtime
+            .collect_doctor_payload()
+            .expect("collect doctor payload");
+        let index_check = payload
+            .checks
+            .iter()
+            .find(|check| check.name == "index")
+            .expect("index doctor check");
+        assert_eq!(index_check.verdict, super::DoctorVerdict::Warn);
+        assert!(
+            index_check
+                .detail
+                .contains("semantic indexing is incomplete")
+        );
+        assert_eq!(
+            index_check.suggestion.as_deref(),
+            Some("resume `fsfs index` before using semantic search")
         );
     }
 
@@ -24125,6 +26175,59 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "embedded-models"))]
+    #[test]
+    fn model_free_guidance_requires_a_loader_capable_build() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mode_hint = runtime
+            .search_mode_hint()
+            .expect("model-free mode hint")
+            .expect("model-free builds always explain their capability boundary");
+        let doctor_hint = super::semantic_model_doctor_recovery_guidance();
+        let directory_hint = super::semantic_model_directory_guidance();
+
+        for guidance in [mode_hint.as_str(), doctor_hint, directory_hint] {
+            assert!(
+                guidance.contains("--no-default-features --features embedded-models"),
+                "guidance must name the verified-input loader build contract: {guidance}"
+            );
+            assert!(
+                !guidance.contains("fall back to hash")
+                    && !guidance.contains("hash + lexical fallback"),
+                "guidance must not promise implicit hash semantics: {guidance}"
+            );
+        }
+        assert!(
+            mode_hint.contains("downloaded model files alone cannot activate semantic retrieval"),
+            "downloaded files are inputs, not a runtime loader capability: {mode_hint}"
+        );
+        assert!(
+            mode_hint.contains("full fsfs prebuilt"),
+            "the supported full-prebuilt recovery path must remain explicit: {mode_hint}"
+        );
+
+        for tier in ["fast", "quality"] {
+            let check = FsfsRuntime::model_doctor_check(
+                tier,
+                "verified-model",
+                Path::new("/verified/model-cache"),
+                true,
+            );
+            assert_eq!(
+                check.verdict,
+                super::DoctorVerdict::Warn,
+                "cached files cannot make a model-free binary loader-capable"
+            );
+            assert!(check.detail.contains("this binary has no"));
+            assert!(
+                check.suggestion.as_deref().is_some_and(|suggestion| {
+                    suggestion.contains("--no-default-features --features embedded-models")
+                }),
+                "doctor must prescribe a loader-capable build"
+            );
+        }
+    }
+
     #[test]
     fn search_payload_cache_roundtrip_and_invalidates_on_index_change() {
         run_test_with_cx(|cx| async move {
@@ -24159,12 +26262,15 @@ mod tests {
             refined.phase = SearchOutputPhase::Refined;
             refined.hits[0].score = 0.9;
             let payloads = vec![initial, refined];
+            let cache_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint cache generation");
 
             runtime
-                .write_search_payload_cache(&key, &payloads)
+                .write_search_payload_cache(&key, &payloads, &cache_fingerprint)
                 .expect("write cache");
             let cached = runtime
-                .try_load_search_payload_cache(&key)
+                .try_load_search_payload_cache(&key, &cache_fingerprint)
                 .expect("read cache")
                 .expect("cache hit");
             assert_eq!(cached, payloads);
@@ -24188,13 +26294,409 @@ mod tests {
             let vector_dir = index_root.join("vector");
             std::fs::create_dir_all(&vector_dir).expect("create vector dir");
             std::fs::write(vector_dir.join("index.fsvi"), b"mutated").expect("touch vector index");
+            let mutated_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint mutated generation");
 
             let stale = runtime
-                .try_load_search_payload_cache(&key)
+                .try_load_search_payload_cache(&key, &mutated_fingerprint)
                 .expect("cache read after mutation");
             assert!(
                 stale.is_none(),
                 "cache should invalidate after index changes"
+            );
+        });
+    }
+
+    #[test]
+    fn search_payload_cache_cannot_relabel_stale_results_as_the_new_generation() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            std::fs::create_dir_all(&index_root).expect("create index root");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = index_root.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let key = runtime.search_cache_key("stale computation", 10, SearchExecutionMode::Full);
+            let stale_payloads = vec![SearchPayload::new(
+                "stale computation",
+                SearchOutputPhase::Refined,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "generation-a.rs".to_owned(),
+                    score: 0.75,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    in_both_sources: true,
+                }],
+            )];
+            let generation_a = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint generation A");
+
+            let vector_dir = index_root.join("vector");
+            std::fs::create_dir_all(&vector_dir).expect("create vector dir");
+            std::fs::write(vector_dir.join("index.fsvi"), b"generation B")
+                .expect("publish generation B vector artifact");
+            let generation_b = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint generation B");
+            assert_ne!(
+                generation_a, generation_b,
+                "the regression requires two distinct generation fingerprints"
+            );
+
+            runtime
+                .write_search_payload_cache(&key, &stale_payloads, &generation_a)
+                .expect("persist generation A computation after generation B is visible");
+
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &generation_b)
+                    .expect("read cache as generation B")
+                    .is_none(),
+                "a late generation A writer must never poison generation B's cache namespace"
+            );
+            let cache_path = runtime.search_cache_path(&key).expect("resolve cache path");
+            let record: SearchCacheRecord = serde_json::from_slice(
+                &std::fs::read(cache_path).expect("read persisted cache record"),
+            )
+            .expect("decode persisted cache record");
+            assert_eq!(
+                record.index_fingerprint, generation_a,
+                "the cache writer must preserve the execution pin instead of recomputing \
+                 and relabeling stale payloads as the currently visible generation"
+            );
+        });
+    }
+
+    fn install_deferred_semantic_generation(index_root: &Path) {
+        fs::create_dir_all(index_root).expect("create deferred generation root");
+        let checkpoint = super::IndexingCheckpoint {
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: "/tmp/project".to_owned(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            embedder_id: "semantic-model".to_owned(),
+            embedder_dimension: 4,
+            embedder_is_hash_fallback: false,
+            artifacts_durable: true,
+            source_hash_hex: "deferred-generation".to_owned(),
+            reason_codes: Vec::new(),
+            files: super::BTreeMap::from([(
+                "src/main.rs".to_owned(),
+                super::CheckpointFileEntry {
+                    revision: 42,
+                    ingestion_class: "full_semantic_lexical".to_owned(),
+                    canonical_bytes: 1_024,
+                    reason_code: "index.plan.full_semantic_lexical".to_owned(),
+                    lexical_indexed: true,
+                    semantic_indexed: false,
+                    content_hash_hex: "abc123".to_owned(),
+                },
+            )]),
+            discovered_files: 1,
+            skipped_files: 0,
+        };
+        super::write_indexing_checkpoint(index_root, &checkpoint)
+            .expect("write deferred generation checkpoint");
+        FsfsRuntime::new(FsfsConfig::default())
+            .write_index_sentinel(
+                index_root,
+                &super::IndexSentinel {
+                    schema_version: 1,
+                    generation_complete: false,
+                    generated_at_ms: 3,
+                    command: "index".to_owned(),
+                    target_root: checkpoint.target_root,
+                    index_root: checkpoint.index_root,
+                    discovered_files: 1,
+                    indexed_files: 1,
+                    skipped_files: 0,
+                    reason_codes: Vec::new(),
+                    total_canonical_bytes: 1_024,
+                    source_hash_hex: checkpoint.source_hash_hex,
+                },
+            )
+            .expect("write deferred generation sentinel");
+    }
+
+    #[test]
+    fn persistent_cache_never_bypasses_deferred_semantic_admission() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            install_deferred_semantic_generation(&index_root);
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            let key = runtime.search_cache_key("cached semantic", 10, SearchExecutionMode::Full);
+            let cached_payloads = vec![SearchPayload::new(
+                "cached semantic",
+                SearchOutputPhase::Refined,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "src/main.rs".to_owned(),
+                    score: 0.9,
+                    snippet: None,
+                    lexical_rank: None,
+                    semantic_rank: Some(0),
+                    in_both_sources: false,
+                }],
+            )];
+            let cache_fingerprint = runtime
+                .search_index_fingerprint()
+                .expect("fingerprint incomplete generation");
+            runtime
+                .write_search_payload_cache(&key, &cached_payloads, &cache_fingerprint)
+                .expect("seed cache against the incomplete generation fingerprint");
+            assert!(
+                runtime
+                    .try_load_search_payload_cache(&key, &cache_fingerprint)
+                    .expect("read matching cache")
+                    .is_some(),
+                "the regression requires an otherwise valid matching cache record"
+            );
+
+            let error = runtime
+                .execute_search_payloads_cached_for_cli(&cx, "cached semantic", 10)
+                .await
+                .expect_err("semantic admission must run before a cache hit can escape");
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "semantic.index_generation" && value == "incomplete"
+                ),
+                "the final sentinel must remain the first semantic admission fence before cache \
+                 lookup: {error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_serve_rebinds_deferred_generation_to_repaired_semantic_resources() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let quill_path = index_root.join(super::FSFS_QUILL_ENGINE_DIR);
+            let lexical_query = "lexical repair marker";
+            let semantic_query = "why does the repaired semantic generation answer this question";
+            let document_id = "src/main.rs";
+
+            let quill = create_test_quill(&cx, &quill_path).await;
+            quill
+                .index_document(&cx, &IndexableDocument::new(document_id, lexical_query))
+                .await
+                .expect("index lexical witness");
+            quill.commit(&cx).await.expect("commit lexical witness");
+            drop(quill);
+            let pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                super::FSFS_QUILL_ENGINE_DIR,
+                frankensearch_quill::FSLX_FORMAT_VERSION,
+            )
+            .expect("create Quill CURRENT pointer");
+            publish_current(&index_root, &pointer).expect("publish Quill CURRENT pointer");
+            install_deferred_semantic_generation(&index_root);
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_serve_resources(&cx)
+                .await
+                .expect("lexical-only serving must admit a durable deferred generation");
+            assert!(resources.lexical_index.is_some());
+            assert!(resources.vector_index.is_none());
+            let deferred_fingerprint = resources.generation_fingerprint.clone();
+
+            let cached_payloads = vec![SearchPayload::new(
+                lexical_query,
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: document_id.to_owned(),
+                    score: 1.0,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                }],
+            )];
+            let lexical_key =
+                runtime.search_cache_key(lexical_query, 10, SearchExecutionMode::LexicalOnly);
+            let full_key = runtime.search_cache_key(semantic_query, 10, SearchExecutionMode::Full);
+            let fast_key =
+                runtime.search_cache_key(semantic_query, 10, SearchExecutionMode::FastOnly);
+            let mut hot_cache = HashMap::from([
+                (lexical_key.clone(), cached_payloads.clone()),
+                (full_key.clone(), cached_payloads.clone()),
+                (fast_key.clone(), cached_payloads),
+            ]);
+
+            let lexical_cached = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    SearchServeRequest {
+                        query: lexical_query.to_owned(),
+                        limit: Some(10),
+                        mode: Some("lexical_only".to_owned()),
+                        filter: None,
+                    },
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("lexical-only hot-cache request");
+            assert!(lexical_cached.cached);
+
+            for mode in ["full", "fast_only"] {
+                let error = runtime
+                    .execute_search_serve_request(
+                        &cx,
+                        SearchServeRequest {
+                            query: semantic_query.to_owned(),
+                            limit: Some(10),
+                            mode: Some(mode.to_owned()),
+                            filter: None,
+                        },
+                        &mut resources,
+                        &mut hot_cache,
+                        true,
+                    )
+                    .await
+                    .expect_err("semantic mode must reject before consulting its hot-cache entry");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "semantic.index_generation"
+                            && matches!(value.as_str(), "deferred_rows" | "incomplete")
+                ));
+            }
+
+            let embedder = HashEmbedder::default_256();
+            let document_embedding = embedder
+                .embed(&cx, semantic_query)
+                .await
+                .expect("embed repaired semantic witness");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(
+                vector_path
+                    .parent()
+                    .expect("FSFS vector artifact has a parent directory"),
+            )
+            .expect("create repaired vector directory");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())
+                    .expect("create repaired vector generation");
+            vector_writer
+                .write_record(document_id, &document_embedding)
+                .expect("append repaired semantic witness");
+            vector_writer
+                .finish()
+                .expect("seal repaired vector generation");
+
+            let mut checkpoint = super::read_indexing_checkpoint(&index_root)
+                .expect("read deferred checkpoint")
+                .expect("deferred checkpoint exists");
+            checkpoint.updated_at_ms = checkpoint.updated_at_ms.saturating_add(1);
+            checkpoint.embedder_id = embedder.id().to_owned();
+            checkpoint.embedder_dimension = embedder.dimension();
+            checkpoint.source_hash_hex = "repaired-generation".to_owned();
+            for entry in checkpoint.files.values_mut() {
+                if entry.ingestion_class
+                    == super::ingestion_class_label(IngestionClass::FullSemanticLexical)
+                {
+                    entry.semantic_indexed = true;
+                }
+            }
+            super::write_indexing_checkpoint(&index_root, &checkpoint)
+                .expect("publish repaired durable checkpoint");
+            let mut sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read deferred sentinel")
+                .expect("deferred sentinel exists");
+            sentinel.generation_complete = true;
+            sentinel.generated_at_ms = sentinel.generated_at_ms.saturating_add(1);
+            sentinel.source_hash_hex = checkpoint.source_hash_hex;
+            runtime
+                .write_index_sentinel(&index_root, &sentinel)
+                .expect("publish repaired complete sentinel");
+
+            let repaired_fingerprint = FsfsRuntime::search_index_fingerprint_at_root(&index_root)
+                .expect("fingerprint repaired generation");
+            assert_ne!(repaired_fingerprint, deferred_fingerprint);
+
+            let lexical_after_repair = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    SearchServeRequest {
+                        query: lexical_query.to_owned(),
+                        limit: Some(10),
+                        mode: Some("lexical_only".to_owned()),
+                        filter: None,
+                    },
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("first post-repair lexical-only request");
+            assert!(
+                !lexical_after_repair.cached,
+                "generation rebind must clear the old hot cache before lookup"
+            );
+            assert_eq!(resources.generation_fingerprint, repaired_fingerprint);
+            assert_eq!(
+                resources
+                    .vector_index
+                    .as_ref()
+                    .expect("lexical-only-triggered rebind retains full resources")
+                    .record_count(),
+                1
+            );
+            assert!(
+                !hot_cache.contains_key(&full_key) && !hot_cache.contains_key(&fast_key),
+                "rebind must evict stale semantic-mode cache entries"
+            );
+
+            let full_after_repair = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    SearchServeRequest {
+                        query: semantic_query.to_owned(),
+                        limit: Some(10),
+                        mode: Some("full".to_owned()),
+                        filter: None,
+                    },
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("full request against repaired generation");
+            assert!(!full_after_repair.cached);
+            assert!(resources.fast_embedder_attempted);
+            assert!(
+                full_after_repair.payloads.iter().any(|payload| {
+                    payload
+                        .hits
+                        .iter()
+                        .any(|hit| hit.path == document_id && hit.semantic_rank.is_some())
+                }),
+                "full request must retrieve the witness from the rebound vector generation"
             );
         });
     }
@@ -24254,6 +26756,117 @@ mod tests {
         assert_eq!(decoded.files["src/main.rs"].canonical_bytes, 1024);
         assert!(!decoded.files["src/main.rs"].semantic_indexed);
         assert!(!decoded.files["src/lib.rs"].semantic_indexed);
+    }
+
+    #[test]
+    fn deferred_semantic_generation_is_degraded_and_semantic_search_fails_closed() {
+        let index_root = Path::new("/tmp/index");
+        let deferred_entry = super::CheckpointFileEntry {
+            revision: 42,
+            ingestion_class: "full_semantic_lexical".to_owned(),
+            canonical_bytes: 1_024,
+            reason_code: "index.plan.full_semantic_lexical".to_owned(),
+            lexical_indexed: true,
+            semantic_indexed: false,
+            content_hash_hex: "abc123".to_owned(),
+        };
+        let checkpoint = super::IndexingCheckpoint {
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: "/tmp/project".to_owned(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            embedder_id: "semantic-model".to_owned(),
+            embedder_dimension: 4,
+            embedder_is_hash_fallback: false,
+            artifacts_durable: true,
+            source_hash_hex: "generation-hash".to_owned(),
+            reason_codes: Vec::new(),
+            files: super::BTreeMap::from([("src/main.rs".to_owned(), deferred_entry)]),
+            discovered_files: 1,
+            skipped_files: 0,
+        };
+
+        assert!(!super::semantic_generation_complete(1));
+        assert_eq!(
+            super::indexing_final_stage(false, false),
+            super::IndexingProgressStage::CompletedDegraded
+        );
+        assert!(
+            super::validate_checkpoint_search_admission(
+                index_root,
+                &checkpoint,
+                super::SearchExecutionMode::LexicalOnly,
+            )
+            .is_ok(),
+            "a durable lexical generation remains searchable"
+        );
+        for mode in [
+            super::SearchExecutionMode::Full,
+            super::SearchExecutionMode::FastOnly,
+        ] {
+            let error = super::validate_checkpoint_search_admission(index_root, &checkpoint, mode)
+                .expect_err("deferred semantic rows must block semantic search");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "semantic.index_generation" && value == "deferred_rows"
+            ));
+        }
+
+        let incomplete_sentinel = super::IndexSentinel {
+            schema_version: 1,
+            generation_complete: false,
+            generated_at_ms: 3,
+            command: "index".to_owned(),
+            target_root: "/tmp/project".to_owned(),
+            index_root: index_root.display().to_string(),
+            discovered_files: 1,
+            indexed_files: 1,
+            skipped_files: 0,
+            reason_codes: Vec::new(),
+            total_canonical_bytes: 1_024,
+            source_hash_hex: "generation-hash".to_owned(),
+        };
+        assert!(
+            super::validate_sentinel_search_admission(
+                index_root,
+                &incomplete_sentinel,
+                super::SearchExecutionMode::LexicalOnly,
+            )
+            .is_ok()
+        );
+        let error = super::validate_sentinel_search_admission(
+            index_root,
+            &incomplete_sentinel,
+            super::SearchExecutionMode::Full,
+        )
+        .expect_err("incomplete sentinel must block semantic search");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, .. }
+                if field == "semantic.index_generation" && value == "incomplete"
+        ));
+
+        let mut complete_checkpoint = checkpoint.clone();
+        complete_checkpoint
+            .files
+            .get_mut("src/main.rs")
+            .expect("semantic row")
+            .semantic_indexed = true;
+        assert!(
+            super::validate_checkpoint_search_admission(
+                index_root,
+                &complete_checkpoint,
+                super::SearchExecutionMode::Full,
+            )
+            .is_ok()
+        );
+        assert!(super::semantic_generation_complete(0));
+        assert_eq!(
+            super::indexing_final_stage(false, true),
+            super::IndexingProgressStage::Completed
+        );
     }
 
     #[test]
@@ -24423,7 +27036,6 @@ mod tests {
             super::IndexingProgressStage::Indexing,
             super::IndexingProgressStage::RetryingEmbedding,
             super::IndexingProgressStage::Finalizing,
-            super::IndexingProgressStage::SemanticUpgrade,
             super::IndexingProgressStage::Completed,
             super::IndexingProgressStage::CompletedDegraded,
         ];
@@ -24441,7 +27053,6 @@ mod tests {
             super::IndexingProgressStage::Indexing,
             super::IndexingProgressStage::RetryingEmbedding,
             super::IndexingProgressStage::Finalizing,
-            super::IndexingProgressStage::SemanticUpgrade,
             super::IndexingProgressStage::Completed,
             super::IndexingProgressStage::CompletedDegraded,
         ];
@@ -24454,7 +27065,6 @@ mod tests {
 
     #[test]
     fn indexing_warning_severity_variants_exist() {
-        let _info = super::IndexingWarningSeverity::Info;
         let _warn = super::IndexingWarningSeverity::Warn;
         let _error = super::IndexingWarningSeverity::Error;
     }

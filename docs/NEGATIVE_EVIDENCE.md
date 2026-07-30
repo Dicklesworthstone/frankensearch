@@ -17454,6 +17454,81 @@ interpreting any A/B magnitude, and require the full normative matrix plus an
 immediate same-ELF reproduction before activation. Never weaken a null law,
 select a favorable row, or gate on CV.
 
+### 2026-07-29 — Hand-written canonical encoder is no-ship after a contaminated adverse diagnostic (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
+
+**Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
+An experimental `index.rs` overlay on committed candidate
+`37c42ed4a278e6fa50022c3e358db65388802b22` replaced
+`serde_json::to_vec` with a scalar hand-written canonical JSON emitter. The
+index-only diff SHA-256 was
+`77f95402188255bd62a65e98dbc9a262a2420a8197cdd6dc882e11f6fb8101f8`.
+Strict-remote correctness job `j-29952570386546852` passed all 15 selected
+tests, including hostile Unicode and control bytes, every `u8` digit-width
+boundary, metadata insertion-order permutations, canonical byte equality,
+content-hash equality, and complete deterministic FSLX segment identity.
+
+The same-binary timing job `j-29952570386546854` executed ELF SHA-256
+`21d8aa832825fdecf69a95069ab66c15bbdfb676f1e69b4025f3ef3bb35a88e4`
+(51,677,560 bytes) on worker `vmi1227854`. Its raw 41-round, four-inner
+diagnostic reported this same-invocation A/A null: `0.989567 [0.977726,
+1.000756]` for serde/serde. The direct/serde latency ratio was
+`1.133086 [1.123543, 1.140405]`; raw absolutes were 6,084.7 ns/document for
+serde and 6,791.2 ns/document for the direct emitter.
+
+Those timing values are **not admissible**. The enclosing RCH job interval was
+13:48:09Z–14:02:58Z, but per-sample worker occupancy was not captured.
+Scheduler mail records unrelated four-slot job `j-29952570386546855`
+starting on the same worker at 13:59:32Z while the benchmark remained in its
+execute phase, filling the worker to eight of eight slots. RCH history also
+shows earlier job-level co-residency with `j-29952570386546853`. Because
+complete-interval isolation is unproven, cross-project CPU, memory, and cache
+interference invalidates the entire timing invocation. The apparent 13.3%
+regression is retained only as an adverse diagnostic; neither its narrow
+interval nor its apparent null can establish a performance verdict.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** Exact
+correctness is insufficient to land an optimization without admissible
+positive evidence. The entire production, test, and benchmark overlay was
+manually removed, and `index.rs` again matches committed source. W2.5 remains
+open for distinct mechanisms.
+
+**Retry predicate:** do not rerun the same scalar per-byte emitter merely to
+seek a favorable sample. Revisit only after a profile or counted allocation
+receipt names a different mechanism, such as block escape scanning or a
+single-pass serializer/hash/IDMAP sink. First repeat the same correctness
+oracles, then run the same-binary A/A plus A/B on a pinned worker with
+exclusive-worker occupancy proven for the complete timed interval. A terminal
+Apple-Silicon or Threadripper campaign claim still requires the separate
+cross-engine contract.
+
+### 2026-07-29 — CORRECTION: QG-1 5995WX width sweep lacks observed-concurrency receipts (`bd-h6eh`, YellowSparrow)
+
+The prior 2026-07-29 QG-1 sweep adjudication is retracted. Its clean source
+revision `bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates commit
+`9b23e0d4`, which made QG-1 concurrency observations receipt-bound. Inspection
+of the sealed 1- and 96-thread `QG-1.evidence.json` artifacts, and likewise
+the other seven cells, shows `spec.concurrency_witness: null`.
+
+The run recorded requested widths and executed an old Quill-side Rayon pool
+assertion, but it did not persist the required Quill and Tantivy observations.
+The current gate contract states that a configuration parameter alone is
+never observed concurrency. A valid A/A control cannot repair missing
+admission provenance.
+
+**Corrected decision: DIAGNOSTIC / UNSCORED / NO QG-1 CLAIM.** The previously
+reported 1-thread `0.256083 [0.250163, 0.258549]` and 96-thread
+`0.236489 [0.233668, 0.239445]` ratios are raw diagnostics, not
+decision-valid MISSes. No certified scaling curve or high-thread conclusion
+exists, and QG-1 remains inactive. The original rows and sealed artifacts are
+retained as retracted history; the tranche adjudication carries an explicit
+erratum.
+
+**Retry predicate:** use source at or after `9b23e0d4` and require every
+QG-1 cell to persist positive Quill and Tantivy concurrency observations with
+`min == max ==` the configured width. Only after those witnesses, both
+same-invocation A/A controls, exact-ELF provenance, the complete normative
+matrix, and immediate reproduction admit may any ratio be labeled a MISS or
+used to describe scaling.
 ### 2026-07-29 — REJECT: exclusive QG-1 sweep observes one active Quill ingest worker at every requested width (`bd-h6eh`, FoggySquirrel)
 
 **Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
@@ -17507,3 +17582,401 @@ counted mechanism changes may this exact topology be rerun under the same
 ELF, same-invocation incumbent, dual-null, bootstrap median-CI, corpus, and
 affinity contract. Do not blind-resample invalid-null rows, select a
 favorable width, weaken a null law, or gate on CV.
+
+### 2026-07-29 — CORRECTION: exclusive QG-1 sweep is diagnostic/no-claim, not a target-slice MISS (`bd-h6eh`, YellowSparrow)
+
+The immediately preceding adjudication is retained as superseded audit
+history, but its MISS and negative-verdict labels are retracted. Direct
+inspection of all nine sealed `QG-1.evidence.json` artifacts shows
+`gate_decision: null` and the no-claim reason
+`evidence.incomplete_gate_selection`. Requested widths 1, 2, 32, 64, and
+128 have `gate_status: no_decision` and are measured-provisional only.
+Requested widths 4, 8, 16, and 96 have `gate_status: invalid_null` and are
+UNSCORED. Every corresponding `QG-1.json` has
+`laws_attested: false`.
+
+**Corrected decision: DIAGNOSTIC / NO-CLAIM / NO QG-1 VERDICT.** None of
+the nine ratios is a decision-valid MISS, no target slice receives a negative
+verdict or promotion, no certified width curve exists, and QG-1 remains
+inactive. The
+untimed observation that only one Quill worker crossed the CPU-active
+threshold is useful structural routing evidence; it does not upgrade an
+incomplete gate selection into a performance verdict. The retained tranche
+contains 63 per-width artifacts plus this one `SWEEP.md` adjudication, for 64
+tracked files. The earlier “72 source artifacts” count included nine ignored
+`run.log` files and was not a tracked-artifact count.
+
+**Retry predicate:** make the counted mechanism change first—reduce Quill
+copy calls or bytes per document on identical input, or make the measured
+ingest hot path use more than one CPU-active worker—then execute the complete
+normative QG-1 selection and its immediate same-ELF reproduction. Require
+the actual Tantivy incumbent in the same invocation, both A/A nulls,
+bootstrap median-CIs, exact executable identity, sealed concurrency
+witnesses, and `laws_attested: true` before publishing any PASS, MISS,
+negative verdict, or promotion claim.
+
+### 2026-07-29 — METHODOLOGY / VALID-MECHANISM: Quill moves 8.1587x Tantivy copy bytes/document on the source-3684 diagnostic child (`bd-e8h`, FoggySquirrel)
+
+**Evidence class: DIAGNOSTIC MECHANISM, not an incumbent timing or QG
+claim.** Exact ELF SHA-256
+`03308f4b4b74140cc2a9cbcf926cbe29b9c9118e34512af947e70538d88114e0`
+ran an identical 200,000-document, 50,000,000-byte writer-heap,
+requested-threads=1, positions-on child fixture. Separate sequential uprobe
+invocations counted 203,720,623 resolved AVX copy entries and
+41,437,077,594 bytes for Quill, versus 104,016,287 entries and
+5,078,894,209 bytes for pinned Tantivy 0.26.1. That is 1,018.603 versus
+520.081 calls/document, 202.329 versus 24.799 KiB/document, and
+Quill/Tantivy ratios of 1.958545x calls and 8.158681x bytes.
+
+Matching profiles attribute 7.74% dwarf / 7.25% frame-pointer self-time to
+Quill memmove and 5.75% / 5.29% to Tantivy. Quill copy bytes/document rise
+205.63% from 20,000 to 200,000 documents while Tantivy stays flat, supporting
+flush, seal, or publication copy amplification as the next investigation
+route. A five-run balanced powersave audit observed median 4.268922 GHz for
+Quill and 4.029451 GHz for Tantivy; the 5.943% frequency skew favored Quill
+and cannot explain its copy deficit. The diagnostic child also reports about
+0.996 versus 1.815 CPU-equivalents, so it is not single-hardware-thread wall
+timing evidence.
+
+**Decision: VALID-MECHANISM / DIAGNOSTIC ONLY.** There is no A/A control
+because the counters came from separate profiler invocations. Do not infer a
+performance ratio, current-incumbent verdict, QG state, or activation from
+this mechanism receipt. Route the next lever to an already mapped copy site.
+The complete receipt and counter definitions are in
+`docs/evidence/e8h/p1-qg2-cross-engine-memmove-counters-20260729.md`.
+
+**Retry predicate:** after immutable integration, require byte-identical
+index output and repeat the same 200,000-document mechanism probe. The lever
+must materially reduce Quill copy bytes/document before any QG rerun. Then
+run QG-2 with the exact-current ELF, pinned Tantivy in the same invocation,
+both A/A nulls, and bootstrap median-CIs. QG-1 additionally requires more
+than one observed CPU-active Quill ingest worker. If bytes/document do not
+fall, record the counted mechanism as unchanged and route elsewhere without
+timing; never derive an A/B ratio from separate profiler invocations or gate
+on CV.
+### 2026-07-29 — REJECT seal-path copy/decode elision in segment+quiver encoders (bd-w8dut P2, SandyGrove)
+
+**Hypothesis (from the P1 attribution card
+`docs/evidence/e8h/p1-local-qg2-memmove-attribution-20260729.md`):** two
+seal-path sites — (a) section-assembly copies 1.37% of the quill arm, (b) seal
+posting re-decode 0.56% — are elidable inside
+`crates/frankensearch-quill/src/segment.rs` + `quiver.rs` alone. Lever as
+implemented: (1) `EncodedPostingList::finish_encoding` passed the freshly
+encoded, self-delimiting block bytes straight through in release instead of
+fully re-decoding them for self-validation (debug builds kept the validating
+re-parse; `block_count` derived by construction, one block per
+`encode_posting_block` call); (2) `EncodedSegment::encode_with_limits_impl`
+wrote the header directly at its planned offset in the destination buffer
+instead of staging an intermediate `header_bytes` Vec and copying it.
+
+**Scope finding (why most of site (a) was NOT implementable here):** the
+production seal calls `EncodedSegment::encode` from `scribe.rs:3441` with
+borrowed section buffers; the one copy per section into the file buffer
+(`segment.rs` §encode loop) and the STOREDMETA accumulator→section blob copy
+(`quiver.rs` `encode_accumulator_with_limits`) can only be elided if the scribe
+seal adopts the existing `SegmentAssembler` encode-into-place seam
+(`segment.rs:227`, already used by keeper concat-merge) — a scribe.rs change,
+out of this pass's reserved files. The in-scope elidable share was therefore
+only ~0.6-0.8% of the arm, and the A/B confirmed exactly that.
+
+**Byte-identity proof (cross-ELF):** deterministic probe emitted 8 artifacts —
+a full 10-section DEFAULT_SCHEMA FSLX segment file plus posting streams
+covering VINT partial/BITMAP/FOR/multi-block and the fresh-seal
+POSTINGS+BLOCKMAX pair — under both ELFs; all 8 SHA-256 MATCH, and block
+counts match (1,1,1,1,4;4). The pinned wire oracle
+(`pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads`,
+frozen `fslx-v1-golden.hex`) and the assembler byte-identity test passed on
+the lever build. RED-ability was demonstrated by deliberate mutations: a
+one-byte CRC-window shift went RED in 10 segment tests; `block_count + 1`
+went RED in `posting_concat_is_associative_and_copies_exact_source_bytes`
+(quiver.rs:12788).
+
+**Workload:** QG-2 smoke memory child (`QUILL_PERF_CHILD_MODE=memory`,
+`ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on,
+`QUILL_PERF_SCALE=smoke`), externally wall-timed, taskset-pinned to one core,
+interleaved paired runs, n=16 per arm. Machine class **local-5975wx-32c**
+(diagnostic host, not a certified campaign class; governor powersave —
+relative paired ratios only).
+
+- Baseline ELF sha256: 9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b
+- Lever ELF sha256: e4e4bcae6b567ece66919cc227fbfd6a1dd650097c67a161701060135c170c25
+- Both built from origin/main `3684b147` overlay (lever = overlay + the two
+  edited files), same flags (`-C force-frame-pointers=yes`, release-perf),
+  same isolated target dir.
+
+| arm | median docs/s | p5 | p95 |
+|---|---:|---:|---:|
+| baseline | 38,348 | 37,799 | 38,778 |
+| lever | 38,718 | 37,874 | 39,186 |
+
+Paired ratio lever/baseline (docs/s, >1 = lever faster): **median 1.0071
+[p5 0.9890, p95 1.0247]**, n=16. A/A null: baseline ELF vs itself, interleaved
+in the same invocation series on the same pinned core, median 0.9995
+[p5 0.9894, p95 1.0161], n=16 — the A/B interval sits inside the null band's
+character and straddles 1.0. Arm dispersion (relative spread of per-run
+values, diagnostic only, never decisive): baseline 0.75%, lever 1.32%, A/A
+arms 0.68%/0.59%. The decision below rests solely on the paired-ratio median
+CI versus the A/A null floor.
+
+**Mechanism evidence (the lever DID land mechanically):** same-session
+arm-scoped dwarf profiles (F=1997, ~10-11K samples each, P1 method):
+seal-validation decode frames `decode_vint_payload` 0.27% +
+`PostingList::parse_with_limits` 0.15% + `decode_block_at` 0.10% (= 0.52% of
+the arm, matching the P1 0.56% attribution) present in the baseline profile
+and ABSENT (zero samples) in the lever profile; memmove family
+`__memmove_avx_unaligned_erms` 7.64% → 6.46%, `__memset_avx2_unaligned_erms`
+0.43% → 0.28%. The elided work is real but too small a fraction of the
+multi-second ingest run to clear the noise floor.
+
+**Comparison class: SELF-SPEEDUP** (quill vs quill; no incumbent arm ran; no
+campaign or competitive claim).
+
+**Decision: REJECT / reverted.** Median +0.71% with the confidence interval
+straddling 1.0 is a WASH against the ≥1.03 acceptance bar; both working-tree files
+were restored byte-identical to origin/main (blob `d87f158b` for quiver.rs;
+empty diff for both).
+
+**Retry predicate:** retry only if (a) the scribe seal call site adopts the
+`SegmentAssembler` encode-into-place seam so the remaining ~1.4%
+section-assembly + STOREDMETA blob copies become elidable in the same change
+(that lever spans scribe.rs and needs its lease), or (b) a certified class
+profile attributes >3% of the quill arm to the seal-path
+memmove+decode-under-encode family. Do not re-run this two-file-only variant;
+its addressable share is bounded at ~0.8% by the P1 attribution.
+
+### 2026-07-29 — SURVEY: allocator/THP family on the quill arm is DEAD on local-5975wx-32c (E8-H P3, SandyGrove)
+
+Symmetric env-only matrix on the memory-mode child seam (not the bulk gate
+cell; diagnostic seam only. Facade-level QG-2 remains inactive, and 0.1113
+is superseded pre-current diagnostic evidence retained only through commit
+`351f5c6d`): 7 cells x 10
+rotated rounds, single ELF sha256
+`9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`, core-pinned,
+external wall time. A/A null (glibc quill vs itself, same-invocation series,
+interleaved): 0.9983 [0.8808, 1.0248], admissible.
+
+- quill jemalloc/glibc: 0.9563 [0.9050, 1.1431] — straddles 1.0, no win.
+- quill THP tunable (glibc.malloc.hugetlb=1): 0.9916 [0.8577, 1.2010] — wash.
+- tantivy jemalloc/glibc: 1.0678 [1.0471, 1.1084] — the INCUMBENT arm is the
+  allocator-sensitive one; symmetric allocator changes would widen the gap.
+- mimalloc absent on host; glibc-tunable cell substituted per plan.
+
+Mechanism consistency: P1 card attributed quill memmove as data-copy-shaped
+(~5.2%) with only ~0.45% allocation-growth; allocator substitution moving
+nothing on the quill arm corroborates it. Class-split note: further decouples
+the x86-vs-m4 gap from glibc allocator behavior on the quill side.
+
+Full card: `docs/evidence/e8h/p3-local-qg2-allocator-sensitivity-20260729.md`.
+
+**Retry predicate:** reopen only if (a) a bulk gate-cell allocator A/B on a
+certified class moves the quill arm's median ratio >3% with an admissible
+same-invocation A/A null, or (b) a certified-class arm-scoped profile
+attributes >8% of quill self-time to allocator frames.
+
+### 2026-07-29 — INVALID-HARNESS: single-sample fusion exclusion latency assertion replaced by a deterministic work bound (YellowSparrow)
+
+The exact protected-candidate all-features diagnostic at revision
+`544ffeb19b519d2e6c849f68334a3eabefb3573a` reached
+`frankensearch-fusion` after a long, contended debug-profile workspace run and
+failed only
+`searcher::tests::exclusion_overhead_is_sub_millisecond_for_typical_query`.
+Its one baseline search measured 1.3424 ms; its one subsequent negated search
+measured 2.5812 ms; subtracting them produced a nominal 1.2389 ms overhead
+against the test's hard 1 ms assertion.
+
+This is not admissible performance evidence. The test always ran one baseline
+then one candidate, without warm-up, AB/BA order balance, repetition, an A/A
+null, a confidence interval, a release build, or worker isolation. It timed
+the complete Phase-1 pipeline—including Rayon scheduling, vector search,
+calibration, and fusion—rather than the exclusion filter alone, and clamped a
+negative difference to zero. This same assertion had already failed at
+1.066 ms on loaded `ovh-a` and passed unchanged on `hz2`; QG-6 separately
+established that one sub-millisecond search per sample is dominated by timer
+resolution and scheduling noise. The production exclusion implementation and
+its surrounding fusion searcher path were unchanged by this candidate; the
+one-shot observation therefore cannot isolate a regression to changed
+production code.
+
+**Decision: INVALID-HARNESS / test contract repaired, no performance claim.**
+The wall-clock subtraction was replaced with a deterministic complexity and
+correctness guard: the ten-document fixture must expose all ten vectors to
+Phase 1, hydrate every distinct semantic candidate exactly once, retain nine
+semantic candidates, and remove `doc-0`. No full-path `<1 ms` claim remains;
+current controlled timing evidence is limited to the isolated normalizer
+benchmark, whose paired AB/BA and A/A evidence demonstrated byte-identical
+output and a large normalizer speedup.
+
+**Retry predicate for any full-path `<1 ms` claim:** add a dedicated
+release-profile, same-binary harness with warm-up, many inner searches per
+sample, alternating AB/BA order, exact result and hydration-count parity, an
+A/A null, median confidence intervals, and a quiet pinned worker. Never
+restore a one-shot debug-test threshold, raise that threshold, or retry it
+until green.
+
+### 2026-07-30 — SURVEY: QG-2 ingest is codegen-INSENSITIVE on local-5975wx-32c — target-cpu moves neither arm (E8-H P7, SandyGrove)
+
+**Comparison class: build-flag A/B survey on both arms** (quill AND pinned
+Tantivy oracle); machine class **local-5975wx-32c** (diagnostic-only; the
+QG-2 smoke memory-child external-wall seam is NOT the gate cell and no
+certified gate numbers exist). NULL result — hypothesis evidence, not a
+verdict on any lever.
+
+The surviving explanation for the per-class ingest-seam split (~9x on the
+5800X diagnostic vs ~2.9x on trj-zen3-16c) was per-uarch codegen of the
+portable build. P7 built the SAME pristine-`3684b147` source at three
+codegen levels (G = frame-pointers only, N = `-C target-cpu=native`,
+Z = `-C target-cpu=znver3`; rustc 1.99.0-nightly 9f36de775, release-perf,
+identical Cargo.lock) and A/B'd all cells on the QG-2 smoke memory child
+(200k docs, 1 thread, taskset core 8, external wall, n=28 rounds/cell,
+round-robin, one warmup/cell).
+
+- G ELF sha256: `ae96a2acb95efdd09af87b4e3ed2457f69529eda76f26d36459d414aa4c40aa4`
+- N ELF sha256: `4a66593a24e04228f50872f3fc34de1ff703356f41a81466c0a4cf257c49a20d`
+- Z ELF sha256: `a819b0068cd1d75099c2f0970ffdb9bb702196f738d42de7f47a41654e90cb40`
+- N and Z .text sections differ (`669170ca…` vs `4dfb762a…`), so the 6-cell
+  matrix was not collapsed.
+
+**A/A null (same-ELF twin cell GQ2/GQ, paired by round, n=28):** mean
+1.0002 [95% t-CI 0.9780, 1.0224], median 0.9985, fast-tail 0.9927 (~0.7%
+method precision; fast-tail = ratio of medians of each cell's 10 fastest
+runs, contamination-immune since ambient load spikes only slow runs).
+
+**Result — both arms NULL, well inside the A/A band:** quill N/G median
+0.9998 (fast-tail 0.9965), quill Z/G median 0.9976 (fast-tail 0.9971) —
+≤0.4% movement; tantivy N/G median 0.9961 (fast-tail 0.9966), tantivy Z/G
+median 0.9939 (fast-tail 0.9990) — ≤0.6% movement. The quill/tantivy seam
+gap is FLAT across codegen levels: fast-tail 0.9027 / 0.9027 / 0.9010
+(G/N/Z). This is a load-bearing null: the flags demonstrably rewrote the
+code (ymm-instruction lines G=1,085 → N=80,052 / Z=78,316; 42% of common
+text symbols changed size, including the interner, tokenizer, xxh3, and
+quiver banded-unpack families in quill AND 42% of tantivy's symbols) and
+throughput did not respond. QG-2 ingest on this class is bound by
+memory/branch/alloc behavior, not instruction selection — consistent with
+the W13 alloc census (ingest cost is SPREAD) and with P6's win coming from
+removing hash WORK, not wider vectors.
+
+**Decision: codegen family CLOSED on local-5975wx-32c for QG-2 ingest,
+both arms.** Do not add `-C target-cpu` to perf-runner profiles expecting
+ingest movement on this class; a `target-cpu=native` default cannot ship on
+crates.io regardless (SIGILL on non-AVX2 hosts, per the 2026-06-25 row),
+and `#[target_feature]` source dispatch re-opens the bd-7zjk packaging
+question while now also lacking a demonstrated ingest-side payoff.
+
+**Retry predicate:** replicate this exact 3-level matrix on the 5800X-class
+diagnostic host where the ~9x seam lives. If quill IS codegen-sensitive
+there, the lever is class-specific; if not (expected), pivot the
+class-split investigation to perf-counter comparison across classes (IPC,
+L1d/L2/LLC misses, branch misses on the same G binary). Full card:
+`docs/evidence/e8h/p7-local-qg2-codegen-sensitivity.md`; raw matrix and
+symbol censuses in `scratchpad/p7/` (session-local).
+
+### 2026-07-30 — REJECT direct canonical-preimage encoder in Quill ingest identity (bd-e8h-w2-canonical-encode-si8mk, P12 takeover, SandyGrove)
+
+**Comparison class: SELF-SPEEDUP** (quill vs quill; no incumbent arm ran; no
+campaign or competitive claim).
+
+**Hypothesis (from the P9 generator-corrected attribution,
+`docs/evidence/e8h/p9-local-qg2-generator-corrected-attribution.md`):** the
+canonicalization/identity family — 16.23% of the quill engine side / 11.80%
+of the QG-2 200k memory child as a call-chain subtree — is dominated by
+serde_json serializer indirection building the IDMAP content_hash preimage
+(`canonical_document_preimage` + `canonical_metadata`, index.rs), with 5-8%
+of child CPU recoverable by a direct encoder emitting byte-identical
+preimages. Two corrections found en route: (1) 2.41% of child inside the P9
+family was `stable_digit_scatter` — the scribe.rs SEAL radix scatter caught
+by a classifier name-collision, untouchable by any canonical-encode lever;
+(2) same-day profiling shows that family's leaf attribution is unstable
+across ELFs/replicates (that same symbol swung 69M↔546M cycles between
+same-fixture runs), so the addressable estimate was further inflated.
+Preregistered corrected expectation before timing: 2.5-5% of child.
+
+**Prior art routed around:** the W2.5 closeout (commit `217e73c1`, codex/*
+lineage, NOT on origin/main) falsified a scalar per-byte emitter
+(contaminated adverse 1.133x, INVALID-EXTERNAL-INTERFERENCE, no-ship) and
+named block escape scanning or a single-pass serializer/hash sink as the only
+retry mechanisms. This lever is exactly those: serde_json-table-identical
+block escape scanning with bulk clean-run copies + exact-size
+single-allocation sink (zero growth realloc, BTreeMap replaced by a sorted
+pair Vec, u8-decimal branch ladder), signatures unchanged.
+
+**Byte-identity proof:** (a) three property tests against the literal old
+serde_json path compiled as the in-test oracle (curated adversarial: every
+control byte in every string position, quote/backslash/0x7F,
+combining-mark/BOM/RTL/4-byte UTF-8, empty strings/maps,
+insertion-order != sorted-order keys incl. uppercase-before-lowercase, 10KB
+strings with escapes planted at 128/4096 boundaries; 2,000 seeded-PRNG fuzz
+documents over an adversarial char pool; all-256 u8 metadata-array values
+plus width boundaries), each case also pinning
+`indexable_document_content_hash` == xxh3(reference bytes). RED-ability
+proven: a `0x0B → \v` short-escape mutation fails both string-path tests
+(u8-array test correctly unaffected), reverted, re-green. (b) corpus gate:
+all 200,000 pinned QG-2 fixture IDMAP content_hash witnesses byte-identical
+across base and lever ELFs (per-doc hash files `cmp`-identical;
+order-sensitive fold `0c0143d44daf6595` both arms). Full quill suite
+477/478; the 1 failure
+(`keeper::…::labruntime_serializes_concurrent_publishers_across_a_late_symlink_alias`,
+`saw_two_waiters`) fails identically on PRISTINE 3684b147 under full-suite
+load on this host and passes 5/5 isolated — pre-existing, disjoint from this
+lever.
+
+**Workload:** QG-2 smoke memory child (`QUILL_PERF_CHILD_MODE=memory`,
+`ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on,
+`QUILL_PERF_SCALE=smoke`), externally wall-timed with per-run CPU (user+sys)
+and peak RSS, taskset-pinned core 8, interleaved paired runs: two independent
+16-pair A/B batches plus a 16-pair A/A null. Machine class
+**local-5975wx-32c** (diagnostic host, not a certified campaign class;
+governor powersave — relative paired ratios only).
+
+- Baseline ELF sha256: `9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`
+- Lever ELF sha256: `aeeac40f52037903666aadcbcb6e30e04e5d45e9b2f4991d06f9857e58cf53bb`
+- Both pristine-3684b147 lineage, lever = overlay + index.rs only
+  (`scratchpad/p12/p12-canonical-encode.patch`), same toolchain (nightly
+  9f36de775 2026-07-19), same Cargo.lock resolution (serde_json 1.0.151),
+  same flags (release-perf, `-C force-frame-pointers=yes`, perf-harness),
+  isolated target dirs, RCH-disabled wrapper.
+
+| arm | median wall s | median CPU s | CPU/wall | median docs/s | median peak RSS MiB |
+|---|---:|---:|---:|---:|---:|
+| baseline (batch1/batch2) | 5.270 / 5.339 | 5.250 / 5.320 | 0.996 | 37,949 / 37,458 | 515 / 536 |
+| lever (batch1/batch2) | 5.205 / 5.248 | 5.180 / 5.225 | 0.996 | 38,426 / 38,110 | 478 / 478 |
+
+Paired WALL ratio lever/baseline (>1 = lever faster): batch1 median 1.0143
+[p5 1.0002, p95 1.0285], batch2 median 1.0221 [0.9973, 1.0600], **pooled
+n=32 median 1.0175 [p5 0.9972, p95 1.0476]**; paired CPU ratio pooled median
+1.0183 [0.9976, 1.0482]; 7/32 pairs ≥1.03. A/A null (baseline vs itself,
+same-invocation protocol, n=16): median 0.9956 [0.9890, 1.0101]. Secondary observation
+(no QG claim): lever peak RSS −37 MiB (−7.2%) consistently across all 32
+pairs; the CPU win is user-side (4.94→4.81 s mean), sys flat.
+
+**Mechanism (same-day arm-scoped dwarf profiles, 3 classifier replicates per
+arm; traced-run totals 20.76B vs 20.52B cycles, ratio 1.012, coherent with
+the untraced A/B):** the win is ALLOCATION-SHAPED, not dispatch-shaped.
+Function-precise allocator leaves (attribution-stable): `_int_realloc` 114M →
+21M cycles (−81%, the growth-realloc elimination working as designed),
+`_int_malloc` 456M → 356M, `_int_free` 351M → 263M; allocator total −292M
+cycles ≈ −1.4% of child ≈ the entire measured win. The canonical family
+itself did NOT shrink: net of frame-concentration effects (base scatters
+serde frames into poll-body/[unknown] families; the lever inlines the emitter
+into `canonical_document_preimage` self), direct-emitter compute (exact-size
+pre-pass double scan + push-based u8-decimal emission) is flat-to-worse vs
+serde_json's tuned single-pass serializer. serde dispatch was never the
+bottleneck; the allocation pattern was. This corroborates the DIRECTION of
+W2.5's contaminated adverse diagnostic for pure emitter swaps.
+
+**Decision: REJECT / overlay reverted.** Pooled paired median 1.0175 is
+below the ≥1.03 acceptance bar (hard point-estimate rule; no CI arguments).
+Real ~+1.8% CPU/wall with −7% peak RSS and full byte-identity, but sub-bar.
+No product change lands; patch + property tests + probes banked in
+`scratchpad/p12/` (session-local). Full card:
+`docs/evidence/e8h/p12-card.md`.
+
+**Retry predicate:** (a) do not re-attempt any canonical-encode emitter swap
+without a counted receipt that emitter compute (not allocation) dominates —
+this pass measured the split: allocator ≈1.4% of child (captured and still
+sub-bar), emitter ≈parity, xxh3 2.8% untouchable; (b) the one evidence-backed
+residual is an alloc-only hybrid (keep serde_json's emitter, serialize into a
+reused scratch buffer + one exact-size copy into the retained Vec) worth
+≈1.4% alone — bundle-only, never a standalone ≥1.03 candidate; (c) re-rank
+the P9 lever table with canonical-encode Impact cut to ≤2 — the 16.23%-ENG
+family number is not addressable mass: it contains the seal radix scatter
+(classifier name-collision), attribution-unstable placement, and hash floor.

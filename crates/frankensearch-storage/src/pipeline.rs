@@ -692,6 +692,9 @@ impl StorageBackedJobRunner {
             let embedding = match embedder.embed(cx, text).await {
                 Ok(embedding) => embedding,
                 Err(error) => {
+                    if matches!(error, SearchError::Cancelled { .. }) {
+                        return Err(error);
+                    }
                     if self.handle_job_failure(job, &error) {
                         result.terminal_failures += 1;
                     }
@@ -747,6 +750,9 @@ impl StorageBackedJobRunner {
                 .vector_sink
                 .persist(&job.doc_id, &job.embedder_id, &embedding);
             if let Err(error) = write_result {
+                if matches!(error, SearchError::Cancelled { .. }) {
+                    return Err(error);
+                }
                 if self.handle_job_failure(job, &error) {
                     result.terminal_failures += 1;
                 }
@@ -1987,12 +1993,13 @@ mod tests {
             .ingest(IngestRequest::new("doc-second", "second"))
             .expect_err("second ingest should trip queue backpressure");
 
-        match error {
-            SearchError::QueueFull { pending, capacity } => {
-                assert!(pending >= 1, "expected non-zero pending jobs");
-                assert_eq!(capacity, 0);
-            }
-            other => panic!("expected QueueFull error, received {other:?}"),
+        assert!(
+            matches!(error, SearchError::QueueFull { .. }),
+            "expected QueueFull error, received {error:?}"
+        );
+        if let SearchError::QueueFull { pending, capacity } = error {
+            assert!(pending >= 1, "expected non-zero pending jobs");
+            assert_eq!(capacity, 0);
         }
     }
 
@@ -2967,11 +2974,12 @@ mod tests {
     #[test]
     fn pipeline_error_creates_subsystem_error() {
         let err = pipeline_error("test message");
-        match err {
-            SearchError::SubsystemError { subsystem, .. } => {
-                assert_eq!(subsystem, "storage_pipeline");
-            }
-            other => panic!("expected SubsystemError, got {other:?}"),
+        assert!(
+            matches!(err, SearchError::SubsystemError { .. }),
+            "expected SubsystemError, got {err:?}"
+        );
+        if let SearchError::SubsystemError { subsystem, .. } = err {
+            assert_eq!(subsystem, "storage_pipeline");
         }
     }
 

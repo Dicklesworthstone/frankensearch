@@ -15,15 +15,16 @@
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
 #   --from-source      Build from source instead of downloading binary
-#   --lite             Build lite variant (no embedded models, ~15MB binary)
+#   --lite             Force the model-free source profile (~15MB binary)
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #
-# Lite build:
-#   The default build embeds ML models (~570MB) for zero-config semantic search.
-#   Use --lite (with --from-source) for a much smaller binary (~15MB) that loads
-#   models from ~/.local/share/frankensearch/models/ at runtime.
-#   Download models after install with: fsfs download-models
+# Build profiles:
+#   Full release artifacts embed ML models for zero-config semantic search.
+#   Cargo and source-build defaults are model-free (~15MB); they can acquire
+#   and verify model files but cannot execute Model2Vec or FastEmbed.
+#   Use --lite to force the explicit --no-default-features source lane.
+#   Downloaded files alone do not add those compiled capabilities.
 #   Equivalent to: cargo build --release -p frankensearch-fsfs --no-default-features
 #
 set -euo pipefail
@@ -186,8 +187,8 @@ Options:
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
-  --lite             Build lite variant without embedded models (~15MB vs ~570MB)
-                     Implies --from-source. Run 'fsfs download-models' after install.
+  --lite             Force the model-free source profile (~15MB).
+                     Implies --from-source; model-free is also the Cargo default.
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
 EOFU
@@ -363,7 +364,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     if ! download_with_progress "$FALLBACK_URL" "$TMP/$FALLBACK_TAR" "Downloading fallback artifact"; then
       # Full Linux artifacts are large and may not be published for every
       # release. Prefer a published lite binary before falling back to a slow
-      # source build that has to download and embed hundreds of MB of models.
+      # source build.
       LITE_TAR="fsfs-lite-${VERSION_BARE}-${TARGET}.${EXT}"
       LITE_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${LITE_TAR}"
       warn "Fallback artifact failed; trying lite release artifact..."
@@ -371,7 +372,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
         TAR="$LITE_TAR"
         URL="$LITE_URL"
         LITE=1
-        warn "Installed lite artifact; run 'fsfs download-models' later for semantic models"
+        warn "Installed model-free artifact; semantic execution requires a full release or an embedded-models-capable rebuild"
       else
         warn "Artifact download failed; falling back to build-from-source"
         FROM_SOURCE=1
@@ -406,8 +407,10 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     info "Building lite variant (no embedded models)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs --no-default-features)
   else
+    info "Building default model-free variant (no embedded models)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs)
   fi
+  LITE=1
   BIN="$TMP/src/target/release/${BINARY_NAME}"
   if [ ! -x "$BIN" ]; then
     # Fallback: search for the binary in case a .cargo/config.toml or other
@@ -437,8 +440,9 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     ok "Self-test complete: $SELF_TEST_OUTPUT"
   fi
   if [ "$LITE" -eq 1 ]; then
-    info "Lite build: no ML models embedded. Download them with:"
-    info "  ${BINARY_NAME} download-models"
+    info "Model-free build: Model2Vec and FastEmbed execution are not compiled."
+    info "Use a full release artifact, or provision verified inputs and rebuild with:"
+    info "  cargo build --release -p frankensearch-fsfs --no-default-features --features embedded-models"
   fi
   ok "Done. Binary at: $DEST/${BINARY_NAME}"
   exit 0

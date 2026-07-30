@@ -3,6 +3,31 @@
 **Author:** MossyPine (read-only audit, requested by YellowSparrow msg #5595) · **Date:** 2026-07-29
 **Basis:** committed `origin/main` content only (line numbers from `git show origin/main:<path>`); working tree ignored. Lease snapshot 2026-07-29T06:10Z. Load-bearing claims in §0.1 independently re-verified before landing.
 
+> **Post-review supersession notice.** The bypass inventory, type-level mismatch,
+> call-site map, and test inventory below remain evidence. The additive C1–C10
+> implementation sequence was a pre-freeze routing draft and is not the landing
+> contract after adversarial review in the `bd-9xuj` Agent Mail thread. The
+> binding implementation law is:
+>
+> - join on semantic-space identity; admit a different producer only when
+>   `EmbeddingIdentityBundleV1::is_conformance_compatible_with` verifies the
+>   pinned golden-vector certificate, and emit typed
+>   `ConformanceCompatibleProducer` telemetry; otherwise reject;
+> - replace public raw-vector seams and their callers atomically—do not retain
+>   deprecated raw methods, additive compatibility twins, or raw fallbacks;
+> - make converted searcher constructors fallible, with no infallible legacy
+>   twin;
+> - route v1 or identity-less artifacts to typed
+>   `LegacyUnidentified`/`RecoveryPlan` reindex, seal and activate an FSVI-v2
+>   generation, then resume the original command; never admit dimension-only
+>   search or `DIM+warn`;
+> - include write-side identity and `create_v2` conversion in the mandatory
+>   train so the new admission checks protect freshly built indexes.
+>
+> Accordingly, §2 and its “recommended first landing slice” are retained only
+> as historical dependency analysis. Bead acceptance must encode the
+> superseding fail-closed law before implementation begins.
+
 ## 0. Baseline corrections to the premise
 
 `RetrievalTopology` already has consumers (throughout `core/src/recovery_plan.rs`). The genuinely zero-call-site surfaces are `BoundQueryEmbedding`, `TieredQueryEmbeddings`, `IdentityBoundEmbedding`, and `Embedder::embed_bound`/`embed_batch_bound`/`SyncEmbed::embed_bound_sync`.

@@ -6013,6 +6013,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bench-internals")]
     fn timed_encoded_grouped_union(
         encoded_doclens: &EncodedDocLenSection,
         encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
@@ -6125,6 +6126,7 @@ mod tests {
         Ok((elapsed_us, hits, stats))
     }
 
+    #[cfg(feature = "bench-internals")]
     fn validate_encoded_pruning_metadata(
         encoded_doclens: &EncodedDocLenSection,
         encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
@@ -8923,6 +8925,145 @@ mod tests {
                 reason: "an empty snapshot cannot contain field tokens",
             })
         ));
+        Ok(())
+    }
+
+    /// Deliberately broken historical control: after draining the initial
+    /// exhaustive buffer, attempt exactly one competitive refill and stop when
+    /// that window contains no candidates. Production must keep refilling
+    /// because a later horizon can still contain an essential-term winner.
+    fn collect_one_competitive_refill_for_negative_control(
+        union: &mut BufferedUnionScorer<'_>,
+        collector: &mut TopDocsCollector,
+    ) -> Result<(), ArgusError> {
+        while let Some(doc) = union.doc() {
+            collector.record_live(doc, Some(union.score()?))?;
+            if union.advance_buffered().is_none() {
+                break;
+            }
+        }
+        let cutoff = collector.competitive_cutoff_score();
+        if union.refill_with_cutoff(cutoff)? {
+            assert!(
+                union.advance_buffered().is_none(),
+                "negative-control fixture requires an empty first competitive window",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn max_score_empty_competitive_window_refills_again_for_late_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 9_001;
+        const FIRST_HORIZON_END: u32 = 4_096;
+        const TARGET_DOC: u32 = 9_000;
+        let lengths = (0..NUM_DOCS)
+            .map(|doc| {
+                Some(if doc < FIRST_HORIZON_END {
+                    2
+                } else if doc == TARGET_DOC {
+                    9
+                } else {
+                    1
+                })
+            })
+            .collect::<Vec<_>>();
+        let total_tokens = lengths
+            .iter()
+            .flatten()
+            .map(|length| u64::from(*length))
+            .sum::<u64>();
+        assert_eq!(total_tokens, 13_105);
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, total_tokens, u64::from(NUM_DOCS))?;
+        let rows_by_term = vec![
+            (0..NUM_DOCS)
+                .map(|doc| Posting::new(doc, 1))
+                .collect::<Vec<_>>(),
+            (0..FIRST_HORIZON_END)
+                .map(|doc| Posting::new(doc, 1))
+                .collect::<Vec<_>>(),
+            vec![Posting::new(TARGET_DOC, 8)],
+        ];
+        let boosts = [1.0, 1.0, 1.0];
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| {
+                EncodedPostingList::encode_with_block_max(rows, |doc| {
+                    field.fieldnorm_id(u64::from(doc))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut broken = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut broken_collector = TopDocsCollector::new(1, 0)?;
+        let ScorerNode::Union(broken_union) = &mut broken.node else {
+            panic!("UNION_HORIZON fixture must lower to a buffered union");
+        };
+        collect_one_competitive_refill_for_negative_control(broken_union, &mut broken_collector)?;
+        assert_eq!(broken_union.pruning_stats.max_score_windows, 1);
+        assert_eq!(broken_union.pruning_stats.block_max_wand_windows, 0);
+        assert_eq!(broken_union.pruning_stats.candidate_docs, 0);
+        assert_eq!(broken_union.pruning_stats.blocks_skipped, 0);
+        let broken_hits = broken_collector.finish()?.hits;
+        assert_eq!(broken_hits[0].global_docid, 0);
+        assert_ne!(broken_hits[0].global_docid, TARGET_DOC);
+
+        let mut oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let stats = candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_hits = candidate_collector.finish()?.hits;
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, TARGET_DOC);
+        assert_eq!(stats.max_score_windows, 2);
+        assert_eq!(stats.block_max_wand_windows, 0);
+        assert_eq!(stats.candidate_docs, 1);
+        assert_eq!(stats.blocks_skipped, 0);
         Ok(())
     }
 

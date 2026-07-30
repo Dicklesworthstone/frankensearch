@@ -42,10 +42,14 @@ pub const PERF_WRITER_HEAP_BYTES: usize = 50_000_000;
 pub const PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES: usize = 15_000_000;
 /// Version of the metric-specific paired estimator contract.
 pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
-/// Exact ordered query groups required by every normative QG-6 cell.
-pub const QG6_QUERY_GROUPS: usize = 4;
+/// Exact ordered query groups required by every normative QG-6 class cell.
+///
+/// One group is one independent frozen query identity. Leaves collected for a
+/// query are repeated measurements of that group, never additional queries.
+pub const QG6_QUERY_GROUPS: usize = 16;
 /// Canonical QG-6 group IDs. Prepared queries are indexed in manifest order.
-pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] = [0, 1, 2, 3];
+pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] =
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Hash the normative performance contract without binding administrative
 /// activation state into measurement identity.
@@ -241,6 +245,18 @@ impl PerfQueryClass {
         Self::Phrase,
         Self::Boolean,
     ];
+
+    /// Stable manifest label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Identifier => "identifier",
+            Self::ShortKeyword => "short_keyword",
+            Self::NaturalLanguage => "natural_language",
+            Self::Phrase => "phrase",
+            Self::Boolean => "boolean",
+        }
+    }
 }
 
 /// One fully pinned matrix cell before it is measured.
@@ -394,7 +410,7 @@ impl PerfMatrixSpec {
                 for (label, document_count) in [("100k", 100_000), ("1m", 1_000_000)] {
                     let mut cell = PerfCellSpec::new(
                         PerfGate::Qg6,
-                        format!("query/{query_class:?}/k{k}/{label}").to_ascii_lowercase(),
+                        format!("query/{}/k{k}/{label}", query_class.label()),
                         "latency_ms",
                     );
                     cell.document_count = Some(document_count);
@@ -459,11 +475,13 @@ impl PerfMatrixSpec {
         cold.writer_heap_bytes = Some(perf_writer_heap_bytes(1));
         cells.push(cold);
 
-        cells.push(PerfCellSpec::new(
+        let mut dependencies = PerfCellSpec::new(
             PerfGate::Qg10,
             "dependency_surface/default_lexical",
             "tantivy_nodes",
-        ));
+        );
+        dependencies.threads = Some(1);
+        cells.push(dependencies);
 
         Self {
             manifest: "docs/contracts/quill-perf-gates.toml".to_owned(),
@@ -475,6 +493,16 @@ impl PerfMatrixSpec {
     #[must_use]
     pub fn for_gate(&self, gate: PerfGate) -> Vec<&PerfCellSpec> {
         self.cells.iter().filter(|cell| cell.gate == gate).collect()
+    }
+
+    /// Maximum engine width required by a gate's complete frozen matrix.
+    #[must_use]
+    pub fn max_thread_width(&self, gate: PerfGate) -> Option<usize> {
+        self.cells
+            .iter()
+            .filter(|cell| cell.gate == gate)
+            .filter_map(|cell| cell.threads)
+            .max()
     }
 }
 
@@ -569,6 +597,9 @@ pub struct PerfInputIdentity {
     pub query_manifest_sha256: String,
     /// SHA-256 of the semantic configuration shared by both engines.
     pub config_contract_sha256: String,
+    /// SHA-256 of the cell-local sealed QG-6 semantic receipt contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_contract_sha256: Option<String>,
     /// Number of ordered query groups represented by the manifest.
     pub query_group_count: usize,
     /// Exact ordered group IDs emitted into both A/B and A/A raw streams.
@@ -580,13 +611,17 @@ impl PerfInputIdentity {
         if !is_lower_hex_digest(&self.prepared_corpus_sha256)
             || !is_lower_hex_digest(&self.query_manifest_sha256)
             || !is_lower_hex_digest(&self.config_contract_sha256)
+            || self
+                .semantic_contract_sha256
+                .as_deref()
+                .is_none_or(|digest| !is_lower_hex_digest(digest))
             || self.query_group_count != QG6_QUERY_GROUPS
             || self.query_group_ids.as_slice() != QG6_QUERY_GROUP_IDS.as_slice()
         {
             return Err(PairedEstimatorError::InvalidProvenance {
                 reason: "prepared-input identity requires separate lowercase SHA-256 prepared \
-                         corpus, ordered query, and configuration hashes plus the exact four \
-                         canonical query-group IDs"
+                         corpus, ordered query, configuration, and semantic-contract hashes plus \
+                         the exact sixteen canonical query-group IDs"
                     .to_owned(),
             });
         }
@@ -607,6 +642,14 @@ impl PerfInputIdentity {
         hasher.update(self.query_manifest_sha256.as_bytes());
         hasher.update(b"config-contract-sha256\0");
         hasher.update(self.config_contract_sha256.as_bytes());
+        hasher.update(b"semantic-contract-sha256\0");
+        match self.semantic_contract_sha256.as_deref() {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
         hasher.update(b"query-group-count\0");
         hasher.update(self.query_group_count.to_string().as_bytes());
         hasher.update(b"\0query-group-ids\0");
@@ -707,6 +750,24 @@ pub enum PerfSamplePhase {
     Measurement,
 }
 
+/// Compact per-row binding into the cell-local QG-6 semantic contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6SampleBinding {
+    /// Stable redacted query ID resolved through `group_id`.
+    pub query_id: String,
+    /// Domain-separated digest of the validated role receipt sequence.
+    pub result_sequence_sha256: String,
+}
+
+impl Qg6SampleBinding {
+    fn validate(&self) -> bool {
+        !self.query_id.is_empty()
+            && self.query_id.len() <= 256
+            && is_lower_hex_digest(&self.result_sequence_sha256)
+    }
+}
+
 /// One bounded raw record emitted by the timing harness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerfRawSample {
@@ -739,12 +800,33 @@ pub struct PerfRawSample {
     /// leave this unset; hierarchical estimation requires it on every sample.
     #[serde(default)]
     pub group_id: Option<u64>,
+    /// Compact semantic binding for QG-6 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qg6_sample_binding: Option<Qg6SampleBinding>,
 }
 
 impl PerfRawSample {
     fn validate_and_value(&self) -> Result<f64, PairedEstimatorError> {
         self.scope.validate()?;
         self.provenance.validate()?;
+        match (
+            self.provenance.input_identity.is_some(),
+            self.qg6_sample_binding.as_ref(),
+        ) {
+            (true, Some(binding)) if binding.validate() => {}
+            (true, _) => {
+                return Err(PairedEstimatorError::InvalidProvenance {
+                    reason: "prepared-input samples require one valid compact QG-6 result binding"
+                        .to_owned(),
+                });
+            }
+            (false, None) => {}
+            (false, Some(_)) => {
+                return Err(PairedEstimatorError::InvalidProvenance {
+                    reason: "non-QG-6 samples cannot carry QG-6 result bindings".to_owned(),
+                });
+            }
+        }
         if self.phase != PerfSamplePhase::Measurement {
             return Err(PairedEstimatorError::WarmupInDecisionSet {
                 sample_id: self.sample_id,
@@ -912,6 +994,8 @@ pub enum PairedEstimatorError {
     MissingGroupId { sample_id: u64 },
     #[error("paired block {block_id} mixes hierarchical group IDs")]
     GroupMismatch { block_id: u64 },
+    #[error("paired block {block_id} mixes QG-6 query bindings")]
+    Qg6BindingMismatch { block_id: u64 },
     #[error("paired block {block_id} compares different work or byte denominators")]
     WorkMismatch { block_id: u64 },
     #[error("paired experiment has only {actual} complete blocks; require {required}")]
@@ -1195,6 +1279,17 @@ pub fn validate_paired_blocks(
         }
         if control.group_id != treatment.group_id {
             return Err(PairedEstimatorError::GroupMismatch { block_id });
+        }
+        if control
+            .qg6_sample_binding
+            .as_ref()
+            .map(|binding| binding.query_id.as_str())
+            != treatment
+                .qg6_sample_binding
+                .as_ref()
+                .map(|binding| binding.query_id.as_str())
+        {
+            return Err(PairedEstimatorError::Qg6BindingMismatch { block_id });
         }
         if control.order == treatment.order {
             return Err(PairedEstimatorError::InvalidOrder { block_id });
@@ -1755,104 +1850,32 @@ pub fn median_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
-/// One statically linked engine identity carried by same-ELF benchmark
-/// evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerfEngineBinaryIdentity {
-    /// Stable engine label.
-    pub engine: String,
-    /// Engine role in the comparison.
-    pub role: String,
-    /// Exact package version linked into the benchmark.
-    pub version: String,
-    /// SHA-256 of the ELF that contains this engine.
-    pub executable_sha256: String,
-    /// Linkage/identity scheme, explicit because both Rust engines share one
-    /// statically linked executable.
-    pub identity_scheme: String,
+/// Closed producer operating-system identity for persisted evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerfProducerOs {
+    /// Linux producer, where the effective CPU allow-list is mandatory.
+    Linux,
+    /// macOS producer, where Linux affinity evidence is inapplicable.
+    Macos,
 }
 
-impl PerfEngineBinaryIdentity {
-    fn is_complete(&self) -> bool {
-        !self.engine.trim().is_empty()
-            && !self.role.trim().is_empty()
-            && !self.version.trim().is_empty()
-            && is_lower_hex_sha256(&self.executable_sha256)
-            && self.identity_scheme == "same-static-elf-v1"
-    }
-}
-
-/// Untimed operating-system observation of one engine arm's effective worker
-/// width.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerfEngineThreadObservation {
-    /// Engine arm observed.
-    pub engine: String,
-    /// Runtime concurrency visible to the harness process.
-    pub runtime_available_parallelism: usize,
-    /// Process thread count immediately before the untimed probe.
-    pub process_threads_before_probe: usize,
-    /// Largest process thread count sampled while the operation ran.
-    pub peak_process_threads: usize,
-    /// Effective engine width: CPU-active newly observed workers, with one as
-    /// the serial calling-thread floor.
-    pub thread_count_actually_used: usize,
-    /// Newly observed engine workers whose per-thread CPU counter advanced.
-    pub cpu_active_new_worker_threads: usize,
-    /// Minimum per-thread scheduler runtime required to count a newly spawned
-    /// worker as active rather than merely initialized.
-    pub cpu_active_threshold_ns: u64,
-    /// Peak newly observed engine workers after subtracting pre-existing
-    /// process threads and the monitor thread.
-    pub peak_new_worker_threads: usize,
-    /// Exact observation procedure.
-    pub observation_method: String,
-}
-
-impl PerfEngineThreadObservation {
-    fn is_complete(&self) -> bool {
-        !self.engine.trim().is_empty()
-            && self.runtime_available_parallelism > 0
-            && self.process_threads_before_probe > 0
-            && self.peak_process_threads >= self.process_threads_before_probe
-            && self.thread_count_actually_used > 0
-            && self.thread_count_actually_used >= self.cpu_active_new_worker_threads.max(1)
-            && self.cpu_active_threshold_ns > 0
-            && !self.observation_method.trim().is_empty()
-    }
-}
-
-/// Per-fixture requested-versus-observed thread provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerfThreadProvenance {
-    /// Exact matrix fixture observed.
-    pub fixture: String,
-    /// Configured engine thread width for this row.
-    pub thread_count_requested: usize,
-    /// Effective affinity/cpuset mask sampled for this row.
-    pub cpu_affinity_allowed_list: Option<String>,
-    /// Quill observation from an untimed execution of this exact fixture.
-    pub quill: PerfEngineThreadObservation,
-    /// Tantivy observation from an untimed execution of this exact fixture.
-    pub tantivy: PerfEngineThreadObservation,
-}
-
-impl PerfThreadProvenance {
-    /// Whether this row distinguishes configured width from observed activity
-    /// and retains an affinity receipt.
+impl PerfProducerOs {
+    /// Stable serialized operating-system label.
     #[must_use]
-    pub fn is_complete(&self, producer_os: &str) -> bool {
-        !self.fixture.trim().is_empty()
-            && self.thread_count_requested > 0
-            && self.quill.engine == "quill"
-            && self.tantivy.engine == "tantivy"
-            && self.quill.is_complete()
-            && self.tantivy.is_complete()
-            && (producer_os != "linux"
-                || self
-                    .cpu_affinity_allowed_list
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()))
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+        }
+    }
+
+    fn current() -> Option<Self> {
+        match std::env::consts::OS {
+            "linux" => Some(Self::Linux),
+            "macos" => Some(Self::Macos),
+            _ => None,
+        }
     }
 }
 
@@ -1860,29 +1883,23 @@ impl PerfThreadProvenance {
 /// artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfExecutionProvenance {
-    /// Producer operating system. Validation uses this serialized fact rather
-    /// than the reader's current OS.
-    pub producer_os: String,
     /// Stable host name, not merely an architecture family label.
     pub host_identity: String,
+    /// Operating system of the producer that captured this persisted
+    /// provenance. Validation must never depend on the reader's host OS.
+    pub producer_os: PerfProducerOs,
     /// Host-wide physical core count.
     pub physical_cores: usize,
     /// Host-wide logical hardware-thread count.
     pub logical_threads: usize,
-    /// Host RAM from the producer's topology interface.
-    pub ram_bytes: u64,
-    /// Host NUMA-node count.
-    pub numa_nodes: usize,
     /// Concurrency available to the benchmark process after scheduler and
     /// cgroup constraints.
     pub process_available_threads: usize,
-    /// Exact configured thread widths selected by the matrix.
-    pub thread_counts_requested: Vec<usize>,
-    /// Untimed requested-versus-observed receipts, one per scaling fixture.
-    pub thread_observations: Vec<PerfThreadProvenance>,
-    /// Both statically linked engine identities. In a same-binary harness their
-    /// SHA-256 values must equal the benchmark ELF SHA-256.
-    pub engine_binaries: Vec<PerfEngineBinaryIdentity>,
+    /// Exact engine thread-width knobs configured by the selected cells.
+    ///
+    /// This is configuration provenance, never a claim that every configured
+    /// worker performed useful work.
+    pub configured_engine_thread_widths: Vec<usize>,
     /// ISA features detected at runtime on the executing host.
     pub runtime_detected_isa: Vec<String>,
     /// Effective Linux `Cpus_allowed_list`, when the platform exposes it.
@@ -1893,19 +1910,12 @@ pub struct PerfExecutionProvenance {
 }
 
 impl PerfExecutionProvenance {
-    /// Capture host-wide topology beside the configured widths selected by this
-    /// invocation and both same-ELF engine identities.
+    /// Capture host-wide topology beside the exact widths selected by this
+    /// invocation.
     #[must_use]
-    pub fn capture(
-        thread_counts_requested: impl IntoIterator<Item = usize>,
-        bench_elf_sha256: &str,
-    ) -> Self {
+    pub fn capture(configured_engine_thread_widths: impl IntoIterator<Item = usize>) -> Self {
         let (physical_cores, logical_threads) = host_cpu_topology()
             .expect("performance evidence requires host physical/logical CPU topology");
-        let ram_bytes =
-            host_ram_bytes().expect("performance evidence requires host RAM provenance");
-        let numa_nodes =
-            host_numa_nodes().expect("performance evidence requires host NUMA provenance");
         let process_available_threads = std::thread::available_parallelism().map_or(1, usize::from);
         let cpu_affinity_allowed_list = linux_cpu_allowed_list();
         let allowed_threads = cpu_affinity_allowed_list
@@ -1929,36 +1939,21 @@ impl PerfExecutionProvenance {
         } else {
             None
         };
-        let mut thread_counts_requested = thread_counts_requested
+        let mut configured_engine_thread_widths = configured_engine_thread_widths
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        thread_counts_requested.retain(|threads| *threads > 0);
+        configured_engine_thread_widths.retain(|threads| *threads > 0);
         let provenance = Self {
-            producer_os: std::env::consts::OS.to_owned(),
             host_identity: host_identity()
                 .expect("performance evidence requires a non-empty host identity"),
+            producer_os: PerfProducerOs::current()
+                .expect("performance evidence supports only Linux and macOS producers"),
             physical_cores,
             logical_threads,
-            ram_bytes,
-            numa_nodes,
             process_available_threads,
-            thread_counts_requested,
-            thread_observations: Vec::new(),
-            engine_binaries: [
-                ("quill", "subject", env!("CARGO_PKG_VERSION")),
-                ("tantivy", "oracle", "0.26.1"),
-            ]
-            .into_iter()
-            .map(|(engine, role, version)| PerfEngineBinaryIdentity {
-                engine: engine.to_owned(),
-                role: role.to_owned(),
-                version: version.to_owned(),
-                executable_sha256: bench_elf_sha256.to_owned(),
-                identity_scheme: "same-static-elf-v1".to_owned(),
-            })
-            .collect(),
+            configured_engine_thread_widths,
             runtime_detected_isa: runtime_detected_isa(),
             cpu_affinity_allowed_list,
             affinity_or_cpuset_cap,
@@ -1970,78 +1965,31 @@ impl PerfExecutionProvenance {
         provenance
     }
 
-    /// Attach untimed per-fixture worker observations before the artifact is
-    /// sealed.
-    pub fn set_thread_observations(
-        &mut self,
-        observations: impl IntoIterator<Item = PerfThreadProvenance>,
-    ) {
-        let mut observations = observations.into_iter().collect::<Vec<_>>();
-        observations.sort_unstable_by(|left, right| {
-            left.thread_count_requested
-                .cmp(&right.thread_count_requested)
-                .then_with(|| left.fixture.cmp(&right.fixture))
-        });
-        self.thread_observations = observations;
-    }
-
     /// Whether all fields required to interpret a scaling result are present.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        !self.producer_os.trim().is_empty()
-            && !self.host_identity.trim().is_empty()
+        !self.host_identity.trim().is_empty()
             && self.physical_cores > 0
             && self.logical_threads >= self.physical_cores
-            && self.ram_bytes > 0
-            && self.numa_nodes > 0
             && self.process_available_threads > 0
-            && !self.thread_counts_requested.is_empty()
+            && !self.configured_engine_thread_widths.is_empty()
             && self
-                .thread_counts_requested
+                .configured_engine_thread_widths
                 .iter()
-                .all(|threads| *threads > 0 && *threads <= self.logical_threads)
+                .all(|threads| *threads > 0)
             && self
-                .thread_counts_requested
+                .configured_engine_thread_widths
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
-            && self.engine_binaries.len() == 2
-            && self
-                .engine_binaries
-                .iter()
-                .all(PerfEngineBinaryIdentity::is_complete)
-            && self
-                .engine_binaries
-                .iter()
-                .map(|identity| identity.engine.as_str())
-                .collect::<BTreeSet<_>>()
-                == BTreeSet::from(["quill", "tantivy"])
-            && self.thread_observations.iter().all(|observation| {
-                observation.is_complete(&self.producer_os)
-                    && self
-                        .thread_counts_requested
-                        .contains(&observation.thread_count_requested)
-            })
-            && self
-                .thread_observations
-                .iter()
-                .map(|observation| observation.fixture.as_str())
-                .collect::<BTreeSet<_>>()
-                .len()
-                == self.thread_observations.len()
-            && !self.runtime_detected_isa.is_empty()
-            && (self.producer_os != "linux"
-                || self
+            && runtime_isa_is_normalized(&self.runtime_detected_isa)
+            && match self.producer_os {
+                PerfProducerOs::Linux => self
                     .cpu_affinity_allowed_list
                     .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()))
+                    .is_some_and(|value| !value.trim().is_empty()),
+                PerfProducerOs::Macos => true,
+            }
     }
-}
-
-fn is_lower_hex_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn host_identity() -> Option<String> {
@@ -2078,60 +2026,6 @@ fn host_cpu_topology() -> Option<(usize, usize)> {
         let physical = sysctl_usize("hw.physicalcpu")?;
         let logical = sysctl_usize("hw.logicalcpu")?;
         Some((physical, logical))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-fn host_ram_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| parse_linux_memtotal_bytes(&contents))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        sysctl_u64("hw.memsize")
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-fn parse_linux_memtotal_bytes(meminfo: &str) -> Option<u64> {
-    let kibibytes = meminfo.lines().find_map(|line| {
-        let mut fields = line.strip_prefix("MemTotal:")?.split_ascii_whitespace();
-        let amount = fields.next()?.parse::<u64>().ok()?;
-        (fields.next()? == "kB").then_some(amount)
-    })?;
-    kibibytes.checked_mul(1024)
-}
-
-fn host_numa_nodes() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let count = fs::read_dir("/sys/devices/system/node")
-            .ok()?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("node"))
-                    .is_some_and(|suffix| {
-                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-            })
-            .count();
-        (count > 0).then_some(count)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(1)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2178,17 +2072,6 @@ fn sysctl_usize(name: &str) -> Option<usize> {
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
-#[cfg(target_os = "macos")]
-fn sysctl_u64(name: &str) -> Option<u64> {
-    Command::new("sysctl")
-        .args(["-n", name])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
 fn linux_cpu_allowed_list() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -2226,7 +2109,7 @@ fn parse_cpu_list_count(value: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-fn runtime_detected_isa() -> Vec<String> {
+pub fn runtime_detected_isa() -> Vec<String> {
     let mut features = Vec::new();
     #[cfg(target_os = "linux")]
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
@@ -2277,7 +2160,30 @@ fn runtime_detected_isa() -> Vec<String> {
     if features.is_empty() {
         features.push("scalar".to_owned());
     }
+    features.sort_unstable();
+    features.dedup();
     features
+}
+
+fn runtime_isa_is_normalized(features: &[String]) -> bool {
+    const REPORTABLE_RUNTIME_ISA: &[&str] = &[
+        "aes", "asimd", "avx2", "avx512f", "bmi2", "fma", "neon", "scalar", "sha2", "vaes",
+    ];
+    let valid_token = |feature: &str| {
+        !feature.is_empty()
+            && feature.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'.' | b'-')
+            })
+    };
+    !features.is_empty()
+        && features.iter().all(|feature| valid_token(feature))
+        && features
+            .iter()
+            .all(|feature| REPORTABLE_RUNTIME_ISA.contains(&feature.as_str()))
+        && features.windows(2).all(|pair| pair[0] < pair[1])
+        && (features.len() == 1 || features.iter().all(|feature| feature != "scalar"))
 }
 
 /// One engine or comparison row in a gate artifact.
@@ -2293,14 +2199,15 @@ pub struct PerfCellResult {
 
 /// Per-gate JSON artifact matching the committed E0.6 schema contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required in v5. `None` exists only so the explicit read-only v3 loader
-    /// can deserialize historical artifacts without upgrading their claims.
+    /// Required on measured v5 artifacts. `None` exists only for the exact
+    /// unmeasured v5 sentinel and the explicit read-only v3 loader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
@@ -2331,19 +2238,15 @@ impl PerfGateArtifact {
         if let Some(execution) = &self.execution {
             let _ = writeln!(
                 table,
-                "host={} | producer_os={} | physical_cores={} | logical_threads={} | \
-                 ram_bytes={} | numa_nodes={} | process_available_threads={} | \
-                 thread_counts_requested={:?} | \
+                "host={} | physical_cores={} | logical_threads={} | \
+                 process_available_threads={} | configured_engine_thread_widths={:?} | \
                  runtime_detected_isa={:?} | cpu_affinity_allowed_list={} | \
                  affinity_or_cpuset_cap={}",
                 execution.host_identity,
-                execution.producer_os,
                 execution.physical_cores,
                 execution.logical_threads,
-                execution.ram_bytes,
-                execution.numa_nodes,
                 execution.process_available_threads,
-                execution.thread_counts_requested,
+                execution.configured_engine_thread_widths,
                 execution.runtime_detected_isa,
                 execution
                     .cpu_affinity_allowed_list
@@ -2354,35 +2257,6 @@ impl PerfGateArtifact {
                     .as_deref()
                     .unwrap_or("none"),
             );
-            for observation in &execution.thread_observations {
-                let _ = writeln!(
-                    table,
-                    "fixture={} | requested_threads={} | affinity={} | \
-                     quill_threads_actually_used={} | quill_peak_new_workers={} | \
-                     tantivy_threads_actually_used={} | tantivy_peak_new_workers={}",
-                    observation.fixture,
-                    observation.thread_count_requested,
-                    observation
-                        .cpu_affinity_allowed_list
-                        .as_deref()
-                        .unwrap_or("unavailable"),
-                    observation.quill.thread_count_actually_used,
-                    observation.quill.peak_new_worker_threads,
-                    observation.tantivy.thread_count_actually_used,
-                    observation.tantivy.peak_new_worker_threads,
-                );
-            }
-            for identity in &execution.engine_binaries {
-                let _ = writeln!(
-                    table,
-                    "engine={} | role={} | version={} | executable_sha256={} | scheme={}",
-                    identity.engine,
-                    identity.role,
-                    identity.version,
-                    identity.executable_sha256,
-                    identity.identity_scheme,
-                );
-            }
         }
         table.push_str(
             "fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission\n",
@@ -2534,6 +2408,91 @@ pub fn validate_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
             reason: "QG-5 requires a nonzero tombstone density".to_owned(),
         });
     }
+    if matrix
+        .cells
+        .iter()
+        .any(|cell| cell.threads.is_none_or(|threads| threads == 0))
+    {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "every performance cell requires a positive configured thread width".to_owned(),
+        });
+    }
+    validate_qg6_matrix(matrix)?;
+    Ok(())
+}
+
+fn validate_qg6_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
+    let qg6_cells = matrix
+        .cells
+        .iter()
+        .filter(|cell| cell.gate == PerfGate::Qg6)
+        .collect::<Vec<_>>();
+    if qg6_cells.len() != PerfQueryClass::ALL.len() * 2 * 2 {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "QG-6 requires exactly 20 warm total-search cells".to_owned(),
+        });
+    }
+
+    let mut observed = BTreeSet::new();
+    for cell in qg6_cells {
+        let Some(query_class) = cell.query_class else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires a named query class".to_owned(),
+            });
+        };
+        let Some(k @ (10 | 100)) = cell.k else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires k=10 or k=100".to_owned(),
+            });
+        };
+        let Some(document_count @ (100_000 | 1_000_000)) = cell.document_count else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires the 100k or 1M corpus".to_owned(),
+            });
+        };
+        let corpus_label = if document_count == 100_000 {
+            "100k"
+        } else {
+            "1m"
+        };
+        let expected_fixture = format!("query/{}/k{k}/{corpus_label}", query_class.label());
+        if cell.fixture != expected_fixture
+            || cell.metric != "latency_ms"
+            || cell.positions != Some(PositionMode::On)
+            || cell.threads != Some(1)
+            || cell.writer_heap_bytes != Some(perf_writer_heap_bytes(1))
+            || cell.topology.is_some()
+            || cell.tombstone_density_pct.is_some()
+        {
+            return Err(GauntletError::InvalidCampaign {
+                reason: format!(
+                    "QG-6 cell {expected_fixture} must be the warm total-search latency lane with \
+                     positions, one thread, and the canonical heap budget"
+                ),
+            });
+        }
+        if !observed.insert((query_class, k, document_count)) {
+            return Err(GauntletError::InvalidCampaign {
+                reason: format!("duplicate QG-6 cell {expected_fixture}"),
+            });
+        }
+    }
+
+    let expected = PerfQueryClass::ALL
+        .into_iter()
+        .flat_map(|query_class| {
+            [10, 100].into_iter().flat_map(move |k| {
+                [100_000, 1_000_000]
+                    .into_iter()
+                    .map(move |document_count| (query_class, k, document_count))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "QG-6 matrix has a missing or reclassified class/k/corpus cell".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -2547,6 +2506,7 @@ mod tests {
             prepared_corpus_sha256: "a".repeat(64),
             query_manifest_sha256: "b".repeat(64),
             config_contract_sha256: "c".repeat(64),
+            semantic_contract_sha256: Some("d".repeat(64)),
             query_group_count: QG6_QUERY_GROUPS,
             query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
         };
@@ -2557,12 +2517,16 @@ mod tests {
             "prepared_corpus_sha256",
             "query_manifest_sha256",
             "config_contract_sha256",
+            "semantic_contract_sha256",
         ] {
             let mut mutated = identity.clone();
             match field {
                 "prepared_corpus_sha256" => mutated.prepared_corpus_sha256 = "d".repeat(64),
                 "query_manifest_sha256" => mutated.query_manifest_sha256 = "e".repeat(64),
                 "config_contract_sha256" => mutated.config_contract_sha256 = "f".repeat(64),
+                "semantic_contract_sha256" => {
+                    mutated.semantic_contract_sha256 = Some("0".repeat(64));
+                }
                 _ => unreachable!("enumerated identity field"),
             }
             assert_ne!(
@@ -2581,6 +2545,26 @@ mod tests {
         wrong_ids.query_group_ids.swap(0, 1);
         assert_ne!(fingerprint, wrong_ids.fingerprint_sha256());
         assert!(wrong_ids.validate().is_err());
+    }
+
+    #[test]
+    fn absent_semantic_contract_has_a_total_fingerprint_and_omits_the_wire_field() {
+        let identity = PerfInputIdentity {
+            prepared_corpus_sha256: "a".repeat(64),
+            query_manifest_sha256: "b".repeat(64),
+            config_contract_sha256: "c".repeat(64),
+            semantic_contract_sha256: None,
+            query_group_count: QG6_QUERY_GROUPS,
+            query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
+        };
+        let fingerprint = identity.fingerprint_sha256();
+        assert!(is_lower_hex_digest(&fingerprint));
+        let json = serde_json::to_value(&identity).expect("identity JSON");
+        assert!(json.get("semantic_contract_sha256").is_none());
+
+        let mut present = identity;
+        present.semantic_contract_sha256 = Some("d".repeat(64));
+        assert_ne!(fingerprint, present.fingerprint_sha256());
     }
 
     fn estimator_config() -> PairedEstimatorConfig {
@@ -2675,6 +2659,7 @@ mod tests {
                 byte_count: Some(64_000),
                 observed_value: None,
                 group_id: None,
+                qg6_sample_binding: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -2690,6 +2675,7 @@ mod tests {
                 byte_count: Some(64_000),
                 observed_value: None,
                 group_id: None,
+                qg6_sample_binding: None,
             });
         }
         samples
@@ -2736,6 +2722,7 @@ mod tests {
                 byte_count: None,
                 observed_value: Some(*control),
                 group_id: None,
+                qg6_sample_binding: None,
             });
             samples.push(PerfRawSample {
                 block_id,
@@ -2755,6 +2742,7 @@ mod tests {
                 byte_count: None,
                 observed_value: Some(*treatment),
                 group_id: None,
+                qg6_sample_binding: None,
             });
         }
         samples
@@ -3098,7 +3086,40 @@ mod tests {
         assert_eq!(matrix.for_gate(PerfGate::Qg5).len(), 3);
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg8).len(), 6);
-        assert_eq!(matrix.for_gate(PerfGate::Qg10).len(), 1);
+        let qg10 = matrix.for_gate(PerfGate::Qg10);
+        assert_eq!(qg10.len(), 1);
+        assert_eq!(qg10[0].threads, Some(1));
+    }
+
+    #[test]
+    fn qg6_matrix_rejects_missing_duplicate_reclassified_and_non_warm_cells() {
+        let complete = PerfMatrixSpec::complete();
+        let first_qg6 = complete
+            .cells
+            .iter()
+            .position(|cell| cell.gate == PerfGate::Qg6)
+            .expect("QG-6 cell");
+
+        let mut missing = complete.clone();
+        missing.cells.remove(first_qg6);
+        assert!(validate_matrix(&missing).is_err());
+
+        let mut duplicate = complete.clone();
+        duplicate.cells.push(duplicate.cells[first_qg6].clone());
+        assert!(validate_matrix(&duplicate).is_err());
+
+        let mut reclassified = complete.clone();
+        reclassified.cells[first_qg6].query_class = Some(PerfQueryClass::Boolean);
+        assert!(validate_matrix(&reclassified).is_err());
+
+        for substituted_metric in ["cold_open_latency_ms", "stage_parse_latency_ms"] {
+            let mut substituted = complete.clone();
+            substituted.cells[first_qg6].metric = substituted_metric.to_owned();
+            assert!(
+                validate_matrix(&substituted).is_err(),
+                "{substituted_metric} must not substitute for warm total search"
+            );
+        }
     }
 
     #[test]
@@ -3209,58 +3230,13 @@ mod tests {
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(PerfExecutionProvenance {
-                producer_os: "linux".to_owned(),
                 host_identity: "test-host".to_owned(),
+                producer_os: PerfProducerOs::Linux,
                 physical_cores: 64,
                 logical_threads: 128,
-                ram_bytes: 512 * 1024 * 1024 * 1024,
-                numa_nodes: 1,
                 process_available_threads: 128,
-                thread_counts_requested: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
-                thread_observations: vec![PerfThreadProvenance {
-                    fixture: "bulk/tiny/1/positions_on".to_owned(),
-                    thread_count_requested: 1,
-                    cpu_affinity_allowed_list: Some("0-127".to_owned()),
-                    quill: PerfEngineThreadObservation {
-                        engine: "quill".to_owned(),
-                        runtime_available_parallelism: 128,
-                        process_threads_before_probe: 2,
-                        peak_process_threads: 4,
-                        thread_count_actually_used: 1,
-                        cpu_active_new_worker_threads: 1,
-                        cpu_active_threshold_ns: 1_000_000,
-                        peak_new_worker_threads: 1,
-                        observation_method: "linux-proc-task-schedstat-v1".to_owned(),
-                    },
-                    tantivy: PerfEngineThreadObservation {
-                        engine: "tantivy".to_owned(),
-                        runtime_available_parallelism: 128,
-                        process_threads_before_probe: 2,
-                        peak_process_threads: 4,
-                        thread_count_actually_used: 1,
-                        cpu_active_new_worker_threads: 1,
-                        cpu_active_threshold_ns: 1_000_000,
-                        peak_new_worker_threads: 1,
-                        observation_method: "linux-proc-task-schedstat-v1".to_owned(),
-                    },
-                }],
-                engine_binaries: vec![
-                    PerfEngineBinaryIdentity {
-                        engine: "quill".to_owned(),
-                        role: "subject".to_owned(),
-                        version: "0.2.1".to_owned(),
-                        executable_sha256: "c".repeat(64),
-                        identity_scheme: "same-static-elf-v1".to_owned(),
-                    },
-                    PerfEngineBinaryIdentity {
-                        engine: "tantivy".to_owned(),
-                        role: "oracle".to_owned(),
-                        version: "0.26.1".to_owned(),
-                        executable_sha256: "c".repeat(64),
-                        identity_scheme: "same-static-elf-v1".to_owned(),
-                    },
-                ],
-                runtime_detected_isa: vec!["avx2".to_owned(), "fma".to_owned(), "bmi2".to_owned()],
+                configured_engine_thread_widths: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
+                runtime_detected_isa: vec!["avx2".to_owned(), "bmi2".to_owned(), "fma".to_owned()],
                 cpu_affinity_allowed_list: Some("0-127".to_owned()),
                 affinity_or_cpuset_cap: None,
             }),
@@ -3301,9 +3277,9 @@ mod tests {
         assert!(table.contains("median_ci95"));
         assert!(table.contains("bulk/tiny/1/positions_on"));
         assert!(table.contains("sampled"));
-        assert!(table.contains("thread_counts_requested=[1, 2, 4, 8, 16, 32, 64, 96, 128]"));
-        assert!(table.contains("quill_threads_actually_used=1"));
-        assert!(table.contains("engine=tantivy"));
+        assert!(
+            table.contains("configured_engine_thread_widths=[1, 2, 4, 8, 16, 32, 64, 96, 128]")
+        );
     }
 
     #[test]
@@ -3329,10 +3305,6 @@ core id : 1
         assert_eq!(parse_cpu_list_count("0-127"), Some(128));
         assert_eq!(parse_cpu_list_count("0-15,32-47,63"), Some(33));
         assert_eq!(parse_cpu_list_count("4-2"), None);
-        assert_eq!(
-            parse_linux_memtotal_bytes("MemTotal:       523505732 kB\nMemFree: 1 kB\n"),
-            Some(536_069_869_568)
-        );
     }
 
     #[test]
