@@ -3025,7 +3025,7 @@ fn adapter_failure(
     }
 }
 
-pub(crate) fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
+pub fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
     let receipts = queries
         .iter()
         .map(Qg6QueryIdentityReceipt::from_query)
@@ -3033,7 +3033,7 @@ pub(crate) fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
     query_identity_manifest_sha256(receipts.iter())
 }
 
-pub(crate) fn query_identity_manifest_sha256<'a>(
+pub fn query_identity_manifest_sha256<'a>(
     queries: impl IntoIterator<Item = &'a Qg6QueryIdentityReceipt>,
 ) -> String {
     let mut hasher = Sha256::new();

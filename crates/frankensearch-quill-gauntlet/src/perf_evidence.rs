@@ -2497,7 +2497,7 @@ pub enum EvidenceArtifactError {
 }
 
 #[cfg(test)]
-pub(crate) mod qg6_test_fixture {
+pub mod qg6_test_fixture {
     use super::*;
     use crate::perf::Qg6SampleBinding;
     use crate::qg6_prepared::{
@@ -2505,13 +2505,13 @@ pub(crate) mod qg6_test_fixture {
         query_manifest_sha256,
     };
 
-    pub(crate) fn contract(
+    pub fn contract(
         query_class: crate::PerfQueryClass,
     ) -> (PerfInputIdentity, Qg6SemanticContract) {
         contract_for(query_class, 100_000, 10)
     }
 
-    pub(crate) fn contract_for(
+    pub fn contract_for(
         query_class: crate::PerfQueryClass,
         document_count: u64,
         k: usize,
@@ -2558,7 +2558,7 @@ pub(crate) mod qg6_test_fixture {
         (identity, contract)
     }
 
-    pub(crate) fn attach_stream(
+    pub fn attach_stream(
         samples: &mut [PerfRawSample],
         effect_stream: bool,
         identity: &PerfInputIdentity,
@@ -4034,7 +4034,7 @@ mod tests {
             &paired.config,
         )
         .expect("recompute structurally valid extra-pair stream");
-        *paired = Box::new(recomputed);
+        **paired = recomputed;
 
         let directory = tempfile::tempdir().expect("QG-6 artifact directory");
         let path = directory.path().join("qg6-extra-balanced-pair.json");

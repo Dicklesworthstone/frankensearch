@@ -2261,7 +2261,6 @@ fn prepared_qg6_streams(
             &mut semantic_compare,
         )
         .expect("QG-6 score/tie-envelope preflight parity");
-    drop(preflight_search);
     let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize, phase: Qg6Phase| {
         let role = match arm {
             PreparedQueryArm::Quill { .. } => Qg6ArmRole::EffectTreatment,
