@@ -8218,3 +8218,82 @@ on CV.
   `clippy::doc_markdown` — doc-text only, probe artifacts re-verified
   identical after the fix). Full evidence:
   `docs/evidence/e8h/p6-local-qg2-hasher-swap-20260730.md`.
+## 2026-07-30 — KEEP: Quill TermInterner span-inline bucket entries — 1.032x QG-2 single-thread ingest (`bd-e8h-w2-interner-arena-x9s38`, P8 retry)
+
+- **Comparison class: SELF-SPEEDUP.** Both arms are frankensearch (Quill);
+  maintenance evidence only, no incumbent arm anywhere in this measurement.
+- **Machine class:** `local-5975wx-32c` (diagnostic-only class, P1 card
+  fingerprint; not ratchet-admissible). Measured 2026-07-30 from a clean
+  detached worktree at the published base
+  `d5ad5d59e3ca7a4000f97867d06f7ecc5fc59baa` (which contains the landed P6
+  identity-hasher KEEP `bd16d35d`, so this row attributes the span-inline
+  lever alone); toolchain rustc 1.99.0-nightly (9f36de775). Landed on parent
+  `6c70c86f7c852fb5e650fe44ff1b4939bb019fcc` after proving the intervening
+  train left the Quill source and dependency seam byte-identical; the
+  pre-lever `scribe.rs` blob is `47cf87cd…` at both bases.
+- **Graze history (honest):** the original P8 measurement (2026-07-29,
+  overlay ELFs on the 3684-era base) pooled n=32 at paired median 1.0293,
+  32/32 favor — adjudicated WASH against the 1.03 material line, with a
+  frozen single-retry predicate: one rerun at the published base, n=64
+  independent pairs, KEEP iff the new independent median >= 1.03, else
+  terminal reject. This row is that one permitted retry; the retry
+  budget for this lever is now spent either way.
+- **Lever:** `scribe.rs` `Bucket` arms carried bare `u32` term ids; every
+  hit-path key verification (`find_in_bucket` → `matches`) paid a
+  dependent random-access load of `spans[id]` before it could touch the
+  arena bytes. `BucketEntry { id, span }` inlines a copy of the arena span
+  into the bucket entry (span-mirror invariant documented at the type and
+  pinned by `bucket_entries_mirror_spans_across_collisions_and_reset`);
+  `spans` remains the id→span source of truth for the resolve APIs. Flush
+  accounting is PINNED (`const _: () = assert!(TERM_BUCKET_BYTES_ESTIMATE
+  == 40)`; niche layout keeps `Bucket` at 24 bytes) so flush boundaries
+  and on-disk bytes cannot drift. No new dependency.
+- **Workload:** QG-2 smoke memory child, `QUILL_PERF_CHILD_MODE=memory`,
+  `ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on, taskset
+  core 8, external wall time, interleaved paired, per-batch untimed
+  warmups.
+- **Executing ELFs (Arm A = pristine d5ad5d59, Arm B = +P8 patch):**
+  - Arm A ELF sha256: `fdc7c5c7b7b1a0b2c7d107f10f26813bb39d02557534b3bbe8aff26a58120064`
+  - Arm B ELF sha256: `3246d1b844467e50b83750abf4445e507ec3abcc27370350a2777c1724e68617`
+- **A/A null (same invocation method, n=16):** paired docs/s ratio median
+  0.9996, mean 0.9982, 95% t-CI [0.9935, 1.0030], span 0.9754-1.0125.
+- **Result (n=64 pairs, four independent 16-pair batches):** docs/s ratio
+  lever/base **median 1.0325**, mean 1.0306, 95% t-CI [1.0271, 1.0340],
+  63/64 pairs favor the lever; per-batch medians 1.0349 / 1.0263 / 1.0328
+  / 1.0314 (batch 2 rode a transient host-noise window, per-arm cv ~3%);
+  time-ratio convention (new/old) **0.9705**, CI [0.9672, 0.9738]. ~38.9k
+  → ~40.2k docs/s. A/B interval disjoint from the A/A null interval;
+  frozen predicate met (1.0325 >= 1.03).
+- **RSS diagnostic — NO CLAIM:** one separate `/usr/bin/time -v` sample
+  observed 500.3→526.3 MiB (+26 MiB), but the 64 paired rows are noisy:
+  median B/A 1.0097, median delta +4.84 MiB, mean +5.34 MiB, interpolated
+  p5-p95 −14.00 to +22.86 MiB, and only 42/64 rows have B>A. Their arm
+  maxima are 555,061,248 and 561,410,048 bytes. The `Bucket` enum remains
+  24 bytes and the dominant `One` path keeps the same pinned 40-byte outer
+  estimate; only rare `Many` collision-vector capacity grows. No QG-7 or
+  high-collision/high-shard memory experiment ran, so the +26 MiB sample is
+  retained as an observation, not attributed to inline span copies and not
+  promoted as a bounded-memory result.
+- **Mechanism (perf fp call-graph, self-time):** `matches` 0.80% → absent
+  (span read inline from the bucket entry; the dependent `spans[id]` load
+  chain is gone); `find_in_bucket` 1.79% → 1.76%; `intern_accounted`
+  0.73% → 1.06% (absorbed inline work); `hash_parts` ~unchanged. Total
+  samples 20355 → 19862.
+- **Byte identity:** deterministic 3-cycle ingest probe (9k docs, ~20k
+  terms/cycle, flush + interner reset each cycle), rebuilt from THIS
+  worktree in both arms — all emitted FSLX segment files
+  SHA-256-identical across arms and across repeated runs
+  (`d3b2382d…`/`1a42f42e…`/`dc861ef5…`/`dd4257a8…`), matching the
+  original P8 overlay probe's artifact hashes exactly across bases.
+- **Tests at the retry base (patched arm):** `cargo test -p
+  frankensearch-quill` = 484 passed / 0 failed / 1 ignored (lib; +1 vs
+  base is the lever's own span-mirror pin) + green integration suites +
+  doctests, exit 0. clippy `--no-deps -p frankensearch-quill`: clean.
+  At the landing parent, the focused span-mirror test also passed strictly
+  remote on `ovh-a`; the final commit received the repository landing gates
+  recorded in the evidence card.
+- **Status:** LANDED (this commit). The source hunk is byte-identical to the
+  measured candidate; only publication-state and RSS-attribution corrections
+  were added during hostile review. Full narrative and consolidated raw rows:
+  `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
+  `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
