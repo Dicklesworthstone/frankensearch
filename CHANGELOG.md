@@ -21,6 +21,22 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 > series: workspace member crates are at 0.2.x and the `frankensearch` facade
 > crate at 0.3.2 while the repo tag series continues at v1.x.
 
+### Post-publication scope correction — 2026-07-30
+
+- **Native ANN scope:** v1.4.0 landed the in-tree native HNSW engine and its
+  FSVI-bound graph and receipt foundations, but it has not yet replaced the
+  shipping ANN path. `TwoTierIndex` and the `ann` feature still use the
+  git-pinned `hnsw_rs` adapter; native production wiring, tombstone handling,
+  and external-dependency removal remain follow-up work.
+- **Embedding-integrity scope:** v1.4.0 landed canonical identity types,
+  remote-vector attestation, zero-signal classification, sink-level
+  validation, and FSVI v2 admission foundations. Enforcement is not yet
+  end-to-end: fusion and fsfs still contain raw-vector and
+  model-ID/dimension-only seams, current production writers still emit legacy
+  FSVI v1, and generic auto-detection can return an explicitly degraded
+  `HashOnly` stack. “Fail closed” therefore describes the implemented trust
+  boundaries, not every production ingest and search boundary.
+
 ### Quill: Native Pure-Rust Lexical Engine (new crate `frankensearch-quill`)
 
 The dominant workstream of the epoch: a ground-up, memory-safe BM25 lexical
