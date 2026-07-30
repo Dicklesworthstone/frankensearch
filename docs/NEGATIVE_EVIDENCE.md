@@ -17812,3 +17812,171 @@ sample, alternating AB/BA order, exact result and hydration-count parity, an
 A/A null, median confidence intervals, and a quiet pinned worker. Never
 restore a one-shot debug-test threshold, raise that threshold, or retry it
 until green.
+
+### 2026-07-30 — SURVEY: QG-2 ingest is codegen-INSENSITIVE on local-5975wx-32c — target-cpu moves neither arm (E8-H P7, SandyGrove)
+
+**Comparison class: build-flag A/B survey on both arms** (quill AND pinned
+Tantivy oracle); machine class **local-5975wx-32c** (diagnostic-only; the
+QG-2 smoke memory-child external-wall seam is NOT the gate cell and no
+certified gate numbers exist). NULL result — hypothesis evidence, not a
+verdict on any lever.
+
+The surviving explanation for the per-class ingest-seam split (~9x on the
+5800X diagnostic vs ~2.9x on trj-zen3-16c) was per-uarch codegen of the
+portable build. P7 built the SAME pristine-`3684b147` source at three
+codegen levels (G = frame-pointers only, N = `-C target-cpu=native`,
+Z = `-C target-cpu=znver3`; rustc 1.99.0-nightly 9f36de775, release-perf,
+identical Cargo.lock) and A/B'd all cells on the QG-2 smoke memory child
+(200k docs, 1 thread, taskset core 8, external wall, n=28 rounds/cell,
+round-robin, one warmup/cell).
+
+- G ELF sha256: `ae96a2acb95efdd09af87b4e3ed2457f69529eda76f26d36459d414aa4c40aa4`
+- N ELF sha256: `4a66593a24e04228f50872f3fc34de1ff703356f41a81466c0a4cf257c49a20d`
+- Z ELF sha256: `a819b0068cd1d75099c2f0970ffdb9bb702196f738d42de7f47a41654e90cb40`
+- N and Z .text sections differ (`669170ca…` vs `4dfb762a…`), so the 6-cell
+  matrix was not collapsed.
+
+**A/A null (same-ELF twin cell GQ2/GQ, paired by round, n=28):** mean
+1.0002 [95% t-CI 0.9780, 1.0224], median 0.9985, fast-tail 0.9927 (~0.7%
+method precision; fast-tail = ratio of medians of each cell's 10 fastest
+runs, contamination-immune since ambient load spikes only slow runs).
+
+**Result — both arms NULL, well inside the A/A band:** quill N/G median
+0.9998 (fast-tail 0.9965), quill Z/G median 0.9976 (fast-tail 0.9971) —
+≤0.4% movement; tantivy N/G median 0.9961 (fast-tail 0.9966), tantivy Z/G
+median 0.9939 (fast-tail 0.9990) — ≤0.6% movement. The quill/tantivy seam
+gap is FLAT across codegen levels: fast-tail 0.9027 / 0.9027 / 0.9010
+(G/N/Z). This is a load-bearing null: the flags demonstrably rewrote the
+code (ymm-instruction lines G=1,085 → N=80,052 / Z=78,316; 42% of common
+text symbols changed size, including the interner, tokenizer, xxh3, and
+quiver banded-unpack families in quill AND 42% of tantivy's symbols) and
+throughput did not respond. QG-2 ingest on this class is bound by
+memory/branch/alloc behavior, not instruction selection — consistent with
+the W13 alloc census (ingest cost is SPREAD) and with P6's win coming from
+removing hash WORK, not wider vectors.
+
+**Decision: codegen family CLOSED on local-5975wx-32c for QG-2 ingest,
+both arms.** Do not add `-C target-cpu` to perf-runner profiles expecting
+ingest movement on this class; a `target-cpu=native` default cannot ship on
+crates.io regardless (SIGILL on non-AVX2 hosts, per the 2026-06-25 row),
+and `#[target_feature]` source dispatch re-opens the bd-7zjk packaging
+question while now also lacking a demonstrated ingest-side payoff.
+
+**Retry predicate:** replicate this exact 3-level matrix on the 5800X-class
+diagnostic host where the ~9x seam lives. If quill IS codegen-sensitive
+there, the lever is class-specific; if not (expected), pivot the
+class-split investigation to perf-counter comparison across classes (IPC,
+L1d/L2/LLC misses, branch misses on the same G binary). Full card:
+`docs/evidence/e8h/p7-local-qg2-codegen-sensitivity.md`; raw matrix and
+symbol censuses in `scratchpad/p7/` (session-local).
+
+### 2026-07-30 — REJECT direct canonical-preimage encoder in Quill ingest identity (bd-e8h-w2-canonical-encode-si8mk, P12 takeover, SandyGrove)
+
+**Comparison class: SELF-SPEEDUP** (quill vs quill; no incumbent arm ran; no
+campaign or competitive claim).
+
+**Hypothesis (from the P9 generator-corrected attribution,
+`docs/evidence/e8h/p9-local-qg2-generator-corrected-attribution.md`):** the
+canonicalization/identity family — 16.23% of the quill engine side / 11.80%
+of the QG-2 200k memory child as a call-chain subtree — is dominated by
+serde_json serializer indirection building the IDMAP content_hash preimage
+(`canonical_document_preimage` + `canonical_metadata`, index.rs), with 5-8%
+of child CPU recoverable by a direct encoder emitting byte-identical
+preimages. Two corrections found en route: (1) 2.41% of child inside the P9
+family was `stable_digit_scatter` — the scribe.rs SEAL radix scatter caught
+by a classifier name-collision, untouchable by any canonical-encode lever;
+(2) same-day profiling shows that family's leaf attribution is unstable
+across ELFs/replicates (that same symbol swung 69M↔546M cycles between
+same-fixture runs), so the addressable estimate was further inflated.
+Preregistered corrected expectation before timing: 2.5-5% of child.
+
+**Prior art routed around:** the W2.5 closeout (commit `217e73c1`, codex/*
+lineage, NOT on origin/main) falsified a scalar per-byte emitter
+(contaminated adverse 1.133x, INVALID-EXTERNAL-INTERFERENCE, no-ship) and
+named block escape scanning or a single-pass serializer/hash sink as the only
+retry mechanisms. This lever is exactly those: serde_json-table-identical
+block escape scanning with bulk clean-run copies + exact-size
+single-allocation sink (zero growth realloc, BTreeMap replaced by a sorted
+pair Vec, u8-decimal branch ladder), signatures unchanged.
+
+**Byte-identity proof:** (a) three property tests against the literal old
+serde_json path compiled as the in-test oracle (curated adversarial: every
+control byte in every string position, quote/backslash/0x7F,
+combining-mark/BOM/RTL/4-byte UTF-8, empty strings/maps,
+insertion-order != sorted-order keys incl. uppercase-before-lowercase, 10KB
+strings with escapes planted at 128/4096 boundaries; 2,000 seeded-PRNG fuzz
+documents over an adversarial char pool; all-256 u8 metadata-array values
+plus width boundaries), each case also pinning
+`indexable_document_content_hash` == xxh3(reference bytes). RED-ability
+proven: a `0x0B → \v` short-escape mutation fails both string-path tests
+(u8-array test correctly unaffected), reverted, re-green. (b) corpus gate:
+all 200,000 pinned QG-2 fixture IDMAP content_hash witnesses byte-identical
+across base and lever ELFs (per-doc hash files `cmp`-identical;
+order-sensitive fold `0c0143d44daf6595` both arms). Full quill suite
+477/478; the 1 failure
+(`keeper::…::labruntime_serializes_concurrent_publishers_across_a_late_symlink_alias`,
+`saw_two_waiters`) fails identically on PRISTINE 3684b147 under full-suite
+load on this host and passes 5/5 isolated — pre-existing, disjoint from this
+lever.
+
+**Workload:** QG-2 smoke memory child (`QUILL_PERF_CHILD_MODE=memory`,
+`ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on,
+`QUILL_PERF_SCALE=smoke`), externally wall-timed with per-run CPU (user+sys)
+and peak RSS, taskset-pinned core 8, interleaved paired runs: two independent
+16-pair A/B batches plus a 16-pair A/A null. Machine class
+**local-5975wx-32c** (diagnostic host, not a certified campaign class;
+governor powersave — relative paired ratios only).
+
+- Baseline ELF sha256: `9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`
+- Lever ELF sha256: `aeeac40f52037903666aadcbcb6e30e04e5d45e9b2f4991d06f9857e58cf53bb`
+- Both pristine-3684b147 lineage, lever = overlay + index.rs only
+  (`scratchpad/p12/p12-canonical-encode.patch`), same toolchain (nightly
+  9f36de775 2026-07-19), same Cargo.lock resolution (serde_json 1.0.151),
+  same flags (release-perf, `-C force-frame-pointers=yes`, perf-harness),
+  isolated target dirs, RCH-disabled wrapper.
+
+| arm | median wall s | median CPU s | CPU/wall | median docs/s | median peak RSS MiB |
+|---|---:|---:|---:|---:|---:|
+| baseline (batch1/batch2) | 5.270 / 5.339 | 5.250 / 5.320 | 0.996 | 37,949 / 37,458 | 515 / 536 |
+| lever (batch1/batch2) | 5.205 / 5.248 | 5.180 / 5.225 | 0.996 | 38,426 / 38,110 | 478 / 478 |
+
+Paired WALL ratio lever/baseline (>1 = lever faster): batch1 median 1.0143
+[p5 1.0002, p95 1.0285], batch2 median 1.0221 [0.9973, 1.0600], **pooled
+n=32 median 1.0175 [p5 0.9972, p95 1.0476]**; paired CPU ratio pooled median
+1.0183 [0.9976, 1.0482]; 7/32 pairs ≥1.03. A/A null (baseline vs itself,
+same-invocation protocol, n=16): median 0.9956 [0.9890, 1.0101]. Secondary observation
+(no QG claim): lever peak RSS −37 MiB (−7.2%) consistently across all 32
+pairs; the CPU win is user-side (4.94→4.81 s mean), sys flat.
+
+**Mechanism (same-day arm-scoped dwarf profiles, 3 classifier replicates per
+arm; traced-run totals 20.76B vs 20.52B cycles, ratio 1.012, coherent with
+the untraced A/B):** the win is ALLOCATION-SHAPED, not dispatch-shaped.
+Function-precise allocator leaves (attribution-stable): `_int_realloc` 114M →
+21M cycles (−81%, the growth-realloc elimination working as designed),
+`_int_malloc` 456M → 356M, `_int_free` 351M → 263M; allocator total −292M
+cycles ≈ −1.4% of child ≈ the entire measured win. The canonical family
+itself did NOT shrink: net of frame-concentration effects (base scatters
+serde frames into poll-body/[unknown] families; the lever inlines the emitter
+into `canonical_document_preimage` self), direct-emitter compute (exact-size
+pre-pass double scan + push-based u8-decimal emission) is flat-to-worse vs
+serde_json's tuned single-pass serializer. serde dispatch was never the
+bottleneck; the allocation pattern was. This corroborates the DIRECTION of
+W2.5's contaminated adverse diagnostic for pure emitter swaps.
+
+**Decision: REJECT / overlay reverted.** Pooled paired median 1.0175 is
+below the ≥1.03 acceptance bar (hard point-estimate rule; no CI arguments).
+Real ~+1.8% CPU/wall with −7% peak RSS and full byte-identity, but sub-bar.
+No product change lands; patch + property tests + probes banked in
+`scratchpad/p12/` (session-local). Full card:
+`docs/evidence/e8h/p12-card.md`.
+
+**Retry predicate:** (a) do not re-attempt any canonical-encode emitter swap
+without a counted receipt that emitter compute (not allocation) dominates —
+this pass measured the split: allocator ≈1.4% of child (captured and still
+sub-bar), emitter ≈parity, xxh3 2.8% untouchable; (b) the one evidence-backed
+residual is an alloc-only hybrid (keep serde_json's emitter, serialize into a
+reused scratch buffer + one exact-size copy into the retained Vec) worth
+≈1.4% alone — bundle-only, never a standalone ≥1.03 candidate; (c) re-rank
+the P9 lever table with canonical-encode Impact cut to ≤2 — the 16.23%-ENG
+family number is not addressable mass: it contains the seal radix scatter
+(classifier name-collision), attribution-unstable placement, and hash floor.
