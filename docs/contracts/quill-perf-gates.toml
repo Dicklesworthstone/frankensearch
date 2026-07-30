@@ -70,6 +70,7 @@ activated = false
 [gate.QG-6]
 name = "query latency"
 fixture = "query-class mix from search_quality_harness slices (identifier/short_keyword/natural_language/phrase/boolean) x k in {10,100} x corpus {100k, 1M}"
+queries_per_class = 16
 target = "p50 parity (+-10%) per class; p99 <= oracle per class; NO class regresses >10%; fuel-metering checkpoints (bd-quill-duel-fuel-metering) must show no measurable delta here before merging"
 activated = false
 
