@@ -24,13 +24,18 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::perf::{PerfQueryClass, QG6_QUERY_GROUPS};
 
-const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v2";
-const QG6_RESULT_DIGEST_VERSION: &str = "frankensearch-qg6-ordered-result-v1";
-const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v1";
+const QG6_QUERY_MANIFEST_VERSION: &str = "frankensearch-qg6-query-manifest-v3";
+const QG6_RESULT_RECEIPT_VERSION: &str = "frankensearch-qg6-result-receipt-v1";
+const QG6_RESULT_SEQUENCE_VERSION: &str = "frankensearch-qg6-result-sequence-v1";
+const QG6_SEMANTIC_CONTRACT_VERSION: &str = "frankensearch-qg6-semantic-contract-v1";
+const QG6_QUERY_IDENTITY_VERSION: &str = "frankensearch-qg6-query-identity-v1";
+const QG6_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-frozen-80-query-generator-v2";
 const QG6_CORPUS_GENERATOR_REVISION: &str =
     "frankensearch-quill-gauntlet/generator-v2;schema=2;zipf=s11;vocab=8192;max_doc=4096";
 const QG6_FROZEN_MANIFEST_SHA256: &str =
-    "1994690d27929beccf09dad2dc82aa09d9e3fb3a00d9e7fab11ed3d79eafa8e8";
+    "4e9ed3dc59538a8f4fb8d100420fdb90e15cc64d4d7a6c8d5de7a3db1eaac1ca";
+const EMPTY_DOCUMENT_ID_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const QG6_AD_HOC_QUERY_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-query-v1";
 const QG6_AD_HOC_CORPUS_GENERATOR_REVISION: &str = "frankensearch-qg6-ad-hoc-corpus-v1";
 const QG6_SAMPLING_FRAME: &str = "five public query classes; sixteen independently frozen \
@@ -46,61 +51,8 @@ const MAX_QUERY_COUNT: usize = 4_096;
 const MAX_QUERY_ID_BYTES: usize = 256;
 const MAX_QUERY_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_DOC_ID_BYTES: usize = 4 * 1_024;
+const MAX_UNSUPPORTED_REASON_CODE_BYTES: usize = 64;
 const MAX_K: usize = 100_000;
-
-/// Declared corpus prevalence represented by one frozen query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Qg6PrevalenceStratum {
-    /// High-frequency generated terms or combinations.
-    Common,
-    /// Mid-frequency generated terms or combinations.
-    MidFrequency,
-    /// Low-frequency terms or combinations.
-    Rare,
-    /// Deliberate no-hit query.
-    NoHit,
-}
-
-impl Qg6PrevalenceStratum {
-    const ALL: [Self; 4] = [Self::Common, Self::MidFrequency, Self::Rare, Self::NoHit];
-
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Common => 0,
-            Self::MidFrequency => 1,
-            Self::Rare => 2,
-            Self::NoHit => 3,
-        }
-    }
-}
-
-/// Declared parser/execution difficulty represented by one frozen query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Qg6DifficultyStratum {
-    /// One uncomplicated leaf.
-    Easy,
-    /// Several ordinary leaves.
-    Moderate,
-    /// A rarer or nested supported shape.
-    Hard,
-    /// A supported boundary/adversarial shape.
-    Adversarial,
-}
-
-impl Qg6DifficultyStratum {
-    const ALL: [Self; 4] = [Self::Easy, Self::Moderate, Self::Hard, Self::Adversarial];
-
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Easy => 0,
-            Self::Moderate => 1,
-            Self::Hard => 2,
-            Self::Adversarial => 3,
-        }
-    }
-}
 
 /// Frozen support state and any reviewed cross-engine result divergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +105,21 @@ impl Qg6SupportDivergence {
                 hash_len_prefixed(hasher, reason_code.as_bytes());
             }
         }
+    }
+}
+
+fn valid_supported_divergence(value: &Qg6SupportDivergence) -> bool {
+    match value {
+        Qg6SupportDivergence::SupportedExact => true,
+        Qg6SupportDivergence::SupportedWithReviewedDivergence {
+            register_id,
+            contract_sha256,
+        } => {
+            !register_id.is_empty()
+                && register_id.len() <= 256
+                && is_lower_hex_sha256(contract_sha256)
+        }
+        Qg6SupportDivergence::Unsupported { .. } => false,
     }
 }
 
@@ -235,6 +202,8 @@ pub enum Qg6Phase {
     Warmup,
     /// Timed measurement.
     Measurement,
+    /// Full native result verification after every timed interval is complete.
+    Postflight,
 }
 
 /// Whether the selected cells constitute the complete QG-6 gate.
@@ -300,8 +269,8 @@ pub struct Qg6QuerySpec {
     class: PerfQueryClass,
     normalized_text_sha256: String,
     parsed_ast_sha256: String,
-    prevalence: Qg6PrevalenceStratum,
-    difficulty: Qg6DifficultyStratum,
+    coverage_row: u8,
+    coverage_column: u8,
     support_divergence: Qg6SupportDivergence,
     supported_k: [usize; 2],
     query_generator_revision: String,
@@ -327,8 +296,8 @@ impl Qg6QuerySpec {
             id,
             text,
             class,
-            Qg6PrevalenceStratum::Common,
-            Qg6DifficultyStratum::Easy,
+            0,
+            0,
             Qg6SupportDivergence::reviewed(),
             QG6_AD_HOC_QUERY_GENERATOR_REVISION,
             QG6_AD_HOC_CORPUS_GENERATOR_REVISION,
@@ -339,8 +308,8 @@ impl Qg6QuerySpec {
         id: String,
         text: String,
         class: PerfQueryClass,
-        prevalence: Qg6PrevalenceStratum,
-        difficulty: Qg6DifficultyStratum,
+        coverage_row: u8,
+        coverage_column: u8,
         support_divergence: Qg6SupportDivergence,
         query_generator_revision: &str,
         corpus_generator_revision: &str,
@@ -369,8 +338,8 @@ impl Qg6QuerySpec {
             class,
             normalized_text_sha256: sha256_hex(normalized.as_bytes()),
             parsed_ast_sha256,
-            prevalence,
-            difficulty,
+            coverage_row,
+            coverage_column,
             support_divergence,
             supported_k: QG6_SUPPORTED_K,
             query_generator_revision: query_generator_revision.to_owned(),
@@ -398,16 +367,16 @@ impl Qg6QuerySpec {
         self.class
     }
 
-    /// Frozen corpus prevalence stratum.
+    /// Neutral row coordinate in the frozen 4x4 coverage grid.
     #[must_use]
-    pub const fn prevalence(&self) -> Qg6PrevalenceStratum {
-        self.prevalence
+    pub const fn coverage_row(&self) -> u8 {
+        self.coverage_row
     }
 
-    /// Frozen parser/execution difficulty stratum.
+    /// Neutral column coordinate in the frozen 4x4 coverage grid.
     #[must_use]
-    pub const fn difficulty(&self) -> Qg6DifficultyStratum {
-        self.difficulty
+    pub const fn coverage_column(&self) -> u8 {
+        self.coverage_column
     }
 
     /// Whether the frozen comparator contract permits a reviewed native
@@ -440,6 +409,12 @@ impl Qg6QuerySpec {
         }
     }
 
+    /// Domain-separated identity of the redacted query contract.
+    #[must_use]
+    pub fn identity_sha256(&self) -> String {
+        Qg6QueryIdentityReceipt::from_query(self).query_identity_sha256
+    }
+
     /// Sampling frame that governs every normative QG-6 query cell.
     #[must_use]
     pub const fn sampling_frame() -> &'static str {
@@ -467,7 +442,7 @@ impl Qg6QuerySpec {
     /// # Errors
     ///
     /// Fails if the built-in frozen manifest violates any count, identity,
-    /// parser, stratum, support, or revision invariant.
+    /// parser, coverage-coordinate, support, or revision invariant.
     pub fn normative_for_class(class: PerfQueryClass) -> Result<Vec<Self>, Qg6HarnessError> {
         let manifest = build_normative_query_manifest()?;
         validate_complete_query_manifest(&manifest)?;
@@ -512,6 +487,11 @@ impl Qg6QuerySpec {
                 ),
             });
         }
+        if self.coverage_row >= 4 || self.coverage_column >= 4 {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: format!("query {:?} has an invalid 4x4 coverage coordinate", self.id),
+            });
+        }
         if self.query_generator_revision.is_empty()
             || self.query_generator_revision.len() > 256
             || self.corpus_generator_revision.is_empty()
@@ -543,10 +523,28 @@ impl Qg6QuerySpec {
                 }
             }
             Qg6SupportDivergence::Unsupported { reason_code } => {
+                if reason_code.is_empty()
+                    || reason_code.len() > MAX_UNSUPPORTED_REASON_CODE_BYTES
+                    || !reason_code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    return Err(Qg6HarnessError::InvalidSpec {
+                        reason: format!(
+                            "query {:?} has an invalid unsupported-reason token",
+                            self.id
+                        ),
+                    });
+                }
                 return Err(Qg6HarnessError::InvalidSpec {
                     reason: format!(
-                        "query {:?} is explicitly unsupported ({reason_code}); refusing silent skip",
-                        self.id
+                        "query {:?} is explicitly unsupported; reason_sha256={}, reason_bytes={}; \
+                         refusing silent skip",
+                        self.id,
+                        sha256_hex(reason_code.as_bytes()),
+                        reason_code.len()
                     ),
                 });
             }
@@ -576,8 +574,8 @@ impl fmt::Debug for Qg6QuerySpec {
             .field("class", &self.class)
             .field("normalized_text_sha256", &self.normalized_text_sha256)
             .field("parsed_ast_sha256", &self.parsed_ast_sha256)
-            .field("prevalence", &self.prevalence)
-            .field("difficulty", &self.difficulty)
+            .field("coverage_row", &self.coverage_row)
+            .field("coverage_column", &self.coverage_column)
             .field("support_divergence", &self.support_divergence)
             .field("supported_k", &self.supported_k)
             .field("query_generator_revision", &self.query_generator_revision)
@@ -589,435 +587,105 @@ impl fmt::Debug for Qg6QuerySpec {
 #[derive(Clone, Copy)]
 struct Qg6QuerySeed {
     text: &'static str,
-    prevalence: Qg6PrevalenceStratum,
-    difficulty: Qg6DifficultyStratum,
 }
 
-const fn query_seed(
-    text: &'static str,
-    prevalence: Qg6PrevalenceStratum,
-    difficulty: Qg6DifficultyStratum,
-) -> Qg6QuerySeed {
-    Qg6QuerySeed {
-        text,
-        prevalence,
-        difficulty,
-    }
+const fn query_seed(text: &'static str) -> Qg6QuerySeed {
+    Qg6QuerySeed { text }
 }
 
 const IDENTIFIER_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
-    query_seed(
-        "term00042",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00137",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "src/main.rs",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        r"crate\:\:module\:\:TypeName",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "snake_case_identifier",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "camelCaseIdentifier",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "HTTPServer2",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "config.toml",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "path/to/module.rs",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "qgupdateg7d42",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "sha256deadbeef",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "user_id",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "nonexistentIdentifierAlpha",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "missing/path/file.rs",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        r"UnknownModule\:\:Type",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "qg6_nohit_identifier_15",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Adversarial,
-    ),
+    query_seed("term00042"),
+    query_seed("term00137"),
+    query_seed("src/main.rs"),
+    query_seed(r"crate\:\:module\:\:TypeName"),
+    query_seed("snake_case_identifier"),
+    query_seed("camelCaseIdentifier"),
+    query_seed("HTTPServer2"),
+    query_seed("config.toml"),
+    query_seed("path/to/module.rs"),
+    query_seed("qgupdateg7d42"),
+    query_seed("sha256deadbeef"),
+    query_seed("user_id"),
+    query_seed("nonexistentIdentifierAlpha"),
+    query_seed("missing/path/file.rs"),
+    query_seed(r"UnknownModule\:\:Type"),
+    query_seed("qg6_nohit_identifier_15"),
 ];
 
 const SHORT_KEYWORD_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
-    query_seed(
-        "term00001",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00002",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "generated",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "record",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "term00005",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00011",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "term00017",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "term00029",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "term02048",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term04096",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "term06000",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "term08190",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "missingkeywordalpha",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "missingkeywordbeta",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "missingkeywordgamma",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "missingkeyworddelta",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Adversarial,
-    ),
+    query_seed("term00001"),
+    query_seed("term00002"),
+    query_seed("generated"),
+    query_seed("record"),
+    query_seed("term00005"),
+    query_seed("term00011"),
+    query_seed("term00017"),
+    query_seed("term00029"),
+    query_seed("term02048"),
+    query_seed("term04096"),
+    query_seed("term06000"),
+    query_seed("term08190"),
+    query_seed("missingkeywordalpha"),
+    query_seed("missingkeywordbeta"),
+    query_seed("missingkeywordgamma"),
+    query_seed("missingkeyworddelta"),
 ];
 
 const NATURAL_LANGUAGE_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
-    query_seed(
-        "term00001 term00007 generated record",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00002 term00013 generated record",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "term00003 term00017 generated record",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "term00005 term00019 generated record",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "search record containing term00023 term00031",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "generated document mentions term00037 term00041",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "find term00043 beside term00047 in record",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "which generated record includes term00053 term00059",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "rare generated record term02048 term03001",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "locate term04096 with term05003 in generated content",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "record containing rare terms term06000 term07001",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "generated content near term08180 and term08190",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "no matching prose alpha qg6missingone",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "find absent generated record qg6missingtwo",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "where is qg6missingthree in this corpus",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "adversarial but valid prose qg6missingfour term08191",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Adversarial,
-    ),
+    query_seed("term00001 term00007 generated record"),
+    query_seed("term00002 term00013 generated record"),
+    query_seed("term00003 term00017 generated record"),
+    query_seed("term00005 term00019 generated record"),
+    query_seed("search record containing term00023 term00031"),
+    query_seed("generated document mentions term00037 term00041"),
+    query_seed("find term00043 beside term00047 in record"),
+    query_seed("which generated record includes term00053 term00059"),
+    query_seed("rare generated record term02048 term03001"),
+    query_seed("locate term04096 with term05003 in generated content"),
+    query_seed("record containing rare terms term06000 term07001"),
+    query_seed("generated content near term08180 and term08190"),
+    query_seed("no matching prose alpha qg6missingone"),
+    query_seed("find absent generated record qg6missingtwo"),
+    query_seed("where is qg6missingthree in this corpus"),
+    query_seed("adversarial but valid prose qg6missingfour term08191"),
 ];
 
 const PHRASE_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
-    query_seed(
-        "\"term00001 term00002\"",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "\"term00002 term00003\"",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "\"generated record\"",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "\"term00005 term00006 term00007\"",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "\"term00011 term00012\"",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "\"term00017 term00018\"",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "\"term00023 term00024 term00025\"",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "\"record term00031 generated\"",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "\"term02048 term02049\"",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "\"term04096 term04097\"",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "\"term06000 term06001 term06002\"",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "\"term08180 term08181\"",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "\"qg6 missing phrase alpha\"",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "\"qg6 missing phrase beta\"",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "\"qg6 missing phrase gamma delta\"",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "\"qg6 adversarial nohit phrase epsilon\"",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Adversarial,
-    ),
+    query_seed("\"term00001 term00002\""),
+    query_seed("\"term00002 term00003\""),
+    query_seed("\"generated record\""),
+    query_seed("\"term00005 term00006 term00007\""),
+    query_seed("\"term00011 term00012\""),
+    query_seed("\"term00017 term00018\""),
+    query_seed("\"term00023 term00024 term00025\""),
+    query_seed("\"record term00031 generated\""),
+    query_seed("\"term02048 term02049\""),
+    query_seed("\"term04096 term04097\""),
+    query_seed("\"term06000 term06001 term06002\""),
+    query_seed("\"term08180 term08181\""),
+    query_seed("\"qg6 missing phrase alpha\""),
+    query_seed("\"qg6 missing phrase beta\""),
+    query_seed("\"qg6 missing phrase gamma delta\""),
+    query_seed("\"qg6 adversarial nohit phrase epsilon\""),
 ];
 
 const BOOLEAN_QUERY_SEEDS: [Qg6QuerySeed; QG6_QUERY_GROUPS] = [
-    query_seed(
-        "term00001 OR term00002",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00003 AND term00004",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "term00005 OR term00007 OR term00011",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "(term00013 OR term00017) AND term00019",
-        Qg6PrevalenceStratum::Common,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "term00023 AND NOT term08191",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term00029 OR NOT term08190",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "(term00031 AND term00037) OR term00041",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "term00043 AND (term00047 OR term00053) AND NOT term08189",
-        Qg6PrevalenceStratum::MidFrequency,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "term02048 OR term03001",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "term04096 AND term05003",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "(term06000 OR term07001) AND term08001",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "term08180 AND NOT (term00001 OR term00002)",
-        Qg6PrevalenceStratum::Rare,
-        Qg6DifficultyStratum::Adversarial,
-    ),
-    query_seed(
-        "qg6missingboolalpha AND term00001",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Easy,
-    ),
-    query_seed(
-        "qg6missingboolbeta OR qg6missingboolgamma",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Moderate,
-    ),
-    query_seed(
-        "(qg6missingbooldelta AND term08191) OR qg6missingboolepsilon",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Hard,
-    ),
-    query_seed(
-        "qg6missingboolzeta AND NOT (term00001 OR term00002 OR term00003)",
-        Qg6PrevalenceStratum::NoHit,
-        Qg6DifficultyStratum::Adversarial,
-    ),
+    query_seed("term00001 OR term00002"),
+    query_seed("term00003 AND term00004"),
+    query_seed("term00005 OR term00007 OR term00011"),
+    query_seed("(term00013 OR term00017) AND term00019"),
+    query_seed("term00023 AND NOT term08191"),
+    query_seed("term00029 OR NOT term08190"),
+    query_seed("(term00031 AND term00037) OR term00041"),
+    query_seed("term00043 AND (term00047 OR term00053) AND NOT term08189"),
+    query_seed("term02048 OR term03001"),
+    query_seed("term04096 AND term05003"),
+    query_seed("(term06000 OR term07001) AND term08001"),
+    query_seed("term08180 AND NOT (term00001 OR term00002)"),
+    query_seed("qg6missingboolalpha AND term00001"),
+    query_seed("qg6missingboolbeta OR qg6missingboolgamma"),
+    query_seed("(qg6missingbooldelta AND term08191) OR qg6missingboolepsilon"),
+    query_seed("qg6missingboolzeta AND NOT (term00001 OR term00002 OR term00003)"),
 ];
 
 fn seeds_for_class(class: PerfQueryClass) -> &'static [Qg6QuerySeed; QG6_QUERY_GROUPS] {
@@ -1038,14 +706,15 @@ fn build_normative_query_manifest() -> Result<Vec<Qg6QuerySpec>, Qg6HarnessError
                 format!("{}-{index:02}", class_slug(class)),
                 seed.text.to_owned(),
                 class,
-                seed.prevalence,
-                seed.difficulty,
+                u8::try_from(index / 4).expect("sixteen-query grid row fits u8"),
+                u8::try_from(index % 4).expect("sixteen-query grid column fits u8"),
                 Qg6SupportDivergence::reviewed(),
                 QG6_QUERY_GENERATOR_REVISION,
                 QG6_CORPUS_GENERATOR_REVISION,
             )?);
         }
     }
+    queries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     Ok(queries)
 }
 
@@ -1059,8 +728,7 @@ fn validate_complete_query_manifest(queries: &[Qg6QuerySpec]) -> Result<(), Qg6H
     let mut normalized_hashes = BTreeSet::new();
     let mut ast_hashes = BTreeSet::new();
     let mut class_counts = BTreeMap::new();
-    let mut prevalence = BTreeMap::<PerfQueryClass, BTreeSet<Qg6PrevalenceStratum>>::new();
-    let mut difficulty = BTreeMap::<PerfQueryClass, BTreeSet<Qg6DifficultyStratum>>::new();
+    let mut coordinates = BTreeMap::<PerfQueryClass, BTreeSet<(u8, u8)>>::new();
     for query in queries {
         query.validate_entry()?;
         if query.query_generator_revision != QG6_QUERY_GENERATOR_REVISION
@@ -1085,14 +753,10 @@ fn validate_complete_query_manifest(queries: &[Qg6QuerySpec]) -> Result<(), Qg6H
             });
         }
         *class_counts.entry(query.class).or_insert(0_usize) += 1;
-        prevalence
+        coordinates
             .entry(query.class)
             .or_default()
-            .insert(query.prevalence);
-        difficulty
-            .entry(query.class)
-            .or_default()
-            .insert(query.difficulty);
+            .insert((query.coverage_row, query.coverage_column));
     }
     for class in PerfQueryClass::ALL {
         if class_counts.get(&class) != Some(&QG6_QUERY_GROUPS) {
@@ -1119,12 +783,13 @@ fn validate_complete_query_manifest(queries: &[Qg6QuerySpec]) -> Result<(), Qg6H
                 ),
             });
         }
-        if prevalence.get(&class) != Some(&Qg6PrevalenceStratum::ALL.into_iter().collect())
-            || difficulty.get(&class) != Some(&Qg6DifficultyStratum::ALL.into_iter().collect())
-        {
+        let expected_coordinates = (0_u8..4)
+            .flat_map(|row| (0_u8..4).map(move |column| (row, column)))
+            .collect::<BTreeSet<_>>();
+        if coordinates.get(&class) != Some(&expected_coordinates) {
             return Err(Qg6HarnessError::InvalidSpec {
                 reason: format!(
-                    "QG-6 class {} must cover every prevalence and difficulty stratum",
+                    "QG-6 class {} must cover every neutral 4x4 coordinate exactly once",
                     class_slug(class)
                 ),
             });
@@ -1179,32 +844,72 @@ pub struct Qg6ExperimentIdentity {
     pub k: usize,
 }
 
-/// A search result whose optional native digest is checked outside the timer.
+/// One native ranked hit retained until the result receipt is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qg6SearchHit {
+    document_id: String,
+    score_bits: u32,
+}
+
+impl Qg6SearchHit {
+    /// Construct one native ranked hit from its external ID and exact score bits.
+    #[must_use]
+    pub fn new(document_id: impl Into<String>, score_bits: u32) -> Self {
+        Self {
+            document_id: document_id.into(),
+            score_bits,
+        }
+    }
+}
+
+/// A search result whose optional native receipt digest is checked outside the timer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qg6SearchResult {
-    ordered_doc_ids: Vec<String>,
+    ordered_hits: Vec<Qg6SearchHit>,
+    total_count: u64,
+    doc_count: Option<u64>,
     claimed_sha256: Option<String>,
 }
 
 impl Qg6SearchResult {
-    /// Wrap exact ordered document IDs without doing digest work in the adapter.
+    /// Wrap exact ordered document IDs for focused tests.
+    ///
+    /// Production adapters should use [`Self::from_ranked_hits`] so score bits
+    /// and the engine-native total count are bound explicitly.
     #[must_use]
     pub fn from_ordered_doc_ids(ordered_doc_ids: Vec<String>) -> Self {
+        let total_count = usize_to_u64_infallible(ordered_doc_ids.len());
         Self {
-            ordered_doc_ids,
+            ordered_hits: ordered_doc_ids
+                .into_iter()
+                .map(|document_id| Qg6SearchHit::new(document_id, 0))
+                .collect(),
+            total_count,
+            doc_count: None,
             claimed_sha256: None,
         }
     }
 
-    /// Wrap IDs plus a native digest. The runner independently recomputes it.
-    pub fn with_claimed_sha256(
-        ordered_doc_ids: Vec<String>,
-        claimed_sha256: impl Into<String>,
+    /// Wrap native ordered hits and exact corpus/result cardinalities.
+    #[must_use]
+    pub fn from_ranked_hits(
+        ordered_hits: Vec<Qg6SearchHit>,
+        total_count: u64,
+        doc_count: u64,
     ) -> Self {
         Self {
-            ordered_doc_ids,
-            claimed_sha256: Some(claimed_sha256.into()),
+            ordered_hits,
+            total_count,
+            doc_count: Some(doc_count),
+            claimed_sha256: None,
         }
+    }
+
+    /// Attach a native full-receipt digest. The runner independently recomputes it.
+    #[must_use]
+    pub fn with_claimed_sha256(mut self, claimed_sha256: impl Into<String>) -> Self {
+        self.claimed_sha256 = Some(claimed_sha256.into());
+        self
     }
 }
 
@@ -1214,13 +919,392 @@ impl From<Vec<String>> for Qg6SearchResult {
     }
 }
 
-/// Stable result facts retained for parity and post-timing stability checks.
+/// One redacted ranked hit in a sealed semantic receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6RankedHitReceipt {
+    /// SHA-256 of the external document ID.
+    pub document_id_sha256: String,
+    /// Exact IEEE-754 score bits returned by the native engine.
+    pub score_bits: u32,
+}
+
+/// Stable full result facts retained for parity and post-timing stability checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Qg6ResultReceipt {
     /// Exact number of returned hits.
-    pub hit_count: usize,
-    /// SHA-256 over length-delimited ordered document IDs.
-    pub ordered_doc_ids_sha256: String,
+    pub returned_count: usize,
+    /// Redacted ordered native hits.
+    pub ordered_hits: Vec<Qg6RankedHitReceipt>,
+    /// Exact total number of matching documents before the top-k cutoff.
+    pub total_count: u64,
+    /// Exact live document cardinality of the searched index.
+    pub doc_count: u64,
+    /// Domain-separated SHA-256 over all preceding fields.
+    pub receipt_sha256: String,
+}
+
+impl Qg6ResultReceipt {
+    #[cfg(test)]
+    pub(crate) fn from_redacted_hits(
+        ordered_hits: Vec<Qg6RankedHitReceipt>,
+        total_count: u64,
+        doc_count: u64,
+        k: usize,
+    ) -> Result<Self, Qg6HarnessError> {
+        let mut receipt = Self {
+            returned_count: ordered_hits.len(),
+            ordered_hits,
+            total_count,
+            doc_count,
+            receipt_sha256: String::new(),
+        };
+        receipt.receipt_sha256 = receipt.canonical_sha256();
+        receipt.verify(k, doc_count)?;
+        Ok(receipt)
+    }
+
+    fn canonical_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, QG6_RESULT_RECEIPT_VERSION.as_bytes());
+        hasher.update(usize_to_u64_infallible(self.returned_count).to_le_bytes());
+        for hit in &self.ordered_hits {
+            hash_len_prefixed(&mut hasher, hit.document_id_sha256.as_bytes());
+            hasher.update(hit.score_bits.to_le_bytes());
+        }
+        hasher.update(self.total_count.to_le_bytes());
+        hasher.update(self.doc_count.to_le_bytes());
+        lower_hex(hasher.finalize())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reseal_for_test(&mut self) {
+        self.receipt_sha256 = self.canonical_sha256();
+    }
+
+    /// Verify shape, cardinality, hashes, and the self-seal.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed or internally inconsistent receipt data.
+    pub fn verify(&self, k: usize, expected_doc_count: u64) -> Result<(), Qg6HarnessError> {
+        let returned_count = usize_to_u64(self.returned_count)?;
+        let requested_count = usize_to_u64(k)?;
+        let mut unique_document_ids = BTreeSet::new();
+        if self.returned_count != self.ordered_hits.len()
+            || self.returned_count > k
+            || returned_count != self.total_count.min(requested_count)
+            || self.total_count > self.doc_count
+            || self.doc_count != expected_doc_count
+            || self.ordered_hits.iter().any(|hit| {
+                !is_lower_hex_sha256(&hit.document_id_sha256)
+                    || hit.document_id_sha256 == EMPTY_DOCUMENT_ID_SHA256
+                    || !f32::from_bits(hit.score_bits).is_finite()
+                    || !unique_document_ids.insert(hit.document_id_sha256.as_str())
+            })
+            || self.receipt_sha256 != self.canonical_sha256()
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 result receipt is malformed or has an invalid self-seal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Named receipts for all four independent logical roles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6FourArmResultReceipts {
+    /// Left Tantivy arm of the A/A null.
+    pub null_left: Qg6ResultReceipt,
+    /// Right Tantivy arm of the A/A null.
+    pub null_right: Qg6ResultReceipt,
+    /// Tantivy control arm of the A/B effect.
+    pub effect_control: Qg6ResultReceipt,
+    /// Quill treatment arm of the A/B effect.
+    pub effect_treatment: Qg6ResultReceipt,
+}
+
+impl Qg6FourArmResultReceipts {
+    /// Resolve a named logical role without relying on array position.
+    #[must_use]
+    pub const fn get(&self, role: Qg6ArmRole) -> &Qg6ResultReceipt {
+        match role {
+            Qg6ArmRole::NullLeft => &self.null_left,
+            Qg6ArmRole::NullRight => &self.null_right,
+            Qg6ArmRole::EffectControl => &self.effect_control,
+            Qg6ArmRole::EffectTreatment => &self.effect_treatment,
+        }
+    }
+}
+
+/// Recomputable redacted identity of one query in a semantic contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6QueryIdentityReceipt {
+    /// Stable non-sensitive query identifier.
+    pub query_id: String,
+    /// Frozen public query class.
+    pub class: PerfQueryClass,
+    /// SHA-256 of normalized source text.
+    pub normalized_text_sha256: String,
+    /// SHA-256 of the canonical parsed AST.
+    pub parsed_ast_sha256: String,
+    /// Neutral row in the frozen 4x4 grid.
+    pub coverage_row: u8,
+    /// Neutral column in the frozen 4x4 grid.
+    pub coverage_column: u8,
+    /// Reviewed support contract.
+    pub support_divergence: Qg6SupportDivergence,
+    /// Exactly supported result cutoffs.
+    pub supported_k: [usize; 2],
+    /// Query-generator revision.
+    pub query_generator_revision: String,
+    /// Corpus-generator revision.
+    pub corpus_generator_revision: String,
+    /// Domain-separated digest over every preceding field.
+    pub query_identity_sha256: String,
+}
+
+impl Qg6QueryIdentityReceipt {
+    pub(crate) fn from_query(query: &Qg6QuerySpec) -> Self {
+        let mut receipt = Self {
+            query_id: query.id.clone(),
+            class: query.class,
+            normalized_text_sha256: query.normalized_text_sha256.clone(),
+            parsed_ast_sha256: query.parsed_ast_sha256.clone(),
+            coverage_row: query.coverage_row,
+            coverage_column: query.coverage_column,
+            support_divergence: query.support_divergence.clone(),
+            supported_k: query.supported_k,
+            query_generator_revision: query.query_generator_revision.clone(),
+            corpus_generator_revision: query.corpus_generator_revision.clone(),
+            query_identity_sha256: String::new(),
+        };
+        receipt.query_identity_sha256 = receipt.canonical_sha256();
+        receipt
+    }
+
+    /// Recompute the domain-separated redacted query digest.
+    #[must_use]
+    pub fn canonical_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, QG6_QUERY_IDENTITY_VERSION.as_bytes());
+        hash_query_identity_receipt(&mut hasher, self);
+        lower_hex(hasher.finalize())
+    }
+
+    fn verify(&self) -> Result<(), Qg6HarnessError> {
+        if self.query_id.is_empty()
+            || self.query_id.len() > MAX_QUERY_ID_BYTES
+            || class_from_query_id(&self.query_id)? != self.class
+            || !is_lower_hex_sha256(&self.normalized_text_sha256)
+            || !is_lower_hex_sha256(&self.parsed_ast_sha256)
+            || self.coverage_row >= 4
+            || self.coverage_column >= 4
+            || self.supported_k != QG6_SUPPORTED_K
+            || self.query_generator_revision.is_empty()
+            || self.query_generator_revision.len() > 256
+            || self.corpus_generator_revision.is_empty()
+            || self.corpus_generator_revision.len() > 512
+            || !valid_supported_divergence(&self.support_divergence)
+            || self.query_identity_sha256 != self.canonical_sha256()
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 query identity receipt is malformed or has an invalid self-seal"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Ordered query-to-group mapping and its complete four-role semantic receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6QueryGroupReceipt {
+    /// Canonical zero-based query group.
+    pub group_id: u64,
+    /// Full recomputable redacted query identity.
+    pub query: Qg6QueryIdentityReceipt,
+    /// Full receipts for every native role.
+    pub roles: Qg6FourArmResultReceipts,
+}
+
+/// Cell-local sealed semantic contract consumed by QG-6 evidence validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qg6SemanticContract {
+    /// Local contract schema.
+    pub schema_version: String,
+    /// Exact ordered prepared corpus.
+    pub prepared_corpus_sha256: String,
+    /// Exact canonical query manifest.
+    pub query_manifest_sha256: String,
+    /// Cross-engine configuration contract.
+    pub config_contract_sha256: String,
+    /// Exact live corpus cardinality.
+    pub document_count: u64,
+    /// Requested result cutoff.
+    pub k: usize,
+    /// Canonically ordered query mapping and four-role results.
+    pub groups: Vec<Qg6QueryGroupReceipt>,
+    /// Domain-separated SHA-256 over all preceding fields.
+    pub contract_sha256: String,
+}
+
+impl Qg6SemanticContract {
+    fn seal(mut self) -> Self {
+        self.contract_sha256 = self.canonical_sha256();
+        self
+    }
+
+    pub(crate) fn from_receipts(
+        identity: &Qg6ExperimentIdentity,
+        queries: &[Qg6QuerySpec],
+        expected_results: &[Qg6FourArmResultReceipts],
+    ) -> Result<Self, Qg6HarnessError> {
+        validate_experiment_inputs(identity.document_count, identity.k, queries)?;
+        if queries.len() != expected_results.len()
+            || query_manifest_sha256(queries) != identity.query_manifest_sha256
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 query/result receipts do not match the experiment identity"
+                    .to_owned(),
+            });
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(queries.len())
+            .map_err(|_| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 semantic-contract allocation failed".to_owned(),
+            })?;
+        entries.extend(queries.iter().zip(expected_results));
+        entries.sort_unstable_by(|(left, _), (right, _)| left.id.cmp(&right.id));
+
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 semantic-contract allocation failed".to_owned(),
+            })?;
+        for (index, (query, roles)) in entries.into_iter().enumerate() {
+            groups.push(Qg6QueryGroupReceipt {
+                group_id: usize_to_u64(index)?,
+                query: Qg6QueryIdentityReceipt::from_query(query),
+                roles: roles.clone(),
+            });
+        }
+        let contract = Self {
+            schema_version: QG6_SEMANTIC_CONTRACT_VERSION.to_owned(),
+            prepared_corpus_sha256: identity.corpus_sha256.clone(),
+            query_manifest_sha256: identity.query_manifest_sha256.clone(),
+            config_contract_sha256: identity.config_contract_sha256.clone(),
+            document_count: identity.document_count,
+            k: identity.k,
+            groups,
+            contract_sha256: String::new(),
+        }
+        .seal();
+        contract.verify()?;
+        Ok(contract)
+    }
+
+    /// Recompute the domain-separated semantic-contract digest.
+    #[must_use]
+    pub fn canonical_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, QG6_SEMANTIC_CONTRACT_VERSION.as_bytes());
+        hash_len_prefixed(&mut hasher, self.prepared_corpus_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, self.query_manifest_sha256.as_bytes());
+        hash_len_prefixed(&mut hasher, self.config_contract_sha256.as_bytes());
+        hasher.update(self.document_count.to_le_bytes());
+        hasher.update(usize_to_u64_infallible(self.k).to_le_bytes());
+        hasher.update(usize_to_u64_infallible(self.groups.len()).to_le_bytes());
+        for group in &self.groups {
+            hasher.update(group.group_id.to_le_bytes());
+            hash_len_prefixed(&mut hasher, group.query.query_identity_sha256.as_bytes());
+            for role in Qg6ArmRole::ALL {
+                hash_len_prefixed(&mut hasher, group.roles.get(role).receipt_sha256.as_bytes());
+            }
+        }
+        lower_hex(hasher.finalize())
+    }
+
+    /// Verify canonical ordering, complete role receipts, context, and self-seal.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any malformed hash, mapping, receipt, or contract digest.
+    pub fn verify(&self) -> Result<(), Qg6HarnessError> {
+        if self.schema_version != QG6_SEMANTIC_CONTRACT_VERSION
+            || !is_lower_hex_sha256(&self.prepared_corpus_sha256)
+            || !is_lower_hex_sha256(&self.query_manifest_sha256)
+            || !is_lower_hex_sha256(&self.config_contract_sha256)
+            || self.document_count == 0
+            || self.k == 0
+            || self.k > MAX_K
+            || self.groups.is_empty()
+            || self.groups.len() > MAX_QUERY_COUNT
+            || self.contract_sha256 != self.canonical_sha256()
+        {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 semantic contract context or self-seal is invalid".to_owned(),
+            });
+        }
+        let observed_manifest_sha256 =
+            query_identity_manifest_sha256(self.groups.iter().map(|group| &group.query));
+        if observed_manifest_sha256 != self.query_manifest_sha256 {
+            return Err(Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 semantic contract query-manifest digest does not recompute"
+                    .to_owned(),
+            });
+        }
+        let mut previous_query_id: Option<&str> = None;
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.group_id != usize_to_u64(index)?
+                || previous_query_id
+                    .is_some_and(|previous| previous >= group.query.query_id.as_str())
+            {
+                return Err(Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 semantic contract query mapping is not canonical".to_owned(),
+                });
+            }
+            group.query.verify()?;
+            for role in Qg6ArmRole::ALL {
+                group.roles.get(role).verify(self.k, self.document_count)?;
+            }
+            previous_query_id = Some(group.query.query_id.as_str());
+        }
+        Ok(())
+    }
+}
+
+/// Domain-separated digest of one validated result repeated for a raw sample.
+///
+/// `work_units` may later represent true leaves rather than a median aggregate;
+/// this function binds only the explicit sequence length and receipt, without
+/// assigning any permanent estimator meaning to one raw row.
+///
+/// # Errors
+///
+/// Rejects zero work or a malformed receipt digest.
+pub fn qg6_result_sequence_sha256(
+    receipt: &Qg6ResultReceipt,
+    work_units: u64,
+) -> Result<String, Qg6HarnessError> {
+    if work_units == 0 || !is_lower_hex_sha256(&receipt.receipt_sha256) {
+        return Err(Qg6HarnessError::InvalidSpec {
+            reason: "QG-6 result sequence requires positive work and a valid receipt".to_owned(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, QG6_RESULT_SEQUENCE_VERSION.as_bytes());
+    hasher.update(work_units.to_le_bytes());
+    hash_len_prefixed(&mut hasher, receipt.receipt_sha256.as_bytes());
+    Ok(lower_hex(hasher.finalize()))
 }
 
 /// Per-arm lifecycle counts proving preparation never re-enters measurement.
@@ -1240,6 +1324,8 @@ pub struct Qg6ArmLifecycle {
     pub warmup_search_calls: u64,
     /// Timed queries.
     pub timed_search_calls: u64,
+    /// Untimed full native stability queries after measurement.
+    pub postflight_search_calls: u64,
     /// Setup operations observed after timing began. This must remain zero.
     pub timed_setup_calls: u64,
 }
@@ -1350,6 +1436,8 @@ pub struct Qg6Measurement {
     pub samples: Vec<Qg6TimedSample>,
     /// Lifecycle contamination proof.
     pub lifecycle: Qg6LifecycleReceipt,
+    /// Sealed query mapping and full four-role semantic receipts.
+    pub semantic_contract: Qg6SemanticContract,
 }
 
 /// Bounded, non-sensitive failure surface for prepared QG-6 execution.
@@ -1476,7 +1564,7 @@ pub enum Qg6HarnessError {
          observed={observed_count}/{observed_sha256}"
     )]
     ResultDrift {
-        /// Warmup or measurement.
+        /// Warmup, measurement, or postflight.
         phase: Qg6Phase,
         /// Logical arm.
         arm: Qg6ArmRole,
@@ -1528,7 +1616,7 @@ pub struct Qg6PreparedExperiment<A> {
 /// Prepared arms whose complete frozen query set passed result parity.
 pub struct Qg6ValidatedExperiment<A> {
     prepared: Qg6PreparedExperiment<A>,
-    expected_results: Vec<Qg6FourArms<Qg6ResultReceipt>>,
+    expected_results: Vec<Qg6FourArmResultReceipts>,
 }
 
 impl<A> Qg6PreparedExperiment<A> {
@@ -1558,6 +1646,8 @@ impl<A> Qg6PreparedExperiment<A> {
         ) -> Result<A, String>,
     {
         validate_experiment_inputs(document_count, k, &queries)?;
+        let mut queries = queries;
+        queries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         let corpus_sha256 = corpus_sha256.into();
         let config_contract_sha256 = config_contract_sha256.into();
         if !is_lower_hex_sha256(&corpus_sha256) || !is_lower_hex_sha256(&config_contract_sha256) {
@@ -1637,6 +1727,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::NullLeft,
                 Qg6Phase::Preflight,
                 search,
@@ -1649,6 +1740,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::NullRight,
                 Qg6Phase::Preflight,
                 search,
@@ -1661,6 +1753,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::EffectControl,
                 Qg6Phase::Preflight,
                 search,
@@ -1673,6 +1766,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::EffectTreatment,
                 Qg6Phase::Preflight,
                 search,
@@ -1688,7 +1782,7 @@ impl<A> Qg6PreparedExperiment<A> {
             ] {
                 compare_exact(query.id(), Qg6ArmRole::NullLeft, &null_left, role, observed)?;
             }
-            expected_results.push(Qg6FourArms {
+            expected_results.push(Qg6FourArmResultReceipts {
                 null_left: null_left.receipt,
                 null_right: null_right.receipt,
                 effect_control: effect_control.receipt,
@@ -1705,7 +1799,8 @@ impl<A> Qg6PreparedExperiment<A> {
     ///
     /// The preflight adapter may return engine-native score and cutoff-tie
     /// evidence. `normalize` extracts the exact native top-k result whose
-    /// per-arm receipt must remain stable during warmup and measurement, while
+    /// per-arm receipt must remain stable during warmup, measurement, and
+    /// postflight, while
     /// `compare` proves that each compared result is semantically equivalent
     /// to the baseline. This permits reviewed native tie-order differences
     /// without requiring every engine to return the same external ID at a
@@ -1732,6 +1827,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::NullLeft,
                 search,
                 normalize,
@@ -1743,6 +1839,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::NullRight,
                 search,
                 normalize,
@@ -1754,6 +1851,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::EffectControl,
                 search,
                 normalize,
@@ -1765,6 +1863,7 @@ impl<A> Qg6PreparedExperiment<A> {
                 &self.arms,
                 query,
                 self.identity.k,
+                self.identity.document_count,
                 Qg6ArmRole::EffectTreatment,
                 search,
                 normalize,
@@ -1788,7 +1887,7 @@ impl<A> Qg6PreparedExperiment<A> {
                     semantic_parity_failure(query.id(), Qg6ArmRole::NullLeft, role, &error)
                 })?;
             }
-            expected_results.push(Qg6FourArms {
+            expected_results.push(Qg6FourArmResultReceipts {
                 null_left: null_left.receipt,
                 null_right: null_right.receipt,
                 effect_control: effect_control.receipt,
@@ -1820,7 +1919,7 @@ impl<A> Qg6ValidatedExperiment<A> {
         search: &mut F,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
     where
-        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<Qg6SearchResult, String>,
+        F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<Qg6SearchResult, String>,
     {
         self.measure_with_normalizer(
             warmup_rounds,
@@ -1847,7 +1946,7 @@ impl<A> Qg6ValidatedExperiment<A> {
         normalize: &mut N,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
     where
-        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+        F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
         N: FnMut(R) -> Qg6SearchResult,
     {
         self.measure_query_p50_with_normalizer(
@@ -1881,7 +1980,7 @@ impl<A> Qg6ValidatedExperiment<A> {
         normalize: &mut N,
     ) -> Result<Qg6Measurement, Qg6HarnessError>
     where
-        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+        F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
         N: FnMut(R) -> Qg6SearchResult,
     {
         if warmup_rounds == 0 {
@@ -1904,7 +2003,19 @@ impl<A> Qg6ValidatedExperiment<A> {
         self.run_warmups(warmup_rounds, schedule_seed, search, normalize)?;
 
         let origin = Instant::now();
-        let mut samples = Vec::with_capacity(schedule.len() * 2);
+        let sample_capacity =
+            schedule
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| Qg6HarnessError::InvalidSpec {
+                    reason: "QG-6 timed sample capacity overflow".to_owned(),
+                })?;
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(sample_capacity)
+            .map_err(|_| Qg6HarnessError::InvalidSpec {
+                reason: "QG-6 timed sample capacity allocation failed".to_owned(),
+            })?;
         for block in &schedule {
             let query = &self.prepared.queries[block.query_index];
             for (order, role) in [
@@ -1912,14 +2023,19 @@ impl<A> Qg6ValidatedExperiment<A> {
                 (Qg6SampleOrder::Second, block.second),
             ] {
                 let started_ns = monotonic_ns(origin);
-                let mut latencies_ns = Vec::with_capacity(searches_per_sample);
-                let mut result_receipts = Sha256::new();
+                let mut latencies_ns = Vec::new();
+                latencies_ns
+                    .try_reserve_exact(searches_per_sample)
+                    .map_err(|_| Qg6HarnessError::InvalidSpec {
+                        reason: "QG-6 latency subsample allocation failed".to_owned(),
+                    })?;
                 for _ in 0..searches_per_sample {
                     let search_started_ns = monotonic_ns(origin);
                     let result = search(
                         self.prepared.arms.get(role),
                         black_box(query),
                         black_box(self.prepared.identity.k),
+                        Qg6Phase::Measurement,
                     );
                     let mut search_ended_ns = monotonic_ns(origin);
                     if search_ended_ns <= search_started_ns {
@@ -1932,6 +2048,7 @@ impl<A> Qg6ValidatedExperiment<A> {
                     let observed = observe_result(
                         normalize(result),
                         self.prepared.identity.k,
+                        self.prepared.identity.document_count,
                         Qg6Phase::Measurement,
                         role,
                         query.id(),
@@ -1944,7 +2061,6 @@ impl<A> Qg6ValidatedExperiment<A> {
                         &observed.receipt,
                     )?;
                     latencies_ns.push(search_ended_ns.saturating_sub(search_started_ns).max(1));
-                    result_receipts.update(observed.receipt.ordered_doc_ids_sha256.as_bytes());
                 }
                 let mut ended_ns = monotonic_ns(origin);
                 if ended_ns <= started_ns {
@@ -1971,10 +2087,19 @@ impl<A> Qg6ValidatedExperiment<A> {
                     ended_ns,
                     observed_latency_ns,
                     subsample_count: usize_to_u64(searches_per_sample)?,
-                    result_sha256: lower_hex(result_receipts.finalize()),
+                    result_sha256: qg6_result_sequence_sha256(
+                        self.expected_results[block.query_index].get(role),
+                        usize_to_u64(searches_per_sample)?,
+                    )?,
                 });
             }
         }
+        self.run_postflight(search, normalize)?;
+        let semantic_contract = build_semantic_contract(
+            &self.prepared.identity,
+            &self.prepared.queries,
+            &self.expected_results,
+        )?;
         verify_lifecycle(
             &self.prepared.lifecycle,
             self.prepared.identity.document_count,
@@ -1992,6 +2117,7 @@ impl<A> Qg6ValidatedExperiment<A> {
             schedule,
             samples,
             lifecycle: self.prepared.lifecycle,
+            semantic_contract,
         })
     }
 
@@ -2003,7 +2129,7 @@ impl<A> Qg6ValidatedExperiment<A> {
         normalize: &mut N,
     ) -> Result<(), Qg6HarnessError>
     where
-        F: FnMut(&A, &Qg6QuerySpec, usize) -> Result<R, String>,
+        F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
         N: FnMut(R) -> Qg6SearchResult,
     {
         for round in 0..warmup_rounds {
@@ -2013,10 +2139,11 @@ impl<A> Qg6ValidatedExperiment<A> {
                     ^ usize_to_u64(query_index)?;
                 shuffle(&mut roles, schedule_seed ^ salt);
                 for role in roles {
-                    let observed = invoke_search(
+                    let observed = invoke_phased_search(
                         &self.prepared.arms,
                         query,
                         self.prepared.identity.k,
+                        self.prepared.identity.document_count,
                         role,
                         Qg6Phase::Warmup,
                         search,
@@ -2032,6 +2159,43 @@ impl<A> Qg6ValidatedExperiment<A> {
                     )?;
                     black_box(observed);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_postflight<R, F, N>(
+        &mut self,
+        search: &mut F,
+        normalize: &mut N,
+    ) -> Result<(), Qg6HarnessError>
+    where
+        F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
+        N: FnMut(R) -> Qg6SearchResult,
+    {
+        for (query_index, query) in self.prepared.queries.iter().enumerate() {
+            for role in Qg6ArmRole::ALL {
+                let observed = invoke_phased_search(
+                    &self.prepared.arms,
+                    query,
+                    self.prepared.identity.k,
+                    self.prepared.identity.document_count,
+                    role,
+                    Qg6Phase::Postflight,
+                    search,
+                    normalize,
+                )?;
+                self.prepared
+                    .lifecycle
+                    .arm_mut(role)
+                    .postflight_search_calls += 1;
+                ensure_stable(
+                    Qg6Phase::Postflight,
+                    role,
+                    query.id(),
+                    self.expected_results[query_index].get(role),
+                    &observed.receipt,
+                )?;
             }
         }
         Ok(())
@@ -2069,20 +2233,30 @@ pub fn seeded_interleaved_four_arm_schedule(
             .ok_or_else(|| Qg6HarnessError::InvalidSpec {
                 reason: "QG-6 schedule unit count overflow".to_owned(),
             })?;
-    let mut query_units = Vec::with_capacity(unit_count);
+    let mut query_units = Vec::new();
+    query_units
+        .try_reserve_exact(unit_count)
+        .map_err(|_| Qg6HarnessError::InvalidSpec {
+            reason: "QG-6 schedule unit allocation failed".to_owned(),
+        })?;
     for _ in 0..rounds_per_query {
         query_units.extend(0..query_count);
     }
     shuffle(&mut query_units, seed ^ 0x8d58_ac26_afe1_2e47);
-    let comparison_order = balanced_bools(unit_count, seed ^ 0x243f_6a88_85a3_08d3);
-    let null_left_first = balanced_bools(unit_count, seed ^ 0x1319_8a2e_0370_7344);
-    let effect_control_first = balanced_bools(unit_count, seed ^ 0xa409_3822_299f_31d0);
+    let comparison_order = balanced_bools(unit_count, seed ^ 0x243f_6a88_85a3_08d3)?;
+    let null_left_first = balanced_bools(unit_count, seed ^ 0x1319_8a2e_0370_7344)?;
+    let effect_control_first = balanced_bools(unit_count, seed ^ 0xa409_3822_299f_31d0)?;
     let block_capacity = unit_count
         .checked_mul(2)
         .ok_or_else(|| Qg6HarnessError::InvalidSpec {
             reason: "QG-6 block count overflow".to_owned(),
         })?;
-    let mut schedule = Vec::with_capacity(block_capacity);
+    let mut schedule = Vec::new();
+    schedule
+        .try_reserve_exact(block_capacity)
+        .map_err(|_| Qg6HarnessError::InvalidSpec {
+            reason: "QG-6 schedule block allocation failed".to_owned(),
+        })?;
     for (unit_index, query_index) in query_units.into_iter().enumerate() {
         let null = pair_roles(Qg6Comparison::Null, null_left_first[unit_index]);
         let effect = pair_roles(Qg6Comparison::Effect, effect_control_first[unit_index]);
@@ -2185,6 +2359,7 @@ fn invoke_search<A, R, F, N>(
     arms: &Qg6FourArms<A>,
     query: &Qg6QuerySpec,
     k: usize,
+    document_count: u64,
     role: Qg6ArmRole,
     phase: Qg6Phase,
     search: &mut F,
@@ -2196,13 +2371,47 @@ where
 {
     let result = search(arms.get(role), black_box(query), black_box(k))
         .map_err(|error| adapter_failure(phase, role, query.id(), &error))?;
-    observe_result(normalize(result), k, phase, role, query.id())
+    observe_result(
+        normalize(result),
+        k,
+        document_count,
+        phase,
+        role,
+        query.id(),
+    )
+}
+
+fn invoke_phased_search<A, R, F, N>(
+    arms: &Qg6FourArms<A>,
+    query: &Qg6QuerySpec,
+    k: usize,
+    document_count: u64,
+    role: Qg6ArmRole,
+    phase: Qg6Phase,
+    search: &mut F,
+    normalize: &mut N,
+) -> Result<ObservedResult, Qg6HarnessError>
+where
+    F: FnMut(&A, &Qg6QuerySpec, usize, Qg6Phase) -> Result<R, String>,
+    N: FnMut(R) -> Qg6SearchResult,
+{
+    let result = search(arms.get(role), black_box(query), black_box(k), phase)
+        .map_err(|error| adapter_failure(phase, role, query.id(), &error))?;
+    observe_result(
+        normalize(result),
+        k,
+        document_count,
+        phase,
+        role,
+        query.id(),
+    )
 }
 
 fn invoke_search_borrowed<A, R, F, N>(
     arms: &Qg6FourArms<A>,
     query: &Qg6QuerySpec,
     k: usize,
+    document_count: u64,
     role: Qg6ArmRole,
     search: &mut F,
     normalize: &mut N,
@@ -2213,18 +2422,34 @@ where
 {
     let native = search(arms.get(role), black_box(query), black_box(k))
         .map_err(|error| adapter_failure(Qg6Phase::Preflight, role, query.id(), &error))?;
-    let observed = observe_result(normalize(&native), k, Qg6Phase::Preflight, role, query.id())?;
+    let observed = observe_result(
+        normalize(&native),
+        k,
+        document_count,
+        Qg6Phase::Preflight,
+        role,
+        query.id(),
+    )?;
     Ok((native, observed))
+}
+
+fn build_semantic_contract(
+    identity: &Qg6ExperimentIdentity,
+    queries: &[Qg6QuerySpec],
+    expected_results: &[Qg6FourArmResultReceipts],
+) -> Result<Qg6SemanticContract, Qg6HarnessError> {
+    Qg6SemanticContract::from_receipts(identity, queries, expected_results)
 }
 
 fn observe_result(
     result: Qg6SearchResult,
     k: usize,
+    expected_doc_count: u64,
     phase: Qg6Phase,
     role: Qg6ArmRole,
     query_id: &str,
 ) -> Result<ObservedResult, Qg6HarnessError> {
-    if result.ordered_doc_ids.len() > k {
+    if result.ordered_hits.len() > k {
         return Err(Qg6HarnessError::InvalidResult {
             phase,
             arm: role,
@@ -2233,9 +2458,21 @@ fn observe_result(
         });
     }
     if result
-        .ordered_doc_ids
+        .ordered_hits
         .iter()
-        .any(|doc_id| doc_id.len() > MAX_DOC_ID_BYTES)
+        .any(|hit| hit.document_id.is_empty())
+    {
+        return Err(Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "returned document ID is empty".to_owned(),
+        });
+    }
+    if result
+        .ordered_hits
+        .iter()
+        .any(|hit| hit.document_id.len() > MAX_DOC_ID_BYTES)
     {
         return Err(Qg6HarnessError::InvalidResult {
             phase,
@@ -2244,24 +2481,96 @@ fn observe_result(
             reason: "returned document ID exceeds 4096 bytes".to_owned(),
         });
     }
-    let computed_sha256 = ordered_doc_ids_sha256(&result.ordered_doc_ids);
+    if result
+        .ordered_hits
+        .iter()
+        .any(|hit| !f32::from_bits(hit.score_bits).is_finite())
+    {
+        return Err(Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "returned score is not finite".to_owned(),
+        });
+    }
+    let mut unique_document_ids = BTreeSet::new();
+    if result
+        .ordered_hits
+        .iter()
+        .any(|hit| !unique_document_ids.insert(hit.document_id.as_str()))
+    {
+        return Err(Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "returned document IDs are not unique".to_owned(),
+        });
+    }
+    let doc_count = result.doc_count.unwrap_or(expected_doc_count);
+    let returned_count =
+        u64::try_from(result.ordered_hits.len()).map_err(|_| Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "returned hit count does not fit u64".to_owned(),
+        })?;
+    if result.total_count > doc_count || doc_count != expected_doc_count {
+        return Err(Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "result total/live document cardinalities are inconsistent".to_owned(),
+        });
+    }
+    let requested_count = u64::try_from(k).map_err(|_| Qg6HarnessError::InvalidResult {
+        phase,
+        arm: role,
+        query_id: query_id.to_owned(),
+        reason: "requested result count does not fit u64".to_owned(),
+    })?;
+    if returned_count != result.total_count.min(requested_count) {
+        return Err(Qg6HarnessError::InvalidResult {
+            phase,
+            arm: role,
+            query_id: query_id.to_owned(),
+            reason: "returned hit count is not exactly min(k, total_count)".to_owned(),
+        });
+    }
+    let ordered_hits = result
+        .ordered_hits
+        .iter()
+        .map(|hit| Qg6RankedHitReceipt {
+            document_id_sha256: sha256_hex(hit.document_id.as_bytes()),
+            score_bits: hit.score_bits,
+        })
+        .collect::<Vec<_>>();
+    let mut receipt = Qg6ResultReceipt {
+        returned_count: result.ordered_hits.len(),
+        ordered_hits,
+        total_count: result.total_count,
+        doc_count,
+        receipt_sha256: String::new(),
+    };
+    receipt.receipt_sha256 = receipt.canonical_sha256();
     if let Some(claimed_sha256) = result.claimed_sha256 {
-        if claimed_sha256 != computed_sha256 {
+        if claimed_sha256 != receipt.receipt_sha256 {
             return Err(Qg6HarnessError::ResultDigestMismatch {
                 phase,
                 arm: role,
                 query_id: query_id.to_owned(),
                 claimed_sha256,
-                computed_sha256,
+                computed_sha256: receipt.receipt_sha256,
             });
         }
     }
+    receipt.verify(k, expected_doc_count)?;
     Ok(ObservedResult {
-        receipt: Qg6ResultReceipt {
-            hit_count: result.ordered_doc_ids.len(),
-            ordered_doc_ids_sha256: computed_sha256,
-        },
-        ordered_doc_ids: result.ordered_doc_ids,
+        receipt,
+        ordered_doc_ids: result
+            .ordered_hits
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect(),
     })
 }
 
@@ -2272,13 +2581,13 @@ fn compare_exact(
     observed_arm: Qg6ArmRole,
     observed: &ObservedResult,
 ) -> Result<(), Qg6HarnessError> {
-    if expected.receipt.hit_count != observed.receipt.hit_count {
+    if expected.receipt.returned_count != observed.receipt.returned_count {
         return Err(Qg6HarnessError::HitCountMismatch {
             query_id: query_id.to_owned(),
             expected_arm,
             observed_arm,
-            expected_count: expected.receipt.hit_count,
-            observed_count: observed.receipt.hit_count,
+            expected_count: expected.receipt.returned_count,
+            observed_count: observed.receipt.returned_count,
         });
     }
     if expected.ordered_doc_ids != observed.ordered_doc_ids {
@@ -2297,13 +2606,13 @@ fn compare_exact(
             observed_doc_sha256: sha256_hex(observed.ordered_doc_ids[rank].as_bytes()),
         });
     }
-    if expected.receipt.ordered_doc_ids_sha256 != observed.receipt.ordered_doc_ids_sha256 {
+    if expected.receipt.receipt_sha256 != observed.receipt.receipt_sha256 {
         return Err(Qg6HarnessError::ResultDigestMismatch {
             phase: Qg6Phase::Preflight,
             arm: observed_arm,
             query_id: query_id.to_owned(),
-            claimed_sha256: observed.receipt.ordered_doc_ids_sha256.clone(),
-            computed_sha256: expected.receipt.ordered_doc_ids_sha256.clone(),
+            claimed_sha256: observed.receipt.receipt_sha256.clone(),
+            computed_sha256: expected.receipt.receipt_sha256.clone(),
         });
     }
     Ok(())
@@ -2336,10 +2645,10 @@ fn ensure_stable(
             phase,
             arm: role,
             query_id: query_id.to_owned(),
-            expected_count: expected.hit_count,
-            observed_count: observed.hit_count,
-            expected_sha256: expected.ordered_doc_ids_sha256.clone(),
-            observed_sha256: observed.ordered_doc_ids_sha256.clone(),
+            expected_count: expected.returned_count,
+            observed_count: observed.returned_count,
+            expected_sha256: expected.receipt_sha256.clone(),
+            observed_sha256: observed.receipt_sha256.clone(),
         });
     }
     Ok(())
@@ -2354,6 +2663,7 @@ fn verify_lifecycle(
     searches_per_sample: usize,
 ) -> Result<(), Qg6HarnessError> {
     let expected_preflight = usize_to_u64(query_count)?;
+    let expected_postflight = expected_preflight;
     let expected_warmups =
         usize_to_u64(query_count.checked_mul(warmup_rounds).ok_or_else(|| {
             Qg6HarnessError::LifecycleViolation {
@@ -2377,13 +2687,14 @@ fn verify_lifecycle(
             || arm.preflight_search_calls != expected_preflight
             || arm.warmup_search_calls != expected_warmups
             || arm.timed_search_calls != expected_timed
+            || arm.postflight_search_calls != expected_postflight
             || arm.timed_setup_calls != 0
         {
             return Err(Qg6HarnessError::LifecycleViolation {
                 reason: format!(
                     "arm {role:?} counts differ from build=1, populated_documents={document_count}, \
                      commit=1, preflight={expected_preflight}, warmup={expected_warmups}, \
-                     timed={expected_timed}, timed_setup=0"
+                     timed={expected_timed}, postflight={expected_postflight}, timed_setup=0"
                 ),
             });
         }
@@ -2713,28 +3024,41 @@ fn adapter_failure(
     }
 }
 
-fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
+pub(crate) fn query_manifest_sha256(queries: &[Qg6QuerySpec]) -> String {
+    let receipts = queries
+        .iter()
+        .map(Qg6QueryIdentityReceipt::from_query)
+        .collect::<Vec<_>>();
+    query_identity_manifest_sha256(receipts.iter())
+}
+
+pub(crate) fn query_identity_manifest_sha256<'a>(
+    queries: impl IntoIterator<Item = &'a Qg6QueryIdentityReceipt>,
+) -> String {
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, QG6_QUERY_MANIFEST_VERSION.as_bytes());
     hash_len_prefixed(&mut hasher, QG6_SAMPLING_FRAME.as_bytes());
-    let mut ordered = queries.iter().collect::<Vec<_>>();
-    ordered.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    let mut ordered = queries.into_iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| left.query_id.cmp(&right.query_id));
     hasher.update(usize_to_u64_infallible(ordered.len()).to_le_bytes());
     for query in ordered {
-        hash_len_prefixed(&mut hasher, query.id.as_bytes());
-        hasher.update([query_class_tag(query.class)]);
-        hash_len_prefixed(&mut hasher, query.normalized_text_sha256.as_bytes());
-        hash_len_prefixed(&mut hasher, query.parsed_ast_sha256.as_bytes());
-        hasher.update([query.prevalence.tag()]);
-        hasher.update([query.difficulty.tag()]);
-        query.support_divergence.hash_into(&mut hasher);
-        for k in query.supported_k {
-            hasher.update(usize_to_u64_infallible(k).to_le_bytes());
-        }
-        hash_len_prefixed(&mut hasher, query.query_generator_revision.as_bytes());
-        hash_len_prefixed(&mut hasher, query.corpus_generator_revision.as_bytes());
+        hash_query_identity_receipt(&mut hasher, query);
     }
     lower_hex(hasher.finalize())
+}
+
+fn hash_query_identity_receipt(hasher: &mut Sha256, query: &Qg6QueryIdentityReceipt) {
+    hash_len_prefixed(hasher, query.query_id.as_bytes());
+    hasher.update([query_class_tag(query.class)]);
+    hash_len_prefixed(hasher, query.normalized_text_sha256.as_bytes());
+    hash_len_prefixed(hasher, query.parsed_ast_sha256.as_bytes());
+    hasher.update([query.coverage_row, query.coverage_column]);
+    query.support_divergence.hash_into(hasher);
+    for k in query.supported_k {
+        hasher.update(usize_to_u64_infallible(k).to_le_bytes());
+    }
+    hash_len_prefixed(hasher, query.query_generator_revision.as_bytes());
+    hash_len_prefixed(hasher, query.corpus_generator_revision.as_bytes());
 }
 
 const fn query_class_tag(class: PerfQueryClass) -> u8 {
@@ -2745,16 +3069,6 @@ const fn query_class_tag(class: PerfQueryClass) -> u8 {
         PerfQueryClass::Phrase => 3,
         PerfQueryClass::Boolean => 4,
     }
-}
-
-fn ordered_doc_ids_sha256(doc_ids: &[String]) -> String {
-    let mut hasher = Sha256::new();
-    hash_len_prefixed(&mut hasher, QG6_RESULT_DIGEST_VERSION.as_bytes());
-    hasher.update(usize_to_u64_infallible(doc_ids.len()).to_le_bytes());
-    for doc_id in doc_ids {
-        hash_len_prefixed(&mut hasher, doc_id.as_bytes());
-    }
-    lower_hex(hasher.finalize())
 }
 
 fn hash_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
@@ -2783,12 +3097,16 @@ fn is_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn balanced_bools(count: usize, seed: u64) -> Vec<bool> {
-    let mut values = (0..count)
-        .map(|index| index < count / 2)
-        .collect::<Vec<_>>();
-    shuffle(&mut values, seed);
+fn balanced_bools(count: usize, seed: u64) -> Result<Vec<bool>, Qg6HarnessError> {
+    let mut values = Vec::new();
     values
+        .try_reserve_exact(count)
+        .map_err(|_| Qg6HarnessError::InvalidSpec {
+            reason: "QG-6 balanced schedule allocation failed".to_owned(),
+        })?;
+    values.extend((0..count).map(|index| index < count / 2));
+    shuffle(&mut values, seed);
+    Ok(values)
 }
 
 fn shuffle<T>(values: &mut [T], mut seed: u64) {
@@ -2870,6 +3188,26 @@ mod tests {
         ]
     }
 
+    fn ranked_result(
+        query: &Qg6QuerySpec,
+        score_bits: u32,
+        total_count: u64,
+        k: usize,
+    ) -> Qg6SearchResult {
+        let returned_count = usize::try_from(total_count)
+            .expect("test total count")
+            .min(k);
+        Qg6SearchResult::from_ranked_hits(
+            (0..returned_count)
+                .map(|index| {
+                    Qg6SearchHit::new(format!("{}-ranked-doc-{index}", query.id()), score_bits)
+                })
+                .collect(),
+            total_count,
+            100_000,
+        )
+    }
+
     #[test]
     fn schedule_is_deterministic_balanced_and_interleaves_comparisons() {
         let first = seeded_interleaved_four_arm_schedule(4, 11, 0x5155_494c).expect("schedule");
@@ -2929,16 +3267,11 @@ mod tests {
             assert_eq!(
                 class_queries
                     .iter()
-                    .map(|query| query.prevalence())
+                    .map(|query| (query.coverage_row(), query.coverage_column()))
                     .collect::<BTreeSet<_>>(),
-                Qg6PrevalenceStratum::ALL.into_iter().collect()
-            );
-            assert_eq!(
-                class_queries
-                    .iter()
-                    .map(|query| query.difficulty())
-                    .collect::<BTreeSet<_>>(),
-                Qg6DifficultyStratum::ALL.into_iter().collect()
+                (0_u8..4)
+                    .flat_map(|row| (0_u8..4).map(move |column| (row, column)))
+                    .collect()
             );
             for query in class_queries {
                 assert!(ids.insert(query.id()));
@@ -3043,7 +3376,11 @@ mod tests {
         assert!(validate_complete_query_manifest(&ast_alias).is_err());
 
         let mut reclassified = normative_manifest();
-        reclassified[0].class = PerfQueryClass::Boolean;
+        let reclassified_index = reclassified
+            .iter()
+            .position(|query| query.class != PerfQueryClass::Boolean)
+            .expect("manifest contains a non-Boolean query");
+        reclassified[reclassified_index].class = PerfQueryClass::Boolean;
         assert!(validate_complete_query_manifest(&reclassified).is_err());
 
         let mut drifted = normative_manifest();
@@ -3057,6 +3394,37 @@ mod tests {
         let error = validate_complete_query_manifest(&unsupported)
             .expect_err("unsupported syntax fails before timing");
         assert!(error.to_string().contains("refusing silent skip"));
+    }
+
+    #[test]
+    fn unsupported_reason_codes_are_bounded_stable_tokens() {
+        for invalid in [
+            "",
+            "UPPERCASE",
+            "contains space",
+            "contains/slash",
+            "reason_code_that_is_deliberately_longer_than_the_sixty_four_byte_contract_limit",
+        ] {
+            let mut query = normative_manifest()[0].clone();
+            query.support_divergence = Qg6SupportDivergence::Unsupported {
+                reason_code: invalid.to_owned(),
+            };
+            assert!(
+                query.validate_entry().is_err(),
+                "invalid reason token {invalid:?} was accepted"
+            );
+        }
+
+        let mut bounded = normative_manifest()[0].clone();
+        bounded.support_divergence = Qg6SupportDivergence::Unsupported {
+            reason_code: "known_parser_gap.v1".to_owned(),
+        };
+        let error = bounded
+            .validate_entry()
+            .expect_err("explicitly unsupported queries always fail closed");
+        let message = error.to_string();
+        assert!(message.contains("refusing silent skip"));
+        assert!(message.contains("reason_bytes=19"));
     }
 
     #[test]
@@ -3123,14 +3491,231 @@ mod tests {
     }
 
     #[test]
+    fn result_receipt_self_seal_binds_every_semantic_field() {
+        let receipt = Qg6ResultReceipt::from_redacted_hits(
+            vec![Qg6RankedHitReceipt {
+                document_id_sha256: "a".repeat(64),
+                score_bits: 1.0_f32.to_bits(),
+            }],
+            1,
+            100_000,
+            10,
+        )
+        .expect("sealed result receipt");
+
+        let mut mutations = Vec::new();
+        let mut returned_count = receipt.clone();
+        returned_count.returned_count += 1;
+        mutations.push(returned_count);
+        let mut document_id = receipt.clone();
+        document_id.ordered_hits[0].document_id_sha256 = "b".repeat(64);
+        mutations.push(document_id);
+        let mut score_bits = receipt.clone();
+        score_bits.ordered_hits[0].score_bits = 2.0_f32.to_bits();
+        mutations.push(score_bits);
+        let mut total_count = receipt.clone();
+        total_count.total_count += 1;
+        mutations.push(total_count);
+        let mut doc_count = receipt.clone();
+        doc_count.doc_count += 1;
+        mutations.push(doc_count);
+        let mut self_seal = receipt.clone();
+        self_seal.receipt_sha256 = "c".repeat(64);
+        mutations.push(self_seal);
+
+        for mutation in mutations {
+            assert!(mutation.verify(10, 100_000).is_err());
+        }
+        assert_ne!(
+            qg6_result_sequence_sha256(&receipt, 1).expect("one result"),
+            qg6_result_sequence_sha256(&receipt, 2).expect("two results")
+        );
+    }
+
+    #[test]
+    fn result_receipt_and_native_observation_reject_underfilled_top_k() {
+        let redacted = Qg6ResultReceipt::from_redacted_hits(
+            vec![Qg6RankedHitReceipt {
+                document_id_sha256: "a".repeat(64),
+                score_bits: 1.0_f32.to_bits(),
+            }],
+            7,
+            100_000,
+            10,
+        )
+        .expect_err("sealed receipts must reject underfilled top-k results");
+        assert!(
+            redacted
+                .to_string()
+                .contains("malformed or has an invalid self-seal")
+        );
+
+        let native = Qg6SearchResult::from_ranked_hits(
+            vec![Qg6SearchHit::new("doc-0", 1.0_f32.to_bits())],
+            7,
+            100_000,
+        );
+        let observed = observe_result(
+            native,
+            10,
+            100_000,
+            Qg6Phase::Preflight,
+            Qg6ArmRole::NullLeft,
+            "identifier-underfill",
+        )
+        .err()
+        .expect("native observations must reject underfilled top-k results");
+        assert!(
+            observed
+                .to_string()
+                .contains("not exactly min(k, total_count)")
+        );
+    }
+
+    #[test]
+    fn result_receipt_rejects_resealed_invalid_ranked_hits() {
+        let receipt = Qg6ResultReceipt::from_redacted_hits(
+            vec![
+                Qg6RankedHitReceipt {
+                    document_id_sha256: "a".repeat(64),
+                    score_bits: 1.0_f32.to_bits(),
+                },
+                Qg6RankedHitReceipt {
+                    document_id_sha256: "b".repeat(64),
+                    score_bits: 0.5_f32.to_bits(),
+                },
+            ],
+            2,
+            100_000,
+            10,
+        )
+        .expect("valid ranked receipt");
+
+        let mut empty_id = receipt.clone();
+        empty_id.ordered_hits[0].document_id_sha256 = EMPTY_DOCUMENT_ID_SHA256.to_owned();
+        empty_id.receipt_sha256 = empty_id.canonical_sha256();
+
+        let mut duplicate_id = receipt.clone();
+        duplicate_id.ordered_hits[1].document_id_sha256 =
+            duplicate_id.ordered_hits[0].document_id_sha256.clone();
+        duplicate_id.receipt_sha256 = duplicate_id.canonical_sha256();
+
+        let mut non_finite_score = receipt;
+        non_finite_score.ordered_hits[0].score_bits = f32::NAN.to_bits();
+        non_finite_score.receipt_sha256 = non_finite_score.canonical_sha256();
+
+        for invalid in [empty_id, duplicate_id, non_finite_score] {
+            assert!(
+                invalid.verify(10, 100_000).is_err(),
+                "fully resealed invalid ranked receipt escaped verification"
+            );
+        }
+    }
+
+    #[test]
+    fn native_observation_rejects_empty_duplicate_and_non_finite_hits() {
+        let cases = [
+            (
+                vec![Qg6SearchHit::new("", 1.0_f32.to_bits())],
+                "returned document ID is empty",
+            ),
+            (
+                vec![
+                    Qg6SearchHit::new("doc-0", 1.0_f32.to_bits()),
+                    Qg6SearchHit::new("doc-0", 0.5_f32.to_bits()),
+                ],
+                "returned document IDs are not unique",
+            ),
+            (
+                vec![Qg6SearchHit::new("doc-0", f32::INFINITY.to_bits())],
+                "returned score is not finite",
+            ),
+        ];
+
+        for (hits, expected_reason) in cases {
+            let total_count = u64::try_from(hits.len()).expect("test hit count");
+            let error = observe_result(
+                Qg6SearchResult::from_ranked_hits(hits, total_count, 100_000),
+                10,
+                100_000,
+                Qg6Phase::Preflight,
+                Qg6ArmRole::NullLeft,
+                "identifier-invalid-hit",
+            )
+            .err()
+            .expect("invalid native hit must fail before timing");
+            assert!(
+                error.to_string().contains(expected_reason),
+                "unexpected error for {expected_reason}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_contract_canonicalizes_reversed_query_and_receipt_input() {
+        let forward_queries = queries();
+        let forward_receipts = forward_queries
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let receipt = Qg6ResultReceipt::from_redacted_hits(
+                    vec![Qg6RankedHitReceipt {
+                        document_id_sha256: format!("{index:064x}"),
+                        score_bits: u32::try_from(index).expect("score bits"),
+                    }],
+                    1,
+                    100_000,
+                    10,
+                )
+                .expect("result receipt");
+                Qg6FourArmResultReceipts {
+                    null_left: receipt.clone(),
+                    null_right: receipt.clone(),
+                    effect_control: receipt.clone(),
+                    effect_treatment: receipt,
+                }
+            })
+            .collect::<Vec<_>>();
+        let identity = Qg6ExperimentIdentity {
+            corpus_sha256: "a".repeat(64),
+            query_manifest_sha256: query_manifest_sha256(&forward_queries),
+            config_contract_sha256: "b".repeat(64),
+            document_count: 100_000,
+            k: 10,
+        };
+        let forward =
+            Qg6SemanticContract::from_receipts(&identity, &forward_queries, &forward_receipts)
+                .expect("forward contract");
+        let mut reversed_queries = forward_queries;
+        reversed_queries.reverse();
+        let mut reversed_receipts = forward_receipts;
+        reversed_receipts.reverse();
+        let reversed =
+            Qg6SemanticContract::from_receipts(&identity, &reversed_queries, &reversed_receipts)
+                .expect("reversed contract");
+
+        assert_eq!(forward, reversed);
+        assert!(
+            forward
+                .groups
+                .windows(2)
+                .all(|pair| pair[0].query.query_id < pair[1].query.query_id)
+        );
+    }
+
+    #[test]
     fn exact_parity_and_measurement_produce_complete_lifecycle_receipt() {
-        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let validated = prepare()
-            .validate_exact_parity(&mut search)
+            .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
         let measurement = validated
             .measure(2, 10, 0x5eed, &mut search)
             .expect("measurement");
@@ -3154,19 +3739,28 @@ mod tests {
             assert_eq!(lifecycle.preflight_search_calls, 4);
             assert_eq!(lifecycle.warmup_search_calls, 8);
             assert_eq!(lifecycle.timed_search_calls, 40);
+            assert_eq!(lifecycle.postflight_search_calls, 4);
             assert_eq!(lifecycle.timed_setup_calls, 0);
         }
+        measurement
+            .semantic_contract
+            .verify()
+            .expect("sealed semantic contract");
     }
 
     #[test]
     fn p50_subsamples_count_every_search_and_retain_one_sample_per_arm() {
-        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let validated = prepare()
-            .validate_exact_parity(&mut search)
+            .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            black_box(arm.role);
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
         let measurement = validated
             .measure_query_p50_with_normalizer(1, 2, 3, 0x5eed, &mut search, &mut |result| result)
             .expect("p50 subsample measurement");
@@ -3184,18 +3778,22 @@ mod tests {
                 measurement.lifecycle.arm(role).timed_search_calls,
                 4 * 2 * 3
             );
+            assert_eq!(measurement.lifecycle.arm(role).postflight_search_calls, 4);
         }
     }
 
     #[test]
     fn p50_subsamples_reject_zero_searches() {
-        let mut search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+        let mut preflight = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
             black_box(arm.role);
             Ok(Qg6SearchResult::from(canonical_result(query)))
         };
         let validated = prepare()
-            .validate_exact_parity(&mut search)
+            .validate_exact_parity(&mut preflight)
             .expect("exact parity");
+        let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
         let error = validated
             .measure_query_p50_with_normalizer(1, 2, 0, 0x5eed, &mut search, &mut |result| result)
             .expect_err("zero-sized p50 subsample");
@@ -3230,9 +3828,10 @@ mod tests {
         let validated = prepare()
             .validate_semantic_parity_with(&mut preflight, &mut normalize, &mut compare)
             .expect("semantic tie-envelope parity");
-        let mut timed_search = |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
-            Ok(Qg6SearchResult::from(native_result(arm.role, query).1))
-        };
+        let mut timed_search =
+            |arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, _phase: Qg6Phase| {
+                Ok(Qg6SearchResult::from(native_result(arm.role, query).1))
+            };
         let measurement = validated
             .measure(1, 2, 0x5eed, &mut timed_search)
             .expect("per-arm native receipts remain stable");
@@ -3328,10 +3927,7 @@ mod tests {
     #[test]
     fn preflight_rejects_claimed_digest_mismatch() {
         let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
-            Ok(Qg6SearchResult::with_claimed_sha256(
-                canonical_result(query),
-                "f".repeat(64),
-            ))
+            Ok(Qg6SearchResult::from(canonical_result(query)).with_claimed_sha256("f".repeat(64)))
         };
         let error = prepare()
             .validate_exact_parity(&mut search)
@@ -3349,20 +3945,19 @@ mod tests {
 
     #[test]
     fn measurement_rejects_result_drift_after_preflight() {
-        let calls = std::cell::Cell::new(0_usize);
-        let preflight_calls = queries().len() * Qg6ArmRole::ALL.len();
-        let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
-            let call = calls.get();
-            calls.set(call + 1);
+        let mut preflight = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize| {
+            Ok(Qg6SearchResult::from(canonical_result(query)))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("preflight");
+        let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, _k: usize, phase: Qg6Phase| {
             let mut result = canonical_result(query);
-            if call >= preflight_calls {
+            if phase == Qg6Phase::Warmup {
                 result[0].push_str("-drift");
             }
             Ok(Qg6SearchResult::from(result))
         };
-        let validated = prepare()
-            .validate_exact_parity(&mut search)
-            .expect("preflight");
         let error = validated
             .measure(1, 2, 7, &mut search)
             .expect_err("warmup drift");
@@ -3370,6 +3965,33 @@ mod tests {
             error,
             Qg6HarnessError::ResultDrift {
                 phase: Qg6Phase::Warmup,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn postflight_rejects_score_and_total_count_drift_after_all_timing() {
+        let mut preflight = |_arm: &FakeArm, query: &Qg6QuerySpec, k: usize| {
+            Ok(ranked_result(query, 1.0_f32.to_bits(), 7, k))
+        };
+        let validated = prepare()
+            .validate_exact_parity(&mut preflight)
+            .expect("preflight");
+        let mut search = |_arm: &FakeArm, query: &Qg6QuerySpec, k: usize, phase: Qg6Phase| {
+            if phase == Qg6Phase::Postflight {
+                Ok(ranked_result(query, 2.0_f32.to_bits(), 8, k))
+            } else {
+                Ok(ranked_result(query, 1.0_f32.to_bits(), 7, k))
+            }
+        };
+        let error = validated
+            .measure(1, 2, 7, &mut search)
+            .expect_err("postflight result drift");
+        assert!(matches!(
+            error,
+            Qg6HarnessError::ResultDrift {
+                phase: Qg6Phase::Postflight,
                 ..
             }
         ));

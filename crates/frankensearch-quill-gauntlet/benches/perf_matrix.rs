@@ -43,12 +43,14 @@ use frankensearch_quill_gauntlet::{
     PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
     PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
     PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
-    Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionScope,
-    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
+    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
+    Qg6SearchResult, Qg6SelectionScope, Qg6SemanticContract, RankClass, RankedHit,
+    ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
     command_sha256_from_argv, compare_observations, estimate_paired_experiment,
     machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
     seeded_balanced_pair_order, validate_matrix,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
@@ -64,6 +66,37 @@ const SMOKE_SEGMENTS: usize = 4;
 // true rank mismatch from a native-order substitution inside a large BM25 tie.
 const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
+
+#[derive(Deserialize)]
+struct GateManifest {
+    gate: BTreeMap<String, GateManifestEntry>,
+}
+
+#[derive(Deserialize)]
+struct GateManifestEntry {
+    queries_per_class: Option<usize>,
+}
+
+fn qg6_queries_per_class(manifest: &str) -> Result<usize, String> {
+    let manifest = toml::from_str::<GateManifest>(manifest).map_err(|error| error.to_string())?;
+    manifest
+        .gate
+        .get("QG-6")
+        .and_then(|gate| gate.queries_per_class)
+        .ok_or_else(|| "gate.QG-6.queries_per_class is missing".to_owned())
+}
+
+fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
+    let observed = qg6_queries_per_class(manifest)?;
+    if observed == QG6_QUERY_GROUPS {
+        Ok(())
+    } else {
+        Err(format!(
+            "gate.QG-6.queries_per_class={observed} differs from runner constant \
+             {QG6_QUERY_GROUPS}"
+        ))
+    }
+}
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -267,11 +300,13 @@ enum PreparedQueryArm {
     },
 }
 
-enum PreparedQueryResult {
-    Quill(Vec<frankensearch_quill::QuillHit>),
-    Tantivy(Vec<frankensearch_lexical::LexicalIdHit>),
+struct PreparedQueryResult {
+    native_hits: Vec<(String, u32)>,
+    total_count: u64,
+    doc_count: u64,
 }
 
+#[derive(Clone)]
 struct PreparedQueryPreflight {
     native_hits: Vec<(String, u32)>,
     total_count: u64,
@@ -1598,6 +1633,7 @@ fn paired_raw_stream(
                 byte_count: None,
                 observed_value: Some(value),
                 group_id: plan.group_id,
+                qg6_sample_binding: None,
             }
         };
         if control_first {
@@ -1916,6 +1952,10 @@ fn qg6_raw_sample(
         byte_count: None,
         observed_value: Some(sample.observed_latency_ns as f64 / 1_000_000.0),
         group_id: Some(u64::try_from(sample.query_index).expect("QG-6 query index")),
+        qg6_sample_binding: Some(Qg6SampleBinding {
+            query_id: sample.query_id.clone(),
+            result_sequence_sha256: sample.result_sha256.clone(),
+        }),
     }
 }
 
@@ -1926,7 +1966,14 @@ fn prepared_qg6_streams(
     evidence: &EvidenceContext,
     scope: &PerfOperationScope,
     cell_seed: u64,
-) -> (Vec<PerfRawSample>, Vec<PerfRawSample>, PerfInputIdentity) {
+) -> (
+    Vec<PerfRawSample>,
+    Vec<PerfRawSample>,
+    PerfInputIdentity,
+    Qg6SemanticContract,
+) {
+    validate_qg6_queries_per_class(MANIFEST)
+        .expect("gate manifest and compiled frozen QG-6 query universe agree");
     let count = context
         .scale
         .document_count(spec.document_count.expect("query corpus count"));
@@ -1978,16 +2025,35 @@ fn prepared_qg6_streams(
         },
     )
     .expect("prepare four independent QG-6 arms");
+    let mut preflight_counts = BTreeMap::<Qg6ArmRole, BTreeMap<String, (u64, u64)>>::new();
     let mut preflight_search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| {
-        qg6_preflight_result(context, arm, query, k)
+        let result = qg6_preflight_result(context, arm, query, k)?;
+        let role = match arm {
+            PreparedQueryArm::Quill { .. } => Qg6ArmRole::EffectTreatment,
+            PreparedQueryArm::Tantivy { role, .. } => *role,
+        };
+        if preflight_counts
+            .entry(role)
+            .or_default()
+            .insert(
+                query.id().to_owned(),
+                (result.total_count, result.doc_count),
+            )
+            .is_some()
+        {
+            return Err("QG-6 preflight repeated one role/query count binding".to_owned());
+        }
+        Ok(result)
     };
     let mut preflight_normalize = |result: &PreparedQueryPreflight| {
-        Qg6SearchResult::from_ordered_doc_ids(
+        Qg6SearchResult::from_ranked_hits(
             result
                 .native_hits
                 .iter()
-                .map(|(doc_id, _)| doc_id.clone())
+                .map(|(doc_id, score_bits)| Qg6SearchHit::new(doc_id.clone(), *score_bits))
                 .collect(),
+            result.total_count,
+            result.doc_count,
         )
     };
     let mut semantic_compare = |query: &Qg6QuerySpec,
@@ -2195,26 +2261,55 @@ fn prepared_qg6_streams(
             &mut semantic_compare,
         )
         .expect("QG-6 score/tie-envelope preflight parity");
-    let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize| match arm {
-        PreparedQueryArm::Quill { index, .. } => index
-            .search_doc_ids(&context.cx, query.text(), k)
-            .map(PreparedQueryResult::Quill)
-            .map_err(|error| error.to_string()),
-        PreparedQueryArm::Tantivy { index, .. } => index
-            .search_doc_ids(&context.cx, query.text(), k)
-            .map(PreparedQueryResult::Tantivy)
-            .map_err(|error| error.to_string()),
-    };
-    let mut normalize = |result| {
-        let ordered_doc_ids = match result {
-            PreparedQueryResult::Quill(hits) => {
-                hits.into_iter().map(|hit| hit.document_id).collect()
-            }
-            PreparedQueryResult::Tantivy(hits) => {
-                hits.into_iter().map(|hit| hit.doc_id.to_string()).collect()
-            }
+    drop(preflight_search);
+    let mut search = |arm: &PreparedQueryArm, query: &Qg6QuerySpec, k: usize, phase: Qg6Phase| {
+        let role = match arm {
+            PreparedQueryArm::Quill { .. } => Qg6ArmRole::EffectTreatment,
+            PreparedQueryArm::Tantivy { role, .. } => *role,
         };
-        Qg6SearchResult::from_ordered_doc_ids(ordered_doc_ids)
+        if phase == Qg6Phase::Postflight {
+            let result = qg6_preflight_result(context, arm, query, k)?;
+            return Ok(PreparedQueryResult {
+                native_hits: result.native_hits,
+                total_count: result.total_count,
+                doc_count: result.doc_count,
+            });
+        }
+        let (total_count, doc_count) = preflight_counts
+            .get(&role)
+            .and_then(|queries| queries.get(query.id()))
+            .copied()
+            .ok_or_else(|| "QG-6 timed query has no accepted preflight counts".to_owned())?;
+        let native_hits = match arm {
+            PreparedQueryArm::Quill { index, .. } => index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|hit| (hit.document_id, hit.score.to_bits()))
+                .collect(),
+            PreparedQueryArm::Tantivy { index, .. } => index
+                .search_doc_ids(&context.cx, query.text(), k)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
+                .collect(),
+        };
+        Ok(PreparedQueryResult {
+            native_hits,
+            total_count,
+            doc_count,
+        })
+    };
+    let mut normalize = |result: PreparedQueryResult| {
+        Qg6SearchResult::from_ranked_hits(
+            result
+                .native_hits
+                .into_iter()
+                .map(|(doc_id, score_bits)| Qg6SearchHit::new(doc_id, score_bits))
+                .collect(),
+            result.total_count,
+            result.doc_count,
+        )
     };
     let rounds_per_query = runs
         .div_ceil(QG6_QUERY_GROUPS)
@@ -2237,9 +2332,11 @@ fn prepared_qg6_streams(
         prepared_corpus_sha256: measurement.identity.corpus_sha256.clone(),
         query_manifest_sha256: measurement.identity.query_manifest_sha256.clone(),
         config_contract_sha256: measurement.identity.config_contract_sha256.clone(),
+        semantic_contract_sha256: Some(measurement.semantic_contract.contract_sha256.clone()),
         query_group_count: QG6_QUERY_GROUPS,
         query_group_ids: QG6_QUERY_GROUP_IDS.to_vec(),
     };
+    let semantic_contract = measurement.semantic_contract.clone();
     let mut sample_provenance = evidence.sample_provenance.clone();
     sample_provenance.input_identity = Some(input_identity.clone());
     eprintln!(
@@ -2276,7 +2373,12 @@ fn prepared_qg6_streams(
             Qg6Comparison::Effect => effect_samples.push(sample),
         }
     }
-    (null_samples, effect_samples, input_identity)
+    (
+        null_samples,
+        effect_samples,
+        input_identity,
+        semantic_contract,
+    )
 }
 
 struct CellCollection {
@@ -2309,6 +2411,7 @@ fn collect_cell(
                 unit: unit(spec).to_owned(),
                 role: EvidenceRole::Diagnostic,
                 input_identity: None,
+                qg6_semantic_contract: None,
                 cold_cache: None,
                 concurrency_witness: None,
             },
@@ -2330,67 +2433,78 @@ fn collect_cell(
     // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
     // four-arm runner so setup is impossible inside timed samples and null/
     // effect blocks are interleaved.
-    let (oracle_null_samples, treatment_null_samples, effect_samples, input_identity) =
-        if spec.gate == PerfGate::Qg6 {
-            let (null, effect, input_identity) =
-                prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
-            (null, None, effect, Some(input_identity))
-        } else {
-            let oracle_null = paired_raw_stream(
+    let (
+        oracle_null_samples,
+        treatment_null_samples,
+        effect_samples,
+        input_identity,
+        qg6_semantic_contract,
+    ) = if spec.gate == PerfGate::Qg6 {
+        let (null, effect, input_identity, semantic_contract) =
+            prepared_qg6_streams(context, spec, runs, evidence, &scope, cell_seed);
+        (
+            null,
+            None,
+            effect,
+            Some(input_identity),
+            Some(semantic_contract),
+        )
+    } else {
+        let oracle_null = paired_raw_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            &StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Tantivy,
+                rounds: runs,
+                seed: cell_seed ^ 0xaa,
+                block_id_base: 0,
+                sample_id_base: 1_000_000,
+                group_id: None,
+                query_override: None,
+            },
+        );
+        let treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
+            paired_raw_stream(
                 context,
                 spec,
                 evidence,
                 &scope,
                 origin,
                 &StreamPlan {
-                    control: EngineArm::Tantivy,
-                    treatment: EngineArm::Tantivy,
-                    rounds: runs,
-                    seed: cell_seed ^ 0xaa,
-                    block_id_base: 0,
-                    sample_id_base: 1_000_000,
-                    group_id: None,
-                    query_override: None,
-                },
-            );
-            let treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
-                paired_raw_stream(
-                    context,
-                    spec,
-                    evidence,
-                    &scope,
-                    origin,
-                    &StreamPlan {
-                        control: EngineArm::Quill,
-                        treatment: EngineArm::Quill,
-                        rounds: runs,
-                        seed: cell_seed ^ 0x55,
-                        block_id_base: 2_000_000,
-                        sample_id_base: 2_000_000,
-                        group_id: None,
-                        query_override: None,
-                    },
-                )
-            });
-            let effect = paired_raw_stream(
-                context,
-                spec,
-                evidence,
-                &scope,
-                origin,
-                &StreamPlan {
-                    control: EngineArm::Tantivy,
+                    control: EngineArm::Quill,
                     treatment: EngineArm::Quill,
                     rounds: runs,
-                    seed: cell_seed,
-                    block_id_base: 0,
-                    sample_id_base: 0,
+                    seed: cell_seed ^ 0x55,
+                    block_id_base: 2_000_000,
+                    sample_id_base: 2_000_000,
                     group_id: None,
                     query_override: None,
                 },
-            );
-            (oracle_null, treatment_null, effect, None)
-        };
+            )
+        });
+        let effect = paired_raw_stream(
+            context,
+            spec,
+            evidence,
+            &scope,
+            origin,
+            &StreamPlan {
+                control: EngineArm::Tantivy,
+                treatment: EngineArm::Quill,
+                rounds: runs,
+                seed: cell_seed,
+                block_id_base: 0,
+                sample_id_base: 0,
+                group_id: None,
+                query_override: None,
+            },
+        );
+        (oracle_null, treatment_null, effect, None, None)
+    };
 
     let quill_distribution =
         DistributionSummary::from_samples(&arm_values(&effect_samples, PerfSampleArm::Treatment))
@@ -2472,6 +2586,7 @@ fn collect_cell(
                 EvidenceRole::Required
             },
             input_identity,
+            qg6_semantic_contract,
             cold_cache,
             concurrency_witness: take_concurrency_witness(spec),
         },
@@ -3157,4 +3272,27 @@ fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_matrix(&mut criterion, &identity.sha256);
     criterion.final_summary();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn typed_qg6_query_count_contract_accepts_exact_value_and_rejects_mismatch() {
+        let exact = "[gate.QG-6]\nqueries_per_class = 16\n";
+        super::validate_qg6_queries_per_class(exact).expect("exact typed query count");
+
+        let mismatch = "[gate.QG-6]\nqueries_per_class = 15\n";
+        assert!(
+            super::validate_qg6_queries_per_class(mismatch)
+                .expect_err("mismatched typed query count")
+                .contains("differs from runner constant")
+        );
+        assert!(super::validate_qg6_queries_per_class("[gate.QG-6]\n").is_err());
+        assert!(
+            super::validate_qg6_queries_per_class(
+                "[gate.QG-6]\nqueries_per_class = \"sixteen\"\n",
+            )
+                .is_err()
+        );
+    }
 }

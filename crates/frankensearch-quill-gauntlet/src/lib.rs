@@ -98,10 +98,10 @@ pub use perf::{
     PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
     PerfMetricSemantics, PerfOperationScope, PerfProducerOs, PerfQueryClass, PerfRawSample,
     PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, PerfTopology,
-    PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, estimate_paired_experiment,
-    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes,
-    perf_manifest_contract_sha256, perf_writer_heap_bytes, seeded_balanced_pair_order,
-    validate_matrix,
+    PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6SampleBinding,
+    estimate_paired_experiment, machine_fingerprint, parse_macos_time_max_rss_bytes,
+    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
+    seeded_balanced_pair_order, validate_matrix,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
@@ -121,11 +121,12 @@ pub use perf_ratchet::{
     evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
 pub use qg6_prepared::{
-    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6HarnessError,
-    Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase, Qg6PreparedExperiment,
-    Qg6QuerySpec, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchResult, Qg6SelectionClaim,
-    Qg6SelectionScope, Qg6SetupRecorder, Qg6TimedSample, Qg6ValidatedExperiment,
-    seeded_interleaved_four_arm_schedule,
+    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
+    Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase,
+    Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
+    Qg6RankedHitReceipt, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
+    Qg6SelectionClaim, Qg6SelectionScope, Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample,
+    Qg6ValidatedExperiment, qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
