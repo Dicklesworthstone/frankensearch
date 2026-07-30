@@ -8153,3 +8153,68 @@ than one observed CPU-active Quill ingest worker. If bytes/document do not
 fall, record the counted mechanism as unchanged and route elsewhere without
 timing; never derive an A/B ratio from separate profiler invocations or gate
 on CV.
+
+## 2026-07-30 — KEEP: Quill TermInterner bucket-map identity hasher — 1.033x QG-2 single-thread ingest (`bd-e8h-w2-u64-hasher-swap-vcfft`, P6)
+
+- **Comparison class: SELF-SPEEDUP.** Both arms are frankensearch (Quill);
+  maintenance evidence only, no incumbent arm anywhere in this measurement.
+- **Machine class:** `local-5975wx-32c` (diagnostic-only class, P1 card
+  fingerprint; not ratchet-admissible). Measured 2026-07-29 from a
+  continuity-base `3684b1477` overlay export; toolchain rustc
+  1.99.0-nightly (9f36de775). **Landed 2026-07-30 at the
+  `928a16baed6d997fb5f63827387eb51cb3f4f4fa` landing base under the
+  revision-bound clause:** scribe.rs is blob-identical
+  (`0d66bba20f4fd988c4b0f4a13cc757b274c63af2`) between the measurement base
+  and the landing base, and the byte-identity probe re-run fresh at the
+  landing base reproduces the banked artifact hashes exactly.
+- **Lever:** `scribe.rs` `TermInterner.buckets` was
+  `std::collections::HashMap<u64, Bucket>` (SipHash) keyed by the
+  ALREADY-FINALIZED `hash_parts` output (ahash) — every token paid a
+  SipHash re-hash of a u64 that is already a hash. Swapped the MAP hasher
+  to a local identity `Hasher` (`PrehashedKeyHasher`, key-is-already-a-hash
+  invariant documented at the type and field); `hash_parts` itself and all
+  durable xxh3 hashing are untouched (the workspace "never substitute
+  durable xxh3" rule governs on-disk hashes, not in-memory map hashers —
+  delta.rs `AHashMap` precedent). No new dependency.
+- **Workload:** QG-2 smoke memory child, `QUILL_PERF_CHILD_MODE=memory`,
+  `ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on, taskset
+  core 8, external wall time, interleaved paired.
+- **Executing ELFs (Arm A = base, pass-2 stash, SHA re-verified; Arm B = lever):**
+  - Arm A ELF sha256: `9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`
+  - Arm B ELF sha256: `454205fd818de191ceca5d69700c51f5c6b441e1e4c39e574a65ed38e66e1bd9`
+- **A/A null (same invocation method, n=16):** paired docs/s ratio median
+  1.0012, mean 1.0010, 95% t-CI [0.9962, 1.0057], span 0.9802–1.0184.
+- **Result (n=32 pairs, two independent batches):** docs/s ratio lever/base
+  mean **1.0334**, median 1.0340, 95% t-CI [1.0296, 1.0372], 32/32 pairs
+  favor the lever; time-ratio convention (new/old) **0.9677**,
+  CI [0.9641, 0.9713] — point and median clear the [0.97, 1.03] band, CI
+  upper bound touches the band edge, and the A/B interval is disjoint from
+  the A/A null interval. ~38.8k → ~40.1k docs/s.
+- **Mechanism (perf dwarf F=1997, self-time):** `hash_one::<&u64>`
+  3.11% → absent; sip `Hasher::write` (u64 site) 1.40% → absent;
+  `find_in_bucket` 2.08% → 1.81%; `matches` 1.47% → 0.78%;
+  `intern_accounted` 0.86% → 1.14% (inlined map op); `hash_parts`
+  unchanged (0.93% → 0.99%), as required.
+- **Byte identity:** deterministic 3-cycle ingest probe (9k docs, ~20k
+  terms/cycle, flush + interner reset each cycle) — all emitted FSLX
+  segment files SHA-256-identical across arms and across repeated runs, on
+  BOTH the 3684-era overlay ELFs AND fresh rebuilds from the 928a16ba
+  landing worktree (pristine probe ELF `aa314dee…`, patched `e3e86843…`,
+  identical artifact hashes `d3b2382d…`/`1a42f42e…`/`dc861ef5…`/
+  `dd4257a8…`); ordering seam pinned by
+  `sorted_ids_match_composite_byte_order_and_field_grouping`, and a
+  deliberately reversed sort turns that test RED and hard-errors the flush
+  (`TermDictionary(NonAscendingInput)`), so an ordering leak cannot emit
+  bytes silently.
+- **Tests at the landing base:** `cargo test -p frankensearch-quill` =
+  482 passed / 0 failed / 1 ignored (lib) + green integration suites, exit
+  0, on BOTH pristine and patched arms; the 3684-era labruntime flake did
+  not reproduce, so no exemption was needed. clippy `--no-deps` warning-set
+  diff vs pristine: empty. `cargo fmt --check`: clean. UBS on scribe.rs:
+  identical totals (47/1408/163) and a byte-identical 22-row per-class
+  census on both arms — zero new findings.
+- **Status:** LANDED (this commit; scribe.rs +48/−3 including one
+  doc-comment backtick added post-measurement to satisfy
+  `clippy::doc_markdown` — doc-text only, probe artifacts re-verified
+  identical after the fix). Full evidence:
+  `docs/evidence/e8h/p6-local-qg2-hasher-swap-20260730.md`.

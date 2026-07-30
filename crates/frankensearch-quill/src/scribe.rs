@@ -39,7 +39,7 @@
 //!   column.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::ops::Range;
 
 use frankensearch_core::DocId;
@@ -1060,6 +1060,48 @@ enum Bucket {
 
 pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
 
+/// Identity [`Hasher`] for the interner's `buckets` map.
+///
+/// INVARIANT (key-is-already-a-hash): every key of `buckets` is a finalized
+/// 64-bit hash — the output of [`TermInterner::hash_parts`] (default: ahash
+/// over the composite `(field_ord, term)` key). Its only producers are
+/// `find`/`find_in_bucket`/`intern_accounted`, each of which computes the
+/// key via `hash_parts` immediately before the map operation. Re-hashing
+/// that u64 through the std map's `SipHash` was pure waste (~4.3% of the QG-2
+/// quill ingest arm: `hash_one::<&u64>` + sip `Hasher::write`; P1 profile
+/// card, bd-e8h-w2-u64-hasher-swap-vcfft).
+///
+/// Do NOT reuse this type for maps whose keys are not already uniformly
+/// distributed hash outputs (sequential ids, pointers, lengths): identity
+/// hashing such keys would degrade hashbrown's probe behavior. Under the
+/// test-injected constant hasher every term collapses into one
+/// `Bucket::Many` entry, so the degenerate path stays exercised. The map
+/// hasher cannot affect on-disk bytes: TERMDICT order comes from
+/// [`TermInterner::sorted_ids`] (a byte sort), and the only whole-map reads
+/// (`bytes_reserved`, `clear`) are order-independent.
+#[derive(Clone, Copy, Debug, Default)]
+struct PrehashedKeyHasher(u64);
+
+impl Hasher for PrehashedKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u64 keys (which use `write_u64`) are expected; fold any other
+        // input so the hasher stays total rather than silently truncating.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+}
+
 /// Per-shard composite-key term interner.
 ///
 /// Keys are `(field_ord, term bytes)`, stored once in the arena as the
@@ -1074,7 +1116,10 @@ pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Buc
 pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     arena: ByteArena,
     spans: Vec<ArenaSpan>,
-    buckets: HashMap<u64, Bucket>,
+    /// hash → term id(s), keyed by the ALREADY-FINALIZED `hash_parts` output,
+    /// so the map hasher is the no-op [`PrehashedKeyHasher`] (see its
+    /// key-is-already-a-hash invariant note).
+    buckets: HashMap<u64, Bucket, BuildHasherDefault<PrehashedKeyHasher>>,
     hasher: S,
     /// Scratch buffer for composite-key assembly (reused, never shrunk).
     key_scratch: Vec<u8>,
@@ -1137,7 +1182,7 @@ impl<S: BuildHasher> TermInterner<S> {
         Self {
             arena: ByteArena::default(),
             spans: Vec::new(),
-            buckets: HashMap::new(),
+            buckets: HashMap::default(),
             hasher,
             key_scratch: Vec::with_capacity(64),
             running_bytes_used: 0,
