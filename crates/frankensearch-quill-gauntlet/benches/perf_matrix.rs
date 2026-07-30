@@ -274,6 +274,9 @@ enum PreparedQueryResult {
 
 struct PreparedQueryPreflight {
     native_hits: Vec<(String, u32)>,
+    total_count: u64,
+    doc_count: u64,
+    public_result_sha256: String,
     observation: Option<EngineObservation>,
 }
 
@@ -1237,33 +1240,13 @@ fn stage_deletes(
     }
 }
 
-fn query_texts(query_class: PerfQueryClass) -> &'static [&'static str; QG6_QUERY_GROUPS] {
-    match query_class {
-        PerfQueryClass::Identifier => &["term00042", "term00137", "term00256", "term00301"],
-        PerfQueryClass::ShortKeyword => &["term00001", "term00002", "term00005", "term00011"],
-        PerfQueryClass::NaturalLanguage => &[
-            "term00001 term00007 generated record",
-            "term00002 term00013 generated record",
-            "term00005 term00011 generated record",
-            "term00003 term00017 generated record",
-        ],
-        PerfQueryClass::Phrase => &[
-            "\"term00001 term00002\"",
-            "\"term00002 term00003\"",
-            "\"term00003 term00004\"",
-            "\"term00005 term00006\"",
-        ],
-        PerfQueryClass::Boolean => &[
-            "term00001 OR term00002",
-            "term00003 OR term00004",
-            "term00002 OR term00005",
-            "term00001 OR term00007",
-        ],
-    }
+fn query_specs(query_class: PerfQueryClass) -> Vec<Qg6QuerySpec> {
+    Qg6QuerySpec::normative_for_class(query_class)
+        .expect("frozen QG-6 query manifest must validate before preparation")
 }
 
-fn query_text(query_class: PerfQueryClass) -> &'static str {
-    query_texts(query_class)[0]
+fn query_text(query_class: PerfQueryClass) -> String {
+    query_specs(query_class)[0].text().to_owned()
 }
 
 fn query_metric(
@@ -1276,8 +1259,14 @@ fn query_metric(
         .scale
         .document_count(spec.document_count.expect("query corpus count"));
     let corpus = corpus_for(count);
-    let query =
-        query_override.unwrap_or_else(|| query_text(spec.query_class.expect("query class")));
+    let owned_query = query_override
+        .is_none()
+        .then(|| query_text(spec.query_class.expect("query class")));
+    let query = query_override.unwrap_or_else(|| {
+        owned_query
+            .as_deref()
+            .expect("owned query exists without an override")
+    });
     let k = spec.k.expect("query k");
     let elapsed = match arm {
         EngineArm::Quill => {
@@ -1685,7 +1674,15 @@ fn values_checksum(samples: &[PerfRawSample]) -> u64 {
 
 fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"frankensearch/qg6/semantic-config/v1\0");
+    hasher.update(b"frankensearch/qg6/semantic-config/v2\0");
+    hasher.update(
+        Qg6QuerySpec::normative_manifest_sha256()
+            .expect("frozen 80-query manifest")
+            .as_bytes(),
+    );
+    hasher.update(Qg6QuerySpec::normative_query_generator_revision().as_bytes());
+    hasher.update(Qg6QuerySpec::normative_corpus_generator_revision().as_bytes());
+    hasher.update(Qg6QuerySpec::sampling_frame().as_bytes());
     hasher.update([u8::from(
         spec.positions.unwrap_or(PositionMode::On).enabled(),
     )]);
@@ -1712,6 +1709,32 @@ fn qg6_config_contract_sha256(spec: &PerfCellSpec) -> String {
     lower_hex(&hasher.finalize())
 }
 
+fn qg6_public_result_sha256(
+    native_hits: &[(String, u32)],
+    total_count: u64,
+    doc_count: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch/qg6/public-total-result/v1\0");
+    hasher.update(total_count.to_le_bytes());
+    hasher.update(doc_count.to_le_bytes());
+    hasher.update(
+        u64::try_from(native_hits.len())
+            .expect("bounded QG-6 top-k length")
+            .to_le_bytes(),
+    );
+    for (doc_id, score_bits) in native_hits {
+        hasher.update(
+            u64::try_from(doc_id.len())
+                .expect("bounded QG-6 document ID")
+                .to_le_bytes(),
+        );
+        hasher.update(doc_id.as_bytes());
+        hasher.update(score_bits.to_le_bytes());
+    }
+    lower_hex(&hasher.finalize())
+}
+
 fn qg6_preflight_result(
     context: &BenchContext,
     arm: &PreparedQueryArm,
@@ -1727,12 +1750,6 @@ fn qg6_preflight_result(
                 .iter()
                 .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
                 .collect::<Vec<_>>();
-            if *role != Qg6ArmRole::NullLeft {
-                return Ok(PreparedQueryPreflight {
-                    native_hits,
-                    observation: None,
-                });
-            }
             let snippet_config = SnippetConfig {
                 max_chars: 0,
                 ..SnippetConfig::default()
@@ -1752,11 +1769,17 @@ fn qg6_preflight_result(
                 .map(|hit| (hit.doc_id.clone(), hit.score_bits))
                 .collect::<Vec<_>>();
             if native_hits != observed_native {
-                return Err(
-                    "Tantivy native timed query disagrees with its tie-evidence observation"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "Tantivy {role:?} native timed query disagrees with its total-result \
+                     preflight observation"
+                ));
             }
+            let total_count = u64::try_from(observed.total_count)
+                .map_err(|_| "Tantivy match count does not fit u64")?;
+            let doc_count = u64::try_from(observed.doc_count)
+                .map_err(|_| "Tantivy document count does not fit u64")?;
+            let public_result_sha256 =
+                qg6_public_result_sha256(&native_hits, total_count, doc_count);
             let hits = observed
                 .hits
                 .into_iter()
@@ -1783,6 +1806,9 @@ fn qg6_preflight_result(
                 .collect();
             Ok(PreparedQueryPreflight {
                 native_hits,
+                total_count,
+                doc_count,
+                public_result_sha256,
                 observation: Some(EngineObservation {
                     hits,
                     cutoff_tie_group,
@@ -1790,12 +1816,8 @@ fn qg6_preflight_result(
                     offset_tie_group: Vec::new(),
                     offset_tie_complete: false,
                     snippets: BTreeMap::new(),
-                    match_count: CountState::Value(
-                        u64::try_from(observed.total_count)
-                            .map_err(|_| "Tantivy match count does not fit u64")?,
-                    ),
-                    doc_count: u64::try_from(observed.doc_count)
-                        .map_err(|_| "Tantivy document count does not fit u64")?,
+                    match_count: CountState::Value(total_count),
+                    doc_count,
                     ast_differences: Vec::new(),
                 }),
             })
@@ -1820,6 +1842,8 @@ fn qg6_preflight_result(
             let total_count = count_evidence
                 .total_count
                 .ok_or_else(|| "Quill tie evidence omitted its exact count".to_owned())?;
+            let public_result_sha256 =
+                qg6_public_result_sha256(&native_hits, total_count, count_evidence.doc_count);
             let hits = native
                 .into_iter()
                 .map(|hit| RankedHit {
@@ -1832,6 +1856,9 @@ fn qg6_preflight_result(
                 .collect();
             Ok(PreparedQueryPreflight {
                 native_hits,
+                total_count,
+                doc_count: count_evidence.doc_count,
+                public_result_sha256,
                 observation: Some(EngineObservation {
                     hits,
                     cutoff_tie_group: Vec::new(),
@@ -1849,18 +1876,7 @@ fn qg6_preflight_result(
 }
 
 fn qg6_query_specs(spec: &PerfCellSpec) -> Vec<Qg6QuerySpec> {
-    let query_class = spec.query_class.expect("QG-6 query class");
-    query_texts(query_class)
-        .iter()
-        .enumerate()
-        .map(|(index, text)| {
-            Qg6QuerySpec::new(
-                format!("{query_class:?}-{index}").to_ascii_lowercase(),
-                *text,
-            )
-            .expect("bounded QG-6 query")
-        })
-        .collect()
+    query_specs(spec.query_class.expect("QG-6 query class"))
 }
 
 fn qg6_raw_sample(
@@ -1982,11 +1998,31 @@ fn prepared_qg6_streams(
         if expected_role != Qg6ArmRole::NullLeft {
             return Err("QG-6 semantic comparator baseline is not null-left".to_owned());
         }
+        if expected.total_count != observed.total_count || expected.doc_count != observed.doc_count
+        {
+            return Err(format!(
+                "QG-6 total public-result contract differs for query_id={} roles={expected_role:?}/\
+                 {observed_role:?}: count={}/{} doc_count={}/{}",
+                query.id(),
+                expected.total_count,
+                observed.total_count,
+                expected.doc_count,
+                observed.doc_count,
+            ));
+        }
         if observed_role != Qg6ArmRole::EffectTreatment {
-            return if expected.native_hits == observed.native_hits {
+            return if expected.native_hits == observed.native_hits
+                && expected.public_result_sha256 == observed.public_result_sha256
+            {
                 Ok(())
             } else {
-                Err("Tantivy A/A preflight changed native ranked hits".to_owned())
+                Err(format!(
+                    "Tantivy A/A total-result preflight changed for query_id={} \
+                     expected_sha256={} observed_sha256={}",
+                    query.id(),
+                    expected.public_result_sha256,
+                    observed.public_result_sha256
+                ))
             };
         }
         let subject = observed
@@ -2001,10 +2037,19 @@ fn prepared_qg6_streams(
             .with_score_epsilon_reason(ScoreEpsilonReason::OracleSegmentGeometry);
         let report = compare_observations(subject, oracle, comparator_config)
             .map_err(|error| error.to_string())?;
+        let non_exact_rank = !matches!(report.rank_class, RankClass::RankExact);
+        if non_exact_rank && !query.allows_reviewed_divergence() {
+            return Err(format!(
+                "query_id={} produced an unregistered result divergence: rank={:?}",
+                query.id(),
+                report.rank_class
+            ));
+        }
         eprintln!(
             "[qg6-semantic-parity] query_id={} status={:?} rank={:?} \
              score_epsilon_reason={:?} score_epsilon_bits={} topk={} \
-             count_equal={} doc_count_equal={}",
+             count_equal={} doc_count_equal={} control_public_sha256={} \
+             treatment_public_sha256={} support={:?}",
             query.id(),
             report.status,
             report.rank_class,
@@ -2013,6 +2058,9 @@ fn prepared_qg6_streams(
             report.subject.hits.len(),
             report.subject.match_count == report.oracle.match_count,
             report.subject.doc_count == report.oracle.doc_count,
+            expected.public_result_sha256,
+            observed.public_result_sha256,
+            query.support_label(),
         );
         if report.status == ComparisonStatus::Failed
             || !matches!(
@@ -2195,11 +2243,18 @@ fn prepared_qg6_streams(
     let mut sample_provenance = evidence.sample_provenance.clone();
     sample_provenance.input_identity = Some(input_identity.clone());
     eprintln!(
-        "[qg6-prepared] fixture={} corpus_sha256={} query_manifest_sha256={} \
+        "[qg6-prepared] fixture={} query_class={} query_count={} \
+         global_query_manifest_sha256={} query_generator_revision={} corpus_generator_revision={} \
+         corpus_sha256={} query_manifest_sha256={} \
          config_contract_sha256={} schedule_seed={} warmup_rounds={} rounds_per_query={} \
          searches_per_sample={} \
          sample_input_sha256={} result_receipt_sha256={} lifecycle={}",
         spec.fixture,
+        spec.query_class.expect("QG-6 class").label(),
+        QG6_QUERY_GROUPS,
+        Qg6QuerySpec::normative_manifest_sha256().expect("global QG-6 manifest"),
+        Qg6QuerySpec::normative_query_generator_revision(),
+        Qg6QuerySpec::normative_corpus_generator_revision(),
         measurement.identity.corpus_sha256,
         measurement.identity.query_manifest_sha256,
         measurement.identity.config_contract_sha256,
@@ -2697,22 +2752,10 @@ fn corpus_identity(
         })
         .max()
         .unwrap_or_default();
-    let query_set_sha256 = {
-        let mut hasher = Sha256::new();
-        for class in [
-            PerfQueryClass::Identifier,
-            PerfQueryClass::ShortKeyword,
-            PerfQueryClass::NaturalLanguage,
-            PerfQueryClass::Phrase,
-            PerfQueryClass::Boolean,
-        ] {
-            for query in query_texts(class) {
-                hasher.update(query.as_bytes());
-                hasher.update([0]);
-            }
-        }
-        Some(lower_hex(&hasher.finalize()))
-    };
+    let query_set_sha256 = Some(
+        Qg6QuerySpec::normative_manifest_sha256()
+            .expect("frozen 80-query manifest validates before evidence identity"),
+    );
     CorpusIdentity {
         corpus_sha256: corpus_hash.to_owned(),
         query_set_sha256,
@@ -2720,7 +2763,7 @@ fn corpus_identity(
         document_count,
         content_bytes: None,
         generator_seed: CORPUS_SEED,
-        generator_revision: "synthetic-zipf-s11-vocab8192-doc4096-v1".to_owned(),
+        generator_revision: Qg6QuerySpec::normative_corpus_generator_revision().to_owned(),
     }
 }
 

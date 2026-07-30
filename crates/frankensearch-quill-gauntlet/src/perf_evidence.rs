@@ -3275,11 +3275,12 @@ mod tests {
     fn qg6_hierarchical_null_can_admit_when_flat_null_inference_is_invalid() {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         let identity = spec.input_identity.clone();
-        let effect_pairs = (0_u64..4)
+        let effect_pairs = QG6_QUERY_GROUP_IDS
+            .into_iter()
             .flat_map(|group_id| [(group_id, 100.0, 98.0); 3])
             .collect::<Vec<_>>();
         let mut null_pairs = Vec::new();
-        for group_id in 0_u64..4 {
+        for group_id in QG6_QUERY_GROUP_IDS {
             null_pairs.extend((0..25).map(|_| (group_id, 100.0, 80.0)));
             null_pairs.extend((0..49).map(|_| (group_id, 100.0, 100.0)));
             null_pairs.extend((0..26).map(|_| (group_id, 100.0, 125.0)));
@@ -3344,7 +3345,7 @@ mod tests {
         let identity = spec.input_identity.clone();
         let mut effect_pairs = Vec::new();
         let mut null_pairs = Vec::new();
-        for group_id in 0_u64..4 {
+        for group_id in QG6_QUERY_GROUP_IDS {
             effect_pairs.extend((0..31).map(|_| (group_id, 1_000.0, 950.0)));
             effect_pairs.extend((0..31).map(|_| (group_id, 10_000.0, 9_500.0)));
             effect_pairs.extend((0..38).map(|_| (group_id, 1.0, 100_000.0)));
@@ -3407,10 +3408,12 @@ mod tests {
     fn qg6_paired_stream_structural_invalidity_still_blocks_admission() {
         let spec = cell_spec(PerfGate::Qg6, EvidenceRole::Required);
         let identity = spec.input_identity.clone();
-        let effect_pairs = (0_u64..4)
+        let effect_pairs = QG6_QUERY_GROUP_IDS
+            .into_iter()
             .flat_map(|group_id| [(group_id, 100.0, 98.0); 3])
             .collect::<Vec<_>>();
-        let null_pairs = (0_u64..4)
+        let null_pairs = QG6_QUERY_GROUP_IDS
+            .into_iter()
             .flat_map(|group_id| [(group_id, 100.0, 100.0); 3])
             .collect::<Vec<_>>();
         let mut effect = grouped_gauge_stream(&effect_pairs, 0, Some(true));

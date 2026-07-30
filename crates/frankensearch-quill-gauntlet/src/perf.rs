@@ -42,10 +42,14 @@ pub const PERF_WRITER_HEAP_BYTES: usize = 50_000_000;
 pub const PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES: usize = 15_000_000;
 /// Version of the metric-specific paired estimator contract.
 pub const PAIRED_ESTIMATOR_SCHEMA_VERSION: &str = "quill-paired-estimator-v1";
-/// Exact ordered query groups required by every normative QG-6 cell.
-pub const QG6_QUERY_GROUPS: usize = 4;
+/// Exact ordered query groups required by every normative QG-6 class cell.
+///
+/// One group is one independent frozen query identity. Leaves collected for a
+/// query are repeated measurements of that group, never additional queries.
+pub const QG6_QUERY_GROUPS: usize = 16;
 /// Canonical QG-6 group IDs. Prepared queries are indexed in manifest order.
-pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] = [0, 1, 2, 3];
+pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] =
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Hash the normative performance contract without binding administrative
 /// activation state into measurement identity.
@@ -241,6 +245,18 @@ impl PerfQueryClass {
         Self::Phrase,
         Self::Boolean,
     ];
+
+    /// Stable manifest label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Identifier => "identifier",
+            Self::ShortKeyword => "short_keyword",
+            Self::NaturalLanguage => "natural_language",
+            Self::Phrase => "phrase",
+            Self::Boolean => "boolean",
+        }
+    }
 }
 
 /// One fully pinned matrix cell before it is measured.
@@ -394,7 +410,7 @@ impl PerfMatrixSpec {
                 for (label, document_count) in [("100k", 100_000), ("1m", 1_000_000)] {
                     let mut cell = PerfCellSpec::new(
                         PerfGate::Qg6,
-                        format!("query/{query_class:?}/k{k}/{label}").to_ascii_lowercase(),
+                        format!("query/{}/k{k}/{label}", query_class.label()),
                         "latency_ms",
                     );
                     cell.document_count = Some(document_count);
@@ -597,7 +613,7 @@ impl PerfInputIdentity {
         {
             return Err(PairedEstimatorError::InvalidProvenance {
                 reason: "prepared-input identity requires separate lowercase SHA-256 prepared \
-                         corpus, ordered query, and configuration hashes plus the exact four \
+                         corpus, ordered query, and configuration hashes plus the exact sixteen \
                          canonical query-group IDs"
                     .to_owned(),
             });
@@ -2334,6 +2350,82 @@ pub fn validate_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
             reason: "every performance cell requires a positive configured thread width".to_owned(),
         });
     }
+    validate_qg6_matrix(matrix)?;
+    Ok(())
+}
+
+fn validate_qg6_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
+    let qg6_cells = matrix
+        .cells
+        .iter()
+        .filter(|cell| cell.gate == PerfGate::Qg6)
+        .collect::<Vec<_>>();
+    if qg6_cells.len() != PerfQueryClass::ALL.len() * 2 * 2 {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "QG-6 requires exactly 20 warm total-search cells".to_owned(),
+        });
+    }
+
+    let mut observed = BTreeSet::new();
+    for cell in qg6_cells {
+        let Some(query_class) = cell.query_class else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires a named query class".to_owned(),
+            });
+        };
+        let Some(k @ (10 | 100)) = cell.k else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires k=10 or k=100".to_owned(),
+            });
+        };
+        let Some(document_count @ (100_000 | 1_000_000)) = cell.document_count else {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "every QG-6 cell requires the 100k or 1M corpus".to_owned(),
+            });
+        };
+        let corpus_label = if document_count == 100_000 {
+            "100k"
+        } else {
+            "1m"
+        };
+        let expected_fixture = format!("query/{}/k{k}/{corpus_label}", query_class.label());
+        if cell.fixture != expected_fixture
+            || cell.metric != "latency_ms"
+            || cell.positions != Some(PositionMode::On)
+            || cell.threads != Some(1)
+            || cell.writer_heap_bytes != Some(perf_writer_heap_bytes(1))
+            || cell.topology.is_some()
+            || cell.tombstone_density_pct.is_some()
+        {
+            return Err(GauntletError::InvalidCampaign {
+                reason: format!(
+                    "QG-6 cell {expected_fixture} must be the warm total-search latency lane with \
+                     positions, one thread, and the canonical heap budget"
+                ),
+            });
+        }
+        if !observed.insert((query_class, k, document_count)) {
+            return Err(GauntletError::InvalidCampaign {
+                reason: format!("duplicate QG-6 cell {expected_fixture}"),
+            });
+        }
+    }
+
+    let expected = PerfQueryClass::ALL
+        .into_iter()
+        .flat_map(|query_class| {
+            [10, 100].into_iter().flat_map(move |k| {
+                [100_000, 1_000_000]
+                    .into_iter()
+                    .map(move |document_count| (query_class, k, document_count))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(GauntletError::InvalidCampaign {
+            reason: "QG-6 matrix has a missing or reclassified class/k/corpus cell".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -2901,6 +2993,37 @@ mod tests {
         let qg10 = matrix.for_gate(PerfGate::Qg10);
         assert_eq!(qg10.len(), 1);
         assert_eq!(qg10[0].threads, Some(1));
+    }
+
+    #[test]
+    fn qg6_matrix_rejects_missing_duplicate_reclassified_and_non_warm_cells() {
+        let complete = PerfMatrixSpec::complete();
+        let first_qg6 = complete
+            .cells
+            .iter()
+            .position(|cell| cell.gate == PerfGate::Qg6)
+            .expect("QG-6 cell");
+
+        let mut missing = complete.clone();
+        missing.cells.remove(first_qg6);
+        assert!(validate_matrix(&missing).is_err());
+
+        let mut duplicate = complete.clone();
+        duplicate.cells.push(duplicate.cells[first_qg6].clone());
+        assert!(validate_matrix(&duplicate).is_err());
+
+        let mut reclassified = complete.clone();
+        reclassified.cells[first_qg6].query_class = Some(PerfQueryClass::Boolean);
+        assert!(validate_matrix(&reclassified).is_err());
+
+        for substituted_metric in ["cold_open_latency_ms", "stage_parse_latency_ms"] {
+            let mut substituted = complete.clone();
+            substituted.cells[first_qg6].metric = substituted_metric.to_owned();
+            assert!(
+                validate_matrix(&substituted).is_err(),
+                "{substituted_metric} must not substitute for warm total search"
+            );
+        }
     }
 
     #[test]
