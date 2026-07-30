@@ -4625,6 +4625,7 @@ mod tests {
                 distribution: DistributionSummary::from_samples(&[1.0; 10]).expect("summary"),
             }],
             laws_attested: false,
+            continuous_timing: None,
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let legacy_path = dir.path().join("legacy.json");
