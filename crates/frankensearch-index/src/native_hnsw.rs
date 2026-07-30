@@ -3705,8 +3705,43 @@ fn sync_parent_directory(path: &Path) -> SearchResult<()> {
 mod tests {
     use super::*;
     use crate::{FsviRecordFlags, FsviV2IdentityBinding, VectorIndex, fnv1a_hash};
+    use ::tempfile as raw_tempfile;
     use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationFormat};
     use std::cell::Cell;
+
+    /// Test-only facade that preserves the production no-symlink-ancestor
+    /// contract on hosts whose default temporary path contains an alias.
+    ///
+    /// macOS commonly returns `/var/folders/...` even though `/var` is a
+    /// symlink to `/private/var`. Canonicalising the fixture root keeps every
+    /// test artifact under the same directory while ensuring failures exercise
+    /// the artifact under test rather than that platform-provided alias.
+    mod tempfile {
+        use std::io;
+        use std::path::{Path, PathBuf};
+
+        use super::raw_tempfile;
+
+        pub(super) struct CanonicalTempDir {
+            _directory: raw_tempfile::TempDir,
+            canonical_path: PathBuf,
+        }
+
+        impl CanonicalTempDir {
+            pub(super) fn path(&self) -> &Path {
+                &self.canonical_path
+            }
+        }
+
+        pub(super) fn tempdir() -> io::Result<CanonicalTempDir> {
+            let directory = raw_tempfile::tempdir()?;
+            let canonical_path = std::fs::canonicalize(directory.path())?;
+            Ok(CanonicalTempDir {
+                _directory: directory,
+                canonical_path,
+            })
+        }
+    }
 
     /// An in-memory store of unit-normalised vectors using cosine distance
     /// (`1 - dot`), which is the metric the two-tier index uses.
@@ -3946,6 +3981,15 @@ mod tests {
             .collect()
     }
 
+    fn admit_owned_fsvi_fixture(
+        path: &Path,
+        binding: &FsviV2IdentityBinding,
+    ) -> ValidatedFsviBytes {
+        let bytes = std::fs::read(path).expect("read completed FSVI v2 owner fixture");
+        ValidatedFsviBytes::from_arc(std::sync::Arc::<[u8]>::from(bytes), binding)
+            .expect("admit owned FSVI v2 fixture bytes")
+    }
+
     fn admitted_fsvi_owner(
         directory: &Path,
         basename: &str,
@@ -3961,7 +4005,7 @@ mod tests {
                 .expect("write FSVI v2 owner row");
         }
         writer.finish().expect("finish FSVI v2 owner fixture");
-        ValidatedFsviBytes::open_published(&path, binding).expect("admit FSVI v2 owner fixture")
+        admit_owned_fsvi_fixture(&path, binding)
     }
 
     fn admitted_fsvi_owner_with_flags(
@@ -3986,7 +4030,7 @@ mod tests {
             }
         }
         writer.finish().expect("finish FSVI v2 owner fixture");
-        ValidatedFsviBytes::open_published(&path, binding).expect("admit FSVI v2 owner fixture")
+        admit_owned_fsvi_fixture(&path, binding)
     }
 
     fn generation_owner(
