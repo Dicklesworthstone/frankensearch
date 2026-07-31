@@ -6193,11 +6193,8 @@ impl WriterLockRecord {
 
 fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
     #[cfg(target_os = "linux")]
-    if let Some(start_time) = linux_process_start_time(pid) {
-        let mut identity = [0_u8; 12];
-        identity[..4].copy_from_slice(&pid.to_le_bytes());
-        identity[4..].copy_from_slice(&start_time.to_le_bytes());
-        return xxhash_rust::xxh3::xxh3_64(&identity);
+    if let Some(nonce) = linux_process_start_nonce(pid) {
+        return nonce;
     }
 
     let mut identity = [0_u8; 12];
@@ -6207,12 +6204,41 @@ fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_start_nonce(pid: u32) -> Option<u64> {
+    let start_time = linux_process_start_time(pid)?;
+    let mut identity = [0_u8; 12];
+    identity[..4].copy_from_slice(&pid.to_le_bytes());
+    identity[4..].copy_from_slice(&start_time.to_le_bytes());
+    Some(xxhash_rust::xxh3::xxh3_64(&identity))
+}
+
+#[cfg(target_os = "linux")]
 fn linux_process_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_command = stat.get(stat.rfind(')')?.checked_add(1)?..)?;
     // The first token after the command is field 3 (`state`); starttime is
     // field 22, hence zero-based token 19 in this suffix.
     after_command.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(unix)]
+fn writer_lock_record_is_live(record: WriterLockRecord) -> bool {
+    if writer_pid_is_dead(record.pid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(observed) = linux_process_start_nonce(record.pid) {
+        return observed == record.pid_start_nonce;
+    }
+    // A live pid whose start identity cannot be inspected remains a
+    // conservative live-owner result. Only a positively observed nonce
+    // mismatch proves PID reuse.
+    true
+}
+
+#[cfg(not(unix))]
+fn writer_lock_record_is_live(_: WriterLockRecord) -> bool {
+    true
 }
 
 struct WriterAdmissionInner {
@@ -6281,12 +6307,14 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         path: lock_path.clone(),
         source,
     })?;
-    let mut lock_file = File::from(lock);
-    let metadata = lock_file.metadata().map_err(|source| KeeperError::Io {
-        operation: "inspect writer lock",
-        path: lock_path.clone(),
-        source,
-    })?;
+    let mut previous_lock_file = File::from(lock);
+    let metadata = previous_lock_file
+        .metadata()
+        .map_err(|source| KeeperError::Io {
+            operation: "inspect writer lock",
+            path: lock_path.clone(),
+            source,
+        })?;
     if !metadata.file_type().is_file() {
         return Err(KeeperError::WriterLockCorrupted {
             path: lock_path,
@@ -6294,11 +6322,14 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         });
     }
     use std::os::unix::fs::MetadataExt;
-    let lock_device = metadata.dev();
-    let lock_inode = metadata.ino();
-    if let Err(source) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+    let previous_lock_device = metadata.dev();
+    let previous_lock_inode = metadata.ino();
+    if let Err(source) = flock(
+        &previous_lock_file,
+        FlockOperation::NonBlockingLockExclusive,
+    ) {
         if source == rustix::io::Errno::AGAIN {
-            let owner_pid = read_writer_lock_record(&lock_path, &mut lock_file)
+            let owner_pid = read_writer_lock_record(&lock_path, &mut previous_lock_file)
                 .ok()
                 .flatten()
                 .map(|record| record.pid);
@@ -6314,24 +6345,36 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         });
     }
 
-    if let Some(previous) = read_writer_lock_record(&lock_path, &mut lock_file)?
-        && !writer_pid_is_dead(previous.pid)
-    {
+    if !writer_lock_path_matches(&lock_path, previous_lock_device, previous_lock_inode)? {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: lock_path,
+            detail: "LOCK pathname changed before writer admission completed".to_owned(),
+        });
+    }
+
+    // A won flock is the authoritative proof that no cooperating writer owns
+    // this inode. The record remains a conservative cross-check for a live
+    // process on platforms where the recorded start identity can be observed.
+    // A corrupt record cannot strand the directory forever: replace it
+    // atomically while the authoritative flock is held.
+    let previous = match read_writer_lock_record(&lock_path, &mut previous_lock_file) {
+        Ok(record) => record,
+        Err(KeeperError::WriterLockCorrupted { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    if previous.is_some_and(|previous| {
+        previous.pid != std::process::id() && writer_lock_record_is_live(previous)
+    }) {
         return Err(KeeperError::WriterBusy {
             path: lock_path,
-            owner_pid: Some(previous.pid),
+            owner_pid: previous.map(|record| record.pid),
         });
     }
 
     let record = WriterLockRecord::current(&lock_path)?;
-    if let Err(error) = write_writer_lock_record(&lock_path, &mut lock_file, record) {
-        // The flock proves this descriptor is the only cooperating writer for
-        // this inode. Best-effort truncation prevents a short failed write from
-        // becoming a permanent corrupt residual record.
-        let _ = lock_file.set_len(0);
-        let _ = lock_file.sync_all();
-        return Err(error);
-    }
+    let (lock_file, lock_device, lock_inode) =
+        publish_writer_lock_record(&directory_file, directory, &lock_path, record)?;
+    drop(previous_lock_file);
     let admission = Arc::new(WriterAdmissionInner {
         directory: directory.to_path_buf(),
         directory_file,
@@ -6413,21 +6456,130 @@ fn read_writer_lock_record(
         })
 }
 
-fn write_writer_lock_record(
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn publish_writer_lock_record(
+    directory_file: &File,
+    directory: &Path,
     path: &Path,
-    file: &mut File,
     record: WriterLockRecord,
-) -> Result<(), KeeperError> {
+) -> Result<(File, u64, u64), KeeperError> {
+    use rustix::fs::{
+        AtFlags, FileType, FlockOperation, Mode, OFlags, flock, openat, renameat, statat,
+    };
+    use std::os::unix::fs::MetadataExt;
+
     let bytes = record.to_bytes();
-    file.set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
-        .and_then(|()| file.write_all(&bytes))
+    let base = format!(".tmp-lock-{:016x}", record.pid_start_nonce);
+    let mut collision = 0_u64;
+    let (temporary_name, mut file, metadata) = loop {
+        let name = if collision == 0 {
+            OsString::from(&base)
+        } else {
+            OsString::from(format!("{base}.{collision}"))
+        };
+        safe_direct_child(directory, Path::new(&name))?;
+        match openat(
+            directory_file,
+            &name,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(file) => {
+                let file = File::from(file);
+                let metadata = file.metadata().map_err(|source| KeeperError::Io {
+                    operation: "inspect writer-lock temp",
+                    path: directory.join(&name),
+                    source,
+                })?;
+                break (name, file, metadata);
+            }
+            Err(source) if source == rustix::io::Errno::EXIST => {
+                collision = collision.checked_add(1).ok_or_else(|| KeeperError::Io {
+                    operation: "allocate writer-lock temp",
+                    path: directory.join(&base),
+                    source: io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "writer-lock temp suffix space is exhausted",
+                    ),
+                })?;
+            }
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "create writer-lock temp",
+                    path: directory.join(&name),
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    };
+    let temporary_path = directory.join(&temporary_name);
+    if !metadata.file_type().is_file() || metadata.len() != 0 {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: temporary_path,
+            detail: "new writer-lock temp is not an empty regular file".to_owned(),
+        });
+    }
+    file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|source| KeeperError::Io {
-            operation: "persist writer-lock record",
+            operation: "persist writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    flock(&file, FlockOperation::NonBlockingLockExclusive)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "lock writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    let temp_stat = statat(directory_file, &temporary_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "verify writer-lock temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    if FileType::from_raw_mode(temp_stat.st_mode) != FileType::RegularFile
+        || stat_dev_as_u64(&temp_stat) != metadata.dev()
+        || temp_stat.st_ino != metadata.ino()
+        || temp_stat.st_size != 36
+    {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: temporary_path,
+            detail: "writer-lock temp pathname no longer names the synced locked inode".to_owned(),
+        });
+    }
+    renameat(directory_file, &temporary_name, directory_file, "LOCK")
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "atomically publish writer-lock record",
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+    directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync writer-lock directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    if !writer_lock_path_matches(path, metadata.dev(), metadata.ino())? {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: path.to_path_buf(),
+            detail: "published LOCK pathname does not name the synced locked inode".to_owned(),
+        });
+    }
+    Ok((file, metadata.dev(), metadata.ino()))
 }
 
 #[cfg(unix)]
@@ -6450,19 +6602,24 @@ fn writer_pid_is_dead(_: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn ensure_writer_lock_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+fn writer_lock_path_matches(path: &Path, device: u64, inode: u64) -> Result<bool, KeeperError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata =
-        std::fs::symlink_metadata(&admission.lock_path).map_err(|source| KeeperError::Io {
-            operation: "verify writer-lock pathname",
-            path: admission.lock_path.clone(),
-            source,
-        })?;
-    if !metadata.file_type().is_file()
-        || metadata.dev() != admission.lock_device
-        || metadata.ino() != admission.lock_inode
-    {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| KeeperError::Io {
+        operation: "verify writer-lock pathname",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(metadata.file_type().is_file() && metadata.dev() == device && metadata.ino() == inode)
+}
+
+#[cfg(unix)]
+fn ensure_writer_lock_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+    if !writer_lock_path_matches(
+        &admission.lock_path,
+        admission.lock_device,
+        admission.lock_inode,
+    )? {
         return Err(KeeperError::WriterLockCorrupted {
             path: admission.lock_path.clone(),
             detail: "LOCK pathname no longer resolves to the flocked inode".to_owned(),
@@ -8930,11 +9087,14 @@ fn collect_writer_garbage_at_platform(
     ensure_gc_directory_identity(directory, &directory_file)?;
     let live_segments = live_segment_names_at(&directory_file, directory, &snapshot)?;
     let current_generation = snapshot.loaded_manifest().manifest.generation;
+    let segment_unreachable_since =
+        segment_unreachability_floor_at(&directory_file, directory, &snapshot, now)?;
     sweep_garbage_directory(
         &directory_file,
         directory,
         &live_segments,
         current_generation,
+        segment_unreachable_since,
         options,
         now,
     )
@@ -8994,7 +9154,15 @@ fn collect_abandoned_genesis_garbage_at_platform(
         }
     }
     ensure_gc_directory_identity(directory, &directory_file)?;
-    sweep_garbage_directory(&directory_file, directory, &HashSet::new(), 0, options, now)
+    sweep_garbage_directory(
+        &directory_file,
+        directory,
+        &HashSet::new(),
+        0,
+        None,
+        options,
+        now,
+    )
 }
 
 #[cfg(unix)]
@@ -9004,6 +9172,7 @@ fn sweep_garbage_directory(
     directory: &Path,
     live_segments: &HashSet<OsString>,
     current_generation: u64,
+    segment_unreachable_since: Option<SystemTime>,
     options: GarbageCollectionOptions,
     now: SystemTime,
 ) -> Result<GarbageCollectionReport, KeeperError> {
@@ -9083,7 +9252,7 @@ fn sweep_garbage_directory(
     for (name, candidate, stat) in &candidates {
         if matches!(candidate, GarbageCandidate::Segment)
             && !live_segments.contains(name)
-            && stat_old_enough(stat, now, options.grace_period)
+            && segment_old_enough(stat, now, options.grace_period, segment_unreachable_since)
         {
             removable_segments.insert(name.clone());
         }
@@ -9144,6 +9313,47 @@ fn sweep_garbage_directory(
         sync_gc_directory(directory_file, directory)?;
     }
     Ok(GarbageCollectionReport { removed })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn segment_unreachability_floor_at(
+    directory_file: &File,
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+    now: SystemTime,
+) -> Result<Option<SystemTime>, KeeperError> {
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    if snapshot.loaded_manifest().source != ManifestSource::Current {
+        // A missing/corrupt current slot is a publication recovery window, so
+        // the time at which the union became unreachable is not durable yet.
+        // Start a fresh grace window rather than infer an unsafe older time.
+        return Ok(Some(now));
+    }
+    let path = directory.join("MANIFEST");
+    let stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "inspect MANIFEST unreachability witness",
+            path: path.clone(),
+            source,
+        })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(KeeperError::GarbageDirectoryChanged {
+            directory: directory.to_path_buf(),
+        });
+    }
+
+    // Renaming the freshly synced current MANIFEST advances its inode ctime,
+    // even when publication reuses an older temp whose mtime and embedded
+    // informational timestamp predate the rename. The embedded witness may be
+    // later (for example after a wall-clock step), so use the later boundary.
+    let changed = stat_change_time(&stat).unwrap_or(now);
+    let published = manifest_publish_time(&snapshot.loaded_manifest().manifest);
+    Ok(Some(published.map_or(changed, |published| {
+        std::cmp::max(changed, published)
+    })))
 }
 
 #[cfg(unix)]
@@ -9257,6 +9467,21 @@ fn sidecar_is_orphan_at(
 
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn segment_old_enough(
+    stat: &rustix::fs::Stat,
+    now: SystemTime,
+    grace_period: Duration,
+    unreachable_since: Option<SystemTime>,
+) -> bool {
+    stat_old_enough(stat, now, grace_period)
+        && unreachable_since.is_none_or(|unreachable_since| {
+            now.duration_since(unreachable_since)
+                .is_ok_and(|age| age >= grace_period)
+        })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Duration) -> bool {
     stat_modified_time(stat).is_some_and(|modified| {
         now.duration_since(modified)
@@ -9267,8 +9492,32 @@ fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Durat
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_modified_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
-    let seconds = stat.st_mtime;
-    let nanoseconds = u32::try_from(stat.st_mtime_nsec).ok()?;
+    unix_system_time(
+        i64::try_from(stat.st_mtime).ok()?,
+        u32::try_from(stat.st_mtime_nsec).ok()?,
+    )
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn stat_change_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
+    unix_system_time(
+        i64::try_from(stat.st_ctime).ok()?,
+        u32::try_from(stat.st_ctime_nsec).ok()?,
+    )
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn manifest_publish_time(manifest: &Manifest) -> Option<SystemTime> {
+    (manifest.last_publish_unix_s > 0)
+        .then_some(manifest.last_publish_unix_s)
+        .and_then(|seconds| unix_system_time(seconds, 0))
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn unix_system_time(seconds: i64, nanoseconds: u32) -> Option<SystemTime> {
     if nanoseconds >= 1_000_000_000 {
         return None;
     }
@@ -12687,9 +12936,11 @@ fn managed_disk_bytes(directory: &Path) -> u64 {
 /// Whether a live writer currently holds `directory`'s LOCK.
 ///
 /// Reads the D1 LOCK record and applies the POSIX `kill(pid, 0)` liveness
-/// rule: only a valid record whose pid is demonstrably alive counts. Any
-/// read/parse failure conservatively reports no live writer. Non-Unix targets
-/// cannot prove liveness, so a valid record alone decides there.
+/// rule. Linux additionally requires the recorded process-start nonce to
+/// match the currently observed identity for that pid; an unavailable start
+/// witness stays conservatively live. Any read/parse failure reports no live
+/// writer. Non-Unix targets cannot prove liveness, so a valid record alone
+/// decides there.
 fn detect_live_writer(directory: &Path) -> bool {
     let lock_path = directory.join("LOCK");
     let Ok(mut file) = File::open(&lock_path) else {
@@ -12698,7 +12949,7 @@ fn detect_live_writer(directory: &Path) -> bool {
     let Ok(Some(record)) = read_writer_lock_record(&lock_path, &mut file) else {
         return false;
     };
-    !writer_pid_is_dead(record.pid)
+    writer_lock_record_is_live(record)
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
@@ -16412,6 +16663,69 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn old_segment_gets_a_full_grace_window_after_becoming_unreachable() -> TestResult {
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0xdead, 1, 0, 2)?;
+        let unreachable_path = directory
+            .path()
+            .join(canonical_segment_name(unreachable.segment_id));
+        File::options()
+            .write(true)
+            .open(&unreachable_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        // The segment was reachable before generation 2 and has only just
+        // fallen out of the two-slot union at generation 3. Its ancient file
+        // mtime must not consume the grace period that starts at that
+        // unreachability transition.
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(3, Vec::new()),
+        )?;
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        let directory_file = open_gc_directory(directory.path())?;
+        let observed = SystemTime::now();
+        let unreachable_since = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            observed,
+        )?
+        .ok_or_else(|| io::Error::other("current MANIFEST supplies a GC floor"))?;
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::from_secs(60),
+        };
+
+        let before_grace = unreachable_since
+            .checked_add(Duration::from_secs(59))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, before_grace,)?
+                .is_empty(),
+            "an old segment must survive until it has been unreachable for the full grace period"
+        );
+        assert!(unreachable_path.exists());
+
+        let after_grace = unreachable_since
+            .checked_add(Duration::from_secs(60))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace,)?
+                .removed,
+            vec![PathBuf::from(canonical_segment_name(
+                unreachable.segment_id
+            ))]
+        );
+        assert!(!unreachable_path.exists());
+        Ok(())
+    }
+
     #[test]
     fn future_claim_blocks_gc_before_any_deletion() -> TestResult {
         let directory = tempdir()?;
@@ -16862,6 +17176,15 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
+            if role == "live_pid" {
+                std::fs::write(control.join(format!("ready-{identifier}")), [])
+                    .map_err(|error| error.to_string())?;
+                let release = control.join("RELEASE");
+                while !release.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Ok(());
+            }
             match KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA).await {
                 Ok(writer) => {
                     if role == "hold_unpublished" {
@@ -16930,10 +17253,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writer_admission_is_exclusive_reusable_and_corruption_fails_closed() -> TestResult {
+    fn writer_admission_atomically_replaces_and_recovers_a_torn_record() -> TestResult {
+        use std::os::unix::fs::MetadataExt;
+
         let directory = tempdir()?;
-        let first = acquire_writer_admission(directory.path())?;
         let lock_path = directory.path().join("LOCK");
+        std::fs::write(&lock_path, [])?;
+        let empty_inode = std::fs::metadata(&lock_path)?.ino();
+        let first = acquire_writer_admission(directory.path())?;
+        let active_inode = std::fs::metadata(&lock_path)?.ino();
+        assert_ne!(
+            active_inode, empty_inode,
+            "record publication must replace rather than overwrite LOCK"
+        );
         let active_bytes = std::fs::read(&lock_path)?;
         assert_eq!(active_bytes.len(), WRITER_LOCK_RECORD_BYTES);
         assert!(matches!(
@@ -16950,12 +17282,73 @@ mod tests {
         let second = acquire_writer_admission(directory.path())?;
         drop(second);
         std::fs::write(&lock_path, b"truncated")?;
-        let before = std::fs::read(&lock_path)?;
+        let torn_inode = std::fs::metadata(&lock_path)?.ino();
+        let recovered = acquire_writer_admission(directory.path())?;
+        assert_ne!(
+            std::fs::metadata(&lock_path)?.ino(),
+            torn_inode,
+            "torn record recovery must install a complete replacement inode"
+        );
+        let recovered_bytes = std::fs::read(&lock_path)?;
+        assert_eq!(
+            WriterLockRecord::from_bytes(&recovered_bytes),
+            Ok(recovered.record)
+        );
         assert!(matches!(
             acquire_writer_admission(directory.path()),
-            Err(KeeperError::WriterLockCorrupted { .. })
+            Err(KeeperError::WriterBusy { .. })
         ));
-        assert_eq!(std::fs::read(lock_path)?, before);
+        drop(recovered);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_reused_pid_with_a_different_start_nonce_does_not_block_takeover() -> TestResult {
+        let directory = tempdir()?;
+        let control = tempdir()?;
+        let ready = control.path().join("ready-reused");
+        let mut child = spawn_writer_child("live_pid", directory.path(), control.path(), "reused")?;
+        wait_for_child_marker(&mut child, &ready, "live pid fixture")?;
+
+        let pid = child.child_mut().id();
+        let acquired_unix_s = 1_700_000_000;
+        let observed_nonce = linux_process_start_nonce(pid)
+            .ok_or_else(|| io::Error::other("live child start identity is observable"))?;
+        let stale = WriterLockRecord {
+            pid,
+            pid_start_nonce: observed_nonce ^ 1,
+            acquired_unix_s,
+        };
+        std::fs::write(directory.path().join("LOCK"), stale.to_bytes())?;
+        assert!(
+            !writer_lock_record_is_live(stale),
+            "same numeric pid with a different process start must be stale"
+        );
+
+        let admission = acquire_writer_admission(directory.path())?;
+        drop(admission);
+
+        let matching = WriterLockRecord {
+            pid,
+            pid_start_nonce: observed_nonce,
+            acquired_unix_s,
+        };
+        std::fs::write(directory.path().join("LOCK"), matching.to_bytes())?;
+        assert!(writer_lock_record_is_live(matching));
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy {
+                owner_pid: Some(owner),
+                ..
+            }) if owner == pid
+        ));
+
+        std::fs::write(control.path().join("RELEASE"), [])?;
+        child.wait_success()?;
+        let after_exit = acquire_writer_admission(directory.path())?;
+        drop(after_exit);
         Ok(())
     }
 
