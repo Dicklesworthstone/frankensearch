@@ -703,6 +703,60 @@ impl DefaultQueryParser {
     #[must_use]
     pub fn parse_lenient(&self, query: &str) -> ParsedQuery {
         let (query, was_truncated) = truncated_prefix(query);
+        if !was_truncated && let Some(query) = self.parse_simple_ascii_atom(query) {
+            return ParsedQuery {
+                query,
+                explanation: QueryExplanation::Simple,
+                diagnostics: Vec::new(),
+                was_truncated: false,
+            };
+        }
+        self.parse_lenient_general(query, was_truncated)
+    }
+
+    /// Lower the overwhelmingly common unscoped literal without building the
+    /// lexer and grammar arenas or analyzing the same bytes once per default
+    /// field. Both mandatory default fields use the identical analyzer, so one
+    /// analyzed token sequence can be attached to the ordered field expansion
+    /// without changing the query tree.
+    fn parse_simple_ascii_atom(&self, query: &str) -> Option<Query> {
+        let bytes = query.as_bytes();
+        if !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'/' | b'_'))
+        {
+            return None;
+        }
+
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut terms = Vec::new();
+        let report = analyze_admitted(
+            &mut analyzer,
+            AnalyzerKind::FrankensearchDefault,
+            query,
+            &mut |token| terms.push(PositionedTerm::new(token.position, token.text.clone())),
+        )
+        .ok()?;
+        if report.oversized_tokens != 0 {
+            return Some(Query::Empty);
+        }
+        match terms.len() {
+            0 => Some(Query::Empty),
+            1 => terms.pop().map(|term| Query::Term {
+                fields: self.default_fields.to_vec(),
+                text: term.text,
+            }),
+            _ => Some(Query::Phrase {
+                fields: self.default_fields.to_vec(),
+                terms,
+                slop: 0,
+                prefix: false,
+            }),
+        }
+    }
+
+    fn parse_lenient_general(&self, query: &str, was_truncated: bool) -> ParsedQuery {
         let mut diagnostics = Vec::new();
         if was_truncated {
             emit_diagnostic(
@@ -5464,6 +5518,40 @@ mod tests {
             diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
                 && diagnostic.message.contains("phrase suffix")
         }));
+    }
+
+    #[test]
+    fn simple_ascii_atom_fast_path_matches_general_parser() {
+        let parser = parser();
+        for query in [
+            "term00042",
+            "term00137",
+            "src/main.rs",
+            "snake_case_identifier",
+            "camelCaseIdentifier",
+            "HTTPServer2",
+            "config.toml",
+            "path/to/module.rs",
+            "qgupdateg7d42",
+            "sha256deadbeef",
+            "user_id",
+            "nonexistentIdentifierAlpha",
+            "missing/path/file.rs",
+            "qg6_nohit_identifier_15",
+        ] {
+            assert!(
+                parser.parse_simple_ascii_atom(query).is_some(),
+                "fixture should use the literal fast path: {query:?}"
+            );
+            assert_eq!(
+                parser.parse_lenient(query),
+                parser.parse_lenient_general(query, false),
+                "fast and general parsers diverged for {query:?}"
+            );
+        }
+        for query in [r"crate\:\:module\:\:TypeName", r"UnknownModule\:\:Type"] {
+            assert!(parser.parse_simple_ascii_atom(query).is_none());
+        }
     }
 
     #[test]
