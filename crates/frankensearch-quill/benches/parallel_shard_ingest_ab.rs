@@ -11,8 +11,10 @@
 //! byte-identical sealed segments from byte-identical shard assignment:
 //!
 //! - **baseline** — serial shard walk, `FlushMode::Scalar`. This is what
-//!   `index.rs` does today: all four production seal sites force the
-//!   single-threaded radix.
+//!   `index.rs` does today. There is exactly *one* production seal site —
+//!   `prepare_shard_flush` (reached from the async `flush_shard`) — and it
+//!   forces the single-threaded radix. The three other `FlushMode::Scalar`
+//!   occurrences in `index.rs` are inside `#[cfg(test)] mod tests`.
 //! - **seal-automatic** (lever 1a) — serial shard walk, `FlushMode::Automatic`.
 //!   The parallel radix seal already exists, is the crate default, and is
 //!   parity-tested against Scalar in `scribe.rs`; production simply never asks
@@ -22,8 +24,13 @@
 //!
 //! Parity is asserted per shard before any timing.
 //!
+//! `QUILL_PSI_ROUNDS` must be **at least 10**: `PairedRatio::is_admissible_null`
+//! requires `rounds >= 10`, and `decidable_against` returns false for an
+//! inadmissible null, so every cell prints `NOISE` at 9 rounds no matter how
+//! large the effect is.
+//!
 //! ```bash
-//! QUILL_PSI_DOCS=50000 QUILL_PSI_SHARDS=all QUILL_PSI_ROUNDS=9 \
+//! QUILL_PSI_DOCS=50000 QUILL_PSI_SHARDS=all QUILL_PSI_ROUNDS=11 \
 //!   cargo bench -p frankensearch-quill --features bench-internals \
 //!     --profile release --bench parallel_shard_ingest_ab
 //! ```
@@ -376,8 +383,17 @@ fn main() {
         print_bench_elf_sha256().expect("hash the executing parallel-shard-ingest benchmark");
     let document_count = env_usize("QUILL_PSI_DOCS", 50_000);
     let batch_documents = env_usize("QUILL_PSI_BATCH", 250);
-    let rounds = env_usize("QUILL_PSI_ROUNDS", 7);
+    // Default must clear `is_admissible_null`'s `rounds >= 10` floor, or every
+    // cell reports NOISE regardless of effect size.
+    let rounds = env_usize("QUILL_PSI_ROUNDS", 11);
     let shard_counts = selected_shards();
+    // Fail loudly rather than emitting an unfalsifiable NOISE verdict.
+    assert!(
+        rounds >= 10,
+        "QUILL_PSI_ROUNDS={rounds} is below the rounds>=10 floor that \
+         PairedRatio::is_admissible_null enforces; every cell would print NOISE \
+         regardless of effect size"
+    );
     eprintln!(
         "[config] docs={document_count} batch={batch_documents} rounds={rounds} \
          shards={shard_counts:?} tokens_per_doc={TOKENS_PER_DOCUMENT} \
