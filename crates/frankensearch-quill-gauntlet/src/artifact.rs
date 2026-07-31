@@ -1259,7 +1259,7 @@ impl PinnedDirectory {
         self.publish_no_clobber_io(name, bytes).map_err(Into::into)
     }
 
-    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[cfg(all(test, feature = "tantivy-oracle", feature = "pruning-conformance"))]
     pub(crate) fn publish_unique_no_clobber(
         &self,
         temporary_name: &OsStr,
@@ -1538,7 +1538,7 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
-    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[cfg(all(test, feature = "tantivy-oracle", feature = "pruning-conformance"))]
     pub(crate) fn publish_unique_no_clobber(
         &self,
         _temporary_name: &OsStr,
