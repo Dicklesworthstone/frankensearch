@@ -67,7 +67,7 @@ use crate::quiver::{
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator,
-    DocIdSpan, FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue,
+    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue,
     IndexedNumericValue, ShardRouter, StoredFieldValue, flush_accumulator_with_mode,
     flush_delta_snapshot,
 };
@@ -81,7 +81,6 @@ const TITLE_FIELD: u16 = 2;
 const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
-const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
 
 /// Typed failure from the scalar shipping facade.
 #[derive(Debug, Error)]
@@ -1132,13 +1131,6 @@ struct ScribeShardState {
     accumulator: ColumnarAccumulator,
     identities: Vec<PendingIdentity>,
     current_lease_base: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParallelShardAssignment {
-    document_start: usize,
-    document_end: usize,
-    span: DocIdSpan,
 }
 
 #[derive(Default)]
@@ -2505,211 +2497,6 @@ impl QuillWriterState {
             .await
     }
 
-    async fn try_index_documents_parallel(
-        &mut self,
-        cx: &Cx,
-        documents: &[IndexableDocument],
-        replacement_ids: &BTreeSet<&str>,
-        allow_automatic_publication: bool,
-    ) -> Result<Option<(usize, usize)>, QuillIndexError> {
-        let shard_count = self.shards.len();
-        if !replacement_ids.is_empty()
-            || self.shard_router.is_deterministic()
-            || shard_count < 2
-            || rayon::current_num_threads() < 2
-            || documents.len() < shard_count.saturating_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
-        {
-            return Ok(None);
-        }
-
-        let maximum_shard_documents = documents.len().div_ceil(shard_count);
-        let maximum_shard_documents = u32::try_from(maximum_shard_documents)
-            .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-        for shard in 0..shard_count {
-            let live_lease = self.docid_allocator.live_lease(shard);
-            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
-                DOC_ORDS_PER_LEASE - next_ord
-            });
-            if maximum_shard_documents > remaining {
-                return Ok(None);
-            }
-            if let (Some(current), Some((live, _))) =
-                (self.shards[shard].current_lease_base, live_lease)
-                && current != live
-            {
-                return Ok(None);
-            }
-        }
-
-        let mut batch_ids = BTreeSet::new();
-        for document in documents {
-            check_cancel(cx, "parallel index validation")?;
-            if document.id.is_empty() {
-                return Err(invalid_state("document id must be nonempty"));
-            }
-            if !batch_ids.insert(document.id.as_str())
-                || self.uncommitted_ids.contains(&document.id)
-                || self
-                    .backend
-                    .snapshot()
-                    .resolve_document_id(&document.id)?
-                    .is_some()
-            {
-                return Err(invalid_state(format!(
-                    "duplicate live document id {:?}",
-                    document.id
-                )));
-            }
-        }
-
-        let mut assignments = vec![None; shard_count];
-        let documents_per_shard = documents.len() / shard_count;
-        let remainder = documents.len() % shard_count;
-        let mut document_start = 0_usize;
-        for position in 0..shard_count {
-            let shard = self.shard_router.route_batch();
-            let count = documents_per_shard + usize::from(position < remainder);
-            let count_u32 = u32::try_from(count)
-                .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-            let allocated = self
-                .docid_allocator
-                .alloc_batch(shard, count_u32)
-                .map_err(|error| invalid_state(error.to_string()))?;
-            let [span] = allocated.spans() else {
-                return Err(invalid_state(
-                    "parallel shard allocation unexpectedly crossed a Q1 lease",
-                ));
-            };
-            let document_end = document_start
-                .checked_add(count)
-                .ok_or_else(|| invalid_state("parallel document range overflow"))?;
-            assignments[shard] = Some(ParallelShardAssignment {
-                document_start,
-                document_end,
-                span: *span,
-            });
-            self.shards[shard].current_lease_base = Some(span.lease_base);
-            document_start = document_end;
-        }
-        debug_assert_eq!(document_start, documents.len());
-        self.next_lease_base = self.docid_allocator.watermark();
-
-        let mut arena_bytes_used_high_water = self
-            .shards
-            .iter()
-            .map(|shard| shard.accumulator.bytes_used())
-            .max()
-            .unwrap_or(0);
-        let mut arena_bytes_reserved_high_water = self
-            .shards
-            .iter()
-            .map(|shard| shard.accumulator.bytes_reserved())
-            .max()
-            .unwrap_or(0);
-        let shard_high_waters = self
-            .shards
-            .par_iter_mut()
-            .enumerate()
-            .filter_map(|(shard, state)| {
-                assignments[shard]
-                    .map(|assignment| Self::accumulate_parallel_shard(state, documents, assignment))
-            })
-            .collect::<Result<Vec<_>, QuillIndexError>>()?;
-        for (bytes_used, bytes_reserved) in shard_high_waters {
-            arena_bytes_used_high_water = arena_bytes_used_high_water.max(bytes_used);
-            arena_bytes_reserved_high_water = arena_bytes_reserved_high_water.max(bytes_reserved);
-        }
-
-        self.uncommitted_ids
-            .extend(documents.iter().map(|document| document.id.clone()));
-        self.unpublished_since.get_or_insert_with(Instant::now);
-
-        for shard in 0..shard_count {
-            if self.shards[shard]
-                .accumulator
-                .should_flush(self.config.scribe_shard_budget_bytes)
-            {
-                self.flush_shard(cx, shard, LifecycleTrigger::ArenaBudget)
-                    .await?;
-                if allow_automatic_publication {
-                    self.publish_bulk_cadence_if_due(cx).await?;
-                }
-            }
-        }
-        let visibility_due = self.unpublished_since.is_some_and(|started| {
-            started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
-        });
-        if allow_automatic_publication && visibility_due {
-            self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
-                .await?;
-        }
-        Ok(Some((
-            arena_bytes_used_high_water,
-            arena_bytes_reserved_high_water,
-        )))
-    }
-
-    fn accumulate_parallel_shard(
-        state: &mut ScribeShardState,
-        documents: &[IndexableDocument],
-        assignment: ParallelShardAssignment,
-    ) -> Result<(usize, usize), QuillIndexError> {
-        let shard_documents = documents
-            .get(assignment.document_start..assignment.document_end)
-            .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
-        if shard_documents.len()
-            != usize::try_from(assignment.span.len)
-                .map_err(|_| invalid_state("parallel shard span length does not fit usize"))?
-        {
-            return Err(invalid_state(
-                "parallel shard document range differs from its Q1 span",
-            ));
-        }
-        state
-            .identities
-            .try_reserve(shard_documents.len())
-            .map_err(|_| invalid_state("could not reserve parallel shard identities"))?;
-        let mut arena_bytes_used_high_water = state.accumulator.bytes_used();
-        let mut arena_bytes_reserved_high_water = state.accumulator.bytes_reserved();
-        for (offset, document) in shard_documents.iter().enumerate() {
-            let offset = u32::try_from(offset)
-                .map_err(|_| invalid_state("parallel shard offset does not fit u32"))?;
-            let doc_ord = assignment
-                .span
-                .ord_start
-                .checked_add(offset)
-                .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
-            let global_docid = assignment
-                .span
-                .lease_base
-                .checked_add(u64::from(doc_ord))
-                .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
-                .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-            let metadata = canonical_metadata(&document.metadata)?;
-            let title = document.title.as_deref().unwrap_or("");
-            let indexed = [
-                IndexedFieldValue::new(ID_FIELD, &document.id),
-                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                IndexedFieldValue::new(TITLE_FIELD, title),
-            ];
-            let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-            let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
-            let accumulated = state
-                .accumulator
-                .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-            arena_bytes_used_high_water = arena_bytes_used_high_water.max(accumulated.bytes_used);
-            arena_bytes_reserved_high_water =
-                arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-            let canonical_content = canonical_document_preimage(document, &metadata)?;
-            state.identities.push(PendingIdentity {
-                doc_ord,
-                document_id: document.id.clone(),
-                canonical_content,
-            });
-        }
-        Ok((arena_bytes_used_high_water, arena_bytes_reserved_high_water))
-    }
-
     async fn index_documents_with_replacements(
         &mut self,
         cx: &Cx,
@@ -2757,30 +2544,6 @@ impl QuillWriterState {
             // Only the successful return below (or a successful commit)
             // disarms it.
             self.ingest_retry_required = true;
-            if let Some((arena_bytes_used_high_water, arena_bytes_reserved_high_water)) = self
-                .try_index_documents_parallel(
-                    cx,
-                    documents,
-                    replacement_ids,
-                    allow_automatic_publication,
-                )
-                .await?
-            {
-                ingest_span.record(
-                    "result_count",
-                    u64::try_from(documents.len()).unwrap_or(u64::MAX),
-                );
-                ingest_span.record(
-                    "arena_bytes_used_high_water",
-                    u64::try_from(arena_bytes_used_high_water).unwrap_or(u64::MAX),
-                );
-                ingest_span.record(
-                    "arena_bytes_reserved_high_water",
-                    u64::try_from(arena_bytes_reserved_high_water).unwrap_or(u64::MAX),
-                );
-                self.ingest_retry_required = false;
-                return Ok(());
-            }
             let shard_id = self.shard_router.route_batch();
             let document_count = u32::try_from(documents.len())
                 .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
@@ -15222,57 +14985,6 @@ mod tests {
                     "a resolved multi-shard writer must consume independent Q1 leases",
                 );
             }
-        });
-    }
-
-    #[test]
-    fn large_batch_accumulates_on_every_available_shared_nothing_shard() {
-        run_with_cx(|cx| async move {
-            let config = QuillConfig {
-                max_ingest_shards: 4,
-                ..QuillConfig::default()
-            };
-            let mut index = QuillIndex::in_memory(config).expect("multi-shard memory index");
-            let shard_count = index.writer_mut().shard_router.shard_count();
-            let documents = (0..shard_count * PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
-                .map(|ordinal| {
-                    IndexableDocument::new(
-                        format!("parallel-shard-{ordinal:05}"),
-                        "parallel shared nothing indexing fixture",
-                    )
-                })
-                .collect::<Vec<_>>();
-            index
-                .index_documents(&cx, &documents)
-                .await
-                .expect("accumulate one large batch");
-
-            let populated_shards = index
-                .writer_mut()
-                .shards
-                .iter()
-                .filter(|shard| shard.accumulator.document_count() != 0)
-                .count();
-            let expected_populated = if shard_count > 1 && rayon::current_num_threads() > 1 {
-                shard_count
-            } else {
-                1
-            };
-            assert_eq!(populated_shards, expected_populated);
-
-            index.commit(&cx).await.expect("publish parallel batch");
-            assert_eq!(
-                index.snapshot().doc_count(),
-                u64::try_from(documents.len()).expect("fixture document count fits u64"),
-            );
-            assert_pairwise_disjoint_manifest(
-                index
-                    .snapshot()
-                    .loaded_manifest()
-                    .manifest
-                    .segments
-                    .as_slice(),
-            );
         });
     }
 
