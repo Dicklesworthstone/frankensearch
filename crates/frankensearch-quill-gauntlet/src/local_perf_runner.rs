@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::machine_class_registry::DefaultFlipDisposition;
 use crate::machine_class_registry::{
     ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
     LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
@@ -37,6 +39,8 @@ use crate::{
     EvidenceArtifactError, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
     PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec, command_sha256_from_argv,
 };
+#[cfg(test)]
+use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
@@ -665,7 +669,7 @@ fn validate_platform_gate_policy(config: &LocalPerfRunConfig) -> Result<(), Loca
     }
     if config.profile.hardware_class_id() == HardwareClassId::M4Macos {
         return Err(LocalPerfRunError::Invalid(
-            "m4-macos promotion is unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; every current M4 run is diagnostic-only"
+            "m4-macos.scheduler-10 remains a required, runnable registry applicability profile, but this producer cannot emit promotion-admissible M4 evidence until it can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; use the diagnostic Apple profiling path until an attesting producer lands"
                 .to_owned(),
         ));
     }
@@ -2775,17 +2779,81 @@ mod tests {
     }
 
     #[test]
-    fn m4_policy_fails_closed_for_every_gate() {
+    fn m4_registry_applicability_remains_required_while_promotion_fails_closed() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
         for gate in PerfGate::ALL {
-            let error = validate_platform_gate_policy(&policy_config(gate))
+            let config = policy_config(gate);
+            let resolved =
+                resolve_run_profile(&config, &registry).expect("registered M4 applicability");
+            assert_eq!(
+                resolved.applicability_plan.default_flip_disposition,
+                DefaultFlipDisposition::RequiredForDefaultFlip,
+                "{gate} must remain required even while this producer is unavailable"
+            );
+            assert!(
+                resolved
+                    .applicability_plan
+                    .cells
+                    .iter()
+                    .all(|cell| cell.reason != PerfCellApplicabilityReason::DiagnosticProfile),
+                "{gate} must not relabel the required M4 profile as diagnostic"
+            );
+
+            let error = validate_platform_gate_policy(&config)
                 .expect_err("every current M4 promotion path must reject");
             if matches!(gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
                 assert!(error.to_string().contains("any host"));
             } else {
                 assert!(error.to_string().contains("actual executing image"));
-                assert!(error.to_string().contains("diagnostic-only"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("required, runnable registry applicability profile")
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cannot emit promotion-admissible M4 evidence")
+                );
             }
         }
+    }
+
+    #[test]
+    fn smt2_128_admits_the_full_canonical_qg1_width_horizon() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let config = LocalPerfRunConfig {
+            gate: PerfGate::Qg1,
+            profile: profile(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128),
+            run_id: "candidate-1".to_owned(),
+            run_window: "window-1".to_owned(),
+            measurement_runs: MIN_MEASUREMENT_RUNS,
+            output_dir: PathBuf::from("/tmp/frankensearch-perf-run"),
+        };
+        let resolved =
+            resolve_run_profile(&config, &registry).expect("registered SMT2 applicability");
+        assert_eq!(
+            resolved.capacity_semantics,
+            ExecutionCapacitySemantics::LogicalThreads
+        );
+        assert_eq!(resolved.execution_capacity, 128);
+        assert_eq!(resolved.max_exercised_cell_width, 128);
+        assert_eq!(
+            resolved
+                .applicability_plan
+                .cell_count(PerfCellApplicability::NotApplicable),
+            0
+        );
+        assert_eq!(
+            resolved.applicability_plan.max_runnable_cell_width(),
+            Some(128)
+        );
+        assert!(
+            resolved
+                .applicability_plan
+                .cell_count(PerfCellApplicability::Required)
+                > 0
+        );
     }
 
     #[test]
