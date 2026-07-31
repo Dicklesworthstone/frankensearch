@@ -71,7 +71,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sysinfo::Disks;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
 use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
@@ -85,6 +85,7 @@ use crate::config::{
 };
 use crate::degradation_advisor::{
     DegradationAdvice, DegradationAdviceInput, DegradationFailureKind, advice_for_search_error,
+    advice_for_zero_signal,
 };
 use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
 use crate::file_classification::{
@@ -7196,11 +7197,33 @@ impl FsfsRuntime {
             ) {
                 match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
-                        match index.search_top_k(&query_embedding, semantic_budget, None) {
-                            Ok(hits) => hits
-                                .into_iter()
-                                .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
-                                .collect::<Vec<_>>(),
+                        // Classified lane (bd-tqhc): an empty semantic result
+                        // carries a typed ZeroSignalReason instead of being
+                        // indistinguishable from "no relevant documents".
+                        // Availability failures surface as operator advice;
+                        // benign reasons stay debug-level.
+                        match index.search_top_k_classified(&query_embedding, semantic_budget, None)
+                        {
+                            Ok(classified) => {
+                                if let Some(reason) = classified.zero_signal {
+                                    debug!(
+                                        reason_code = reason.reason_code(),
+                                        "fsfs semantic lane returned zero results"
+                                    );
+                                    if let Some(zero_signal_advice) = advice_for_zero_signal(
+                                        &normalized_query,
+                                        Some(&resources.index_root),
+                                        reason,
+                                    ) {
+                                        resources.degradation_advice.push(zero_signal_advice);
+                                    }
+                                }
+                                classified
+                                    .hits
+                                    .into_iter()
+                                    .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
+                                    .collect::<Vec<_>>()
+                            }
                             Err(error) if lexical_available => {
                                 info!(
                                     error = %error,
@@ -8375,6 +8398,7 @@ impl FsfsRuntime {
 
         checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
+        checks.push(Self::collect_zero_signal_doctor_check(&index_root));
 
         // 5. Index directory writable
         if index_root.exists() {
@@ -8557,6 +8581,99 @@ impl FsfsRuntime {
             detail,
             suggestion: None,
         })
+    }
+
+    /// Doctor check for the semantic lane's zero-signal census (bd-tqhc).
+    ///
+    /// Reports the typed index state that classified searches would see,
+    /// without running any query: benign empty states (newly created, all
+    /// tombstoned, WAL-only) warn with the census, availability failures
+    /// (live records but zero usable vectors) fail, and a healthy populated
+    /// index passes with its counts. An unreadable artifact fails; a missing
+    /// artifact warns because the semantic lane is simply not built yet.
+    fn collect_zero_signal_doctor_check(index_root: &Path) -> DoctorCheck {
+        use frankensearch_core::config::ZeroSignalReason;
+
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        if !vector_path.exists() {
+            return DoctorCheck {
+                name: "semantic.zero_signal".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!(
+                    "semantic lane unavailable: no vector index at {}",
+                    vector_path.display()
+                ),
+                suggestion: Some("run `fsfs index <dir>` to build the semantic index".to_owned()),
+            };
+        }
+        let index = match VectorIndex::open(&vector_path) {
+            Ok(index) => index,
+            Err(error) => {
+                return DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!(
+                        "vector index at {} could not be opened: {error}",
+                        vector_path.display()
+                    ),
+                    suggestion: Some(
+                        "rebuild index artifacts in place with `fsfs index --full`".to_owned(),
+                    ),
+                };
+            }
+        };
+        let state = index.zero_signal_state();
+        let census = format!(
+            "records={} live={} tombstones={} wal={} usable={}",
+            state.record_count,
+            state.live_count,
+            state.tombstone_count,
+            state.wal_count,
+            state.usable_vector_count
+        );
+        match state.state_reason() {
+            Some(reason @ ZeroSignalReason::NoUsableVectors) => DoctorCheck {
+                name: "semantic.zero_signal".to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail: format!("{}: {census}", reason.reason_code()),
+                suggestion: Some(
+                    "live records carry no usable vectors (zero-norm or corrupt); rebuild with `fsfs index --full`"
+                        .to_owned(),
+                ),
+            },
+            Some(reason) => DoctorCheck {
+                name: "semantic.zero_signal".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!("{}: {census}", reason.reason_code()),
+                suggestion: Some(match reason {
+                    ZeroSignalReason::AllTombstoned => {
+                        "every record is tombstoned; compact or re-run `fsfs index`".to_owned()
+                    }
+                    _ => "index is empty; run `fsfs index <dir>` to populate it".to_owned(),
+                }),
+            },
+            None if state.live_count > 0 && state.usable_vector_count < state.live_count => {
+                // Partial coverage loss: searches still work, but some live
+                // records carry unusable (zero-norm/corrupt) vectors and can
+                // never be found semantically. Warn-worthy per bd-tqhc even
+                // though no query would classify it (results are non-empty).
+                DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!("partial usable-vector coverage: {census}"),
+                    suggestion: Some(
+                        "some live records have unusable vectors and are invisible to semantic search; rebuild with `fsfs index --full`"
+                            .to_owned(),
+                    ),
+                }
+            }
+            None => DoctorCheck {
+                name: "semantic.zero_signal".to_owned(),
+                verdict: DoctorVerdict::Pass,
+                detail: census,
+                suggestion: None,
+            },
+        }
     }
 
     fn collect_lexical_engine_doctor_check(index_root: &Path) -> SearchResult<DoctorCheck> {
@@ -19940,7 +20057,7 @@ mod tests {
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
-                .write_record("src/ghost.rs", &vec![0.0_f32; 256])
+                .write_record("src/ghost.rs", &vec![0.01_f32; 256])
                 .expect("seed vector record");
             vector_writer.finish().expect("finish vector index");
             let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
@@ -20099,7 +20216,7 @@ mod tests {
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
-                .write_record("src/blob.bin", &vec![0.0_f32; 256])
+                .write_record("src/blob.bin", &vec![0.01_f32; 256])
                 .expect("seed vector record");
             vector_writer.finish().expect("finish vector index");
             let vector_index = VectorIndex::open(&vector_path).expect("open vector index");
@@ -23000,6 +23117,13 @@ mod tests {
         assert!(
             payload.checks.iter().any(|c| c.name == "shadow_oracle"),
             "doctor should expose shadow-oracle state"
+        );
+        assert!(
+            payload
+                .checks
+                .iter()
+                .any(|c| c.name == "semantic.zero_signal"),
+            "doctor should report the semantic zero-signal census"
         );
         assert_eq!(
             payload.pass_count + payload.warn_count + payload.fail_count,

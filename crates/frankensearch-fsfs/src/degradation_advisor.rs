@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use frankensearch_core::SearchError;
+use frankensearch_core::config::ZeroSignalReason;
 use serde::{Deserialize, Serialize};
 
 pub const DEGRADATION_ADVICE_SCHEMA_VERSION: &str = "fsfs.degradation.advice.v2";
@@ -17,6 +18,7 @@ pub enum DegradationFailureKind {
     Timeout,
     CorruptIndex,
     CacheMiss,
+    SemanticZeroSignal,
 }
 
 impl DegradationFailureKind {
@@ -30,6 +32,7 @@ impl DegradationFailureKind {
             Self::Timeout => "degrade.advice.timeout",
             Self::CorruptIndex => "degrade.advice.index_corrupt",
             Self::CacheMiss => "degrade.advice.cache_miss",
+            Self::SemanticZeroSignal => "degrade.advice.semantic_zero_signal",
         }
     }
 
@@ -45,6 +48,9 @@ impl DegradationFailureKind {
             Self::Timeout => "quality stage exceeded its latency budget",
             Self::CorruptIndex => "index artifact could not be read safely",
             Self::CacheMiss => "expected cache artifact was missing or stale",
+            Self::SemanticZeroSignal => {
+                "semantic lane produced zero signal despite live records; results may be lexical-only"
+            }
         }
     }
 
@@ -56,7 +62,8 @@ impl DegradationFailureKind {
             | Self::MissingQualityModel
             | Self::UnverifiableEmbeddingSpace
             | Self::Timeout
-            | Self::CacheMiss => true,
+            | Self::CacheMiss
+            | Self::SemanticZeroSignal => true,
             Self::CorruptIndex => false,
         }
     }
@@ -159,6 +166,35 @@ pub fn advice_for_search_error(
     })
 }
 
+/// Operator advice for a typed semantic zero-signal classification
+/// (bd-tqhc).
+///
+/// Only availability failures (`NoUsableVectors`,
+/// `AnnReturnedEmptyDespiteUsableVectors`) warrant operator advice: every
+/// other [`ZeroSignalReason`] is an expected outcome of the request or index
+/// state and must not surface as degradation. The typed reason code rides in
+/// `original_error` so the advice schema stays at v2; the machine-readable
+/// channel remains `TwoTierMetrics::zero_signal`.
+#[must_use]
+pub fn advice_for_zero_signal(
+    query: &str,
+    index_dir: Option<&Path>,
+    reason: ZeroSignalReason,
+) -> Option<DegradationAdvice> {
+    if !reason.is_availability_failure() {
+        return None;
+    }
+    let mut advice = DegradationAdvice::from_input(DegradationAdviceInput {
+        failure: DegradationFailureKind::SemanticZeroSignal,
+        query,
+        index_dir,
+        original_error: None,
+        replay_command: None,
+    });
+    advice.original_error = Some(format!("{}: {reason}", reason.reason_code()));
+    Some(advice)
+}
+
 #[must_use]
 pub const fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
     match error {
@@ -199,6 +235,7 @@ pub fn synthetic_degradation_advice_fixture() -> Vec<DegradationAdvice> {
         DegradationFailureKind::Timeout,
         DegradationFailureKind::CorruptIndex,
         DegradationFailureKind::CacheMiss,
+        DegradationFailureKind::SemanticZeroSignal,
     ]
     .into_iter()
     .map(|failure| {
@@ -220,7 +257,8 @@ const fn severity_for(failure: DegradationFailureKind) -> DegradationAdviceSever
         | DegradationFailureKind::MissingQualityModel
         | DegradationFailureKind::UnverifiableEmbeddingSpace
         | DegradationFailureKind::Timeout
-        | DegradationFailureKind::CacheMiss => DegradationAdviceSeverity::Warn,
+        | DegradationFailureKind::CacheMiss
+        | DegradationFailureKind::SemanticZeroSignal => DegradationAdviceSeverity::Warn,
         DegradationFailureKind::LexicalFallback => DegradationAdviceSeverity::Info,
         DegradationFailureKind::CorruptIndex => DegradationAdviceSeverity::Error,
     }
@@ -340,6 +378,20 @@ fn next_actions_for(
                 )),
             ),
         ],
+        DegradationFailureKind::SemanticZeroSignal => vec![
+            action(
+                1,
+                "degrade.action.inspect_zero_signal_census",
+                "Run doctor to see the typed zero-signal census (records, live, tombstones, usable vectors).",
+                Some(format!("fsfs doctor --index-dir {index_dir} --format json")),
+            ),
+            action(
+                2,
+                "degrade.action.rebuild_unusable_vectors",
+                "Rebuild in place if the census shows live records without usable vectors (zero-norm or corrupt embeddings).",
+                Some(format!("fsfs index --full --index-dir {index_dir} .")),
+            ),
+        ],
     }
 }
 
@@ -371,9 +423,12 @@ mod tests {
 
     use frankensearch_core::SearchError;
 
+    use frankensearch_core::config::ZeroSignalReason;
+
     use super::{
-        AdviceOutputSurface, DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationFailureKind,
-        advice_for_search_error, synthetic_degradation_advice_fixture,
+        AdviceOutputSurface, DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationAdviceSeverity,
+        DegradationFailureKind, advice_for_search_error, advice_for_zero_signal,
+        synthetic_degradation_advice_fixture,
     };
 
     #[test]
@@ -393,6 +448,7 @@ mod tests {
                 "degrade.advice.timeout",
                 "degrade.advice.index_corrupt",
                 "degrade.advice.cache_miss",
+                "degrade.advice.semantic_zero_signal",
             ]
         );
         assert!(
@@ -411,6 +467,56 @@ mod tests {
                 .contains(&AdviceOutputSurface::CliJsonl)
                 && item.output_surfaces.contains(&AdviceOutputSurface::CliToon)
         }));
+    }
+
+    #[test]
+    fn zero_signal_advice_only_for_availability_failures() {
+        let benign = [
+            ZeroSignalReason::CallerRequestedZeroK,
+            ZeroSignalReason::FilterEliminatedAll,
+            ZeroSignalReason::NonFiniteQuery,
+            ZeroSignalReason::ZeroNormQuery,
+            ZeroSignalReason::NewlyCreatedEmpty,
+            ZeroSignalReason::AllTombstoned,
+            ZeroSignalReason::WalOnlyNoLiveRecords,
+        ];
+        for reason in benign {
+            assert!(
+                advice_for_zero_signal("auth", None, reason).is_none(),
+                "benign reason {reason:?} must not produce operator advice"
+            );
+        }
+
+        for reason in [
+            ZeroSignalReason::NoUsableVectors,
+            ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
+        ] {
+            let advice = advice_for_zero_signal(
+                "auth",
+                Some(Path::new("/tmp/project/.frankensearch")),
+                reason,
+            )
+            .expect("availability failure must produce advice");
+            assert_eq!(advice.failure, DegradationFailureKind::SemanticZeroSignal);
+            assert_eq!(advice.severity, DegradationAdviceSeverity::Warn);
+            assert_eq!(advice.reason_code, "degrade.advice.semantic_zero_signal");
+            assert!(advice.preserves_initial_results);
+            assert!(
+                advice
+                    .original_error
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(reason.reason_code())),
+                "typed reason code must ride in original_error"
+            );
+            let commands = advice
+                .next_actions
+                .iter()
+                .filter_map(|action| action.command.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(commands.contains("fsfs doctor"));
+            assert!(!commands.to_ascii_lowercase().contains("delete"));
+        }
     }
 
     #[test]
