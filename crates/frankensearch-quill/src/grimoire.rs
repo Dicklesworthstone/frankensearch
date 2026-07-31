@@ -921,6 +921,27 @@ impl ValidatedTermDictionaryMetadata {
     pub(crate) const fn schema(&self) -> SchemaDescriptor {
         self.schema
     }
+
+    /// Exact heap bytes retained by this validated metadata object.
+    ///
+    /// Counts the boxed struct itself plus the full capacity of the block and
+    /// restart directories. [`BlockMeta`] and [`RestartMeta`] are flat offset
+    /// records without nested heap allocations, so capacity-based accounting
+    /// is exact. This is the persistent per-segment cost of validating
+    /// TERMDICT metadata once per immutable backing instead of per query.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(
+                self.blocks
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<BlockMeta>()),
+            )
+            .saturating_add(
+                self.restarts
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<RestartMeta>()),
+            )
+    }
 }
 
 /// Borrowed, eagerly validated TERMDICT view.

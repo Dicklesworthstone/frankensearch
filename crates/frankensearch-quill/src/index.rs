@@ -13332,6 +13332,81 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_only_delete_commit_reuses_termdict_metadata_and_preserves_results() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("first", "alpha shared"),
+                        IndexableDocument::new("second", "beta shared"),
+                        IndexableDocument::new("third", "gamma only"),
+                    ],
+                )
+                .await
+                .expect("index rebind fixture");
+            index.commit(&cx).await.expect("seal rebind fixture");
+
+            let before_snapshot = index.snapshot();
+            assert_eq!(before_snapshot.segments().len(), 1);
+            let segment = &before_snapshot.segments()[0];
+            assert_eq!(segment.term_dictionary_cache_counts().0, 1);
+            assert_eq!(segment.term_dictionary_metadata_reuse_count(), 0);
+            let metadata_bytes = segment.term_dictionary_metadata_bytes();
+            assert!(metadata_bytes > 0, "validated metadata must be accounted");
+            let baseline = index
+                .search_paginated(&cx, "shared", 10, 0, true)
+                .expect("baseline ranked search")
+                .hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(baseline.len(), 2);
+
+            // Deleting the only non-matching document publishes a
+            // tombstone-only successor generation over the same immutable
+            // segment backing.
+            assert!(
+                index
+                    .delete_document(&cx, "third")
+                    .await
+                    .expect("tombstone delete")
+            );
+
+            let after_snapshot = index.snapshot();
+            assert_eq!(after_snapshot.segments().len(), 1);
+            let rebound = &after_snapshot.segments()[0];
+            assert_eq!(
+                rebound.term_dictionary_cache_counts().0,
+                1,
+                "a tombstone-only successor generation must not re-validate TERMDICT"
+            );
+            assert!(
+                rebound.term_dictionary_metadata_reuse_count() >= 1,
+                "the successor generation must reuse the validated metadata"
+            );
+            assert_eq!(
+                rebound.term_dictionary_metadata_bytes(),
+                metadata_bytes,
+                "reuse must not grow persistent metadata bytes"
+            );
+            let after = index
+                .search_paginated(&cx, "shared", 10, 0, true)
+                .expect("post-rebind ranked search")
+                .hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after, baseline,
+                "ranked hits and exact score bits must be byte-identical across \
+                 a tombstone-only rebind that does not touch matching documents"
+            );
+        });
+    }
+
+    #[test]
     fn quill_lexical_contract_is_immediate_hydratable_cancel_safe_and_upserts() {
         run_with_cx(|cx| async move {
             let index =
