@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Reviewed commit containing the normative registry.
-pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "cc94cb772908dc3efdd69d010d172037160c6847";
+pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "483e59a1d6edeb237462e4f54e92ab273f13a5ae";
 /// Exact Git blob of the normative registry.
 pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "04eabf6a9daa6ec3239f1f8e5ccb2256921c7a72";
 /// SHA-256 of the exact normative registry file bytes.
