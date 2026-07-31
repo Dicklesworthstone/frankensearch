@@ -798,18 +798,15 @@ impl EncodedTermDictionary {
         }
         debug_assert_eq!(bytes.len(), output_len);
 
-        #[cfg(debug_assertions)]
-        {
-            let owned_limits = TermDictionaryLimits {
-                max_bytes: bytes.len(),
-                max_blocks: blocks.len(),
-                max_terms: terms.len(),
-                max_restarts: restart_count,
-            };
-            let parsed = TermDictionary::parse_with_limits(&bytes, schema, sections, owned_limits)?;
-            debug_assert_eq!(parsed.restart_count(), restart_count);
-            debug_assert_eq!(parsed.term_count(), term_count);
-        }
+        let owned_limits = TermDictionaryLimits {
+            max_bytes: bytes.len(),
+            max_blocks: blocks.len(),
+            max_terms: terms.len(),
+            max_restarts: restart_count,
+        };
+        let parsed = TermDictionary::parse_with_limits(&bytes, schema, sections, owned_limits)?;
+        debug_assert_eq!(parsed.restart_count(), restart_count);
+        debug_assert_eq!(parsed.term_count(), term_count);
         Ok(Self {
             bytes,
             term_count,
