@@ -19,12 +19,6 @@
 pub mod cass_compat;
 pub mod quill_contract;
 
-/// Version of the lexical wrapper actually linked into the current producer.
-///
-/// Gauntlet evidence records this live package identity separately from the
-/// historical reviewed-oracle baseline in its dependency contract.
-pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
 pub use cass_compat::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassDocumentRef, CassFields,
     CassMergeStatus, CassQueryFilters, CassQueryToken, CassSourceFilter, CassTantivyIndex,

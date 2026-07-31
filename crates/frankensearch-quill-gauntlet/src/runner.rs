@@ -7551,10 +7551,21 @@ mod tests {
         /// explicit identity against its live Git revision and dirty state.
         GitCheckoutVerified,
         /// A Git-less build accepted caller-supplied revision metadata only
-        /// for diagnostic execution. This state can never publish evidence.
+        /// for diagnostic execution.
         ExplicitUnverified,
         /// Neither an exact checkout nor explicit diagnostic identity existed.
         Unavailable,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonSourceVerification {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::GitCheckoutVerified => "git_checkout_verified",
+                Self::ExplicitUnverified => "explicit_unverified",
+                Self::Unavailable => "unavailable",
+            }
+        }
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
@@ -7696,7 +7707,7 @@ mod tests {
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct UnionHorizonCompletionEntry {
+    struct UnionHorizonDiagnosticCompletionEntry {
         proof_kind: UnionHorizonProofKind,
         filename: String,
         semantic_sha256: String,
@@ -7708,17 +7719,17 @@ mod tests {
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct UnionHorizonCompletionManifest {
+    struct UnionHorizonDiagnosticCompletionManifest {
         schema_version: String,
         run_id: String,
         build_identity: UnionHorizonBuildIdentity,
-        artifacts: Vec<UnionHorizonCompletionEntry>,
+        artifacts: Vec<UnionHorizonDiagnosticCompletionEntry>,
         manifest_sha256: String,
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
-    impl UnionHorizonCompletionManifest {
-        fn seal(run_id: String, mut artifacts: Vec<UnionHorizonCompletionEntry>) -> Self {
+    impl UnionHorizonDiagnosticCompletionManifest {
+        fn seal(run_id: String, mut artifacts: Vec<UnionHorizonDiagnosticCompletionEntry>) -> Self {
             artifacts.sort_by_key(|entry| entry.proof_kind);
             let mut manifest = Self {
                 schema_version: UNION_HORIZON_COMPLETION_SCHEMA_VERSION.to_owned(),
@@ -7751,10 +7762,11 @@ mod tests {
             );
             assert!(
                 !self.run_id.is_empty()
+                    && self.run_id.len() <= 128
                     && self.run_id.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
                     }),
-                "UNION_HORIZON completion run ID must be path-safe",
+                "UNION_HORIZON diagnostic completion run ID must be bounded and path-safe",
             );
             assert_eq!(
                 self.build_identity,
@@ -7762,8 +7774,8 @@ mod tests {
                 "UNION_HORIZON completion must bind the executing test binary",
             );
             assert!(
-                union_horizon_identity_is_publishable(&self.build_identity),
-                "UNION_HORIZON completion requires clean Git-verified source",
+                union_horizon_diagnostic_source_identity_is_well_formed(&self.build_identity),
+                "UNION_HORIZON diagnostic completion source identity is malformed",
             );
             assert_eq!(
                 self.artifacts
@@ -7881,9 +7893,9 @@ mod tests {
 
         fn preimage_sha256(&self) -> String {
             let mut preimage = self.clone();
-            // `run_id` is publication metadata, not semantic evidence.  Two
-            // invocations that prove the same layouts against the same binary
-            // must therefore have the same content identity.
+            // `run_id` identifies one diagnostic publication, not semantic
+            // content. Two invocations that prove the same layouts against
+            // the same binary must therefore have the same content identity.
             preimage.run_id.clear();
             preimage.artifact_sha256.clear();
             let bytes = serde_json::to_vec(&preimage)
@@ -7901,10 +7913,11 @@ mod tests {
             );
             assert!(
                 !self.run_id.is_empty()
+                    && self.run_id.len() <= 128
                     && self.run_id.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
                     }),
-                "UNION_HORIZON run ID must be a non-empty path-safe ASCII token",
+                "UNION_HORIZON run ID must be a non-empty bounded path-safe ASCII token",
             );
             assert_eq!(
                 self.proofs.len(),
@@ -8605,7 +8618,7 @@ mod tests {
                     refill.candidate_docs()
                         <= u64::try_from(window_doc_count)
                             .expect("UNION_HORIZON window count fits u64"),
-                    "UNION_HORIZON refill admitted more candidates than its physical window",
+                    "UNION_HORIZON refill returned more candidates than its physical window",
                 );
                 assert_eq!(
                     refill.buffer_empty(),
@@ -8748,11 +8761,6 @@ mod tests {
                     union_horizon_current_executable_identity();
 
                 assert_lower_hex(
-                    &source_git_revision,
-                    40,
-                    "embedded UNION_HORIZON Git revision",
-                );
-                assert_lower_hex(
                     &cargo_lock_sha256,
                     64,
                     "embedded UNION_HORIZON Cargo.lock identity",
@@ -8803,7 +8811,7 @@ mod tests {
                     "UNION_HORIZON test executable must be nonempty",
                 );
 
-                UnionHorizonBuildIdentity {
+                let identity = UnionHorizonBuildIdentity {
                     source_git_revision,
                     source_git_dirty,
                     source_verification,
@@ -8815,18 +8823,28 @@ mod tests {
                     enabled_features_sha256,
                     test_executable_sha256,
                     test_executable_byte_len,
-                }
+                };
+                assert!(
+                    union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                    "embedded UNION_HORIZON diagnostic source identity is malformed",
+                );
+                identity
             })
             .clone()
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+        value.len() == expected_len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn assert_lower_hex(value: &str, expected_len: usize, label: &str) {
         assert!(
-            value.len() == expected_len
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            is_lower_hex(value, expected_len),
             "{label} must be {expected_len} lowercase hexadecimal characters",
         );
     }
@@ -8912,13 +8930,18 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
-    fn union_horizon_identity_is_publishable(identity: &UnionHorizonBuildIdentity) -> bool {
-        cfg!(target_os = "linux")
-            && !identity.source_git_dirty
-            && matches!(
-                identity.source_verification,
-                UnionHorizonSourceVerification::GitCheckoutVerified
-            )
+    fn union_horizon_diagnostic_source_identity_is_well_formed(
+        identity: &UnionHorizonBuildIdentity,
+    ) -> bool {
+        match identity.source_verification {
+            UnionHorizonSourceVerification::GitCheckoutVerified
+            | UnionHorizonSourceVerification::ExplicitUnverified => {
+                is_lower_hex(&identity.source_git_revision, 40)
+            }
+            UnionHorizonSourceVerification::Unavailable => {
+                identity.source_git_revision == "unavailable" && identity.source_git_dirty
+            }
+        }
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
@@ -9024,7 +9047,7 @@ mod tests {
             if let Some(prior_bits) = envelope.insert(hit.doc_id.clone(), hit.score_bits) {
                 assert_eq!(
                     prior_bits, hit.score_bits,
-                    "UNION_HORIZON observation changed score bits across ranked and tie evidence",
+                    "UNION_HORIZON observation changed score bits across ranked and tie receipts",
                 );
             }
         }
@@ -9119,7 +9142,7 @@ mod tests {
         assert_eq!(subject_ties, oracle_ties);
         assert!(
             run.comparison.subject.cutoff_tie_complete && run.comparison.oracle.cutoff_tie_complete,
-            "UNION_HORIZON limit={limit} requires complete cutoff-tie evidence",
+            "UNION_HORIZON limit={limit} requires a complete cutoff-tie receipt",
         );
         assert_union_horizon_native_addresses(run, layout, tantivy_segments);
     }
@@ -9184,7 +9207,7 @@ mod tests {
                     && run.comparison.divergences.iter().all(|divergence| {
                         matches!(divergence.class, DivergenceClass::TieOrder)
                     }),
-                "UNION_HORIZON two-segment tie proof admitted a non-TieOrder divergence: {:#?}",
+                "UNION_HORIZON two-segment tie proof contained a non-TieOrder divergence: {:#?}",
                 run.comparison,
             );
         }
@@ -9694,13 +9717,11 @@ mod tests {
             (Some(_), Ok(run_id)) => run_id,
             (None, Err(std::env::VarError::NotPresent)) => {
                 let identity = union_horizon_build_identity();
-                format!(
-                    "local-{}",
-                    identity
-                        .source_git_revision
-                        .get(..12)
-                        .expect("validated UNION_HORIZON revision has 12 characters"),
-                )
+                let revision_label = identity
+                    .source_git_revision
+                    .get(..12)
+                    .unwrap_or(&identity.source_git_revision);
+                format!("local-{revision_label}")
             }
             (Some(_), Err(error)) => {
                 panic!(
@@ -9736,7 +9757,7 @@ mod tests {
             .expect("re-encode canonical UNION_HORIZON artifact bytes");
         assert_eq!(
             bytes, canonical_bytes,
-            "UNION_HORIZON strict decoder requires the publisher's exact canonical bytes; unknown, duplicate, reordered, or alternate-spelling JSON is inadmissible",
+            "UNION_HORIZON strict decoder requires the publisher's exact canonical bytes; unknown, duplicate, reordered, or alternate-spelling JSON is noncanonical",
         );
         artifact.verify();
         artifact
@@ -9774,11 +9795,10 @@ mod tests {
                 .build_identity,
         );
         assert!(
-            artifact
-                .proofs
-                .first()
-                .is_some_and(|proof| union_horizon_identity_is_publishable(&proof.build_identity)),
-            "persisted UNION_HORIZON evidence requires a clean Git-verified compiled producer build",
+            artifact.proofs.first().is_some_and(|proof| {
+                union_horizon_diagnostic_source_identity_is_well_formed(&proof.build_identity)
+            }),
+            "persisted UNION_HORIZON diagnostic requires a well-formed recorded source identity",
         );
         assert!(
             root.is_relative()
@@ -9849,9 +9869,9 @@ mod tests {
             target_os = "watchos"
         )
     ))]
-    fn validate_union_horizon_completed_bundle(
+    fn validate_union_horizon_completed_diagnostic_bundle(
         directory: &crate::artifact::PinnedDirectory,
-        manifest: &UnionHorizonCompletionManifest,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
         completion_name: &std::ffi::OsStr,
     ) {
         manifest.verify();
@@ -9941,9 +9961,9 @@ mod tests {
             target_os = "watchos"
         )
     ))]
-    fn publish_union_horizon_completion_manifest() -> (
+    fn publish_union_horizon_diagnostic_completion_manifest() -> (
         PublishedUnionHorizonDiagnostic,
-        UnionHorizonCompletionManifest,
+        UnionHorizonDiagnosticCompletionManifest,
     ) {
         const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
         const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
@@ -9956,7 +9976,7 @@ mod tests {
         assert_union_horizon_executable_still_matches(&build_identity);
         assert!(
             root.ends_with(&run_id),
-            "UNION_HORIZON admitted evidence root must be isolated by exact run ID",
+            "UNION_HORIZON diagnostic root must be isolated by exact run ID",
         );
         let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
             .expect("pin UNION_HORIZON completion directory");
@@ -9997,11 +10017,11 @@ mod tests {
                     artifact.artifact_sha256,
                     raw_file_sha256,
                 ),
-                "UNION_HORIZON artifact filename is not bound to its canonical evidence",
+                "UNION_HORIZON artifact filename is not bound to its canonical diagnostic bytes",
             );
             let proof_kind = artifact.proof_kind;
             let semantic_sha256 = artifact.artifact_sha256.clone();
-            entries.push(UnionHorizonCompletionEntry {
+            entries.push(UnionHorizonDiagnosticCompletionEntry {
                 proof_kind,
                 filename,
                 semantic_sha256,
@@ -10012,7 +10032,7 @@ mod tests {
             });
         }
 
-        let manifest = UnionHorizonCompletionManifest::seal(run_id, entries);
+        let manifest = UnionHorizonDiagnosticCompletionManifest::seal(run_id, entries);
         let bytes = serde_json::to_vec_pretty(&manifest)
             .expect("serialize sealed UNION_HORIZON completion manifest");
         let raw_file_sha256 = sha256_hex(&bytes);
@@ -10033,8 +10053,9 @@ mod tests {
             )
             .expect("reread completion manifest through pinned directory");
         assert_eq!(sha256_hex(&reloaded_bytes), raw_file_sha256);
-        let reloaded: UnionHorizonCompletionManifest = serde_json::from_slice(&reloaded_bytes)
-            .expect("strictly decode UNION_HORIZON completion manifest");
+        let reloaded: UnionHorizonDiagnosticCompletionManifest =
+            serde_json::from_slice(&reloaded_bytes)
+                .expect("strictly decode UNION_HORIZON diagnostic completion manifest");
         assert_eq!(
             reloaded_bytes,
             serde_json::to_vec_pretty(&reloaded)
@@ -10044,17 +10065,19 @@ mod tests {
         reloaded.verify();
         assert_eq!(reloaded, manifest);
         assert_union_horizon_executable_still_matches(&manifest.build_identity);
-        validate_union_horizon_completed_bundle(&directory, &manifest, &target_name);
+        validate_union_horizon_completed_diagnostic_bundle(&directory, &manifest, &target_name);
         eprintln!(
             "{}",
             serde_json::json!({
-                "event": "salej_union_horizon_completion",
+                "event": "salej_union_horizon_diagnostic_completion",
                 "schema_version": manifest.schema_version,
                 "run_id": manifest.run_id,
                 "manifest_sha256": manifest.manifest_sha256,
                 "raw_file_sha256": raw_file_sha256,
                 "artifact_count": manifest.artifacts.len(),
                 "test_executable_sha256": manifest.build_identity.test_executable_sha256,
+                "source_verification": manifest.build_identity.source_verification.label(),
+                "source_git_dirty": manifest.build_identity.source_git_dirty,
             }),
         );
         (
@@ -10069,7 +10092,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
-    fn log_union_horizon_evidence(
+    fn log_union_horizon_diagnostic(
         artifact: &UnionHorizonDiagnosticArtifact,
         publication: Option<&PublishedUnionHorizonDiagnostic>,
     ) {
@@ -10081,7 +10104,7 @@ mod tests {
             eprintln!(
                 "{}",
                 serde_json::json!({
-                    "event": "salej_union_horizon_layout_proof",
+                    "event": "salej_union_horizon_diagnostic_layout_proof",
                     "schema_version": artifact.schema_version,
                     "run_id": artifact.run_id,
                     "proof_kind": artifact.proof_kind.label(),
@@ -10097,13 +10120,19 @@ mod tests {
                         .collect::<Vec<_>>(),
                     "complete_trace_count": proof.complete_pruning_traces.len(),
                     "artifact_sha256": artifact.artifact_sha256,
+                    "source_verification": proof.build_identity.source_verification.label(),
+                    "source_git_dirty": proof.build_identity.source_git_dirty,
                 }),
             );
         }
+        let first_proof = artifact
+            .proofs
+            .first()
+            .expect("UNION_HORIZON diagnostic contains proofs");
         eprintln!(
             "{}",
             serde_json::json!({
-                "event": "salej_union_horizon_artifact",
+                "event": "salej_union_horizon_diagnostic_artifact",
                 "schema_version": artifact.schema_version,
                 "run_id": artifact.run_id,
                 "proof_kind": artifact.proof_kind.label(),
@@ -10112,7 +10141,10 @@ mod tests {
                 "raw_file_sha256": publication.map(|receipt| &receipt.raw_file_sha256),
                 "byte_len": publication.map(|receipt| receipt.byte_len),
                 "persisted": publication.is_some(),
-                "path": publication.map(|receipt| receipt.path.display().to_string()),
+                "filename": publication.and_then(|receipt| receipt.path.file_name())
+                    .and_then(std::ffi::OsStr::to_str),
+                "source_verification": first_proof.build_identity.source_verification.label(),
+                "source_git_dirty": first_proof.build_identity.source_git_dirty,
             }),
         );
     }
@@ -10191,7 +10223,7 @@ mod tests {
             // The serial collector reaches the target tail with a global heap
             // populated by prefix segments. Rayon intentionally gives each
             // segment a fresh local heap before merging. Exact cutoff bits and
-            // admitted-candidate counts are therefore branch-local evidence,
+            // selected-candidate counts are therefore branch-local diagnostics,
             // not a valid cross-branch equality contract.
         }
         assert_eq!(
@@ -10212,7 +10244,7 @@ mod tests {
             proofs,
         );
         let publication = persist_union_horizon_artifact(&artifact);
-        log_union_horizon_evidence(&artifact, publication.as_ref());
+        log_union_horizon_diagnostic(&artifact, publication.as_ref());
         artifact
     }
 
@@ -11585,26 +11617,66 @@ mod tests {
                 "runtime identity rewrite unexpectedly passed: revision={revision:?} dirty={dirty:?}",
             );
         }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_diagnostic_source_identity_accepts_degraded_provenance_without_upgrading_it() {
+        let mut identity = union_horizon_build_identity();
+        identity.source_git_revision = "a".repeat(40);
+        for verification in [
+            UnionHorizonSourceVerification::GitCheckoutVerified,
+            UnionHorizonSourceVerification::ExplicitUnverified,
+        ] {
+            identity.source_verification = verification;
+            for dirty in [false, true] {
+                identity.source_git_dirty = dirty;
+                assert!(
+                    union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                    "{verification:?} dirty={dirty} must remain a recordable diagnostic identity",
+                );
+            }
+        }
+
+        identity.source_verification = UnionHorizonSourceVerification::Unavailable;
+        identity.source_git_revision = "unavailable".to_owned();
+        identity.source_git_dirty = true;
         assert!(
-            !union_horizon_identity_is_publishable(&embedded),
-            "plain explicit identity must remain diagnostic-only",
+            union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "the conservative unavailable sentinel must remain recordable as a diagnostic",
         );
-        embedded.source_git_dirty = false;
+        identity.source_git_dirty = false;
         assert!(
-            !union_horizon_identity_is_publishable(&embedded),
-            "runtime clean metadata cannot upgrade an unverified source identity",
+            !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "unavailable source provenance must retain conservative dirty=true",
         );
-        embedded.source_verification = UnionHorizonSourceVerification::GitCheckoutVerified;
-        #[cfg(target_os = "linux")]
+        identity.source_git_dirty = true;
+        identity.source_git_revision = "b".repeat(40);
         assert!(
-            union_horizon_identity_is_publishable(&embedded),
-            "a clean build-time Git verification is publishable on Linux",
+            !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "unavailable verification cannot carry a fabricated revision",
         );
-        #[cfg(not(target_os = "linux"))]
-        assert!(
-            !union_horizon_identity_is_publishable(&embedded),
-            "non-Linux builds remain diagnostic-only until executable identity is pinned without a path race",
-        );
+        for verification in [
+            UnionHorizonSourceVerification::GitCheckoutVerified,
+            UnionHorizonSourceVerification::ExplicitUnverified,
+        ] {
+            identity.source_verification = verification;
+            identity.source_git_revision = "unavailable".to_owned();
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} cannot carry the unavailable sentinel",
+            );
+            identity.source_git_revision = "A".repeat(40);
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} must reject noncanonical uppercase revisions",
+            );
+            identity.source_git_revision = "a".repeat(39);
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} must reject malformed revision lengths",
+            );
+        }
     }
 
     #[cfg(all(
@@ -11667,8 +11739,8 @@ mod tests {
         let parent = tempfile::tempdir().expect("create pinned-directory test parent");
         let real = parent.path().join("real");
         let decoy = parent.path().join("decoy");
-        std::fs::create_dir(&real).expect("create real evidence root");
-        std::fs::create_dir(&decoy).expect("create decoy evidence root");
+        std::fs::create_dir(&real).expect("create real diagnostic root");
+        std::fs::create_dir(&decoy).expect("create decoy diagnostic root");
 
         let ancestor_link = parent.path().join("ancestor-link");
         symlink(&real, &ancestor_link).expect("create hostile ancestor symlink");
@@ -11686,7 +11758,7 @@ mod tests {
         );
 
         let directory =
-            crate::artifact::PinnedDirectory::ensure_path(&real).expect("pin real evidence root");
+            crate::artifact::PinnedDirectory::ensure_path(&real).expect("pin real diagnostic root");
         let moved = parent.path().join("moved-real");
         std::fs::rename(&real, &moved).expect("move pinned root away from ambient path");
         std::fs::rename(&decoy, &real).expect("replace ambient root with decoy");
@@ -11713,7 +11785,7 @@ mod tests {
         let external = parent.path().join("external.json");
         std::fs::write(&external, b"hostile").expect("write hostile symlink target");
         let symlink_name = std::ffi::OsStr::new("symlink.json");
-        symlink(&external, moved.join(symlink_name)).expect("create hostile evidence symlink");
+        symlink(&external, moved.join(symlink_name)).expect("create hostile diagnostic symlink");
         assert!(
             directory.read_regular_bounded(symlink_name, 16).is_err(),
             "artifact reread must require a regular no-follow file",
@@ -11886,6 +11958,9 @@ mod tests {
                     .oracle_dependency
                     .pinned_lexical_contract_revision = "0".repeat(40);
             });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.run_id = "x".repeat(129);
+            });
 
             let mut republished = artifact.clone();
             republished.run_id = "independent-publication".to_owned();
@@ -11996,9 +12071,9 @@ mod tests {
         feature = "pruning-conformance",
         any(target_os = "linux", target_os = "macos")
     ))]
-    fn assert_union_horizon_completion_rejected(
-        manifest: &UnionHorizonCompletionManifest,
-        mutate: impl FnOnce(&mut UnionHorizonCompletionManifest),
+    fn assert_union_horizon_diagnostic_completion_rejected(
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
+        mutate: impl FnOnce(&mut UnionHorizonDiagnosticCompletionManifest),
     ) {
         let mut tampered = manifest.clone();
         mutate(&mut tampered);
@@ -12014,9 +12089,9 @@ mod tests {
         feature = "pruning-conformance",
         any(target_os = "linux", target_os = "macos")
     ))]
-    fn write_union_horizon_bundle_fixture(
+    fn write_union_horizon_diagnostic_bundle_fixture(
         root: &std::path::Path,
-        manifest: &UnionHorizonCompletionManifest,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
     ) -> std::ffi::OsString {
         std::fs::create_dir(root).expect("create hostile completion-bundle fixture root");
         for entry in &manifest.artifacts {
@@ -12043,15 +12118,19 @@ mod tests {
         feature = "pruning-conformance",
         any(target_os = "linux", target_os = "macos")
     ))]
-    fn assert_union_horizon_bundle_validation_panics(
+    fn assert_union_horizon_diagnostic_bundle_validation_panics(
         directory: &crate::artifact::PinnedDirectory,
-        manifest: &UnionHorizonCompletionManifest,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
         completion_name: &std::ffi::OsStr,
         context: &str,
     ) {
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                validate_union_horizon_completed_bundle(directory, manifest, completion_name);
+                validate_union_horizon_completed_diagnostic_bundle(
+                    directory,
+                    manifest,
+                    completion_name,
+                );
             }))
             .is_err(),
             "hostile UNION_HORIZON bundle unexpectedly verified: {context}",
@@ -12064,19 +12143,19 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "requires an isolated, clean-Git evidence publication environment"]
+    #[ignore = "requires an isolated diagnostic publication directory"]
     fn salej_complete_union_horizon_diagnostic_bundle() {
         let build_identity = union_horizon_validated_build_identity();
         assert!(
-            union_horizon_identity_is_publishable(&build_identity),
-            "Salej completion requires a clean Linux Git-verified build; diagnostic Gitless snapshots must fail before executing the evidence matrix",
+            union_horizon_diagnostic_source_identity_is_well_formed(&build_identity),
+            "Salej diagnostic completion requires a structurally valid recorded source identity",
         );
         salej_runtime_identity_rejects_revision_or_dirty_state_rewrites();
         salej_union_horizon_publication_never_replaces_an_existing_artifact();
         salej_union_horizon_publication_rejects_symlinks_and_survives_root_swap();
         salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes();
         salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes();
-        let (completion, manifest) = publish_union_horizon_completion_manifest();
+        let (completion, manifest) = publish_union_horizon_diagnostic_completion_manifest();
         assert!(completion.path.ends_with(".json"));
         assert_lower_hex(
             &completion.raw_file_sha256,
@@ -12086,19 +12165,23 @@ mod tests {
         assert!(completion.byte_len > 0);
         manifest.verify();
 
-        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
             tampered.build_identity.test_executable_sha256 = "0".repeat(64);
         });
-        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
             tampered.artifacts[0].raw_file_sha256 = "0".repeat(64);
         });
-        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
             tampered.artifacts[1].proof_kind = UnionHorizonProofKind::LateWinner;
+        });
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
+            tampered.run_id = "x".repeat(129);
         });
 
         let wrong_name_parent = tempfile::tempdir().expect("wrong-name bundle parent");
         let wrong_name_root = wrong_name_parent.path().join("bundle");
-        let wrong_name_completion = write_union_horizon_bundle_fixture(&wrong_name_root, &manifest);
+        let wrong_name_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&wrong_name_root, &manifest);
         let wrong_name_directory = crate::artifact::PinnedDirectory::ensure_path(&wrong_name_root)
             .expect("pin wrong-name bundle fixture");
         std::fs::rename(
@@ -12106,7 +12189,7 @@ mod tests {
             wrong_name_root.join("same-count-substitution.json"),
         )
         .expect("rename one proof without changing bundle cardinality");
-        assert_union_horizon_bundle_validation_panics(
+        assert_union_horizon_diagnostic_bundle_validation_panics(
             &wrong_name_directory,
             &manifest,
             &wrong_name_completion,
@@ -12115,12 +12198,13 @@ mod tests {
 
         let mutated_parent = tempfile::tempdir().expect("mutated bundle parent");
         let mutated_root = mutated_parent.path().join("bundle");
-        let mutated_completion = write_union_horizon_bundle_fixture(&mutated_root, &manifest);
+        let mutated_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&mutated_root, &manifest);
         let mutated_directory = crate::artifact::PinnedDirectory::ensure_path(&mutated_root)
             .expect("pin mutated bundle fixture");
         std::fs::write(mutated_root.join(&manifest.artifacts[0].filename), b"{}")
             .expect("mutate proof bytes after pinning");
-        assert_union_horizon_bundle_validation_panics(
+        assert_union_horizon_diagnostic_bundle_validation_panics(
             &mutated_directory,
             &manifest,
             &mutated_completion,
@@ -12129,7 +12213,8 @@ mod tests {
 
         let missing_parent = tempfile::tempdir().expect("missing bundle parent");
         let missing_root = missing_parent.path().join("bundle");
-        let missing_completion = write_union_horizon_bundle_fixture(&missing_root, &manifest);
+        let missing_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&missing_root, &manifest);
         let missing_directory = crate::artifact::PinnedDirectory::ensure_path(&missing_root)
             .expect("pin missing-entry bundle fixture");
         std::fs::rename(
@@ -12137,7 +12222,7 @@ mod tests {
             missing_parent.path().join("moved-proof.json"),
         )
         .expect("move proof outside the completed bundle");
-        assert_union_horizon_bundle_validation_panics(
+        assert_union_horizon_diagnostic_bundle_validation_panics(
             &missing_directory,
             &manifest,
             &missing_completion,
@@ -12146,12 +12231,13 @@ mod tests {
 
         let extra_parent = tempfile::tempdir().expect("extra bundle parent");
         let extra_root = extra_parent.path().join("bundle");
-        let extra_completion = write_union_horizon_bundle_fixture(&extra_root, &manifest);
+        let extra_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&extra_root, &manifest);
         let extra_directory = crate::artifact::PinnedDirectory::ensure_path(&extra_root)
             .expect("pin extra-entry bundle fixture");
         std::fs::write(extra_root.join("extra.json"), b"diagnostic")
             .expect("add extra completed-bundle entry");
-        assert_union_horizon_bundle_validation_panics(
+        assert_union_horizon_diagnostic_bundle_validation_panics(
             &extra_directory,
             &manifest,
             &extra_completion,

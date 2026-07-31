@@ -239,7 +239,7 @@ jobs:
         timeout-minutes: 15
         run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
 
-      - name: Salej UNION_HORIZON exactness PR gate
+      - name: Salej direct-term MaxScore UNION_HORIZON diagnostic PR gate
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 30
         env:
