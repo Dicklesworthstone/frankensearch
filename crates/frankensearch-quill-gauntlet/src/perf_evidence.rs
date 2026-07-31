@@ -4626,6 +4626,7 @@ mod tests {
             }],
             laws_attested: false,
             continuous_timing: None,
+            work_receipts: None,
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let legacy_path = dir.path().join("legacy.json");

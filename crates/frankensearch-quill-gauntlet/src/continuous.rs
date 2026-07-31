@@ -23,7 +23,8 @@
 //!    [`PerfMetricSemantics::Throughput`] samples), never a stored gauge.
 //!
 //! QG-1 H2 (actual-work and lifecycle receipts) composes through the
-//! [`LifecycleObserver`] seam without touching the timing loop.
+//! [`crate::work_receipt::LifecycleObserver`] seam without touching the
+//! timing loop.
 
 use std::collections::BTreeMap;
 
@@ -36,6 +37,7 @@ use crate::perf::{
     PerfMetricSemantics, PerfOperationScope, PerfRawSample, PerfSampleArm, PerfSampleOrder,
     PerfSamplePhase, PerfSampleProvenance,
 };
+use crate::work_receipt::ByteStageObservation;
 
 /// Schema tag stamped on every continuous-timing evidence object.
 pub const CONTINUOUS_TIMING_SCHEMA_VERSION: &str = "qg1-continuous-timing-v1";
@@ -435,67 +437,6 @@ pub struct ContinuousPhaseTimeline {
     pub window_total_ns: u64,
 }
 
-/// Lifecycle boundary passed to the H2 receipts seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LifecyclePhase {
-    FirstFeed,
-    FeedComplete,
-    CommitComplete,
-    SearchableVerified,
-    QuiescenceJoined,
-}
-
-/// QG-1 H2 composition seam.
-///
-/// The continuous runner reports every phase boundary through this trait so
-/// the actual-work/queue/worker-role receipts bead can attach collectors
-/// without modifying the timing loop. H1 ships only [`NoopLifecycleObserver`].
-pub trait LifecycleObserver {
-    /// Called at each phase boundary with window-relative elapsed time.
-    fn on_phase(&mut self, phase: LifecyclePhase, window_elapsed_ns: u64);
-}
-
-/// Default observer: records nothing, costs nothing.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopLifecycleObserver;
-
-impl LifecycleObserver for NoopLifecycleObserver {
-    fn on_phase(&mut self, _phase: LifecyclePhase, _window_elapsed_ns: u64) {}
-}
-
-/// Byte count for one lifecycle stage: observed from the actual documents at
-/// the stage boundary, or typed as structurally unobservable at this seam.
-///
-/// The unobservable variant is an explicit, named gap — never a silently
-/// copied denominator. H1 stays open behind every such gap until the H2
-/// receipts bead makes the stage observable engine-side.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ByteStageObservation {
-    /// Byte total observed from the actual documents at this stage.
-    Observed(u64),
-    /// The stage's byte total cannot be observed at this seam; `seam` names
-    /// exactly which boundary lacks the observation.
-    StructurallyUnobservable { seam: String },
-}
-
-/// Bytes exactly as the sealed manifest counts them for one document.
-///
-/// Covers id, optional title, content, and every metadata key/value. This is
-/// the single shared definition used by both manifest sealing and
-/// window-time observed byte accounting, so the two can never drift.
-#[must_use]
-pub fn document_bytes(document: &IndexableDocument) -> u64 {
-    let mut bytes = document.id.len() as u64 + document.content.len() as u64;
-    if let Some(title) = &document.title {
-        bytes += title.len() as u64;
-    }
-    for (key, value) in &document.metadata {
-        bytes += key.len() as u64 + value.len() as u64;
-    }
-    bytes
-}
-
 /// Receipt for one continuous first-feed-to-quiescence window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuousWindowReceipt {
@@ -788,6 +729,7 @@ pub fn continuous_raw_sample(
 mod tests {
     use super::*;
     use crate::perf::PerfGateArtifact;
+    use crate::work_receipt::document_bytes;
 
     const IDENTITY: &str = "qg1-native/synthetic-zipf-s11-vocab8192-doc4096-v1";
 
