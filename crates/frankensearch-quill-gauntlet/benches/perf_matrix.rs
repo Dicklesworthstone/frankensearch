@@ -1,7 +1,7 @@
 //! Same-binary Quill/Tantivy performance matrix for QG-1 through QG-10.
 //!
 //! The default invocation is deliberately a one-cell smoke slice. A release
-//! evidence run selects one gate (and optionally one fixture substring), then
+//! evidence run selects one gate (and optionally one exact canonical fixture), then
 //! lets Criterion self-cap that slice while this harness also emits the raw
 //! per-gate JSON and human table required by the E0.6 manifests.
 //!
@@ -14,6 +14,7 @@
 //!     --features perf-harness --profile release-perf --bench perf_matrix
 //! ```
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 use std::io::Write;
@@ -67,6 +68,40 @@ const SMOKE_SEGMENTS: usize = 4;
 // true rank mismatch from a native-order substitution inside a large BM25 tie.
 const QG6_TIE_EXPANSION_LIMIT: usize = 1_000_000;
 const QG6_TIMED_SEARCHES_PER_SAMPLE: usize = 128;
+const QG1_CORPUS_GENERATOR_REVISION: &str = "frankensearch-quill-qg1-synthetic-corpus-v1";
+// Frozen by a strict-remote full replay on 2026-07-31. The retired per-shard
+// all-count replay generated 4,222,000 documents and took 326,401 ms in the
+// unoptimized audit binary. Each full-scale producer now validates only the
+// selected count against these full-universe pins; H4 requires assembled
+// coverage of every Applicable/Required canonical cell before admitting a claim.
+const QG1_FULL_PREFIX_IDENTITY_PINS: [(u64, &str, &str); 4] = [
+    (
+        500,
+        "16b56b9704cfd2234a3fa8ca9fcfce1c935dd8ebd3f20c820e3212a684a7aeb1",
+        "59188638fb211394e8c1c3d98a28a2cf3790400de1f229a5c6e1b10b100ee5a8",
+    ),
+    (
+        5_000,
+        "4886e04bb07825b130f3ad24801738759cc9d6e63af5adb663cab94a45155e0f",
+        "72d977c424bc2f1ab1b08b4fc210dcff7dfd9139100ca59f741759be9856d4fb",
+    ),
+    (
+        50_000,
+        "a4cdb819886a56944316cf726237eb4d1216e243e2fdea94b5a08c5bddd266a0",
+        "21f76704040e4f2f2cd4d1a0f2c3e261bbb5ca5e86f9e23edca6ed718ec98cfd",
+    ),
+    (
+        1_000_000,
+        "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+        "b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+    ),
+];
+
+/// Wire-stable producer diagnostic accepted by the H4 assembler only when the
+/// retained source artifact is an actual proper subset of the runnable gate.
+pub const QG1_PARTIAL_SHARD_NO_CLAIM_CODE: &str = "qg1.partial_shard";
+const QG1_PARTIAL_SHARD_NO_CLAIM_DETAIL: &str = "the invocation retained one immutable partial QG-1 shard; this source artifact cannot \
+     support a publication or ratchet claim until exact disjoint assembly proves full coverage";
 
 #[derive(Deserialize)]
 struct GateManifest {
@@ -551,16 +586,20 @@ fn hash_qg1_indexed_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn qg1_indexed_content_sha256(documents: &[IndexableDocument]) -> String {
+fn qg1_indexed_content_sha256<I, D>(
+    expected_document_count: u64,
+    documents: I,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = D>,
+    D: Borrow<IndexableDocument>,
+{
     let mut hasher = Sha256::new();
     hasher.update(b"frankensearch-quill-qg1-indexable-documents-v1\0");
-    hasher.update(
-        u64::try_from(documents.len())
-            .expect("QG-1 indexed document count fits u64")
-            .to_le_bytes(),
-    );
-    let mut metadata = Vec::new();
+    hasher.update(expected_document_count.to_le_bytes());
+    let mut observed_document_count = 0_u64;
     for document in documents {
+        let document = document.borrow();
         hash_qg1_indexed_bytes(&mut hasher, document.id.as_bytes());
         match &document.title {
             Some(title) => {
@@ -571,24 +610,35 @@ fn qg1_indexed_content_sha256(documents: &[IndexableDocument]) -> String {
         }
         hash_qg1_indexed_bytes(&mut hasher, document.content.as_bytes());
 
-        metadata.extend(document.metadata.iter());
-        metadata.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
-            left_key
-                .cmp(right_key)
-                .then_with(|| left_value.cmp(right_value))
-        });
         hasher.update(
-            u64::try_from(metadata.len())
+            u64::try_from(document.metadata.len())
                 .expect("QG-1 indexed metadata count fits u64")
                 .to_le_bytes(),
         );
-        for (key, value) in &metadata {
+        let mut previous_metadata = None;
+        for _ in 0..document.metadata.len() {
+            let (key, value) = document
+                .metadata
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .filter(|entry| previous_metadata.is_none_or(|previous| *entry > previous))
+                .min()
+                .expect("QG-1 indexed metadata cardinality is stable while hashing");
             hash_qg1_indexed_bytes(&mut hasher, key.as_bytes());
             hash_qg1_indexed_bytes(&mut hasher, value.as_bytes());
+            previous_metadata = Some((key, value));
         }
-        metadata.clear();
+        observed_document_count = observed_document_count
+            .checked_add(1)
+            .ok_or_else(|| "QG-1 indexed document count overflowed".to_owned())?;
     }
-    lower_hex(&hasher.finalize())
+    if observed_document_count != expected_document_count {
+        return Err(format!(
+            "QG-1 indexed content observed {observed_document_count} documents but expected \
+             {expected_document_count}"
+        ));
+    }
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 impl PreparedQg1Corpus {
@@ -670,7 +720,11 @@ impl PreparedQg1Corpus {
                     PreparedQg1Prefix {
                         manifest,
                         manifest_sha256,
-                        indexed_content_sha256: qg1_indexed_content_sha256(indexed_documents),
+                        indexed_content_sha256: qg1_indexed_content_sha256(
+                            count,
+                            indexed_documents.iter(),
+                        )
+                        .expect("hash prepared QG-1 indexed content"),
                     },
                 )
             })
@@ -724,7 +778,8 @@ impl PreparedQg1Corpus {
         if observed_manifest_sha256 != prefix.manifest_sha256 {
             return Err("QG-1 prepared manifest identity changed after replay verification".into());
         }
-        let observed_indexed_content_sha256 = qg1_indexed_content_sha256(indexed_documents);
+        let observed_indexed_content_sha256 =
+            qg1_indexed_content_sha256(document_count, indexed_documents.iter())?;
         if observed_indexed_content_sha256 != prefix.indexed_content_sha256 {
             return Err("QG-1 prepared indexed content changed after verification".into());
         }
@@ -3163,7 +3218,7 @@ fn selected_cells(
             ));
         }
 
-        let matches_filter = fixture_filter.is_none_or(|needle| spec.fixture.contains(needle));
+        let matches_filter = fixture_filter.is_none_or(|fixture| spec.fixture == fixture);
         if fixture_filter.is_some() && matches_filter {
             filter_matched = true;
         }
@@ -3260,6 +3315,26 @@ fn gate_selection_complete(
     !expected.is_empty() && actual == expected && actual.len() == selected.len()
 }
 
+fn partial_shard_no_claim(
+    gate: PerfGate,
+    selection_complete: bool,
+) -> Option<(&'static str, &'static str)> {
+    if selection_complete {
+        None
+    } else if gate == PerfGate::Qg1 {
+        Some((
+            QG1_PARTIAL_SHARD_NO_CLAIM_CODE,
+            QG1_PARTIAL_SHARD_NO_CLAIM_DETAIL,
+        ))
+    } else {
+        Some((
+            "evidence.incomplete_gate_selection",
+            "the invocation selected only part of the normative gate; durable pre-admission \
+             evidence cannot support a publication or ratchet claim",
+        ))
+    }
+}
+
 fn git_revision(scale: MatrixScale) -> String {
     if let Ok(revision) = std::env::var("QUILL_PERF_GIT_REV")
         && !revision.trim().is_empty()
@@ -3287,7 +3362,20 @@ fn manifest_sha256() -> String {
     perf_manifest_contract_sha256(MANIFEST)
 }
 
-fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Result<String, String> {
+type Qg1PrefixIdentityMap = BTreeMap<u64, (String, String)>;
+
+fn qg1_effective_counts(scale: MatrixScale, cells: &[PerfCellSpec]) -> BTreeSet<u64> {
+    cells
+        .iter()
+        .filter(|cell| cell.gate == PerfGate::Qg1)
+        .map(|cell| scale.document_count(cell.document_count.unwrap_or_default()))
+        .collect()
+}
+
+fn prepared_qg1_prefix_identities(
+    context: &BenchContext,
+    cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
     let qg1_counts = cells
         .iter()
         .filter(|cell| cell.gate == PerfGate::Qg1)
@@ -3297,7 +3385,7 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
                 .document_count(cell.document_count.unwrap_or_default())
         })
         .collect::<BTreeSet<_>>();
-    let qg1_identities = qg1_counts
+    qg1_counts
         .into_iter()
         .map(|document_count| {
             let prepared = context
@@ -3314,18 +3402,139 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
                 ),
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
+        .collect::<Result<_, String>>()
+}
+
+fn replay_qg1_prefix_identities(
+    scale: MatrixScale,
+    cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
+    qg1_effective_counts(scale, cells)
+        .into_iter()
+        .map(|document_count| {
+            let corpus = corpus_for(document_count);
+            let manifest = corpus
+                .manifest()
+                .map_err(|error| format!("build authoritative QG-1 corpus manifest: {error}"))?;
+            manifest
+                .verify_documents(corpus.iter())
+                .map_err(|error| format!("replay authoritative QG-1 corpus manifest: {error}"))?;
+            let manifest_sha256 = manifest
+                .manifest_hash()
+                .map_err(|error| format!("hash authoritative QG-1 corpus manifest: {error}"))?;
+            let indexed_content_sha256 = qg1_indexed_content_sha256(
+                document_count,
+                corpus.iter().map(IndexableDocument::from),
+            )?;
+            Ok((document_count, (manifest_sha256, indexed_content_sha256)))
+        })
+        .collect()
+}
+
+fn frozen_qg1_full_prefix_identities(
+    canonical_cells: &[PerfCellSpec],
+) -> Result<Qg1PrefixIdentityMap, String> {
+    let expected_counts = qg1_effective_counts(MatrixScale::Full, canonical_cells);
+    let mut identities = BTreeMap::new();
+    for (document_count, manifest_sha256, indexed_content_sha256) in QG1_FULL_PREFIX_IDENTITY_PINS {
+        let is_lower_sha256 = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        };
+        if !is_lower_sha256(manifest_sha256) || !is_lower_sha256(indexed_content_sha256) {
+            return Err(format!(
+                "frozen QG-1 prefix {document_count} has a malformed identity pin"
+            ));
+        }
+        if identities
+            .insert(
+                document_count,
+                (
+                    manifest_sha256.to_owned(),
+                    indexed_content_sha256.to_owned(),
+                ),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "frozen QG-1 prefix identity repeats document count {document_count}"
+            ));
+        }
+    }
+    let pinned_counts = identities.keys().copied().collect::<BTreeSet<_>>();
+    if pinned_counts != expected_counts {
+        return Err(format!(
+            "frozen QG-1 prefix counts {pinned_counts:?} differ from canonical counts \
+             {expected_counts:?}"
+        ));
+    }
+    Ok(identities)
+}
+
+fn validate_selected_qg1_prefixes(
+    context: &BenchContext,
+    selected: &[PerfCellSpec],
+    authoritative: &Qg1PrefixIdentityMap,
+) -> Result<(), String> {
+    let selected_identities = prepared_qg1_prefix_identities(context, selected)?;
+    for (document_count, selected_identity) in selected_identities {
+        let authoritative_identity = authoritative.get(&document_count).ok_or_else(|| {
+            format!(
+                "selected QG-1 corpus prefix {document_count} is absent from the authoritative \
+                 full-corpus identity"
+            )
+        })?;
+        if &selected_identity != authoritative_identity {
+            return Err(format!(
+                "selected QG-1 corpus prefix {document_count} differs from the authoritative \
+                 full-corpus identity"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_corpus_identity_cells(
+    scale: MatrixScale,
+    cells: &[PerfCellSpec],
+    qg1_identities: &Qg1PrefixIdentityMap,
+) -> Result<String, String> {
+    let has_qg1 = cells.iter().any(|cell| cell.gate == PerfGate::Qg1);
 
     let mut hasher = Sha256::new();
+    if has_qg1 {
+        hasher.update(b"frankensearch-quill-qg1-full-corpus-identity-v1\0");
+        hasher.update(PerfMatrixSpec::QG1_CANONICAL_SHA256.as_bytes());
+        hasher.update(
+            u64::try_from(cells.len())
+                .map_err(|_| "QG-1 corpus identity cell count is not representable".to_owned())?
+                .to_le_bytes(),
+        );
+    }
     for cell in cells {
         let requested = cell.document_count.unwrap_or_default();
-        let effective = context.scale.document_count(requested);
-        hasher.update(cell.fixture.as_bytes());
+        let effective = scale.document_count(requested);
+        if has_qg1 {
+            hasher.update(b"\0corpus-identity-cell-v1\0");
+            hash_qg1_indexed_bytes(&mut hasher, cell.fixture.as_bytes());
+        } else {
+            // Preserve the established identity contract for every non-QG-1
+            // gate; this framing revision belongs only to QG-1's new frozen
+            // full-universe identity domain.
+            hasher.update(cell.fixture.as_bytes());
+        }
         hasher.update(effective.to_le_bytes());
         hasher.update(CORPUS_SEED.to_le_bytes());
         hasher.update(VOCABULARY_SIZE.to_le_bytes());
         hasher.update(MAX_DOCUMENT_BYTES.to_le_bytes());
         if cell.gate == PerfGate::Qg1 {
+            let cell_contract_sha256 = cell
+                .contract_sha256()
+                .map_err(|error| format!("hash authoritative QG-1 cell contract: {error}"))?;
+            hasher.update(b"\0canonical-qg1-cell-contract-v1\0");
+            hasher.update(cell_contract_sha256.as_bytes());
             let (manifest_sha256, indexed_content_sha256) = qg1_identities
                 .get(&effective)
                 .ok_or_else(|| format!("QG-1 corpus identity {effective} was not verified"))?;
@@ -3336,6 +3545,45 @@ fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Resul
         }
     }
     Ok(lower_hex(&hasher.finalize()))
+}
+
+fn corpus_manifest_hash(context: &BenchContext, cells: &[PerfCellSpec]) -> Result<String, String> {
+    let qg1_identities = prepared_qg1_prefix_identities(context, cells)?;
+    hash_corpus_identity_cells(context.scale, cells, &qg1_identities)
+}
+
+fn authoritative_qg1_corpus_identity(
+    context: &BenchContext,
+    matrix: &PerfMatrixSpec,
+    selected: &[PerfCellSpec],
+) -> Result<(String, Vec<PerfCellSpec>), String> {
+    let canonical_sha256 = matrix
+        .gate_contract_sha256(PerfGate::Qg1)
+        .map_err(|error| format!("hash canonical QG-1 matrix: {error}"))?;
+    if canonical_sha256 != PerfMatrixSpec::QG1_CANONICAL_SHA256 {
+        return Err(format!(
+            "canonical QG-1 matrix identity {canonical_sha256} differs from frozen identity {}",
+            PerfMatrixSpec::QG1_CANONICAL_SHA256
+        ));
+    }
+    let canonical_cells = matrix
+        .for_gate(PerfGate::Qg1)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() || selected.iter().any(|cell| cell.gate != PerfGate::Qg1) {
+        return Err("authoritative QG-1 identity requires a nonempty QG-1 selection".to_owned());
+    }
+
+    let authoritative = if context.scale.is_full() {
+        frozen_qg1_full_prefix_identities(&canonical_cells)?
+    } else {
+        replay_qg1_prefix_identities(context.scale, &canonical_cells)?
+    };
+    validate_selected_qg1_prefixes(context, selected, &authoritative)?;
+    let corpus_sha256 =
+        hash_corpus_identity_cells(context.scale, &canonical_cells, &authoritative)?;
+    Ok((corpus_sha256, canonical_cells))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -3463,6 +3711,7 @@ fn corpus_identity(
     cells: &[PerfCellSpec],
     corpus_hash: &str,
 ) -> CorpusIdentity {
+    let qg1_native_identity = cells.iter().all(|cell| cell.gate == PerfGate::Qg1);
     let document_count = cells
         .iter()
         .map(|cell| {
@@ -3472,10 +3721,10 @@ fn corpus_identity(
         })
         .max()
         .unwrap_or_default();
-    let query_set_sha256 = Some(
+    let query_set_sha256 = (!qg1_native_identity).then(|| {
         Qg6QuerySpec::normative_manifest_sha256()
-            .expect("frozen 80-query manifest validates before evidence identity"),
-    );
+            .expect("frozen 80-query manifest validates before evidence identity")
+    });
     CorpusIdentity {
         corpus_sha256: corpus_hash.to_owned(),
         query_set_sha256,
@@ -3483,7 +3732,11 @@ fn corpus_identity(
         document_count,
         content_bytes: None,
         generator_seed: CORPUS_SEED,
-        generator_revision: Qg6QuerySpec::normative_corpus_generator_revision().to_owned(),
+        generator_revision: if qg1_native_identity {
+            QG1_CORPUS_GENERATOR_REVISION.to_owned()
+        } else {
+            Qg6QuerySpec::normative_corpus_generator_revision().to_owned()
+        },
     }
 }
 
@@ -3605,8 +3858,14 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let run_id = std::env::var("QUILL_PERF_RUN_ID")
         .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
-    let corpus_hash = corpus_manifest_hash(&context, &selected_specs)
-        .expect("verify exact prepared QG-1 corpus identity");
+    let corpus_hash = if runner.plan.binding().gate == PerfGate::Qg1 {
+        authoritative_qg1_corpus_identity(&context, &matrix, &selected_specs)
+            .expect("verify authoritative immutable full QG-1 corpus identity")
+            .0
+    } else {
+        corpus_manifest_hash(&context, &selected_specs)
+            .expect("verify exact selected corpus identity")
+    };
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -3677,16 +3936,18 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             cells,
         )
         .expect("assemble QG evidence artifact");
-        if !selection_complete {
-            artifact.force_no_claim(
-                "evidence.incomplete_gate_selection",
-                "the invocation selected only part of the normative gate; durable pre-admission \
-                 evidence cannot support a publication or ratchet claim",
-            );
+        if let Some((code, detail)) = partial_shard_no_claim(gate, selection_complete) {
+            artifact.force_no_claim(code, detail);
         }
         let paths = artifact
             .write_atomic(&output_dir)
             .expect("write QG evidence artifact");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("reload and verify persisted QG evidence artifact");
+        assert_eq!(
+            reloaded, artifact,
+            "persisted QG evidence artifact must reload as the exact sealed source object"
+        );
         eprintln!(
             "[quill-evidence] gate={gate} status={} ratchet_admissible={} json={} table={}",
             artifact.gate_status,
@@ -3893,6 +4154,14 @@ fn assert_incumbent_is_genuine_tantivy() -> String {
 }
 
 fn main() {
+    #[cfg(test)]
+    if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
+        tests::assert_qg1_disjoint_partial_shard_contract();
+        tests::assert_corpus_identity_fixture_framing();
+        tests::assert_non_qg1_corpus_identity_preserves_legacy_hash();
+        eprintln!("[quill-perf-self-check] H1 immutable partial-shard contract passed");
+        return;
+    }
     if run_child_mode() {
         return;
     }
@@ -4142,15 +4411,15 @@ mod tests {
             &matrix,
             &context,
             super::MatrixScale::Full,
-            Some("bulk/tiny/1/"),
+            Some("bulk/tiny/1/positions_on"),
         )
         .expect("runnable partial selection");
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 1);
         assert!(!super::gate_selection_complete(
             &context,
             &filtered,
             super::MatrixScale::Full,
-            Some("bulk/tiny/1/")
+            Some("bulk/tiny/1/positions_on")
         ));
 
         assert!(
@@ -4158,7 +4427,18 @@ mod tests {
                 &matrix,
                 &context,
                 super::MatrixScale::Full,
-                Some("bulk/tiny/16/"),
+                Some("bulk/tiny/1/"),
+            )
+            .expect_err("fixture prefixes must not select a fuzzy shard")
+            .contains("matched no canonical")
+        );
+
+        assert!(
+            super::selected_cells(
+                &matrix,
+                &context,
+                super::MatrixScale::Full,
+                Some("bulk/tiny/16/positions_on"),
             )
             .expect_err("explicit NA fixture filter must fail")
             .contains("non-applicable")
@@ -4173,6 +4453,272 @@ mod tests {
             .expect_err("unknown fixture filter must fail")
             .contains("matched no canonical")
         );
+    }
+
+    pub fn assert_qg1_disjoint_partial_shard_contract() {
+        use frankensearch_quill_gauntlet::{
+            ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey, PerfGate,
+            PerfMatrixSpec,
+        };
+
+        let matrix = PerfMatrixSpec::complete();
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let profile = MachineProfileKey::new(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        )
+        .expect("canonical physical-64 profile");
+        let plan = matrix
+            .applicability_plan(&registry, profile, PerfGate::Qg1)
+            .expect("canonical physical-64 QG-1 plan");
+        let execution_capacity = plan
+            .execution_capacity
+            .expect("physical-64 profile has typed capacity");
+        let max_exercised_cell_width = plan
+            .max_exercised_cell_width
+            .expect("physical-64 QG-1 plan has a maximum width");
+        let claims = super::RunnerPlanClaims {
+            gate: PerfGate::Qg1,
+            hardware_class: HardwareClassId::TrjZen35995wx,
+            execution_profile: ExecutionProfileId::Physical64,
+            execution_capacity,
+            max_exercised_cell_width,
+            rayon_num_threads: execution_capacity,
+            applicability_plan_schema_version: plan.binding().schema_version.clone(),
+            applicability_plan_sha256: plan.binding().applicability_plan_sha256.clone(),
+            gate_matrix_contract_sha256: plan.binding().gate_matrix_contract_sha256.clone(),
+            profile_contract_sha256: plan.binding().profile_contract_sha256.clone(),
+            registry_schema_version: plan.binding().registry_schema_version.clone(),
+            registry_sha256: plan.binding().registry_sha256.clone(),
+        };
+        let runner = super::RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+            .expect("exact physical-64 applicability plan");
+        let full = super::selected_cells(&matrix, &runner, super::MatrixScale::Full, None)
+            .expect("complete physical-64 QG-1 selection");
+        assert!(super::gate_selection_complete(
+            &runner,
+            &full,
+            super::MatrixScale::Full,
+            None
+        ));
+        assert!(
+            super::selected_cells(&matrix, &runner, super::MatrixScale::Full, Some("bulk/"),)
+                .expect_err("fixture prefixes must not select a fuzzy shard")
+                .contains("matched no canonical")
+        );
+
+        let expected_ordinals = full
+            .iter()
+            .map(|cell| cell.ordinal)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut shard_ordinals = std::collections::BTreeSet::new();
+        let mut identity_probe_shards: Vec<Vec<super::PlannedPerfCell>> = Vec::new();
+        for planned in &full {
+            let shard = super::selected_cells(
+                &matrix,
+                &runner,
+                super::MatrixScale::Full,
+                Some(planned.spec.fixture.as_str()),
+            )
+            .expect("exact runnable fixture forms one real partial shard");
+            assert_eq!(shard.len(), 1, "fixture filters must be disjoint");
+            assert!(
+                !super::gate_selection_complete(
+                    &runner,
+                    &shard,
+                    super::MatrixScale::Full,
+                    Some(planned.spec.fixture.as_str()),
+                ),
+                "no individual shard may become ratchet-admissible"
+            );
+            let (code, detail) = super::partial_shard_no_claim(PerfGate::Qg1, false)
+                .expect("partial QG-1 shard has an explicit NoClaim");
+            assert_eq!(code, super::QG1_PARTIAL_SHARD_NO_CLAIM_CODE);
+            assert!(!detail.is_empty());
+            assert!(shard_ordinals.insert(shard[0].ordinal));
+            if identity_probe_shards.is_empty()
+                || (identity_probe_shards.len() == 1
+                    && identity_probe_shards[0][0].spec.document_count
+                        != shard[0].spec.document_count)
+            {
+                identity_probe_shards.push(shard);
+            }
+        }
+        assert_eq!(
+            shard_ordinals, expected_ordinals,
+            "the disjoint NoClaim shards collectively cover the runnable full gate"
+        );
+        assert!(
+            super::partial_shard_no_claim(PerfGate::Qg1, true).is_none(),
+            "only a single complete invocation may omit the partial-shard NoClaim"
+        );
+        assert_eq!(
+            identity_probe_shards.len(),
+            2,
+            "hostile identity probes require two shards with distinct measured corpus sizes"
+        );
+
+        let first_specs = identity_probe_shards[0]
+            .iter()
+            .map(|cell| cell.spec.clone())
+            .collect::<Vec<_>>();
+        let second_specs = identity_probe_shards[1]
+            .iter()
+            .map(|cell| cell.spec.clone())
+            .collect::<Vec<_>>();
+        let first_context =
+            super::BenchContext::for_selected(super::MatrixScale::Full, &first_specs);
+        let second_context =
+            super::BenchContext::for_selected(super::MatrixScale::Full, &second_specs);
+        let (first_authoritative_hash, first_authoritative_specs) =
+            super::authoritative_qg1_corpus_identity(&first_context, &matrix, &first_specs)
+                .expect("first shard binds the authoritative corpus");
+        let (second_authoritative_hash, second_authoritative_specs) =
+            super::authoritative_qg1_corpus_identity(&second_context, &matrix, &second_specs)
+                .expect("second shard binds the authoritative corpus");
+        assert_eq!(
+            first_authoritative_specs.len(),
+            matrix.for_gate(PerfGate::Qg1).len()
+        );
+        assert_eq!(first_authoritative_specs, second_authoritative_specs);
+        assert_eq!(
+            first_authoritative_hash, second_authoritative_hash,
+            "runtime shard selection must not alter the full-corpus identity"
+        );
+        let first_qg1_identity =
+            super::corpus_identity(&first_context, &first_specs, &first_authoritative_hash);
+        let second_qg1_identity =
+            super::corpus_identity(&second_context, &second_specs, &second_authoritative_hash);
+        assert_eq!(
+            first_qg1_identity.corpus_sha256, second_qg1_identity.corpus_sha256,
+            "disjoint shards must retain the same immutable full-corpus-universe seal"
+        );
+        assert_eq!(
+            first_qg1_identity.document_count,
+            first_specs[0]
+                .document_count
+                .expect("first shard has a measured document count")
+        );
+        assert_eq!(
+            second_qg1_identity.document_count,
+            second_specs[0]
+                .document_count
+                .expect("second shard has a measured document count")
+        );
+        assert_ne!(
+            first_qg1_identity.document_count, second_qg1_identity.document_count,
+            "shared full-corpus identity must not erase distinct shard-local measured counts"
+        );
+        assert_eq!(
+            first_qg1_identity.generator_revision,
+            super::QG1_CORPUS_GENERATOR_REVISION
+        );
+        assert_eq!(first_qg1_identity.query_set_sha256, None);
+
+        let first_selected_only_hash = super::corpus_manifest_hash(&first_context, &first_specs)
+            .expect("hash first selected-only control");
+        let second_selected_only_hash = super::corpus_manifest_hash(&second_context, &second_specs)
+            .expect("hash second selected-only control");
+        assert_ne!(
+            first_selected_only_hash, second_selected_only_hash,
+            "hostile control proves selected-spec hashing would split the corpus identity"
+        );
+        assert_ne!(first_authoritative_hash, first_selected_only_hash);
+        assert_ne!(second_authoritative_hash, second_selected_only_hash);
+
+        let mut position_mutated_matrix = matrix.clone();
+        position_mutated_matrix
+            .cells
+            .iter_mut()
+            .find(|cell| cell.gate == PerfGate::Qg1)
+            .expect("canonical QG-1 cell")
+            .positions = Some(frankensearch_quill_gauntlet::PositionMode::Off);
+        assert!(
+            super::authoritative_qg1_corpus_identity(
+                &first_context,
+                &position_mutated_matrix,
+                &first_specs,
+            )
+            .expect_err("position-contract mutation must change the authoritative identity")
+            .contains("differs from frozen identity")
+        );
+    }
+
+    #[test]
+    fn qg1_disjoint_partial_shards_share_full_corpus_identity_and_stay_no_claim() {
+        assert_qg1_disjoint_partial_shard_contract();
+    }
+
+    pub fn assert_corpus_identity_fixture_framing() {
+        use sha2::{Digest, Sha256};
+
+        let mut left_unframed = b"a".to_vec();
+        left_unframed.extend_from_slice(b"bc");
+        let mut right_unframed = b"ab".to_vec();
+        right_unframed.extend_from_slice(b"c");
+        assert_eq!(
+            left_unframed, right_unframed,
+            "hostile variable-field control must collide without boundary framing"
+        );
+
+        let framed_hash = |fixture: &[u8], following_field: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"corpus-identity-framing-test-v1\0");
+            super::hash_qg1_indexed_bytes(&mut hasher, fixture);
+            hasher.update(following_field);
+            super::lower_hex(&hasher.finalize())
+        };
+        assert_ne!(
+            framed_hash(b"a", b"bc"),
+            framed_hash(b"ab", b"c"),
+            "length-prefixed fixture framing must separate the hostile preimages"
+        );
+    }
+
+    #[test]
+    fn corpus_identity_length_prefixes_variable_fixture_text() {
+        assert_corpus_identity_fixture_framing();
+    }
+
+    pub fn assert_non_qg1_corpus_identity_preserves_legacy_hash() {
+        use frankensearch_quill_gauntlet::{PerfGate, PerfMatrixSpec};
+        use sha2::{Digest, Sha256};
+
+        let representative = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg6)
+            .into_iter()
+            .next()
+            .expect("canonical QG-6 cell")
+            .clone();
+        let cells = [representative];
+        let mut legacy = Sha256::new();
+        for cell in &cells {
+            legacy.update(cell.fixture.as_bytes());
+            legacy.update(
+                super::MatrixScale::Full
+                    .document_count(cell.document_count.unwrap_or_default())
+                    .to_le_bytes(),
+            );
+            legacy.update(super::CORPUS_SEED.to_le_bytes());
+            legacy.update(super::VOCABULARY_SIZE.to_le_bytes());
+            legacy.update(super::MAX_DOCUMENT_BYTES.to_le_bytes());
+        }
+        let expected = super::lower_hex(&legacy.finalize());
+        let actual = super::hash_corpus_identity_cells(
+            super::MatrixScale::Full,
+            &cells,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("hash representative non-QG-1 corpus identity");
+        assert_eq!(
+            actual, expected,
+            "the QG-1 identity revision must not alter a non-QG-1 corpus hash"
+        );
+    }
+
+    #[test]
+    fn non_qg1_corpus_identity_preserves_legacy_hash() {
+        assert_non_qg1_corpus_identity_preserves_legacy_hash();
     }
 
     #[test]
