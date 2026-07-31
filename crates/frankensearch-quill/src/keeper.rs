@@ -16720,6 +16720,197 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_publication_resets_unreachable_segment_grace() -> TestResult {
+        fn valid_manifest(path: &Path) -> Result<Manifest, String> {
+            match read_manifest_slot(path).map_err(|error| error.to_string())? {
+                ManifestSlot::Valid(manifest) => Ok(manifest),
+                ManifestSlot::Missing => Err(format!("{} is missing", path.display())),
+                ManifestSlot::Invalid(error) => {
+                    Err(format!("{} is invalid: {error}", path.display()))
+                }
+            }
+        }
+
+        let index = tempdir()?;
+        let segment = write_test_segment(index.path(), 0xd00d, 1, 0, 2)?;
+        let segment_id = segment.segment_id;
+        let segment_path = index.path().join(canonical_segment_name(segment_id));
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+        write_manifest(
+            &index.path().join("MANIFEST"),
+            &durable_test_manifest(1, vec![segment]),
+        )?;
+
+        let directory = index.path().to_path_buf();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !writer
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err("generation 1 does not reference the segment".to_owned());
+            }
+
+            let mut publish_two = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            writer
+                .snapshot()
+                .delete_all(&mut publish_two)
+                .map_err(|error| error.to_string())?;
+            publish_two.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_two)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let current = valid_manifest(&directory.join("MANIFEST"))?;
+            let previous = valid_manifest(&directory.join("MANIFEST.prev"))?;
+            if current.generation != 2
+                || current
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == segment_id)
+                || previous.generation != 1
+                || !previous
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err(
+                    "generation 2 must retain the segment only through MANIFEST.prev".to_owned(),
+                );
+            }
+            let options = GarbageCollectionOptions {
+                grace_period: Duration::from_secs(60),
+            };
+            let while_previous_is_live = SystemTime::now()
+                .checked_add(Duration::from_secs(120))
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(
+                &directory,
+                DEFAULT_SCHEMA,
+                options,
+                while_previous_is_live,
+            )
+            .map_err(|error| error.to_string())?
+            .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("MANIFEST.prev reachability did not protect the segment".to_owned());
+            }
+
+            let mut publish_three = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            publish_three.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_three)
+                .await
+                .map_err(|error| error.to_string())?;
+            let current = valid_manifest(&directory.join("MANIFEST"))?;
+            let previous = valid_manifest(&directory.join("MANIFEST.prev"))?;
+            if current.generation != 3
+                || previous.generation != 2
+                || current
+                    .segments
+                    .iter()
+                    .chain(&previous.segments)
+                    .any(|segment| segment.segment_id == segment_id)
+            {
+                return Err("generation 3 did not make the segment unreachable".to_owned());
+            }
+
+            let directory_file =
+                open_gc_directory(&directory).map_err(|error| error.to_string())?;
+            let third_publish_floor = segment_unreachability_floor_at(
+                &directory_file,
+                &directory,
+                writer.snapshot(),
+                SystemTime::now(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation 3 did not supply an unreachability floor".to_owned())?;
+            let before_first_grace = third_publish_floor
+                .checked_add(Duration::from_secs(59))
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, before_first_grace)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("newly unreachable segment did not receive its full grace".to_owned());
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+            let mut publish_four = writer
+                .snapshot()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            publish_four.last_publish_unix_s = 0;
+            writer
+                .publish(&cx, &publish_four)
+                .await
+                .map_err(|error| error.to_string())?;
+            let directory_file =
+                open_gc_directory(&directory).map_err(|error| error.to_string())?;
+            let fourth_publish_floor = segment_unreachability_floor_at(
+                &directory_file,
+                &directory,
+                writer.snapshot(),
+                SystemTime::now(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation 4 did not supply an unreachability floor".to_owned())?;
+            if fourth_publish_floor <= third_publish_floor {
+                return Err("later publication did not advance the conservative floor".to_owned());
+            }
+
+            let old_grace_deadline = third_publish_floor
+                .checked_add(options.grace_period)
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            if !collect_writer_garbage_at(&directory, DEFAULT_SCHEMA, options, old_grace_deadline)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+                || !segment_path.exists()
+            {
+                return Err("later publication did not reset the conservative floor".to_owned());
+            }
+
+            let reset_grace_deadline = fourth_publish_floor
+                .checked_add(options.grace_period)
+                .ok_or_else(|| "test clock remains representable".to_owned())?;
+            let report = collect_writer_garbage_at(
+                &directory,
+                DEFAULT_SCHEMA,
+                options,
+                reset_grace_deadline,
+            )
+            .map_err(|error| error.to_string())?;
+            if report.removed != vec![PathBuf::from(canonical_segment_name(segment_id))]
+                || segment_path.exists()
+            {
+                return Err("segment was not reclaimed at the reset grace deadline".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
     #[test]
     fn future_claim_blocks_gc_before_any_deletion() -> TestResult {
         let directory = tempdir()?;
