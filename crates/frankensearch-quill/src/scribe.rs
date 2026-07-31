@@ -16,7 +16,7 @@
 //!   ids in precisely the order the dictionary serializer needs.
 //! - Budget accounting ([`TermInterner::bytes_used`]) that feeds the shard
 //!   flush trigger (`QuillConfig::scribe_shard_budget_bytes`).
-//! - [`FrankensearchTokenizer`]: the allocation-reusing scalar reference for
+//! - [`FrankensearchTokenizer`]: the allocation-reusing portable-SIMD path for
 //!   the shipping `SimpleTokenizer + LowerCaser` semantics.
 //! - [`CassAnalyzer`]: the native CASS hyphen/CJK analyzer family plus the
 //!   matching edge-prefix and bounded-preview helpers.
@@ -45,6 +45,7 @@ use std::ops::Range;
 use frankensearch_core::DocId;
 use rayon::prelude::*;
 use thiserror::Error;
+use wide::u8x32;
 
 use crate::contract::fieldnorm_to_id;
 use crate::delta::DeltaSnapshot;
@@ -203,14 +204,13 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
 /// enforce [`MAX_TERM_BYTES`]; admission belongs to document/query consumers
 /// so a dropped document token retains its position gap.
 ///
-/// Token boundaries are found by a SWAR (SIMD-within-a-register) byte
-/// classifier that visits eight ASCII bytes per 64-bit word
-/// ([`skip_separators`]/[`scan_token_end`]), falling back to the scalar
-/// char-walk for the span around each non-ASCII byte. The emitted stream is
-/// byte-parity-identical to [`analyze_default_scalar_reference`] — the retained
-/// scalar oracle — which the `swar_default_matches_scalar_reference_*` tests and
-/// the `tokenizer_simd_ab` bench pin (bd-quill-e1-scribe-bejd.1). No
-/// `core::arch` intrinsics are used; the quill crate root is
+/// Token boundaries are found by a one-pass 32-byte portable SIMD classifier,
+/// falling back to the scalar char-walk only at non-ASCII scalars and the short
+/// tail. `wide` lowers the same safe code to the available SSE2/AVX2, NEON, or
+/// wasm SIMD implementation without exposing architecture intrinsics here. The
+/// emitted stream is byte-parity-identical to
+/// [`analyze_default_scalar_reference`] — the retained scalar oracle — which
+/// the tokenizer parity tests pin. The quill crate root remains
 /// `#![forbid(unsafe_code)]`.
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
@@ -219,11 +219,8 @@ pub struct FrankensearchTokenizer {
 
 impl sealed::Sealed for FrankensearchTokenizer {}
 
-/// Boundary-mask candidate retained only for the same-binary admission probe
-/// and exact-parity tests.
-///
-/// The shipping [`FrankensearchTokenizer`] remains the existing two-pass SWAR
-/// implementation until measurement admits this lever.
+/// Legacy one-pass 8-byte SWAR comparison retained for exact-parity tests and
+/// the same-binary tokenizer microbenchmark.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Clone, Default)]
 pub struct BoundaryMaskTokenizer {
@@ -262,11 +259,35 @@ fn next_token_position(position: u32) -> u32 {
 }
 
 /// Bytes classified per 64-bit SWAR word.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_LANES: usize = 8;
 /// SWAR broadcast of the byte `0x01` into every lane.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
 /// SWAR broadcast of the byte `0x80` (per-lane high bit) into every lane.
+#[cfg(any(test, feature = "bench-internals"))]
 const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Bytes classified by the portable SIMD tokenizer in one pass.
+const SIMD_TOKENIZER_LANES: usize = 32;
+
+/// Return bit `lane` for ASCII alphanumeric and non-ASCII bytes in one chunk.
+///
+/// The caller guarantees that the complete 32-byte chunk is in bounds. A local
+/// array keeps the load safe and lets `wide` select the best portable vector
+/// representation for the compilation target.
+#[inline]
+fn simd_tokenizer_masks(bytes: &[u8], at: usize) -> (u32, u32) {
+    let mut chunk = [0_u8; SIMD_TOKENIZER_LANES];
+    chunk.copy_from_slice(&bytes[at..at + SIMD_TOKENIZER_LANES]);
+    let lanes = u8x32::new(chunk);
+    let digits = lanes.simd_ge(b'0') & lanes.simd_le(b'9');
+    let uppercase = lanes.simd_ge(b'A') & lanes.simd_le(b'Z');
+    let lowercase = lanes.simd_ge(b'a') & lanes.simd_le(b'z');
+    let alphanumeric = (digits | uppercase | lowercase).to_bitmask();
+    let non_ascii = lanes.simd_ge(0x80).to_bitmask();
+    (alphanumeric, non_ascii)
+}
 
 /// Per-lane marker (`0x80` in the lane) where `lo <= byte <= hi`.
 ///
@@ -280,6 +301,7 @@ const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
 /// every caller pairs this with an explicit high-bit test so a non-ASCII lane
 /// terminates the span before its marker is consulted.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 const fn swar_range_mark(word: u64, lo: u64, hi: u64) -> u64 {
     let guarded = word | SWAR_HIGH;
     // 0x80 in each lane whose byte is >= lo.
@@ -296,6 +318,7 @@ const fn swar_range_mark(word: u64, lo: u64, hi: u64) -> u64 {
 /// [`tokenizer_is_alphanumeric`] for ASCII scalar values. See
 /// [`swar_range_mark`] for the non-ASCII lane caveat.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 const fn swar_ascii_alnum_mark(word: u64) -> u64 {
     swar_range_mark(word, b'0' as u64, b'9' as u64)
         | swar_range_mark(word, b'A' as u64, b'Z' as u64)
@@ -305,88 +328,11 @@ const fn swar_ascii_alnum_mark(word: u64) -> u64 {
 /// Load the eight bytes at `at` as a little-endian word so lane 0 is the byte at
 /// the lowest offset. The caller guarantees `at + SWAR_LANES <= bytes.len()`.
 #[inline]
+#[cfg(any(test, feature = "bench-internals"))]
 fn swar_load(bytes: &[u8], at: usize) -> u64 {
     let mut lanes = [0_u8; SWAR_LANES];
     lanes.copy_from_slice(&bytes[at..at + SWAR_LANES]);
     u64::from_le_bytes(lanes)
-}
-
-/// Advance past separators and return the byte offset of the first byte that
-/// begins an alphanumeric token, or `text.len()` when the remainder holds none.
-///
-/// The SWAR fast path classifies eight ASCII bytes per word; the first
-/// non-ASCII byte (always a UTF-8 leading byte because every earlier byte was
-/// ASCII) hands off to [`tokenizer_next_char`] so Unicode alphanumeric
-/// classification stays byte-parity-exact with the scalar reference.
-#[inline]
-fn skip_separators(text: &str, from: usize) -> usize {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut cursor = from;
-    loop {
-        while cursor + SWAR_LANES <= len {
-            let word = swar_load(bytes, cursor);
-            // Stop at the first ASCII-alnum lane or the first non-ASCII byte.
-            let stop = swar_ascii_alnum_mark(word) | (word & SWAR_HIGH);
-            if stop == 0 {
-                cursor += SWAR_LANES;
-                continue;
-            }
-            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
-            if bytes[at] < 0x80 {
-                return at;
-            }
-            cursor = at;
-            break;
-        }
-        match tokenizer_next_char(text, cursor) {
-            None => return len,
-            Some((ch, next)) => {
-                if tokenizer_is_alphanumeric(ch) {
-                    return cursor;
-                }
-                cursor = next;
-            }
-        }
-    }
-}
-
-/// Given a token starting at `from` (an alphanumeric char boundary), return the
-/// exclusive end offset of the maximal alphanumeric run and whether every byte
-/// in it is ASCII (which selects the [`str::make_ascii_lowercase`] fast path).
-#[inline]
-fn scan_token_end(text: &str, from: usize) -> (usize, bool) {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut cursor = from;
-    let mut all_ascii = true;
-    loop {
-        while cursor + SWAR_LANES <= len {
-            let word = swar_load(bytes, cursor);
-            // Stop at the first ASCII separator lane or the first non-ASCII byte.
-            let stop = (swar_ascii_alnum_mark(word) ^ SWAR_HIGH) | (word & SWAR_HIGH);
-            if stop == 0 {
-                cursor += SWAR_LANES;
-                continue;
-            }
-            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
-            if bytes[at] < 0x80 {
-                return (at, all_ascii);
-            }
-            cursor = at;
-            break;
-        }
-        match tokenizer_next_char(text, cursor) {
-            None => return (len, all_ascii),
-            Some((ch, next)) => {
-                if !tokenizer_is_alphanumeric(ch) {
-                    return (cursor, all_ascii);
-                }
-                all_ascii &= ch.is_ascii();
-                cursor = next;
-            }
-        }
-    }
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
@@ -531,19 +477,107 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+        const NO_TOKEN: usize = usize::MAX;
+        let bytes = text.as_bytes();
         let len = text.len();
         let mut cursor = 0;
         let mut position = 0_u32;
+        let mut offset_from = NO_TOKEN;
+        let mut all_ascii = true;
 
         while cursor < len {
-            let offset_from = skip_separators(text, cursor);
-            if offset_from >= len {
-                break;
-            }
-            let (offset_to, all_ascii) = scan_token_end(text, offset_from);
+            if cursor + SIMD_TOKENIZER_LANES <= len {
+                let (alphanumeric, non_ascii) = simd_tokenizer_masks(bytes, cursor);
+                let ascii_lanes = if non_ascii == 0 {
+                    SIMD_TOKENIZER_LANES
+                } else {
+                    non_ascii.trailing_zeros() as usize
+                };
+                if ascii_lanes != 0 {
+                    let valid = if ascii_lanes == SIMD_TOKENIZER_LANES {
+                        u32::MAX
+                    } else {
+                        (1_u32 << ascii_lanes) - 1
+                    };
+                    let alphanumeric = alphanumeric & valid;
+                    let prior_lane = u32::from(offset_from != NO_TOKEN);
+                    let mut transitions =
+                        (alphanumeric ^ ((alphanumeric << 1) | prior_lane)) & valid;
+                    while transitions != 0 {
+                        let lane = transitions.trailing_zeros() as usize;
+                        let lane_mark = 1_u32 << lane;
+                        let at = cursor + lane;
+                        transitions &= !lane_mark;
 
+                        if alphanumeric & lane_mark != 0 {
+                            debug_assert_eq!(offset_from, NO_TOKEN);
+                            offset_from = at;
+                            all_ascii = true;
+                        } else {
+                            debug_assert_ne!(offset_from, NO_TOKEN);
+                            self.token.text.clear();
+                            let source = &text[offset_from..at];
+                            if all_ascii {
+                                self.token.text.push_str(source);
+                                self.token.text.make_ascii_lowercase();
+                            } else {
+                                for source_char in source.chars() {
+                                    self.token.text.extend(source_char.to_lowercase());
+                                }
+                            }
+                            self.token.position = position;
+                            self.token.offset_from = offset_from;
+                            self.token.offset_to = at;
+                            self.token.position_length = 1;
+                            sink(&self.token);
+
+                            position = next_token_position(position);
+                            offset_from = NO_TOKEN;
+                        }
+                    }
+                    cursor += ascii_lanes;
+                    if ascii_lanes == SIMD_TOKENIZER_LANES {
+                        continue;
+                    }
+                }
+            }
+
+            let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
+                break;
+            };
+            if tokenizer_is_alphanumeric(ch) {
+                if offset_from == NO_TOKEN {
+                    offset_from = cursor;
+                    all_ascii = ch.is_ascii();
+                } else {
+                    all_ascii &= ch.is_ascii();
+                }
+            } else if offset_from != NO_TOKEN {
+                self.token.text.clear();
+                let source = &text[offset_from..cursor];
+                if all_ascii {
+                    self.token.text.push_str(source);
+                    self.token.text.make_ascii_lowercase();
+                } else {
+                    for source_char in source.chars() {
+                        self.token.text.extend(source_char.to_lowercase());
+                    }
+                }
+                self.token.position = position;
+                self.token.offset_from = offset_from;
+                self.token.offset_to = cursor;
+                self.token.position_length = 1;
+                sink(&self.token);
+
+                position = next_token_position(position);
+                offset_from = NO_TOKEN;
+            }
+            cursor = next;
+        }
+
+        if offset_from != NO_TOKEN {
             self.token.text.clear();
-            let source = &text[offset_from..offset_to];
+            let source = &text[offset_from..len];
             if all_ascii {
                 self.token.text.push_str(source);
                 self.token.text.make_ascii_lowercase();
@@ -554,12 +588,9 @@ impl TokenAnalyzer for FrankensearchTokenizer {
             }
             self.token.position = position;
             self.token.offset_from = offset_from;
-            self.token.offset_to = offset_to;
+            self.token.offset_to = len;
             self.token.position_length = 1;
             sink(&self.token);
-
-            position = next_token_position(position);
-            cursor = offset_to;
         }
     }
 
