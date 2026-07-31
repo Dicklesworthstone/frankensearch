@@ -288,6 +288,27 @@ moves by 3× across hosts, published without the host, is a host-conditional
 result presented as an unconditional one. Filed as
 `bd-fourbit-self-ratio-not-portable-1eqce`.
 
+## Coverage after this session
+
+| | 2026-07-30 | after 2026-07-31 |
+|---|---:|---:|
+| claims with a same-invocation vs-incumbent ratio | 10 | **11** |
+| …of which satisfy the **full** written `INCUMBENT` contract | **0** | **1** |
+| claims without | 137 | 136 |
+
+The one addition is `fsvi-4bit-vs-incumbent-20260731.md`, and it is a **loss**:
+the converted claim was refuted, not confirmed. It is nonetheless the first row
+in this repository's history to carry every field the contract demands — named
+actual legacy incumbent, numeric incumbent ratio, same-invocation A/A null,
+side-by-side execution in one invocation, and a self-reported executing ELF
+SHA-256. `grep -c "Actual legacy incumbent" docs/PERF_LEDGER.md` still returns 0
+because the row lives in `NEGATIVE_EVIDENCE.md`, which is where a refutation
+belongs.
+
+**One conversion, one refutation.** That is the expected yield and the reason
+the exercise is worth continuing: the 136 remaining are not a backlog of wins
+waiting to be documented.
+
 ## Surface sweep extended (2026-07-31): CHANGELOG is the *only* exposed surface
 
 The 2026-07-30 audit checked `README.md`, `CHANGELOG.md`, crate `description`
