@@ -10,6 +10,38 @@
 //! reads go through the [`IndexCache`] which provides
 //! atomic snapshot replacement.
 //!
+//! # Identity-bound refresh (bd-9xuj T2 C4-write)
+//!
+//! Every embedding harvested by this worker is identity-bound at the embedder
+//! boundary ([`Embedder::embed_batch_bound`]) and carried as a
+//! [`BoundQueryEmbedding`]; no raw vector enters a [`RefreshRecord`]. Two
+//! lanes exist:
+//!
+//! - **Canonical bootstrap lane** ([`RefreshWorker::run_cycle`]): admissible
+//!   only while the canonical generation retains nothing (missing artifacts
+//!   or an empty legacy v1 seed). It publishes through the legacy two-tier
+//!   writer with the producing identity declared process-locally
+//!   (`TwoTierIndexBuilder::set_*_identity`) — DECLARED, never attested.
+//! - **Staged identity-bound replacement**
+//!   ([`RefreshWorker::stage_identity_bound_generation`]): the typed merge
+//!   that replaces the former blanket refusal. It admits the existing
+//!   generation's ATTESTED FSVI v2 identity through
+//!   [`VectorIndex::open_admitted_v2`] (plain [`VectorIndex::open`] is
+//!   strictly v1 and can never see a v2 identity), joins every bound
+//!   embedding against it, and republishes a complete FSVI v2 replacement via
+//!   [`VectorIndex::create_v2`] into a non-canonical staging directory.
+//!
+//! # Canonical publication is gated (composite generation authority)
+//!
+//! Installing a staged fast/quality pair over the canonical filenames is a
+//! SPLIT publication — two renames with no atomic pair authority. Until the
+//! composite generation-authority primitive lands (bd-xomn.1/.3), canonical
+//! publication of an identity-admissible v2 replacement is refused with the
+//! typed `composite-generation-authority-unavailable` reason, *before any
+//! queue drain*, so the permanent condition can never consume retry budget or
+//! drop queued documents. [`RefreshWorker::publish_staged_canonical`] pins
+//! the same refusal at the staged seam.
+//!
 //! # Lifecycle
 //!
 //! The worker loops until the parent `Cx` is cancelled. On cancellation it
@@ -22,14 +54,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::Embedder;
+use frankensearch_core::generation::{
+    ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+};
+use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding};
+use frankensearch_core::{BoundQueryEmbedding, SpaceIdentityAdmission};
 use frankensearch_index::{
-    TwoTierIndex, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
-    VECTOR_INDEX_QUALITY_FILENAME, VectorIndex,
+    FsviAdmissionError, FsviInspection, FsviV2IdentityBinding, FsviV2IdentityMetadata,
+    TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
+    VECTOR_INDEX_QUALITY_FILENAME, ValidatedFsviBytes, VectorIndex, VectorMetadata,
 };
 
 use crate::cache::IndexCache;
@@ -145,59 +183,480 @@ pub struct RefreshMetricsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded record (intermediate)
+// Refresh record (identity-bound carrier)
 // ---------------------------------------------------------------------------
 
-/// A document with its computed embedding, ready for index insertion.
+/// A document with its identity-bound embeddings, ready for index insertion
+/// (bd-9xuj T2 C4-write).
+///
+/// Both tiers carry [`BoundQueryEmbedding`] — a vector bound at the embedder
+/// boundary to the complete identity bundle that produced it, validated at
+/// bind time. The embeddings are produced ONLY via
+/// [`Embedder::embed_batch_bound`]; no raw `Vec<f32>` enters this record, so
+/// every downstream seam can verify space and producer identity instead of
+/// trusting provenance-free floats.
 #[derive(Debug)]
-struct EmbeddedRecord {
+struct RefreshRecord {
     doc_id: String,
-    fast_embedding: Vec<f32>,
-    quality_embedding: Option<Vec<f32>>,
+    fast_embedding: BoundQueryEmbedding,
+    quality_embedding: Option<BoundQueryEmbedding>,
     content_hash: String,
 }
 
-/// Explain why the current refresh writer must not merge an existing generation.
+/// Convert an embedder-bound output into the C1r2 verifier carrier.
 ///
-/// Legacy FSVI v1 carries only a display id, revision string, and dimension.
-/// None proves vector-space compatibility, so even equal values must fail
-/// closed. FSVI v2 carries the required identity, but this refresh path still
-/// consumes raw embeddings and publishes through the legacy two-tier writer;
-/// allowing it to merge would discard that identity on the replacement. A
-/// future identity-bound writer can replace this refusal with exact typed
-/// identity comparison and v2 republication.
-fn incremental_merge_refusal(
-    fast_index: &VectorIndex,
-    quality_index: Option<&VectorIndex>,
-) -> SearchError {
-    let legacy_tier = if fast_index.identity_v2().is_none() {
-        Some("fast")
-    } else if quality_index.is_some_and(|index| index.identity_v2().is_none()) {
-        Some("quality")
-    } else {
-        None
-    };
+/// [`BoundQueryEmbedding::new`] re-validates the bundle and precomputes the
+/// identity and space fingerprints, so seam checks are string compares.
+fn into_bound_query(bound: IdentityBoundEmbedding) -> SearchResult<BoundQueryEmbedding> {
+    BoundQueryEmbedding::new(bound.values, bound.identity)
+}
 
-    if let Some(tier) = legacy_tier {
-        return SearchError::InvalidConfig {
-            field: format!("refresh.{tier}_index_identity"),
-            value: "identityless-fsvi-v1".to_owned(),
-            reason: "refusing incremental vector merge because the existing generation has no complete immutable embedding identity; a full identity-bound rebuild is required"
-                .to_owned(),
-        };
+// ---------------------------------------------------------------------------
+// Canonical generation inspection + typed refusals
+// ---------------------------------------------------------------------------
+
+/// Subdirectory of the index dir holding staged (non-canonical) identity-bound
+/// v2 replacement generations. Never discovered by `TwoTierIndex::open`.
+const STAGED_V2_DIR_NAME: &str = "v2-staged";
+
+/// Typed state of one canonical tier artifact on disk.
+enum TierState {
+    /// No artifact at the tier's path.
+    Missing,
+    /// Recognized legacy FSVI v1 bytes; `live` is true when the tier retains
+    /// a live main-slab row or a WAL-resident append.
+    LegacyV1 { live: bool },
+    /// Identity-complete FSVI v2 header (attested identity available from
+    /// the artifact's own bytes). Content admission still happens through
+    /// [`VectorIndex::open_admitted_v2`].
+    V2 { metadata: Box<VectorMetadata> },
+}
+
+/// Inspect one tier artifact without mutating anything.
+///
+/// v2 recognition happens through [`VectorIndex::inspect`] because plain
+/// [`VectorIndex::open`] is strictly v1: any refresh branch keyed on
+/// `identity_v2()` from a plain open would be unreachable for on-disk v2.
+fn inspect_tier(path: &Path) -> SearchResult<TierState> {
+    if !path.exists() {
+        return Ok(TierState::Missing);
     }
-
-    SearchError::InvalidConfig {
-        field: "refresh.index_publication".to_owned(),
-        value: "identity-bound-republication-unavailable".to_owned(),
-        reason: "refusing incremental vector merge because this refresh writer cannot preserve and republish FSVI v2 identity; a full identity-bound rebuild is required"
-            .to_owned(),
+    match VectorIndex::inspect(path)? {
+        FsviInspection::V2IdentityComplete(metadata) => Ok(TierState::V2 { metadata }),
+        FsviInspection::ReindexRequired(_) => {
+            let index = VectorIndex::open(path)?;
+            Ok(TierState::LegacyV1 {
+                live: index_has_live_vectors(&index),
+            })
+        }
+        FsviInspection::UpgradeRequired(upgrade) => Err(SearchError::InvalidConfig {
+            field: "refresh.index_format".to_owned(),
+            value: format!("fsvi-v{}", upgrade.found_version),
+            reason: format!(
+                "existing generation uses a newer FSVI schema than this reader supports \
+                 (through v{}); a reader upgrade is required before any refresh",
+                upgrade.supported_version
+            ),
+        }),
     }
 }
 
 fn index_has_live_vectors(index: &VectorIndex) -> bool {
     index.wal_records().next().is_some()
         || (0..index.record_count()).any(|record_index| !index.is_deleted(record_index))
+}
+
+/// The landed generation-containment refusal for identityless legacy tiers
+/// (origin 5386b39e): equal display ids, revisions, and dimensions cannot
+/// prove that two embeddings inhabit the same vector space, so a live v1
+/// tier fails closed and requires a full identity-bound rebuild.
+fn identityless_refusal(tier: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("refresh.{tier}_index_identity"),
+        value: "identityless-fsvi-v1".to_owned(),
+        reason: "refusing incremental vector merge because the existing generation has no \
+                 complete immutable embedding identity; a full identity-bound rebuild is required"
+            .to_owned(),
+    }
+}
+
+/// An attested quality tier retains content but this worker has no quality
+/// embedder, so no identity-bound replacement of that tier can be produced.
+fn quality_republication_unavailable() -> SearchError {
+    SearchError::InvalidConfig {
+        field: "refresh.index_publication".to_owned(),
+        value: "identity-bound-republication-unavailable".to_owned(),
+        reason: "the attested quality tier retains content but this worker has no quality \
+                 embedder to produce its identity-bound replacement; configure a quality \
+                 embedder attesting the same producer or run a full rebuild"
+            .to_owned(),
+    }
+}
+
+/// The bd-xomn composite-generation-authority gate (C4-write disposition).
+///
+/// The identity gates PASSED — the merge itself is admissible — but
+/// installing a fast/quality replacement over the canonical filenames is a
+/// split two-rename publication with no atomic pair authority. This slice
+/// deliberately does not invent one; canonical publication reopens when the
+/// composite generation-authority primitive (bd-xomn.1/.3) lands. The
+/// refusal fires BEFORE any queue drain so the (currently permanent)
+/// condition never consumes retry budget or drops queued documents.
+fn composite_authority_refusal(index_dir: &Path) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "refresh.canonical_publication".to_owned(),
+        value: "composite-generation-authority-unavailable".to_owned(),
+        reason: format!(
+            "the identity-bound v2 replacement for {} is admissible (and can be staged and \
+             proven via stage_identity_bound_generation), but canonical installation of a \
+             split fast/quality generation pair is refused until the composite \
+             generation-authority primitive lands (bd-xomn.1/.3); no per-tier rename \
+             sequence can make the pair atomic",
+            index_dir.display()
+        ),
+    }
+}
+
+/// Guard 7 at its strictest: only `SameProducer` is admitted in this slice.
+///
+/// A producer that differs from the expected/attested producer is refused
+/// with this typed reason even when it carries a byte-identical golden-vector
+/// certificate (i.e. even when the pairing would classify as
+/// [`SpaceIdentityAdmission::ConformanceCompatibleProducer`]): certificate
+/// equality attests what some implementation once produced, not what the
+/// implementation executing THIS merge produces. The conformance-compatible
+/// lane reopens when executing-producer attestation (attestation of the
+/// running implementation, in code) lands; until then this is a deliberate
+/// narrowing, and the copied-certificate attack shape (same space, foreign
+/// producer, cloned certificate) is rejected by construction.
+fn attestation_unavailable_refusal(
+    tier: &str,
+    query_producer_fingerprint: &str,
+    expected_producer_fingerprint: &str,
+) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("refresh.{tier}_producer_conformance"),
+        value: "executing-producer-attestation-unavailable".to_owned(),
+        reason: format!(
+            "producer fingerprint {query_producer_fingerprint} shares the {tier} tier's \
+             embedding space but is not the attested producer \
+             {expected_producer_fingerprint}; this slice admits SameProducer only — a \
+             golden-vector certificate alone cannot attest the implementation executing \
+             this merge, so the conformance-compatible lane stays closed until \
+             executing-producer attestation lands"
+        ),
+    }
+}
+
+/// Cross-space refusal at the artifact level (pre-drain): the executing
+/// embedder's space does not join the attested space of the existing tier.
+fn space_identity_refusal(
+    tier: &str,
+    executing_space_fingerprint: &str,
+    attested_space_fingerprint: &str,
+) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("refresh.{tier}_space_identity"),
+        value: executing_space_fingerprint.to_owned(),
+        reason: format!(
+            "the executing {tier} embedder produces vectors in a different embedding space \
+             than the attested {tier} generation (attested space fingerprint \
+             {attested_space_fingerprint}); refusing the identity-bound merge — reindex \
+             into a new generation instead"
+        ),
+    }
+}
+
+/// Map a typed [`FsviAdmissionError`] into the refresh error surface, naming
+/// the tier. I/O and corruption pass through unchanged.
+fn admission_error_to_refresh_error(
+    error: FsviAdmissionError,
+    tier: &str,
+    path: &Path,
+) -> SearchError {
+    match error {
+        FsviAdmissionError::Index(error) => error,
+        other => SearchError::InvalidConfig {
+            field: format!("refresh.{tier}_v2_admission"),
+            value: path.display().to_string(),
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// Lowercase hex encoding of raw fingerprint bytes.
+fn fingerprint_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The parsed v2 identity block of an inspected tier, or a typed error when
+/// inspection and metadata disagree (never fabricated).
+fn v2_identity_of<'metadata>(
+    metadata: &'metadata VectorMetadata,
+    tier: &str,
+) -> SearchResult<&'metadata FsviV2IdentityMetadata> {
+    metadata
+        .identity_v2
+        .as_ref()
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: format!("refresh.{tier}_index_identity"),
+            value: "missing-v2-identity-metadata".to_owned(),
+            reason: "inspection classified the artifact as FSVI v2 but its parsed metadata \
+                     carries no identity block"
+                .to_owned(),
+        })
+}
+
+/// Derive the FSVI v2 artifact identity bundle for an embedder: the same
+/// space, producer, and input contracts, with the storage component rewritten
+/// to the canonical persisted contract (`fsvi-v2`, F16, little-endian) that
+/// [`VectorIndex::create_v2`] requires. The result is re-validated: storage
+/// is physical, so the space and producer fingerprints are unchanged.
+fn artifact_identity_for(embedder: &dyn Embedder) -> SearchResult<EmbeddingIdentityBundleV1> {
+    let mut bundle = embedder.identity()?.clone();
+    "fsvi-v2".clone_into(&mut bundle.storage.format);
+    bundle.storage.quantization = QuantizationFormat::F16;
+    "little-endian".clone_into(&mut bundle.storage.endianness);
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+/// Reconstruct the exact identity binding an existing attested tier was
+/// published under, from the executing embedder's identity plus the
+/// artifact's own header metadata.
+///
+/// The bundle canonical bytes in a v2 header are encode-only (no structured
+/// decoder exists, by design), so exact admission needs the caller to hold
+/// the structured bundle. The executing embedder holds the space/producer/
+/// input components (already gated equal to the attested fingerprints); only
+/// the physical storage quantization can legitimately vary, so both F16 and
+/// F32 candidates are tried against the header's full-bundle fingerprint.
+fn reconstruct_admission_binding(
+    metadata: &VectorMetadata,
+    embedder_identity: &EmbeddingIdentityBundleV1,
+    tier: &str,
+) -> SearchResult<FsviV2IdentityBinding> {
+    let identity = v2_identity_of(metadata, tier)?;
+    let attested_bundle_hex = fingerprint_hex(&identity.identity_bundle_fingerprint);
+    for quantization in [QuantizationFormat::F16, QuantizationFormat::F32] {
+        let mut candidate = embedder_identity.clone();
+        "fsvi-v2".clone_into(&mut candidate.storage.format);
+        candidate.storage.quantization = quantization;
+        "little-endian".clone_into(&mut candidate.storage.endianness);
+        if candidate.validate().is_err() {
+            continue;
+        }
+        if candidate.fingerprint() == attested_bundle_hex {
+            return FsviV2IdentityBinding::new(identity.generation, candidate.freeze()?);
+        }
+    }
+    Err(SearchError::InvalidConfig {
+        field: format!("refresh.{tier}_storage_identity"),
+        value: fingerprint_hex(&identity.storage_fingerprint),
+        reason: format!(
+            "the attested {tier} generation's identity bundle ({attested_bundle_hex}) cannot \
+             be reconstructed from the executing embedder's identity under any supported \
+             storage contract; identity-bound republication is unavailable for this artifact"
+        ),
+    })
+}
+
+/// Unique non-zero nonce material for one staged generation build attempt.
+///
+/// The generation nonce is uniqueness material, never a credential (see
+/// [`ArtifactGenerationIdentityV1`]): it exists so two build attempts of the
+/// same sequence are distinguishable. Uniqueness comes from OS-seeded
+/// [`std::collections::hash_map::RandomState`] draws (fresh keys per
+/// process from OS randomness, distinct per instantiation), domain-mixed
+/// with the deterministic build context.
+fn generation_nonce(index_dir: &Path, tier: &str, sequence: u64) -> [u8; 16] {
+    use std::hash::BuildHasher as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(index_dir.as_os_str().as_encoded_bytes());
+    hasher.update(tier.as_bytes());
+    hasher.update(sequence.to_le_bytes());
+    for draw in 0_u64..4 {
+        let os_seeded = std::collections::hash_map::RandomState::new();
+        hasher.update(os_seeded.hash_one(draw).to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut nonce = [0_u8; 16];
+    nonce.copy_from_slice(&digest[..16]);
+    nonce
+}
+
+/// Guard 7 seam check on one bound embedding: apply the complete C1r2
+/// admission law against `expected` and admit ONLY `SameProducer`.
+/// A `ConformanceCompatibleProducer` outcome is telemetry-logged and refused
+/// (see [`attestation_unavailable_refusal`] for the deliberate narrowing and
+/// its reopening condition).
+fn require_same_producer(
+    bound: &BoundQueryEmbedding,
+    expected: &EmbeddingIdentityBundleV1,
+    tier: &str,
+) -> SearchResult<()> {
+    match bound.verify_producer_conformance(expected, tier)? {
+        SpaceIdentityAdmission::SameProducer => Ok(()),
+        SpaceIdentityAdmission::ConformanceCompatibleProducer {
+            query_producer_fingerprint,
+            expected_producer_fingerprint,
+        } => {
+            warn!(
+                target: "frankensearch.refresh",
+                tier,
+                %query_producer_fingerprint,
+                %expected_producer_fingerprint,
+                "conformance-compatible producer refused: executing-producer attestation \
+                 unavailable (SameProducer-only slice)"
+            );
+            Err(attestation_unavailable_refusal(
+                tier,
+                &query_producer_fingerprint,
+                &expected_producer_fingerprint,
+            ))
+        }
+        // `SpaceIdentityAdmission` is #[non_exhaustive]: a future admission
+        // basis this seam does not understand must fail CLOSED, never admit.
+        other => {
+            warn!(
+                target: "frankensearch.refresh",
+                tier,
+                admission = other.code(),
+                "unrecognized producer-conformance admission outcome refused (fail closed)"
+            );
+            Err(SearchError::InvalidConfig {
+                field: format!("refresh.{tier}_producer_conformance"),
+                value: other.code().to_owned(),
+                reason: "unrecognized producer-conformance admission outcome; this \
+                         SameProducer-only seam fails closed on admission bases it cannot \
+                         verify"
+                    .to_owned(),
+            })
+        }
+    }
+}
+
+/// Gate one attested v2 tier against the executing embedder's artifact
+/// bundle: space join first (typed cross-space refusal), then the
+/// SameProducer-only producer law against the header's attested producer
+/// fingerprint. Both expected values come from the artifact's OWN header —
+/// never from a caller-supplied fingerprint.
+fn admit_attested_tier(
+    tier: &str,
+    metadata: &VectorMetadata,
+    executing_bundle: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
+    let identity = v2_identity_of(metadata, tier)?;
+    let attested_space = fingerprint_hex(&identity.space_fingerprint);
+    let executing_space = executing_bundle.space.fingerprint();
+    if executing_space != attested_space {
+        return Err(space_identity_refusal(
+            tier,
+            &executing_space,
+            &attested_space,
+        ));
+    }
+    let attested_producer = fingerprint_hex(&identity.producer_fingerprint);
+    let executing_producer = executing_bundle.producer.fingerprint();
+    if executing_producer != attested_producer {
+        return Err(attestation_unavailable_refusal(
+            tier,
+            &executing_producer,
+            &attested_producer,
+        ));
+    }
+    Ok(())
+}
+
+/// Admit one existing attested canonical tier exactly and return the sealed
+/// owner plus the attested space fingerprint (lowercase hex) read from the
+/// artifact's own header.
+fn admit_existing_tier(
+    path: &Path,
+    metadata: &VectorMetadata,
+    embedder: &dyn Embedder,
+    tier: &str,
+) -> SearchResult<(ValidatedFsviBytes, String)> {
+    let attested_space_hex = fingerprint_hex(&v2_identity_of(metadata, tier)?.space_fingerprint);
+    let binding = reconstruct_admission_binding(metadata, embedder.identity()?, tier)?;
+    let owner = VectorIndex::open_admitted_v2(path, &binding)
+        .map_err(|error| admission_error_to_refresh_error(error, tier, path))?;
+    Ok((owner, attested_space_hex))
+}
+
+/// Next generation sequence for a staged replacement: the attested prior
+/// generation's sequence plus one, or 1 for a fresh lineage.
+fn next_generation_sequence(prior: Option<&ValidatedFsviBytes>) -> SearchResult<u64> {
+    prior.map_or_else(
+        || Ok(1),
+        |owner| {
+            owner
+                .identity_v2()
+                .generation
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "refresh.generation_sequence".to_owned(),
+                    value: u64::MAX.to_string(),
+                    reason: "generation sequence overflow".to_owned(),
+                })
+        },
+    )
+}
+
+/// Classification of the existing canonical generation after all identity
+/// gates have been applied.
+enum ExistingGenerationClass {
+    /// Nothing is retained on disk (missing artifacts or empty legacy v1
+    /// seeds): a bootstrap replacement cannot mix vector spaces.
+    BootstrapReplaceable,
+    /// At least one tier is an attested FSVI v2 artifact and every gate
+    /// (space join, `SameProducer`, quality republication capability) passed.
+    AttestedV2,
+}
+
+// ---------------------------------------------------------------------------
+// Staged identity-bound generation
+// ---------------------------------------------------------------------------
+
+/// A proven, non-canonical identity-bound v2 replacement generation
+/// (bd-9xuj T2 C4-write).
+///
+/// Produced by [`RefreshWorker::stage_identity_bound_generation`]: the tiers
+/// live under the `v2-staged/` subdirectory of the index dir — never the
+/// canonical filenames — and `index` is the staged pair re-admitted through
+/// [`TwoTierIndex::open_admitted_v2_with_paths`], so its identity is
+/// header-ATTESTED (`index.fast_identity_is_attested()`). Canonical
+/// installation is refused by [`RefreshWorker::publish_staged_canonical`]
+/// until the composite generation-authority primitive lands.
+pub struct StagedIdentityBoundGeneration {
+    /// The staged generation, opened through exact v2 admission.
+    pub index: TwoTierIndex,
+    /// Staged fast-tier artifact path.
+    pub fast_path: PathBuf,
+    /// Staged quality-tier artifact path, when a quality tier was staged.
+    pub quality_path: Option<PathBuf>,
+    /// Exact binding the staged fast tier was written and admitted under.
+    pub fast_binding: FsviV2IdentityBinding,
+    /// Exact binding the staged quality tier was written and admitted under.
+    pub quality_binding: Option<FsviV2IdentityBinding>,
+}
+
+impl std::fmt::Debug for StagedIdentityBoundGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedIdentityBoundGeneration")
+            .field("fast_path", &self.fast_path)
+            .field("quality_path", &self.quality_path)
+            .field("fast_binding", &self.fast_binding)
+            .finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +668,7 @@ fn index_has_live_vectors(index: &VectorIndex) -> bool {
 /// # Architecture
 ///
 /// ```text
-/// EmbeddingQueue ──drain──> RefreshWorker ──embed──> TwoTierIndexBuilder
+/// EmbeddingQueue ──drain──> RefreshWorker ──embed_batch_bound──> RefreshRecord
 ///                                                         │
 ///                                                    ┌────┘
 ///                                                    ▼
@@ -218,17 +677,21 @@ fn index_has_live_vectors(index: &VectorIndex) -> bool {
 ///
 /// The worker is the single writer for vector indices. It:
 /// 1. Drains pending jobs from the [`EmbeddingQueue`]
-/// 2. Batch-embeds via the fast-tier [`Embedder`] (and optionally quality-tier)
-/// 3. Rebuilds the full `TwoTierIndex` from scratch
+/// 2. Batch-embeds via the fast-tier [`Embedder`] (and optionally
+///    quality-tier), binding every output to its producing identity
+/// 3. Rebuilds the `TwoTierIndex` (bootstrap lane) or refuses typed
 /// 4. Atomically replaces the cached index via [`IndexCache::replace`]
 ///
-/// # Legacy incremental safety boundary
+/// # Identity admission boundary
 ///
-/// The current two-tier writer emits identityless FSVI v1 artifacts. It may
-/// publish the initial generation, but a later non-empty cycle refuses to merge
-/// that generation before draining, leaving queued jobs and retry counts
-/// untouched. Operators must run a full identity-bound rebuild until this path
-/// consumes bound embeddings and republishes complete FSVI v2 identity.
+/// A canonical generation that retains content is admissible for replacement
+/// only when its identity is ATTESTED (FSVI v2 header) and joins the
+/// executing embedders' identity as the same space and the same producer.
+/// Live v1 tiers keep the landed containment refusal
+/// (`identityless-fsvi-v1`). Admissible v2 replacements can be staged and
+/// proven ([`Self::stage_identity_bound_generation`]) but canonical
+/// installation is refused pre-drain until composite generation authority
+/// lands (see the module docs).
 ///
 /// # Cancellation
 ///
@@ -345,7 +808,7 @@ impl RefreshWorker {
     /// Run a single refresh cycle.
     ///
     /// Returns the number of documents successfully embedded, or an error
-    /// if the index rebuild itself failed.
+    /// if the cycle was refused or the index rebuild itself failed.
     ///
     /// # Errors
     ///
@@ -353,13 +816,15 @@ impl RefreshWorker {
     /// failures for individual documents are handled via retry (requeue) and
     /// do not cause the cycle to fail.
     pub async fn run_cycle(&self, cx: &Cx) -> SearchResult<usize> {
-        // Avoid opening the index on idle polls, but refuse any unsafe merge
-        // before draining work. A permanent identity-admission failure must not
-        // consume retry budget or eventually drop the queued documents.
+        // Avoid opening the index on idle polls, but refuse any inadmissible
+        // or currently-unpublishable replacement BEFORE draining work: a
+        // permanent refusal (identityless v1, foreign space/producer, missing
+        // composite generation authority) must not consume retry budget or
+        // eventually drop the queued documents.
         if self.queue.is_empty() {
             return Ok(0);
         }
-        self.ensure_no_existing_generation_for_merge()?;
+        self.ensure_canonical_cycle_admissible()?;
 
         // Drain at most `max_docs_per_cycle` jobs from the queue.
         let mut all_jobs = Vec::new();
@@ -385,7 +850,7 @@ impl RefreshWorker {
             "starting refresh cycle"
         );
 
-        // Embed all documents.
+        // Embed all documents, identity-bound at the embedder boundary.
         let embedded = self.embed_batch(cx, &all_jobs).await;
 
         if embedded.is_empty() {
@@ -460,25 +925,29 @@ impl RefreshWorker {
         }
     }
 
-    /// Embed a batch of jobs using the fast (and optionally quality) embedder.
+    /// Embed a batch of jobs using the fast (and optionally quality)
+    /// embedder, binding every output to its producing identity.
     ///
-    /// Failed embeddings are requeued for retry. Returns only the successfully
-    /// embedded records.
-    async fn embed_batch(&self, cx: &Cx, jobs: &[EmbeddingJob]) -> Vec<EmbeddedRecord> {
+    /// Failed embeddings are requeued for retry. Returns only the
+    /// successfully embedded, identity-bound records.
+    async fn embed_batch(&self, cx: &Cx, jobs: &[EmbeddingJob]) -> Vec<RefreshRecord> {
         let embed_start = Instant::now();
 
         // Collect texts for batch embedding.
         let texts: Vec<&str> = jobs.iter().map(|j| j.canonical_text.as_str()).collect();
 
-        // Fast-tier embedding (required).
-        let fast_embeddings = match self.fast_embedder.embed_batch(cx, &texts).await {
+        // Fast-tier identity-bound embedding (required). An identity-less
+        // embedder fails here typed (`embedder.identity`), which also means
+        // it can no longer publish provenance-free vectors through this
+        // worker — that is the C4-write bound-carrier contract.
+        let fast_bound = match self.fast_embedder.embed_batch_bound(cx, &texts).await {
             Ok(embeddings) => embeddings,
             Err(e) => {
                 warn!(
                     target: "frankensearch.refresh",
                     error = %e,
                     batch_size = jobs.len(),
-                    "fast-tier batch embedding failed, requeueing all"
+                    "fast-tier bound batch embedding failed, requeueing all"
                 );
                 let mut dropped_requeues = 0usize;
                 for job in jobs {
@@ -500,23 +969,26 @@ impl RefreshWorker {
                 return Vec::new();
             }
         };
+        let mut fast_bound: Vec<Option<IdentityBoundEmbedding>> =
+            fast_bound.into_iter().map(Some).collect();
 
-        // Quality-tier embedding (optional).
-        let quality_embeddings = if let Some(ref quality) = self.quality_embedder {
-            match quality.embed_batch(cx, &texts).await {
-                Ok(embeddings) => Some(embeddings),
-                Err(e) => {
-                    warn!(
-                        target: "frankensearch.refresh",
-                        error = %e,
-                        "quality-tier batch embedding failed, proceeding with fast only"
-                    );
-                    None
+        // Quality-tier identity-bound embedding (optional).
+        let mut quality_bound: Option<Vec<Option<IdentityBoundEmbedding>>> =
+            if let Some(ref quality) = self.quality_embedder {
+                match quality.embed_batch_bound(cx, &texts).await {
+                    Ok(embeddings) => Some(embeddings.into_iter().map(Some).collect()),
+                    Err(e) => {
+                        warn!(
+                            target: "frankensearch.refresh",
+                            error = %e,
+                            "quality-tier bound batch embedding failed, proceeding with fast only"
+                        );
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let embed_us = u64::try_from(embed_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.metrics
@@ -526,15 +998,14 @@ impl RefreshWorker {
         // Assemble records.
         let mut records = Vec::with_capacity(jobs.len());
         for (i, job) in jobs.iter().enumerate() {
-            let Some(fast_embedding) = fast_embeddings.get(i).cloned() else {
+            let Some(fast_ib) = fast_bound.get_mut(i).and_then(Option::take) else {
                 // Embedder returned fewer vectors than inputs — skip this doc
                 // and requeue so it can be retried next cycle.
                 warn!(
                     target: "frankensearch.refresh",
                     doc_id = %job.doc_id,
                     expected = jobs.len(),
-                    got = fast_embeddings.len(),
-                    "fast embedder returned fewer vectors than inputs, requeueing"
+                    "fast embedder returned fewer bound vectors than inputs, requeueing"
                 );
                 if !self.requeue_job(job.clone(), "fast_batch_missing_vector") {
                     warn!(
@@ -546,9 +1017,45 @@ impl RefreshWorker {
                 self.metrics.docs_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let quality_embedding = quality_embeddings.as_ref().and_then(|q| q.get(i).cloned());
+            let fast_embedding = match into_bound_query(fast_ib) {
+                Ok(bound) => bound,
+                Err(e) => {
+                    warn!(
+                        target: "frankensearch.refresh",
+                        doc_id = %job.doc_id,
+                        error = %e,
+                        "fast-tier bound embedding failed bind-time validation, requeueing"
+                    );
+                    if !self.requeue_job(job.clone(), "fast_bound_validation_failed") {
+                        warn!(
+                            target: "frankensearch.refresh",
+                            doc_id = %job.doc_id,
+                            "failed to requeue job after bind-time validation failure"
+                        );
+                    }
+                    self.metrics.docs_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let quality_embedding = quality_bound
+                .as_mut()
+                .and_then(|bound| bound.get_mut(i))
+                .and_then(Option::take)
+                .and_then(|ib| match into_bound_query(ib) {
+                    Ok(bound) => Some(bound),
+                    Err(e) => {
+                        warn!(
+                            target: "frankensearch.refresh",
+                            doc_id = %job.doc_id,
+                            error = %e,
+                            "quality-tier bound embedding failed bind-time validation, \
+                             proceeding fast-only for this document"
+                        );
+                        None
+                    }
+                });
 
-            records.push(EmbeddedRecord {
+            records.push(RefreshRecord {
                 doc_id: job.doc_id.clone(),
                 fast_embedding,
                 quality_embedding,
@@ -594,54 +1101,106 @@ impl RefreshWorker {
         }
     }
 
-    /// Refuse to merge any active generation until refresh publication is
-    /// identity-bound end to end.
-    fn ensure_no_existing_generation_for_merge(&self) -> SearchResult<()> {
+    /// Resolve the existing canonical fast-tier artifact path, if any.
+    fn resolve_existing_fast_path(&self) -> Option<PathBuf> {
         let fast_path = self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME);
-        let fallback_path = self.config.index_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
-        let existing_fast_path = if fast_path.exists() {
-            Some(fast_path)
-        } else if fallback_path.exists() {
-            Some(fallback_path)
-        } else {
-            None
-        };
-
-        let Some(existing_fast_path) = existing_fast_path else {
-            return Ok(());
-        };
-
-        let fast_index = VectorIndex::open(&existing_fast_path)?;
-        let quality_path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-        let quality_index = if quality_path.exists() {
-            Some(VectorIndex::open(&quality_path)?)
-        } else {
-            None
-        };
-
-        // Replacing an empty bootstrap artifact cannot mix vector spaces. The
-        // cache requires such a seed before the first real refresh, so admit it
-        // only when neither tier has a live main-slab or WAL-resident vector.
-        let fast_is_empty = !index_has_live_vectors(&fast_index);
-        let quality_is_empty = quality_index
-            .as_ref()
-            .is_none_or(|index| !index_has_live_vectors(index));
-        if fast_is_empty && quality_is_empty {
-            return Ok(());
+        if fast_path.exists() {
+            return Some(fast_path);
         }
-
-        Err(incremental_merge_refusal(
-            &fast_index,
-            quality_index.as_ref(),
-        ))
+        let fallback_path = self.config.index_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        if fallback_path.exists() {
+            return Some(fallback_path);
+        }
+        None
     }
 
-    /// Rebuild the `TwoTierIndex` from embedded records.
-    fn rebuild_index(&self, records: &[EmbeddedRecord]) -> SearchResult<TwoTierIndex> {
+    /// Inspect both canonical tiers.
+    fn canonical_tier_states(&self) -> SearchResult<(TierState, TierState)> {
+        let fast_state = match self.resolve_existing_fast_path() {
+            Some(path) => inspect_tier(&path)?,
+            None => TierState::Missing,
+        };
+        let quality_path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let quality_state = inspect_tier(&quality_path)?;
+        Ok((fast_state, quality_state))
+    }
+
+    /// Apply the full identity admission law to the existing canonical
+    /// generation (guards 2, 7, 8).
+    ///
+    /// - live legacy v1 tiers keep the landed containment refusal, the fast
+    ///   tier named first (matching origin 5386b39e);
+    /// - attested v2 tiers are gated per tier: space join against the
+    ///   artifact's OWN header fingerprints, then SameProducer-only producer
+    ///   conformance; an attested quality tier additionally requires a
+    ///   quality embedder capable of republishing it;
+    /// - only a content-free generation (missing artifacts or empty v1
+    ///   seeds) classifies as bootstrap-replaceable.
+    fn classify_existing_generation(
+        &self,
+        fast_state: &TierState,
+        quality_state: &TierState,
+    ) -> SearchResult<ExistingGenerationClass> {
+        let fast_v1_live = matches!(fast_state, TierState::LegacyV1 { live: true });
+        let quality_v1_live = matches!(quality_state, TierState::LegacyV1 { live: true });
+        if fast_v1_live || quality_v1_live {
+            // Name the fast tier whenever it is identityless, else quality —
+            // the same attribution the landed containment refusal used.
+            let tier = if matches!(fast_state, TierState::LegacyV1 { .. }) {
+                "fast"
+            } else {
+                "quality"
+            };
+            return Err(identityless_refusal(tier));
+        }
+
+        let fast_is_v2 = matches!(fast_state, TierState::V2 { .. });
+        let quality_is_v2 = matches!(quality_state, TierState::V2 { .. });
+        if !fast_is_v2 && !quality_is_v2 {
+            return Ok(ExistingGenerationClass::BootstrapReplaceable);
+        }
+
+        if let TierState::V2 { metadata } = fast_state {
+            let bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
+            admit_attested_tier("fast", metadata, &bundle)?;
+        }
+        if let TierState::V2 { metadata } = quality_state {
+            let Some(quality_embedder) = &self.quality_embedder else {
+                return Err(quality_republication_unavailable());
+            };
+            let bundle = artifact_identity_for(quality_embedder.as_ref())?;
+            admit_attested_tier("quality", metadata, &bundle)?;
+        }
+        Ok(ExistingGenerationClass::AttestedV2)
+    }
+
+    /// Pre-drain admission for the canonical cycle: only the bootstrap lane
+    /// may proceed; an identity-admissible attested v2 replacement refuses
+    /// with the composite generation-authority reason (see the module docs
+    /// and [`composite_authority_refusal`]).
+    fn ensure_canonical_cycle_admissible(&self) -> SearchResult<()> {
+        let (fast_state, quality_state) = self.canonical_tier_states()?;
+        match self.classify_existing_generation(&fast_state, &quality_state)? {
+            ExistingGenerationClass::BootstrapReplaceable => Ok(()),
+            ExistingGenerationClass::AttestedV2 => {
+                Err(composite_authority_refusal(&self.config.index_dir))
+            }
+        }
+    }
+
+    /// Rebuild the `TwoTierIndex` from identity-bound records — the
+    /// bootstrap lane (content-free canonical generation only).
+    ///
+    /// The producing identities are declared on the builder
+    /// (`set_*_identity`, process-local, DECLARED — the persisted artifacts
+    /// stay v1 and never read as attested), and every bound record is
+    /// re-verified against the executing embedder's identity under the
+    /// SameProducer-only law before its vector is written.
+    fn rebuild_index(&self, records: &[RefreshRecord]) -> SearchResult<TwoTierIndex> {
         // Repeat the admission check after embedding to close the race where
         // another publisher installs a generation between the pre-drain check
         // and this rebuild. Only this race fallback consumes one retry.
-        self.ensure_no_existing_generation_for_merge()?;
+        self.ensure_canonical_cycle_admissible()?;
 
         let mut builder =
             TwoTierIndex::create(&self.config.index_dir, self.config.index_config.clone())?;
@@ -650,6 +1209,29 @@ impl RefreshWorker {
         if let Some(ref quality) = self.quality_embedder {
             builder.set_quality_embedder_id(quality.id());
         }
+
+        // Declare the producing identities. Records exist only when bound
+        // harvesting succeeded, so the fast identity is available; a quality
+        // identity is required exactly when quality-bound records exist.
+        let fast_expected = self.fast_embedder.identity()?.clone();
+        builder.set_fast_identity(&fast_expected)?;
+        let need_quality_identity = records
+            .iter()
+            .any(|record| record.quality_embedding.is_some());
+        let quality_expected = if need_quality_identity {
+            let Some(quality_embedder) = &self.quality_embedder else {
+                return Err(SearchError::InvalidConfig {
+                    field: "refresh.quality_identity".to_owned(),
+                    value: "missing-quality-embedder".to_owned(),
+                    reason: "quality-bound records exist without a quality embedder".to_owned(),
+                });
+            };
+            let expected = quality_embedder.identity()?.clone();
+            builder.set_quality_identity(&expected)?;
+            Some(expected)
+        } else {
+            None
+        };
 
         // Keep only the latest update per doc_id from this cycle.
         let mut latest_by_doc_id = HashMap::new();
@@ -664,14 +1246,383 @@ impl RefreshWorker {
             if consumed[idx] {
                 continue;
             }
+            // Guard 7 at the write seam: every vector written must be bound
+            // to the identity being declared for this generation. This is
+            // the defense against an embedder whose bound outputs disagree
+            // with its `identity()` (SameProducer only; certified-compatible
+            // foreign producers are refused, see [`require_same_producer`]).
+            require_same_producer(&record.fast_embedding, &fast_expected, "fast")?;
+            if let Some(quality_embedding) = &record.quality_embedding {
+                let Some(expected) = &quality_expected else {
+                    return Err(SearchError::InvalidConfig {
+                        field: "refresh.quality_identity".to_owned(),
+                        value: "missing-quality-identity".to_owned(),
+                        reason: "quality-bound record exists without a declared quality identity"
+                            .to_owned(),
+                    });
+                };
+                require_same_producer(quality_embedding, expected, "quality")?;
+            }
             builder.add_record(
                 &record.doc_id,
-                &record.fast_embedding,
-                record.quality_embedding.as_deref(),
+                record.fast_embedding.vector(),
+                record
+                    .quality_embedding
+                    .as_ref()
+                    .map(BoundQueryEmbedding::vector),
             )?;
         }
 
         builder.finish()
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged identity-bound replacement (the C4-write merge)
+    // -----------------------------------------------------------------------
+
+    /// Embed `jobs` identity-bound with NO queue interaction: staging must
+    /// not consume retry budget or record content hashes, because the
+    /// canonical generation is not being published. Any failure propagates.
+    async fn embed_jobs_bound_strict(
+        &self,
+        cx: &Cx,
+        jobs: &[EmbeddingJob],
+    ) -> SearchResult<Vec<RefreshRecord>> {
+        let embed_start = Instant::now();
+        let texts: Vec<&str> = jobs.iter().map(|j| j.canonical_text.as_str()).collect();
+        let fast_bound = self.fast_embedder.embed_batch_bound(cx, &texts).await?;
+        if fast_bound.len() != jobs.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "refresh.staged_embedding".to_owned(),
+                value: fast_bound.len().to_string(),
+                reason: format!(
+                    "fast embedder returned {} bound vectors for {} inputs",
+                    fast_bound.len(),
+                    jobs.len()
+                ),
+            });
+        }
+        let quality_bound = match &self.quality_embedder {
+            Some(quality) => {
+                let bound = quality.embed_batch_bound(cx, &texts).await?;
+                if bound.len() != jobs.len() {
+                    return Err(SearchError::InvalidConfig {
+                        field: "refresh.staged_embedding".to_owned(),
+                        value: bound.len().to_string(),
+                        reason: format!(
+                            "quality embedder returned {} bound vectors for {} inputs",
+                            bound.len(),
+                            jobs.len()
+                        ),
+                    });
+                }
+                Some(bound)
+            }
+            None => None,
+        };
+        let embed_us = u64::try_from(embed_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.metrics
+            .embed_time_us
+            .fetch_add(embed_us, Ordering::Relaxed);
+
+        let mut quality_iter = quality_bound.map(Vec::into_iter);
+        let mut records = Vec::with_capacity(jobs.len());
+        for (job, fast_ib) in jobs.iter().zip(fast_bound) {
+            let quality_embedding = match quality_iter.as_mut().and_then(Iterator::next) {
+                Some(ib) => Some(into_bound_query(ib)?),
+                None => None,
+            };
+            records.push(RefreshRecord {
+                doc_id: job.doc_id.clone(),
+                fast_embedding: into_bound_query(fast_ib)?,
+                quality_embedding,
+                content_hash: job.content_hash.clone(),
+            });
+        }
+        self.metrics.docs_embedded.fetch_add(
+            u64::try_from(records.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(records)
+    }
+
+    /// Stage the typed identity-bound replacement generation — the merge
+    /// that replaces the former blanket refusal (bd-9xuj T2 C4-write).
+    ///
+    /// Reads the existing canonical generation through exact FSVI v2
+    /// admission (attested identity only; live v1 keeps the typed
+    /// `identityless-fsvi-v1` refusal), joins every bound embedding's space
+    /// fingerprint against the tier's attested identity
+    /// ([`BoundQueryEmbedding::verify_space_identity`]) and applies the
+    /// SameProducer-only producer law
+    /// ([`BoundQueryEmbedding::verify_producer_conformance`] via
+    /// [`require_same_producer`]), merges the carried live rows with the new
+    /// records (new wins per `doc_id`; tombstoned rows are never
+    /// resurrected), and writes the replacement via
+    /// [`VectorIndex::create_v2`] into the non-canonical `v2-staged/`
+    /// directory. The staged pair is then re-admitted through
+    /// [`TwoTierIndex::open_admitted_v2_with_paths`], so the returned
+    /// generation's identity is proven from its own header bytes.
+    ///
+    /// The queue is untouched: `jobs` are caller-supplied, nothing is
+    /// drained, no content hash is recorded, and the canonical generation's
+    /// bytes are not modified. Canonical installation is a separate,
+    /// currently-refused step ([`Self::publish_staged_canonical`]).
+    ///
+    /// # Errors
+    ///
+    /// Typed identity refusals (space, producer, legacy, republication),
+    /// admission failures, and I/O errors from staging.
+    #[allow(clippy::too_many_lines)]
+    pub async fn stage_identity_bound_generation(
+        &self,
+        cx: &Cx,
+        jobs: &[EmbeddingJob],
+    ) -> SearchResult<StagedIdentityBoundGeneration> {
+        // 1. Gates over the existing canonical generation (typed refusals,
+        //    fast-first, identical to the canonical lane).
+        let (fast_state, quality_state) = self.canonical_tier_states()?;
+        self.classify_existing_generation(&fast_state, &quality_state)?;
+
+        // 2. Harvest identity-bound records (strict; no queue interaction).
+        let records = self.embed_jobs_bound_strict(cx, jobs).await?;
+
+        // 3. Exact admission of the existing attested tiers. The
+        //    reconstructed binding re-proves space/producer/input equality
+        //    bit-for-bit against the artifact's own header.
+        let fast_admitted = if let TierState::V2 { metadata } = &fast_state {
+            let path =
+                self.resolve_existing_fast_path()
+                    .ok_or_else(|| SearchError::IndexNotFound {
+                        path: self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME),
+                    })?;
+            Some(admit_existing_tier(
+                &path,
+                metadata,
+                self.fast_embedder.as_ref(),
+                "fast",
+            )?)
+        } else {
+            None
+        };
+        let quality_admitted = if let TierState::V2 { metadata } = &quality_state {
+            let Some(quality_embedder) = &self.quality_embedder else {
+                return Err(quality_republication_unavailable());
+            };
+            let path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            Some(admit_existing_tier(
+                &path,
+                metadata,
+                quality_embedder.as_ref(),
+                "quality",
+            )?)
+        } else {
+            None
+        };
+
+        // 4. Per-embedding seam verification (C1r2 verifiers): each bound
+        //    embedding must be the same producer as the identity being
+        //    republished, and must join the attested space of any tier it is
+        //    merged into. (Producer equality against the ATTESTED producer
+        //    follows transitively: record == executing identity ==
+        //    reconstructed binding == header, all checked above.)
+        let fast_expected = self.fast_embedder.identity()?.clone();
+        let quality_expected = match &self.quality_embedder {
+            Some(quality)
+                if records
+                    .iter()
+                    .any(|record| record.quality_embedding.is_some()) =>
+            {
+                Some(quality.identity()?.clone())
+            }
+            _ => None,
+        };
+        for record in &records {
+            require_same_producer(&record.fast_embedding, &fast_expected, "fast")?;
+            if let Some((_, attested_space_hex)) = &fast_admitted {
+                record
+                    .fast_embedding
+                    .verify_space_identity(attested_space_hex, "fast")?;
+            }
+            if let Some(quality_embedding) = &record.quality_embedding {
+                let Some(expected) = &quality_expected else {
+                    return Err(SearchError::InvalidConfig {
+                        field: "refresh.quality_identity".to_owned(),
+                        value: "missing-quality-identity".to_owned(),
+                        reason: "quality-bound record exists without a quality embedder identity"
+                            .to_owned(),
+                    });
+                };
+                require_same_producer(quality_embedding, expected, "quality")?;
+                if let Some((_, attested_space_hex)) = &quality_admitted {
+                    quality_embedding.verify_space_identity(attested_space_hex, "quality")?;
+                }
+            }
+        }
+
+        // 5. Merge: carried live rows first (tombstones stay dead), then the
+        //    new records override per doc_id (last write in the batch wins).
+        let mut merged: HashMap<String, (Vec<f32>, Option<Vec<f32>>)> = HashMap::new();
+        if let Some((fast_owner, _)) = &fast_admitted {
+            let mut quality_lookup: HashMap<String, Vec<f32>> = HashMap::new();
+            if let Some((quality_owner, _)) = &quality_admitted {
+                for i in 0..quality_owner.record_count() {
+                    let row = quality_owner.row(i)?;
+                    if !row.flags().is_live() {
+                        continue;
+                    }
+                    let doc_id = row.doc_id().to_owned();
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        quality_lookup.entry(doc_id)
+                    {
+                        entry.insert(quality_owner.vector_at_f32(i)?);
+                    }
+                }
+            }
+            for i in 0..fast_owner.record_count() {
+                let row = fast_owner.row(i)?;
+                if !row.flags().is_live() {
+                    continue;
+                }
+                let doc_id = row.doc_id().to_owned();
+                let vector = fast_owner.vector_at_f32(i)?;
+                let quality = quality_lookup.get(&doc_id).cloned();
+                merged.insert(doc_id, (vector, quality));
+            }
+        }
+        for record in &records {
+            merged.insert(
+                record.doc_id.clone(),
+                (
+                    record.fast_embedding.vector().to_vec(),
+                    record
+                        .quality_embedding
+                        .as_ref()
+                        .map(|bound| bound.vector().to_vec()),
+                ),
+            );
+        }
+        if merged.is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "refresh.staged_generation".to_owned(),
+                value: "empty".to_owned(),
+                reason: "no rows to stage: the job batch produced no records and the canonical \
+                         generation carries no live rows"
+                    .to_owned(),
+            });
+        }
+
+        // 6. Write the staged replacement via the production v2 writer.
+        let staged_dir = self.config.index_dir.join(STAGED_V2_DIR_NAME);
+        std::fs::create_dir_all(&staged_dir).map_err(SearchError::Io)?;
+        let staged_fast = staged_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let staged_quality = staged_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let _ = std::fs::remove_file(&staged_fast);
+        let _ = std::fs::remove_file(&staged_quality);
+
+        let fast_sequence =
+            next_generation_sequence(fast_admitted.as_ref().map(|(owner, _)| owner))?;
+        let fast_artifact_bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
+        let fast_generation = ArtifactGenerationIdentityV1::new(
+            fast_sequence,
+            generation_nonce(&self.config.index_dir, "fast", fast_sequence),
+        )?;
+        let fast_binding =
+            FsviV2IdentityBinding::new(fast_generation, fast_artifact_bundle.freeze()?)?;
+        let mut fast_writer = VectorIndex::create_v2(&staged_fast, fast_binding.clone())?;
+        for (doc_id, (vector, _)) in &merged {
+            fast_writer.write_record(doc_id, vector)?;
+        }
+        fast_writer.finish()?;
+
+        let quality_rows: Vec<(&String, &Vec<f32>)> = merged
+            .iter()
+            .filter_map(|(doc_id, (_, quality))| quality.as_ref().map(|q| (doc_id, q)))
+            .collect();
+        let quality_binding = if quality_rows.is_empty() {
+            None
+        } else {
+            let Some(quality_embedder) = &self.quality_embedder else {
+                return Err(SearchError::InvalidConfig {
+                    field: "refresh.quality_identity".to_owned(),
+                    value: "missing-quality-embedder".to_owned(),
+                    reason: "quality rows were merged without a quality embedder".to_owned(),
+                });
+            };
+            let quality_sequence =
+                next_generation_sequence(quality_admitted.as_ref().map(|(owner, _)| owner))?;
+            let quality_bundle = artifact_identity_for(quality_embedder.as_ref())?;
+            let quality_generation = ArtifactGenerationIdentityV1::new(
+                quality_sequence,
+                generation_nonce(&self.config.index_dir, "quality", quality_sequence),
+            )?;
+            let binding = FsviV2IdentityBinding::new(quality_generation, quality_bundle.freeze()?)?;
+            let mut quality_writer = VectorIndex::create_v2(&staged_quality, binding.clone())?;
+            for (doc_id, vector) in quality_rows {
+                quality_writer.write_record(doc_id, vector)?;
+            }
+            quality_writer.finish()?;
+            Some(binding)
+        };
+
+        // 7. Prove the staged generation by re-admitting it through the only
+        //    legitimate v2 open path; the returned index's identity is
+        //    header-attested by construction.
+        let mut staged_paths = TwoTierIndexPaths::new(&staged_fast);
+        if quality_binding.is_some() {
+            staged_paths = staged_paths.with_quality_index(&staged_quality);
+        }
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &staged_paths,
+            self.config.index_config.clone(),
+            &fast_binding,
+            quality_binding.as_ref(),
+        )?;
+        debug_assert!(index.fast_identity_is_attested());
+
+        info!(
+            target: "frankensearch.refresh",
+            staged_fast = %staged_fast.display(),
+            staged_quality = quality_binding.is_some(),
+            rows = merged.len(),
+            generation_sequence = fast_sequence,
+            "identity-bound replacement generation staged and admitted (non-canonical)"
+        );
+
+        Ok(StagedIdentityBoundGeneration {
+            index,
+            fast_path: staged_fast,
+            quality_path: quality_binding.as_ref().map(|_| staged_quality),
+            fast_binding,
+            quality_binding,
+        })
+    }
+
+    /// Canonical installation of a staged generation — REFUSED in this slice.
+    ///
+    /// Installing the staged fast/quality pair over the canonical filenames
+    /// would be a split two-rename publication with no atomic pair
+    /// authority; a crash between the renames leaves mixed generations
+    /// serving. This slice deliberately does not invent a pair-atomicity
+    /// primitive. The refusal is typed (`refresh.canonical_publication` /
+    /// `composite-generation-authority-unavailable`) and reopens when the
+    /// composite generation-authority primitive lands (bd-xomn.1/.3).
+    ///
+    /// # Errors
+    ///
+    /// Always returns the typed composite-authority refusal in this slice.
+    pub fn publish_staged_canonical(
+        &self,
+        staged: &StagedIdentityBoundGeneration,
+    ) -> SearchResult<()> {
+        warn!(
+            target: "frankensearch.refresh",
+            staged_fast = %staged.fast_path.display(),
+            index_dir = %self.config.index_dir.display(),
+            "canonical publication of a staged split generation refused: composite \
+             generation authority unavailable (bd-xomn.1/.3)"
+        );
+        Err(composite_authority_refusal(&self.config.index_dir))
     }
 
     /// Reference to the index directory.
@@ -701,25 +1652,54 @@ mod tests {
     use crate::cache::SentinelFileDetector;
     use crate::queue::{EmbeddingQueueConfig, EmbeddingRequest, JobOutcome};
 
-    // -- Stub embedder for tests -----------------------------------------------
+    // -- Stub embedders for tests ----------------------------------------------
 
     struct StubEmbedder {
         id: &'static str,
         dimension: usize,
         space_offset: f32,
+        identity: EmbeddingIdentityBundleV1,
     }
 
     impl StubEmbedder {
-        const fn new(id: &'static str, dimension: usize) -> Self {
+        fn new(id: &'static str, dimension: usize) -> Self {
             Self::in_space(id, dimension, 0.0)
         }
 
-        const fn in_space(id: &'static str, dimension: usize, space_offset: f32) -> Self {
+        /// Same display id, different `space_offset` = a genuinely different
+        /// vector space AND a different typed space identity: the identity
+        /// model key embeds the offset, mirroring how a real model change
+        /// alters the immutable space identity even when the display id
+        /// stays the same.
+        fn in_space(id: &'static str, dimension: usize, space_offset: f32) -> Self {
+            let identity = EmbeddingIdentityBundleV1::explicit_test_model(
+                &format!("{id}#space-{space_offset}"),
+                u32::try_from(dimension).expect("test dimension fits u32"),
+            );
             Self {
                 id,
                 dimension,
                 space_offset,
+                identity,
             }
+        }
+
+        /// Stub with an explicit identity bundle (foreign-producer fixtures).
+        fn with_identity(
+            id: &'static str,
+            dimension: usize,
+            identity: EmbeddingIdentityBundleV1,
+        ) -> Self {
+            Self {
+                id,
+                dimension,
+                space_offset: 0.0,
+                identity,
+            }
+        }
+
+        fn identity_bundle(&self) -> &EmbeddingIdentityBundleV1 {
+            &self.identity
         }
     }
 
@@ -728,6 +1708,10 @@ mod tests {
             let dim = self.dimension;
             let seed = text.len() as f32 + self.space_offset;
             Box::pin(async move { Ok((0..dim).map(|i| (seed + i as f32).sin()).collect()) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
         }
 
         fn id(&self) -> &str {
@@ -792,6 +1776,68 @@ mod tests {
         }
     }
 
+    /// An embedder whose bound outputs carry a DIFFERENT (but
+    /// conformance-certified sibling) producer than its own `identity()` —
+    /// the hostile shape the per-record seam check exists for.
+    struct TwoFacedEmbedder {
+        public_identity: EmbeddingIdentityBundleV1,
+        bound_identity: EmbeddingIdentityBundleV1,
+        dimension: usize,
+    }
+
+    impl Embedder for TwoFacedEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let dim = self.dimension;
+            let seed = text.len() as f32;
+            Box::pin(async move { Ok((0..dim).map(|i| (seed + i as f32).sin()).collect()) })
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+            Box::pin(async move {
+                let vectors = self.embed_batch(cx, texts).await?;
+                vectors
+                    .into_iter()
+                    .map(|values| {
+                        let bound = IdentityBoundEmbedding {
+                            values,
+                            identity: self.bound_identity.clone(),
+                        };
+                        bound.validate()?;
+                        Ok(bound)
+                    })
+                    .collect()
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.public_identity)
+        }
+
+        fn id(&self) -> &'static str {
+            "two-faced-embedder"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "two-faced-embedder"
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
     // -- Test helpers ----------------------------------------------------------
 
     fn make_queue(capacity: usize) -> Arc<EmbeddingQueue> {
@@ -844,6 +1890,19 @@ mod tests {
         Arc::new(IndexCache::open(dir, TwoTierConfig::default(), detector).unwrap())
     }
 
+    /// Seed the cache from an empty v1 FALLBACK artifact (`vector.idx`), so
+    /// a v2 canonical fast artifact (`vector.fast.idx`) can be installed
+    /// afterwards without breaking the (v1-only) cache open.
+    fn make_cache_with_fallback_seed(dir: &Path, dimension: usize) -> Arc<IndexCache> {
+        let seed_path = dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        VectorIndex::create(&seed_path, "stub-fast", dimension)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let detector = Box::new(SentinelFileDetector::new());
+        Arc::new(IndexCache::open(dir, TwoTierConfig::default(), detector).unwrap())
+    }
+
     fn make_worker(
         queue: Arc<EmbeddingQueue>,
         dir: &Path,
@@ -854,6 +1913,79 @@ mod tests {
         let fast = Arc::new(StubEmbedder::new("stub-fast", dimension));
         let worker = RefreshWorker::new(config, queue, fast, cache.clone());
         (worker, cache)
+    }
+
+    fn normalized(dim: usize, seed: f32) -> Vec<f32> {
+        let raw: Vec<f32> = (0..dim).map(|i| seed + 1.0 + i as f32).collect();
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.iter().map(|x| x / norm).collect()
+    }
+
+    /// The fsvi-v2 artifact-storage variant of an in-memory identity bundle
+    /// (what `artifact_identity_for` derives for an embedder).
+    fn artifact_variant(bundle: &EmbeddingIdentityBundleV1) -> EmbeddingIdentityBundleV1 {
+        let mut artifact = bundle.clone();
+        "fsvi-v2".clone_into(&mut artifact.storage.format);
+        artifact.storage.quantization = QuantizationFormat::F16;
+        "little-endian".clone_into(&mut artifact.storage.endianness);
+        artifact
+    }
+
+    fn v2_binding(
+        bundle_in_memory: &EmbeddingIdentityBundleV1,
+        sequence: u64,
+    ) -> FsviV2IdentityBinding {
+        let artifact = artifact_variant(bundle_in_memory);
+        let generation =
+            ArtifactGenerationIdentityV1::new(sequence, [0x3b; 16]).expect("test generation");
+        FsviV2IdentityBinding::new(generation, artifact.freeze().expect("freeze artifact"))
+            .expect("valid binding")
+    }
+
+    fn write_v2_tier(path: &Path, binding: &FsviV2IdentityBinding, rows: &[(&str, Vec<f32>)]) {
+        let mut writer = VectorIndex::create_v2(path, binding.clone()).expect("create_v2 fixture");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+    }
+
+    fn admitted_vectors_by_doc(owner: &ValidatedFsviBytes) -> HashMap<String, Vec<f32>> {
+        let mut out = HashMap::new();
+        for i in 0..owner.record_count() {
+            let row = owner.row(i).expect("row");
+            if !row.flags().is_live() {
+                continue;
+            }
+            out.insert(
+                row.doc_id().to_owned(),
+                owner.vector_at_f32(i).expect("vector"),
+            );
+        }
+        out
+    }
+
+    /// Assert a typed `InvalidConfig` refusal with the exact field and value.
+    #[track_caller]
+    fn assert_invalid_config(error: &SearchError, expected_field: &str, expected_value: &str) {
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == expected_field && value == expected_value
+            ),
+            "expected InvalidConfig {{ field: {expected_field:?}, value: {expected_value:?} }}, \
+             got {error:?}"
+        );
+    }
+
+    /// Reason string of a typed `InvalidConfig` refusal (empty for other
+    /// variants; call after [`assert_invalid_config`]).
+    fn invalid_config_reason(error: &SearchError) -> &str {
+        match error {
+            SearchError::InvalidConfig { reason, .. } => reason.as_str(),
+            _ => "",
+        }
     }
 
     // -- Tests -----------------------------------------------------------------
@@ -920,6 +2052,67 @@ mod tests {
             // Cache should have the new index (2 docs, not the seed).
             let current = cache.current();
             assert_eq!(current.doc_count(), 2);
+        });
+    }
+
+    /// Red proof (c), production surface: the bootstrap lane declares the
+    /// producing identity (retained, C2) but the published artifacts are v1
+    /// — the identity is DECLARED, never attested, and the next cycle's
+    /// admission does not accept it.
+    #[test]
+    fn bootstrap_publishes_declared_identity_never_attested() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("declared-not-attested");
+            let queue = make_queue(100);
+            submit(&queue, "doc-1", "Hello world");
+            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            worker.run_cycle(&cx).await.unwrap();
+
+            let current = cache.current();
+            assert!(
+                current.fast_declared_identity().is_some(),
+                "the bootstrap lane must declare the producing identity (C2 retention)"
+            );
+            assert_eq!(
+                current.fast_space_fingerprint_hex(),
+                Some(
+                    StubEmbedder::new("stub-fast", 256)
+                        .identity_bundle()
+                        .space
+                        .fingerprint()
+                        .as_str()
+                ),
+            );
+            assert!(
+                !current.fast_identity_is_attested(),
+                "a v1 bootstrap publication is DECLARED, never header-attested"
+            );
+
+            // Declared-only retention never unlocks the merge: the on-disk
+            // generation is live v1 and the next cycle keeps the typed
+            // containment refusal.
+            submit(&queue, "doc-2", "Second document");
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("declared-only generation must keep the identityless refusal");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
+
+            // Staging refuses the same way: declared-not-attested rejects.
+            let jobs = queue.drain_batch();
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("staging must not admit a declared-only (v1) generation");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
         });
     }
 
@@ -1657,4 +2850,626 @@ mod tests {
     }
 
     // ─── bd-wt20 tests end ────────────────────────────────────────────
+
+    // ─── bd-9xuj T2 C4-write red proofs ───────────────────────────────
+
+    const V2_DIM: usize = 8;
+
+    /// Fixture: cache seeded from an empty v1 FALLBACK artifact, then a live
+    /// attested v2 canonical fast generation written under `bundle`.
+    fn v2_canonical_fixture(
+        label: &str,
+        bundle: &EmbeddingIdentityBundleV1,
+        rows: &[(&str, Vec<f32>)],
+        sequence: u64,
+    ) -> (PathBuf, Arc<IndexCache>, FsviV2IdentityBinding, PathBuf) {
+        let dir = temp_index_dir(label);
+        let cache = make_cache_with_fallback_seed(&dir, V2_DIM);
+        let binding = v2_binding(bundle, sequence);
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_v2_tier(&fast_path, &binding, rows);
+        (dir, cache, binding, fast_path)
+    }
+
+    /// Finding-1 regression + composite-authority guard: an attested,
+    /// same-producer, space-matching v2 canonical generation is recognized
+    /// through inspection/admission (never plain-opened), the identity gates
+    /// PASS, and the cycle still refuses pre-drain with the typed
+    /// composite-generation-authority reason — with ZERO side effects: no
+    /// drain, no embed, no write, no staging.
+    #[test]
+    fn live_v2_same_producer_cycle_refuses_composite_authority_with_zero_side_effects() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "v2-composite-guard",
+                embedder.identity_bundle(),
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                7,
+            );
+            let canonical_bytes = std::fs::read(&fast_path).expect("read canonical");
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("canonical publication must be refused until composite authority");
+            assert_invalid_config(
+                &error,
+                "refresh.canonical_publication",
+                "composite-generation-authority-unavailable",
+            );
+            assert!(
+                invalid_config_reason(&error).contains("bd-xomn"),
+                "reason must name the dependency"
+            );
+
+            // Zero side effects: nothing drained, embedded, written, staged.
+            assert_eq!(queue.pending_count(), 1, "refusal must fire before drain");
+            let snap = worker.metrics().snapshot();
+            assert_eq!(snap.docs_embedded, 0);
+            assert_eq!(snap.index_rebuilds, 0);
+            assert_eq!(snap.rebuild_failures, 0);
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                canonical_bytes,
+                "admission/inspection must not mutate the canonical artifact"
+            );
+            assert!(
+                !dir.join(STAGED_V2_DIR_NAME).exists(),
+                "run_cycle must not stage as a side effect"
+            );
+            let drained = queue.drain_batch();
+            assert_eq!(drained[0].retry_count, 0, "no retry budget consumed");
+        });
+    }
+
+    /// Red proof (a), positive re-enablement: the same-producer, attested,
+    /// space-matching merge the containment refused is now staged
+    /// successfully — carried rows plus updates plus new documents — and the
+    /// replacement's identity is verified from the republished artifact's
+    /// OWN header bytes through `open_admitted_v2` (reviewer caution: never
+    /// only against the in-memory bundle).
+    #[test]
+    fn staging_same_producer_merges_and_republishes_attested_v2() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, canonical_binding, fast_path) = v2_canonical_fixture(
+                "v2-stage-positive",
+                embedder.identity_bundle(),
+                &[
+                    ("old-1", normalized(V2_DIM, 0.25)),
+                    ("old-2", normalized(V2_DIM, 0.75)),
+                ],
+                7,
+            );
+            let canonical_bytes = std::fs::read(&fast_path).expect("read canonical");
+
+            let queue = make_queue(100);
+            submit(&queue, "old-2", "updated content for old-2");
+            submit(&queue, "doc-3", "a brand new document");
+            let jobs = queue.drain_batch();
+            assert_eq!(jobs.len(), 2);
+
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder.clone(),
+                cache,
+            );
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("same-producer attested merge must stage successfully");
+
+            // The staged two-tier view is attested and carries all rows.
+            assert_eq!(staged.index.doc_count(), 3);
+            assert!(staged.index.fast_identity_is_attested());
+            assert_eq!(
+                staged.index.fast_space_fingerprint_hex(),
+                Some(embedder.identity_bundle().space.fingerprint().as_str())
+            );
+            assert_eq!(
+                staged.fast_binding.generation().sequence,
+                8,
+                "replacement generation must succeed the attested sequence 7"
+            );
+
+            // REVIEWER CAUTION: prove the identity from the artifact's own
+            // header bytes via the only legitimate v2 open path.
+            let staged_owner =
+                VectorIndex::open_admitted_v2(&staged.fast_path, &staged.fast_binding)
+                    .expect("staged artifact must admit exactly");
+            assert_eq!(
+                fingerprint_hex(&staged_owner.identity_v2().space_fingerprint),
+                embedder.identity_bundle().space.fingerprint(),
+                "the header of the republished artifact must carry the producing space \
+                 fingerprint bit-for-bit"
+            );
+            let staged_vectors = admitted_vectors_by_doc(&staged_owner);
+            assert_eq!(staged_vectors.len(), 3);
+
+            // Carried row is byte-stable; updated row actually changed.
+            let canonical_owner = VectorIndex::open_admitted_v2(&fast_path, &canonical_binding)
+                .expect("canonical artifact still admits");
+            let canonical_vectors = admitted_vectors_by_doc(&canonical_owner);
+            assert_eq!(
+                staged_vectors.get("old-1"),
+                canonical_vectors.get("old-1"),
+                "carried rows must be preserved exactly"
+            );
+            assert_ne!(
+                staged_vectors.get("old-2"),
+                canonical_vectors.get("old-2"),
+                "updated rows must carry the NEW embedding"
+            );
+            assert!(staged_vectors.contains_key("doc-3"));
+
+            // Staging is non-canonical and queue-neutral.
+            assert!(staged.fast_path.starts_with(dir.join(STAGED_V2_DIR_NAME)));
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                canonical_bytes,
+                "staging must not touch the canonical generation"
+            );
+            assert_eq!(queue.pending_count(), 0);
+        });
+    }
+
+    /// Red proof (b): a cross-space attempt is rejected with the NEW typed
+    /// space-identity reason — not the generic republication refusal — both
+    /// at the staging seam and pre-drain in the canonical cycle.
+    #[test]
+    fn cross_space_attempt_rejects_with_typed_space_identity() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // Canonical generation from model alpha; executing embedder is
+            // model beta at the SAME dimension (the case dimension checks
+            // can never catch).
+            let alpha = EmbeddingIdentityBundleV1::explicit_test_model(
+                "canonical-model-alpha",
+                u32::try_from(V2_DIM).expect("dim"),
+            );
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "v2-cross-space",
+                &alpha,
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                3,
+            );
+            let canonical_bytes = std::fs::read(&fast_path).expect("read canonical");
+            let beta = Arc::new(StubEmbedder::new("beta-stub", V2_DIM));
+            let beta_space_fingerprint = beta.identity_bundle().space.fingerprint();
+            assert_ne!(beta_space_fingerprint, alpha.space.fingerprint());
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), beta, cache);
+
+            // Canonical cycle: typed cross-space refusal, pre-drain.
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("cross-space merge must be refused");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_space_identity",
+                &beta_space_fingerprint,
+            );
+            assert!(
+                invalid_config_reason(&error).contains(&alpha.space.fingerprint()),
+                "reason must carry the attested space fingerprint"
+            );
+            assert_eq!(queue.pending_count(), 1);
+
+            // Staging seam: same typed refusal.
+            let jobs = queue.drain_batch();
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("cross-space staging must be refused");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_space_identity",
+                &beta_space_fingerprint,
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                canonical_bytes
+            );
+        });
+    }
+
+    /// Red proof (d): a producer that IS conformance-certified against the
+    /// attested producer (same space, byte-identical golden certificate,
+    /// different attested backend) — the exact
+    /// `ConformanceCompatibleProducer` shape — is refused with the typed
+    /// `executing-producer-attestation-unavailable` reason carrying both
+    /// producer fingerprints (truthful telemetry).
+    #[test]
+    fn certified_sibling_producer_refused_attestation_unavailable() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let base = EmbeddingIdentityBundleV1::explicit_test_model(
+                "shared-space-model",
+                u32::try_from(V2_DIM).expect("dim"),
+            );
+            let mut sibling = base.clone();
+            "alternate-conformant-backend".clone_into(&mut sibling.producer.backend);
+            sibling.validate().expect("sibling must validate");
+            assert!(
+                sibling.is_conformance_compatible_with(&base)
+                    && base.is_conformance_compatible_with(&sibling),
+                "fixture must be the certified conformance-compatible shape"
+            );
+            assert_ne!(base.producer.fingerprint(), sibling.producer.fingerprint());
+            assert_eq!(base.space.fingerprint(), sibling.space.fingerprint());
+
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "v2-certified-sibling",
+                &base,
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                3,
+            );
+            let canonical_bytes = std::fs::read(&fast_path).expect("read canonical");
+            let executing = Arc::new(StubEmbedder::with_identity(
+                "sibling-stub",
+                V2_DIM,
+                sibling.clone(),
+            ));
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                executing,
+                cache,
+            );
+
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("certified sibling must still be refused (SameProducer only)");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_producer_conformance",
+                "executing-producer-attestation-unavailable",
+            );
+            let reason = invalid_config_reason(&error);
+            assert!(
+                reason.contains(&base.producer.fingerprint())
+                    && reason.contains(&sibling.producer.fingerprint()),
+                "truthful telemetry must carry both producer fingerprints: {reason}"
+            );
+
+            let jobs = queue.drain_batch();
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("staging must refuse the certified sibling too");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_producer_conformance",
+                "executing-producer-attestation-unavailable",
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                canonical_bytes
+            );
+        });
+    }
+
+    /// Red proof (e), reviewer addition (carry-forward-#1 attack shape): a
+    /// same-space, DIFFERENT-producer bundle whose golden-vector certificate
+    /// is a byte-identical COPY of the attested producer's certificate must
+    /// REJECT. Trivial under SameProducer-only — and exactly the regression
+    /// guard that must stay red when the conformance-compatible lane opens:
+    /// certificate bytes can be copied; executing-producer attestation
+    /// cannot.
+    #[test]
+    fn copied_certificate_foreign_producer_rejects() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let victim = EmbeddingIdentityBundleV1::explicit_test_model(
+                "victim-space-model",
+                u32::try_from(V2_DIM).expect("dim"),
+            );
+            let mut attacker = victim.clone();
+            "attacker-backend".clone_into(&mut attacker.producer.backend);
+            "attacker-rev-1".clone_into(&mut attacker.producer.implementation_revision);
+            attacker.validate().expect("attacker bundle validates");
+            assert_eq!(
+                attacker.producer.golden_vectors, victim.producer.golden_vectors,
+                "the certificate is a byte-identical copy"
+            );
+            assert_ne!(
+                attacker.producer.fingerprint(),
+                victim.producer.fingerprint()
+            );
+            assert_eq!(attacker.space.fingerprint(), victim.space.fingerprint());
+
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "v2-copied-cert",
+                &victim,
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                3,
+            );
+            let canonical_bytes = std::fs::read(&fast_path).expect("read canonical");
+            let executing = Arc::new(StubEmbedder::with_identity(
+                "attacker-stub",
+                V2_DIM,
+                attacker,
+            ));
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                executing,
+                cache,
+            );
+
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("copied certificate must never admit a foreign producer");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_producer_conformance",
+                "executing-producer-attestation-unavailable",
+            );
+
+            let jobs = queue.drain_batch();
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("staging must reject the copied certificate too");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_producer_conformance",
+                "executing-producer-attestation-unavailable",
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                canonical_bytes
+            );
+        });
+    }
+
+    /// The per-record seam half of guard 7: an embedder whose BOUND outputs
+    /// carry a conformance-certified sibling producer while its `identity()`
+    /// attests another is caught at the bound-record seam
+    /// (`verify_producer_conformance` per embedding), not just at the
+    /// artifact gate.
+    #[test]
+    fn two_faced_embedder_refused_at_bound_record_seam() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let public = EmbeddingIdentityBundleV1::explicit_test_model(
+                "two-faced-model",
+                u32::try_from(V2_DIM).expect("dim"),
+            );
+            let mut bound_side = public.clone();
+            "alternate-conformant-backend".clone_into(&mut bound_side.producer.backend);
+            bound_side.validate().expect("bound-side validates");
+            assert!(bound_side.is_conformance_compatible_with(&public));
+
+            let dir = temp_index_dir("two-faced");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, V2_DIM);
+            let embedder = Arc::new(TwoFacedEmbedder {
+                public_identity: public,
+                bound_identity: bound_side,
+                dimension: V2_DIM,
+            });
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+
+            submit(&queue, "doc-1", "some document");
+            let jobs = queue.drain_batch();
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("bound records from a different producer must be refused");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_producer_conformance",
+                "executing-producer-attestation-unavailable",
+            );
+        });
+    }
+
+    /// Finding-2 pin: canonical installation of a staged (proven) generation
+    /// is refused with the typed composite-generation-authority reason, and
+    /// the canonical directory is untouched by both staging and the refusal.
+    #[test]
+    fn publish_staged_canonical_refuses_split_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("staged-publish-guard");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, V2_DIM);
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let seed_bytes = std::fs::read(&fast_path).expect("read v1 seed");
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+
+            submit(&queue, "doc-1", "some document");
+            let jobs = queue.drain_batch();
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("staging over an empty seed must succeed");
+            assert!(staged.fast_path.exists());
+            assert!(staged.index.fast_identity_is_attested());
+
+            let error = worker
+                .publish_staged_canonical(&staged)
+                .expect_err("split canonical publication must be refused in this slice");
+            assert_invalid_config(
+                &error,
+                "refresh.canonical_publication",
+                "composite-generation-authority-unavailable",
+            );
+            assert!(invalid_config_reason(&error).contains("bd-xomn"));
+
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical seed"),
+                seed_bytes,
+                "neither staging nor the publication refusal may touch the canonical files"
+            );
+        });
+    }
+
+    /// Tombstoned rows in an attested generation stay dead through the merge.
+    #[test]
+    fn staging_never_resurrects_tombstoned_rows() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let dir = temp_index_dir("v2-tombstones");
+            let cache = make_cache_with_fallback_seed(&dir, V2_DIM);
+            let binding = v2_binding(embedder.identity_bundle(), 4);
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut writer =
+                    VectorIndex::create_v2(&fast_path, binding.clone()).expect("create_v2");
+                writer
+                    .write_record("doc-keep", &normalized(V2_DIM, 0.5))
+                    .expect("live row");
+                writer
+                    .write_tombstone_record("doc-dead", &normalized(V2_DIM, 0.7))
+                    .expect("tombstone row");
+                writer.finish().expect("finish");
+            }
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-b", "a new document");
+            let jobs = queue.drain_batch();
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("staging must succeed");
+
+            let owner = VectorIndex::open_admitted_v2(&staged.fast_path, &staged.fast_binding)
+                .expect("admit staged");
+            let vectors = admitted_vectors_by_doc(&owner);
+            assert!(vectors.contains_key("doc-keep"));
+            assert!(vectors.contains_key("doc-b"));
+            assert!(
+                !vectors.contains_key("doc-dead"),
+                "a tombstoned document must never be resurrected by the merge"
+            );
+        });
+    }
+
+    /// Quality tier end-to-end: carried + new quality rows are staged under
+    /// the quality embedder's identity and admit exactly.
+    #[test]
+    fn staging_quality_tier_carries_and_binds() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+            let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
+            let (dir, cache, _fast_binding, _fast_path) = v2_canonical_fixture(
+                "v2-quality-carry",
+                fast.identity_bundle(),
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                2,
+            );
+            let quality_binding = v2_binding(quality.identity_bundle(), 2);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_v2_tier(
+                &quality_path,
+                &quality_binding,
+                &[("old-1", normalized(16, 0.5))],
+            );
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a second document");
+            let jobs = queue.drain_batch();
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache)
+                    .with_quality_embedder(quality.clone());
+
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("two-tier staging must succeed");
+            assert!(staged.quality_path.is_some());
+            assert!(staged.index.quality_identity_is_attested());
+
+            let quality_owner = VectorIndex::open_admitted_v2(
+                staged.quality_path.as_ref().expect("quality path"),
+                staged.quality_binding.as_ref().expect("quality binding"),
+            )
+            .expect("staged quality admits");
+            assert_eq!(
+                fingerprint_hex(&quality_owner.identity_v2().space_fingerprint),
+                quality.identity_bundle().space.fingerprint(),
+                "staged quality header must carry the quality producer's space"
+            );
+            let vectors = admitted_vectors_by_doc(&quality_owner);
+            assert!(vectors.contains_key("old-1"), "carried quality row");
+            assert!(vectors.contains_key("doc-2"), "new quality row");
+        });
+    }
+
+    /// An attested quality tier with no quality embedder cannot be
+    /// republished identity-bound: typed refusal, pre-drain.
+    #[test]
+    fn live_v2_quality_without_quality_embedder_refuses_republication() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+            let quality_bundle =
+                EmbeddingIdentityBundleV1::explicit_test_model("v2-quality-model", 16);
+            let (dir, cache, _fast_binding, _fast_path) = v2_canonical_fixture(
+                "v2-quality-missing-embedder",
+                fast.identity_bundle(),
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                2,
+            );
+            let quality_binding = v2_binding(&quality_bundle, 2);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_v2_tier(
+                &quality_path,
+                &quality_binding,
+                &[("old-1", normalized(16, 0.5))],
+            );
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a second document");
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache);
+
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("attested quality without a quality embedder must refuse");
+            assert_invalid_config(
+                &error,
+                "refresh.index_publication",
+                "identity-bound-republication-unavailable",
+            );
+            assert_eq!(queue.pending_count(), 1, "pre-drain refusal");
+        });
+    }
 }
