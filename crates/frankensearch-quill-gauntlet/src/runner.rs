@@ -41,9 +41,10 @@ use crate::generator::{
     MAX_QUERY_ID_BYTES, QUERY_MANIFEST_SCHEMA_VERSION, QueryManifest, QuerySuiteSource,
     QuerySyntax, RangeClass, StructuredFilterClass, SyntheticCorpus, is_canonical_query_id,
 };
+use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 6;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 5;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 1;
 /// Redaction policy required by committed Divergence Register evidence.
@@ -70,7 +71,7 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v6\0";
+const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v5\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v1\0";
@@ -1894,12 +1895,11 @@ where
 impl CampaignProvenance {
     /// Collect the full immutable provenance for one campaign execution.
     ///
-    /// The shared producer Git state is read from the invoking checkout unless
-    /// explicitly overridden. Both linked wrappers are stamped with that one
-    /// build identity; the historical lexical baseline and pinned Tantivy
-    /// dependency remain separate in
-    /// [`crate::version_contract::OracleVersionContract`]. Toolchain facts
-    /// come from the executing `rustc` and workspace `Cargo.lock`.
+    /// Subject Git state is read from the invoking checkout unless explicitly
+    /// overridden. Oracle state defaults to the committed oracle version
+    /// contract and may likewise be overridden by a complete revision/dirty
+    /// pair. The CI path supplies both pairs explicitly. Toolchain facts come
+    /// from the executing `rustc` and workspace `Cargo.lock`.
     ///
     /// # Errors
     ///
@@ -1911,10 +1911,6 @@ impl CampaignProvenance {
         selection: &CampaignSelection,
         semantic_contract: &SemanticContract,
     ) -> Result<Self, GauntletError> {
-        reject_legacy_oracle_provenance_overrides(
-            std::env::var_os("GAUNTLET_ORACLE_REVISION").as_deref(),
-            std::env::var_os("GAUNTLET_ORACLE_DIRTY").as_deref(),
-        )?;
         corpus_manifest.validate_contract()?;
         semantic_contract.validate()?;
         let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
@@ -1931,8 +1927,7 @@ impl CampaignProvenance {
         };
         let (subject_git_revision, subject_source_dirty) =
             collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
-        let oracle_git_revision = subject_git_revision.clone();
-        let oracle_source_dirty = subject_source_dirty;
+        let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
         let cargo_lock_sha256 = hash_workspace_lockfile()?;
         let rustc_version_verbose = collect_rustc_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
@@ -2002,10 +1997,6 @@ impl CampaignProvenance {
 
         if !is_git_revision(&self.subject_git_revision)
             || !is_git_revision(&self.oracle_git_revision)
-            || self.subject_source_dirty
-            || self.oracle_source_dirty
-            || self.subject_git_revision != self.oracle_git_revision
-            || self.subject_source_dirty != self.oracle_source_dirty
             || self.subject_git_revision != engines.subject.source_revision
             || self.subject_source_dirty != engines.subject.source_dirty
             || self.oracle_git_revision != engines.oracle.source_revision
@@ -2104,16 +2095,19 @@ fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, boo
     Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
 }
 
-fn reject_legacy_oracle_provenance_overrides(
-    legacy_revision: Option<&std::ffi::OsStr>,
-    legacy_dirty: Option<&std::ffi::OsStr>,
-) -> Result<(), GauntletError> {
-    if legacy_revision.is_some() || legacy_dirty.is_some() {
-        return Err(campaign_error(
-            "GAUNTLET_ORACLE_REVISION and GAUNTLET_ORACLE_DIRTY are obsolete and forbidden: both linked wrappers must use the one GAUNTLET_SUBJECT producer identity; the pinned Tantivy dependency is carried by the oracle version contract",
-        ));
+fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
+    const REVISION_ENV: &str = "GAUNTLET_ORACLE_REVISION";
+    const DIRTY_ENV: &str = "GAUNTLET_ORACLE_DIRTY";
+    match (std::env::var(REVISION_ENV), std::env::var(DIRTY_ENV)) {
+        (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            let contract = oracle_version_contract()?;
+            Ok((contract.lexical_git_revision, false))
+        }
+        _ => Err(campaign_error(format!(
+            "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
+        ))),
     }
-    Ok(())
 }
 
 fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
@@ -2348,7 +2342,7 @@ impl CampaignReport {
         self.semantic_contract.validate()?;
         self.config.validate()?;
         self.divergence_registry.validate()?;
-        if matches!(self.schema_version, 3 | 4 | 5) {
+        if matches!(self.schema_version, 3 | 4) {
             return Err(campaign_error(
                 "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign",
             ));
@@ -6059,8 +6053,6 @@ mod tests {
 
     use super::*;
 
-    const TEST_PRODUCER_REVISION: &str = "1111111111111111111111111111111111111111";
-
     #[cfg(feature = "tantivy-oracle")]
     #[derive(Clone, Debug)]
     struct TraceLogWriter {
@@ -6703,7 +6695,7 @@ mod tests {
             family: EngineFamily::Quill,
             implementation: "scripted-quill-subject".to_owned(),
             crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            source_revision: TEST_PRODUCER_REVISION.to_owned(),
+            source_revision: "runner-test-subject".to_owned(),
             source_dirty: false,
             config_hash: "runner-test-quill-config".to_owned(),
         }
@@ -6715,7 +6707,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: version.lexical_package_version,
-            source_revision: TEST_PRODUCER_REVISION.to_owned(),
+            source_revision: version.lexical_git_revision,
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         }
@@ -7387,18 +7379,25 @@ mod tests {
         root: &std::path::Path,
         fixture: &Fixture,
     ) -> Result<CampaignReport, GauntletError> {
-        // One fixed synthetic producer identity makes repeated report bytes
-        // comparable. This self-contained test is deterministic regression
-        // coverage, not independently observed live Git provenance.
-        let producer_revision = "d".repeat(40);
+        // The fixed subject label and contract-sourced oracle revision make
+        // repeated report bytes comparable. This self-contained test is
+        // deterministic regression coverage, not independently observed live
+        // Git provenance.
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject = crate::engine::QuillSubject::in_memory(config, &producer_revision, false)
-            .expect("fresh scalar Quill subject");
+        let mut subject = crate::engine::QuillSubject::in_memory(
+            config,
+            "g1a-deterministic-regression-not-live-provenance",
+            false,
+        )
+        .expect("fresh scalar Quill subject");
         let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&producer_revision, false)
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
                 .expect("fresh scalar G1a Tantivy oracle");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
@@ -7441,16 +7440,16 @@ mod tests {
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_ARTIFACT_SCHEMA_VERSION: &str =
-        "frankensearch.salej-union-horizon-evidence.v3";
+        "frankensearch.salej-union-horizon-diagnostic.v3";
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_ARTIFACT_HASH_DOMAIN: &[u8] =
-        b"frankensearch/quill/salej-union-horizon-evidence/v3\0";
+        b"frankensearch/quill/salej-union-horizon-diagnostic/v3\0";
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_COMPLETION_SCHEMA_VERSION: &str =
-        "frankensearch.salej-union-horizon-completion.v2";
+        "frankensearch.salej-union-horizon-diagnostic-completion.v2";
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_COMPLETION_HASH_DOMAIN: &[u8] =
-        b"frankensearch/quill/salej-union-horizon-completion/v2\0";
+        b"frankensearch/quill/salej-union-horizon-diagnostic-completion/v2\0";
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -7678,7 +7677,7 @@ mod tests {
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct UnionHorizonEvidenceArtifact {
+    struct UnionHorizonDiagnosticArtifact {
         schema_version: String,
         run_id: String,
         proof_kind: UnionHorizonProofKind,
@@ -7688,7 +7687,7 @@ mod tests {
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct PublishedUnionHorizonArtifact {
+    struct PublishedUnionHorizonDiagnostic {
         path: std::path::PathBuf,
         raw_file_sha256: String,
         byte_len: u64,
@@ -7703,7 +7702,7 @@ mod tests {
         semantic_sha256: String,
         raw_file_sha256: String,
         byte_len: u64,
-        artifact: UnionHorizonEvidenceArtifact,
+        artifact: UnionHorizonDiagnosticArtifact,
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
@@ -7861,7 +7860,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
-    impl UnionHorizonEvidenceArtifact {
+    impl UnionHorizonDiagnosticArtifact {
         fn seal(
             run_id: String,
             proof_kind: UnionHorizonProofKind,
@@ -8041,16 +8040,24 @@ mod tests {
                         run.engines.oracle.config_hash, TANTIVY_ORACLE_CONFIG_HASH,
                         "UNION_HORIZON oracle configuration drifted",
                     );
-                    for descriptor in [&run.engines.subject, &run.engines.oracle] {
-                        assert_eq!(
-                            descriptor.source_revision, proof.build_identity.source_git_revision,
-                            "UNION_HORIZON engine descriptor must identify the compiled wrapper build",
-                        );
-                        assert_eq!(
-                            descriptor.source_dirty, proof.build_identity.source_git_dirty,
-                            "UNION_HORIZON engine descriptor dirty state must identify the compiled wrapper build",
-                        );
-                    }
+                    assert_eq!(
+                        run.engines.subject.source_revision,
+                        proof.build_identity.source_git_revision,
+                        "UNION_HORIZON subject descriptor must identify the compiled wrapper build",
+                    );
+                    assert_eq!(
+                        run.engines.subject.source_dirty, proof.build_identity.source_git_dirty,
+                        "UNION_HORIZON subject dirty state must identify the compiled wrapper build",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.source_revision,
+                        proof.oracle_dependency.pinned_lexical_contract_revision,
+                        "UNION_HORIZON oracle descriptor must retain the committed lexical baseline",
+                    );
+                    assert!(
+                        !run.engines.oracle.source_dirty,
+                        "UNION_HORIZON committed oracle baseline cannot be dirty",
+                    );
                     assert_eq!(run.case.limit, expected_limit);
                     assert_eq!(
                         run.case.fixture_id,
@@ -8915,10 +8922,23 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn reject_union_horizon_oracle_identity_overrides(
+        revision: Option<&std::ffi::OsStr>,
+        dirty: Option<&std::ffi::OsStr>,
+    ) -> Result<(), GauntletError> {
+        if revision.is_some() || dirty.is_some() {
+            return Err(campaign_error(
+                "Salej UNION_HORIZON uses the committed oracle dependency contract; GAUNTLET_ORACLE_REVISION and GAUNTLET_ORACLE_DIRTY cannot override it",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn union_horizon_validated_build_identity() -> UnionHorizonBuildIdentity {
         const REVISION_ENV: &str = "GAUNTLET_SUBJECT_REVISION";
         const DIRTY_ENV: &str = "GAUNTLET_SUBJECT_DIRTY";
-        reject_legacy_oracle_provenance_overrides(
+        reject_union_horizon_oracle_identity_overrides(
             std::env::var_os("GAUNTLET_ORACLE_REVISION").as_deref(),
             std::env::var_os("GAUNTLET_ORACLE_DIRTY").as_deref(),
         )
@@ -9400,10 +9420,10 @@ mod tests {
             "UNION_HORIZON eight-leaf fixture must not trigger the default eight-way merge",
         );
         let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
-            &build_identity.source_git_revision,
-            build_identity.source_git_dirty,
+            &oracle_dependency.pinned_lexical_contract_revision,
+            false,
         )
-        .expect("fresh UNION_HORIZON current-build Tantivy oracle");
+        .expect("fresh UNION_HORIZON pinned Tantivy oracle");
         oracle
             .index()
             .oracle_disable_auto_merge(cx)
@@ -9697,7 +9717,7 @@ mod tests {
     fn decode_union_horizon_artifact_bytes(
         bytes: &[u8],
         expected_raw_file_sha256: &str,
-    ) -> UnionHorizonEvidenceArtifact {
+    ) -> UnionHorizonDiagnosticArtifact {
         assert!(
             expected_raw_file_sha256.len() == 64
                 && expected_raw_file_sha256
@@ -9710,7 +9730,7 @@ mod tests {
             expected_raw_file_sha256,
             "UNION_HORIZON uploaded bytes do not match their publication receipt",
         );
-        let artifact: UnionHorizonEvidenceArtifact =
+        let artifact: UnionHorizonDiagnosticArtifact =
             serde_json::from_slice(bytes).expect("decode published UNION_HORIZON artifact");
         let canonical_bytes = serde_json::to_vec_pretty(&artifact)
             .expect("re-encode canonical UNION_HORIZON artifact bytes");
@@ -9724,8 +9744,8 @@ mod tests {
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn assert_union_horizon_artifact_rejected(
-        artifact: &UnionHorizonEvidenceArtifact,
-        mutate: impl FnOnce(&mut UnionHorizonEvidenceArtifact),
+        artifact: &UnionHorizonDiagnosticArtifact,
+        mutate: impl FnOnce(&mut UnionHorizonDiagnosticArtifact),
     ) {
         let mut tampered = artifact.clone();
         mutate(&mut tampered);
@@ -9742,8 +9762,8 @@ mod tests {
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn persist_union_horizon_artifact(
-        artifact: &UnionHorizonEvidenceArtifact,
-    ) -> Option<PublishedUnionHorizonArtifact> {
+        artifact: &UnionHorizonDiagnosticArtifact,
+    ) -> Option<PublishedUnionHorizonDiagnostic> {
         const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
         let root = std::env::var_os(ARTIFACT_ROOT_ENV).map(std::path::PathBuf::from)?;
         assert_union_horizon_executable_still_matches(
@@ -9810,7 +9830,7 @@ mod tests {
                 .expect("UNION_HORIZON artifact contains proofs")
                 .build_identity,
         );
-        Some(PublishedUnionHorizonArtifact {
+        Some(PublishedUnionHorizonDiagnostic {
             path: target,
             raw_file_sha256,
             byte_len: u64::try_from(published_bytes.len())
@@ -9922,7 +9942,7 @@ mod tests {
         )
     ))]
     fn publish_union_horizon_completion_manifest() -> (
-        PublishedUnionHorizonArtifact,
+        PublishedUnionHorizonDiagnostic,
         UnionHorizonCompletionManifest,
     ) {
         const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
@@ -10038,7 +10058,7 @@ mod tests {
             }),
         );
         (
-            PublishedUnionHorizonArtifact {
+            PublishedUnionHorizonDiagnostic {
                 path: root.join(target_name),
                 raw_file_sha256,
                 byte_len: u64::try_from(reloaded_bytes.len())
@@ -10050,8 +10070,8 @@ mod tests {
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn log_union_horizon_evidence(
-        artifact: &UnionHorizonEvidenceArtifact,
-        publication: Option<&PublishedUnionHorizonArtifact>,
+        artifact: &UnionHorizonDiagnosticArtifact,
+        publication: Option<&PublishedUnionHorizonDiagnostic>,
     ) {
         for proof in &artifact.proofs {
             let execution_mode = match proof.layout.expected_execution_mode() {
@@ -10129,7 +10149,7 @@ mod tests {
         cx: &Cx,
         fixture: &Fixture,
         proof_kind: UnionHorizonProofKind,
-    ) -> UnionHorizonEvidenceArtifact {
+    ) -> UnionHorizonDiagnosticArtifact {
         let mut proofs = Vec::with_capacity(UnionHorizonSegmentLayout::ALL.len());
         for layout in UnionHorizonSegmentLayout::ALL {
             let first = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
@@ -10186,8 +10206,11 @@ mod tests {
             );
         }
 
-        let artifact =
-            UnionHorizonEvidenceArtifact::seal(union_horizon_artifact_run_id(), proof_kind, proofs);
+        let artifact = UnionHorizonDiagnosticArtifact::seal(
+            union_horizon_artifact_run_id(),
+            proof_kind,
+            proofs,
+        );
         let publication = persist_union_horizon_artifact(&artifact);
         log_union_horizon_evidence(&artifact, publication.as_ref());
         artifact
@@ -10551,25 +10574,6 @@ mod tests {
             assert!(subject.index_calls.load(Ordering::Relaxed) > 0);
             assert!(oracle.index_calls.load(Ordering::Relaxed) > 0);
         });
-    }
-
-    #[test]
-    fn legacy_oracle_provenance_overrides_fail_closed() {
-        use std::ffi::OsStr;
-
-        assert!(reject_legacy_oracle_provenance_overrides(None, None).is_ok());
-        for (revision, dirty) in [
-            (Some(OsStr::new("a")), None),
-            (None, Some(OsStr::new("false"))),
-            (Some(OsStr::new("a")), Some(OsStr::new("false"))),
-        ] {
-            let error = reject_legacy_oracle_provenance_overrides(revision, dirty)
-                .expect_err("legacy split-wrapper provenance must be rejected");
-            assert!(
-                error.to_string().contains("obsolete and forbidden"),
-                "unexpected legacy provenance failure: {error}",
-            );
-        }
     }
 
     #[test]
@@ -11188,12 +11192,12 @@ mod tests {
             let mut wrong_summary = report.clone();
             wrong_summary.query_classes[0].total += 1;
             assert!(wrong_summary.canonical_bytes().is_err());
-            for legacy_version in [3, 4, 5] {
+            for legacy_version in [3, 4] {
                 let mut legacy = report.clone();
                 legacy.schema_version = legacy_version;
                 let error = legacy
                     .validate_contract()
-                    .expect_err("pre-v6 report must require a campaign rerun");
+                    .expect_err("pre-v5 report must require a campaign rerun");
                 assert!(matches!(
                     error,
                     GauntletError::InvalidCampaign { ref reason }
@@ -11513,7 +11517,7 @@ mod tests {
     #[test]
     fn salej_runtime_identity_rejects_revision_or_dirty_state_rewrites() {
         assert!(
-            reject_legacy_oracle_provenance_overrides(
+            reject_union_horizon_oracle_identity_overrides(
                 Some(std::ffi::OsStr::new(
                     "062a5e5b2d41653b1c8b07888eda1a765e421f49"
                 )),
@@ -11850,24 +11854,20 @@ mod tests {
                 }
             });
             assert_union_horizon_artifact_rejected(&artifact, |tampered| {
-                let historical_revision = tampered.proofs[0]
-                    .oracle_dependency
-                    .pinned_lexical_contract_revision
+                let producer_revision = tampered.proofs[0]
+                    .build_identity
+                    .source_git_revision
                     .clone();
                 tampered.proofs[0].comparisons[0]
                     .engines
                     .oracle
-                    .source_revision = historical_revision;
+                    .source_revision = producer_revision;
             });
             assert_union_horizon_artifact_rejected(&artifact, |tampered| {
-                let subject_dirty = tampered.proofs[0].comparisons[0]
-                    .engines
-                    .subject
-                    .source_dirty;
                 tampered.proofs[0].comparisons[0]
                     .engines
                     .oracle
-                    .source_dirty = !subject_dirty;
+                    .source_dirty = true;
             });
             assert_union_horizon_artifact_rejected(&artifact, |tampered| {
                 tampered.proofs[0].oracle_dependency.tantivy_version = "0.0.0".to_owned();
@@ -12065,7 +12065,7 @@ mod tests {
     ))]
     #[test]
     #[ignore = "requires an isolated, clean-Git evidence publication environment"]
-    fn salej_complete_union_horizon_evidence_bundle() {
+    fn salej_complete_union_horizon_diagnostic_bundle() {
         let build_identity = union_horizon_validated_build_identity();
         assert!(
             union_horizon_identity_is_publishable(&build_identity),
@@ -12778,6 +12778,9 @@ mod tests {
     #[test]
     fn tantivy_campaign_adapter_enforces_the_one_shot_lifecycle() {
         let fixture = make_fixture();
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
         let contract = SemanticContract::shipping_default();
         let query = fixture
             .query_suite
@@ -12791,7 +12794,7 @@ mod tests {
         evidence_case.offset = query.offset;
         evidence_case.count_requested = query.count_requested;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut before_begin = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
+            let mut before_begin = crate::TantivyOracle::in_memory(&lexical_revision, false)
                 .expect("oracle before begin");
             assert!(matches!(
                 before_begin.index_batch(&cx, &fixture.documents[..1]).await,
@@ -12810,7 +12813,7 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut before_commit = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
+            let mut before_commit = crate::TantivyOracle::in_memory(&lexical_revision, false)
                 .expect("oracle before commit");
             before_commit
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -12843,7 +12846,7 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut oracle = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
+            let mut oracle = crate::TantivyOracle::in_memory(&lexical_revision, false)
                 .expect("committed in-memory oracle");
             oracle
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -12885,10 +12888,13 @@ mod tests {
         use frankensearch_core::LexicalSearch;
 
         let fixture = make_fixture();
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
         let contract = SemanticContract::shipping_default();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut oracle = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
-                .expect("fresh oracle");
+            let mut oracle =
+                crate::TantivyOracle::in_memory(&lexical_revision, false).expect("fresh oracle");
             oracle
                 .index_documents(
                     &cx,
@@ -14632,15 +14638,18 @@ mod tests {
     #[test]
     fn harvested_14_score_bits_preserve_ranked_and_counted_orders() {
         let fixture = make_scalar_g1a_regression_fixture();
-        let producer_revision = "e".repeat(40);
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject = crate::engine::QuillSubject::in_memory(config, &producer_revision, false)
-            .expect("fresh scalar Quill subject");
+        let mut subject =
+            crate::engine::QuillSubject::in_memory(config, "harvested-14-score-regression", false)
+                .expect("fresh scalar Quill subject");
         let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&producer_revision, false)
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
                 .expect("fresh scalar G1a Tantivy oracle");
         let semantic_contract = SemanticContract::scalar_g1a();
 

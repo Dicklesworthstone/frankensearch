@@ -247,14 +247,14 @@ jobs:
           GAUNTLET_SUBJECT_DIRTY: "false"
           GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}
           GAUNTLET_UNION_HORIZON_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_evidence_bundle -- --ignored --exact --nocapture --test-threads=1
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
 
-      - name: Upload admitted Salej UNION_HORIZON evidence
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
         if: success() && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: quill-gauntlet-salej-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/completion-*.json
+          name: quill-gauntlet-salej-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/*.json
           if-no-files-found: error
           retention-days: 14
 

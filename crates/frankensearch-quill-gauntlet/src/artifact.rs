@@ -23,7 +23,7 @@ use crate::runner::{
 };
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
-pub const OBJECT_SCHEMA_VERSION: u32 = 4;
+pub const OBJECT_SCHEMA_VERSION: u32 = 3;
 pub const CANONICALIZATION_VERSION: u32 = 1;
 /// Current mutable run-manifest schema.
 ///
@@ -33,7 +33,6 @@ pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const HASH_DOMAIN_V1: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v1\0";
 const HASH_DOMAIN_V2: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v2\0";
 const HASH_DOMAIN_V3: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v3\0";
-const HASH_DOMAIN_V4: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v4\0";
 const MAX_CAMPAIGN_RESERVATION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CAMPAIGN_REPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CAMPAIGN_RUN_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -61,7 +60,7 @@ pub struct CampaignArtifactContext {
     pub registered_divergence: Option<DivergenceRegisterEntry>,
 }
 
-/// Explicit total-contract scope carried by every v3-or-newer artifact.
+/// Explicit total-contract scope carried by every v3 artifact.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactLexicalContractEvidence {
@@ -144,7 +143,7 @@ impl ArtifactObject {
     /// Compute the versioned, domain-separated object address.
     ///
     /// Legacy v1/v2 objects retain their historical XXH3-64 address so they can
-    /// be decoded and diagnosed. Current v4 evidence uses SHA-256; a 64-bit
+    /// be decoded and diagnosed. Current v3 evidence uses SHA-256; a 64-bit
     /// non-cryptographic digest is not an admissible durable evidence seal.
     ///
     /// For a legacy object decoded from historical bytes, this method hashes
@@ -164,7 +163,7 @@ impl ArtifactObject {
     }
 
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
-        if matches!(self.object_schema_version, 1 | 2 | 3) {
+        if matches!(self.object_schema_version, 1 | 2) {
             return Err(GauntletError::InvalidContract {
                 reason: format!(
                     "legacy artifact v{} lacks the current total lexical contract and is non-admissible; rerun the campaign",
@@ -182,13 +181,11 @@ impl ArtifactObject {
         }
         self.engines.validate_gauntlet_contract()?;
         if self.engines.comparison_mode == crate::ComparisonMode::CrossEngine
-            && (self.oracle_version.lexical_package_version
-                != frankensearch_lexical::FRANKENSEARCH_LEXICAL_CRATE_VERSION
-                || self.engines.oracle.crate_version
-                    != frankensearch_lexical::FRANKENSEARCH_LEXICAL_CRATE_VERSION)
+            && (self.engines.oracle.crate_version != self.oracle_version.lexical_package_version
+                || self.engines.oracle.source_revision != self.oracle_version.lexical_git_revision)
         {
             return Err(GauntletError::InvalidContract {
-                reason: "artifact oracle package does not match its embedded dependency contract"
+                reason: "artifact oracle identity does not match its embedded version contract"
                     .to_owned(),
             });
         }
@@ -802,7 +799,7 @@ impl ArtifactStore {
                 })?
                 .read_regular_bounded(&object_name, MAX_CAMPAIGN_OBJECT_BYTES)?;
             let object: ArtifactObject = serde_json::from_slice(&object_bytes)?;
-            if matches!(object.object_schema_version, 1 | 2 | 3) {
+            if matches!(object.object_schema_version, 1 | 2) {
                 return Err(GauntletError::InvalidPreparedArtifact {
                     reason: "legacy artifact schema lacks the current total lexical contract and is non-admissible; rerun the campaign".to_owned(),
                 });
@@ -910,15 +907,9 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
             hasher.update(bytes);
             Ok(format!("{:016x}", hasher.digest()))
         }
-        3 => {
-            let mut hasher = Sha256::new();
-            hasher.update(HASH_DOMAIN_V3);
-            hasher.update(bytes);
-            Ok(lower_hex(&hasher.finalize()))
-        }
         OBJECT_SCHEMA_VERSION => {
             let mut hasher = Sha256::new();
-            hasher.update(HASH_DOMAIN_V4);
+            hasher.update(HASH_DOMAIN_V3);
             hasher.update(bytes);
             Ok(lower_hex(&hasher.finalize()))
         }
@@ -1268,6 +1259,7 @@ impl PinnedDirectory {
         self.publish_no_clobber_io(name, bytes).map_err(Into::into)
     }
 
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     pub(crate) fn publish_unique_no_clobber(
         &self,
         temporary_name: &OsStr,
@@ -1546,6 +1538,7 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     pub(crate) fn publish_unique_no_clobber(
         &self,
         _temporary_name: &OsStr,
@@ -1611,12 +1604,11 @@ mod tests {
 
     fn sample_object() -> ArtifactObject {
         let oracle_version = oracle_version_contract().expect("version contract");
-        let producer_revision = "a".repeat(40);
         let subject = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "quill-stub".to_owned(),
             crate_version: "0.2.1".to_owned(),
-            source_revision: producer_revision.clone(),
+            source_revision: "stub".to_owned(),
             source_dirty: false,
             config_hash: "01".to_owned(),
         };
@@ -1624,7 +1616,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: oracle_version.lexical_package_version.clone(),
-            source_revision: producer_revision,
+            source_revision: oracle_version.lexical_git_revision.clone(),
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         };
@@ -1769,12 +1761,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_oracle_descriptor_outside_shared_producer_build() {
+    fn prepare_rejects_oracle_descriptor_outside_version_contract() {
         let mut object = sample_object();
         object.engines.oracle.source_revision = "f".repeat(40);
         assert!(
             ArtifactStore::default()
-                .prepare("bad-oracle-producer", &object, BTreeMap::new())
+                .prepare("bad-oracle-pin", &object, BTreeMap::new())
                 .is_err()
         );
     }
@@ -1847,7 +1839,7 @@ mod tests {
         );
         let error = object
             .validate()
-            .expect_err("pre-v4 object must require a campaign rerun");
+            .expect_err("pre-v3 object must require a campaign rerun");
         assert!(matches!(
             error,
             GauntletError::InvalidContract { ref reason }
@@ -1858,26 +1850,24 @@ mod tests {
     }
 
     #[test]
-    fn committed_v3_object_is_decode_only_hashable_and_nonadmissible() {
-        const LEGACY_V3_BYTES: &[u8] = include_bytes!("../fixtures/artifact-object-v3.json");
+    fn reserved_v4_pre_policy_fixture_is_not_admissible_as_current_evidence() {
+        // Salej's diagnostic proof bundle is deliberately independent from the
+        // generic ArtifactStore schema. Keep this pre-policy v4 shape only as a
+        // negative canary until bd-artifactstore-v4-evidence-admission-zlhvo
+        // replaces it with the closed diagnostic/evidence admission contract.
+        const PRE_POLICY_V4_BYTES: &[u8] = include_bytes!("../fixtures/artifact-object-v4.json");
         let object: ArtifactObject =
-            serde_json::from_slice(LEGACY_V3_BYTES).expect("decode committed v3 object");
-        assert_eq!(object.object_schema_version, 3);
-        assert_eq!(
-            hash_object_bytes(LEGACY_V3_BYTES, 3)
-                .expect("registered v3 address remains diagnosable")
-                .len(),
-            64,
-        );
-        let error = object
-            .validate()
-            .expect_err("schema-v3 object must require a campaign rerun");
+            serde_json::from_slice(PRE_POLICY_V4_BYTES).expect("decode pre-policy v4 canary");
+        assert_eq!(object.object_schema_version, 4);
         assert!(matches!(
-            error,
-            GauntletError::InvalidContract { ref reason }
-                if reason.contains("legacy artifact")
-                    && reason.contains("non-admissible")
-                    && reason.contains("rerun")
+            object.validate(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("schema or embedded oracle contract")
+        ));
+        assert!(matches!(
+            hash_object_bytes(PRE_POLICY_V4_BYTES, 4),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("no registered hash domain")
         ));
     }
 
@@ -1936,13 +1926,13 @@ mod tests {
     fn canonical_object_golden_bytes_and_hash_are_pinned() {
         let object = sample_object();
         let canonical = object.canonical_bytes().unwrap();
-        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v4.json");
+        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v3.json");
         let golden = golden_with_newline
             .strip_suffix(b"\n")
             .expect("golden fixture must end in exactly one LF");
         assert_eq!(
             object.object_hash().unwrap(),
-            "04c8b97eb1996169dff2fe11160006f93be2980ae97f24a235e38de643c80833"
+            "f6267a769cdc6ecf067619d2502e014be77183e94cb7c93bfd0b80a0d98aac83"
         );
         assert_eq!(canonical, golden);
     }
