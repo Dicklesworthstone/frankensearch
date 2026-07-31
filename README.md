@@ -87,7 +87,7 @@ PHASE 1 (refined): 5 hits in 151ms
 ## What It Does
 
 `frankensearch` combines lexical and semantic retrieval with progressive delivery:
-- lexical BM25 via Tantivy for exact keyword precision
+- lexical BM25 for exact keyword precision (native Quill engine via the `quill` feature; Tantivy retained behind `lexical-tantivy` as the conformance oracle/migration lane)
 - fast semantic tier for immediate relevant hits
 - quality semantic tier for reranked refinement
 - reciprocal rank fusion (RRF) to combine sources robustly
@@ -194,7 +194,7 @@ Model path used in the default quality lane:
 - fast tier: potion-128M (or fallback)
 - fusion: RRF over lexical + semantic ranks
 - quality tier: MiniLM
-- optional final rerank: FlashRank cross-encoder
+- optional final rerank: pure-Rust frankentorch cross-encoder (`native`), with a FastEmbed/FlashRank-style alternative behind `fastembed-reranker`
 
 ## Architecture Breakdown
 
@@ -204,10 +204,12 @@ Model path used in the default quality lane:
 |---|---|
 | `frankensearch-core` | Shared types/traits/errors/config, query canonicalization/classification, metrics/eval helpers |
 | `frankensearch-embed` | Embedding backends and fallback stack (`hash`, `model2vec`, `fastembed`) |
-| `frankensearch-index` | FSVI vector storage, SIMD dot products, top-k search, optional ANN support |
-| `frankensearch-lexical` | Tantivy schema/index/search for BM25 lexical retrieval |
+| `frankensearch-index` | FSVI vector storage, SIMD dot products, top-k search, optional native HNSW ANN |
+| `frankensearch-lexical` | Tantivy schema/index/search for BM25 lexical retrieval (conformance oracle + `cass-compat` interop lane) |
+| `frankensearch-quill` | Native pure-Rust BM25 lexical engine (FSLX segments, delta-visible indexing) |
+| `frankensearch-quill-gauntlet` | Differential conformance/perf gauntlet certifying Quill against the pinned Tantivy oracle |
 | `frankensearch-fusion` | RRF fusion, two-tier orchestration, blending, optional rerank integration |
-| `frankensearch-rerank` | Cross-encoder reranking integration |
+| `frankensearch-rerank` | Cross-encoder reranking (pure-Rust frankentorch native backend + optional FastEmbed) |
 | `frankensearch-storage` | FrankenSQLite metadata persistence, dedup/content-hash tracking, embedding queue |
 | `frankensearch-durability` | Repair/protection primitives for index artifacts and segment health |
 | `crates/frankensearch-fsfs` | Standalone CLI product around the library stack |
@@ -429,16 +431,23 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
 
     #[cfg(feature = "quill")]
     {
-        let lexical = frankensearch::QuillIndex::open(
+        // `open_hybrid` opens every arm of the index directory and attaches
+        // the active lexical reader (blue-green roots resolve to their
+        // active engine dir; foreign or damaged layouts are typed errors).
+        use frankensearch::LexicalSearch;
+
+        let parts = frankensearch::open_hybrid(
             &cx,
-            "./my_index/lexical",
-            frankensearch::QuillConfig::default(),
+            "./my_index",
+            frankensearch::TwoTierConfig::default(),
         )
         .await
-        .expect("open Quill lexical index");
+        .expect("open hybrid index");
+        let lexical = parts.lexical.expect("lexical arm attached");
         let lexical_hits = lexical
-            .search_results(&cx, "ownership", 10)
-            .expect("search Quill lexical index");
+            .search(&cx, "ownership", 10)
+            .await
+            .expect("search lexical arm");
         assert!(!lexical_hits.is_empty());
     }
 });
@@ -600,7 +609,9 @@ These are crate feature flags from `frankensearch/Cargo.toml`:
 | Hybrid retrieval (semantic + BM25) | `hybrid` | adds lexical precision on top of semantic recall |
 | Persistent local indexing | `persistent` | `hybrid + storage` for durable metadata/queues |
 | Durable + self-healing stack | `durable` | `persistent + durability` |
-| Full capability surface | `full` | `durable + rerank + ann + download` |
+| Native lexical engine | `quill` | pure-Rust Quill BM25 engine (recommended lexical path) |
+| Tantivy oracle/migration lane | `lexical-tantivy` | explicit Tantivy-backed lexical path; `cass-compat` aliases it for external CASS schema-v8 interop |
+| Full capability surface | `full` | `durable + rerank + ann + download + graph + api` |
 | Full stack + FTS5 storage backend | `full-fts5` | `full + fts5` for advanced local SQL FTS paths |
 
 Quick examples:
@@ -720,7 +731,7 @@ host-specific env var drift.
 | Phase 2 / `Refined` | Optional improved ranking after quality embedding |
 | `RefinementFailed` | Graceful degradation event when Phase 2 errors/times out |
 | RRF | Reciprocal Rank Fusion combining lexical + semantic rank lists |
-| BM25 | Lexical ranking function used by Tantivy backend |
+| BM25 | Lexical ranking function used by the lexical backends (Quill and Tantivy) |
 | FSVI | On-disk vector index format used by frankensearch-index |
 | `f16` quantization | Half-precision storage mode reducing memory footprint |
 | `TwoTierIndex` | Wrapper over fast and optional quality vector indexes |

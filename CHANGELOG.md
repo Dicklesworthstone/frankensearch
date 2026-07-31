@@ -6,7 +6,176 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 
 ---
 
-## [Unreleased](https://github.com/Dicklesworthstone/frankensearch/compare/v1.1.4...HEAD)
+## [Unreleased — proposed v1.4.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.3.0...HEAD) -- 2026-04-24 through 2026-07-29
+
+> **Scope window: v1.3.0..HEAD (~1,375 commits), reconstructed as one epoch.** This window is too
+> large to enumerate commit-by-commit, so this section is organized as capability
+> waves with representative live-linked commits, reconstructed from `git log`,
+> `git diff --stat v1.3.0..HEAD`, and the checked-in beads tracker
+> ([`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensearch/blob/main/.beads/issues.jsonl)).
+> It is a navigation aid, not an exhaustive record.
+>
+> **Release status:** v1.3.0 is a git tag with **no** GitHub Release; the latest
+> actual GitHub Release is [v1.2.5](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.5)
+> (2026-04-08). Crate versions are intentionally decoupled from the v1.x tag
+> series: workspace member crates are at 0.2.x and the `frankensearch` facade
+> crate at 0.3.2 while the repo tag series continues at v1.x.
+
+### Quill: Native Pure-Rust Lexical Engine (new crate `frankensearch-quill`)
+
+The dominant workstream of the epoch: a ground-up, memory-safe BM25 lexical
+engine built to replace Tantivy inside frankensearch (design doc:
+`COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md`). Epics E0–E5 of the
+`bd-quill-*` family are closed (89 closed issues in the quill epic family);
+E6 (gauntlet at scale), E7 (default flip), E8 (perf doctrine), and E9 (Tantivy
+retirement) remain open — Quill is the recommended `quill` feature path, while
+Tantivy stays in-tree behind `lexical-tantivy` as the pinned conformance oracle.
+
+- Scribe ingest pipeline: term interner + bump arenas, columnar accumulator, deterministic radix flush kernel ([ba26e5dc](https://github.com/Dicklesworthstone/frankensearch/commit/ba26e5dcc6679f9e4cb272004a2a197a1e4232b4))
+- Grimoire/Quiver formats: prefix-block term dictionary ([c497bac6](https://github.com/Dicklesworthstone/frankensearch/commit/c497bac61115784b57894dc27b30819850edc723)), canonical posting codec, block-max skip tables, positions codec, IDMAP/IDHASH ([db1bf12c](https://github.com/Dicklesworthstone/frankensearch/commit/db1bf12c839938205a52249f361558ad19fa833e)), STOREDMETA stored fields
+- Keeper lifecycle: FSLX segment container ([eae50313](https://github.com/Dicklesworthstone/frankensearch/commit/eae5031316194c11d79a82ba7ff09833dc00775e)), atomic manifest keeper ([a60bb8b3](https://github.com/Dicklesworthstone/frankensearch/commit/a60bb8b39596162c7c51b50f3946e3bfd3f28bef)), crash-only recovery and GC ([f3ab5dbe](https://github.com/Dicklesworthstone/frankensearch/commit/f3ab5dbe97bb093a5de7e59b36095d8ca4148458)), Q1-preserving tombstone compaction ([f1081753](https://github.com/Dicklesworthstone/frankensearch/commit/f108175316b011ea56fe0f0f8ad572ad1e8b659c)), tiered Keeper lifecycle ([bc210b77](https://github.com/Dicklesworthstone/frankensearch/commit/bc210b777f60286bac06cfc85b21e9dd135406ba))
+- Argus query layer: native lenient + CASS query parsers ([9c8ebecd](https://github.com/Dicklesworthstone/frankensearch/commit/9c8ebecd77ebb35e46baa4dd71ef92e230e5d001)), exhaustive BM25 scorer correctness anchor ([522d2d3c](https://github.com/Dicklesworthstone/frankensearch/commit/522d2d3ce4aebcd8a902aeeadc32bf8111d31bda)), exact phrase scorer ([b4500dc1](https://github.com/Dicklesworthstone/frankensearch/commit/b4500dc126394264f3fe8df491aa3ad78edffa99)), native snippet generation ([6f78b38f](https://github.com/Dicklesworthstone/frankensearch/commit/6f78b38f867f24ef7da91a41e6268481b199d560))
+- Searchable-while-indexing delta segments: mutable delta ([73bde1d6](https://github.com/Dicklesworthstone/frankensearch/commit/73bde1d644b872f33a736a534b443aa2aee5bb0d)), epoch sealing without visibility gaps ([327b1a6b](https://github.com/Dicklesworthstone/frankensearch/commit/327b1a6b68e29d28b2282f9c1b06b7dcc974b147))
+- Operational safety: cross-process writer admission ([554c9ef2](https://github.com/Dicklesworthstone/frankensearch/commit/554c9ef2398e9b29fffe84e90d3340edd8606698)), blue-green CURRENT pointer machinery ([8ba6cab4](https://github.com/Dicklesworthstone/frankensearch/commit/8ba6cab402855efc7a5180d148d3fdcfdf5f1842)), unrepairable-segment quarantine ([3fa54a8a](https://github.com/Dicklesworthstone/frankensearch/commit/3fa54a8a2cd6ef5f5c767d89ed188b8004df8fc0)), content-witness resumable bulk builds ([6c5478dc](https://github.com/Dicklesworthstone/frankensearch/commit/6c5478dc4ca4b49f3325914ea41f3a615797b0ad)), dark-launch shadow oracle ([7e3a8dbf](https://github.com/Dicklesworthstone/frankensearch/commit/7e3a8dbfe3bcc8b57cbdcd94a9e7ddacffd03549)), deterministic query fuel metering ([ae5baa0d](https://github.com/Dicklesworthstone/frankensearch/commit/ae5baa0dbc433f3a92591f93e8f652e406ecdbeb))
+- Integration flip machinery (E7, in progress): lexical backend contract ([9c468af6](https://github.com/Dicklesworthstone/frankensearch/commit/9c468af6cc6723f273b2bd462ebefe8a3f6f1a34)), fsfs lexical runtime ported to Quill ([ab4dc2bd](https://github.com/Dicklesworthstone/frankensearch/commit/ab4dc2bdab8da62f24016672853ebfe9e012b8f1)), blue-green Tantivy upgrade path ([e708abad](https://github.com/Dicklesworthstone/frankensearch/commit/e708abad2c79d63a0c1db186b76ba4d1a3d1e8a1)), committed performance ratchet ([cc36e146](https://github.com/Dicklesworthstone/frankensearch/commit/cc36e146038d24d018dd8f6d2d1f3bb2e59018c4))
+
+### Quill Gauntlet: Differential Verification (new crate `frankensearch-quill-gauntlet`)
+
+A dedicated differential-testing crate that certifies Quill against pinned
+Tantivy as an oracle before any default flip.
+
+- Conformance gauntlet skeleton ([1139973a](https://github.com/Dicklesworthstone/frankensearch/commit/1139973a5da74b0930132f454646fa7a6ba82c7b)) and deterministic corpus + query generators for differential campaigns ([d9fd0743](https://github.com/Dicklesworthstone/frankensearch/commit/d9fd074366b4a5ea04865bb615df8027d8beb8d6))
+- ddmin divergence shrinker with auto-triage ([cc78425c](https://github.com/Dicklesworthstone/frankensearch/commit/cc78425c1b199a0e5e85d70c6091869c2801ecd2)) and append-only divergence ledger ([d3b5b303](https://github.com/Dicklesworthstone/frankensearch/commit/d3b5b303616146e47a13b25c97c8611040743f5a))
+- Exact CASS oracle campaigns ([ace575cb](https://github.com/Dicklesworthstone/frankensearch/commit/ace575cb84a94a8591d418a93335a4da0b81c263)); versioned QG evidence layer with sealed atomic artifacts and metric-specific estimands ([dc301b28](https://github.com/Dicklesworthstone/frankensearch/commit/dc301b28d2ee52ed6cecebd8af14ae79c7d20827)); repaired paired estimators wired into the bench harness ([8912f04f](https://github.com/Dicklesworthstone/frankensearch/commit/8912f04fd380670d75d4bfe4baebf5fc1051a18c))
+
+### Native Cross-Encoder and Embedder (frankentorch) — ONNX/ort Retired from the Default Rerank Lane
+
+- Replace the ONNX/ort cross-encoder with a pure-Rust frankentorch `NativeReranker` ([e717b8b4](https://github.com/Dicklesworthstone/frankensearch/commit/e717b8b4785a3e087e2ca17c22c946b4335b268e)), pinned by git rev so the `native` feature is consumable ([2eaf7539](https://github.com/Dicklesworthstone/frankensearch/commit/2eaf753955f58d8ce0f6203224d1ee2759b7cc49))
+- Pure-Rust `NativeEmbedder` (all-MiniLM-L6-v2) ([a18943de](https://github.com/Dicklesworthstone/frankensearch/commit/a18943de844abfc63fb711ad23b10f5f0761ccc1))
+- Kernel work to beat the ONNX baseline: tape-free fully-fused encoder layer ([30084c3d](https://github.com/Dicklesworthstone/frankensearch/commit/30084c3d8ef79c036dfee8d233e58203c6f29b79)), raw gemm-based attention ([e022c2b3](https://github.com/Dicklesworthstone/frankensearch/commit/e022c2b348a65573923b6bd6affc5ca55eed90f0)), fused softmax/GELU/LayerNorm and int8 GEMM paths
+- `fastembed-reranker` remains available as an optional feature for the previous FlashRank-style lane
+
+### SIMD and Systems Performance Offensive
+
+Hundreds of measured, bit-identity-gated optimizations across every crate,
+recorded pass-over-pass in `docs/PERF_LEDGER.md` with rejected hypotheses in
+`docs/NEGATIVE_EVIDENCE.md` (the ledger discipline itself is a deliverable of
+this epoch: ~150+ negative-evidence entries prevent re-litigating dead ends).
+
+- Runtime-dispatched AVX2/F16C kernels: f16 dot products 3.6–4.0x ([7239d585](https://github.com/Dicklesworthstone/frankensearch/commit/7239d585e765a430e0acff5a573a6ddbaf12f936)), 4-bit slab pack 10.3–13.6x ([dc60d618](https://github.com/Dicklesworthstone/frankensearch/commit/dc60d618c649e33d2d596abb44750b65f3ed3bad)), FSVI slab write 6.4–7.3x ([2a4d3334](https://github.com/Dicklesworthstone/frankensearch/commit/2a4d333445b14e80f3d7d865516056b2619efbf5)), 384-dim specializations ([cb0bb785](https://github.com/Dicklesworthstone/frankensearch/commit/cb0bb785771d1fae6a87d922f0c3bffb7ba9564e))
+- Lossless quantized search: FSVI 4-bit two-pass, the fastest lossless vector-search primitive ([f04074a4](https://github.com/Dicklesworthstone/frankensearch/commit/f04074a4d92d126b6fe5b02c63a9a6aa92aebfa3)), wired into the sync fast tier ([226814a1](https://github.com/Dicklesworthstone/frankensearch/commit/226814a1298959f1265afb878a3a65ed76d9044d)); parallelized MRL truncated scan 8.64x ([31c3d9cf](https://github.com/Dicklesworthstone/frankensearch/commit/31c3d9cfbd2fe1bfcda421937b00338256f46645)); selective-filter gather fast path 6.9–50x on filtered search ([ec76859a](https://github.com/Dicklesworthstone/frankensearch/commit/ec76859ace6dec12e5d569cc4b27781528845495))
+- Fusion-path clone elision and merge-structured RRF: doc_id moves instead of clones (7.8–21.5x on the fuse step) ([832c2613](https://github.com/Dicklesworthstone/frankensearch/commit/832c261396c54d936615bd2200153aafe9ccb04e)), merge-structured `rrf_fuse` 1.31–1.46x ([4aeb66b1](https://github.com/Dicklesworthstone/frankensearch/commit/4aeb66b1004e8e23fdfdd948449c19fa35bc8258))
+- Analyzer/canonicalizer hot path: ASCII NFC fast path, ~45–368x on the analyzer hot path ([9d7e8d00](https://github.com/Dicklesworthstone/frankensearch/commit/9d7e8d0022b9351bd586ff34e9e6057896074fb7)); S3-FIFO query-embedding cache ([b83b25d6](https://github.com/Dicklesworthstone/frankensearch/commit/b83b25d637e393692d5b9086692888cdaf5cb2e2)); Tantivy fast-field id materialization up to 6.32x ([14e87e4a](https://github.com/Dicklesworthstone/frankensearch/commit/14e87e4aa7e6cfb26078c58c5e1dc27b72c7d859))
+- Representative negative evidence: HNSW route-next refuted at production scale ([b8aec7b2](https://github.com/Dicklesworthstone/frankensearch/commit/b8aec7b292fe1d7c9284c6f7cfe1dc5aeab52de1)), AVX-512/VNNI ruled out as hardware-unavailable ([da7de808](https://github.com/Dicklesworthstone/frankensearch/commit/da7de808455d1aa094079bac9d39a23743688e5d))
+
+### HNSW / ANN Maturation
+
+- Persist native HNSW graph sidecars instead of rebuilding on load ([b5c3bab4](https://github.com/Dicklesworthstone/frankensearch/commit/b5c3bab4acc0ec6f6767c4cc522d28d0f5c03359)), with a v2 sidecar guard against silent vector swaps ([acf3f866](https://github.com/Dicklesworthstone/frankensearch/commit/acf3f866c96903bec986ea153a3d130567622c6a))
+- Native in-tree HNSW graph engine replacing the external dependency ([0b59e600](https://github.com/Dicklesworthstone/frankensearch/commit/0b59e6008fb17c403ad836361811aed34da4156f))
+- Correctness hardening: atomic generation publish ([a816f6d9](https://github.com/Dicklesworthstone/frankensearch/commit/a816f6d93b408f5dece7bcb9f13e38c8c4778ac4)), per-vector fingerprinting ([f96a9008](https://github.com/Dicklesworthstone/frankensearch/commit/f96a900885128cb6192b14b563f2dac2fa84fdc5)), READY-generation recovery ([b23dbe4e](https://github.com/Dicklesworthstone/frankensearch/commit/b23dbe4e51103b175e201aa069a6706a9cbb4f07)), duplicate-row-preserving repair ([95a636f9](https://github.com/Dicklesworthstone/frankensearch/commit/95a636f95d12da436a8453f685ef6b09c76f033c))
+
+### Embedding Integrity: Fail-Closed Trust Boundaries
+
+- Fail closed on unverifiable embedding identity ([ab0f69f8](https://github.com/Dicklesworthstone/frankensearch/commit/ab0f69f8c966844dbd5e595a07c1c317a8ca2e2d)) with frozen canonical embedding identity contracts ([d615076c](https://github.com/Dicklesworthstone/frankensearch/commit/d615076c15c2f6ffee975eb637638821dfd09b83))
+- Authenticate remote API vectors ([46ebeebf](https://github.com/Dicklesworthstone/frankensearch/commit/46ebeebf72c3d7b1fec2101be5a21d0f49df87b9)) and daemon vectors ([e580d460](https://github.com/Dicklesworthstone/frankensearch/commit/e580d4604ee9b73b800620fa1db1160d2dc08f2d)); acquire frozen models atomically ([e2851547](https://github.com/Dicklesworthstone/frankensearch/commit/e2851547c2598616dd229afa89487370436c890b))
+- Typed semantic zero-signal vocabulary ([7a8c6eb9](https://github.com/Dicklesworthstone/frankensearch/commit/7a8c6eb9efba6165637f1645f2020b66fbd073cc)); reject unusable embeddings at the ingestion sink ([df91954b](https://github.com/Dicklesworthstone/frankensearch/commit/df91954b2bed942db5d41caff4904619bc0a157b)); make degraded embedder stacks observable instead of silent ([5097f545](https://github.com/Dicklesworthstone/frankensearch/commit/5097f545c627c58f8f0d148f8b105128dbbedaed))
+- Lift the 16 MiB download cap so built-in model artifacts fetch (closes [#27](https://github.com/Dicklesworthstone/frankensearch/issues/27)) ([0ca8dc45](https://github.com/Dicklesworthstone/frankensearch/commit/0ca8dc457f4fce20f3e6eeed337dc7a3b1f9d1d2))
+
+### fsfs Operability Wave (bd-pkl0 roadmap)
+
+A May burst delivering the "agent-scale resilience and operability" roadmap
+(epic `bd-pkl0`, closed with 15+ children), followed by lifecycle hardening.
+
+- New diagnostic/ops surfaces: self-calibrating profile report ([0581b039](https://github.com/Dicklesworthstone/frankensearch/commit/0581b03940ee9c04af03b06249908d3430a8648a)), index freshness audit ([7c82d27f](https://github.com/Dicklesworthstone/frankensearch/commit/7c82d27f166bbc832ba395da426b6e6f4e421403)), resource pressure governor ([3c7cda27](https://github.com/Dicklesworthstone/frankensearch/commit/3c7cda27e0b9ed053f959564f38434babb7970bd)), index footprint advisor ([ea64a0f0](https://github.com/Dicklesworthstone/frankensearch/commit/ea64a0f05a58dba761601b9435a6a5a577f81b55)), benchmark drift dashboard ([a4d3cec8](https://github.com/Dicklesworthstone/frankensearch/commit/a4d3cec852a8cc862b531ca042742c012cfc460c)), corpus privacy preflight, model cache diagnostics, degraded incident suite, query-plan metamorphic suite
+- Incremental change evaluator and contract-parity validators ([468488f0](https://github.com/Dicklesworthstone/frankensearch/commit/468488f0f0a1eb54f89c025b05c3f4acd9e00bd2)); per-feature CI smoke lanes ([d305eda2](https://github.com/Dicklesworthstone/frankensearch/commit/d305eda22ab2e7d358cde8d6c79089eb0e41a886))
+- Streaming search command with a phase-sink, flush-visible writer ([bd1821ce](https://github.com/Dicklesworthstone/frankensearch/commit/bd1821ce1c5a5ba3e69e4fefd514208135c51660)); resumable interrupted indexing ([b596cca8](https://github.com/Dicklesworthstone/frankensearch/commit/b596cca8c6f2bb6f9775823e48d72c310fdfc806)); shutdown-aware concurrent serve accept loop ([77b68c7f](https://github.com/Dicklesworthstone/frankensearch/commit/77b68c7faefbdc0a812808a0d86809c05d6a2ba1)); executable lifecycle commands ([c5bd2c6d](https://github.com/Dicklesworthstone/frankensearch/commit/c5bd2c6d3694c9b1f29f5632f49f35c3dceb8cc3))
+
+### CASS Compatibility and Lexical Scale
+
+- Bounded-merge API to avoid `vm.max_map_count` exhaustion on huge rebuilds ([ceaba154](https://github.com/Dicklesworthstone/frankensearch/commit/ceaba154449b931fd58d9b1c1c90be7673e5f38c))
+- Query-semantics hardening: wildcard regexes fail closed ([3b65ab32](https://github.com/Dicklesworthstone/frankensearch/commit/3b65ab3270a3ae8e52410ab726fdeff1de3b17e1)); standalone NOT complement semantics preserved ([054dab0d](https://github.com/Dicklesworthstone/frankensearch/commit/054dab0d92ea52149efeabfadc70785db0830058)); ASCII-token CJK allocation elision ([a982f33a](https://github.com/Dicklesworthstone/frankensearch/commit/a982f33a5b5109f6fc6be7853dd4598f35a31482))
+- Feature-graph rename: `cass-compat` is now an alias of `lexical-tantivy` (which implies `lexical`); the CASS schema-v8 Tantivy adapter is an explicitly foreign-format lane outside default builds
+
+### Hybrid Quality Harness
+
+- Statistically disciplined retrieval-quality evidence (`docs/quality_harness/`): tier-asymmetry finding — lexical decisive on 4/4 corpora, dense tier ~4.4x smaller contribution ([8a90fa13](https://github.com/Dicklesworthstone/frankensearch/commit/8a90fa13bcb558bd1240822810d028cdc26bedd6)); bootstrap-CI dense-tier marginal value ([e0dab5cd](https://github.com/Dicklesworthstone/frankensearch/commit/e0dab5cde0b39fd7abdf07e131a9075979b4d900)); pool-size-dependent fusion comparisons ([91abbe8d](https://github.com/Dicklesworthstone/frankensearch/commit/91abbe8d898211da6aac1bed8228f5cd088c2831))
+
+### Toolchain, Dependencies, and Packaging
+
+- asupersync tracked through the 0.3.x series: 0.3.4 alignment ([f130ec4c](https://github.com/Dicklesworthstone/frankensearch/commit/f130ec4cffbcada856776140812db39bd9ae62e3)), floored at 0.3.9 to exclude a sleep regression ([b3b5d618](https://github.com/Dicklesworthstone/frankensearch/commit/b3b5d6185d26fdc2ce9efd3a15a0793976c1a75b))
+- crates.io republish of the cass-closure crates: members 0.2.1, rerank 0.2.2, umbrella `frankensearch` 0.3.1/0.3.2 ([c8fd6654](https://github.com/Dicklesworthstone/frankensearch/commit/c8fd66544614b434f82eab86e86e189ea284dada), [2cad158f](https://github.com/Dicklesworthstone/frankensearch/commit/2cad158f4468ece7076e3fe529c8e5c20b2e020e))
+- Vendored OpenSSL / forced rustls TLS for fastembed/ort/hf-hub ([10383e3d](https://github.com/Dicklesworthstone/frankensearch/commit/10383e3dd0310c8ca7c17a2bd06f9275ed192a06)); test-internals de-leaked from production dependency graphs ([e82ba84c](https://github.com/Dicklesworthstone/frankensearch/commit/e82ba84cd76ad7456587e524b8e491625cd3f127))
+
+---
+
+## v1.3.0 -- 2026-04-24
+
+> **Git tag only — no GitHub Release was published for v1.3.0.** -- [Full diff from v1.2.5](https://github.com/Dicklesworthstone/frankensearch/compare/v1.2.5...v1.3.0)
+>
+> 84 commits (2026-04-08 through 2026-04-22). Workspace version bump: 11 member
+> crates to 0.2.0, fsfs to 1.3.0, `frankensearch` binary crate to 0.3.0
+> ([3dbab624](https://github.com/Dicklesworthstone/frankensearch/commit/3dbab624fd05d4b22dac8ad4b8b02bee49db6b39)).
+
+### CASS-Compat Lexical Indexing Overhaul
+
+- Custom `CassTokenizer` with unified content prefix/preview builder; schema v7 hash bump ([84566328](https://github.com/Dicklesworthstone/frankensearch/commit/84566328322e0ae95982a9f46aacf040fae75c90))
+- Writer scaling: `CASS_MAX_WRITER_THREADS` raised to 32, batched adds via `Writer::run`, bulk-load merge threshold lifted to 256 ([4be27b96](https://github.com/Dicklesworthstone/frankensearch/commit/4be27b963e82d436f926db5682dccb227ff59dd5))
+
+### fsfs Contract Parity
+
+- Pressure profile contract types, `Reranked` search phase, and config contract schema ([c146fdfe](https://github.com/Dicklesworthstone/frankensearch/commit/c146fdfe495fb7231ea9af047e3fca2818cce458)); `reranked` phase wired through search_events with explanation goldens ([4ef8e090](https://github.com/Dicklesworthstone/frankensearch/commit/4ef8e0904d0ac6f953065506e6e323344e1fb257))
+
+### Runtime & Dependencies
+
+- asupersync moved from a git pin to crates.io v0.3.0, then 0.3.1 ([f6dc73aa](https://github.com/Dicklesworthstone/frankensearch/commit/f6dc73aac0343358b213743cefcba0c679669749))
+- `PR_SET_PDEATHSIG` installed on spawned search daemons so orphans cannot outlive their parent ([0134f073](https://github.com/Dicklesworthstone/frankensearch/commit/0134f0735794ae47f311f571cc1b783fc93d8f2d))
+
+---
+
+## [v1.2.1 – v1.2.5](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.5) -- 2026-04-07/08
+
+> **Five CI-stabilization respins, each published as a GitHub Release**
+> ([v1.2.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.1),
+> [v1.2.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.2),
+> [v1.2.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.3),
+> [v1.2.4](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.4),
+> [v1.2.5](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.5)) --
+> [Full diff from v1.2.0](https://github.com/Dicklesworthstone/frankensearch/compare/v1.2.0...v1.2.5)
+>
+> Cut in rapid succession to get green release binaries out after v1.2.0:
+> flaky ops/ingestion test fixes and removal of ort-incompatible build targets
+> ([0a325fa5](https://github.com/Dicklesworthstone/frankensearch/commit/0a325fa5654cb59d8e6fa400adbc609575202e70)),
+> proptest temp-path fixes for macOS CI and nightly-clippy `tempfile` adaptations
+> ([b6fbf0db](https://github.com/Dicklesworthstone/frankensearch/commit/b6fbf0db922f5e77e6f9ebaf8e8f09dde8b5e0ea),
+> [c71cd45f](https://github.com/Dicklesworthstone/frankensearch/commit/c71cd45fb99b42acce2d2d8ae514dc16903902c2)).
+> v1.2.5 is the latest GitHub Release as of this changelog's reconstruction.
+
+---
+
+## [v1.2.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.2.0) -- 2026-04-07
+
+> **CJK search, performance improvements, async embedder fix** -- [Full diff from v1.1.7](https://github.com/Dicklesworthstone/frankensearch/compare/v1.1.7...v1.2.0)
+>
+> Lightweight tag. Published as a GitHub Release.
+
+- CJK bigram tokenization for Chinese/Japanese/Korean search ([b7a6cf61](https://github.com/Dicklesworthstone/frankensearch/commit/b7a6cf61c730b140793ce628adb813360f9572c3))
+- Raw reranker logit propagation, `config set/reset`, and WAL compaction on shutdown ([fa945601](https://github.com/Dicklesworthstone/frankensearch/commit/fa94560180bdef2e143447749533f8f22e7ff228))
+- Parallelized embedding + lexical search via `rayon::join` with `poll_immediate` for sync-in-async futures ([cba3632a](https://github.com/Dicklesworthstone/frankensearch/commit/cba3632a794f73bf0fa4a0e3925963f130b7ba90))
+
+---
+
+## v1.1.5, v1.1.6, and [v1.1.7](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.1.7) -- 2026-03-22/23
+
+> **v1.1.5 and v1.1.6 are git tags only (no GitHub Releases); v1.1.7 was
+> published as a GitHub Release.** -- [Full diff from v1.1.4](https://github.com/Dicklesworthstone/frankensearch/compare/v1.1.4...v1.1.7)
+>
+> Compilation/CI respins of the v1.1.4 feature set: adaptation to the
+> fsqlite-types 0.1.2 API (`Arc<str>`/`Arc<[u8]>` values, `Cx` type)
+> ([37dc7e18](https://github.com/Dicklesworthstone/frankensearch/commit/37dc7e185f6e3e8a67258b56133dcb79ca3e59f9)),
+> warnings-as-errors and OpenSSL cross-compilation fixes
+> ([007ffadb](https://github.com/Dicklesworthstone/frankensearch/commit/007ffadb970e541ea929cd6c85ecfee1f6dcf077)),
+> and partial release publishing when some targets lack ORT prebuilts
+> ([fb623f37](https://github.com/Dicklesworthstone/frankensearch/commit/fb623f37f33b9186ac5a3a6900762a99b3823a8c)).
 
 ---
 

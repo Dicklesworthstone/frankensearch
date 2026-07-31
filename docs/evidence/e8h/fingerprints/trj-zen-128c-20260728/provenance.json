@@ -1,0 +1,22 @@
+{
+  "schema": "frankensearch.perf-runner.v1",
+  "machine_class": "trj-zen-128c",
+  "label": "first-fingerprint",
+  "calibrate_aa": 0,
+  "timestamp_utc": "20260728T182136Z",
+  "hostname": "threadripperje",
+  "os": "Linux",
+  "git_rev": "f5581f907420e97d1b5cb27c684d76cf91bb2d30",
+  "dirty_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "rustc": "rustc 1.99.0-nightly (09ee43b2d 2026-07-27)",
+  "cargo": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)",
+  "governor": "performance",
+  "smt": "on",
+  "thermal_pressure": "n/a",
+  "page_size": "4096",
+  "cargo_target_dir": "/data/tmp/cargo-target",
+  "quill_perf_scale": "unset",
+  "quill_perf_fixture": "unset",
+  "rayon_num_threads": "unset",
+  "command": "true "
+}

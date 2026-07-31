@@ -1,0 +1,26 @@
+machdep.cpu.cores_per_package: 14
+machdep.cpu.core_count: 14
+machdep.cpu.logical_per_package: 14
+machdep.cpu.thread_count: 14
+machdep.cpu.brand_string: Apple M4 Pro
+hw.ncpu: 14
+hw.memsize: 68719476736
+hw.pagesize: 16384
+hw.perflevel0.physicalcpu: 10
+hw.perflevel0.physicalcpu_max: 10
+hw.perflevel0.logicalcpu: 10
+hw.perflevel0.logicalcpu_max: 10
+hw.perflevel0.l1icachesize: 196608
+hw.perflevel0.l1dcachesize: 131072
+hw.perflevel0.l2cachesize: 16777216
+hw.perflevel0.cpusperl2: 5
+hw.perflevel0.name: Performance
+hw.perflevel1.physicalcpu: 4
+hw.perflevel1.physicalcpu_max: 4
+hw.perflevel1.logicalcpu: 4
+hw.perflevel1.logicalcpu_max: 4
+hw.perflevel1.l1icachesize: 131072
+hw.perflevel1.l1dcachesize: 65536
+hw.perflevel1.l2cachesize: 4194304
+hw.perflevel1.cpusperl2: 4
+hw.perflevel1.name: Efficiency
