@@ -86,7 +86,7 @@ Build: strict-remote `rch exec --base 3debdf25 --clean-overlay` with only the
 bench and its `Cargo.toml` overlaid. Bench source:
 `frankensearch/benches/fsvi_4bit_vs_incumbent.rs`.
 
-## Results — run 1 (15 rounds): **losslessness CONFIRMED, speed claim INVERTED but UNDECIDABLE**
+## Results — run 1 (15 rounds)
 
 Strict-remote `rch exec` on worker `vmi1152480`, exit 0. Self-reported from
 inside the process:
@@ -181,9 +181,88 @@ host-dependent rather than wrong — but it means the published self-vs-self
 ratio is not portable either, and it was never labelled with the host it was
 measured on. Filed as a separate concern; not resolved by this card.
 
-## Results — run 2 (61 rounds)
+## Results — run 2 (61 rounds): more rounds made the null **worse**
 
-<!-- RESULTS-2 -->
+Same worker (`vmi1152480`), same fixture, different binary
+(`elf_sha256 = 905fa9597cbc940708dfeeeb09f9957fa82b6d1997168005a9f9f11e31bb7924`),
+`rounds=61`, exit 0. Fleet was at 9 active builds vs 13–15 during run 1.
+
+### Losslessness — reconfirmed on a second, independent ELF
+
+```
+candidate == ours_exact_f16     : 32/32
+candidate == incumbent_f32      : 32/32
+ours_exact_f16 == incumbent_f32 : 32/32
+```
+
+### Per-arm
+
+| arm | median µs/query | cpu/wall | n |
+|---|---:|---:|---:|
+| `incumbent_batch32_A` | 2590.04 | 0.98 | 61 |
+| `incumbent_batch32_B` | 2639.32 | 1.00 | 61 |
+| `incumbent_gemv_nq1` | 12147.50 | 0.99 | 61 |
+| `cand_4bit_mult5_threads1` | 4037.68 | 0.97 | 61 |
+| `cand_4bit_mult5_default` | 4255.07 | 1.34 | 61 |
+| `ours_exact_flat_default` | 5701.13 | 1.42 | 61 |
+
+### The gate result — still DIRTY, and further from clean
+
+```
+null_median = 1.0598   null_p5 = 0.5788   null_p95 = 1.8289
+null_gate(median within 1.000 +/- 0.030) = DIRTY
+
+ratio_like_for_like(1 thread both)  = 1.5359  (0.65x)  UNDECIDABLE
+ratio_as_shipped                    = 1.6186  (0.62x)  UNDECIDABLE
+ratio_ours_exact_flat               = 2.1687  (0.46x)  UNDECIDABLE
+self_vs_self_context: cand/flat     = 0.7464  (1.34x)
+```
+
+**Quadrupling the rounds moved the null the wrong way**: median 1.0321 → 1.0598,
+band `[0.7685, 1.5559]` → `[0.5788, 1.8289]`. Every absolute time inflated too
+(incumbent 1833.79 → 2590.04 µs/q) and both parallel arms lost CPU (`cand_default`
+cpu/wall 2.82 → 1.34, `ours_exact_flat` 3.37 → 1.42). **The dispersion is
+environmental, not sampling error** — this is a shared, contended VPS, and more
+samples of a drifting process do not converge. That is the method lesson: when a
+null is dirty because the host is noisy, `n` is the wrong lever.
+
+## Verdict
+
+| half of the claim | outcome |
+|---|---|
+| **"lossless"** | **SUPPORTED.** 32/32 on all three definitions, twice, on two independent ELFs. This is a deterministic set comparison, so it needs no null and the fleet noise cannot touch it. It is also *stronger* than the ledger ever showed: the ledger only tested against our own f16 scan; it is now verified against an f32 exhaustive scan. |
+| **"the fastest … primitive"** | **NOT SUPPORTED, and not refutable on this infrastructure either.** Both runs are UNDECIDABLE by the pre-declared gate. |
+
+**All six ratio observations across two runs and two binaries put the candidate
+slower than the incumbent** (1.62, 1.18 / 1.54, 1.62 vs the incumbent; and our
+own exact scan slower still). But — the same discipline the ledger gate enforced
+on me elsewhere this session — **consistent direction across runs is a prior, not
+a decision.** No ratio from this card may be quoted.
+
+### The retraction does not depend on the measurement
+
+This is the load-bearing point. The superlative must be withdrawn **regardless of
+whether a clean null ever confirms the loss**, because:
+
+1. It never had an incumbent arm at all. Its whole basis
+   (`PERF_LEDGER.md:825/827`, and commit `f04074a4`'s subject line) is
+   frankensearch-vs-frankensearch.
+2. "Fastest" is unbounded. Even a decisive win against `matrixmultiply` would not
+   establish it, with faiss, usearch and hnswlib unmeasured.
+
+So the measurement's undecidability delays a *counter-claim*; it does not rescue
+the original. Filed as `bd-retract-fastest-lossless-superlative-3ush8` with exact
+replacement text, because the claim lives at `origin/main:82` and **cannot be
+corrected from this checkout** — local `main` is 270 commits behind and its HEAD
+does not contain the line, while the working-tree `CHANGELOG.md` carries an
+unrelated peer's uncommitted 170-line draft that a commit here would sweep in.
+
+### What a decidable answer needs
+
+A quiet or CPU-pinned host, both arms in one invocation as here. The harness is
+done and reusable; only the environment is missing. This is the same blocker that
+keeps the Class-D retry predicates in
+`retry-predicate-sweep-20260731.md` unsatisfied.
 
 ## Disclosed asymmetries
 
