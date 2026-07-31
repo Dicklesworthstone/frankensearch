@@ -620,6 +620,22 @@ pub enum PerfApplicabilityPlanError {
         /// Gate with no maximum.
         gate: PerfGate,
     },
+    /// A diagnostic profile cannot make runnable claims without both bounds.
+    #[error(
+        "diagnostic execution profile {profile:?} cannot plan {gate} without a verified bounded \
+         capacity envelope (capacity {execution_capacity:?}, maximum \
+         {max_exercised_cell_width:?})"
+    )]
+    UnboundedDiagnosticProfile {
+        /// Diagnostic profile whose execution envelope is incomplete.
+        profile: MachineProfileKey,
+        /// Gate that cannot be planned.
+        gate: PerfGate,
+        /// Hash-bound execution capacity, when one exists.
+        execution_capacity: Option<u64>,
+        /// Hash-bound maximum runnable canonical width, when one exists.
+        max_exercised_cell_width: Option<u64>,
+    },
     /// Profile capacity and per-gate maximum contradict one another.
     #[error("execution profile {profile:?} has an invalid capacity envelope for {gate}")]
     InvalidCapacityEnvelope {
@@ -701,6 +717,56 @@ fn update_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
             update_length_framed(hasher, value.to_string().as_bytes());
         }
         None => update_length_framed(hasher, b"none"),
+    }
+}
+
+/// Complete bounded facts used to classify cells for one admitted profile.
+///
+/// Production construction occurs only after the registry's profile contract
+/// supplies both values. A future receipt-bound diagnostic path must bind the
+/// same facts before constructing this envelope; `None` never means unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedProfileApplicabilityEnvelope {
+    profile: MachineProfileKey,
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: u64,
+    disposition: DefaultFlipDisposition,
+    max_exercised_cell_width: u64,
+}
+
+impl BoundedProfileApplicabilityEnvelope {
+    fn classify_cell(
+        self,
+        configured_width: u64,
+        canonical_diagnostic: bool,
+    ) -> (PerfCellApplicability, PerfCellApplicabilityReason) {
+        if configured_width > self.max_exercised_cell_width {
+            (
+                PerfCellApplicability::NotApplicable,
+                PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                    profile: self.profile,
+                    capacity_semantics: self.capacity_semantics,
+                    execution_capacity: self.execution_capacity,
+                    required_cell_width: configured_width,
+                    max_exercised_cell_width: self.max_exercised_cell_width,
+                },
+            )
+        } else if self.disposition == DefaultFlipDisposition::DiagnosticOnly {
+            (
+                PerfCellApplicability::Diagnostic,
+                PerfCellApplicabilityReason::DiagnosticProfile,
+            )
+        } else if canonical_diagnostic {
+            (
+                PerfCellApplicability::Diagnostic,
+                PerfCellApplicabilityReason::DiagnosticCell,
+            )
+        } else {
+            (
+                PerfCellApplicability::Required,
+                PerfCellApplicabilityReason::RequiredForDefaultFlip,
+            )
+        }
     }
 }
 
@@ -1102,6 +1168,7 @@ impl PerfMatrixSpec {
         )?;
         let disposition = policy.default_flip_disposition();
         let max_exercised_cell_width = policy.max_exercised_cell_width();
+        let execution_capacity = profile.execution_capacity();
         if disposition == DefaultFlipDisposition::RequiredForDefaultFlip
             && max_exercised_cell_width.is_none()
         {
@@ -1110,10 +1177,20 @@ impl PerfMatrixSpec {
                 gate,
             });
         }
-        if profile.execution_capacity() == Some(0)
+        if disposition == DefaultFlipDisposition::DiagnosticOnly
+            && (execution_capacity.is_none() || max_exercised_cell_width.is_none())
+        {
+            return Err(PerfApplicabilityPlanError::UnboundedDiagnosticProfile {
+                profile: profile_key,
+                gate,
+                execution_capacity,
+                max_exercised_cell_width,
+            });
+        }
+        if execution_capacity == Some(0)
             || max_exercised_cell_width == Some(0)
-            || (profile.execution_capacity().is_none() && max_exercised_cell_width.is_some())
-            || profile.execution_capacity().is_some_and(|capacity| {
+            || (execution_capacity.is_none() && max_exercised_cell_width.is_some())
+            || execution_capacity.is_some_and(|capacity| {
                 max_exercised_cell_width.is_some_and(|maximum| maximum > capacity)
             })
         {
@@ -1138,9 +1215,7 @@ impl PerfMatrixSpec {
                 });
             }
             if disposition == DefaultFlipDisposition::RequiredForDefaultFlip
-                && (profile
-                    .execution_capacity()
-                    .is_none_or(|capacity| capacity < primary_target_cell_width)
+                && (execution_capacity.is_none_or(|capacity| capacity < primary_target_cell_width)
                     || max_exercised_cell_width
                         .is_none_or(|maximum| maximum < primary_target_cell_width))
             {
@@ -1149,12 +1224,27 @@ impl PerfMatrixSpec {
                         profile: profile_key,
                         gate,
                         primary_target_cell_width,
-                        execution_capacity: profile.execution_capacity(),
+                        execution_capacity,
                         max_exercised_cell_width,
                     },
                 );
             }
         }
+        let (Some(execution_capacity), Some(max_exercised_cell_width)) =
+            (execution_capacity, max_exercised_cell_width)
+        else {
+            return Err(PerfApplicabilityPlanError::InvalidCapacityEnvelope {
+                profile: profile_key,
+                gate,
+            });
+        };
+        let envelope = BoundedProfileApplicabilityEnvelope {
+            profile: profile_key,
+            capacity_semantics: profile.capacity_semantics(),
+            execution_capacity,
+            disposition,
+            max_exercised_cell_width,
+        };
 
         let mut entries = Vec::new();
         for (ordinal, cell) in self.for_gate(gate).into_iter().enumerate() {
@@ -1164,41 +1254,8 @@ impl PerfMatrixSpec {
                 .ok_or(PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
             let configured_width = u64::try_from(configured_threads)
                 .map_err(|_| PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
-            let exceeded_maximum =
-                max_exercised_cell_width.filter(|maximum| configured_width > *maximum);
-            let (applicability, reason) = if let Some(maximum) = exceeded_maximum {
-                let execution_capacity = profile.execution_capacity().ok_or(
-                    PerfApplicabilityPlanError::InvalidCapacityEnvelope {
-                        profile: profile_key,
-                        gate,
-                    },
-                )?;
-                (
-                    PerfCellApplicability::NotApplicable,
-                    PerfCellApplicabilityReason::ExceedsProfileMaximum {
-                        profile: profile_key,
-                        capacity_semantics: profile.capacity_semantics(),
-                        execution_capacity,
-                        required_cell_width: configured_width,
-                        max_exercised_cell_width: maximum,
-                    },
-                )
-            } else if disposition == DefaultFlipDisposition::DiagnosticOnly {
-                (
-                    PerfCellApplicability::Diagnostic,
-                    PerfCellApplicabilityReason::DiagnosticProfile,
-                )
-            } else if canonical_cell_is_diagnostic(cell) {
-                (
-                    PerfCellApplicability::Diagnostic,
-                    PerfCellApplicabilityReason::DiagnosticCell,
-                )
-            } else {
-                (
-                    PerfCellApplicability::Required,
-                    PerfCellApplicabilityReason::RequiredForDefaultFlip,
-                )
-            };
+            let (applicability, reason) =
+                envelope.classify_cell(configured_width, canonical_cell_is_diagnostic(cell));
             entries.push(PerfCellApplicabilityEntry {
                 ordinal,
                 cell_contract_sha256: cell.contract_sha256().map_err(|error| {
@@ -1227,8 +1284,8 @@ impl PerfMatrixSpec {
                             profile: profile_key,
                             gate,
                             primary_target_cell_width,
-                            execution_capacity: profile.execution_capacity(),
-                            max_exercised_cell_width,
+                            execution_capacity: Some(execution_capacity),
+                            max_exercised_cell_width: Some(max_exercised_cell_width),
                         },
                     );
                 }
@@ -1257,9 +1314,9 @@ impl PerfMatrixSpec {
                 applicability_plan_sha256: String::new(),
             },
             capacity_semantics: profile.capacity_semantics(),
-            execution_capacity: profile.execution_capacity(),
+            execution_capacity: Some(execution_capacity),
             default_flip_disposition: disposition,
-            max_exercised_cell_width,
+            max_exercised_cell_width: Some(max_exercised_cell_width),
             cells: entries,
         };
         plan.binding.applicability_plan_sha256 = plan.contract_sha256();
@@ -4369,6 +4426,118 @@ mod tests {
                                     == u64::try_from(cell.configured_threads)
                                         .expect("canonical width fits u64")
                         )
+                })
+        );
+    }
+
+    #[test]
+    fn unbounded_x86_diagnostic_profile_returns_typed_no_claim_error() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let key = profile_key(
+            HardwareClassId::X86VpsOvh,
+            ExecutionProfileId::X86Diagnostic,
+        );
+        let profile = registry
+            .execution_profile(key)
+            .expect("frozen x86 diagnostic profile");
+        let policy = profile
+            .gate_policy(PerfGate::Qg1.label())
+            .expect("x86 QG-1 policy");
+        assert_eq!(
+            policy.default_flip_disposition(),
+            DefaultFlipDisposition::DiagnosticOnly
+        );
+        assert_eq!(profile.execution_capacity(), None);
+        assert_eq!(policy.max_exercised_cell_width(), None);
+        assert!(matches!(
+            PerfMatrixSpec::complete().applicability_plan(&registry, key, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::UnboundedDiagnosticProfile {
+                profile,
+                gate: PerfGate::Qg1,
+                execution_capacity: None,
+                max_exercised_cell_width: None,
+            }) if profile == key
+        ));
+    }
+
+    #[test]
+    fn bounded_diagnostic_envelope_marks_wider_cells_na_and_never_required() {
+        let profile = profile_key(
+            HardwareClassId::X86VpsOvh,
+            ExecutionProfileId::X86Diagnostic,
+        );
+        let envelope = BoundedProfileApplicabilityEnvelope {
+            profile,
+            capacity_semantics: ExecutionCapacitySemantics::DiagnosticWorkerBudget,
+            execution_capacity: 8,
+            disposition: DefaultFlipDisposition::DiagnosticOnly,
+            max_exercised_cell_width: 8,
+        };
+        let classifications = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .map(|cell| {
+                let configured_width = u64::try_from(
+                    cell.threads
+                        .expect("canonical QG-1 cell has a configured width"),
+                )
+                .expect("canonical QG-1 width fits u64");
+                (
+                    configured_width,
+                    envelope.classify_cell(configured_width, canonical_cell_is_diagnostic(cell)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(classifications.len(), 74);
+        assert_eq!(
+            classifications
+                .iter()
+                .filter(|(_, (applicability, _))| {
+                    *applicability == PerfCellApplicability::Diagnostic
+                })
+                .count(),
+            34
+        );
+        assert_eq!(
+            classifications
+                .iter()
+                .filter(|(_, (applicability, _))| {
+                    *applicability == PerfCellApplicability::NotApplicable
+                })
+                .count(),
+            40
+        );
+        let any_required = classifications
+            .iter()
+            .any(|(_, (applicability, _))| *applicability == PerfCellApplicability::Required);
+        assert!(
+            !any_required,
+            "a diagnostic-only envelope must force PerfEvidenceArtifact::fold onto its \
+             evidence.gate_without_required_cells NoDecision path, never an Allow path"
+        );
+        assert!(
+            classifications
+                .iter()
+                .all(|(configured_width, (applicability, reason))| {
+                    if *configured_width > 8 {
+                        *applicability == PerfCellApplicability::NotApplicable
+                            && matches!(
+                                reason,
+                                PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                                    profile: reason_profile,
+                                    capacity_semantics:
+                                        ExecutionCapacitySemantics::DiagnosticWorkerBudget,
+                                    execution_capacity: 8,
+                                    required_cell_width,
+                                    max_exercised_cell_width: 8,
+                                } if *reason_profile == profile
+                                    && *required_cell_width == *configured_width
+                            )
+                    } else {
+                        *applicability == PerfCellApplicability::Diagnostic
+                            && *reason == PerfCellApplicabilityReason::DiagnosticProfile
+                    }
                 })
         );
     }
