@@ -2204,8 +2204,10 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
         );
-        let _accumulate_timer = crate::tracing_conventions::StageTimer::new(&accumulate_span);
-        let _accumulate_entered = accumulate_span.enter();
+        let trace_accumulate = !accumulate_span.is_disabled();
+        let _accumulate_timer =
+            trace_accumulate.then(|| crate::tracing_conventions::StageTimer::new(&accumulate_span));
+        let _accumulate_entered = trace_accumulate.then(|| accumulate_span.enter());
         if doc_ord >= DOC_ORDS_PER_LEASE {
             return Err(AccumulatorError::DocumentOutsideLease { doc_ord });
         }
@@ -2449,18 +2451,24 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     debug_assert!(self.analyzer.supports(analyzer));
                     let terms = &mut self.terms;
                     let column = &mut self.fields[field_index];
-                    let report = {
-                        let tokenize_span = tracing::info_span!(
-                            target: crate::tracing_conventions::TARGET,
-                            crate::tracing_conventions::SCRIBE_TOKENIZE,
-                            phase = "tokenize",
-                            field_ord,
-                            source_bytes = value.text.len(),
-                            result_count = tracing::field::Empty,
-                            oversized_tokens = tracing::field::Empty,
-                            analyzer_bytes_reserved = tracing::field::Empty,
-                            duration_us = tracing::field::Empty,
-                        );
+                    let tokenize_span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        crate::tracing_conventions::SCRIBE_TOKENIZE,
+                        phase = "tokenize",
+                        field_ord,
+                        source_bytes = value.text.len(),
+                        result_count = tracing::field::Empty,
+                        oversized_tokens = tracing::field::Empty,
+                        analyzer_bytes_reserved = tracing::field::Empty,
+                        duration_us = tracing::field::Empty,
+                    );
+                    let report = if tokenize_span.is_disabled() {
+                        analyze_admitted(&mut self.analyzer, analyzer, value.text, &mut |token| {
+                            let term_id = terms.intern(field_ord, token.text.as_bytes());
+                            column.append_token(term_id, doc_ord, token.position);
+                        })
+                        .expect("document validation checked analyzer-family support")
+                    } else {
                         let _tokenize_timer =
                             crate::tracing_conventions::StageTimer::new(&tokenize_span);
                         let _tokenize_entered = tokenize_span.enter();
@@ -2534,25 +2542,27 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         self.last_doc_ord = Some(doc_ord);
         let arena_bytes_used = self.bytes_used();
         let arena_bytes_reserved = self.bytes_reserved();
-        accumulate_span.record(
-            "doc_count",
-            u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record("result_count", 1_u64);
-        accumulate_span.record("admitted_tokens", admitted_tokens);
-        accumulate_span.record("oversized_tokens", oversized_tokens);
-        accumulate_span.record(
-            "token_count",
-            u64::try_from(self.token_count()).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record(
-            "arena_bytes_used_high_water",
-            u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record(
-            "arena_bytes_reserved_high_water",
-            u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
-        );
+        if trace_accumulate {
+            accumulate_span.record(
+                "doc_count",
+                u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
+            );
+            accumulate_span.record("result_count", 1_u64);
+            accumulate_span.record("admitted_tokens", admitted_tokens);
+            accumulate_span.record("oversized_tokens", oversized_tokens);
+            accumulate_span.record(
+                "token_count",
+                u64::try_from(self.token_count()).unwrap_or(u64::MAX),
+            );
+            accumulate_span.record(
+                "arena_bytes_used_high_water",
+                u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
+            );
+            accumulate_span.record(
+                "arena_bytes_reserved_high_water",
+                u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
+            );
+        }
         tracing::info!(
             target: crate::tracing_conventions::TARGET,
             phase = "accumulate.complete",
