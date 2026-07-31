@@ -13,13 +13,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use frankensearch_quill_gauntlet::{
-    ExecutionProfileId, HardwareClassId, LocalPerfRunConfig, MachineProfileKey, PerfGate,
-    run_local_perf_command,
+    ExecutionProfileId, HardwareClassId, LocalPerfRunConfig, LocalPerfRunError,
+    LocalPerfRunSelection, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
+    MachineProfileKey, PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyReadiness, PerfGate,
+    VerifiedLocalPerfAttemptBundle, run_local_perf_command, run_selected_local_perf_command,
 };
 #[cfg(test)]
 use frankensearch_quill_gauntlet::{
-    LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
-    local_perf_producer_contract_json,
+    LOCAL_PERF_PRODUCER_CONTRACT_VERSION, local_perf_producer_contract_json,
 };
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -33,11 +34,23 @@ Usage:
     --run-id <unique-pass-id> \\
     --run-window <candidate-rerun-window> \\
     --runs <integer-10-through-100> \\
+    [--fixture <exact-canonical-fixture>] \\
     --output-dir <unique-run-directory>
+
+  quill-perf-finalize assemble \\
+    --attempt-dir <exact-H2-attempt-directory> \\
+    [--attempt-dir <exact-H2-attempt-directory>]... \\
+    --output-dir <content-addressed-assembly-directory>
 
 The typed producer builds and resolves perf_matrix itself from a clean source
 snapshot. It requires RCH_DISABLE=1, RCH_CARGO_WRAPPER_BYPASS=1, and an
-absolute CARGO_TARGET_DIR outside the source repository.";
+absolute CARGO_TARGET_DIR outside the source repository.
+
+Assembly strictly reloads every sealed input and writes one descriptor-verified,
+content-addressed receipt without creating or advancing a latest alias.
+Exit status: 0=complete/adjudicable, 2=durable NoClaim, 64=invalid invocation.";
+
+const MAX_LOG_VALUE_BYTES: usize = 240;
 
 #[derive(Debug)]
 struct Args {
@@ -46,12 +59,26 @@ struct Args {
     run_id: String,
     run_window: String,
     measurement_runs: usize,
+    fixture: Option<String>,
     output_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct AssemblyArgs {
+    attempt_dirs: Vec<PathBuf>,
+    output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeOutcome {
+    Success,
+    DurableNoClaim,
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(FinalizeOutcome::Success) => ExitCode::SUCCESS,
+        Ok(FinalizeOutcome::DurableNoClaim) => ExitCode::from(2),
         Err(error) => {
             eprintln!("quill-perf-finalize: {error}");
             eprintln!("{USAGE}");
@@ -60,25 +87,273 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let args = parse_args(env::args_os().skip(1))?;
-    let output = run_local_perf_command(&LocalPerfRunConfig {
+fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
+    let mut values = env::args_os().skip(1);
+    let first = values.next();
+    if first.as_deref() == Some(OsStr::new("assemble")) {
+        return run_assembly(parse_assembly_args(values)?);
+    }
+    let args = parse_args(first.into_iter().chain(values))?;
+    let config = LocalPerfRunConfig {
         gate: args.gate,
         profile: args.profile,
         run_id: args.run_id,
         run_window: args.run_window,
         measurement_runs: args.measurement_runs,
         output_dir: args.output_dir,
-    })?;
+    };
+    let result = if let Some(fixture) = args.fixture {
+        let selection = LocalPerfRunSelection::for_fixture(fixture)?;
+        run_selected_local_perf_command(&config, &selection)
+    } else {
+        run_local_perf_command(&config)
+    };
+    let output = match result {
+        Ok(output) => output,
+        Err(LocalPerfRunError::AttemptFailed {
+            receipt_path,
+            outcome,
+        }) => {
+            println!("attempt_receipt={}", receipt_path.display());
+            println!("attempt_outcome={outcome:?}");
+            return Ok(FinalizeOutcome::DurableNoClaim);
+        }
+        Err(error) => return Err(error.into()),
+    };
     println!("run_log={}", output.run_log.display());
     println!("artifact_manifest={}", output.artifact_manifest.display());
     println!("environment_policy={}", output.environment_policy.display());
     println!("runner_receipt={}", output.runner_receipt.display());
+    println!("attempt_receipt={}", output.attempt_receipt.display());
+    println!("threshold_artifact={}", output.threshold_artifact.display());
+    println!(
+        "prebinding_evidence={}",
+        output.prebinding_evidence.display()
+    );
+    println!("bound_evidence={}", output.bound_evidence.display());
     println!(
         "precommit_inventory={}",
         output.precommit_inventory.display()
     );
+    Ok(FinalizeOutcome::Success)
+}
+
+fn parse_assembly_args<I>(mut values: I) -> Result<AssemblyArgs, Box<dyn Error>>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut attempt_dirs = Vec::new();
+    let mut output_dir = None;
+    while let Some(flag) = values.next() {
+        match flag.to_string_lossy().as_ref() {
+            "-h" | "--help" => return Err(USAGE.into()),
+            "--attempt-dir" => {
+                attempt_dirs.push(PathBuf::from(next_value(&mut values, "--attempt-dir")?));
+            }
+            "--output-dir" => {
+                if output_dir.is_some() {
+                    return Err("assemble repeats singleton --output-dir".into());
+                }
+                output_dir = Some(PathBuf::from(next_value(&mut values, "--output-dir")?));
+            }
+            other => return Err(format!("unknown assemble argument {other:?}").into()),
+        }
+    }
+    if attempt_dirs.is_empty() {
+        return Err("assemble requires at least one --attempt-dir".into());
+    }
+    Ok(AssemblyArgs {
+        attempt_dirs,
+        output_dir: output_dir.ok_or("assemble is missing --output-dir")?,
+    })
+}
+
+fn run_assembly(args: AssemblyArgs) -> Result<FinalizeOutcome, Box<dyn Error>> {
+    let attempts = args
+        .attempt_dirs
+        .iter()
+        .map(|path| VerifiedLocalPerfAttemptBundle::load_verified(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let assembly = PerfEvidenceAssemblyArtifact::assemble(attempts)?;
+    let output_path = assembly.write_atomic(&args.output_dir)?;
+    // write_atomic pins the output directory and independently reopens the
+    // owned final inode through that held directory descriptor before it
+    // returns. A second pathname-based reload here would discard that proof
+    // and reintroduce a symlink/substitution race.
+    emit_assembly_logs(&assembly, &output_path)?;
+    Ok(
+        if assembly.readiness() == PerfEvidenceAssemblyReadiness::ReadyForAdjudication {
+            FinalizeOutcome::Success
+        } else {
+            FinalizeOutcome::DurableNoClaim
+        },
+    )
+}
+
+fn emit_assembly_logs(
+    assembly: &PerfEvidenceAssemblyArtifact,
+    output_path: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    let plan = assembly.applicability_plan();
+    let profile = plan.profile;
+    let counts = assembly.counts();
+    let compatibility = assembly.compatibility();
+    emit_json_log(serde_json::json!({
+        "event": "qg1_assembly_summary",
+        "gate": "QG-1",
+        "hardware_class": profile.hardware_class_id().as_str(),
+        "execution_profile": profile.execution_profile_id().as_str(),
+        "run_window": bounded_log_value(assembly.run_window()),
+        "required_complete": assembly.is_complete(),
+        "full_plan_coverage": assembly.has_full_plan_coverage(),
+        "readiness": assembly.readiness(),
+        "canonical_cells": counts.canonical_cells(),
+        "required_cells": counts.required_cells(),
+        "diagnostic_cells": counts.diagnostic_cells(),
+        "not_applicable_cells": counts.not_applicable_cells(),
+        "measured_cells": counts.measured_cells(),
+        "missing_required_cells": assembly.missing_required_cell_ids().len(),
+        "missing_diagnostic_cells": assembly.missing_diagnostic_cell_ids().len(),
+        "completed_shards": counts.completed_shards(),
+        "failed_shards": counts.failed_shards(),
+        "applicability_plan_schema_version": plan.schema_version.as_str(),
+        "applicability_plan_sha256": plan.applicability_plan_sha256.as_str(),
+        "normalized_perf_manifest_sha256": plan.normalized_perf_manifest_sha256.as_str(),
+        "matrix_contract_schema_version": plan.matrix_contract_schema_version.as_str(),
+        "gate_matrix_contract_sha256": plan.gate_matrix_contract_sha256.as_str(),
+        "machine_class_registry_schema_version": MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
+        "machine_class_registry_sha256": MACHINE_CLASS_REGISTRY_SHA256,
+        "capacity_semantics": compatibility.map(|value| value.capacity_semantics()),
+        "execution_capacity": compatibility.map(|value| value.execution_capacity()),
+        "max_exercised_cell_width": compatibility.map(|value| value.max_exercised_cell_width()),
+        "matrix_manifest_sha256": assembly.matrix_manifest().matrix_manifest_sha256(),
+        "semantic_cell_set_sha256": assembly.semantic_cell_set().semantic_cell_set_sha256(),
+        "assembly_sha256": assembly.assembly_sha256(),
+        "output": bounded_log_value(&output_path.display().to_string()),
+    }))?;
+    for (index, source) in assembly.source_shards().iter().enumerate() {
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_shard",
+            "shard_index": index,
+            "terminal": "completed",
+            "run_id": bounded_log_value(source.run_id()),
+            "cell_count": source.cell_ids().len(),
+            "process_receipt_sha256": source.process().process_receipt_sha256(),
+            "bound_evidence_file_sha256": source.bound_evidence_file_sha256(),
+            "evidence_artifact_sha256": source.evidence_artifact_sha256(),
+            "runner_receipt_sha256": source.runner_receipt_sha256(),
+            "runner_artifact_manifest_sha256": source.runner_artifact_manifest_sha256(),
+        }))?;
+    }
+    for cell in assembly.cell_sources() {
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_cell",
+            "ordinal": cell.ordinal(),
+            "cell_id": cell.cell_id(),
+            "role": cell.role(),
+            "terminal": cell.terminal_status(),
+            "run_id": bounded_log_value(cell.run_id()),
+            "evidence_artifact_sha256": cell.evidence_artifact_sha256(),
+            "runner_receipt_sha256": cell.runner_receipt_sha256(),
+            "runner_artifact_manifest_sha256": cell.runner_artifact_manifest_sha256(),
+        }))?;
+    }
+    for (index, attempt) in assembly.failed_shards().iter().enumerate() {
+        let process = attempt.process();
+        let receipt = process.receipt();
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_shard",
+            "shard_index": assembly.source_shards().len() + index,
+            "terminal": receipt.outcome(),
+            "run_id": bounded_log_value(receipt.run_id()),
+            "run_window": bounded_log_value(receipt.run_window()),
+            "selected_cell_count": receipt.selected_cell_ids().len(),
+            "process_receipt_sha256": process.process_receipt_sha256(),
+            "retry": receipt.retry(),
+        }))?;
+    }
+    for cell_id in assembly.missing_required_cell_ids() {
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_set_difference",
+            "cell_id": cell_id,
+            "role": "required",
+            "terminal": "missing",
+        }))?;
+    }
+    for cell_id in assembly.missing_diagnostic_cell_ids() {
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_set_difference",
+            "cell_id": cell_id,
+            "role": "diagnostic",
+            "terminal": "missing",
+        }))?;
+    }
+    for diagnostic in assembly.non_adjudicable_cells() {
+        let reasons = diagnostic
+            .reasons()
+            .iter()
+            .map(|reason| {
+                serde_json::json!({
+                    "code": reason.code,
+                    "severity": reason.severity,
+                    "message": bounded_log_value(&reason.message),
+                })
+            })
+            .collect::<Vec<_>>();
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_non_adjudicable_cell",
+            "cell_id": diagnostic.cell_id(),
+            "ordinal": diagnostic.ordinal(),
+            "role": diagnostic.role(),
+            "terminal": diagnostic.terminal_status(),
+            "reasons": reasons,
+        }))?;
+    }
+    for diagnostic in assembly.non_adjudicable_sources() {
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_non_adjudicable_source",
+            "run_id": bounded_log_value(diagnostic.run_id()),
+            "evidence_artifact_sha256": diagnostic.evidence_artifact_sha256(),
+            "cell_ids": diagnostic.cell_ids(),
+            "reason": {
+                "code": diagnostic.reason().code.as_str(),
+                "severity": diagnostic.reason().severity,
+                "message": bounded_log_value(&diagnostic.reason().message),
+            },
+        }))?;
+    }
+    for (scope, retry) in [
+        ("required_coverage", assembly.retry_predicate()),
+        ("diagnostic_coverage", assembly.diagnostic_retry_predicate()),
+        ("adjudication", assembly.adjudication_retry_predicate()),
+    ] {
+        let Some(retry) = retry else {
+            continue;
+        };
+        emit_json_log(serde_json::json!({
+            "event": "qg1_assembly_retry",
+            "scope": scope,
+            "terminal": assembly.readiness(),
+            "retry": retry,
+        }))?;
+    }
     Ok(())
+}
+
+fn emit_json_log(value: serde_json::Value) -> Result<(), serde_json::Error> {
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
+}
+
+fn bounded_log_value(value: &str) -> &str {
+    if value.len() <= MAX_LOG_VALUE_BYTES {
+        return value;
+    }
+    let mut end = MAX_LOG_VALUE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -123,6 +398,7 @@ where
     let mut run_id = None;
     let mut run_window = None;
     let mut measurement_runs = None;
+    let mut fixture = None;
     let mut output_dir = None;
 
     while let Some(flag) = values.next() {
@@ -131,36 +407,66 @@ where
             "-h" | "--help" => return Err(USAGE.into()),
             "--gate" => {
                 let value = next_value(&mut values, "--gate")?;
-                gate = Some(value.to_string_lossy().parse::<PerfGate>()?);
+                set_singleton(
+                    &mut gate,
+                    "--gate",
+                    value.to_string_lossy().parse::<PerfGate>()?,
+                )?;
             }
             "--hardware-class" => {
                 let value = next_value(&mut values, "--hardware-class")?;
-                hardware_class_id = Some(parse_hardware_class_id(&value)?);
+                set_singleton(
+                    &mut hardware_class_id,
+                    "--hardware-class",
+                    parse_hardware_class_id(&value)?,
+                )?;
             }
             "--execution-profile" => {
                 let value = next_value(&mut values, "--execution-profile")?;
-                execution_profile_id = Some(parse_execution_profile_id(&value)?);
+                set_singleton(
+                    &mut execution_profile_id,
+                    "--execution-profile",
+                    parse_execution_profile_id(&value)?,
+                )?;
             }
             "--run-id" => {
-                run_id = Some(
+                set_singleton(
+                    &mut run_id,
+                    "--run-id",
                     next_value(&mut values, "--run-id")?
                         .to_string_lossy()
                         .into_owned(),
-                );
+                )?;
             }
             "--run-window" => {
-                run_window = Some(
+                set_singleton(
+                    &mut run_window,
+                    "--run-window",
                     next_value(&mut values, "--run-window")?
                         .to_string_lossy()
                         .into_owned(),
-                );
+                )?;
             }
             "--runs" => {
                 let value = next_value(&mut values, "--runs")?;
-                measurement_runs = Some(value.to_string_lossy().parse::<usize>()?);
+                set_singleton(
+                    &mut measurement_runs,
+                    "--runs",
+                    value.to_string_lossy().parse::<usize>()?,
+                )?;
+            }
+            "--fixture" => {
+                set_singleton(
+                    &mut fixture,
+                    "--fixture",
+                    next_value(&mut values, "--fixture")?
+                        .to_string_lossy()
+                        .into_owned(),
+                )?;
             }
             "--output-dir" => {
-                output_dir = Some(PathBuf::from(next_value(&mut values, "--output-dir")?));
+                let value = PathBuf::from(next_value(&mut values, "--output-dir")?);
+                set_singleton(&mut output_dir, "--output-dir", value)?;
             }
             other => return Err(format!("unknown argument {other:?}").into()),
         }
@@ -175,8 +481,17 @@ where
         run_id: run_id.ok_or("missing --run-id")?,
         run_window: run_window.ok_or("missing --run-window")?,
         measurement_runs: measurement_runs.ok_or("missing --runs")?,
+        fixture,
         output_dir: output_dir.ok_or("missing --output-dir")?,
     })
+}
+
+fn set_singleton<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), Box<dyn Error>> {
+    if slot.is_some() {
+        return Err(format!("repeated singleton argument {flag}").into());
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 fn parse_hardware_class_id(value: &OsStr) -> Result<HardwareClassId, Box<dyn Error>> {
@@ -215,6 +530,105 @@ where
 mod tests {
     use super::*;
 
+    fn production_source() -> &'static str {
+        const TEST_MODULE_BOUNDARY: &str = "#[cfg(test)]\nmod tests {";
+
+        let source = include_str!("quill_perf_finalize.rs");
+        assert_eq!(
+            source.matches(TEST_MODULE_BOUNDARY).count(),
+            1,
+            "the production/test boundary must be unique"
+        );
+        let test_module_start = source
+            .find(TEST_MODULE_BOUNDARY)
+            .expect("unique production/test boundary");
+        &source[..test_module_start]
+    }
+
+    fn unique_marker_offset(source: &str, marker: &str) -> usize {
+        assert_eq!(
+            source.matches(marker).count(),
+            1,
+            "expected one production occurrence of {marker:?}"
+        );
+        source.find(marker).expect("unique production marker")
+    }
+
+    #[test]
+    fn assembly_parser_accepts_repeated_typed_inputs() {
+        let args = parse_assembly_args(
+            [
+                "--attempt-dir",
+                "/tmp/qg1-attempt-a",
+                "--attempt-dir",
+                "/tmp/qg1-attempt-b",
+                "--attempt-dir",
+                "/tmp/qg1-attempt-c",
+                "--output-dir",
+                "/tmp/qg1-assembly",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("complete assembly invocation");
+        assert_eq!(args.attempt_dirs.len(), 3);
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/qg1-assembly"));
+    }
+
+    #[test]
+    fn assembly_parser_rejects_empty_or_ambiguous_invocations() {
+        assert!(
+            parse_assembly_args(
+                ["--output-dir", "/tmp/qg1-assembly"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_assembly_args(
+                [
+                    "--attempt-dir",
+                    "/tmp/qg1-attempt",
+                    "--output-dir",
+                    "/tmp/one",
+                    "--output-dir",
+                    "/tmp/two",
+                ]
+                .into_iter()
+                .map(OsString::from)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_assembly_args(
+                ["--attempt-dir", "/tmp/qg1-attempt"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .is_err()
+        );
+        for legacy_flag in ["--completed-shard", "--failed-shard", "--candidate"] {
+            assert!(
+                parse_assembly_args(
+                    [legacy_flag, "/tmp/legacy.json"]
+                        .into_iter()
+                        .map(OsString::from)
+                )
+                .is_err(),
+                "legacy assembly flag {legacy_flag} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_log_values_are_utf8_safe_and_bounded() {
+        let value = format!("{}{}", "x".repeat(MAX_LOG_VALUE_BYTES - 1), "éé");
+        let bounded = bounded_log_value(&value);
+        assert!(bounded.len() <= MAX_LOG_VALUE_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
     #[test]
     fn parser_accepts_only_complete_typed_producer_identity() {
         let args = parse_args(
@@ -231,6 +645,8 @@ mod tests {
                 "window-1",
                 "--runs",
                 "10",
+                "--fixture",
+                "bulk/small/1/on",
                 "--output-dir",
                 "/tmp/quill-perf/candidate",
             ]
@@ -248,6 +664,7 @@ mod tests {
             ExecutionProfileId::Physical64
         );
         assert_eq!(args.measurement_runs, 10);
+        assert_eq!(args.fixture.as_deref(), Some("bulk/small/1/on"));
     }
 
     #[test]
@@ -271,6 +688,16 @@ mod tests {
             ]
             .into_iter()
             .map(OsString::from),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn producer_parser_rejects_repeated_singleton_arguments() {
+        let result = parse_args(
+            ["--gate", "QG-2", "--gate", "QG-1"]
+                .into_iter()
+                .map(OsString::from),
         );
         assert!(result.is_err());
     }
@@ -343,18 +770,48 @@ mod tests {
 
     #[test]
     fn measurement_mode_enters_the_typed_runner_without_prelock_hashing() {
-        let source = include_str!("quill_perf_finalize.rs");
+        let source = production_source();
         let run_body = source
-            .split("fn run() -> Result<(), Box<dyn Error>>")
+            .split("fn run() -> Result<FinalizeOutcome, Box<dyn Error>>")
             .nth(1)
-            .and_then(|suffix| suffix.split("#[cfg(test)]").next())
+            .and_then(|suffix| suffix.split("fn parse_assembly_args").next())
             .expect("production run body");
-        let typed_runner = source
-            .find("run_local_perf_command(&LocalPerfRunConfig")
-            .expect("typed runner invocation");
-        assert!(typed_runner > 0);
+        let config = unique_marker_offset(run_body, "let config = LocalPerfRunConfig");
+        let selected = unique_marker_offset(
+            run_body,
+            "run_selected_local_perf_command(&config, &selection)",
+        );
+        let full = unique_marker_offset(run_body, "run_local_perf_command(&config)");
+        assert!(selected > config);
+        assert!(full > config);
         assert!(!run_body.contains("sha256"));
         assert!(!run_body.contains("open_executing_image"));
+    }
+
+    #[test]
+    fn assembly_uses_the_descriptor_verified_publication_without_path_reload() {
+        let source = production_source();
+        let assembly_body = source
+            .split("fn run_assembly(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("fn emit_assembly_logs(").next())
+            .expect("production assembly body");
+        let attempt_loader = unique_marker_offset(
+            assembly_body,
+            "VerifiedLocalPerfAttemptBundle::load_verified(path)",
+        );
+        let assembly = unique_marker_offset(
+            assembly_body,
+            "PerfEvidenceAssemblyArtifact::assemble(attempts)",
+        );
+        let publication =
+            unique_marker_offset(assembly_body, "assembly.write_atomic(&args.output_dir)");
+        assert!(attempt_loader < assembly);
+        assert!(assembly < publication);
+        assert!(
+            !assembly_body[publication..].contains("load_verified"),
+            "the descriptor-verified publication boundary must not be followed by a pathname reload"
+        );
     }
 
     #[test]
