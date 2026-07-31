@@ -31,6 +31,7 @@ pub mod metrics_eval;
 pub mod observability_lint;
 pub mod parsed_query;
 pub mod query_class;
+pub mod recovery_plan;
 pub mod repair;
 pub mod shadow;
 pub mod simd;
@@ -70,7 +71,14 @@ pub use contract_sanity::{
     ContractViolationDiagnostic, MAX_SCHEMA_VERSION_LAG, ViolationSeverity, classify_version,
     classify_version_against, replay_command_for_reason,
 };
-pub use daemon::{DaemonClient, DaemonError, DaemonRetryConfig, apply_jitter, next_request_id};
+pub use daemon::{
+    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
+    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
+    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
+    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, apply_jitter,
+    daemon_embedding_payload_sha256, daemon_endpoint_fingerprint, daemon_executable_fingerprint,
+    daemon_ordered_request_sha256, next_request_id,
+};
 pub use decision_plane::{
     CalibrationFallbackReason, CalibrationStatus, CalibrationThresholds, DecisionContext,
     DecisionOutcome, EvidenceEventType, EvidenceRecord, ExhaustionPolicy, LossVector, LossWeights,
@@ -152,12 +160,14 @@ pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, Ti
 pub use asupersync::Cx;
 pub use query_class::QueryClass;
 pub use traits::{
-    Embedder, IdentityBoundEmbedding, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo,
-    ModelTier, NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
+    Embedder, IdentityBoundEmbedding, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
+    LexicalSearch, LexicalWrite, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
+    NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
     SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
     cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
-    DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,
-    ScoreSource, ScoredResult, SearchMetrics, SearchMode, SearchPhase, VectorHit,
+    BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
+    PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
+    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };

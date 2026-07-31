@@ -7,6 +7,7 @@
 //! Async operations are represented as boxed futures so the traits remain
 //! dyn-compatible for runtime polymorphism (`Box<dyn Embedder>`, etc.).
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -902,6 +903,221 @@ pub trait LexicalSearch: Send + Sync {
 
     /// Number of documents currently indexed.
     fn doc_count(&self) -> usize;
+}
+
+// ─── Split lexical traits (bd-8nqz.1) ───────────────────────────────────────
+//
+// [`LexicalSearch`] combines read and write concerns, which forces read-only
+// consumers to hold writer-capable backends and lets hydration read a newer
+// snapshot than the one that scored a candidate batch. The split below is the
+// replacement contract: [`LexicalRead`] for search + generation-pinned
+// hydration, [`LexicalWrite`] for mutation. Consumers migrate off
+// [`LexicalSearch`] in the coordinated flip (fusion/facade/gauntlet), after
+// which the combined trait is removed.
+
+/// Opaque, backend-owned pin of the immutable snapshot that scored a
+/// candidate batch (bd-8nqz.1).
+///
+/// A backend stores whatever it needs — typically an `Arc` of its published
+/// search snapshot — and downcasts it back during hydration, so hydrated
+/// metadata always comes from the exact generation that produced the scores.
+/// Callers cannot forge or relabel a context: the payload is opaque, the
+/// backend tag is read-only, and a context only originates from a backend's
+/// own [`LexicalRead::search_candidates`].
+pub struct LexicalHydrationContext {
+    backend: &'static str,
+    inner: Box<dyn Any + Send + Sync>,
+}
+
+impl LexicalHydrationContext {
+    /// Wrap a backend-owned snapshot pin.
+    #[must_use]
+    pub fn new(backend: &'static str, inner: Box<dyn Any + Send + Sync>) -> Self {
+        Self { backend, inner }
+    }
+
+    /// Stable tag of the backend that produced this context.
+    #[must_use]
+    pub const fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    /// Downcast the opaque payload back to the backend's snapshot type.
+    ///
+    /// Returns `None` for a foreign context (wrong backend or wrong payload
+    /// type) — backends must treat that as a typed error, never a silent
+    /// no-op, so cross-engine mixing cannot pass unnoticed.
+    #[must_use]
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.inner.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Debug for LexicalHydrationContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LexicalHydrationContext")
+            .field("backend", &self.backend)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Typed result of a fusion-candidate search: scored candidates plus the
+/// snapshot pin required to hydrate them from the exact immutable generation
+/// that scored them (bd-8nqz.1).
+#[derive(Debug)]
+pub struct LexicalCandidateBatch {
+    results: Vec<ScoredResult>,
+    context: Option<LexicalHydrationContext>,
+}
+
+impl LexicalCandidateBatch {
+    /// Batch whose results already carry full metadata (no hydration needed).
+    #[must_use]
+    pub const fn eager(results: Vec<ScoredResult>) -> Self {
+        Self {
+            results,
+            context: None,
+        }
+    }
+
+    /// Batch with deferred metadata, pinned to the scoring snapshot.
+    #[must_use]
+    pub const fn deferred(results: Vec<ScoredResult>, context: LexicalHydrationContext) -> Self {
+        Self {
+            results,
+            context: Some(context),
+        }
+    }
+
+    /// Scored candidates in backend rank order.
+    #[must_use]
+    pub fn results(&self) -> &[ScoredResult] {
+        &self.results
+    }
+
+    /// Snapshot pin for hydration; `None` when the batch is eager.
+    #[must_use]
+    pub const fn context(&self) -> Option<&LexicalHydrationContext> {
+        self.context.as_ref()
+    }
+
+    /// Whether metadata hydration is required for final winners.
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        self.context.is_some()
+    }
+
+    /// Decompose into candidates and the hydration pin.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ScoredResult>, Option<LexicalHydrationContext>) {
+        (self.results, self.context)
+    }
+}
+
+/// Read-only lexical search surface (bd-8nqz.1).
+///
+/// Search consumers (`TwoTierSearcher`, the sync searcher, `open_hybrid`
+/// callers) depend on this trait alone, so a read-only reader never needs a
+/// writer-capable backend or a writer lease.
+pub trait LexicalRead: Send + Sync {
+    /// Search for documents matching the query, returning up to `limit`
+    /// results sorted by BM25 relevance, with full metadata attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the query cannot be parsed or the backend
+    /// fails.
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>>;
+
+    /// Search for fusion candidates as a typed batch pinned to the scoring
+    /// snapshot.
+    ///
+    /// The default preserves full-metadata results as an eager batch.
+    /// Backends with a cheaper deferred-metadata path override this and
+    /// return [`LexicalCandidateBatch::deferred`] with their snapshot pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` under the same conditions as [`Self::search`].
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        Box::pin(async move {
+            Ok(LexicalCandidateBatch::eager(
+                self.search(cx, query, limit).await?,
+            ))
+        })
+    }
+
+    /// Restore metadata for final winners produced from a deferred candidate
+    /// batch, reading from the pinned scoring snapshot — never from a newer
+    /// generation.
+    ///
+    /// Implementations must ignore results without a lexical score (those
+    /// did not survive from the lexical candidate pool) and must reject a
+    /// foreign context with a typed error. The default is a no-op for eager
+    /// batches (`context == None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if winner metadata cannot be materialized or the
+    /// context does not belong to this backend.
+    fn hydrate_candidates<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        _results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        let _ = context;
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Number of documents currently searchable.
+    fn doc_count(&self) -> usize;
+}
+
+/// Mutation/indexing surface of a lexical backend (bd-8nqz.1).
+pub trait LexicalWrite: Send + Sync {
+    /// Index a single document for full-text search.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the document cannot be indexed.
+    fn index_document<'a>(&'a self, cx: &'a Cx, doc: &'a IndexableDocument)
+    -> SearchFuture<'a, ()>;
+
+    /// Index a batch of documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if any document cannot be indexed.
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            for doc in docs {
+                self.index_document(cx, doc).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Commit any pending writes to the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the commit fails (e.g., I/O error).
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()>;
 }
 
 // ─── Metrics Exporter Trait ─────────────────────────────────────────────────
