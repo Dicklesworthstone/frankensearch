@@ -659,6 +659,22 @@ impl SealedBlockMax {
             Self::Fixture(entries) => entries,
         }
     }
+
+    fn term_score_bound_inputs(&self) -> Option<(u32, u8)> {
+        match self {
+            Self::ValidatedTerm(metadata) => metadata.term_score_bound_inputs(),
+            #[cfg(test)]
+            Self::Fixture(entries) => {
+                let mut maximum_frequency = 0_u32;
+                let mut minimum_fieldnorm_id = u8::MAX;
+                for entry in entries.iter() {
+                    maximum_frequency = maximum_frequency.max(entry.max_frequency());
+                    minimum_fieldnorm_id = minimum_fieldnorm_id.min(entry.min_fieldnorm_id());
+                }
+                (!entries.is_empty()).then_some((maximum_frequency, minimum_fieldnorm_id))
+            }
+        }
+    }
 }
 
 /// Owner-safe adapter for one validated sealed posting or position cursor.
@@ -843,18 +859,9 @@ impl PostingCursor for SealedPostingCursor<'_> {
         weight: f32,
         record_option: TermRecordOption,
     ) -> Option<f32> {
-        let entries = self.block_max.as_ref()?.entries();
-        let mut maximum = None::<f32>;
-        for entry in entries {
-            let bound = record_option.score_upper_bound(
-                entry.max_frequency(),
-                entry.min_fieldnorm_id(),
-                live_avgdl,
-                weight,
-            )?;
-            maximum = Some(maximum.map_or(bound, |current| current.max(bound)));
-        }
-        maximum
+        let (maximum_frequency, minimum_fieldnorm_id) =
+            self.block_max.as_ref()?.term_score_bound_inputs()?;
+        record_option.score_upper_bound(maximum_frequency, minimum_fieldnorm_id, live_avgdl, weight)
     }
 
     fn supports_block_max(&self) -> bool {
