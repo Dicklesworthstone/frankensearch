@@ -196,6 +196,10 @@ mod tests {
         );
     }
 
+    // Gated to the two audited platforms: on other Unix the probe
+    // intentionally returns Unsupported, and this test would panic with a
+    // misleading "must succeed" message rather than documenting that fact.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn clean_file_and_directory_report_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
