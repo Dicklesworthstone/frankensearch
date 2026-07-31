@@ -317,18 +317,46 @@ impl EmbedderStack {
     ///
     /// Returns `SearchError::EmbedderUnavailable` when no usable fast embedder is available.
     pub fn auto_detect_with(model_root: Option<&Path>) -> SearchResult<Self> {
+        Self::auto_detect_with_options(model_root, &DetectOptions::default())
+    }
+
+    /// Auto-detect embedders under caller-supplied policy (bd-p6z6.2).
+    ///
+    /// Callers (fsfs config, library hosts) pass policy EXPLICITLY instead
+    /// of relying on process environment: `options.offline = Some(true)`
+    /// forbids model downloads for this detection regardless of
+    /// `FRANKENSEARCH_OFFLINE`, and `Some(false)` ignores the env variable
+    /// entirely — environment cannot silently change library semantics when
+    /// the caller states intent. `None` fields defer to the environment,
+    /// preserving `auto_detect_with` behavior. Detection itself never
+    /// prompts: interactive consent is a product-surface concern.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::EmbedderUnavailable` when no usable fast
+    /// embedder is available, and `SearchError::UnverifiableRemoteSpace`
+    /// when explicit remote configuration cannot be verified.
+    pub fn auto_detect_with_options(
+        model_root: Option<&Path>,
+        options: &DetectOptions,
+    ) -> SearchResult<Self> {
         #[cfg(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         ))]
         {
-            Self::auto_detect_with_policy(model_root, download_policy_from_environment())
+            let mut policy = download_policy_from_environment();
+            if let Some(offline) = options.offline {
+                policy.offline = offline;
+            }
+            Self::auto_detect_with_policy(model_root, policy)
         }
         #[cfg(not(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         )))]
         {
+            let _ = options;
             Self::auto_detect_with_policy(model_root)
         }
     }
@@ -342,9 +370,12 @@ impl EmbedderStack {
         policy: DownloadPolicy,
     ) -> SearchResult<Self> {
         materialize_bundled_default_models(model_root);
+        // Explicit-but-invalid remote intent is an error, never a silent
+        // downgrade to local/hash detection (bd-p6z6.2).
+        let remote = detect_remote_intent()?;
         let quality = detect_quality_embedder(model_root)
             .or_else(|| maybe_lazy_quality_embedder(model_root, policy))
-            .or_else(detect_api_embedder);
+            .or(remote);
         let fast = detect_fast_embedder(model_root)
             .or_else(|| maybe_lazy_fast_embedder(model_root, policy))
             .or_else(hash_fallback_embedder)
@@ -364,7 +395,10 @@ impl EmbedderStack {
     )))]
     fn auto_detect_with_policy(model_root: Option<&Path>) -> SearchResult<Self> {
         materialize_bundled_default_models(model_root);
-        let quality = detect_quality_embedder(model_root).or_else(detect_api_embedder);
+        // Explicit-but-invalid remote intent is an error, never a silent
+        // downgrade to local/hash detection (bd-p6z6.2).
+        let remote = detect_remote_intent()?;
+        let quality = detect_quality_embedder(model_root).or(remote);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
             .ok_or_else(|| SearchError::EmbedderUnavailable {
@@ -1693,59 +1727,126 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 /// model name is never treated as compatibility evidence.
 ///
 /// Returns a cached `ApiEmbedder` for the quality tier.
+/// Caller-supplied detection policy (bd-p6z6.2).
+///
+/// Every `None` defers to the process environment; every `Some` overrides
+/// it, so hosts with explicit configuration are immune to ambient
+/// environment drift.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DetectOptions {
+    /// `Some(true)`: never download models during this detection.
+    /// `Some(false)`: permit downloads (still subject to consent policy)
+    /// even if `FRANKENSEARCH_OFFLINE` is set. `None`: follow the
+    /// environment.
+    pub offline: Option<bool>,
+}
+
+/// Snapshot of the remote-embedding environment, taken once so the intent
+/// resolver is a pure function (testable without process-global env
+/// mutation, which this workspace forbids).
+#[derive(Debug, Clone, Default)]
+struct RemoteIntentEnv {
+    provider: Option<String>,
+    model: Option<String>,
+    dimension: Option<String>,
+    identity_json: Option<String>,
+    openai_key: Option<String>,
+    gemini_key: Option<String>,
+}
+
+impl RemoteIntentEnv {
+    fn from_environment() -> Self {
+        Self {
+            provider: std::env::var("FRANKENSEARCH_API_PROVIDER").ok(),
+            model: std::env::var("FRANKENSEARCH_API_MODEL").ok(),
+            dimension: std::env::var("FRANKENSEARCH_API_DIMENSION").ok(),
+            identity_json: std::env::var("FRANKENSEARCH_API_IDENTITY_JSON").ok(),
+            openai_key: std::env::var("OPENAI_API_KEY").ok(),
+            gemini_key: std::env::var("GEMINI_API_KEY").ok(),
+        }
+    }
+
+    /// True when explicit frankensearch remote-embedding configuration is
+    /// present. A bare `OPENAI_API_KEY`/`GEMINI_API_KEY` does NOT count:
+    /// those are ambient credentials that unrelated tools export, and
+    /// treating them as frankensearch intent would break every host that
+    /// has one set.
+    fn has_explicit_intent(&self) -> bool {
+        self.provider.is_some()
+            || self.model.is_some()
+            || self.dimension.is_some()
+            || self.identity_json.is_some()
+    }
+}
+
+fn unverifiable_remote(reason: &str) -> SearchError {
+    SearchError::UnverifiableRemoteSpace {
+        producer: "environment".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// Resolve explicit remote-embedding intent to a verified embedder, a typed
+/// failure, or nothing (bd-p6z6.2).
+///
+/// - `Ok(None)`: no explicit frankensearch remote configuration exists.
+///   Ambient provider keys without any `FRANKENSEARCH_API_*` setting are
+///   logged and ignored, exactly as before.
+/// - `Ok(Some(_))`: explicit intent, producer-attested frozen identity,
+///   verified construction.
+/// - `Err(UnverifiableRemoteSpace)`: explicit intent that is missing,
+///   malformed, unverifiable, or producer-unattested. Detection never
+///   converts explicit intent into `None` — a silent downgrade to
+///   local/hash embedders would serve vectors from the wrong space.
+fn detect_remote_intent() -> SearchResult<Option<Arc<dyn Embedder>>> {
+    resolve_remote_intent(&RemoteIntentEnv::from_environment())
+}
+
 #[cfg(feature = "api")]
-fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
+fn resolve_remote_intent(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
     use crate::api_embedder::ApiEmbedder;
     use crate::api_provider::{GeminiProvider, OpenAiProvider};
 
-    let explicit_provider = std::env::var("FRANKENSEARCH_API_PROVIDER").ok();
-    let explicit_model = std::env::var("FRANKENSEARCH_API_MODEL").ok();
-    let explicit_dim: Option<usize> = std::env::var("FRANKENSEARCH_API_DIMENSION")
-        .ok()
-        .and_then(|s| s.parse().ok());
-    let Ok(identity_json) = std::env::var("FRANKENSEARCH_API_IDENTITY_JSON") else {
-        if std::env::var_os("OPENAI_API_KEY").is_some()
-            || std::env::var_os("GEMINI_API_KEY").is_some()
-        {
+    let explicit_dim: Option<usize> = env.dimension.as_deref().and_then(|s| s.parse().ok());
+    let Some(identity_json) = env.identity_json.as_deref() else {
+        if env.has_explicit_intent() {
+            return Err(unverifiable_remote(
+                "explicit remote configuration is present but \
+                 FRANKENSEARCH_API_IDENTITY_JSON (the immutable space epoch) is not set",
+            ));
+        }
+        if env.openai_key.is_some() || env.gemini_key.is_some() {
             warn!(
                 field = "FRANKENSEARCH_API_IDENTITY_JSON",
-                "remote embedder ignored because no immutable space epoch was supplied"
+                "ambient provider key ignored: no frankensearch remote configuration \
+                 and no immutable space epoch was supplied"
             );
         }
-        return None;
+        return Ok(None);
     };
-    let identity: FrozenEmbeddingIdentityBundleV1 = match serde_json::from_str(&identity_json) {
-        Ok(identity) => identity,
-        Err(_error) => {
-            warn!(
-                field = "FRANKENSEARCH_API_IDENTITY_JSON",
-                reason = "malformed-json",
-                "remote embedder ignored because its immutable space epoch is malformed"
-            );
-            return None;
-        }
-    };
-    if let Err(_error) = identity.validate() {
-        warn!(
-            field = "FRANKENSEARCH_API_IDENTITY_JSON",
-            reason = "identity-validation-failed",
-            "remote embedder ignored because its immutable space epoch is invalid"
-        );
-        return None;
-    }
+    let identity: FrozenEmbeddingIdentityBundleV1 =
+        serde_json::from_str(identity_json).map_err(|_| {
+            unverifiable_remote("FRANKENSEARCH_API_IDENTITY_JSON is not valid identity JSON")
+        })?;
+    identity.validate().map_err(|_| {
+        unverifiable_remote("FRANKENSEARCH_API_IDENTITY_JSON failed identity validation")
+    })?;
 
-    let provider: Box<dyn crate::api_provider::ApiProvider> = match explicit_provider.as_deref() {
+    let provider: Box<dyn crate::api_provider::ApiProvider> = match env.provider.as_deref() {
         Some("gemini") => {
-            let key = std::env::var("GEMINI_API_KEY").ok()?;
-            match explicit_model.as_deref() {
+            let key = env.gemini_key.clone().ok_or_else(|| {
+                unverifiable_remote("provider gemini is configured but GEMINI_API_KEY is not set")
+            })?;
+            match env.model.as_deref() {
                 Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
                 _ => Box::new(GeminiProvider::text_embedding_004(key)),
             }
         }
         Some("openai") => {
-            // Explicit OpenAI — require OPENAI_API_KEY.
-            let key = std::env::var("OPENAI_API_KEY").ok()?;
-            match explicit_model.as_deref() {
+            let key = env.openai_key.clone().ok_or_else(|| {
+                unverifiable_remote("provider openai is configured but OPENAI_API_KEY is not set")
+            })?;
+            match env.model.as_deref() {
                 Some("text-embedding-3-large") => {
                     Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
                 }
@@ -1753,31 +1854,30 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
             }
         }
         None => {
-            // Auto-detect: prefer OpenAI if OPENAI_API_KEY is set,
-            // otherwise fall back to Gemini if GEMINI_API_KEY is set.
-            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                match explicit_model.as_deref() {
+            // Identity supplied without a provider name: prefer OpenAI if
+            // its key is present, otherwise Gemini.
+            if let Some(key) = env.openai_key.clone() {
+                match env.model.as_deref() {
                     Some("text-embedding-3-large") => {
                         Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
                     }
                     _ => Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim)),
                 }
-            } else if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-                match explicit_model.as_deref() {
+            } else if let Some(key) = env.gemini_key.clone() {
+                match env.model.as_deref() {
                     Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
                     _ => Box::new(GeminiProvider::text_embedding_004(key)),
                 }
             } else {
-                return None;
+                return Err(unverifiable_remote(
+                    "an immutable space epoch is configured but no provider API key is set",
+                ));
             }
         }
         Some(_other) => {
-            warn!(
-                field = "FRANKENSEARCH_API_PROVIDER",
-                reason = "unknown-provider",
-                "unknown remote embedding provider"
-            );
-            return None;
+            return Err(unverifiable_remote(
+                "FRANKENSEARCH_API_PROVIDER names an unknown provider",
+            ));
         }
     };
 
@@ -1788,21 +1888,23 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
         "detected API embedder from environment"
     );
 
-    match ApiEmbedder::with_defaults(provider, Some(identity)) {
-        Ok(embedder) => Some(Arc::new(embedder.cached_default())),
-        Err(_error) => {
-            warn!(
-                reason = "provider-identity-disagreement",
-                "remote embedder ignored because its provider and immutable epoch disagree"
-            );
-            None
-        }
-    }
+    ApiEmbedder::with_defaults(provider, Some(identity))
+        .map(|embedder| Some(Arc::new(embedder.cached_default()) as Arc<dyn Embedder>))
+        .map_err(|_| {
+            unverifiable_remote("the configured provider and the immutable space epoch disagree")
+        })
 }
 
+/// Without the `api` feature the build cannot satisfy remote intent, so
+/// explicit configuration is a typed failure rather than a silent ignore.
 #[cfg(not(feature = "api"))]
-fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
-    None
+fn resolve_remote_intent(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
+    if env.has_explicit_intent() {
+        return Err(unverifiable_remote(
+            "explicit remote configuration is present but this build lacks the `api` feature",
+        ));
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "bundled-default-models")]
@@ -2854,5 +2956,78 @@ mod tests {
         );
         let encoded = safetensors::tensor::serialize(&tensors, None).unwrap();
         fs::write(dir.join("model.safetensors"), encoded).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod remote_intent_tests {
+    use frankensearch_core::SearchError;
+
+    use super::{RemoteIntentEnv, resolve_remote_intent};
+
+    fn expect_unverifiable(env: &RemoteIntentEnv, context: &str) {
+        match resolve_remote_intent(env) {
+            Err(SearchError::UnverifiableRemoteSpace { .. }) => {}
+            Err(other) => panic!("{context}: expected UnverifiableRemoteSpace, got {other:?}"),
+            Ok(Some(_)) => panic!("{context}: expected typed failure, got a verified embedder"),
+            Ok(None) => panic!("{context}: explicit intent silently degraded to None"),
+        }
+    }
+
+    #[test]
+    fn no_intent_and_no_keys_is_none() {
+        let outcome =
+            resolve_remote_intent(&RemoteIntentEnv::default()).expect("no intent is not an error");
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn ambient_provider_key_without_intent_stays_none() {
+        let env = RemoteIntentEnv {
+            openai_key: Some("sk-ambient-unrelated-tool".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let outcome = resolve_remote_intent(&env).expect("ambient key is not intent");
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn explicit_provider_without_identity_fails_closed() {
+        let env = RemoteIntentEnv {
+            provider: Some("openai".to_owned()),
+            openai_key: Some("sk-test".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        expect_unverifiable(&env, "provider without identity");
+    }
+
+    #[test]
+    fn explicit_model_alone_is_intent_and_fails_closed_without_identity() {
+        let env = RemoteIntentEnv {
+            model: Some("text-embedding-3-small".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        expect_unverifiable(&env, "model without identity");
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn malformed_identity_fails_closed() {
+        let env = RemoteIntentEnv {
+            identity_json: Some("{not json".to_owned()),
+            openai_key: Some("sk-test".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        expect_unverifiable(&env, "malformed identity");
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn structurally_empty_identity_fails_closed() {
+        let env = RemoteIntentEnv {
+            identity_json: Some("{}".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        expect_unverifiable(&env, "empty identity object");
     }
 }

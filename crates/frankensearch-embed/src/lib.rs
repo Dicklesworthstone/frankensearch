@@ -18,7 +18,8 @@ pub mod model_manifest;
 pub mod model_registry;
 pub mod simd;
 pub use auto_detect::{
-    DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus, TwoTierAvailability,
+    DetectOptions, DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus,
+    TwoTierAvailability,
 };
 pub use batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
@@ -119,7 +120,15 @@ pub use fastembed_embedder::{FastEmbedEmbedder, OnnxEmbedderConfig};
 pub mod model_download;
 
 #[cfg(feature = "download")]
-pub use model_download::{DownloadConfig, DownloadProgress, ModelDownloader};
+pub use model_download::{
+    DownloadConfig, DownloadProgress, MODEL_ACQUISITION_PROGRESS_SCHEMA_V1,
+    MODEL_ACQUISITION_RECEIPT_SCHEMA_V1, MODEL_ACQUISITION_RECOVERY_SCHEMA_V1,
+    ModelAcquisitionCacheReasonV1, ModelAcquisitionOutcomeV1, ModelAcquisitionProgressV1,
+    ModelAcquisitionReceiptV1, ModelAcquisitionRecoveryV1, ModelAcquisitionRequest,
+    ModelAcquisitionSource, ModelAcquisitionSourceKindV1, ModelAcquisitionStageV1,
+    ModelAcquisitionVerificationResultV1, ModelDownloader, VerifiedModelStageV1,
+    diagnose_model_acquisition,
+};
 
 #[cfg(feature = "api")]
 pub mod api_provider;
@@ -128,9 +137,17 @@ pub mod api_provider;
 pub mod api_embedder;
 
 #[cfg(feature = "api")]
-pub use api_embedder::ApiEmbedder;
+pub use api_embedder::{
+    ApiEmbedder, ApiEmbedderConfig, AssumedRemoteApi, AssumedRemoteEmbeddingBatchV1,
+    PinnedRemoteAttesterV1, RemoteApiTrustLevelV1,
+};
 #[cfg(feature = "api")]
-pub use api_provider::{ApiProvider, GeminiProvider, OpenAiProvider, RemoteEmbeddingAttestationV1};
+pub use api_provider::{
+    ApiProvider, GeminiProvider, MIN_REMOTE_ATTESTATION_KEY_BYTES, OpenAiProvider,
+    REMOTE_EMBEDDING_ATTESTATION_SCHEMA_V1, REMOTE_EMBEDDING_CHALLENGE_SCHEMA_V1,
+    RemoteEmbeddingAttestationV1, RemoteEmbeddingChallengeV1, remote_embedding_payload_sha256,
+    remote_endpoint_fingerprint, remote_ordered_request_sha256,
+};
 
 #[cfg(test)]
 mod build_policy_tests {
