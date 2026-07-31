@@ -1,13 +1,14 @@
 # Claim conversion #1 — "the fastest lossless vector-search primitive" vs a live third-party incumbent (2026-07-31, BlackThrush)
 
-**Claim under test:** `CHANGELOG.md:66` —
+**Claim under test:** `origin/main:CHANGELOG.md:82` (this working tree: `:66`) —
 *"Lossless quantized search: FSVI 4-bit two-pass, the fastest lossless
 vector-search primitive"*.
 
 Ranked **#1** of the 137 unconverted claims by public load-bearingness, per
 `claim-coverage-audit-20260730.md` (CORRECTION section). It is the only
 **unbounded superlative** on any public surface of this repository, and
-`git grep fastest` confirms `CHANGELOG.md:66` is its sole public occurrence.
+`git grep fastest` confirms it is the sole public occurrence. It also travels as
+the subject line of commit `f04074a4`.
 
 ## Why this claim was ranked first
 
@@ -85,6 +86,12 @@ CPU/wall and observed thread count are published per arm.
 Build: strict-remote `rch exec --base 3debdf25 --clean-overlay` with only the
 bench and its `Cargo.toml` overlaid. Bench source:
 `frankensearch/benches/fsvi_4bit_vs_incumbent.rs`.
+
+> **Note on a known wart.** `cpu_time_ns()` routes through a pointless
+> `american_paren()` helper where `rsplit_once(')')` would do. It is deliberately
+> left in place: the committed source must keep producing the two ELF SHA-256s
+> recorded below, and a cosmetic edit would break that correspondence. Clean it
+> only in a commit that explicitly postdates and supersedes these measurements.
 
 ## Results — run 1 (15 rounds)
 
