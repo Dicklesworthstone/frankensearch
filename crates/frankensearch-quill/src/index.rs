@@ -82,6 +82,7 @@ const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
 const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
+const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
 /// Typed failure from the scalar shipping facade.
 #[derive(Debug, Error)]
@@ -1117,7 +1118,7 @@ fn clone_delta_arcs(
 struct PendingIdentity {
     doc_ord: u32,
     document_id: String,
-    canonical_content: Vec<u8>,
+    content_hash: u64,
 }
 
 struct StagedFlush {
@@ -2458,7 +2459,7 @@ impl QuillWriterState {
             for identity in &shard.identities {
                 hasher.update(identity.doc_ord.to_be_bytes());
                 conformance_hash_bytes(&mut hasher, identity.document_id.as_bytes());
-                conformance_hash_bytes(&mut hasher, &identity.canonical_content);
+                hasher.update(identity.content_hash.to_be_bytes());
             }
         }
 
@@ -2724,11 +2725,11 @@ impl QuillWriterState {
             state
                 .accumulator
                 .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-            let canonical_content = canonical_document_preimage(document, &metadata)?;
+            let content_hash = canonical_document_content_hash(document, &metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
                 document_id: document.id.clone(),
-                canonical_content,
+                content_hash,
             });
         }
         Ok(())
@@ -2891,11 +2892,11 @@ impl QuillWriterState {
                         arena_bytes_used_high_water.max(accumulated.bytes_used);
                     arena_bytes_reserved_high_water =
                         arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                    let canonical_content = canonical_document_preimage(document, &metadata)?;
+                    let content_hash = canonical_document_content_hash(document, &metadata)?;
                     self.shards[shard_id].identities.push(PendingIdentity {
                         doc_ord,
                         document_id: document.id.clone(),
-                        canonical_content,
+                        content_hash,
                     });
                     self.uncommitted_ids.insert(document.id.clone());
                     self.unpublished_since.get_or_insert_with(Instant::now);
@@ -3735,10 +3736,10 @@ impl QuillWriterState {
             .identities
             .iter()
             .map(|identity| {
-                FlushDocumentInput::from_canonical_content(
+                FlushDocumentInput::new(
                     identity.doc_ord,
                     &identity.document_id,
-                    &identity.canonical_content,
+                    identity.content_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -3822,10 +3823,10 @@ impl QuillWriterState {
             .identities
             .iter()
             .map(|identity| {
-                FlushDocumentInput::from_canonical_content(
+                FlushDocumentInput::new(
                     identity.doc_ord,
                     &identity.document_id,
-                    &identity.canonical_content,
+                    identity.content_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -3940,11 +3941,7 @@ impl QuillWriterState {
         let schema_id = self.schema.schema_id()?;
         let mut batch_hasher = Xxh3::new();
         for identity in &self.shards[shard].identities {
-            let len = u64::try_from(identity.canonical_content.len()).map_err(|_| {
-                invalid_state("canonical document preimage length does not fit u64")
-            })?;
-            batch_hasher.update(&len.to_le_bytes());
-            batch_hasher.update(&identity.canonical_content);
+            batch_hasher.update(&identity.content_hash.to_le_bytes());
         }
         let batch_digest = batch_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
@@ -6344,16 +6341,24 @@ fn canonical_metadata(
     serde_json::to_vec(&ordered)
 }
 
-fn canonical_document_preimage(
+fn canonical_document_content_hash(
     document: &IndexableDocument,
     metadata: &[u8],
-) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&(
-        document.id.as_str(),
-        document.content.as_str(),
-        document.title.as_deref().unwrap_or(""),
+) -> Result<u64, QuillIndexError> {
+    let mut hasher = Xxh3::new();
+    hasher.update(CONTENT_HASH_DOMAIN);
+    for field in [
+        document.id.as_bytes(),
+        document.content.as_bytes(),
+        document.title.as_deref().unwrap_or("").as_bytes(),
         metadata,
-    ))
+    ] {
+        let len = u64::try_from(field.len())
+            .map_err(|_| invalid_state("canonical document field length does not fit u64"))?;
+        hasher.update(&len.to_le_bytes());
+        hasher.update(field);
+    }
+    Ok(hasher.digest())
 }
 
 /// Compute the exact IDMAP content witness Quill will persist for a document.
@@ -6365,7 +6370,7 @@ pub fn indexable_document_content_hash(
     document: &IndexableDocument,
 ) -> Result<u64, QuillIndexError> {
     let metadata = canonical_metadata(&document.metadata)?;
-    Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
+    canonical_document_content_hash(document, &metadata)
 }
 
 #[cfg(feature = "conformance-internals")]
@@ -9149,10 +9154,35 @@ mod tests {
     fn shipping_content_hash(document_id: &str, content: &str) -> u64 {
         let document = IndexableDocument::new(document_id, content);
         let metadata = canonical_metadata(&document.metadata).expect("canonical fixture metadata");
-        xxh3_64(
-            &canonical_document_preimage(&document, &metadata)
-                .expect("canonical fixture document preimage"),
-        )
+        canonical_document_content_hash(&document, &metadata)
+            .expect("canonical fixture document hash")
+    }
+
+    #[test]
+    fn content_hash_has_unambiguous_fields_and_canonical_metadata() {
+        let first = IndexableDocument::new("ab", "c")
+            .with_title("title")
+            .with_metadata("zeta", "last")
+            .with_metadata("alpha", "first");
+        let reordered = IndexableDocument::new("ab", "c")
+            .with_title("title")
+            .with_metadata("alpha", "first")
+            .with_metadata("zeta", "last");
+        let boundary_shifted = IndexableDocument::new("a", "bc")
+            .with_title("title")
+            .with_metadata("alpha", "first")
+            .with_metadata("zeta", "last");
+
+        let first_hash = indexable_document_content_hash(&first).expect("hash first document");
+        assert_eq!(
+            first_hash,
+            indexable_document_content_hash(&reordered).expect("hash reordered metadata")
+        );
+        assert_ne!(
+            first_hash,
+            indexable_document_content_hash(&boundary_shifted)
+                .expect("hash field-boundary-shifted document")
+        );
     }
 
     fn fixture_documents() -> Vec<IndexableDocument> {
@@ -9569,7 +9599,7 @@ mod tests {
     ) -> Q1Ob2aSeal {
         let mut accumulator =
             ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("Q1-OB2a accumulator");
-        let mut canonical_contents = Vec::with_capacity(documents.len());
+        let mut content_hashes = Vec::with_capacity(documents.len());
         for (offset, document) in documents.iter().enumerate() {
             let doc_ord = q1_ob2a_doc_ord(first_doc_ord, offset);
             let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
@@ -9587,9 +9617,9 @@ mod tests {
             accumulator
                 .add_document_with_values(doc_ord, &indexed, &[], &stored)
                 .expect("accumulate Q1-OB2a document");
-            canonical_contents.push(
-                canonical_document_preimage(document, &metadata)
-                    .expect("canonical Q1-OB2a content"),
+            content_hashes.push(
+                canonical_document_content_hash(document, &metadata)
+                    .expect("canonical Q1-OB2a content hash"),
             );
         }
 
@@ -9601,13 +9631,13 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let identities = documents
             .iter()
-            .zip(&canonical_contents)
+            .zip(&content_hashes)
             .enumerate()
-            .map(|(offset, (document, canonical_content))| {
-                FlushDocumentInput::from_canonical_content(
+            .map(|(offset, (document, &content_hash))| {
+                FlushDocumentInput::new(
                     q1_ob2a_doc_ord(first_doc_ord, offset),
                     &document.id,
-                    canonical_content,
+                    content_hash,
                 )
             })
             .collect::<Vec<_>>();
