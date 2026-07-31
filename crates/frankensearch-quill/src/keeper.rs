@@ -15759,13 +15759,11 @@ mod tests {
         // error tells the caller a durable reopen is required.
         let mut successor = snapshot.next_manifest()?;
         assert!(successor.segments[0].insert_tombstone(1)?);
-        let Err(error) = segment.rebind(successor.segments[0].clone()) else {
-            panic!("mapped rebind must be rejected with a reopen-required error");
-        };
+        let error = segment.rebind(successor.segments[0].clone()).err();
         assert!(
             matches!(
-                &error,
-                KeeperError::InvalidTransition { detail }
+                error.as_ref(),
+                Some(KeeperError::InvalidTransition { detail })
                     if detail.contains("cannot rebind in place")
                         && detail.contains("durable reopen")
                         && detail.contains("owned-only")
