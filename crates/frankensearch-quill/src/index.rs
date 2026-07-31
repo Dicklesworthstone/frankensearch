@@ -7922,24 +7922,30 @@ fn open_sealed_term_cursor<'a>(
         return Ok((cursor, fieldnorms));
     }
     let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)?;
-    if !rank_pruning {
-        let size_hint = postings.doc_freq();
-        let cursor = postings.into_cursor()?;
-        return Ok((
-            SealedPostingCursor::from_owned(cursor, size_hint, segment.doc_count()),
-            fieldnorms,
-        ));
-    }
+    // Cache the validated posting-block table even when this query shape does
+    // not consume BLOCKMAX.  Default multi-field queries deliberately take
+    // the exhaustive scorer today; without this cache every repeated search
+    // decoded the term's complete posting stream once for validation and then
+    // decoded the visited blocks again in the cursor.  Binding BLOCKMAX on the
+    // first open gives both scorer paths one immutable validation witness, so
+    // subsequent searches decode only the blocks they actually traverse.
     let blockmax_section = required_section(segment, SectionKind::BLOCKMAX)?;
     let blockmax_bytes = span(blockmax_section, found.metadata.blockmax, "BLOCKMAX")?;
     let pruning = Arc::new(postings.into_pruning_metadata(blockmax_bytes, fieldnorms)?);
     let pruning = segment
         .cache_rank_pruning_metadata(found.term_ord, found.metadata, pruning)
         .map_err(invalid_state)?;
-    Ok((
-        SealedPostingCursor::from_validated_pruning(postings_bytes, pruning, segment.doc_count())?,
-        fieldnorms,
-    ))
+    let cursor = if rank_pruning {
+        SealedPostingCursor::from_validated_pruning(postings_bytes, pruning, segment.doc_count())?
+    } else {
+        let size_hint = pruning.doc_freq();
+        SealedPostingCursor::from_owned(
+            pruning.cursor(postings_bytes)?,
+            size_hint,
+            segment.doc_count(),
+        )
+    };
+    Ok((cursor, fieldnorms))
 }
 
 fn composite_snapshot_field(
@@ -9732,6 +9738,7 @@ mod tests {
                 .and_then(|cursor| cursor.collect_bounded(term_count))
                 .expect("collect cached cursor");
             assert!(!cursor_rows.is_empty());
+            assert_eq!(segment.cached_rank_pruning_term_count(), 0);
 
             for _ in 0..32 {
                 let hits = index
@@ -9739,6 +9746,10 @@ mod tests {
                     .expect("repeat cached search");
                 assert_eq!(hits.len(), 2);
             }
+            assert!(
+                segment.cached_rank_pruning_term_count() >= 1,
+                "an exhaustive query must retain validated posting-block metadata"
+            );
             let (full_validations_after, borrowed_views_after) =
                 segment.term_dictionary_cache_counts();
             assert_eq!(
