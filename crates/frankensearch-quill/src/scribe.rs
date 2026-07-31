@@ -121,6 +121,24 @@ pub trait TokenAnalyzer: sealed::Sealed {
     /// Callers invoke this only for kinds accepted by [`Self::supports`].
     fn analyze(&mut self, analyzer: AnalyzerKind, text: &str, sink: &mut dyn FnMut(&AnalyzedToken));
 
+    /// Analyze directly into an ingest sink that needs only normalized text
+    /// and position.
+    ///
+    /// The default bridge preserves custom analyzer behavior. Analyzer
+    /// families that can borrow already-normalized source text may override
+    /// this method to avoid materializing an owned token for every occurrence.
+    #[inline]
+    fn analyze_terms(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&str, u32),
+    ) {
+        self.analyze(analyzer, text, &mut |token| {
+            sink(&token.text, token.position);
+        });
+    }
+
     /// Retained analyzer scratch included in RSS/reuse diagnostics.
     fn bytes_reserved(&self) -> usize {
         0
@@ -196,6 +214,37 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
     Ok(report)
 }
 
+#[inline]
+fn analyze_admitted_terms<A: TokenAnalyzer + ?Sized>(
+    analyzer: &mut A,
+    analyzer_kind: AnalyzerKind,
+    text: &str,
+    sink: &mut dyn FnMut(&str, u32),
+) -> Result<AnalysisReport, UnsupportedAnalysis> {
+    if !analyzer.supports(analyzer_kind) {
+        return Err(UnsupportedAnalysis {
+            analyzer: analyzer_kind,
+        });
+    }
+    let mut report = AnalysisReport::default();
+    analyzer.analyze_terms(analyzer_kind, text, &mut |term, position| {
+        report.raw_tokens += 1;
+        if term.len() > MAX_TERM_BYTES {
+            report.oversized_tokens += 1;
+            tracing::warn!(
+                token_bytes = term.len(),
+                max_token_bytes = MAX_TERM_BYTES,
+                position,
+                "Quill dropped an oversized analyzed token"
+            );
+            return;
+        }
+        report.admitted_tokens += 1;
+        sink(term, position);
+    });
+    Ok(report)
+}
+
 /// Default implementation of the shipping frankensearch analyzer.
 ///
 /// This fuses Tantivy's `SimpleTokenizer` and `LowerCaser`: split on
@@ -215,6 +264,7 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
     token: AnalyzedToken,
+    normalization_scratch: String,
 }
 
 impl sealed::Sealed for FrankensearchTokenizer {}
@@ -287,6 +337,135 @@ fn simd_tokenizer_masks(bytes: &[u8], at: usize) -> (u32, u32) {
     let alphanumeric = (digits | uppercase | lowercase).to_bitmask();
     let non_ascii = lanes.simd_ge(0x80).to_bitmask();
     (alphanumeric, non_ascii)
+}
+
+#[inline]
+fn emit_default_borrowed(
+    scratch: &mut String,
+    source: &str,
+    all_ascii: bool,
+    position: u32,
+    offset_from: usize,
+    offset_to: usize,
+    sink: &mut dyn FnMut(&str, u32, usize, usize),
+) {
+    if all_ascii && !source.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        sink(source, position, offset_from, offset_to);
+        return;
+    }
+
+    scratch.clear();
+    if all_ascii {
+        scratch.push_str(source);
+        scratch.make_ascii_lowercase();
+    } else {
+        for source_char in source.chars() {
+            scratch.extend(source_char.to_lowercase());
+        }
+    }
+    sink(scratch, position, offset_from, offset_to);
+}
+
+#[inline]
+fn analyze_default_borrowed(
+    scratch: &mut String,
+    text: &str,
+    sink: &mut dyn FnMut(&str, u32, usize, usize),
+) {
+    const NO_TOKEN: usize = usize::MAX;
+    let bytes = text.as_bytes();
+    let len = text.len();
+    let mut cursor = 0;
+    let mut position = 0_u32;
+    let mut offset_from = NO_TOKEN;
+    let mut all_ascii = true;
+
+    while cursor < len {
+        if cursor + SIMD_TOKENIZER_LANES <= len {
+            let (alphanumeric, non_ascii) = simd_tokenizer_masks(bytes, cursor);
+            let ascii_lanes = if non_ascii == 0 {
+                SIMD_TOKENIZER_LANES
+            } else {
+                non_ascii.trailing_zeros() as usize
+            };
+            if ascii_lanes != 0 {
+                let valid = if ascii_lanes == SIMD_TOKENIZER_LANES {
+                    u32::MAX
+                } else {
+                    (1_u32 << ascii_lanes) - 1
+                };
+                let alphanumeric = alphanumeric & valid;
+                let prior_lane = u32::from(offset_from != NO_TOKEN);
+                let mut transitions = (alphanumeric ^ ((alphanumeric << 1) | prior_lane)) & valid;
+                while transitions != 0 {
+                    let lane = transitions.trailing_zeros() as usize;
+                    let lane_mark = 1_u32 << lane;
+                    let at = cursor + lane;
+                    transitions &= !lane_mark;
+
+                    if alphanumeric & lane_mark != 0 {
+                        debug_assert_eq!(offset_from, NO_TOKEN);
+                        offset_from = at;
+                        all_ascii = true;
+                    } else {
+                        debug_assert_ne!(offset_from, NO_TOKEN);
+                        emit_default_borrowed(
+                            scratch,
+                            &text[offset_from..at],
+                            all_ascii,
+                            position,
+                            offset_from,
+                            at,
+                            sink,
+                        );
+                        position = next_token_position(position);
+                        offset_from = NO_TOKEN;
+                    }
+                }
+                cursor += ascii_lanes;
+                if ascii_lanes == SIMD_TOKENIZER_LANES {
+                    continue;
+                }
+            }
+        }
+
+        let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
+            break;
+        };
+        if tokenizer_is_alphanumeric(ch) {
+            if offset_from == NO_TOKEN {
+                offset_from = cursor;
+                all_ascii = ch.is_ascii();
+            } else {
+                all_ascii &= ch.is_ascii();
+            }
+        } else if offset_from != NO_TOKEN {
+            emit_default_borrowed(
+                scratch,
+                &text[offset_from..cursor],
+                all_ascii,
+                position,
+                offset_from,
+                cursor,
+                sink,
+            );
+            position = next_token_position(position);
+            offset_from = NO_TOKEN;
+        }
+        cursor = next;
+    }
+
+    if offset_from != NO_TOKEN {
+        emit_default_borrowed(
+            scratch,
+            &text[offset_from..len],
+            all_ascii,
+            position,
+            offset_from,
+            len,
+            sink,
+        );
+    }
 }
 
 /// Per-lane marker (`0x80` in the lane) where `lo <= byte <= hi`.
@@ -470,6 +649,19 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         analyzer == AnalyzerKind::FrankensearchDefault
     }
 
+    #[inline]
+    fn analyze_terms(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&str, u32),
+    ) {
+        debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+        analyze_default_borrowed(&mut self.token.text, text, &mut |term, position, _, _| {
+            sink(term, position)
+        });
+    }
+
     fn analyze(
         &mut self,
         analyzer: AnalyzerKind,
@@ -477,129 +669,32 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
-        const NO_TOKEN: usize = usize::MAX;
-        let bytes = text.as_bytes();
-        let len = text.len();
-        let mut cursor = 0;
-        let mut position = 0_u32;
-        let mut offset_from = NO_TOKEN;
-        let mut all_ascii = true;
-
-        while cursor < len {
-            if cursor + SIMD_TOKENIZER_LANES <= len {
-                let (alphanumeric, non_ascii) = simd_tokenizer_masks(bytes, cursor);
-                let ascii_lanes = if non_ascii == 0 {
-                    SIMD_TOKENIZER_LANES
-                } else {
-                    non_ascii.trailing_zeros() as usize
-                };
-                if ascii_lanes != 0 {
-                    let valid = if ascii_lanes == SIMD_TOKENIZER_LANES {
-                        u32::MAX
-                    } else {
-                        (1_u32 << ascii_lanes) - 1
-                    };
-                    let alphanumeric = alphanumeric & valid;
-                    let prior_lane = u32::from(offset_from != NO_TOKEN);
-                    let mut transitions =
-                        (alphanumeric ^ ((alphanumeric << 1) | prior_lane)) & valid;
-                    while transitions != 0 {
-                        let lane = transitions.trailing_zeros() as usize;
-                        let lane_mark = 1_u32 << lane;
-                        let at = cursor + lane;
-                        transitions &= !lane_mark;
-
-                        if alphanumeric & lane_mark != 0 {
-                            debug_assert_eq!(offset_from, NO_TOKEN);
-                            offset_from = at;
-                            all_ascii = true;
-                        } else {
-                            debug_assert_ne!(offset_from, NO_TOKEN);
-                            self.token.text.clear();
-                            let source = &text[offset_from..at];
-                            if all_ascii {
-                                self.token.text.push_str(source);
-                                self.token.text.make_ascii_lowercase();
-                            } else {
-                                for source_char in source.chars() {
-                                    self.token.text.extend(source_char.to_lowercase());
-                                }
-                            }
-                            self.token.position = position;
-                            self.token.offset_from = offset_from;
-                            self.token.offset_to = at;
-                            self.token.position_length = 1;
-                            sink(&self.token);
-
-                            position = next_token_position(position);
-                            offset_from = NO_TOKEN;
-                        }
-                    }
-                    cursor += ascii_lanes;
-                    if ascii_lanes == SIMD_TOKENIZER_LANES {
-                        continue;
-                    }
-                }
-            }
-
-            let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
-                break;
-            };
-            if tokenizer_is_alphanumeric(ch) {
-                if offset_from == NO_TOKEN {
-                    offset_from = cursor;
-                    all_ascii = ch.is_ascii();
-                } else {
-                    all_ascii &= ch.is_ascii();
-                }
-            } else if offset_from != NO_TOKEN {
-                self.token.text.clear();
-                let source = &text[offset_from..cursor];
-                if all_ascii {
-                    self.token.text.push_str(source);
-                    self.token.text.make_ascii_lowercase();
-                } else {
-                    for source_char in source.chars() {
-                        self.token.text.extend(source_char.to_lowercase());
-                    }
-                }
-                self.token.position = position;
-                self.token.offset_from = offset_from;
-                self.token.offset_to = cursor;
-                self.token.position_length = 1;
-                sink(&self.token);
-
-                position = next_token_position(position);
-                offset_from = NO_TOKEN;
-            }
-            cursor = next;
-        }
-
-        if offset_from != NO_TOKEN {
-            self.token.text.clear();
-            let source = &text[offset_from..len];
-            if all_ascii {
-                self.token.text.push_str(source);
-                self.token.text.make_ascii_lowercase();
-            } else {
-                for source_char in source.chars() {
-                    self.token.text.extend(source_char.to_lowercase());
-                }
-            }
-            self.token.position = position;
-            self.token.offset_from = offset_from;
-            self.token.offset_to = len;
-            self.token.position_length = 1;
-            sink(&self.token);
-        }
+        let token = &mut self.token;
+        analyze_default_borrowed(
+            &mut self.normalization_scratch,
+            text,
+            &mut |term, position, offset_from, offset_to| {
+                token.text.clear();
+                token.text.push_str(term);
+                token.position = position;
+                token.offset_from = offset_from;
+                token.offset_to = offset_to;
+                token.position_length = 1;
+                sink(token);
+            },
+        );
     }
 
     fn bytes_reserved(&self) -> usize {
-        self.token.text.capacity()
+        self.token
+            .text
+            .capacity()
+            .saturating_add(self.normalization_scratch.capacity())
     }
 
     fn reset(&mut self) {
         self.token.text.clear();
+        self.normalization_scratch.clear();
         self.token.position = 0;
         self.token.offset_from = 0;
         self.token.offset_to = 0;
@@ -2464,13 +2559,13 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                         let _tokenize_timer =
                             crate::tracing_conventions::StageTimer::new(&tokenize_span);
                         let _tokenize_entered = tokenize_span.enter();
-                        let report = analyze_admitted(
+                        let report = analyze_admitted_terms(
                             &mut self.analyzer,
                             analyzer,
                             value.text,
-                            &mut |token| {
-                                let term_id = terms.intern(field_ord, token.text.as_bytes());
-                                column.append_token(term_id, doc_ord, token.position);
+                            &mut |term, position| {
+                                let term_id = terms.intern(field_ord, term.as_bytes());
+                                column.append_token(term_id, doc_ord, position);
                             },
                         )
                         .expect("document validation checked analyzer-family support");
@@ -5428,6 +5523,36 @@ mod tests {
         let mut tokens = Vec::new();
         analyze_default_scalar_reference(text, &mut |token| tokens.push(token.clone()));
         tokens
+    }
+
+    #[test]
+    fn borrowed_ingest_terms_match_owned_default_stream() {
+        for input in [
+            "already normalized lowercase tokens 123",
+            "Mixed CASE Across SIMD-boundary-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "Unicode CAFÉ Σίσυφος 東京 and ascii",
+            "punctuation...joins---and___splits",
+        ] {
+            let mut owned_analyzer = FrankensearchTokenizer::default();
+            let mut owned = Vec::new();
+            owned_analyzer.analyze(AnalyzerKind::FrankensearchDefault, input, &mut |token| {
+                owned.push((token.text.clone(), token.position))
+            });
+
+            let mut borrowed_analyzer = FrankensearchTokenizer::default();
+            let mut borrowed = Vec::new();
+            let report = analyze_admitted_terms(
+                &mut borrowed_analyzer,
+                AnalyzerKind::FrankensearchDefault,
+                input,
+                &mut |term, position| borrowed.push((term.to_owned(), position)),
+            )
+            .expect("default analyzer supports borrowed ingest terms");
+
+            assert_eq!(borrowed, owned, "borrowed ingest diverged for {input:?}");
+            assert_eq!(report.admitted_tokens, owned.len());
+            assert_eq!(report.oversized_tokens, 0);
+        }
     }
 
     #[test]
